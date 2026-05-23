@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Pensieve
 
@@ -14,6 +16,46 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertEqual(EditorMode.split.label, "Split")
         XCTAssertEqual(EditorMode.preview.label, "Preview")
         XCTAssertEqual(EditorMode.focus.label, "Focus")
+    }
+
+    @MainActor
+    func testMarkdownEditorBridgeLoadsAndUpdatesDocumentText() {
+        let loadedText = "# Loaded\n\nThe editor must show this text."
+        let bridge = EditorRepresentable.makeBridge(text: loadedText, fontSize: 14, delegate: nil)
+
+        XCTAssertTrue(bridge.scrollView.documentView === bridge.textView)
+        XCTAssertEqual((bridge.scrollView.documentView as? NSTextView)?.string, loadedText)
+        XCTAssertEqual(bridge.textStorage.string, loadedText)
+        XCTAssertNotNil(bridge.textView.gutter)
+        XCTAssertNotNil(bridge.textStorage.attribute(.font, at: 0, effectiveRange: nil))
+
+        let updatedText = "## Updated\n\nBinding changes must reach AppKit."
+        bridge.update(text: updatedText, fontSize: 18)
+
+        XCTAssertEqual(bridge.textView.string, updatedText)
+        XCTAssertEqual(bridge.textView.gutter?.fontSize, 18)
+    }
+
+    @MainActor
+    func testMarkdownEditorTypingMarksDirtyAndPostsDocumentChanged() {
+        var boundText = "before"
+        var isDirty = false
+        let representable = EditorRepresentable(
+            text: Binding(get: { boundText }, set: { boundText = $0 }),
+            fontSize: 14,
+            isDirty: Binding(get: { isDirty }, set: { isDirty = $0 })
+        )
+        let coordinator = representable.makeCoordinator()
+        let bridge = EditorRepresentable.makeBridge(text: boundText, fontSize: 14, delegate: coordinator)
+        coordinator.bridge = bridge
+
+        let documentChanged = expectation(forNotification: .vcDocumentChanged, object: nil)
+        bridge.textView.string = "typed edit"
+        coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: bridge.textView))
+
+        wait(for: [documentChanged], timeout: 1.0)
+        XCTAssertEqual(boundText, "typed edit")
+        XCTAssertTrue(isDirty)
     }
 
     func testFileWatcherReportsDirectoryChanges() throws {
