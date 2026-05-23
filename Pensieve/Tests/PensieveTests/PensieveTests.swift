@@ -74,4 +74,37 @@ final class PensieveSmokeTests: XCTestCase {
 
         BookmarkStore.shared.clear(into: appState)
     }
+
+    @MainActor
+    func testIndexDatabaseUsesLowercaseApplicationSupportPath() {
+        let appState = AppState()
+
+        IndexDatabase.shared.open(into: appState)
+
+        XCTAssertNil(appState.lastError)
+        XCTAssertEqual(IndexDatabase.shared.databaseURL?.lastPathComponent, "index.db")
+        XCTAssertEqual(IndexDatabase.shared.databaseURL?.deletingLastPathComponent().lastPathComponent, "pensieve")
+    }
+
+    @MainActor
+    func testBookmarkRestoreClearsDeletedFolder() throws {
+        let suiteName = "PensieveBookmarkTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveBookmarkTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        let appState = AppState()
+        let store = BookmarkStore(defaults: defaults)
+        try store.persist(url: folder, into: appState)
+        try FileManager.default.removeItem(at: folder)
+
+        XCTAssertNil(store.restore(into: appState))
+        XCTAssertNil(appState.bookmarkData)
+        XCTAssertNotNil(appState.lastError)
+    }
 }
