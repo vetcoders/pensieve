@@ -67,10 +67,8 @@ final class PreviewWebView: NSView {
         <!DOCTYPE html>
         <html><head><meta charset="utf-8">
         <style>
-        :root { --vc-font-size: \(Int(fontSize))px; }
         \(safeCSS)
-        body { font-size: var(--vc-font-size); padding: 24px; box-sizing: border-box; }
-        .markdown-body { max-width: 980px; margin: 0 auto; }
+        \(Self.appearanceCSS(fontSize: fontSize))
         </style>
         </head><body>
         <article class="markdown-body">
@@ -82,6 +80,105 @@ final class PreviewWebView: NSView {
         webView.loadHTMLString(html, baseURL: baseURL)
         lastReportedBlock = -1
         lastAppliedBlock = -1
+    }
+
+    static func appearanceCSS(fontSize: CGFloat) -> String {
+        """
+        :root {
+          color-scheme: light dark;
+          --vc-font-size: \(Int(fontSize))px;
+          --vc-preview-text: #1f2328;
+          --vc-preview-muted: #57606a;
+          --vc-preview-border: #d0d7de;
+          --vc-preview-code-bg: #f6f8fa;
+          --vc-preview-link: #0969da;
+          --vc-preview-row-alt: #f6f8fa;
+          --vc-preview-mark-bg: #fff8c5;
+          --vc-preview-mark-text: #24292f;
+        }
+
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #f0f0f0;
+            --vc-preview-muted: #a1a1aa;
+            --vc-preview-border: #3f3f46;
+            --vc-preview-code-bg: #2a2a2d;
+            --vc-preview-link: #8ab4f8;
+            --vc-preview-row-alt: #242428;
+            --vc-preview-mark-bg: #4a3f16;
+            --vc-preview-mark-text: #fff3b0;
+          }
+        }
+
+        html,
+        body {
+          background: transparent !important;
+          color: var(--vc-preview-text) !important;
+        }
+
+        body {
+          font-size: var(--vc-font-size);
+          padding: 24px;
+          box-sizing: border-box;
+        }
+
+        .markdown-body {
+          max-width: 980px;
+          margin: 0 auto;
+          color: var(--vc-preview-text) !important;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+          line-height: 1.65;
+        }
+
+        .markdown-body h1,
+        .markdown-body h2,
+        .markdown-body h3,
+        .markdown-body h4,
+        .markdown-body h5 {
+          color: var(--vc-preview-text) !important;
+        }
+
+        .markdown-body h2,
+        .markdown-body hr,
+        .markdown-body table tr,
+        .markdown-body table th,
+        .markdown-body table td {
+          border-color: var(--vc-preview-border) !important;
+        }
+
+        .markdown-body h6,
+        .markdown-body blockquote {
+          color: var(--vc-preview-muted) !important;
+        }
+
+        .markdown-body blockquote {
+          border-left-color: var(--vc-preview-border) !important;
+        }
+
+        .markdown-body a {
+          color: var(--vc-preview-link) !important;
+        }
+
+        .markdown-body code,
+        .markdown-body tt,
+        .markdown-body pre {
+          background: var(--vc-preview-code-bg) !important;
+          color: var(--vc-preview-text) !important;
+        }
+
+        .markdown-body table tr {
+          background: transparent !important;
+        }
+
+        .markdown-body table tr:nth-child(2n) {
+          background: var(--vc-preview-row-alt) !important;
+        }
+
+        .markdown-body mark {
+          background: var(--vc-preview-mark-bg) !important;
+          color: var(--vc-preview-mark-text) !important;
+        }
+        """
     }
 
     func scroll(toBlock index: Int) {

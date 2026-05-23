@@ -25,4 +25,14 @@ final class PreviewBaseURLTests: XCTestCase {
             URL(fileURLWithPath: "/Users/x/Notes/2026/05").path
         )
     }
+
+    func testPreviewAppearanceCSSRespondsToSystemScheme() {
+        let css = PreviewWebView.appearanceCSS(fontSize: 17)
+
+        XCTAssertTrue(css.contains("color-scheme: light dark"))
+        XCTAssertTrue(css.contains("@media (prefers-color-scheme: dark)"))
+        XCTAssertTrue(css.contains("--vc-font-size: 17px"))
+        XCTAssertTrue(css.contains("background: transparent !important"))
+        XCTAssertTrue(css.contains("color: var(--vc-preview-text) !important"))
+    }
 }
