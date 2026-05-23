@@ -19,7 +19,8 @@ struct PreviewView: View {
             markdown: appState.activeDocumentText,
             fontSize: appState.fontSize,
             theme: themeManager.current,
-            themeManager: themeManager
+            themeManager: themeManager,
+            documentURL: appState.activeDocumentURL
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.textBackgroundColor))
@@ -33,6 +34,18 @@ struct PreviewRepresentable: NSViewRepresentable {
     let fontSize: CGFloat
     let theme: ThemeManager.Theme
     let themeManager: ThemeManager
+    let documentURL: URL?
+
+    /// Base URL for relative resource resolution inside the preview WebView.
+    /// File-first markdown: relative images/links belong to the note's folder.
+    /// Falls back to the module bundle so a fresh app (no document loaded) is
+    /// still well-defined.
+    static func resolveBaseURL(for documentURL: URL?) -> URL? {
+        if let documentURL {
+            return documentURL.deletingLastPathComponent()
+        }
+        return Bundle.module.resourceURL
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(themeManager: themeManager)
@@ -45,6 +58,7 @@ struct PreviewRepresentable: NSViewRepresentable {
             markdown: markdown,
             fontSize: fontSize,
             theme: theme,
+            documentURL: documentURL,
             initial: true
         )
         return view
@@ -55,6 +69,7 @@ struct PreviewRepresentable: NSViewRepresentable {
             markdown: markdown,
             fontSize: fontSize,
             theme: theme,
+            documentURL: documentURL,
             initial: false
         )
     }
@@ -70,6 +85,7 @@ struct PreviewRepresentable: NSViewRepresentable {
             let markdown: String
             let fontSize: CGFloat
             let theme: ThemeManager.Theme
+            let documentURL: URL?
         }
 
         private let renderer = MarkdownRenderer()
@@ -102,8 +118,14 @@ struct PreviewRepresentable: NSViewRepresentable {
         func submit(markdown: String,
                     fontSize: CGFloat,
                     theme: ThemeManager.Theme,
+                    documentURL: URL?,
                     initial: Bool) {
-            let input = Input(markdown: markdown, fontSize: fontSize, theme: theme)
+            let input = Input(
+                markdown: markdown,
+                fontSize: fontSize,
+                theme: theme,
+                documentURL: documentURL
+            )
             if initial {
                 // First mount: render immediately so the user does not stare
                 // at an empty pane for the debounce interval.
@@ -123,7 +145,7 @@ struct PreviewRepresentable: NSViewRepresentable {
                 body: output.body,
                 css: css,
                 fontSize: input.fontSize,
-                baseURL: Bundle.module.resourceURL
+                baseURL: PreviewRepresentable.resolveBaseURL(for: input.documentURL)
             )
         }
     }
