@@ -41,6 +41,6 @@ final class IndexDatabase {
                 appropriateFor: nil,
                 create: true
             )
-            .appendingPathComponent("pensieve", isDirectory: true)
+            .appendingPathComponent("Pensieve", isDirectory: true)
     }
 }

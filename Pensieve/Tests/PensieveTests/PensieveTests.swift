@@ -76,14 +76,14 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
-    func testIndexDatabaseUsesLowercaseApplicationSupportPath() {
+    func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
         let appState = AppState()
 
         IndexDatabase.shared.open(into: appState)
 
         XCTAssertNil(appState.lastError)
         XCTAssertEqual(IndexDatabase.shared.databaseURL?.lastPathComponent, "index.db")
-        XCTAssertEqual(IndexDatabase.shared.databaseURL?.deletingLastPathComponent().lastPathComponent, "pensieve")
+        XCTAssertEqual(IndexDatabase.shared.databaseURL?.deletingLastPathComponent().lastPathComponent, "Pensieve")
     }
 
     @MainActor
