@@ -61,3 +61,18 @@ fastlane/test_output
 # https://github.com/johnno1962/injectionforxcode
 
 iOSInjectionProject/
+
+# VCNotes SwiftPM
+VCNotes/.build/
+VCNotes/.swiftpm/
+VCNotes/Package.resolved
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Loctree atlas (regenerated per scan)
+.loctree/
