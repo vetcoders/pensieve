@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zsh -ic 'repo-full')",
+      "Bash(zsh -ic 'loct --for-ai')",
+      "Bash(zsh -ic 'cat /Users/maciejgad/.ai-memories/AI-Chronicles/kronika_202*.md')",
+      "mcp__aicx-mcp__aicx_search",
+      "Read(//private/tmp/**)"
+    ]
+  }
+}

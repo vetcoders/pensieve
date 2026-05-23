@@ -32,7 +32,7 @@ struct SidebarView: View {
                     .font(.headline)
                     .lineLimit(1)
             } else {
-                Text("VC Notes")
+                Text("Pensieve")
                     .font(.headline)
             }
 

@@ -1,5 +1,5 @@
 ---
-title: "VC Notes — design doc (MVP 0.1)"
+title: "Pensieve — design doc (MVP 0.1)"
 date: 2026-05-22
 status: approved-for-implementation
 authors: maciej (operator) + monika (vision) + klaudiusz (synthesis)
@@ -7,7 +7,7 @@ format: vc-scaffold
 target_skill: vc-implement (alias vc-justdo)
 ---
 
-# VC Notes — design doc
+# Pensieve — design doc
 
 Native macOS markdown writing app. File-first. Source-first.
 Not Notion. Not Obsidian. Not MWeb-grade kombajn.
@@ -56,11 +56,11 @@ Nic więcej. No CocoaPods, no Carthage, no GCDWebServer, no AppAuth.
 ## 3. Architektura wysokopoziomowa
 
 ```
-VCNotes/
+Pensieve/
 ├── Package.swift
-├── Sources/VCNotes/
+├── Sources/Pensieve/
 │   ├── App/
-│   │   ├── VCNotesApp.swift           — entry, scene management
+│   │   ├── PensieveApp.swift           — entry, scene management
 │   │   ├── ContentView.swift          — 3-pane layout (sidebar | editor | preview)
 │   │   ├── Commands.swift             — menu commands (File/Edit/View/Mode)
 │   │   └── AppState.swift             — ObservableObject root
@@ -90,7 +90,7 @@ VCNotes/
 │       ├── markdown.css               — z legacy/MarkdownEditor/Resources
 │       ├── gfm.css                    — z legacy
 │       └── sample.md                  — z legacy (welcome file)
-└── Tests/VCNotesTests/
+└── Tests/PensieveTests/
     └── (minimal smoke tests dla MVP 0.1)
 ```
 

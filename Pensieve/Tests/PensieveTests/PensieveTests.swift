@@ -1,7 +1,7 @@
 import XCTest
-@testable import VCNotes
+@testable import Pensieve
 
-final class VCNotesSmokeTests: XCTestCase {
+final class PensieveSmokeTests: XCTestCase {
     func testEditorModeRawValues() {
         XCTAssertEqual(EditorMode.source.rawValue, 1)
         XCTAssertEqual(EditorMode.split.rawValue, 2)
@@ -18,7 +18,7 @@ final class VCNotesSmokeTests: XCTestCase {
 
     func testFileWatcherReportsDirectoryChanges() throws {
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VCNotesWatcherTests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("PensieveWatcherTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: folder)
@@ -43,7 +43,7 @@ final class VCNotesSmokeTests: XCTestCase {
     @MainActor
     func testFolderOpenAndAutosaveWriteThrough() async throws {
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VCNotesStorageTests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("PensieveStorageTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: folder)

@@ -27,7 +27,7 @@ final class IndexDatabase {
             databaseQueue = queue
             databaseURL = url
         } catch {
-            let message = "Could not open VC Notes index database: \(error.localizedDescription)"
+            let message = "Could not open Pensieve index database: \(error.localizedDescription)"
             appState?.lastError = message
             NSLog(message)
         }
@@ -41,6 +41,6 @@ final class IndexDatabase {
                 appropriateFor: nil,
                 create: true
             )
-            .appendingPathComponent("VCNotes", isDirectory: true)
+            .appendingPathComponent("Pensieve", isDirectory: true)
     }
 }

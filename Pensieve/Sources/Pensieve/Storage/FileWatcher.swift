@@ -13,7 +13,7 @@ final class FileWatcher {
         }
     }
 
-    private let queue = DispatchQueue(label: "io.vetcoders.vcnotes.file-watcher", qos: .utility)
+    private let queue = DispatchQueue(label: "io.vetcoders.pensieve.file-watcher", qos: .utility)
     private var source: (any DispatchSourceFileSystemObject)?
     private var pendingChange: DispatchWorkItem?
 

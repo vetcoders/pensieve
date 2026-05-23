@@ -5,7 +5,7 @@ final class BookmarkStore {
     static let shared = BookmarkStore()
 
     private let defaults: UserDefaults
-    private let bookmarkKey = "VCNotes.openFolder.bookmark"
+    private let bookmarkKey = "Pensieve.openFolder.bookmark"
     private var activeURL: URL?
     private var activeAccessWasGranted = false
 

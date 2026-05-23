@@ -1,6 +1,6 @@
 import XCTest
 import Markdown
-@testable import VCNotes
+@testable import Pensieve
 
 final class HTMLEmitterTests: XCTestCase {
     private func render(_ markdown: String) -> String {

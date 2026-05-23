@@ -62,10 +62,10 @@ fastlane/test_output
 
 iOSInjectionProject/
 
-# VCNotes SwiftPM
-VCNotes/.build/
-VCNotes/.swiftpm/
-VCNotes/Package.resolved
+# Pensieve SwiftPM
+Pensieve/.build/
+Pensieve/.swiftpm/
+Pensieve/Package.resolved
 
 # macOS
 .DS_Store

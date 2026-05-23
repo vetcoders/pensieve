@@ -1,11 +1,11 @@
 import SwiftUI
 
 @main
-struct VCNotesApp: App {
+struct PensieveApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        WindowGroup("VC Notes") {
+        WindowGroup("Pensieve") {
             ContentView()
                 .environmentObject(appState)
                 .frame(minWidth: 900, minHeight: 600)
@@ -17,7 +17,7 @@ struct VCNotesApp: App {
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
-            VCNotesCommands(appState: appState)
+            PensieveCommands(appState: appState)
         }
     }
 }

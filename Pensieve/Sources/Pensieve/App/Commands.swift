@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct VCNotesCommands: Commands {
+struct PensieveCommands: Commands {
     @ObservedObject var appState: AppState
 
     var body: some Commands {
@@ -78,7 +78,7 @@ struct VCNotesCommands: Commands {
 }
 
 extension Notification.Name {
-    static let vcOpenFolder = Notification.Name("VCNotes.openFolder")
-    static let vcSaveActiveDocument = Notification.Name("VCNotes.saveActiveDocument")
-    static let vcDocumentChanged = Notification.Name("VCNotes.documentChanged")
+    static let vcOpenFolder = Notification.Name("Pensieve.openFolder")
+    static let vcSaveActiveDocument = Notification.Name("Pensieve.saveActiveDocument")
+    static let vcDocumentChanged = Notification.Name("Pensieve.documentChanged")
 }

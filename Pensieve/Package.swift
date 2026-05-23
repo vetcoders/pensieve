@@ -1,15 +1,15 @@
 // swift-tools-version:5.9
-// VCNotes — native macOS markdown editor (file-first, source-first)
+// Pensieve — native macOS markdown editor (file-first, source-first)
 
 import PackageDescription
 
 let package = Package(
-    name: "VCNotes",
+    name: "Pensieve",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "VCNotes", targets: ["VCNotes"])
+        .executable(name: "Pensieve", targets: ["Pensieve"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-markdown", from: "0.4.0"),
@@ -17,7 +17,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "VCNotes",
+            name: "Pensieve",
             dependencies: [
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "GRDB", package: "GRDB.swift")
@@ -29,8 +29,8 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "VCNotesTests",
-            dependencies: ["VCNotes"]
+            name: "PensieveTests",
+            dependencies: ["Pensieve"]
         )
     ]
 )

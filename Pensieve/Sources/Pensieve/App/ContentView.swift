@@ -10,7 +10,7 @@ struct ContentView: View {
         } detail: {
             EditorPreviewSplit()
         }
-        .navigationTitle(appState.selectedDocument?.title ?? "VC Notes")
+        .navigationTitle(appState.selectedDocument?.title ?? "Pensieve")
         .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
     }
 }

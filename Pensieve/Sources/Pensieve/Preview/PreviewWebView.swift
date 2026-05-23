@@ -156,11 +156,11 @@ final class PreviewWebView: NSView {
 extension Notification.Name {
     /// Posted by the editor when its visible viewport top changes. UserInfo
     /// must include `["block": Int]` with the topmost visible block index.
-    static let vcEditorViewportChanged = Notification.Name("VCNotes.editorViewportChanged")
+    static let vcEditorViewportChanged = Notification.Name("Pensieve.editorViewportChanged")
 
     /// Posted by the preview when its visible viewport top changes. UserInfo
     /// includes `["block": Int]`. Editor consumes for two-way sync.
-    static let vcPreviewViewportChanged = Notification.Name("VCNotes.previewViewportChanged")
+    static let vcPreviewViewportChanged = Notification.Name("Pensieve.previewViewportChanged")
 }
 
 // MARK: - WKScriptMessageHandler proxy
