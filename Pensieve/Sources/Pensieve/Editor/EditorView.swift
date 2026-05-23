@@ -1,8 +1,6 @@
 import SwiftUI
 import AppKit
 
-// MARK: - SwiftUI wrapper (Wave C-2 agent will replace internals with NSTextView+TextKit2)
-
 struct EditorView: View {
     @EnvironmentObject private var appState: AppState
 
@@ -25,45 +23,31 @@ struct EditorRepresentable: NSViewRepresentable {
     @Binding var isDirty: Bool
 
     func makeNSView(context: Context) -> NSScrollView {
-        let bridge = Self.makeBridge(text: text, fontSize: fontSize, delegate: context.coordinator)
-        context.coordinator.bridge = bridge
-        return bridge.scrollView
+        let surface = MarkdownEditorSurface(text: text, fontSize: fontSize)
+        surface.onTextChanged = { newText in
+            self.text = newText
+            self.isDirty = true
+            NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
+        }
+        context.coordinator.surface = surface
+        return surface.scrollView
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let bridge = context.coordinator.bridge else { return }
-        context.coordinator.isApplyingExternalText = true
-        bridge.update(text: text, fontSize: fontSize)
-        context.coordinator.isApplyingExternalText = false
+        guard let surface = context.coordinator.surface else { return }
+        surface.update(text: text, fontSize: fontSize)
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+        Coordinator()
     }
 
-    static func makeBridge(text: String, fontSize: CGFloat, delegate: NSTextViewDelegate?) -> MarkdownEditorBridge {
-        MarkdownEditorBridge(text: text, fontSize: fontSize, delegate: delegate)
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: EditorRepresentable
-        var bridge: MarkdownEditorBridge?
-        var isApplyingExternalText = false
-        
-        init(_ parent: EditorRepresentable) { self.parent = parent }
-
-        func textDidChange(_ notification: Notification) {
-            guard !isApplyingExternalText else { return }
-            guard let textView = notification.object as? NSTextView,
-                  let textStorage = textView.textStorage else { return }
-            parent.text = textStorage.string
-            parent.isDirty = true
-            NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
-        }
+    final class Coordinator {
+        var surface: MarkdownEditorSurface?
     }
 }
 
-final class MarkdownEditorBridge {
+final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     let scrollView: NSScrollView
     let textView: MarkdownTextView
     let textStorage: NSTextStorage
@@ -71,7 +55,10 @@ final class MarkdownEditorBridge {
     let textLayoutManager: NSTextLayoutManager
     let textContainer: NSTextContainer
 
-    init(text: String, fontSize: CGFloat, delegate: NSTextViewDelegate?) {
+    var onTextChanged: ((String) -> Void)?
+    var isApplyingExternalText = false
+
+    init(text: String, fontSize: CGFloat) {
         textLayoutManager = NSTextLayoutManager()
         textContentStorage = MarkdownTextStorage()
         textStorage = NSTextStorage()
@@ -93,7 +80,7 @@ final class MarkdownEditorBridge {
             frame: NSRect(x: 0, y: 0, width: 640, height: scrollView.contentSize.height),
             textContainer: textContainer
         )
-        textView.delegate = delegate
+        
         textView.minSize = NSSize(width: 0, height: scrollView.contentSize.height)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
@@ -105,6 +92,9 @@ final class MarkdownEditorBridge {
         scrollView.documentView = textView
         textView.setupGutter(layoutManager: textLayoutManager)
 
+        super.init()
+        
+        textView.delegate = self
         update(text: text, fontSize: fontSize)
     }
 
@@ -117,8 +107,16 @@ final class MarkdownEditorBridge {
         }
 
         if textStorage.string != text {
+            isApplyingExternalText = true
             textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: text)
             textContentStorage.refreshHighlighting()
+            isApplyingExternalText = false
         }
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard !isApplyingExternalText else { return }
+        guard let changedTextView = notification.object as? NSTextView, changedTextView === textView else { return }
+        onTextChanged?(textStorage.string)
     }
 }

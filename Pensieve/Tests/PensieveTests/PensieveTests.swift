@@ -19,21 +19,21 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
-    func testMarkdownEditorBridgeLoadsAndUpdatesDocumentText() {
+    func testMarkdownEditorSurfaceLoadsAndUpdatesDocumentText() {
         let loadedText = "# Loaded\n\nThe editor must show this text."
-        let bridge = EditorRepresentable.makeBridge(text: loadedText, fontSize: 14, delegate: nil)
+        let surface = MarkdownEditorSurface(text: loadedText, fontSize: 14)
 
-        XCTAssertTrue(bridge.scrollView.documentView === bridge.textView)
-        XCTAssertEqual((bridge.scrollView.documentView as? NSTextView)?.string, loadedText)
-        XCTAssertEqual(bridge.textStorage.string, loadedText)
-        XCTAssertNotNil(bridge.textView.gutter)
-        XCTAssertNotNil(bridge.textStorage.attribute(.font, at: 0, effectiveRange: nil))
+        XCTAssertTrue(surface.scrollView.documentView === surface.textView)
+        XCTAssertEqual((surface.scrollView.documentView as? NSTextView)?.string, loadedText)
+        XCTAssertEqual(surface.textStorage.string, loadedText)
+        XCTAssertNotNil(surface.textView.gutter)
+        XCTAssertNotNil(surface.textStorage.attribute(.font, at: 0, effectiveRange: nil))
 
         let updatedText = "## Updated\n\nBinding changes must reach AppKit."
-        bridge.update(text: updatedText, fontSize: 18)
+        surface.update(text: updatedText, fontSize: 18)
 
-        XCTAssertEqual(bridge.textView.string, updatedText)
-        XCTAssertEqual(bridge.textView.gutter?.fontSize, 18)
+        XCTAssertEqual(surface.textView.string, updatedText)
+        XCTAssertEqual(surface.textView.gutter?.fontSize, 18)
     }
 
     @MainActor
@@ -46,12 +46,17 @@ final class PensieveSmokeTests: XCTestCase {
             isDirty: Binding(get: { isDirty }, set: { isDirty = $0 })
         )
         let coordinator = representable.makeCoordinator()
-        let bridge = EditorRepresentable.makeBridge(text: boundText, fontSize: 14, delegate: coordinator)
-        coordinator.bridge = bridge
+        let surface = MarkdownEditorSurface(text: boundText, fontSize: 14)
+        surface.onTextChanged = { newText in
+            boundText = newText
+            isDirty = true
+            NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
+        }
+        coordinator.surface = surface
 
         let documentChanged = expectation(forNotification: .vcDocumentChanged, object: nil)
-        bridge.textView.string = "typed edit"
-        coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: bridge.textView))
+        surface.textView.string = "typed edit"
+        surface.textDidChange(Notification(name: NSText.didChangeNotification, object: surface.textView))
 
         wait(for: [documentChanged], timeout: 1.0)
         XCTAssertEqual(boundText, "typed edit")
