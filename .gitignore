@@ -76,3 +76,6 @@ VCNotes/Package.resolved
 
 # Loctree atlas (regenerated per scan)
 .loctree/
+/.claude/
+/.vibecrafted/
+/agents
