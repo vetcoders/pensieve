@@ -38,6 +38,10 @@ final class AppState: ObservableObject {
     // Sidebar visibility
     @Published var sidebarVisible: Bool = true
 
+    // Storage persistence + user-visible errors
+    @Published var bookmarkData: Data?
+    @Published var lastError: String?
+
     var selectedDocument: DocumentRef? {
         guard let id = selectedDocumentID else { return nil }
         return documents.first(where: { $0.id == id })

@@ -9,6 +9,10 @@ struct VCNotesApp: App {
             ContentView()
                 .environmentObject(appState)
                 .frame(minWidth: 900, minHeight: 600)
+                .task {
+                    IndexDatabase.shared.open(into: appState)
+                    FolderManager.shared.restoreLastFolder(into: appState)
+                }
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: true))
