@@ -118,6 +118,67 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testDirtyDocumentIsSavedBeforeFastSelectionLoad() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveDirtySwitchTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha original".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta original".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
+        DocumentStore.shared.load(ref: DocumentRef(id: alphaURL), into: appState)
+
+        appState.activeDocumentText = "alpha unsaved"
+        appState.activeDocumentDirty = true
+
+        // SwiftUI List selection can mutate before its onChange load callback runs.
+        appState.selectedDocumentID = betaURL
+        DocumentStore.shared.load(ref: DocumentRef(id: betaURL), into: appState)
+
+        XCTAssertEqual(try String(contentsOf: alphaURL, encoding: .utf8), "alpha unsaved")
+        XCTAssertEqual(try String(contentsOf: betaURL, encoding: .utf8), "beta original")
+        XCTAssertEqual(appState.activeDocumentText, "beta original")
+        XCTAssertEqual(appState.activeDocumentURL?.resolvingSymlinksInPath(), betaURL.resolvingSymlinksInPath())
+        XCTAssertFalse(appState.activeDocumentDirty)
+    }
+
+    @MainActor
+    func testExplicitSaveWritesLoadedDocumentEvenIfSelectionAlreadyMoved() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveExplicitSaveTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha original".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta original".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
+        DocumentStore.shared.load(ref: DocumentRef(id: alphaURL), into: appState)
+
+        appState.activeDocumentText = "alpha command save"
+        appState.activeDocumentDirty = true
+        appState.selectedDocumentID = betaURL
+
+        DocumentStore.shared.save(appState: appState)
+
+        XCTAssertEqual(try String(contentsOf: alphaURL, encoding: .utf8), "alpha command save")
+        XCTAssertEqual(try String(contentsOf: betaURL, encoding: .utf8), "beta original")
+        XCTAssertFalse(appState.activeDocumentDirty)
+    }
+
+    @MainActor
     func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
         let appState = AppState()
 

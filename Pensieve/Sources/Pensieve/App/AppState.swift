@@ -27,6 +27,7 @@ final class AppState: ObservableObject {
     @Published var selectedDocumentID: DocumentRef.ID?
 
     // Active document
+    @Published var activeDocumentURL: URL?
     @Published var activeDocumentText: String = ""
     @Published var activeDocumentDirty: Bool = false
 
