@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var controller: AppController
+    @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -69,25 +71,23 @@ struct SidebarView: View {
             if !appState.openFiles.isEmpty {
                 Section("Open Files") {
                     ForEach(appState.openFiles) { doc in
-                        documentRow(doc)
-                            .simultaneousGesture(TapGesture().onEnded {
+                        Button {
                             controller.selectDocument(id: doc.id)
-                            })
+                        } label: {
+                            documentRow(doc, isSelected: appState.selectedDocumentID == doc.id)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            documentContextMenu(for: doc)
+                        }
                     }
                 }
             }
 
             if !appState.workspaceTree.isEmpty {
                 Section("Workspace") {
-                    OutlineGroup(appState.workspaceTree, children: \.children) { node in
-                        if node.kind == .document {
-                            nodeRow(node)
-                                .simultaneousGesture(TapGesture().onEnded {
-                                controller.selectWorkspaceNode(node)
-                                })
-                        } else {
-                            nodeRow(node)
-                        }
+                    ForEach(appState.workspaceTree) { node in
+                        workspaceTreeRow(node, depth: 0)
                     }
                 }
             }
@@ -108,10 +108,18 @@ struct SidebarView: View {
             if !workspaceResults.isEmpty {
                 Section("Workspace Results") {
                     ForEach(workspaceResults) { result in
-                        searchResultRow(result)
-                            .simultaneousGesture(TapGesture().onEnded {
+                        Button {
                             controller.selectSearchResult(result)
-                            })
+                        } label: {
+                            searchResultRow(
+                                result,
+                                isSelected: appState.selectedDocumentID == result.document.id
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            documentContextMenu(for: result.document)
+                        }
                     }
                 }
             }
@@ -119,10 +127,18 @@ struct SidebarView: View {
             if !openFileResults.isEmpty {
                 Section("Open Files") {
                     ForEach(openFileResults) { result in
-                        searchResultRow(result)
-                            .simultaneousGesture(TapGesture().onEnded {
+                        Button {
                             controller.selectSearchResult(result)
-                            })
+                        } label: {
+                            searchResultRow(
+                                result,
+                                isSelected: appState.selectedDocumentID == result.document.id
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            documentContextMenu(for: result.document)
+                        }
                     }
                 }
             }
@@ -130,28 +146,95 @@ struct SidebarView: View {
         .listStyle(.sidebar)
     }
 
-    private func documentRow(_ doc: DocumentRef) -> some View {
+    private func documentRow(_ doc: DocumentRef, isSelected: Bool) -> some View {
         HStack {
             Image(systemName: "doc.text")
                 .foregroundColor(.secondary)
             Text(doc.title)
                 .lineLimit(1)
         }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
         .help(doc.displayPath)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .background(selectionBackground(isSelected))
+    }
+
+    private func workspaceTreeRow(_ node: WorkspaceNode, depth: Int) -> AnyView {
+        if node.kind == .document {
+            return AnyView(Button {
+                controller.selectWorkspaceNode(node)
+            } label: {
+                nodeRow(node, depth: depth, isSelected: appState.selectedDocumentID == node.documentID)
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                nodeContextMenu(for: node)
+            })
+        } else {
+            let children = node.children ?? []
+            let isRoot = depth == 0
+            let isExpanded = isRoot || expandedNodeIDs.contains(node.id)
+
+            let content = VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    if !isRoot {
+                        toggleExpanded(node.id)
+                    }
+                } label: {
+                    folderRow(node, depth: depth, isExpanded: isExpanded)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    nodeContextMenu(for: node)
+                }
+
+                if isExpanded {
+                    ForEach(children) { child in
+                        workspaceTreeRow(child, depth: depth + 1)
+                    }
+                }
+            }
+            return AnyView(content)
+        }
+    }
+
+    private func folderRow(_ node: WorkspaceNode, depth: Int, isExpanded: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+                .frame(width: 10)
+
+            Image(systemName: "folder")
+                .foregroundColor(.secondary)
+
+            Text(node.name)
+                .lineLimit(1)
+        }
+        .padding(.leading, CGFloat(depth) * 14)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .help(node.url?.path ?? node.name)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 
-    private func nodeRow(_ node: WorkspaceNode) -> some View {
+    private func nodeRow(_ node: WorkspaceNode, depth: Int, isSelected: Bool) -> some View {
         HStack {
-            Image(systemName: node.kind == .folder ? "folder" : "doc.text")
+            Image(systemName: "doc.text")
                 .foregroundColor(.secondary)
             Text(node.name)
                 .lineLimit(1)
         }
+        .padding(.leading, CGFloat(depth) * 14 + 15)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
         .help(node.url?.path ?? node.name)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .background(selectionBackground(isSelected))
     }
 
     private var searchText: Binding<String> {
@@ -163,7 +246,7 @@ struct SidebarView: View {
         )
     }
 
-    private func searchResultRow(_ result: WorkspaceSearchResult) -> some View {
+    private func searchResultRow(_ result: WorkspaceSearchResult, isSelected: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Image(systemName: "doc.text")
@@ -184,9 +267,85 @@ struct SidebarView: View {
                     .lineLimit(2)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
         .help(result.displayPath)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .background(selectionBackground(isSelected))
+    }
+
+    private func selectionBackground(_ isSelected: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(isSelected ? Color.accentColor.opacity(0.24) : Color.clear)
+    }
+
+    @ViewBuilder
+    private func documentContextMenu(for doc: DocumentRef) -> some View {
+        Button("Open") {
+            controller.selectDocument(id: doc.id)
+        }
+
+        Button("Reveal in Finder") {
+            revealInFinder(doc.url)
+        }
+
+        Button("Copy Path") {
+            copyPath(doc.url.path)
+        }
+
+        if let relativePath = doc.relativePath {
+            Button("Copy Workspace Path") {
+                copyPath(relativePath)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func nodeContextMenu(for node: WorkspaceNode) -> some View {
+        if node.kind == .document, let url = node.url {
+            if let documentID = node.documentID,
+               let doc = appState.allDocuments.first(where: { $0.id == documentID }) {
+                documentContextMenu(for: doc)
+            } else {
+                Button("Open") {
+                    controller.selectWorkspaceNode(node)
+                }
+
+                Button("Reveal in Finder") {
+                    revealInFinder(url)
+                }
+
+                Button("Copy Path") {
+                    copyPath(url.path)
+                }
+            }
+        } else if let url = node.url {
+            Button("Reveal in Finder") {
+                revealInFinder(url)
+            }
+
+            Button("Copy Path") {
+                copyPath(url.path)
+            }
+        }
+    }
+
+    private func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func copyPath(_ path: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(path, forType: .string)
+    }
+
+    private func toggleExpanded(_ id: WorkspaceNode.ID) {
+        if expandedNodeIDs.contains(id) {
+            expandedNodeIDs.remove(id)
+        } else {
+            expandedNodeIDs.insert(id)
+        }
     }
 }
