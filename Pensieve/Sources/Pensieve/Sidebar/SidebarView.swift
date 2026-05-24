@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var controller: AppController
     @State private var searchText: String = ""
 
     var body: some View {
@@ -15,14 +16,6 @@ struct SidebarView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onReceive(NotificationCenter.default.publisher(for: .vcOpenFolder)) { note in
-            if let url = note.userInfo?["url"] as? URL {
-                FolderManager.shared.open(url: url, into: appState)
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .vcSaveActiveDocument)) { _ in
-            DocumentStore.shared.save(appState: appState)
-        }
     }
 
     private var header: some View {
@@ -77,14 +70,7 @@ struct SidebarView: View {
         Binding(
             get: { appState.selectedDocumentID },
             set: { newID in
-                guard let newID else {
-                    DocumentStore.shared.select(ref: nil, into: appState)
-                    return
-                }
-                guard let ref = appState.documents.first(where: { $0.id == newID }) else {
-                    return
-                }
-                DocumentStore.shared.select(ref: ref, into: appState)
+                controller.selectDocument(id: newID)
             }
         )
     }

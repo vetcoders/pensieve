@@ -37,30 +37,33 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
-    func testMarkdownEditorTypingMarksDirtyAndPostsDocumentChanged() {
+    func testMarkdownEditorTypingMarksDirtyAndRoutesDocumentChanged() {
         var boundText = "before"
         var isDirty = false
+        var didRouteDocumentChange = false
         let representable = EditorRepresentable(
             text: Binding(get: { boundText }, set: { boundText = $0 }),
             fontSize: 14,
-            isDirty: Binding(get: { isDirty }, set: { isDirty = $0 })
+            isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
+            onDocumentChanged: {
+                didRouteDocumentChange = true
+            }
         )
         let coordinator = representable.makeCoordinator()
         let surface = MarkdownEditorSurface(text: boundText, fontSize: 14)
         surface.onTextChanged = { newText in
             boundText = newText
             isDirty = true
-            NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
+            didRouteDocumentChange = true
         }
         coordinator.surface = surface
 
-        let documentChanged = expectation(forNotification: .vcDocumentChanged, object: nil)
         surface.textView.string = "typed edit"
         surface.textDidChange(Notification(name: NSText.didChangeNotification, object: surface.textView))
 
-        wait(for: [documentChanged], timeout: 1.0)
         XCTAssertEqual(boundText, "typed edit")
         XCTAssertTrue(isDirty)
+        XCTAssertTrue(didRouteDocumentChange)
     }
 
     func testFileWatcherReportsDirectoryChanges() throws {
@@ -100,7 +103,8 @@ final class PensieveSmokeTests: XCTestCase {
         try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
 
         let appState = AppState()
-        FolderManager.shared.open(url: folder, into: appState)
+        let controller = AppController(appState: appState)
+        controller.openFolder(url: folder)
 
         XCTAssertEqual(
             appState.documents.map { $0.url.resolvingSymlinksInPath() },
@@ -112,7 +116,7 @@ final class PensieveSmokeTests: XCTestCase {
 
         appState.activeDocumentText = "changed"
         appState.activeDocumentDirty = true
-        NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
+        controller.documentDidChange()
 
         try await Task.sleep(nanoseconds: 700_000_000)
 
@@ -138,14 +142,15 @@ final class PensieveSmokeTests: XCTestCase {
 
         let appState = AppState()
         appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
-        DocumentStore.shared.load(ref: DocumentRef(id: alphaURL), into: appState)
+        let controller = AppController(appState: appState)
+        controller.selectDocument(id: alphaURL)
 
         appState.activeDocumentText = "alpha unsaved"
         appState.activeDocumentDirty = true
 
         // SwiftUI List selection can mutate before its onChange load callback runs.
         appState.selectedDocumentID = betaURL
-        DocumentStore.shared.load(ref: DocumentRef(id: betaURL), into: appState)
+        controller.selectDocument(id: betaURL)
 
         XCTAssertEqual(try String(contentsOf: alphaURL, encoding: .utf8), "alpha unsaved")
         XCTAssertEqual(try String(contentsOf: betaURL, encoding: .utf8), "beta original")
@@ -171,16 +176,38 @@ final class PensieveSmokeTests: XCTestCase {
         let appState = AppState()
         appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
         DocumentStore.shared.load(ref: DocumentRef(id: alphaURL), into: appState)
+        let controller = AppController(appState: appState)
 
         appState.activeDocumentText = "alpha command save"
         appState.activeDocumentDirty = true
         appState.selectedDocumentID = betaURL
 
-        DocumentStore.shared.save(appState: appState)
+        controller.saveActiveDocument()
 
         XCTAssertEqual(try String(contentsOf: alphaURL, encoding: .utf8), "alpha command save")
         XCTAssertEqual(try String(contentsOf: betaURL, encoding: .utf8), "beta original")
         XCTAssertFalse(appState.activeDocumentDirty)
+    }
+
+    @MainActor
+    func testControllerRoutesModeAndPreferenceCommands() {
+        let appState = AppState()
+        let controller = AppController(appState: appState)
+
+        controller.setMode(.preview)
+        XCTAssertEqual(appState.mode, .preview)
+
+        controller.toggleSidebar()
+        XCTAssertFalse(appState.sidebarVisible)
+
+        controller.toggleRichMarkdown()
+        XCTAssertTrue(appState.richMarkdownEnabled)
+
+        controller.bumpFontSize(by: 2)
+        XCTAssertEqual(appState.fontSize, 16)
+
+        controller.resetFontSize()
+        XCTAssertEqual(appState.fontSize, 14)
     }
 
     @MainActor

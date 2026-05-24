@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PensieveCommands: Commands {
     @ObservedObject var appState: AppState
+    @ObservedObject var controller: AppController
 
     var body: some Commands {
         // File menu
@@ -14,7 +15,7 @@ struct PensieveCommands: Commands {
             Divider()
 
             Button("Save") {
-                NotificationCenter.default.post(name: .vcSaveActiveDocument, object: nil)
+                controller.saveActiveDocument()
             }
             .keyboardShortcut("s", modifiers: [.command])
             .disabled(appState.selectedDocument == nil)
@@ -24,7 +25,7 @@ struct PensieveCommands: Commands {
         CommandMenu("Mode") {
             ForEach(EditorMode.allCases) { mode in
                 Button("\(mode.label) Mode") {
-                    appState.mode = mode
+                    controller.setMode(mode)
                 }
                 .keyboardShortcut(KeyEquivalent(Character("\(mode.rawValue)")), modifiers: [.command])
             }
@@ -32,12 +33,12 @@ struct PensieveCommands: Commands {
             Divider()
 
             Button(appState.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") {
-                appState.sidebarVisible.toggle()
+                controller.toggleSidebar()
             }
             .keyboardShortcut("\\", modifiers: [.command, .option])
 
             Button(appState.richMarkdownEnabled ? "Disable Rich Markdown" : "Enable Rich Markdown") {
-                appState.richMarkdownEnabled.toggle()
+                controller.toggleRichMarkdown()
             }
             .keyboardShortcut("/", modifiers: [.command])
         }
@@ -45,17 +46,17 @@ struct PensieveCommands: Commands {
         // Format menu — font sizing
         CommandMenu("Format") {
             Button("Bigger Font") {
-                appState.bumpFontSize(by: 1)
+                controller.bumpFontSize(by: 1)
             }
             .keyboardShortcut("=", modifiers: [.command])
 
             Button("Smaller Font") {
-                appState.bumpFontSize(by: -1)
+                controller.bumpFontSize(by: -1)
             }
             .keyboardShortcut("-", modifiers: [.command])
 
             Button("Reset Font") {
-                appState.resetFontSize()
+                controller.resetFontSize()
             }
             .keyboardShortcut("0", modifiers: [.command])
         }
@@ -68,17 +69,7 @@ struct PensieveCommands: Commands {
         panel.allowsMultipleSelection = false
         panel.prompt = "Open"
         if panel.runModal() == .OK, let url = panel.url {
-            NotificationCenter.default.post(
-                name: .vcOpenFolder,
-                object: nil,
-                userInfo: ["url": url]
-            )
+            controller.openFolder(url: url)
         }
     }
-}
-
-extension Notification.Name {
-    static let vcOpenFolder = Notification.Name("Pensieve.openFolder")
-    static let vcSaveActiveDocument = Notification.Name("Pensieve.saveActiveDocument")
-    static let vcDocumentChanged = Notification.Name("Pensieve.documentChanged")
 }

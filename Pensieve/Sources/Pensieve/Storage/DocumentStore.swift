@@ -102,25 +102,8 @@ final class DocumentStore {
     static let shared = DocumentStore()
     private let autosaver = Autosaver.shared
     private weak var appState: AppState?
-    private var documentChangedObserver: NSObjectProtocol?
 
-    private init() {
-        documentChangedObserver = NotificationCenter.default.addObserver(
-            forName: .vcDocumentChanged,
-            object: nil,
-            queue: nil
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.scheduleAutosave()
-            }
-        }
-    }
-
-    deinit {
-        if let documentChangedObserver {
-            NotificationCenter.default.removeObserver(documentChangedObserver)
-        }
-    }
+    private init() {}
 
     func load(ref: DocumentRef, into appState: AppState) {
         self.appState = appState
@@ -190,8 +173,13 @@ final class DocumentStore {
         }
     }
 
-    private func scheduleAutosave() {
-        guard let appState, appState.selectedDocument != nil, appState.activeDocumentDirty else {
+    func documentDidChange(appState: AppState) {
+        self.appState = appState
+        scheduleAutosave(appState: appState)
+    }
+
+    private func scheduleAutosave(appState: AppState) {
+        guard appState.selectedDocument != nil, appState.activeDocumentDirty else {
             return
         }
 

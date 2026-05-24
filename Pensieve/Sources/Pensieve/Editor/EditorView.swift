@@ -3,12 +3,14 @@ import AppKit
 
 struct EditorView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var controller: AppController
 
     var body: some View {
         EditorRepresentable(
             text: $appState.activeDocumentText,
             fontSize: appState.fontSize,
-            isDirty: $appState.activeDocumentDirty
+            isDirty: $appState.activeDocumentDirty,
+            onDocumentChanged: controller.documentDidChange
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.textBackgroundColor))
@@ -21,13 +23,14 @@ struct EditorRepresentable: NSViewRepresentable {
     @Binding var text: String
     let fontSize: CGFloat
     @Binding var isDirty: Bool
+    let onDocumentChanged: @MainActor () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
         let surface = MarkdownEditorSurface(text: text, fontSize: fontSize)
         surface.onTextChanged = { newText in
             self.text = newText
             self.isDirty = true
-            NotificationCenter.default.post(name: .vcDocumentChanged, object: nil)
+            self.onDocumentChanged()
         }
         context.coordinator.surface = surface
         return surface.scrollView
