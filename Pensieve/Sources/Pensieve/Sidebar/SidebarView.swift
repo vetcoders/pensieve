@@ -5,6 +5,7 @@ struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var controller: AppController
     @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
+    @State private var hoveredDocumentID: DocumentRef.ID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -74,9 +75,13 @@ struct SidebarView: View {
                         Button {
                             controller.selectDocument(id: doc.id)
                         } label: {
-                            documentRow(doc, isSelected: appState.selectedDocumentID == doc.id)
+                            documentRow(
+                                doc,
+                                isSelected: isSelectedOrHovered(doc.id)
+                            )
                         }
                         .buttonStyle(.plain)
+                        .onHover { updateHoveredDocument(doc.id, isHovered: $0) }
                         .contextMenu {
                             documentContextMenu(for: doc)
                         }
@@ -113,10 +118,11 @@ struct SidebarView: View {
                         } label: {
                             searchResultRow(
                                 result,
-                                isSelected: appState.selectedDocumentID == result.document.id
+                                isSelected: isSelectedOrHovered(result.document.id)
                             )
                         }
                         .buttonStyle(.plain)
+                        .onHover { updateHoveredDocument(result.document.id, isHovered: $0) }
                         .contextMenu {
                             documentContextMenu(for: result.document)
                         }
@@ -132,10 +138,11 @@ struct SidebarView: View {
                         } label: {
                             searchResultRow(
                                 result,
-                                isSelected: appState.selectedDocumentID == result.document.id
+                                isSelected: isSelectedOrHovered(result.document.id)
                             )
                         }
                         .buttonStyle(.plain)
+                        .onHover { updateHoveredDocument(result.document.id, isHovered: $0) }
                         .contextMenu {
                             documentContextMenu(for: result.document)
                         }
@@ -166,9 +173,17 @@ struct SidebarView: View {
             return AnyView(Button {
                 controller.selectWorkspaceNode(node)
             } label: {
-                nodeRow(node, depth: depth, isSelected: appState.selectedDocumentID == node.documentID)
+                nodeRow(
+                    node,
+                    depth: depth,
+                    isSelected: node.documentID.map(isSelectedOrHovered) ?? false
+                )
             }
             .buttonStyle(.plain)
+            .onHover { isHovered in
+                guard let documentID = node.documentID else { return }
+                updateHoveredDocument(documentID, isHovered: isHovered)
+            }
             .contextMenu {
                 nodeContextMenu(for: node)
             })
@@ -286,8 +301,18 @@ struct SidebarView: View {
             controller.selectDocument(id: doc.id)
         }
 
+        Button("Open in Default App") {
+            openExternally(doc.url)
+        }
+
         Button("Reveal in Finder") {
             revealInFinder(doc.url)
+        }
+
+        Divider()
+
+        Button("Copy Name") {
+            copyPath(doc.title)
         }
 
         Button("Copy Path") {
@@ -297,6 +322,10 @@ struct SidebarView: View {
         if let relativePath = doc.relativePath {
             Button("Copy Workspace Path") {
                 copyPath(relativePath)
+            }
+
+            Button("Copy Markdown Link") {
+                copyPath("[\(doc.title)](\(markdownLinkPath(relativePath)))")
             }
         }
     }
@@ -321,6 +350,16 @@ struct SidebarView: View {
                 }
             }
         } else if let url = node.url {
+            if expandedNodeIDs.contains(node.id) {
+                Button("Collapse Folder") {
+                    expandedNodeIDs.remove(node.id)
+                }
+            } else {
+                Button("Expand Folder") {
+                    expandedNodeIDs.insert(node.id)
+                }
+            }
+
             Button("Reveal in Finder") {
                 revealInFinder(url)
             }
@@ -331,6 +370,10 @@ struct SidebarView: View {
         }
     }
 
+    private func openExternally(_ url: URL) {
+        NSWorkspace.shared.open(url)
+    }
+
     private func revealInFinder(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
@@ -339,6 +382,18 @@ struct SidebarView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(path, forType: .string)
+    }
+
+    private func markdownLinkPath(_ path: String) -> String {
+        path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+    }
+
+    private func isSelectedOrHovered(_ id: DocumentRef.ID) -> Bool {
+        appState.selectedDocumentID == id || hoveredDocumentID == id
+    }
+
+    private func updateHoveredDocument(_ id: DocumentRef.ID, isHovered: Bool) {
+        hoveredDocumentID = isHovered ? id : nil
     }
 
     private func toggleExpanded(_ id: WorkspaceNode.ID) {
