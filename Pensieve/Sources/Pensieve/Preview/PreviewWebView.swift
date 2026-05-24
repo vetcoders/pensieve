@@ -1,17 +1,29 @@
 import AppKit
 import WebKit
 
-/// AppKit-side preview surface.
+/// AppKit-side preview sink.
 ///
-/// Owns a WKWebView and the two-way scroll bridge:
-///   • external links → open in default browser via NSWorkspace
-///   • body scroll → posts `.vcPreviewViewportChanged` so editor can follow
-///   • exposes `scroll(toBlock:)` so editor can drive preview position
+/// Owns a WKWebView and the viewport / external-link bridge surface. This is
+/// the terminal stage of the preview pipeline:
 ///
-/// Editor↔preview coordination is loose: PreviewWebView only listens for
-/// `.vcEditorViewportChanged` and dispatches its own viewport changes by
-/// notification. The Wave C-2 editor agent wires the editor side; until then
-/// the bridge is inert but harmless.
+///     markdown -> render scheduling -> HTML document -> WKWebView load
+///                                                       ^^^^^^^^^^^^^
+///                                                       this type
+///
+/// What this type does today:
+///   • Loads a `PreviewDocument` into the underlying WKWebView.
+///   • Routes activated `http(s)` / `mailto` links to `NSWorkspace` instead of
+///     navigating the WebView itself.
+///   • Bridges body scroll → posts `.vcPreviewViewportChanged` so the editor
+///     can follow once an editor-side listener exists.
+///   • Exposes `scroll(toBlock:)` and listens for `.vcEditorViewportChanged`
+///     so the editor can drive preview position once an editor-side poster
+///     exists.
+///
+/// What is *not* live yet: there is no poster of `.vcEditorViewportChanged`
+/// anywhere in the app, so the editor → preview half of the two-way bridge is
+/// inert. The surface is wired so an editor agent can switch it on without
+/// touching this file.
 final class PreviewWebView: NSView {
     private let webView: WKWebView
     private let scrollMessageName = "vcScroll"
@@ -61,23 +73,11 @@ final class PreviewWebView: NSView {
 
     // MARK: - Public
 
-    func loadDocument(body: String, css: String, fontSize: CGFloat, baseURL: URL?) {
-        let safeCSS = css.replacingOccurrences(of: "</style>", with: "<\\/style>")
-        let html = """
-        <!DOCTYPE html>
-        <html><head><meta charset="utf-8">
-        <style>
-        \(safeCSS)
-        \(Self.appearanceCSS(fontSize: fontSize))
-        </style>
-        </head><body>
-        <article class="markdown-body">
-        \(body)
-        </article>
-        <script>\(Self.bridgeScript)</script>
-        </body></html>
-        """
-        webView.loadHTMLString(html, baseURL: baseURL)
+    /// Load a composed `PreviewDocument` into the WebView. This is the only
+    /// sink path the pipeline uses; document composition happens upstream so
+    /// this method stays focused on the WKWebView contract.
+    func load(document: PreviewDocument) {
+        webView.loadHTMLString(document.html, baseURL: document.baseURL)
         lastReportedBlock = -1
         lastAppliedBlock = -1
     }
@@ -268,7 +268,12 @@ final class PreviewWebView: NSView {
 
     // MARK: - JS bridge
 
-    private static let bridgeScript: String = """
+    /// Viewport bridge installed in every preview document. Block elements
+    /// emitted by `HTMLEmitter` carry `data-vc-block="<index>"`; this script
+    /// (a) exposes `window.__vcScrollToBlock(idx)` so Swift can drive scroll
+    /// position, and (b) posts `vcScroll` messages with the top-visible block
+    /// index whenever the body scrolls.
+    static let bridgeScript: String = """
     (function() {
       function blocks() {
         return Array.from(document.querySelectorAll('[data-vc-block]'));
@@ -304,6 +309,10 @@ final class PreviewWebView: NSView {
     })();
     """
 }
+
+// MARK: - PreviewSink conformance
+
+extension PreviewWebView: PreviewSink {}
 
 // MARK: - Notifications
 
