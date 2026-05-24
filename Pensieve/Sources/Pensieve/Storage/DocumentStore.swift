@@ -328,28 +328,25 @@ final class DocumentStore {
 
     func load(ref: DocumentRef, into appState: AppState) {
         self.appState = appState
-        let activeDocumentURL = appState.activeDocumentURL
 
-        if appState.activeDocumentDirty {
-            save(appState: appState)
-            guard !appState.activeDocumentDirty else {
-                appState.selectedDocumentID = activeDocumentURL
-                return
-            }
+        guard saveDirtySessionIfNeeded(appState: appState) else {
+            return
         }
 
+        loadClean(ref: ref, into: appState)
+    }
+
+    private func loadClean(ref: DocumentRef, into appState: AppState) {
         autosaver.cancel()
 
         do {
             let text = try String(contentsOf: ref.url, encoding: .utf8)
-            appState.activeDocumentURL = ref.url
             appState.selectedDocumentID = ref.id
-            appState.activeDocumentText = text
-            appState.activeDocumentDirty = false
+            appState.documentSession.load(document: ref, text: text)
             appState.lastError = nil
         } catch {
             appState.lastError = "Could not load \(ref.url.lastPathComponent): \(error.localizedDescription)"
-            appState.activeDocumentDirty = false
+            appState.selectedDocumentID = appState.documentSession.id
         }
     }
 
@@ -357,23 +354,18 @@ final class DocumentStore {
     func select(ref: DocumentRef?, into appState: AppState) -> Bool {
         self.appState = appState
 
-        if appState.activeDocumentDirty {
-            save(appState: appState)
-            guard !appState.activeDocumentDirty else {
-                return false
-            }
+        guard saveDirtySessionIfNeeded(appState: appState) else {
+            return false
         }
 
         guard let ref else {
             autosaver.cancel()
             appState.selectedDocumentID = nil
-            appState.activeDocumentURL = nil
-            appState.activeDocumentText = ""
-            appState.activeDocumentDirty = false
+            appState.documentSession.clear()
             return true
         }
 
-        load(ref: ref, into: appState)
+        loadClean(ref: ref, into: appState)
         return true
     }
 
@@ -381,15 +373,15 @@ final class DocumentStore {
         self.appState = appState
         autosaver.cancel()
 
-        guard let url = appState.activeDocumentURL ?? appState.selectedDocument?.url else { return }
+        guard let url = appState.documentSession.url else { return }
+        let ref = documentRef(for: url, appState: appState)
+
         do {
-            try appState.activeDocumentText.write(to: url, atomically: true, encoding: .utf8)
-            appState.activeDocumentURL = url
-            appState.activeDocumentDirty = false
+            try appState.documentSession.text.write(to: url, atomically: true, encoding: .utf8)
+            appState.documentSession.document = ref
+            appState.documentSession.isDirty = false
             appState.lastError = nil
-            if let ref = documentRef(for: url, appState: appState) {
-                indexDatabase.index(document: ref, body: appState.activeDocumentText, appState: appState)
-            }
+            indexDatabase.index(document: ref, body: appState.documentSession.text, appState: appState)
         } catch {
             let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
             appState.lastError = message
@@ -399,11 +391,15 @@ final class DocumentStore {
 
     func documentDidChange(appState: AppState) {
         self.appState = appState
+        guard appState.documentSession.document != nil else {
+            return
+        }
+        appState.documentSession.isDirty = true
         scheduleAutosave(appState: appState)
     }
 
     private func scheduleAutosave(appState: AppState) {
-        guard appState.selectedDocument != nil, appState.activeDocumentDirty else {
+        guard appState.documentSession.document != nil, appState.documentSession.isDirty else {
             return
         }
 
@@ -413,7 +409,21 @@ final class DocumentStore {
         }
     }
 
-    private func documentRef(for url: URL, appState: AppState) -> DocumentRef? {
+    private func saveDirtySessionIfNeeded(appState: AppState) -> Bool {
+        guard appState.documentSession.isDirty else {
+            return true
+        }
+
+        let openSessionID = appState.documentSession.id
+        save(appState: appState)
+        guard !appState.documentSession.isDirty else {
+            appState.selectedDocumentID = openSessionID
+            return false
+        }
+        return true
+    }
+
+    private func documentRef(for url: URL, appState: AppState) -> DocumentRef {
         let standardizedURL = url.standardizedFileURL
         if let existing = appState.allDocuments.first(where: { $0.url.standardizedFileURL == standardizedURL }) {
             return existing

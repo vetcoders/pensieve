@@ -257,6 +257,105 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testDocumentSessionOwnsActiveDocumentState() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveSessionOwnershipTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("session.md")
+        try "session original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
+        DocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+            .load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
+
+        XCTAssertEqual(appState.documentSession.url?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.documentSession.text, "session original")
+        XCTAssertFalse(appState.documentSession.isDirty)
+
+        appState.activeDocumentText = "session edited"
+        appState.activeDocumentDirty = true
+
+        XCTAssertEqual(appState.documentSession.text, "session edited")
+        XCTAssertTrue(appState.documentSession.isDirty)
+    }
+
+    @MainActor
+    func testSelectionRefusesWhenDirtySessionCannotBeSaved() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveDirtyRefusalTests-\(UUID().uuidString)", isDirectory: true)
+        let deletedFolder = folder.appendingPathComponent("Deleted", isDirectory: true)
+        try FileManager.default.createDirectory(at: deletedFolder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = deletedFolder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha original".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta original".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [
+            DocumentRef(id: alphaURL.standardizedFileURL),
+            DocumentRef(id: betaURL.standardizedFileURL)
+        ]
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+            documentStore: DocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+        )
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+
+        appState.activeDocumentText = "alpha unsaved"
+        appState.activeDocumentDirty = true
+        try FileManager.default.removeItem(at: deletedFolder)
+
+        controller.selectDocument(id: betaURL.standardizedFileURL)
+
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), alphaURL.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.documentSession.url?.resolvingSymlinksInPath(), alphaURL.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.documentSession.text, "alpha unsaved")
+        XCTAssertTrue(appState.documentSession.isDirty)
+        XCTAssertTrue(appState.lastError?.contains("Could not save alpha.md") == true)
+    }
+
+    @MainActor
+    func testExternalRefreshReloadsCleanSessionButProtectsDirtySession() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveRefreshSessionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("note.md")
+        try "clean original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let manager = FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder))
+        manager.open(url: folder, into: appState)
+        XCTAssertEqual(appState.documentSession.text, "clean original")
+
+        try "clean external".write(to: noteURL, atomically: true, encoding: .utf8)
+        manager.refresh(into: appState)
+        XCTAssertEqual(appState.documentSession.text, "clean external")
+        XCTAssertFalse(appState.documentSession.isDirty)
+
+        appState.activeDocumentText = "dirty local edit"
+        appState.activeDocumentDirty = true
+        try "dirty external".write(to: noteURL, atomically: true, encoding: .utf8)
+        manager.refresh(into: appState)
+
+        XCTAssertEqual(appState.documentSession.text, "dirty local edit")
+        XCTAssertTrue(appState.documentSession.isDirty)
+    }
+
+    @MainActor
     func testExplicitSaveWritesLoadedDocumentEvenIfSelectionAlreadyMoved() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveExplicitSaveTests-\(UUID().uuidString)", isDirectory: true)

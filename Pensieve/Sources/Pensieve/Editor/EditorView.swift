@@ -7,13 +7,27 @@ struct EditorView: View {
 
     var body: some View {
         EditorRepresentable(
-            text: $appState.activeDocumentText,
+            text: documentText,
             fontSize: appState.fontSize,
-            isDirty: $appState.activeDocumentDirty,
+            isDirty: documentDirty,
             onDocumentChanged: controller.documentDidChange
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.textBackgroundColor))
+    }
+
+    private var documentText: Binding<String> {
+        Binding(
+            get: { appState.documentSession.text },
+            set: { appState.documentSession.text = $0 }
+        )
+    }
+
+    private var documentDirty: Binding<Bool> {
+        Binding(
+            get: { appState.documentSession.isDirty },
+            set: { appState.documentSession.isDirty = $0 }
+        )
     }
 }
 

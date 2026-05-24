@@ -33,9 +33,40 @@ final class AppState: ObservableObject {
     @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
 
     // Active document
-    @Published var activeDocumentURL: URL?
-    @Published var activeDocumentText: String = ""
-    @Published var activeDocumentDirty: Bool = false
+    @Published var documentSession: DocumentSession = .empty
+
+    var activeDocumentURL: URL? {
+        get {
+            documentSession.url
+        }
+        set {
+            guard let newValue else {
+                documentSession.clear()
+                return
+            }
+
+            let standardizedURL = newValue.standardizedFileURL
+            documentSession.document = documentRef(for: standardizedURL)
+        }
+    }
+
+    var activeDocumentText: String {
+        get {
+            documentSession.text
+        }
+        set {
+            documentSession.text = newValue
+        }
+    }
+
+    var activeDocumentDirty: Bool {
+        get {
+            documentSession.isDirty
+        }
+        set {
+            documentSession.isDirty = newValue
+        }
+    }
 
     // Editor preferences
     @Published var mode: EditorMode = .split
@@ -75,6 +106,12 @@ final class AppState: ObservableObject {
 
     func resetFontSize() {
         fontSize = 14
+    }
+
+    func documentRef(for url: URL) -> DocumentRef {
+        let standardizedURL = url.standardizedFileURL
+        return allDocuments.first { $0.url.standardizedFileURL == standardizedURL }
+            ?? DocumentRef(id: standardizedURL, isAdHoc: workspaceRoots.isEmpty)
     }
 }
 
