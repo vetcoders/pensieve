@@ -127,6 +127,103 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testFolderOpenImportsMarkdownRecursivelyAndSkipsDefaultNoise() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveRecursiveImportTests-\(UUID().uuidString)", isDirectory: true)
+        let nested = folder.appendingPathComponent("Nested", isDirectory: true)
+        let nodeModules = folder.appendingPathComponent("node_modules", isDirectory: true)
+        let git = folder.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: git, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = nested.appendingPathComponent("beta.markdown")
+        try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+        try "ignored".write(to: nested.appendingPathComponent("ignored.txt"), atomically: true, encoding: .utf8)
+        try "package".write(to: nodeModules.appendingPathComponent("package.md"), atomically: true, encoding: .utf8)
+        try "git".write(to: git.appendingPathComponent("config.md"), atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let manager = FolderManager(metadataStore: temporaryMetadataStore())
+        manager.open(url: folder, into: appState)
+
+        XCTAssertEqual(
+            Set(appState.documents.map { $0.url.resolvingSymlinksInPath() }),
+            Set([alphaURL.resolvingSymlinksInPath(), betaURL.resolvingSymlinksInPath()])
+        )
+        XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
+        XCTAssertEqual(appState.workspaceTree.first?.name, folder.lastPathComponent)
+        XCTAssertTrue(appState.workspaceTree.first?.children?.contains(where: { $0.name == "Nested" }) == true)
+    }
+
+    @MainActor
+    func testWorkspaceExclusionsPersistAndFilterImportedPaths() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveExclusionTests-\(UUID().uuidString)", isDirectory: true)
+        let drafts = folder.appendingPathComponent("Drafts", isDirectory: true)
+        try FileManager.default.createDirectory(at: drafts, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let keepURL = folder.appendingPathComponent("keep.md")
+        let skipURL = drafts.appendingPathComponent("skip.md")
+        try "keep".write(to: keepURL, atomically: true, encoding: .utf8)
+        try "skip".write(to: skipURL, atomically: true, encoding: .utf8)
+
+        let metadataStore = temporaryMetadataStore()
+        let appState = AppState()
+        let manager = FolderManager(metadataStore: metadataStore)
+        manager.open(url: folder, into: appState)
+        XCTAssertEqual(appState.documents.count, 2)
+
+        manager.addExcludedURLs([drafts], into: appState)
+
+        XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Drafts"]))
+        XCTAssertEqual(appState.documents.map { $0.url.resolvingSymlinksInPath() }, [keepURL.resolvingSymlinksInPath()])
+        XCTAssertEqual(metadataStore.load().excludedPaths, ["Drafts"])
+        XCTAssertFalse(appState.documents.contains(where: { $0.url == skipURL.standardizedFileURL }))
+
+        let relaunchedState = AppState()
+        let relaunchedManager = FolderManager(metadataStore: metadataStore)
+        relaunchedManager.open(url: folder, into: relaunchedState)
+        XCTAssertEqual(relaunchedState.documents.map { $0.url.resolvingSymlinksInPath() }, [keepURL.resolvingSymlinksInPath()])
+    }
+
+    @MainActor
+    func testOpenSingleMarkdownFileLoadsWithoutWorkspaceFolder() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveOpenFileTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("single.md")
+        try "# Single".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+            documentStore: .shared
+        )
+        controller.openFile(url: noteURL)
+
+        XCTAssertNil(appState.folderURL)
+        XCTAssertTrue(appState.workspaceRoots.isEmpty)
+        XCTAssertTrue(appState.documents.isEmpty)
+        XCTAssertEqual(appState.openFiles.map { $0.url.resolvingSymlinksInPath() }, [noteURL.resolvingSymlinksInPath()])
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.activeDocumentText, "# Single")
+    }
+
+    @MainActor
     func testDirtyDocumentIsSavedBeforeFastSelectionLoad() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveDirtySwitchTests-\(UUID().uuidString)", isDirectory: true)
@@ -211,6 +308,38 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testControllerRoutesWorkspaceCommands() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveWorkspaceCommandTests-\(UUID().uuidString)", isDirectory: true)
+        let hidden = folder.appendingPathComponent("Hidden", isDirectory: true)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        try "visible".write(to: folder.appendingPathComponent("visible.md"), atomically: true, encoding: .utf8)
+        try "hidden".write(to: hidden.appendingPathComponent("hidden.md"), atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+            documentStore: .shared
+        )
+
+        controller.openFolder(url: folder)
+        XCTAssertEqual(appState.documents.count, 2)
+
+        controller.excludeFromWorkspace(urls: [hidden])
+        XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Hidden"]))
+        XCTAssertEqual(appState.documents.count, 1)
+
+        controller.clearWorkspaceExclusions()
+        XCTAssertTrue(appState.excludedWorkspacePaths.isEmpty)
+        XCTAssertEqual(appState.documents.count, 2)
+    }
+
+    @MainActor
     func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
         let appState = AppState()
 
@@ -241,5 +370,11 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertNil(store.restore(into: appState))
         XCTAssertNil(appState.bookmarkData)
         XCTAssertNotNil(appState.lastError)
+    }
+
+    private func temporaryMetadataStore() -> WorkspaceMetadataStore {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveMetadataTests-\(UUID().uuidString)", isDirectory: true)
+        return WorkspaceMetadataStore(metadataURL: folder.appendingPathComponent("workspace.json", isDirectory: false))
     }
 }

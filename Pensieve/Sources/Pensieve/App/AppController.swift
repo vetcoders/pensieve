@@ -26,8 +26,20 @@ final class AppController: ObservableObject {
         folderManager.open(url: url, into: appState)
     }
 
+    func openFile(url: URL) {
+        folderManager.openFile(url: url, into: appState)
+    }
+
     func restoreLastFolder() {
         folderManager.restoreLastFolder(into: appState)
+    }
+
+    func excludeFromWorkspace(urls: [URL]) {
+        folderManager.addExcludedURLs(urls, into: appState)
+    }
+
+    func clearWorkspaceExclusions() {
+        folderManager.clearExclusions(into: appState)
     }
 
     func saveActiveDocument() {
@@ -40,7 +52,7 @@ final class AppController: ObservableObject {
             return
         }
 
-        guard let ref = appState.documents.first(where: { $0.id == id }) else {
+        guard let ref = appState.allDocuments.first(where: { $0.id == id }) else {
             return
         }
 

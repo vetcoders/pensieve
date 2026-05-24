@@ -21,9 +21,13 @@ enum EditorMode: Int, CaseIterable, Identifiable {
 
 @MainActor
 final class AppState: ObservableObject {
-    // Folder + document selection
+    // Workspace + document selection
     @Published var folderURL: URL?
+    @Published var workspaceRoots: [WorkspaceRoot] = []
+    @Published var workspaceTree: [WorkspaceNode] = []
     @Published var documents: [DocumentRef] = []
+    @Published var openFiles: [DocumentRef] = []
+    @Published var excludedWorkspacePaths: Set<String> = []
     @Published var selectedDocumentID: DocumentRef.ID?
 
     // Active document
@@ -45,7 +49,18 @@ final class AppState: ObservableObject {
 
     var selectedDocument: DocumentRef? {
         guard let id = selectedDocumentID else { return nil }
-        return documents.first(where: { $0.id == id })
+        return allDocuments.first(where: { $0.id == id })
+    }
+
+    var allDocuments: [DocumentRef] {
+        var seen = Set<DocumentRef.ID>()
+        return (documents + openFiles).filter { ref in
+            seen.insert(ref.id).inserted
+        }
+    }
+
+    var hasWorkspaceContent: Bool {
+        !workspaceRoots.isEmpty || !openFiles.isEmpty
     }
 
     func bumpFontSize(by delta: CGFloat) {
@@ -59,6 +74,36 @@ final class AppState: ObservableObject {
 
 struct DocumentRef: Identifiable, Hashable {
     let id: URL
+    var rootURL: URL?
+    var relativePath: String?
+    var isAdHoc: Bool = false
+
     var url: URL { id }
     var title: String { url.deletingPathExtension().lastPathComponent }
+    var displayPath: String {
+        relativePath ?? url.lastPathComponent
+    }
+}
+
+struct WorkspaceRoot: Identifiable, Hashable {
+    let id: URL
+    var url: URL { id }
+    var name: String { url.lastPathComponent }
+}
+
+struct WorkspaceNode: Identifiable, Hashable {
+    enum Kind: String {
+        case folder
+        case document
+    }
+
+    let id: String
+    var name: String
+    var kind: Kind
+    var url: URL?
+    var children: [WorkspaceNode]?
+
+    var documentID: DocumentRef.ID? {
+        kind == .document ? url : nil
+    }
 }

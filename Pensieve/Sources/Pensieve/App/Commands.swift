@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PensieveCommands: Commands {
     @ObservedObject var appState: AppState
@@ -7,10 +8,27 @@ struct PensieveCommands: Commands {
     var body: some Commands {
         // File menu
         CommandGroup(replacing: .newItem) {
+            Button("Open File…") {
+                openFile()
+            }
+            .keyboardShortcut("o", modifiers: [.command])
+
             Button("Open Folder…") {
                 openFolder()
             }
             .keyboardShortcut("o", modifiers: [.command, .shift])
+
+            Divider()
+
+            Button("Exclude from Workspace…") {
+                excludeFromWorkspace()
+            }
+            .disabled(appState.workspaceRoots.isEmpty)
+
+            Button("Clear Workspace Exclusions") {
+                controller.clearWorkspaceExclusions()
+            }
+            .disabled(appState.excludedWorkspacePaths.isEmpty)
 
             Divider()
 
@@ -62,6 +80,21 @@ struct PensieveCommands: Commands {
         }
     }
 
+    private func openFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "md"),
+            UTType(filenameExtension: "markdown")
+        ].compactMap { $0 }
+        panel.prompt = "Open"
+        if panel.runModal() == .OK, let url = panel.url {
+            controller.openFile(url: url)
+        }
+    }
+
     private func openFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -70,6 +103,18 @@ struct PensieveCommands: Commands {
         panel.prompt = "Open"
         if panel.runModal() == .OK, let url = panel.url {
             controller.openFolder(url: url)
+        }
+    }
+
+    private func excludeFromWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Exclude"
+        panel.message = "Choose folders or files inside the current workspace to exclude from import."
+        if panel.runModal() == .OK {
+            controller.excludeFromWorkspace(urls: panel.urls)
         }
     }
 }

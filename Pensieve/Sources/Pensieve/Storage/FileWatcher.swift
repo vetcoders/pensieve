@@ -14,7 +14,7 @@ final class FileWatcher {
     }
 
     private let queue = DispatchQueue(label: "io.vetcoders.pensieve.file-watcher", qos: .utility)
-    private var source: (any DispatchSourceFileSystemObject)?
+    private var sources: [any DispatchSourceFileSystemObject] = []
     private var pendingChange: DispatchWorkItem?
 
     deinit {
@@ -22,39 +22,51 @@ final class FileWatcher {
     }
 
     func start(watching url: URL, onChange: @escaping @Sendable () -> Void) throws {
+        try start(watching: [url], onChange: onChange)
+    }
+
+    func start(watching urls: [URL], onChange: @escaping @Sendable () -> Void) throws {
         stop()
 
-        let fileDescriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            return Darwin.open(path, O_EVTONLY)
+        do {
+            sources = try urls.map { url in
+                let fileDescriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+                    guard let path else { return -1 }
+                    return Darwin.open(path, O_EVTONLY)
+                }
+
+                guard fileDescriptor >= 0 else {
+                    throw WatchError.cannotOpen(url)
+                }
+
+                let source = DispatchSource.makeFileSystemObjectSource(
+                    fileDescriptor: fileDescriptor,
+                    eventMask: [.write, .delete, .rename, .attrib, .extend],
+                    queue: queue
+                )
+
+                source.setEventHandler { [weak self] in
+                    self?.debounce(onChange)
+                }
+                source.setCancelHandler {
+                    Darwin.close(fileDescriptor)
+                }
+
+                return source
+            }
+        } catch {
+            stop()
+            throw error
         }
 
-        guard fileDescriptor >= 0 else {
-            throw WatchError.cannotOpen(url)
-        }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileDescriptor,
-            eventMask: [.write, .delete, .rename, .attrib, .extend],
-            queue: queue
-        )
-
-        source.setEventHandler { [weak self] in
-            self?.debounce(onChange)
-        }
-        source.setCancelHandler {
-            Darwin.close(fileDescriptor)
-        }
-
-        self.source = source
-        source.resume()
+        sources.forEach { $0.resume() }
     }
 
     func stop() {
         pendingChange?.cancel()
         pendingChange = nil
-        source?.cancel()
-        source = nil
+        sources.forEach { $0.cancel() }
+        sources.removeAll()
     }
 
     private func debounce(_ onChange: @escaping @Sendable () -> Void) {
