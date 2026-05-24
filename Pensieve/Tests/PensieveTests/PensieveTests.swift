@@ -340,6 +340,141 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkspaceSearchIndexesBodyTextAndSnippet() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveSearchBodyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("ordinary-title.md")
+        try """
+        # Ordinary Title
+
+        The hidden phrase is crystal harmonics inside the body.
+        """.write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let ref = DocumentRef(id: noteURL.standardizedFileURL, rootURL: folder.standardizedFileURL, relativePath: "ordinary-title.md")
+        indexDatabase.reindex(documents: [ref], appState: appState)
+
+        let results = indexDatabase.search(query: "crystal harmonics", documents: [ref], appState: appState)
+
+        XCTAssertEqual(results.map(\.document.id), [noteURL.standardizedFileURL])
+        XCTAssertEqual(results.first?.matchKind, .body)
+        XCTAssertTrue(results.first?.snippet?.contains("crystal harmonics") == true)
+    }
+
+    @MainActor
+    func testWorkspaceSearchDropsExcludedPathsAfterReindex() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveSearchExclusionTests-\(UUID().uuidString)", isDirectory: true)
+        let drafts = folder.appendingPathComponent("Drafts", isDirectory: true)
+        try FileManager.default.createDirectory(at: drafts, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        try "public notes".write(to: folder.appendingPathComponent("keep.md"), atomically: true, encoding: .utf8)
+        let skipURL = drafts.appendingPathComponent("skip.md")
+        try "private nebula keyword".write(to: skipURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let manager = FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase)
+        let controller = AppController(
+            appState: appState,
+            folderManager: manager,
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.updateWorkspaceSearch(query: "nebula")
+        XCTAssertEqual(appState.workspaceSearchResults.map(\.document.id), [skipURL.standardizedFileURL])
+
+        controller.excludeFromWorkspace(urls: [drafts])
+
+        XCTAssertFalse(appState.documents.contains { $0.url == skipURL.standardizedFileURL })
+        XCTAssertTrue(appState.workspaceSearchResults.isEmpty)
+    }
+
+    @MainActor
+    func testSearchResultSelectionLoadsDocumentThroughController() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveSearchSelectionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha body".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta contains selection-token".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.updateWorkspaceSearch(query: "selection-token")
+        let result = try XCTUnwrap(appState.workspaceSearchResults.first)
+
+        controller.selectSearchResult(result)
+
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), betaURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.activeDocumentText, "beta contains selection-token")
+    }
+
+    @MainActor
+    func testSearchIndexUpdatesAfterSaveAndRefresh() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveSearchRefreshTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha original".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta original".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let manager = FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase)
+        let controller = AppController(
+            appState: appState,
+            folderManager: manager,
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+        appState.activeDocumentText = "alpha saved search-token"
+        appState.activeDocumentDirty = true
+        controller.saveActiveDocument()
+
+        controller.updateWorkspaceSearch(query: "search-token")
+        XCTAssertEqual(appState.workspaceSearchResults.map(\.document.id), [alphaURL.standardizedFileURL])
+
+        try "beta externally refreshed-token".write(to: betaURL, atomically: true, encoding: .utf8)
+        manager.refresh(into: appState)
+        controller.updateWorkspaceSearch(query: "refreshed-token")
+
+        XCTAssertEqual(appState.workspaceSearchResults.map(\.document.id), [betaURL.standardizedFileURL])
+    }
+
+    @MainActor
     func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
         let appState = AppState()
 
@@ -376,5 +511,10 @@ final class PensieveSmokeTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveMetadataTests-\(UUID().uuidString)", isDirectory: true)
         return WorkspaceMetadataStore(metadataURL: folder.appendingPathComponent("workspace.json", isDirectory: false))
+    }
+
+    @MainActor
+    private func temporaryIndexDatabase(in folder: URL) -> IndexDatabase {
+        IndexDatabase(databaseURL: folder.appendingPathComponent("index.db", isDirectory: false))
     }
 }

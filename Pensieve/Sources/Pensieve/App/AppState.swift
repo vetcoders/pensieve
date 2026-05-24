@@ -29,6 +29,8 @@ final class AppState: ObservableObject {
     @Published var openFiles: [DocumentRef] = []
     @Published var excludedWorkspacePaths: Set<String> = []
     @Published var selectedDocumentID: DocumentRef.ID?
+    @Published var workspaceSearchQuery: String = ""
+    @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
 
     // Active document
     @Published var activeDocumentURL: URL?
@@ -61,6 +63,10 @@ final class AppState: ObservableObject {
 
     var hasWorkspaceContent: Bool {
         !workspaceRoots.isEmpty || !openFiles.isEmpty
+    }
+
+    var isSearchingWorkspace: Bool {
+        !workspaceSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func bumpFontSize(by delta: CGFloat) {

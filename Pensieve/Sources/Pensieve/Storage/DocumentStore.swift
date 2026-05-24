@@ -5,9 +5,11 @@ final class FolderManager {
     static let shared = FolderManager()
     private let watcher = FileWatcher()
     private let metadataStore: WorkspaceMetadataStore
+    private let indexDatabase: IndexDatabase
 
-    init(metadataStore: WorkspaceMetadataStore = .shared) {
+    init(metadataStore: WorkspaceMetadataStore = .shared, indexDatabase: IndexDatabase? = nil) {
         self.metadataStore = metadataStore
+        self.indexDatabase = indexDatabase ?? .shared
     }
 
     func open(url: URL, into appState: AppState) {
@@ -98,7 +100,7 @@ final class FolderManager {
     }
 
     private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
-        IndexDatabase.shared.open(into: appState)
+        indexDatabase.open(into: appState)
         let previousSelection = appState.selectedDocumentID
         let metadata = metadataStore.load()
         appState.excludedWorkspacePaths = Set(metadata.excludedPaths)
@@ -134,6 +136,8 @@ final class FolderManager {
 
         let workspaceIDs = Set(appState.documents.map(\.id))
         appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
+
+        indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
     }
 
     private func scan(folder url: URL, exclusions: Set<String>) -> WorkspaceScan {
@@ -313,10 +317,14 @@ private struct WorkspaceScan {
 @MainActor
 final class DocumentStore {
     static let shared = DocumentStore()
-    private let autosaver = Autosaver.shared
+    private let autosaver: Autosaver
+    private let indexDatabase: IndexDatabase
     private weak var appState: AppState?
 
-    private init() {}
+    init(autosaver: Autosaver? = nil, indexDatabase: IndexDatabase? = nil) {
+        self.autosaver = autosaver ?? .shared
+        self.indexDatabase = indexDatabase ?? .shared
+    }
 
     func load(ref: DocumentRef, into appState: AppState) {
         self.appState = appState
@@ -379,6 +387,9 @@ final class DocumentStore {
             appState.activeDocumentURL = url
             appState.activeDocumentDirty = false
             appState.lastError = nil
+            if let ref = documentRef(for: url, appState: appState) {
+                indexDatabase.index(document: ref, body: appState.activeDocumentText, appState: appState)
+            }
         } catch {
             let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
             appState.lastError = message
@@ -400,5 +411,13 @@ final class DocumentStore {
             guard let appState else { return }
             self?.save(appState: appState)
         }
+    }
+
+    private func documentRef(for url: URL, appState: AppState) -> DocumentRef? {
+        let standardizedURL = url.standardizedFileURL
+        if let existing = appState.allDocuments.first(where: { $0.url.standardizedFileURL == standardizedURL }) {
+            return existing
+        }
+        return DocumentRef(id: standardizedURL, isAdHoc: appState.workspaceRoots.isEmpty)
     }
 }

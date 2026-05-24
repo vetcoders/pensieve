@@ -7,19 +7,27 @@ final class AppController: ObservableObject {
     private let appState: AppState
     private let folderManager: FolderManager
     private let documentStore: DocumentStore
+    private let indexDatabase: IndexDatabase
 
     convenience init(appState: AppState) {
         self.init(
             appState: appState,
             folderManager: FolderManager.shared,
-            documentStore: DocumentStore.shared
+            documentStore: DocumentStore.shared,
+            indexDatabase: IndexDatabase.shared
         )
     }
 
-    init(appState: AppState, folderManager: FolderManager, documentStore: DocumentStore) {
+    init(
+        appState: AppState,
+        folderManager: FolderManager,
+        documentStore: DocumentStore,
+        indexDatabase: IndexDatabase? = nil
+    ) {
         self.appState = appState
         self.folderManager = folderManager
         self.documentStore = documentStore
+        self.indexDatabase = indexDatabase ?? .shared
     }
 
     func openFolder(url: URL) {
@@ -57,6 +65,15 @@ final class AppController: ObservableObject {
         }
 
         _ = documentStore.select(ref: ref, into: appState)
+    }
+
+    func selectSearchResult(_ result: WorkspaceSearchResult) {
+        selectDocument(id: result.document.id)
+    }
+
+    func updateWorkspaceSearch(query: String) {
+        appState.workspaceSearchQuery = query
+        indexDatabase.refreshSearchResults(in: appState)
     }
 
     func setMode(_ mode: EditorMode) {
