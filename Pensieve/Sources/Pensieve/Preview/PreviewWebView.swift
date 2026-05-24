@@ -116,10 +116,17 @@ final class PreviewWebView: NSView {
           color: var(--vc-preview-text) !important;
         }
 
+        html {
+          overflow-x: hidden;
+        }
+
         body {
           font-size: var(--vc-font-size);
-          padding: 24px;
+          margin: 0 !important;
+          padding: clamp(12px, 3vw, 28px) !important;
           box-sizing: border-box;
+          overflow-wrap: anywhere;
+          word-wrap: break-word;
         }
 
         .markdown-body {
@@ -128,6 +135,19 @@ final class PreviewWebView: NSView {
           color: var(--vc-preview-text) !important;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
           line-height: 1.65;
+          overflow-wrap: anywhere;
+          word-wrap: break-word;
+        }
+
+        .markdown-body h1,
+        .markdown-body h2,
+        .markdown-body h3,
+        .markdown-body h4,
+        .markdown-body h5,
+        .markdown-body h6 {
+          overflow-wrap: anywhere;
+          word-wrap: break-word;
+          hyphens: auto;
         }
 
         .markdown-body h1,
@@ -157,13 +177,44 @@ final class PreviewWebView: NSView {
 
         .markdown-body a {
           color: var(--vc-preview-link) !important;
+          overflow-wrap: anywhere;
+          word-break: break-word;
         }
 
         .markdown-body code,
-        .markdown-body tt,
+        .markdown-body tt {
+          background: var(--vc-preview-code-bg) !important;
+          color: var(--vc-preview-text) !important;
+          white-space: normal !important;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+        }
+
         .markdown-body pre {
           background: var(--vc-preview-code-bg) !important;
           color: var(--vc-preview-text) !important;
+          max-width: 100%;
+          overflow-x: auto;
+        }
+
+        .markdown-body pre code,
+        .markdown-body pre tt {
+          white-space: pre !important;
+          overflow-wrap: normal;
+          word-break: normal;
+        }
+
+        .markdown-body img {
+          max-width: 100%;
+          height: auto;
+        }
+
+        .markdown-body table {
+          display: block;
+          width: 100%;
+          max-width: 100%;
+          overflow-x: auto;
+          border-collapse: collapse;
         }
 
         .markdown-body table tr {
@@ -172,6 +223,12 @@ final class PreviewWebView: NSView {
 
         .markdown-body table tr:nth-child(2n) {
           background: var(--vc-preview-row-alt) !important;
+        }
+
+        .markdown-body table th,
+        .markdown-body table td {
+          overflow-wrap: anywhere;
+          word-break: break-word;
         }
 
         .markdown-body mark {

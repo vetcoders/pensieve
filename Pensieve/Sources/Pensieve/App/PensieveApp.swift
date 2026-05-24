@@ -16,7 +16,7 @@ struct PensieveApp: App {
             ContentView()
                 .environmentObject(appState)
                 .environmentObject(controller)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 720, minHeight: 480)
                 .task {
                     IndexDatabase.shared.open(into: appState)
                     controller.restoreLastFolder()
@@ -24,6 +24,8 @@ struct PensieveApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: true))
+        .defaultSize(width: 1180, height: 760)
+        .windowResizability(.contentMinSize)
         .commands {
             PensieveCommands(appState: appState, controller: controller)
         }
