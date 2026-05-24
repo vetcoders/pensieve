@@ -65,17 +65,14 @@ struct SidebarView: View {
     }
 
     private var explorer: some View {
-        List(selection: documentSelection) {
+        List {
             if !appState.openFiles.isEmpty {
                 Section("Open Files") {
                     ForEach(appState.openFiles) { doc in
-                        Button {
+                        documentRow(doc)
+                            .simultaneousGesture(TapGesture().onEnded {
                             controller.selectDocument(id: doc.id)
-                        } label: {
-                            documentRow(doc)
-                        }
-                        .buttonStyle(.plain)
-                            .tag(doc.id as DocumentRef.ID?)
+                            })
                     }
                 }
             }
@@ -84,13 +81,10 @@ struct SidebarView: View {
                 Section("Workspace") {
                     OutlineGroup(appState.workspaceTree, children: \.children) { node in
                         if node.kind == .document {
-                            Button {
+                            nodeRow(node)
+                                .simultaneousGesture(TapGesture().onEnded {
                                 controller.selectWorkspaceNode(node)
-                            } label: {
-                                nodeRow(node)
-                            }
-                            .buttonStyle(.plain)
-                            .tag(node.documentID)
+                                })
                         } else {
                             nodeRow(node)
                         }
@@ -102,7 +96,7 @@ struct SidebarView: View {
     }
 
     private var searchResults: some View {
-        List(selection: documentSelection) {
+        List {
             let workspaceResults = appState.workspaceSearchResults.filter { !$0.isAdHoc }
             let openFileResults = appState.workspaceSearchResults.filter(\.isAdHoc)
 
@@ -114,13 +108,10 @@ struct SidebarView: View {
             if !workspaceResults.isEmpty {
                 Section("Workspace Results") {
                     ForEach(workspaceResults) { result in
-                        Button {
+                        searchResultRow(result)
+                            .simultaneousGesture(TapGesture().onEnded {
                             controller.selectSearchResult(result)
-                        } label: {
-                            searchResultRow(result)
-                        }
-                        .buttonStyle(.plain)
-                            .tag(result.document.id as DocumentRef.ID?)
+                            })
                     }
                 }
             }
@@ -128,13 +119,10 @@ struct SidebarView: View {
             if !openFileResults.isEmpty {
                 Section("Open Files") {
                     ForEach(openFileResults) { result in
-                        Button {
+                        searchResultRow(result)
+                            .simultaneousGesture(TapGesture().onEnded {
                             controller.selectSearchResult(result)
-                        } label: {
-                            searchResultRow(result)
-                        }
-                        .buttonStyle(.plain)
-                            .tag(result.document.id as DocumentRef.ID?)
+                            })
                     }
                 }
             }
@@ -150,6 +138,7 @@ struct SidebarView: View {
                 .lineLimit(1)
         }
         .help(doc.displayPath)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 
@@ -161,16 +150,8 @@ struct SidebarView: View {
                 .lineLimit(1)
         }
         .help(node.url?.path ?? node.name)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-    }
-
-    private var documentSelection: Binding<DocumentRef.ID?> {
-        Binding(
-            get: { appState.selectedDocumentID },
-            set: { newID in
-                controller.selectDocument(id: newID)
-            }
-        )
     }
 
     private var searchText: Binding<String> {
@@ -205,6 +186,7 @@ struct SidebarView: View {
         }
         .padding(.vertical, 2)
         .help(result.displayPath)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 }
