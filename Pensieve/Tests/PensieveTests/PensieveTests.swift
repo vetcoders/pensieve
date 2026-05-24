@@ -435,6 +435,38 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkspaceExplorerNodeSelectionLoadsDocumentThroughController() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveExplorerSelectionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("clickable.md")
+        try "click me".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        let root = try XCTUnwrap(appState.workspaceTree.first)
+        let node = try XCTUnwrap(root.children?.first(where: { $0.documentID == noteURL.standardizedFileURL }))
+        controller.selectDocument(id: nil)
+
+        controller.selectWorkspaceNode(node)
+
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.activeDocumentText, "click me")
+    }
+
+    @MainActor
     func testSearchIndexUpdatesAfterSaveAndRefresh() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveSearchRefreshTests-\(UUID().uuidString)", isDirectory: true)

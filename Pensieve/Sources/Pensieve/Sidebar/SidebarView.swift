@@ -69,7 +69,12 @@ struct SidebarView: View {
             if !appState.openFiles.isEmpty {
                 Section("Open Files") {
                     ForEach(appState.openFiles) { doc in
-                        documentRow(doc)
+                        Button {
+                            controller.selectDocument(id: doc.id)
+                        } label: {
+                            documentRow(doc)
+                        }
+                        .buttonStyle(.plain)
                             .tag(doc.id as DocumentRef.ID?)
                     }
                 }
@@ -78,8 +83,17 @@ struct SidebarView: View {
             if !appState.workspaceTree.isEmpty {
                 Section("Workspace") {
                     OutlineGroup(appState.workspaceTree, children: \.children) { node in
-                        nodeRow(node)
+                        if node.kind == .document {
+                            Button {
+                                controller.selectWorkspaceNode(node)
+                            } label: {
+                                nodeRow(node)
+                            }
+                            .buttonStyle(.plain)
                             .tag(node.documentID)
+                        } else {
+                            nodeRow(node)
+                        }
                     }
                 }
             }
@@ -100,7 +114,12 @@ struct SidebarView: View {
             if !workspaceResults.isEmpty {
                 Section("Workspace Results") {
                     ForEach(workspaceResults) { result in
-                        searchResultRow(result)
+                        Button {
+                            controller.selectSearchResult(result)
+                        } label: {
+                            searchResultRow(result)
+                        }
+                        .buttonStyle(.plain)
                             .tag(result.document.id as DocumentRef.ID?)
                     }
                 }
@@ -109,7 +128,12 @@ struct SidebarView: View {
             if !openFileResults.isEmpty {
                 Section("Open Files") {
                     ForEach(openFileResults) { result in
-                        searchResultRow(result)
+                        Button {
+                            controller.selectSearchResult(result)
+                        } label: {
+                            searchResultRow(result)
+                        }
+                        .buttonStyle(.plain)
                             .tag(result.document.id as DocumentRef.ID?)
                     }
                 }
@@ -126,6 +150,7 @@ struct SidebarView: View {
                 .lineLimit(1)
         }
         .help(doc.displayPath)
+        .contentShape(Rectangle())
     }
 
     private func nodeRow(_ node: WorkspaceNode) -> some View {
@@ -136,6 +161,7 @@ struct SidebarView: View {
                 .lineLimit(1)
         }
         .help(node.url?.path ?? node.name)
+        .contentShape(Rectangle())
     }
 
     private var documentSelection: Binding<DocumentRef.ID?> {
@@ -179,5 +205,6 @@ struct SidebarView: View {
         }
         .padding(.vertical, 2)
         .help(result.displayPath)
+        .contentShape(Rectangle())
     }
 }

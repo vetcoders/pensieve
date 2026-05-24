@@ -71,6 +71,11 @@ final class AppController: ObservableObject {
         selectDocument(id: result.document.id)
     }
 
+    func selectWorkspaceNode(_ node: WorkspaceNode) {
+        guard let documentID = node.documentID else { return }
+        selectDocument(id: documentID)
+    }
+
     func updateWorkspaceSearch(query: String) {
         appState.workspaceSearchQuery = query
         indexDatabase.refreshSearchResults(in: appState)
