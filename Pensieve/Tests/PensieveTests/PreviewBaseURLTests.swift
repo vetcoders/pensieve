@@ -11,9 +11,10 @@ final class PreviewBaseURLTests: XCTestCase {
         )
     }
 
-    func testNilDocumentFallsBackToModuleBundle() {
+    func testNilDocumentFallsBackToPreviewResourceLocation() {
         let base = PreviewRepresentable.resolveBaseURL(for: nil)
-        XCTAssertEqual(base, Bundle.module.resourceURL)
+        XCTAssertNotNil(base)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: base?.path ?? ""))
     }
 
     func testNestedDocumentFolderIsPreserved() {

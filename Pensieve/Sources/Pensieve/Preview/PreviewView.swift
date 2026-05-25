@@ -49,13 +49,14 @@ struct PreviewRepresentable: NSViewRepresentable {
 
   /// Base URL for relative resource resolution inside the preview WebView.
   /// File-first markdown: relative images/links belong to the note's folder.
-  /// Falls back to the module bundle so a fresh app (no document loaded) is
-  /// still well-defined.
+  /// Falls back to the preview resource bundle so a fresh app (no document
+  /// loaded) is still well-defined without invoking SwiftPM's crash-prone
+  /// `Bundle.module` accessor in packaged apps.
   static func resolveBaseURL(for documentURL: URL?) -> URL? {
     if let documentURL {
       return documentURL.deletingLastPathComponent()
     }
-    return Bundle.module.resourceURL
+    return PreviewResourceLocator.fallbackBaseURL()
   }
 
   func makeCoordinator() -> Coordinator {
