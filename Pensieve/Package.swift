@@ -26,6 +26,7 @@ let package = Package(
                 .process("Resources/Assets.xcassets"),
                 .copy("Resources/markdown.css"),
                 .copy("Resources/gfm.css"),
+                .copy("Resources/mermaid.min.js"),
                 .copy("Resources/sample.md")
             ]
         ),

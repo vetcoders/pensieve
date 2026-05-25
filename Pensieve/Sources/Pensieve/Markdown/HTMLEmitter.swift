@@ -44,6 +44,10 @@ struct HTMLEmitter: MarkupVisitor {
   mutating func visitCodeBlock(_ codeBlock: CodeBlock) -> String {
     let language = (codeBlock.language ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let escaped = Self.escapeText(codeBlock.code)
+    if language.caseInsensitiveCompare("mermaid") == .orderedSame {
+      let anchor = nextAnchorAttr()
+      return "<div class=\"mermaid\"\(anchor) data-vc-mermaid=\"true\">\(escaped)</div>"
+    }
     let classAttr = language.isEmpty ? "" : " class=\"language-\(Self.escapeAttribute(language))\""
     let anchor = nextAnchorAttr()
     return "<pre\(anchor)><code\(classAttr)>\(escaped)</code></pre>"

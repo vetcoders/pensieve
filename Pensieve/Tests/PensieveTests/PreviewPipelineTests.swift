@@ -44,8 +44,30 @@ final class PreviewPipelineTests: XCTestCase {
 
     // Viewport bridge script is embedded so block-level scroll sync stays wired.
     XCTAssertTrue(document.html.contains("window.__vcScrollToBlock"))
+    XCTAssertFalse(document.html.contains("window.mermaid"))
 
     XCTAssertEqual(document.baseURL?.path, URL(fileURLWithPath: "/tmp").path)
+  }
+
+  func testMakeDocumentIncludesMermaidRuntimeOnlyWhenProvided() {
+    let withoutMermaid = PreviewDocument.make(
+      body: "<p data-vc-block=\"0\">hello</p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertFalse(withoutMermaid.html.contains("mermaid.run"))
+
+    let withMermaid = PreviewDocument.make(
+      body: "<div class=\"mermaid\" data-vc-block=\"0\">graph TD\nA--&gt;B</div>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      mermaidJavaScript: "window.mermaid = { initialize() {}, parse() {}, run() {} };"
+    )
+    XCTAssertTrue(withMermaid.html.contains("window.mermaid ="))
+    XCTAssertTrue(withMermaid.html.contains("mermaid.run"))
+    XCTAssertTrue(withMermaid.html.contains("suppressErrors: true"))
   }
 
   func testMakeDocumentEscapesEmbeddedStyleClose() {
@@ -59,6 +81,18 @@ final class PreviewPipelineTests: XCTestCase {
     )
     XCTAssertFalse(document.html.contains("</style><script>alert('x')</script>"))
     XCTAssertTrue(document.html.contains("<\\/style>"))
+  }
+
+  func testMakeDocumentEscapesEmbeddedScriptCloseInMermaidRuntime() {
+    let document = PreviewDocument.make(
+      body: "<div class=\"mermaid\">graph TD\nA--&gt;B</div>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      mermaidJavaScript: "window.example = '</script>';"
+    )
+    XCTAssertFalse(document.html.contains("'</script>'"))
+    XCTAssertTrue(document.html.contains("'<\\/script>'"))
   }
 
   // MARK: - Pipeline scheduling
@@ -135,6 +169,26 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("<h1 data-vc-block=\"0\">Heading</h1>"))
     XCTAssertTrue(document.html.contains("<p data-vc-block=\"1\">Body.</p>"))
     XCTAssertTrue(document.html.contains("--vc-font-size: 16px"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentLoadsBundledMermaidForMermaidFence() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let request = PreviewRenderRequest(
+      markdown: "```mermaid\ngraph TD\nA-->B\n```",
+      fontSize: 16,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    let document = pipeline.makeDocument(for: request)
+
+    XCTAssertTrue(document.html.contains("<div class=\"mermaid\""), document.html)
+    XCTAssertTrue(document.html.contains("Mermaid v11.15.0"), "bundled runtime missing")
+    XCTAssertTrue(document.html.contains("window.mermaid.initialize"))
+    XCTAssertTrue(document.html.contains("mermaid.run"))
+    XCTAssertFalse(document.html.contains("cdn.jsdelivr"))
+    XCTAssertFalse(document.html.contains("unpkg.com"))
   }
 
   @MainActor

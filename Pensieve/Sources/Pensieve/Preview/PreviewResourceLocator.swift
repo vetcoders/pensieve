@@ -9,14 +9,14 @@ enum PreviewResourceLocator {
   static func css(named name: String, candidateDirectories: [URL] = defaultCandidateDirectories())
     -> String?
   {
-    let fileName = "\(name).css"
-    for directory in candidateDirectories {
-      let url = directory.appendingPathComponent(fileName)
-      if let css = readUTF8File(at: url) {
-        return css
-      }
-    }
-    return nil
+    resource(named: name, extension: "css", candidateDirectories: candidateDirectories)
+  }
+
+  static func javascript(
+    named name: String,
+    candidateDirectories: [URL] = defaultCandidateDirectories()
+  ) -> String? {
+    resource(named: name, extension: "js", candidateDirectories: candidateDirectories)
   }
 
   static func fallbackBaseURL(candidateDirectories: [URL] = defaultCandidateDirectories()) -> URL? {
@@ -51,6 +51,21 @@ enum PreviewResourceLocator {
   private static func readUTF8File(at url: URL) -> String? {
     guard let data = try? Data(contentsOf: url) else { return nil }
     return String(data: data, encoding: .utf8)
+  }
+
+  private static func resource(
+    named name: String,
+    extension fileExtension: String,
+    candidateDirectories: [URL]
+  ) -> String? {
+    let fileName = "\(name).\(fileExtension)"
+    for directory in candidateDirectories {
+      let url = directory.appendingPathComponent(fileName)
+      if let contents = readUTF8File(at: url) {
+        return contents
+      }
+    }
+    return nil
   }
 
   private static func uniqueDirectories(_ directories: [URL]) -> [URL] {

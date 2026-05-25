@@ -96,6 +96,9 @@ final class PreviewWebView: NSView {
       --vc-preview-row-alt: #f6f8fa;
       --vc-preview-mark-bg: #fff8c5;
       --vc-preview-mark-text: #24292f;
+      --vc-preview-diagram-bg: #ffffff;
+      --vc-preview-diagram-error-bg: #fff1f1;
+      --vc-preview-diagram-error-text: #8c1d18;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -108,6 +111,9 @@ final class PreviewWebView: NSView {
         --vc-preview-row-alt: #242428;
         --vc-preview-mark-bg: #4a3f16;
         --vc-preview-mark-text: #fff3b0;
+        --vc-preview-diagram-bg: #18181b;
+        --vc-preview-diagram-error-bg: #3f1d1d;
+        --vc-preview-diagram-error-text: #fecaca;
       }
     }
 
@@ -236,6 +242,48 @@ final class PreviewWebView: NSView {
       background: var(--vc-preview-mark-bg) !important;
       color: var(--vc-preview-mark-text) !important;
     }
+
+    /* Mermaid preview support added by pensieve-mermaid-preview-20260525. */
+    .markdown-body .mermaid {
+      background: var(--vc-preview-diagram-bg);
+      border: 1px solid var(--vc-preview-border);
+      border-radius: 6px;
+      box-sizing: border-box;
+      color: var(--vc-preview-text);
+      margin: 1rem 0;
+      max-width: 100%;
+      overflow-x: auto;
+      padding: 1rem;
+      text-align: center;
+    }
+
+    .markdown-body .mermaid svg {
+      background: transparent !important;
+      height: auto;
+      max-width: 100%;
+    }
+
+    .markdown-body .mermaid .label,
+    .markdown-body .mermaid .nodeLabel,
+    .markdown-body .mermaid .edgeLabel,
+    .markdown-body .mermaid text {
+      color: var(--vc-preview-text) !important;
+      fill: var(--vc-preview-text) !important;
+    }
+
+    .markdown-body .mermaid .edgePath .path,
+    .markdown-body .mermaid .flowchart-link,
+    .markdown-body .mermaid .relationshipLine {
+      stroke: var(--vc-preview-muted) !important;
+    }
+
+    .markdown-body .mermaid.vc-mermaid-error {
+      background: var(--vc-preview-diagram-error-bg);
+      color: var(--vc-preview-diagram-error-text) !important;
+      font-family: "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono";
+      text-align: left;
+      white-space: pre-wrap;
+    }
     """
   }
 
@@ -307,6 +355,89 @@ final class PreviewWebView: NSView {
           report();
         });
       }, {passive: true});
+    })();
+    """
+
+  static let mermaidBootstrapScript: String = """
+    (function() {
+      const diagrams = Array.from(document.querySelectorAll('.mermaid'));
+      if (!diagrams.length) return;
+
+      function markFailed(el, message) {
+        el.classList.add('vc-mermaid-error');
+        el.setAttribute('role', 'img');
+        el.setAttribute('aria-label', 'Invalid Mermaid diagram');
+        el.setAttribute('data-vc-mermaid-error', String(message || 'Invalid Mermaid diagram'));
+      }
+
+      if (!window.mermaid) {
+        diagrams.forEach(function(el) {
+          markFailed(el, 'Mermaid runtime unavailable');
+        });
+        return;
+      }
+
+      const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const themeVariables = dark ? {
+        background: '#18181b',
+        primaryColor: '#27272a',
+        primaryTextColor: '#f0f0f0',
+        primaryBorderColor: '#71717a',
+        lineColor: '#a1a1aa',
+        secondaryColor: '#1f2937',
+        tertiaryColor: '#111827'
+      } : {
+        background: '#ffffff',
+        primaryColor: '#f6f8fa',
+        primaryTextColor: '#1f2328',
+        primaryBorderColor: '#8c959f',
+        lineColor: '#57606a',
+        secondaryColor: '#eef6ff',
+        tertiaryColor: '#ffffff'
+      };
+
+      try {
+        window.mermaid.parseError = function(error) {
+          console.warn('Mermaid parse error', error);
+        };
+        window.mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'strict',
+          suppressErrorRendering: true,
+          theme: 'base',
+          themeVariables: themeVariables
+        });
+
+        Promise.all(diagrams.map(function(el) {
+          const source = el.textContent || '';
+          return Promise.resolve(window.mermaid.parse(source, { suppressErrors: true }))
+            .then(function(result) {
+              if (result === false) {
+                markFailed(el, 'Invalid Mermaid diagram');
+                return null;
+              }
+              return el;
+            })
+            .catch(function(error) {
+              markFailed(el, error && error.message ? error.message : error);
+              return null;
+            });
+        })).then(function(results) {
+          const validDiagrams = results.filter(Boolean);
+          if (!validDiagrams.length) return;
+          return window.mermaid.run({ nodes: validDiagrams, suppressErrors: true });
+        }).catch(function(error) {
+          diagrams.forEach(function(el) {
+            if (!el.querySelector('svg')) {
+              markFailed(el, error && error.message ? error.message : error);
+            }
+          });
+        });
+      } catch (error) {
+        diagrams.forEach(function(el) {
+          markFailed(el, error && error.message ? error.message : error);
+        });
+      }
     })();
     """
 }

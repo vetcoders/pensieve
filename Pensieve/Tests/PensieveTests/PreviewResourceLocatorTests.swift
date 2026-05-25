@@ -15,11 +15,17 @@ final class PreviewResourceLocatorTests: XCTestCase {
     try ".markdown-body { color: rebeccapurple; }"
       .write(
         to: bundleURL.appendingPathComponent("markdown.css"), atomically: true, encoding: .utf8)
+    try "window.mermaid = {};"
+      .write(
+        to: bundleURL.appendingPathComponent("mermaid.min.js"), atomically: true, encoding: .utf8)
     defer { try? FileManager.default.removeItem(at: tempRoot) }
 
     let css = PreviewResourceLocator.css(named: "markdown", candidateDirectories: [bundleURL])
+    let javascript = PreviewResourceLocator.javascript(
+      named: "mermaid.min", candidateDirectories: [bundleURL])
 
     XCTAssertEqual(css, ".markdown-body { color: rebeccapurple; }")
+    XCTAssertEqual(javascript, "window.mermaid = {};")
   }
 
   func testProductionThemesLoadWithoutBundleModuleAccessor() {

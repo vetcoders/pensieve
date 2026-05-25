@@ -37,8 +37,22 @@ extension PreviewDocument {
   /// block; appearance CSS and the viewport bridge script come from
   /// `PreviewWebView` so the renderer-side and webview-side surfaces share
   /// one source of truth.
-  static func make(body: String, css: String, fontSize: CGFloat, baseURL: URL?) -> PreviewDocument {
+  static func make(
+    body: String,
+    css: String,
+    fontSize: CGFloat,
+    baseURL: URL?,
+    mermaidJavaScript: String? = nil
+  ) -> PreviewDocument {
     let safeCSS = css.replacingOccurrences(of: "</style>", with: "<\\/style>")
+    let mermaidScripts =
+      mermaidJavaScript.map { javascript in
+        let safeJavaScript = javascript.replacingOccurrences(of: "</script>", with: "<\\/script>")
+        return """
+          <script>\(safeJavaScript)</script>
+          <script>\(PreviewWebView.mermaidBootstrapScript)</script>
+          """
+      } ?? ""
     let html = """
       <!DOCTYPE html>
       <html><head><meta charset="utf-8">
@@ -50,6 +64,7 @@ extension PreviewDocument {
       <article class="markdown-body">
       \(body)
       </article>
+      \(mermaidScripts)
       <script>\(PreviewWebView.bridgeScript)</script>
       </body></html>
       """
@@ -149,11 +164,16 @@ final class PreviewPipeline {
   func makeDocument(for request: PreviewRenderRequest) -> PreviewDocument {
     let output = renderer.render(request.markdown)
     let css = themeManager.css(for: request.theme)
+    let mermaidJavaScript =
+      output.body.contains("class=\"mermaid\"")
+      ? PreviewResourceLocator.javascript(named: "mermaid.min")
+      : nil
     return PreviewDocument.make(
       body: output.body,
       css: css,
       fontSize: request.fontSize,
-      baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL)
+      baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL),
+      mermaidJavaScript: mermaidJavaScript
     )
   }
 

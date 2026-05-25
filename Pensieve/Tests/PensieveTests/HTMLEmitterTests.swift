@@ -38,6 +38,15 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertTrue(html.contains("</code></pre>"), html)
   }
 
+  func testMermaidFencedCodeBlockEmitsDiagramContainer() {
+    let html = render("```mermaid\ngraph TD\n  A-->B\n```")
+    XCTAssertTrue(html.contains("<div class=\"mermaid\""), html)
+    XCTAssertTrue(html.contains("data-vc-mermaid=\"true\""), html)
+    XCTAssertTrue(html.contains("graph TD"), html)
+    XCTAssertTrue(html.contains("A--&gt;B"), html)
+    XCTAssertFalse(html.contains("language-mermaid"), html)
+  }
+
   func testFencedCodeBlockNoLanguage() {
     let html = render("```\nplain\n```")
     XCTAssertTrue(html.contains("<pre"), html)
