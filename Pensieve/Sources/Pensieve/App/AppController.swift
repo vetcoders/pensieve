@@ -94,6 +94,27 @@ final class AppController: ObservableObject {
         _ = documentStore.select(ref: ref, into: appState)
     }
 
+    func closeDocumentTab(id: DocumentRef.ID) {
+        let closingActiveDocument = appState.selectedDocumentID?.standardizedFileURL == id.standardizedFileURL
+        guard !closingActiveDocument || documentStore.prepareForDocumentSwitch(appState: appState) else {
+            return
+        }
+
+        let currentTabs = appState.documentTabs
+        let closingIndex = currentTabs.firstIndex { $0.id.standardizedFileURL == id.standardizedFileURL }
+        appState.forgetDocumentTab(id: id)
+
+        guard closingActiveDocument else { return }
+
+        let remainingTabs = appState.documentTabs
+        let replacementIndex = min(closingIndex ?? remainingTabs.count, remainingTabs.count - 1)
+        if replacementIndex >= 0, remainingTabs.indices.contains(replacementIndex) {
+            _ = documentStore.select(ref: remainingTabs[replacementIndex], into: appState)
+        } else {
+            _ = documentStore.select(ref: nil, into: appState)
+        }
+    }
+
     func selectSearchResult(_ result: WorkspaceSearchResult) {
         selectDocument(id: result.document.id)
     }

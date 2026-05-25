@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
   @EnvironmentObject private var appState: AppState
@@ -10,7 +11,11 @@ struct ContentView: View {
       SidebarView()
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
-      EditorPreviewSplit()
+      VStack(spacing: 0) {
+        DocumentTabStrip()
+        Divider()
+        EditorPreviewSplit()
+      }
     }
     .navigationTitle(appState.selectedDocument?.title ?? "Pensieve")
     .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
@@ -21,6 +26,123 @@ struct ContentView: View {
         themeManager: themeManager
       )
     }
+  }
+}
+
+struct DocumentTabStrip: View {
+  @EnvironmentObject private var appState: AppState
+  @EnvironmentObject private var controller: AppController
+
+  var body: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 0) {
+        ForEach(appState.documentTabs) { tab in
+          tabButton(tab)
+        }
+
+        Button {
+          createNewFile()
+        } label: {
+          Image(systemName: "plus")
+            .font(.system(size: 13, weight: .semibold))
+            .frame(width: 34, height: 30)
+        }
+        .buttonStyle(.plain)
+        .help("New File")
+      }
+      .padding(.leading, 6)
+    }
+    .frame(height: 31)
+    .background(Color(NSColor.controlBackgroundColor))
+  }
+
+  private func tabButton(_ tab: DocumentRef) -> some View {
+    let isSelected = appState.selectedDocumentID?.standardizedFileURL == tab.id.standardizedFileURL
+    let isDirty = isSelected && appState.activeDocumentDirty
+
+    return HStack(spacing: 6) {
+      Text(isDirty ? "\(tab.title) *" : tab.title)
+        .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+        .lineLimit(1)
+        .truncationMode(.middle)
+
+      Button {
+        controller.closeDocumentTab(id: tab.id)
+      } label: {
+        Image(systemName: "xmark")
+          .font(.system(size: 9, weight: .semibold))
+          .foregroundStyle(.secondary)
+      }
+      .buttonStyle(.plain)
+      .help("Close Tab")
+    }
+    .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
+    .padding(.horizontal, 8)
+    .background(tabBackground(isSelected))
+    .overlay(alignment: .trailing) {
+      Rectangle()
+        .fill(Color(NSColor.separatorColor))
+        .frame(width: 1)
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      controller.selectDocument(id: tab.id)
+    }
+    .help(tab.displayPath)
+  }
+
+  private func tabBackground(_ isSelected: Bool) -> some View {
+    Rectangle()
+      .fill(isSelected ? Color(NSColor.windowBackgroundColor) : Color.clear)
+  }
+
+  private func createNewFile() {
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = markdownContentTypes
+    panel.canCreateDirectories = true
+    panel.directoryURL = defaultNewFileDirectory
+    panel.nameFieldStringValue = uniqueNewFileName(in: panel.directoryURL)
+    panel.prompt = "Create"
+    if panel.runModal() == .OK, let url = panel.url {
+      controller.createMarkdownFile(url: url)
+    }
+  }
+
+  private var markdownContentTypes: [UTType] {
+    [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+    ].compactMap { $0 }
+  }
+
+  private var defaultNewFileDirectory: URL? {
+    if let activeURL = appState.documentSession.url {
+      return activeURL.deletingLastPathComponent()
+    }
+    if let rootURL = appState.workspaceRoots.first?.url {
+      return rootURL
+    }
+    if let openFileURL = appState.openFiles.first?.url {
+      return openFileURL.deletingLastPathComponent()
+    }
+    return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+  }
+
+  private func uniqueNewFileName(in directory: URL?) -> String {
+    guard let directory else { return "Untitled.md" }
+
+    let fm = FileManager.default
+    let base = "Untitled"
+    let ext = "md"
+    var candidate = "\(base).\(ext)"
+    var index = 2
+
+    while fm.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
+      candidate = "\(base) \(index).\(ext)"
+      index += 1
+    }
+
+    return candidate
   }
 }
 

@@ -222,6 +222,7 @@ final class FolderManager {
 
         let workspaceIDs = Set(appState.documents.map(\.id))
         appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
+        appState.pruneDocumentTabs()
     }
 
     private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
@@ -502,6 +503,7 @@ final class DocumentStore {
             let text = try String(contentsOf: ref.url, encoding: .utf8)
             appState.selectedDocumentID = ref.id
             appState.documentSession.load(document: ref, text: text)
+            appState.rememberDocumentTab(ref)
             appState.lastError = nil
         } catch {
             appState.lastError = "Could not load \(ref.url.lastPathComponent): \(error.localizedDescription)"

@@ -27,6 +27,7 @@ final class AppState: ObservableObject {
     @Published var workspaceTree: [WorkspaceNode] = []
     @Published var documents: [DocumentRef] = []
     @Published var openFiles: [DocumentRef] = []
+    @Published var documentTabs: [DocumentRef] = []
     @Published var excludedWorkspacePaths: Set<String> = []
     @Published var selectedDocumentID: DocumentRef.ID?
     @Published var workspaceSearchQuery: String = ""
@@ -126,6 +127,23 @@ final class AppState: ObservableObject {
         let standardizedURL = url.standardizedFileURL
         return allDocuments.first { $0.url.standardizedFileURL == standardizedURL }
             ?? DocumentRef(id: standardizedURL, isAdHoc: workspaceRoots.isEmpty)
+    }
+
+    func rememberDocumentTab(_ ref: DocumentRef) {
+        documentTabs.removeAll { $0.id.standardizedFileURL == ref.id.standardizedFileURL }
+        documentTabs.append(ref)
+        if documentTabs.count > 12 {
+            documentTabs.removeFirst(documentTabs.count - 12)
+        }
+    }
+
+    func forgetDocumentTab(id: DocumentRef.ID) {
+        documentTabs.removeAll { $0.id.standardizedFileURL == id.standardizedFileURL }
+    }
+
+    func pruneDocumentTabs() {
+        let liveIDs = Set(allDocuments.map { $0.id.standardizedFileURL })
+        documentTabs.removeAll { !liveIDs.contains($0.id.standardizedFileURL) }
     }
 }
 

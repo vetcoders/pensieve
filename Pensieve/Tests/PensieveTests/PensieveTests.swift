@@ -868,6 +868,80 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testDocumentSelectionMaintainsWorkingSetTabs() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveTabsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+        controller.selectDocument(id: betaURL.standardizedFileURL)
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+
+        XCTAssertEqual(appState.documentTabs.map { $0.url.lastPathComponent }, ["beta.md", "alpha.md"])
+        XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    }
+
+    @MainActor
+    func testClosingActiveDocumentTabSelectsNeighborWithoutDroppingWorkspace() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCloseTabTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+        controller.selectDocument(id: betaURL.standardizedFileURL)
+
+        controller.closeDocumentTab(id: betaURL.standardizedFileURL)
+
+        XCTAssertEqual(appState.documentTabs.map { $0.url.lastPathComponent }, ["alpha.md"])
+        XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+        XCTAssertEqual(appState.activeDocumentText, "alpha")
+        XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
+
+        controller.closeDocumentTab(id: alphaURL.standardizedFileURL)
+
+        XCTAssertTrue(appState.documentTabs.isEmpty)
+        XCTAssertNil(appState.selectedDocumentID)
+        XCTAssertNil(appState.documentSession.document)
+        XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
+    }
+
+    @MainActor
     func testSearchIndexUpdatesAfterSaveAndRefresh() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveSearchRefreshTests-\(UUID().uuidString)", isDirectory: true)
