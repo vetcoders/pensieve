@@ -56,14 +56,30 @@ final class IndexDatabase {
 
     func reindex(documents: [DocumentRef], appState: AppState? = nil) {
         guard let queue = ensureOpen(into: appState) else { return }
+        let records = Self.searchDocumentRecords(from: documents)
 
-        let records = documents.compactMap { document -> SearchDocumentRecord? in
+        reindex(records: records, queue: queue, appState: appState)
+    }
+
+    func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async {
+        guard let queue = ensureOpen(into: appState) else { return }
+        let records = await Task.detached(priority: .utility) {
+            Self.searchDocumentRecords(from: documents)
+        }.value
+
+        reindex(records: records, queue: queue, appState: appState)
+    }
+
+    private nonisolated static func searchDocumentRecords(from documents: [DocumentRef]) -> [SearchDocumentRecord] {
+        documents.compactMap { document -> SearchDocumentRecord? in
             guard let body = try? String(contentsOf: document.url, encoding: .utf8) else {
                 return nil
             }
             return SearchDocumentRecord(document: document, body: body)
         }
+    }
 
+    private func reindex(records: [SearchDocumentRecord], queue: DatabaseQueue, appState: AppState?) {
         do {
             try queue.write { db in
                 try db.execute(sql: "DELETE FROM workspace_search_documents")
@@ -319,7 +335,7 @@ final class IndexDatabase {
     }
 }
 
-private struct SearchDocumentRecord: FetchableRecord {
+private struct SearchDocumentRecord: FetchableRecord, Sendable {
     var path: String
     var title: String
     var displayPath: String

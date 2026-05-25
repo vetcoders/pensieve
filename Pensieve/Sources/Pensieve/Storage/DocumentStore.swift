@@ -124,22 +124,84 @@ final class FolderManager {
     }
 
     private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
+        workspaceBuildTask?.cancel()
         indexDatabase.open(into: appState)
         let previousSelection = appState.selectedDocumentID
+        prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
+        rebuildWorkspace(into: appState)
+        selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
+    }
+
+    private func openResolvedWorkspaceInBackground(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
+        workspaceBuildTask?.cancel()
+        indexDatabase.open(into: appState)
+        let previousSelection = appState.selectedDocumentID
+        prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
+
+        let expectedRootPaths = appState.workspaceRoots.map { $0.url.standardizedFileURL.path }
+        let expectedOpenFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
+        let roots = appState.workspaceRoots.map(\.url)
+        let exclusions = appState.excludedWorkspacePaths
+        let workspaceBuilder = workspaceBuilder
+        let scanTask = Task.detached(priority: .userInitiated) {
+            workspaceBuilder(roots, exclusions)
+        }
+
+        workspaceBuildTask = Task { [weak self, weak appState] in
+            let scans = await scanTask.value
+            guard !Task.isCancelled, let self, let appState else { return }
+            guard self.matchesCurrentWorkspace(
+                rootPaths: expectedRootPaths,
+                openFilePaths: expectedOpenFilePaths,
+                in: appState
+            ) else {
+                return
+            }
+
+            self.applyWorkspaceScans(scans, into: appState)
+            self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+            self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
+            await self.indexDatabase.reindexInBackground(documents: appState.allDocuments, appState: appState)
+        }
+    }
+
+    private func prepareWorkspaceShell(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
         let metadata = metadataStore.load()
         appState.excludedWorkspacePaths = Set(metadata.excludedPaths)
         appState.workspaceRoots = rootURLs.map { WorkspaceRoot(id: $0.standardizedFileURL) }
         appState.folderURL = appState.workspaceRoots.first?.url
         appState.openFiles = fileURLs
-            .filter(isMarkdownFile)
+            .filter(WorkspaceScanner.isMarkdownFile)
             .map { DocumentRef(id: $0.standardizedFileURL, isAdHoc: true) }
         appState.lastError = nil
-        rebuildWorkspace(into: appState)
+    }
+
+    private func rebuildWorkspace(into appState: AppState) {
+        let scans = workspaceBuilder(appState.workspaceRoots.map(\.url), appState.excludedWorkspacePaths)
+        applyWorkspaceScans(scans, into: appState)
+        indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
+    }
+
+    private func applyWorkspaceScans(_ scans: [WorkspaceScan], into appState: AppState) {
+        appState.documents = scans.flatMap(\.documents)
+        appState.workspaceTree = scans.map(\.rootNode)
+
+        let workspaceIDs = Set(appState.documents.map(\.id))
+        appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
+    }
+
+    private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
+        let documents = appState.allDocuments
+        if let currentSelection = appState.selectedDocumentID,
+           documents.contains(where: { $0.id == currentSelection }) {
+            return
+        }
 
         if let previousSelection,
-           let ref = appState.allDocuments.first(where: { $0.id == previousSelection }) {
+           let ref = documents.first(where: { $0.id == previousSelection }) {
             DocumentStore.shared.select(ref: ref, into: appState)
-        } else if let first = appState.allDocuments.first {
+        } else if let first = documents.first {
             DocumentStore.shared.select(ref: first, into: appState)
         } else {
             appState.selectedDocumentID = nil
@@ -147,109 +209,6 @@ final class FolderManager {
             appState.activeDocumentText = ""
             appState.activeDocumentDirty = false
         }
-
-        startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-    }
-
-    private func rebuildWorkspace(into appState: AppState) {
-        let scans = appState.workspaceRoots.map {
-            scan(folder: $0.url, exclusions: appState.excludedWorkspacePaths)
-        }
-        appState.documents = scans.flatMap(\.documents)
-        appState.workspaceTree = scans.map(\.rootNode)
-
-        let workspaceIDs = Set(appState.documents.map(\.id))
-        appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
-
-        indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
-    }
-
-    private func scan(folder url: URL, exclusions: Set<String>) -> WorkspaceScan {
-        let root = url.standardizedFileURL
-        let scan = scanChildren(folder: root, root: root, exclusions: exclusions)
-        return WorkspaceScan(
-            documents: scan.documents,
-            rootNode: WorkspaceNode(
-                id: "root:\(root.path)",
-                name: root.lastPathComponent,
-                kind: .folder,
-                url: root,
-                children: scan.nodes
-            )
-        )
-    }
-
-    private func scanChildren(
-        folder url: URL,
-        root: URL,
-        exclusions: Set<String>
-    ) -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
-        let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
-            options: []
-        ) else {
-            return ([], [])
-        }
-
-        var documents: [DocumentRef] = []
-        var nodes: [WorkspaceNode] = []
-
-        let itemsWithValues = urls.compactMap { item -> (url: URL, isDir: Bool, relativePath: String, name: String)? in
-            let relativePath = self.relativePath(for: item, root: root)
-            guard self.shouldInclude(item, relativePath: relativePath, exclusions: exclusions) else {
-                return nil
-            }
-            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-            return (url: item, isDir: isDir, relativePath: relativePath, name: item.lastPathComponent)
-        }
-
-        let sortedItems = itemsWithValues.sorted { lhs, rhs in
-            if lhs.isDir, !rhs.isDir { return true }
-            if !lhs.isDir, rhs.isDir { return false }
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-        }
-
-        for data in sortedItems {
-            let item = data.url
-            let relativePath = data.relativePath
-
-            let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
-            if values?.isDirectory == true {
-                let childScan = scanChildren(folder: item, root: root, exclusions: exclusions)
-                guard !childScan.nodes.isEmpty else { continue }
-                documents.append(contentsOf: childScan.documents)
-                nodes.append(
-                    WorkspaceNode(
-                        id: "folder:\(item.standardizedFileURL.path)",
-                        name: item.lastPathComponent,
-                        kind: .folder,
-                        url: item.standardizedFileURL,
-                        children: childScan.nodes
-                    )
-                )
-            } else if values?.isRegularFile == true, isMarkdownFile(item) {
-                let ref = DocumentRef(
-                    id: item.standardizedFileURL,
-                    rootURL: root,
-                    relativePath: relativePath,
-                    isAdHoc: false
-                )
-                documents.append(ref)
-                nodes.append(
-                    WorkspaceNode(
-                        id: "document:\(item.standardizedFileURL.path)",
-                        name: item.deletingPathExtension().lastPathComponent,
-                        kind: .document,
-                        url: item.standardizedFileURL,
-                        children: nil
-                    )
-                )
-            }
-        }
-
-        return (documents, nodes)
     }
 
     private func startWatching(urls: [URL], appState: AppState) {
@@ -270,41 +229,6 @@ final class FolderManager {
         }
     }
 
-    private func isMarkdownFile(_ url: URL) -> Bool {
-        ["md", "markdown"].contains(url.pathExtension.lowercased())
-    }
-
-    private func workspaceSort(_ lhs: URL, _ rhs: URL) -> Bool {
-        let lhsValues = try? lhs.resourceValues(forKeys: [.isDirectoryKey])
-        let rhsValues = try? rhs.resourceValues(forKeys: [.isDirectoryKey])
-        if lhsValues?.isDirectory == true, rhsValues?.isDirectory != true {
-            return true
-        }
-        if lhsValues?.isDirectory != true, rhsValues?.isDirectory == true {
-            return false
-        }
-        return lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
-    }
-
-    private func shouldInclude(_ url: URL, relativePath: String, exclusions: Set<String>) -> Bool {
-        let name = url.lastPathComponent
-        if name.hasPrefix(".") || WorkspaceDefaults.excludedNames.contains(name) {
-            return false
-        }
-        return !exclusions.contains { excluded in
-            relativePath == excluded || relativePath.hasPrefix("\(excluded)/")
-        }
-    }
-
-    private func relativePath(for url: URL, root: URL) -> String {
-        let rootComponents = root.standardizedFileURL.pathComponents
-        let components = url.standardizedFileURL.pathComponents
-        guard components.count >= rootComponents.count else {
-            return url.lastPathComponent
-        }
-        return components.dropFirst(rootComponents.count).joined(separator: "/")
-    }
-
     private func relativeExcludedPath(for url: URL, roots: [URL]) -> String? {
         let standardizedURL = url.standardizedFileURL
         let matchingRoot = roots
@@ -313,8 +237,13 @@ final class FolderManager {
             .sorted { $0.path.count > $1.path.count }
             .first
         guard let matchingRoot else { return nil }
-        let path = relativePath(for: standardizedURL, root: matchingRoot)
+        let path = WorkspaceScanner.relativePath(for: standardizedURL, root: matchingRoot)
         return path.isEmpty ? nil : path
+    }
+
+    private func matchesCurrentWorkspace(rootPaths: [String], openFilePaths: [String], in appState: AppState) -> Bool {
+        appState.workspaceRoots.map { $0.url.standardizedFileURL.path } == rootPaths
+            && appState.openFiles.map { $0.url.standardizedFileURL.path } == openFilePaths
     }
 
     private func persistExcludedPaths(_ excluded: Set<String>, into appState: AppState) {
@@ -346,9 +275,151 @@ private enum WorkspaceDefaults {
     ]
 }
 
-private struct WorkspaceScan {
+struct WorkspaceScan: Sendable {
     var documents: [DocumentRef]
     var rootNode: WorkspaceNode
+}
+
+enum WorkspaceScanner {
+    typealias Builder = @Sendable (_ rootURLs: [URL], _ exclusions: Set<String>) -> [WorkspaceScan]
+
+    static func build(rootURLs: [URL], exclusions: Set<String>) -> [WorkspaceScan] {
+        rootURLs.map { scan(folder: $0, exclusions: exclusions) }
+    }
+
+    static func isMarkdownFile(_ url: URL) -> Bool {
+        ["md", "markdown"].contains(url.pathExtension.lowercased())
+    }
+
+    static func relativePath(for url: URL, root: URL) -> String {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let components = url.standardizedFileURL.pathComponents
+        guard components.count >= rootComponents.count else {
+            return url.lastPathComponent
+        }
+        return components.dropFirst(rootComponents.count).joined(separator: "/")
+    }
+
+    private static func scan(folder url: URL, exclusions: Set<String>) -> WorkspaceScan {
+        let root = url.standardizedFileURL
+        let scan = scanChildren(folder: root, root: root, exclusions: exclusions)
+        return WorkspaceScan(
+            documents: scan.documents,
+            rootNode: WorkspaceNode(
+                id: "root:\(root.path)",
+                name: root.lastPathComponent,
+                kind: .folder,
+                url: root,
+                children: scan.nodes
+            )
+        )
+    }
+
+    private static func scanChildren(
+        folder url: URL,
+        root: URL,
+        exclusions: Set<String>
+    ) -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: []
+        ) else {
+            return ([], [])
+        }
+
+        var documents: [DocumentRef] = []
+        var nodes: [WorkspaceNode] = []
+        let entries = urls.compactMap { entry(for: $0, root: root, exclusions: exclusions) }
+            .sorted(by: workspaceSort)
+
+        for entry in entries {
+            if entry.isDirectory {
+                let childScan = scanChildren(folder: entry.url, root: root, exclusions: exclusions)
+                guard !childScan.nodes.isEmpty else { continue }
+                documents.append(contentsOf: childScan.documents)
+                nodes.append(
+                    WorkspaceNode(
+                        id: "folder:\(entry.standardizedURL.path)",
+                        name: entry.name,
+                        kind: .folder,
+                        url: entry.standardizedURL,
+                        children: childScan.nodes
+                    )
+                )
+            } else if entry.isRegularFile, isMarkdownFile(entry.url) {
+                let ref = DocumentRef(
+                    id: entry.standardizedURL,
+                    rootURL: root,
+                    relativePath: entry.relativePath,
+                    isAdHoc: false
+                )
+                documents.append(ref)
+                nodes.append(
+                    WorkspaceNode(
+                        id: "document:\(entry.standardizedURL.path)",
+                        name: entry.url.deletingPathExtension().lastPathComponent,
+                        kind: .document,
+                        url: entry.standardizedURL,
+                        children: nil
+                    )
+                )
+            }
+        }
+
+        return (documents, nodes)
+    }
+
+    private static func entry(for url: URL, root: URL, exclusions: Set<String>) -> WorkspaceDirectoryEntry? {
+        let relativePath = relativePath(for: url, root: root)
+        guard shouldInclude(url, relativePath: relativePath, exclusions: exclusions) else {
+            return nil
+        }
+
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+        return WorkspaceDirectoryEntry(
+            url: url,
+            relativePath: relativePath,
+            isDirectory: values?.isDirectory == true,
+            isRegularFile: values?.isRegularFile == true
+        )
+    }
+
+    private static func workspaceSort(_ lhs: WorkspaceDirectoryEntry, _ rhs: WorkspaceDirectoryEntry) -> Bool {
+        if lhs.isDirectory, !rhs.isDirectory {
+            return true
+        }
+        if !lhs.isDirectory, rhs.isDirectory {
+            return false
+        }
+        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+    }
+
+    private static func shouldInclude(_ url: URL, relativePath: String, exclusions: Set<String>) -> Bool {
+        let name = url.lastPathComponent
+        if name.hasPrefix(".") || WorkspaceDefaults.excludedNames.contains(name) {
+            return false
+        }
+        return !exclusions.contains { excluded in
+            relativePath == excluded || relativePath.hasPrefix("\(excluded)/")
+        }
+    }
+}
+
+private struct WorkspaceDirectoryEntry: Sendable {
+    var url: URL
+    var relativePath: String
+    var isDirectory: Bool
+    var isRegularFile: Bool
+
+    var standardizedURL: URL {
+        url.standardizedFileURL
+    }
+
+    var name: String {
+        url.lastPathComponent
+    }
 }
 
 @MainActor

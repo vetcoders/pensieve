@@ -162,6 +162,89 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkspaceScannerSortsFoldersBeforeDocumentsWithStableNames() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveScannerSortTests-\(UUID().uuidString)", isDirectory: true)
+        let zeta = folder.appendingPathComponent("Zeta", isDirectory: true)
+        let alpha = folder.appendingPathComponent("Alpha", isDirectory: true)
+        try FileManager.default.createDirectory(at: zeta, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: alpha, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        try "alpha child".write(to: alpha.appendingPathComponent("child.md"), atomically: true, encoding: .utf8)
+        try "zeta child".write(to: zeta.appendingPathComponent("child.md"), atomically: true, encoding: .utf8)
+        try "ten".write(to: folder.appendingPathComponent("10.md"), atomically: true, encoding: .utf8)
+        try "two".write(to: folder.appendingPathComponent("2.md"), atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let manager = FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder))
+
+        manager.open(url: folder, into: appState)
+
+        let children = try XCTUnwrap(appState.workspaceTree.first?.children)
+        XCTAssertEqual(children.map(\.name), ["Alpha", "Zeta", "2", "10"])
+        XCTAssertEqual(children.map(\.kind), [.folder, .folder, .document, .document])
+    }
+
+    @MainActor
+    func testRestoreLastFolderInBackgroundPublishesShellBeforeScanAndEventuallyIndexesSearch() async throws {
+        let suiteName = "PensieveAsyncRestoreTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveAsyncRestoreTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("restore.md")
+        try "launch-search-token".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let bookmarkStore = BookmarkStore(defaults: defaults)
+        let seedState = AppState()
+        try bookmarkStore.persistRoot(url: folder, into: seedState)
+
+        let scanStarted = DispatchSemaphore(value: 0)
+        let releaseScan = DispatchSemaphore(value: 0)
+        let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+            scanStarted.signal()
+            _ = releaseScan.wait(timeout: .now() + 2)
+            return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+        }
+        let appState = AppState()
+        appState.workspaceSearchQuery = "launch-search-token"
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let manager = FolderManager(
+            metadataStore: temporaryMetadataStore(),
+            indexDatabase: indexDatabase,
+            bookmarkStore: bookmarkStore,
+            workspaceBuilder: builder
+        )
+
+        manager.restoreLastFolderInBackground(into: appState)
+
+        XCTAssertEqual(scanStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
+        XCTAssertTrue(appState.documents.isEmpty)
+        XCTAssertNil(appState.selectedDocumentID)
+
+        releaseScan.signal()
+        await manager.waitForPendingWorkspaceBuild()
+
+        XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
+        XCTAssertEqual(appState.activeDocumentText, "launch-search-token")
+        XCTAssertEqual(appState.workspaceSearchResults.map(\.document.id), [noteURL.standardizedFileURL])
+        bookmarkStore.clear(into: appState)
+    }
+
+    @MainActor
     func testWorkspaceExclusionsPersistAndFilterImportedPaths() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveExclusionTests-\(UUID().uuidString)", isDirectory: true)
