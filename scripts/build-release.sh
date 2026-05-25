@@ -28,6 +28,8 @@ DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
 DMG_VOLNAME="Pensieve"
 INFO_PLIST_SRC="$PKG_DIR/Resources/Info.plist"
 ENTITLEMENTS="$PKG_DIR/Resources/Pensieve.entitlements"
+ICON_SRC="$PKG_DIR/Resources/$APP_NAME.icns"
+ICON_RESOURCE="$APP_NAME.icns"
 KEYS_DIR="${HOME}/.keys"
 NOTARY_ENV="$KEYS_DIR/.notary.env"
 SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
@@ -59,6 +61,7 @@ log "Pre-flight checks"
 [[ -f "$PKG_DIR/Package.swift" ]] || die "Package.swift missing"
 [[ -f "$INFO_PLIST_SRC" ]] || die "Info.plist template missing at $INFO_PLIST_SRC"
 [[ -f "$ENTITLEMENTS" ]] || die "Pensieve.entitlements missing"
+[[ -f "$ICON_SRC" ]] || die "App icon missing at $ICON_SRC"
 [[ -f "$SIGNING_IDENTITY_FILE" ]] || die "Signing identity file missing at $SIGNING_IDENTITY_FILE"
 
 SIGNING_IDENTITY="$(head -n1 "$SIGNING_IDENTITY_FILE" | sed -e 's/[[:space:]]*$//')"
@@ -111,6 +114,9 @@ cp "$EXECUTABLE" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 cp "$INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
+cp "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/$ICON_RESOURCE"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile $APP_NAME" "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string $APP_NAME" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 cp -R "$SPM_BUNDLE_DIR" "$APP_BUNDLE/Contents/Resources/"
 ok ".app bundle laid out at $APP_BUNDLE"
 
