@@ -6,13 +6,20 @@ struct EditorView: View {
     @EnvironmentObject private var controller: AppController
 
     var body: some View {
-        EditorRepresentable(
-            text: documentText,
-            fontSize: appState.fontSize,
-            isDirty: documentDirty,
-            onDocumentChanged: controller.documentDidChange
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 0) {
+            MarkdownFormattingToolbelt { format in
+                controller.applyMarkdownFormat(format)
+            }
+
+            EditorRepresentable(
+                text: documentText,
+                fontSize: appState.fontSize,
+                formattingCommand: appState.pendingMarkdownFormatCommand,
+                isDirty: documentDirty,
+                onDocumentChanged: controller.documentDidChange
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
         .background(Color(NSColor.textBackgroundColor))
     }
 
@@ -31,11 +38,40 @@ struct EditorView: View {
     }
 }
 
+struct MarkdownFormattingToolbelt: View {
+    let apply: (MarkdownFormat) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(MarkdownFormat.allCases) { format in
+                    Button {
+                        apply(format)
+                    } label: {
+                        Image(systemName: format.systemImageName)
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(format.label)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .frame(height: 32)
+        .background(Color(NSColor.controlBackgroundColor))
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+}
+
 // MARK: - TextKit bridge
 
 struct EditorRepresentable: NSViewRepresentable {
     @Binding var text: String
     let fontSize: CGFloat
+    let formattingCommand: MarkdownFormatCommand?
     @Binding var isDirty: Bool
     let onDocumentChanged: @MainActor () -> Void
 
@@ -53,6 +89,7 @@ struct EditorRepresentable: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let surface = context.coordinator.surface else { return }
         surface.update(text: text, fontSize: fontSize)
+        context.coordinator.apply(formattingCommand, to: surface)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -61,6 +98,14 @@ struct EditorRepresentable: NSViewRepresentable {
 
     final class Coordinator {
         var surface: MarkdownEditorSurface?
+        private var lastAppliedFormattingCommandID: UUID?
+
+        func apply(_ command: MarkdownFormatCommand?, to surface: MarkdownEditorSurface) {
+            guard let command else { return }
+            guard command.id != lastAppliedFormattingCommandID else { return }
+            lastAppliedFormattingCommandID = command.id
+            surface.applyMarkdownFormat(command.format)
+        }
     }
 }
 
@@ -135,5 +180,22 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
         guard !isApplyingExternalText else { return }
         guard let changedTextView = notification.object as? NSTextView, changedTextView === textView else { return }
         onTextChanged?(textStorage.string)
+    }
+
+    @discardableResult
+    func applyMarkdownFormat(_ format: MarkdownFormat) -> Bool {
+        let range = textView.selectedRange()
+        guard range.length > 0 else { return false }
+        guard NSMaxRange(range) <= (textStorage.string as NSString).length else { return false }
+
+        let selectedText = (textStorage.string as NSString).substring(with: range)
+        let replacement = MarkdownFormatter.format(selectedText, as: format)
+        guard textView.shouldChangeText(in: range, replacementString: replacement) else { return false }
+
+        textStorage.replaceCharacters(in: range, with: replacement)
+        textContentStorage.refreshHighlighting()
+        textView.setSelectedRange(NSRange(location: range.location, length: (replacement as NSString).length))
+        textView.didChangeText()
+        return true
     }
 }

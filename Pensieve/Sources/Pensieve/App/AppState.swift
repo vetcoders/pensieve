@@ -72,6 +72,7 @@ final class AppState: ObservableObject {
     @Published var mode: EditorMode = .split
     @Published var fontSize: CGFloat = 14
     @Published var richMarkdownEnabled: Bool = false
+    @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
 
     // Sidebar visibility
     @Published var sidebarVisible: Bool = true

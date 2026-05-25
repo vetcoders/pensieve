@@ -44,6 +44,7 @@ final class PensieveSmokeTests: XCTestCase {
         let representable = EditorRepresentable(
             text: Binding(get: { boundText }, set: { boundText = $0 }),
             fontSize: 14,
+            formattingCommand: nil,
             isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
             onDocumentChanged: {
                 didRouteDocumentChange = true

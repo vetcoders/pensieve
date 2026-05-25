@@ -125,8 +125,29 @@ final class AppController: ObservableObject {
 
     // MARK: - Toolbar Actions
 
+    func applyMarkdownFormat(_ format: MarkdownFormat) {
+        guard appState.documentSession.document != nil else { return }
+        appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(format: format)
+    }
+
     func formatSelection(with wrapper: String) {
-        // TODO: Coordinate with formatter worker to implement selection wrapping
-        print("Format selection with \(wrapper)")
+        guard let format = MarkdownFormat(wrapper: wrapper) else { return }
+        applyMarkdownFormat(format)
+    }
+}
+
+private extension MarkdownFormat {
+    init?(wrapper: String) {
+        switch wrapper {
+        case "**": self = .bold
+        case "*": self = .italic
+        case "~~": self = .strike
+        case "`": self = .code
+        case ">": self = .quote
+        case "-": self = .bulletedList
+        case "1.": self = .numberedList
+        case "[]()": self = .link
+        default: return nil
+        }
     }
 }

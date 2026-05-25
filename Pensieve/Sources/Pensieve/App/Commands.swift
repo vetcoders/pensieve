@@ -72,8 +72,60 @@ struct PensieveCommands: Commands {
             .keyboardShortcut("/", modifiers: [.command])
         }
 
-        // Format menu — font sizing
+        // Format menu — Markdown formatting and font sizing
         CommandMenu("Format") {
+            Section {
+                Button("Bold") {
+                    controller.applyMarkdownFormat(.bold)
+                }
+                .keyboardShortcut("b", modifiers: [.command])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Italic") {
+                    controller.applyMarkdownFormat(.italic)
+                }
+                .keyboardShortcut("i", modifiers: [.command])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Strikethrough") {
+                    controller.applyMarkdownFormat(.strike)
+                }
+                .keyboardShortcut("x", modifiers: [.command, .shift])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Quote") {
+                    controller.applyMarkdownFormat(.quote)
+                }
+                .keyboardShortcut("'", modifiers: [.command])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Code") {
+                    controller.applyMarkdownFormat(.code)
+                }
+                .keyboardShortcut("`", modifiers: [.command])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Link") {
+                    controller.applyMarkdownFormat(.link)
+                }
+                .keyboardShortcut("k", modifiers: [.command])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Bulleted List") {
+                    controller.applyMarkdownFormat(.bulletedList)
+                }
+                .keyboardShortcut("8", modifiers: [.command, .shift])
+                .disabled(appState.documentSession.document == nil)
+
+                Button("Numbered List") {
+                    controller.applyMarkdownFormat(.numberedList)
+                }
+                .keyboardShortcut("7", modifiers: [.command, .shift])
+                .disabled(appState.documentSession.document == nil)
+            }
+
+            Divider()
+
             Button("Bigger Font") {
                 controller.bumpFontSize(by: 1)
             }

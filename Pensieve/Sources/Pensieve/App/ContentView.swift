@@ -16,46 +16,46 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup(placement: .principal) {
                 if appState.documentSession.document != nil {
-                    Button(action: { controller.formatSelection(with: "**") }) {
+                    Button(action: { controller.applyMarkdownFormat(.bold) }) {
                         Image("ic_format_bold_18pt")
                     }
                     .help("Bold")
                     
-                    Button(action: { controller.formatSelection(with: "*") }) {
+                    Button(action: { controller.applyMarkdownFormat(.italic) }) {
                         Image("ic_format_italic_18pt")
                     }
                     .help("Italic")
                     
-                    Button(action: { controller.formatSelection(with: "~~") }) {
+                    Button(action: { controller.applyMarkdownFormat(.strike) }) {
                         Image("ic_format_strikethrough_18pt")
                     }
                     .help("Strikethrough")
                     
                     Divider()
                     
-                    Button(action: { controller.formatSelection(with: "`") }) {
+                    Button(action: { controller.applyMarkdownFormat(.code) }) {
                         Image("ic_code_18pt")
                     }
                     .help("Code")
                     
-                    Button(action: { controller.formatSelection(with: ">") }) {
+                    Button(action: { controller.applyMarkdownFormat(.quote) }) {
                         Image("ic_format_quote_18pt")
                     }
                     .help("Blockquote")
                     
                     Divider()
                     
-                    Button(action: { controller.formatSelection(with: "-") }) {
+                    Button(action: { controller.applyMarkdownFormat(.bulletedList) }) {
                         Image("ic_format_list_bulleted_18pt")
                     }
                     .help("Bulleted List")
                     
-                    Button(action: { controller.formatSelection(with: "1.") }) {
+                    Button(action: { controller.applyMarkdownFormat(.numberedList) }) {
                         Image("ic_format_list_numbered_18pt")
                     }
                     .help("Numbered List")
                     
-                    Button(action: { controller.formatSelection(with: "[]()") }) {
+                    Button(action: { controller.applyMarkdownFormat(.link) }) {
                         Image("ic_insert_link_18pt")
                     }
                     .help("Link")
