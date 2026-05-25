@@ -47,6 +47,15 @@ final class AppController: ObservableObject {
         folderManager.openFile(url: url, into: appState)
     }
 
+    @discardableResult
+    func createMarkdownFile(url: URL) -> Bool {
+        guard documentStore.prepareForDocumentSwitch(appState: appState) else {
+            return false
+        }
+
+        return folderManager.createMarkdownFile(at: url, into: appState)
+    }
+
     func restoreLastFolder() {
         folderManager.restoreLastFolder(into: appState)
     }

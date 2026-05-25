@@ -681,6 +681,66 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testControllerCreatesMarkdownFileInWorkspaceAndSelectsIt() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCreateFileTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let manager = FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase)
+        let controller = AppController(
+            appState: appState,
+            folderManager: manager,
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        let createdURL = folder.appendingPathComponent("Fresh Note.md").standardizedFileURL
+
+        XCTAssertTrue(controller.createMarkdownFile(url: folder.appendingPathComponent("Fresh Note")))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: createdURL.path))
+        XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, createdURL)
+        XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, createdURL)
+        XCTAssertEqual(appState.activeDocumentText, "")
+        XCTAssertFalse(appState.activeDocumentDirty)
+        XCTAssertEqual(appState.documents.first?.relativePath, "Fresh Note.md")
+        XCTAssertEqual(appState.workspaceTree.first?.children?.first?.name, "Fresh Note")
+    }
+
+    @MainActor
+    func testControllerCreateMarkdownFileRefusesToOverwriteExistingFile() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCreateExistingTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let existingURL = folder.appendingPathComponent("existing.md")
+        try "keep me".write(to: existingURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+
+        XCTAssertFalse(controller.createMarkdownFile(url: existingURL))
+        XCTAssertEqual(try String(contentsOf: existingURL, encoding: .utf8), "keep me")
+        XCTAssertTrue(appState.lastError?.contains("already exists") == true)
+    }
+
+    @MainActor
     func testWorkspaceSearchIndexesBodyTextAndSnippet() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("PensieveSearchBodyTests-\(UUID().uuidString)", isDirectory: true)

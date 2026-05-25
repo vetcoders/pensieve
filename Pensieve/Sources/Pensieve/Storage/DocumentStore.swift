@@ -55,6 +55,39 @@ final class FolderManager {
         }
     }
 
+    @discardableResult
+    func createMarkdownFile(at url: URL, into appState: AppState) -> Bool {
+        let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
+        let fm = FileManager.default
+
+        guard !fm.fileExists(atPath: targetURL.path) else {
+            appState.lastError = "A file named \(targetURL.lastPathComponent) already exists."
+            return false
+        }
+
+        do {
+            try fm.createDirectory(
+                at: targetURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try "".write(to: targetURL, atomically: true, encoding: .utf8)
+        } catch {
+            appState.lastError = "Could not create \(targetURL.lastPathComponent): \(error.localizedDescription)"
+            return false
+        }
+
+        let standardizedURL = targetURL.standardizedFileURL
+        if appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(standardizedURL, in: $0.url) }) {
+            refresh(into: appState)
+            if let ref = appState.documents.first(where: { $0.url.standardizedFileURL == standardizedURL }) {
+                return DocumentStore.shared.select(ref: ref, into: appState)
+            }
+        }
+
+        openFile(url: standardizedURL, into: appState)
+        return appState.selectedDocumentID?.standardizedFileURL == standardizedURL
+    }
+
     func restoreLastFolder(into appState: AppState) {
         let restored = bookmarkStore.restoreWorkspace(into: appState)
         guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
@@ -291,6 +324,24 @@ enum WorkspaceScanner {
         ["md", "markdown"].contains(url.pathExtension.lowercased())
     }
 
+    static func normalizedMarkdownFileURL(for url: URL) -> URL {
+        let ext = url.pathExtension.lowercased()
+        if ext == "md" || ext == "markdown" {
+            return url.standardizedFileURL
+        }
+        if ext.isEmpty {
+            return url.appendingPathExtension("md").standardizedFileURL
+        }
+        return url.deletingPathExtension().appendingPathExtension("md").standardizedFileURL
+    }
+
+    static func contains(_ url: URL, in root: URL) -> Bool {
+        let standardizedURL = url.standardizedFileURL
+        let standardizedRoot = root.standardizedFileURL
+        return standardizedURL.path == standardizedRoot.path
+            || standardizedURL.path.hasPrefix(standardizedRoot.path + "/")
+    }
+
     static func relativePath(for url: URL, root: URL) -> String {
         let rootComponents = root.standardizedFileURL.pathComponents
         let components = url.standardizedFileURL.pathComponents
@@ -504,6 +555,12 @@ final class DocumentStore {
         }
         appState.documentSession.isDirty = true
         scheduleAutosave(appState: appState)
+    }
+
+    @discardableResult
+    func prepareForDocumentSwitch(appState: AppState) -> Bool {
+        self.appState = appState
+        return saveDirtySessionIfNeeded(appState: appState)
     }
 
     private func scheduleAutosave(appState: AppState) {

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
@@ -24,17 +25,20 @@ struct SidebarView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if appState.workspaceRoots.count == 1, let root = appState.workspaceRoots.first {
-                Text(root.name)
+            HStack(spacing: 8) {
+                Text(sidebarTitle)
                     .font(.headline)
                     .lineLimit(1)
-            } else if !appState.workspaceRoots.isEmpty {
-                Text("Workspace")
-                    .font(.headline)
-                    .lineLimit(1)
-            } else {
-                Text("Pensieve")
-                    .font(.headline)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    createNewFile(in: defaultNewFileDirectory)
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .buttonStyle(.borderless)
+                .help("New Markdown File")
             }
 
             TextField("Search…", text: searchText)
@@ -62,6 +66,9 @@ struct SidebarView: View {
             Text("⌘O opens a Markdown file. ⌘⇧O opens a workspace folder.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+            Button("New File…") {
+                createNewFile(in: defaultNewFileDirectory)
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity)
@@ -350,6 +357,12 @@ struct SidebarView: View {
                 }
             }
         } else if let url = node.url {
+            Button("New File in Folder…") {
+                createNewFile(in: url)
+            }
+
+            Divider()
+
             if expandedNodeIDs.contains(node.id) {
                 Button("Collapse Folder") {
                     expandedNodeIDs.remove(node.id)
@@ -386,6 +399,65 @@ struct SidebarView: View {
 
     private func markdownLinkPath(_ path: String) -> String {
         path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+    }
+
+    private var sidebarTitle: String {
+        if appState.workspaceRoots.count == 1, let root = appState.workspaceRoots.first {
+            return root.name
+        }
+        if !appState.workspaceRoots.isEmpty {
+            return "Workspace"
+        }
+        return "Pensieve"
+    }
+
+    private var defaultNewFileDirectory: URL? {
+        if let activeURL = appState.documentSession.url {
+            return activeURL.deletingLastPathComponent()
+        }
+        if let rootURL = appState.workspaceRoots.first?.url {
+            return rootURL
+        }
+        if let openFileURL = appState.openFiles.first?.url {
+            return openFileURL.deletingLastPathComponent()
+        }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    }
+
+    private func createNewFile(in directory: URL?) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = markdownContentTypes
+        panel.canCreateDirectories = true
+        panel.directoryURL = directory
+        panel.nameFieldStringValue = uniqueNewFileName(in: directory)
+        panel.prompt = "Create"
+        if panel.runModal() == .OK, let url = panel.url {
+            controller.createMarkdownFile(url: url)
+        }
+    }
+
+    private var markdownContentTypes: [UTType] {
+        [
+            UTType(filenameExtension: "md"),
+            UTType(filenameExtension: "markdown")
+        ].compactMap { $0 }
+    }
+
+    private func uniqueNewFileName(in directory: URL?) -> String {
+        guard let directory else { return "Untitled.md" }
+
+        let fm = FileManager.default
+        let base = "Untitled"
+        let ext = "md"
+        var candidate = "\(base).\(ext)"
+        var index = 2
+
+        while fm.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
+            candidate = "\(base) \(index).\(ext)"
+            index += 1
+        }
+
+        return candidate
     }
 
     private func isSelectedOrHovered(_ id: DocumentRef.ID) -> Bool {
