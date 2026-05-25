@@ -74,6 +74,13 @@ final class AppState: ObservableObject {
     @Published var richMarkdownEnabled: Bool = false
     @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
 
+    // Preview behaviour. `previewAutoReload` mirrors the legacy
+    // "Automatically reload page" checkbox; `previewRefreshToken` is bumped
+    // by the toolbar refresh button to force a re-render even when
+    // auto-reload is paused or the markdown text is identical.
+    @Published var previewAutoReload: Bool = true
+    @Published var previewRefreshToken: Int = 0
+
     // Sidebar visibility
     @Published var sidebarVisible: Bool = true
 
@@ -107,6 +114,12 @@ final class AppState: ObservableObject {
 
     func resetFontSize() {
         fontSize = 14
+    }
+
+    /// Bumps `previewRefreshToken`, asking the preview pipeline to re-render
+    /// even when the markdown payload is identical or auto-reload is off.
+    func requestPreviewRefresh() {
+        previewRefreshToken &+= 1
     }
 
     func documentRef(for url: URL) -> DocumentRef {

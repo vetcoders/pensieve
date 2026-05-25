@@ -70,6 +70,19 @@ struct PensieveCommands: Commands {
                 controller.toggleRichMarkdown()
             }
             .keyboardShortcut("/", modifiers: [.command])
+
+            Divider()
+
+            Button("Reload Preview") {
+                appState.requestPreviewRefresh()
+            }
+            .keyboardShortcut("r", modifiers: [.command])
+            .disabled(appState.documentSession.document == nil)
+
+            Button(appState.previewAutoReload ? "Pause Auto Reload" : "Resume Auto Reload") {
+                appState.previewAutoReload.toggle()
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
         }
 
         // Format menu — Markdown formatting and font sizing
