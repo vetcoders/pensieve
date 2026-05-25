@@ -1,21 +1,31 @@
-MIT License
+Business Source License 1.1
 
-Copyright (c) 2018 satoshi-iwaki
+License text copyright (c) 2017 MariaDB Corporation Ab, MySQL AB, 
+and Santeri Paavolainen.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Parameters
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Licensor: VetCoders / LibraxisAI
+Licensed Work: Pensieve
+Additional Use Grant: You may make use of the Licensed Work, provided that you do not use the Licensed Work for a product or service that generates more than $50,000 in annual revenue. You may use it freely for individual, non-commercial, academic, and veterinary practice purposes.
+Change Date: May 24, 2030
+Change License: Apache License, Version 2.0
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Terms
+
+The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. The Licensor may make an Additional Use Grant, above, permitting limited production use.
+
+Effective on the Change Date, or the fourth anniversary of the first publicly available distribution of a specific version of the Licensed Work under this License, whichever comes first, the Licensor hereby grants you the rights provided under the Change License, and this Business Source License will terminate as to that version.
+
+If your use of the Licensed Work does not comply with the requirements currently in effect as described in this License, you must purchase a commercial license from the Licensor, its affiliated entities, or authorized resellers, or you must refrain from using the Licensed Work.
+
+All copies of the original and modified Licensed Work, and derivative works of the Licensed Work, are subject to this Business Source License. This Business Source License applies separately for each version of the Licensed Work and the Change Date may vary for each version of the Licensed Work released by Licensor.
+
+You must conspicuously display this Business Source License on each original or modified copy of the Licensed Work. If you receive the Licensed Work in source code form you may not alter or remove any copyright notices or notices of this License. Any copy of the Licensed Work that you distribute must include a prominent notice that the Licensed Work is subject to this Business Source License and you may not grant rights to the Licensed Work that conflict with this License.
+
+LIMITATION OF LIABILITY
+THE LICENSED WORK IS PROVIDED "AS IS". TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR EXCLUDES ALL WARRANTIES AND CONDITIONS, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT WILL THE LICENSOR BE LIABLE FOR ANY DAMAGES, INCLUDING BUT NOT LIMITED TO DIRECT, INDIRECT, SPECIAL, INCIDENTAL, PUNITIVE, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE LICENSED WORK.
+
+---
+
+Legacy code in `legacy/` remains under its original MIT License by satoshi-iwaki.
