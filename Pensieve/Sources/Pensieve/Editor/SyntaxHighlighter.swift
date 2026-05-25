@@ -4,25 +4,36 @@ class SyntaxHighlighter {
     var baseFontSize: CGFloat = 14
     
     func highlight(_ textStorage: NSTextStorage, range: NSRange) {
+        guard let targetRange = validRange(range, in: textStorage) else { return }
         let string = textStorage.string as NSString
-        let fullRange = NSRange(location: 0, length: string.length)
-        
-        // Ensure range is valid
-        guard NSIntersectionRange(range, fullRange).length > 0 || range.length == 0 else { return }
-        let targetRange = NSIntersectionRange(range, fullRange)
-        
-        // Reset base attributes over the target range
+        applyMarkdownAttributes(textStorage, string: string, targetRange: targetRange)
+    }
+
+    func resetBaseAttributes(_ textStorage: NSTextStorage, range: NSRange) {
+        guard let targetRange = validRange(range, in: textStorage) else { return }
         let baseFont = NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
         let baseColor = NSColor.textColor
-        
+
         textStorage.removeAttribute(.font, range: targetRange)
         textStorage.removeAttribute(.foregroundColor, range: targetRange)
         textStorage.removeAttribute(.backgroundColor, range: targetRange)
         textStorage.removeAttribute(.underlineStyle, range: targetRange)
-        
+
         textStorage.addAttribute(.font, value: baseFont, range: targetRange)
         textStorage.addAttribute(.foregroundColor, value: baseColor, range: targetRange)
-        
+    }
+
+    private func validRange(_ range: NSRange, in textStorage: NSTextStorage) -> NSRange? {
+        let string = textStorage.string as NSString
+        let fullRange = NSRange(location: 0, length: string.length)
+
+        guard NSIntersectionRange(range, fullRange).length > 0 || range.length == 0 else { return nil }
+        return NSIntersectionRange(range, fullRange)
+    }
+
+    private func applyMarkdownAttributes(_ textStorage: NSTextStorage, string: NSString, targetRange: NSRange) {
+        let baseFont = NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
+
         // Blockquote: ^> text
         highlightRegex("(?m)^>.*$", in: string, storage: textStorage, targetRange: targetRange, attributes: [
             .foregroundColor: NSColor.secondaryLabelColor
@@ -37,7 +48,7 @@ class SyntaxHighlighter {
             let size = baseFontSize + CGFloat((7 - level) * 2)
             let font = NSFont.systemFont(ofSize: size, weight: .bold)
             textStorage.addAttribute(.font, value: font, range: match.range)
-            textStorage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: match.range)
+            textStorage.addAttribute(.foregroundColor, value: NSColor.systemGreen, range: match.range)
         }
         
         // Bold: **text** or __text__

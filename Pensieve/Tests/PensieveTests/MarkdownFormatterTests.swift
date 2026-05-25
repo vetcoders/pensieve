@@ -37,6 +37,7 @@ final class MarkdownFormatterTests: XCTestCase {
         let representable = EditorRepresentable(
             text: Binding(get: { boundText }, set: { boundText = $0 }),
             fontSize: 14,
+            syntaxHighlightingEnabled: true,
             formattingCommand: command,
             isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
             onDocumentChanged: {

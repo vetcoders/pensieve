@@ -30,10 +30,46 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertNotNil(surface.textStorage.attribute(.font, at: 0, effectiveRange: nil))
 
         let updatedText = "## Updated\n\nBinding changes must reach AppKit."
-        surface.update(text: updatedText, fontSize: 18)
+        surface.update(text: updatedText, fontSize: 18, syntaxHighlightingEnabled: true)
 
         XCTAssertEqual(surface.textView.string, updatedText)
         XCTAssertEqual(surface.textView.gutter?.fontSize, 18)
+    }
+
+    @MainActor
+    func testMarkdownEditorSurfaceAppliesSyntaxColorsToRenderedTextViewStorage() {
+        let text = """
+        # Heading
+
+        `code`
+
+        [link](https://example.com)
+        """
+        let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+        let storage = surface.textView.textStorage ?? surface.textStorage
+        let nsText = storage.string as NSString
+
+        let codeRange = nsText.range(of: "`code`")
+        let linkRange = nsText.range(of: "[link](https://example.com)")
+
+        XCTAssertEqual(storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor, NSColor.systemGreen)
+        XCTAssertEqual(storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor, NSColor.systemPink)
+        XCTAssertEqual(storage.attribute(.foregroundColor, at: linkRange.location, effectiveRange: nil) as? NSColor, NSColor.controlAccentColor)
+        XCTAssertEqual(storage.attribute(.underlineStyle, at: linkRange.location, effectiveRange: nil) as? Int, NSUnderlineStyle.single.rawValue)
+    }
+
+    @MainActor
+    func testMarkdownEditorSurfaceCanDisableSyntaxColors() {
+        let surface = MarkdownEditorSurface(text: "# Heading\n\n`code`", fontSize: 14, syntaxHighlightingEnabled: false)
+        let storage = surface.textView.textStorage ?? surface.textStorage
+        let nsText = storage.string as NSString
+        let codeRange = nsText.range(of: "`code`")
+
+        XCTAssertEqual(storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor, NSColor.textColor)
+
+        surface.update(text: storage.string, fontSize: 14, syntaxHighlightingEnabled: true)
+
+        XCTAssertEqual(storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor, NSColor.systemPink)
     }
 
     @MainActor
@@ -44,6 +80,7 @@ final class PensieveSmokeTests: XCTestCase {
         let representable = EditorRepresentable(
             text: Binding(get: { boundText }, set: { boundText = $0 }),
             fontSize: 14,
+            syntaxHighlightingEnabled: true,
             formattingCommand: nil,
             isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
             onDocumentChanged: {
@@ -602,7 +639,7 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertFalse(appState.sidebarVisible)
 
         controller.toggleRichMarkdown()
-        XCTAssertTrue(appState.richMarkdownEnabled)
+        XCTAssertFalse(appState.richMarkdownEnabled)
 
         controller.bumpFontSize(by: 2)
         XCTAssertEqual(appState.fontSize, 16)

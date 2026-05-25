@@ -71,7 +71,7 @@ final class AppState: ObservableObject {
     // Editor preferences
     @Published var mode: EditorMode = .split
     @Published var fontSize: CGFloat = 14
-    @Published var richMarkdownEnabled: Bool = false
+    @Published var richMarkdownEnabled: Bool = true
     @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
 
     // Preview behaviour. `previewAutoReload` mirrors the legacy

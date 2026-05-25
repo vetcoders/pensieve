@@ -3,6 +3,12 @@ import AppKit
 class MarkdownTextStorage: NSTextContentStorage {
     let highlighter = SyntaxHighlighter()
     let codeBlockHighlighter = CodeBlockHighlighter()
+
+    var syntaxHighlightingEnabled: Bool = true {
+        didSet {
+            refreshHighlighting()
+        }
+    }
     
     var fontSize: CGFloat = 14 {
         didSet {
@@ -28,8 +34,11 @@ class MarkdownTextStorage: NSTextContentStorage {
         
         // Prevent recursive processEditing calls for attribute changes
         textStorage.beginEditing()
-        highlighter.highlight(textStorage, range: fullRange)
-        codeBlockHighlighter.highlight(textStorage, range: fullRange)
+        highlighter.resetBaseAttributes(textStorage, range: fullRange)
+        if syntaxHighlightingEnabled {
+            highlighter.highlight(textStorage, range: fullRange)
+            codeBlockHighlighter.highlight(textStorage, range: fullRange)
+        }
         textStorage.endEditing()
     }
 }

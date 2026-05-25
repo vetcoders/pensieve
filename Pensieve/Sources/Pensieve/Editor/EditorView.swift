@@ -14,6 +14,7 @@ struct EditorView: View {
             EditorRepresentable(
                 text: documentText,
                 fontSize: appState.fontSize,
+                syntaxHighlightingEnabled: appState.richMarkdownEnabled,
                 formattingCommand: appState.pendingMarkdownFormatCommand,
                 isDirty: documentDirty,
                 onDocumentChanged: controller.documentDidChange
@@ -71,12 +72,17 @@ struct MarkdownFormattingToolbelt: View {
 struct EditorRepresentable: NSViewRepresentable {
     @Binding var text: String
     let fontSize: CGFloat
+    let syntaxHighlightingEnabled: Bool
     let formattingCommand: MarkdownFormatCommand?
     @Binding var isDirty: Bool
     let onDocumentChanged: @MainActor () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
-        let surface = MarkdownEditorSurface(text: text, fontSize: fontSize)
+        let surface = MarkdownEditorSurface(
+            text: text,
+            fontSize: fontSize,
+            syntaxHighlightingEnabled: syntaxHighlightingEnabled
+        )
         surface.onTextChanged = { newText in
             self.text = newText
             self.isDirty = true
@@ -88,7 +94,11 @@ struct EditorRepresentable: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let surface = context.coordinator.surface else { return }
-        surface.update(text: text, fontSize: fontSize)
+        surface.update(
+            text: text,
+            fontSize: fontSize,
+            syntaxHighlightingEnabled: syntaxHighlightingEnabled
+        )
         context.coordinator.apply(formattingCommand, to: surface)
     }
 
@@ -120,10 +130,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     var onTextChanged: ((String) -> Void)?
     var isApplyingExternalText = false
 
-    init(text: String, fontSize: CGFloat) {
+    init(text: String, fontSize: CGFloat, syntaxHighlightingEnabled: Bool = true) {
         textLayoutManager = NSTextLayoutManager()
         textContentStorage = MarkdownTextStorage()
         textStorage = NSTextStorage()
+        textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
 
         textContentStorage.textStorage = textStorage
         textContentStorage.addTextLayoutManager(textLayoutManager)
@@ -157,10 +168,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
         super.init()
         
         textView.delegate = self
-        update(text: text, fontSize: fontSize)
+        update(text: text, fontSize: fontSize, syntaxHighlightingEnabled: syntaxHighlightingEnabled)
     }
 
-    func update(text: String, fontSize: CGFloat) {
+    func update(text: String, fontSize: CGFloat, syntaxHighlightingEnabled: Bool) {
+        if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
+            textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
+        }
+
         if textContentStorage.fontSize != fontSize {
             textContentStorage.fontSize = fontSize
             textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
