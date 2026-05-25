@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var controller: AppController
 
     var body: some View {
         NavigationSplitView {
@@ -12,6 +13,55 @@ struct ContentView: View {
         }
         .navigationTitle(appState.selectedDocument?.title ?? "Pensieve")
         .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
+        .toolbar {
+            ToolbarItemGroup(placement: .principal) {
+                if appState.documentSession.document != nil {
+                    Button(action: { controller.formatSelection(with: "**") }) {
+                        Image("ic_format_bold_18pt")
+                    }
+                    .help("Bold")
+                    
+                    Button(action: { controller.formatSelection(with: "*") }) {
+                        Image("ic_format_italic_18pt")
+                    }
+                    .help("Italic")
+                    
+                    Button(action: { controller.formatSelection(with: "~~") }) {
+                        Image("ic_format_strikethrough_18pt")
+                    }
+                    .help("Strikethrough")
+                    
+                    Divider()
+                    
+                    Button(action: { controller.formatSelection(with: "`") }) {
+                        Image("ic_code_18pt")
+                    }
+                    .help("Code")
+                    
+                    Button(action: { controller.formatSelection(with: ">") }) {
+                        Image("ic_format_quote_18pt")
+                    }
+                    .help("Blockquote")
+                    
+                    Divider()
+                    
+                    Button(action: { controller.formatSelection(with: "-") }) {
+                        Image("ic_format_list_bulleted_18pt")
+                    }
+                    .help("Bulleted List")
+                    
+                    Button(action: { controller.formatSelection(with: "1.") }) {
+                        Image("ic_format_list_numbered_18pt")
+                    }
+                    .help("Numbered List")
+                    
+                    Button(action: { controller.formatSelection(with: "[]()") }) {
+                        Image("ic_insert_link_18pt")
+                    }
+                    .help("Link")
+                }
+            }
+        }
     }
 }
 

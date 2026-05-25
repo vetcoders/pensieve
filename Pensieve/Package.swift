@@ -23,6 +23,7 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
             resources: [
+                .process("Resources/Assets.xcassets"),
                 .copy("Resources/markdown.css"),
                 .copy("Resources/gfm.css"),
                 .copy("Resources/sample.md")

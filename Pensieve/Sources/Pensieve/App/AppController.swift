@@ -122,4 +122,11 @@ final class AppController: ObservableObject {
     func documentDidChange() {
         documentStore.documentDidChange(appState: appState)
     }
+
+    // MARK: - Toolbar Actions
+
+    func formatSelection(with wrapper: String) {
+        // TODO: Coordinate with formatter worker to implement selection wrapping
+        print("Format selection with \(wrapper)")
+    }
 }
