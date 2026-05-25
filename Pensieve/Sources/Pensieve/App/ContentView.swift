@@ -34,26 +34,65 @@ struct EditorPreviewSplit: View {
 
     @ViewBuilder
     private func content(forWidth width: CGFloat) -> some View {
-        switch appState.mode {
-        case .source, .focus:
-            // Focus mode shares source layout (Wave 2 dimming TBD).
-            EditorView()
-        case .preview:
-            PreviewView()
-        case .split:
-            if width < Self.narrowSplitThreshold {
-                // Window is too narrow for a real two-pane view; honor the
-                // editor as source-of-truth. User can switch to .preview to
-                // see rendered output.
+        if appState.documentSession.document == nil {
+            DocumentEmptyStateView(hasWorkspace: appState.hasWorkspaceContent)
+        } else {
+            switch appState.mode {
+            case .source, .focus:
+                // Focus mode shares source layout (Wave 2 dimming TBD).
                 EditorView()
-            } else {
-                HSplitView {
+            case .preview:
+                PreviewView()
+            case .split:
+                if width < Self.narrowSplitThreshold {
+                    // Window is too narrow for a real two-pane view; honor the
+                    // editor as source-of-truth. User can switch to .preview to
+                    // see rendered output.
                     EditorView()
-                        .frame(minWidth: Self.paneMinWidth)
-                    PreviewView()
-                        .frame(minWidth: Self.paneMinWidth)
+                } else {
+                    HSplitView {
+                        EditorView()
+                            .frame(minWidth: Self.paneMinWidth)
+                        PreviewView()
+                            .frame(minWidth: Self.paneMinWidth)
+                    }
                 }
             }
         }
+    }
+}
+
+/// Detail-pane placeholder shown when no document session is active. Reached
+/// from a fresh launch with no restored selection, after File > Close, or
+/// after the workspace is cleared. The window stays alive; this view is the
+/// thing the operator sees instead of stale editor/preview state.
+struct DocumentEmptyStateView: View {
+    let hasWorkspace: Bool
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.text")
+                .font(.system(size: 48, weight: .light))
+                .foregroundStyle(.tertiary)
+
+            Text("No Document Open")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+
+            Text(secondaryMessage)
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var secondaryMessage: String {
+        if hasWorkspace {
+            return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
+        }
+        return "Open a Markdown file or folder from the File menu to get started."
     }
 }

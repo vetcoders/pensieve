@@ -386,6 +386,127 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testCloseActiveDocumentClearsSessionWithoutDroppingWorkspace() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCloseClearTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let alphaURL = folder.appendingPathComponent("alpha.md")
+        let betaURL = folder.appendingPathComponent("beta.md")
+        try "alpha body".write(to: alphaURL, atomically: true, encoding: .utf8)
+        try "beta body".write(to: betaURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: DocumentStore(indexDatabase: indexDatabase),
+            indexDatabase: indexDatabase
+        )
+
+        controller.openFolder(url: folder)
+        controller.selectDocument(id: alphaURL.standardizedFileURL)
+        XCTAssertNotNil(appState.documentSession.document)
+
+        let workspaceDocumentsBefore = appState.documents.map(\.id)
+
+        let didClose = controller.closeActiveDocument()
+
+        XCTAssertTrue(didClose)
+        XCTAssertNil(appState.documentSession.document)
+        XCTAssertNil(appState.selectedDocumentID)
+        XCTAssertEqual(appState.documentSession.text, "")
+        XCTAssertFalse(appState.documentSession.isDirty)
+        // Workspace and other open documents stay alive — only the active
+        // session is cleared, not the window or sidebar contents.
+        XCTAssertEqual(appState.documents.map(\.id), workspaceDocumentsBefore)
+        XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
+    }
+
+    @MainActor
+    func testCloseActiveDocumentSavesDirtySessionBeforeClearing() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCloseDirtyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = folder.appendingPathComponent("dirty.md")
+        try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let documentStore = DocumentStore(indexDatabase: indexDatabase)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: documentStore,
+            indexDatabase: indexDatabase
+        )
+        documentStore.load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
+
+        appState.activeDocumentText = "edited before close"
+        appState.activeDocumentDirty = true
+
+        let didClose = controller.closeActiveDocument()
+
+        XCTAssertTrue(didClose)
+        XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "edited before close")
+        XCTAssertNil(appState.documentSession.document)
+        XCTAssertNil(appState.selectedDocumentID)
+        XCTAssertFalse(appState.documentSession.isDirty)
+    }
+
+    @MainActor
+    func testCloseActiveDocumentRefusesWhenDirtySaveFails() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PensieveCloseRefusalTests-\(UUID().uuidString)", isDirectory: true)
+        let writable = folder.appendingPathComponent("Writable", isDirectory: true)
+        try FileManager.default.createDirectory(at: writable, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+
+        let noteURL = writable.appendingPathComponent("doomed.md")
+        try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
+        let indexDatabase = temporaryIndexDatabase(in: folder)
+        let documentStore = DocumentStore(indexDatabase: indexDatabase)
+        let controller = AppController(
+            appState: appState,
+            folderManager: FolderManager(metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+            documentStore: documentStore,
+            indexDatabase: indexDatabase
+        )
+        documentStore.load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
+
+        appState.activeDocumentText = "unsaved tail"
+        appState.activeDocumentDirty = true
+
+        // Knock the directory out from under the active document so its save
+        // fails. The session must stay alive and dirty rather than silently
+        // dropping the user's edits.
+        try FileManager.default.removeItem(at: writable)
+
+        let didClose = controller.closeActiveDocument()
+
+        XCTAssertFalse(didClose)
+        XCTAssertNotNil(appState.documentSession.document)
+        XCTAssertEqual(appState.documentSession.text, "unsaved tail")
+        XCTAssertTrue(appState.documentSession.isDirty)
+        XCTAssertEqual(appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertTrue(appState.lastError?.contains("Could not save doomed.md") == true)
+    }
+
+    @MainActor
     func testControllerRoutesModeAndPreferenceCommands() {
         let appState = AppState()
         let controller = AppController(appState: appState)

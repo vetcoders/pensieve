@@ -18,8 +18,7 @@ struct PensieveApp: App {
                 .environmentObject(controller)
                 .frame(minWidth: 720, minHeight: 480)
                 .task {
-                    IndexDatabase.shared.open(into: appState)
-                    controller.restoreLastFolder()
+                    controller.start()
                 }
         }
         .windowStyle(.titleBar)

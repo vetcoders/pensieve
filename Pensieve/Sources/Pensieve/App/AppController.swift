@@ -8,6 +8,7 @@ final class AppController: ObservableObject {
     private let folderManager: FolderManager
     private let documentStore: DocumentStore
     private let indexDatabase: IndexDatabase
+    private var didStart = false
 
     convenience init(appState: AppState) {
         self.init(
@@ -28,6 +29,14 @@ final class AppController: ObservableObject {
         self.folderManager = folderManager
         self.documentStore = documentStore
         self.indexDatabase = indexDatabase ?? .shared
+    }
+
+    func start() {
+        guard !didStart else { return }
+        didStart = true
+
+        indexDatabase.open(into: appState)
+        folderManager.restoreLastFolderInBackground(into: appState)
     }
 
     func openFolder(url: URL) {
@@ -52,6 +61,15 @@ final class AppController: ObservableObject {
 
     func saveActiveDocument() {
         documentStore.save(appState: appState)
+    }
+
+    /// Closes the active document session without exiting Pensieve.
+    /// Dirty sessions are routed through the existing save semantics in
+    /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
+    /// so the window stays alive and reverts to its empty state.
+    @discardableResult
+    func closeActiveDocument() -> Bool {
+        documentStore.select(ref: nil, into: appState)
     }
 
     func selectDocument(id: DocumentRef.ID?) {

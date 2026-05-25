@@ -39,6 +39,17 @@ struct PensieveCommands: Commands {
             .disabled(appState.selectedDocument == nil)
         }
 
+        // File menu — replace the default Save/Close group so ⌘W closes the
+        // active document session instead of the window itself. Save lives in
+        // the .newItem block above; here we only own Close.
+        CommandGroup(replacing: .saveItem) {
+            Button("Close") {
+                controller.closeActiveDocument()
+            }
+            .keyboardShortcut("w", modifiers: [.command])
+            .disabled(appState.documentSession.document == nil)
+        }
+
         // Mode menu - editor modes and reading preferences
         CommandMenu("Mode") {
             ForEach(EditorMode.allCases) { mode in

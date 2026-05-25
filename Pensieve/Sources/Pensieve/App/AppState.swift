@@ -115,7 +115,7 @@ final class AppState: ObservableObject {
     }
 }
 
-struct DocumentRef: Identifiable, Hashable {
+struct DocumentRef: Identifiable, Hashable, Sendable {
     let id: URL
     var rootURL: URL?
     var relativePath: String?
@@ -128,14 +128,14 @@ struct DocumentRef: Identifiable, Hashable {
     }
 }
 
-struct WorkspaceRoot: Identifiable, Hashable {
+struct WorkspaceRoot: Identifiable, Hashable, Sendable {
     let id: URL
     var url: URL { id }
     var name: String { url.lastPathComponent }
 }
 
-struct WorkspaceNode: Identifiable, Hashable {
-    enum Kind: String {
+struct WorkspaceNode: Identifiable, Hashable, Sendable {
+    enum Kind: String, Sendable {
         case folder
         case document
     }

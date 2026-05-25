@@ -6,15 +6,25 @@ final class FolderManager {
     private let watcher = FileWatcher()
     private let metadataStore: WorkspaceMetadataStore
     private let indexDatabase: IndexDatabase
+    private let bookmarkStore: BookmarkStore
+    private let workspaceBuilder: WorkspaceScanner.Builder
+    private var workspaceBuildTask: Task<Void, Never>?
 
-    init(metadataStore: WorkspaceMetadataStore = .shared, indexDatabase: IndexDatabase? = nil) {
+    init(
+        metadataStore: WorkspaceMetadataStore = .shared,
+        indexDatabase: IndexDatabase? = nil,
+        bookmarkStore: BookmarkStore = .shared,
+        workspaceBuilder: @escaping WorkspaceScanner.Builder = WorkspaceScanner.build
+    ) {
         self.metadataStore = metadataStore
         self.indexDatabase = indexDatabase ?? .shared
+        self.bookmarkStore = bookmarkStore
+        self.workspaceBuilder = workspaceBuilder
     }
 
     func open(url: URL, into appState: AppState) {
         do {
-            try BookmarkStore.shared.persistRoot(url: url, into: appState)
+            try bookmarkStore.persistRoot(url: url, into: appState)
             let roots = mergedRoots(current: appState.workspaceRoots.map(\.url), adding: [url])
             openResolvedWorkspace(rootURLs: roots, fileURLs: appState.openFiles.map(\.url), into: appState)
         } catch {
@@ -23,7 +33,7 @@ final class FolderManager {
     }
 
     func openFile(url: URL, into appState: AppState) {
-        guard isMarkdownFile(url) else {
+        guard WorkspaceScanner.isMarkdownFile(url) else {
             appState.lastError = "Pensieve can open Markdown files with .md or .markdown extensions."
             return
         }
@@ -34,7 +44,7 @@ final class FolderManager {
         }
 
         do {
-            try BookmarkStore.shared.persistFile(url: url, into: appState)
+            try bookmarkStore.persistFile(url: url, into: appState)
             let fileURLs = mergedRoots(current: appState.openFiles.map(\.url), adding: [url])
             openResolvedWorkspace(rootURLs: appState.workspaceRoots.map(\.url), fileURLs: fileURLs, into: appState)
             if let ref = appState.openFiles.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
@@ -46,7 +56,7 @@ final class FolderManager {
     }
 
     func restoreLastFolder(into appState: AppState) {
-        let restored = BookmarkStore.shared.restoreWorkspace(into: appState)
+        let restored = bookmarkStore.restoreWorkspace(into: appState)
         guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
             return
         }
@@ -54,9 +64,23 @@ final class FolderManager {
         openResolvedWorkspace(rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
     }
 
+    func restoreLastFolderInBackground(into appState: AppState) {
+        let restored = bookmarkStore.restoreWorkspace(into: appState)
+        guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
+            return
+        }
+
+        openResolvedWorkspaceInBackground(rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
+    }
+
+    func waitForPendingWorkspaceBuild() async {
+        await workspaceBuildTask?.value
+    }
+
     func refresh(into appState: AppState) {
         guard appState.hasWorkspaceContent else { return }
 
+        workspaceBuildTask?.cancel()
         let previousSelection = appState.selectedDocumentID
         rebuildWorkspace(into: appState)
         let documents = appState.allDocuments
@@ -172,11 +196,24 @@ final class FolderManager {
         var documents: [DocumentRef] = []
         var nodes: [WorkspaceNode] = []
 
-        for item in urls.sorted(by: workspaceSort) {
-            let relativePath = relativePath(for: item, root: root)
-            guard shouldInclude(item, relativePath: relativePath, exclusions: exclusions) else {
-                continue
+        let itemsWithValues = urls.compactMap { item -> (url: URL, isDir: Bool, relativePath: String, name: String)? in
+            let relativePath = self.relativePath(for: item, root: root)
+            guard self.shouldInclude(item, relativePath: relativePath, exclusions: exclusions) else {
+                return nil
             }
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            return (url: item, isDir: isDir, relativePath: relativePath, name: item.lastPathComponent)
+        }
+
+        let sortedItems = itemsWithValues.sorted { lhs, rhs in
+            if lhs.isDir, !rhs.isDir { return true }
+            if !lhs.isDir, rhs.isDir { return false }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+
+        for data in sortedItems {
+            let item = data.url
+            let relativePath = data.relativePath
 
             let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
             if values?.isDirectory == true {
