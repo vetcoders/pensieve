@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -6,6 +7,12 @@ struct PensieveCommands: Commands {
   @ObservedObject var controller: AppController
 
   var body: some Commands {
+    CommandGroup(replacing: .appInfo) {
+      Button("About Pensieve") {
+        showAboutPanel()
+      }
+    }
+
     // File menu
     CommandGroup(replacing: .newItem) {
       Button("New File…") {
@@ -245,5 +252,15 @@ struct PensieveCommands: Commands {
     }
 
     return candidate
+  }
+
+  private func showAboutPanel() {
+    let identity = BuildIdentity.current
+    let alert = NSAlert()
+    alert.messageText = identity.aboutTitle
+    alert.informativeText = identity.aboutDetails
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
   }
 }

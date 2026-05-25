@@ -226,6 +226,10 @@ struct DocumentEmptyStateView: View {
           .foregroundStyle(.tertiary)
           .multilineTextAlignment(.center)
           .padding(.horizontal, 32)
+
+        Text(BuildIdentity.current.conciseLabel)
+          .font(.caption)
+          .foregroundStyle(.tertiary)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)

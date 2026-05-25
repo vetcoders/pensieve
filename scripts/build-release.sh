@@ -26,6 +26,7 @@ APP_NAME="Pensieve"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
 DMG_VOLNAME="Pensieve"
+VERSION_FILE="$REPO_ROOT/VERSION"
 INFO_PLIST_SRC="$PKG_DIR/Resources/Info.plist"
 ENTITLEMENTS="$PKG_DIR/Resources/Pensieve.entitlements"
 ICON_SRC="$PKG_DIR/Resources/$APP_NAME.icns"
@@ -55,10 +56,19 @@ ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
 
+plist_set_string() {
+    local plist="$1"
+    local key="$2"
+    local value="$3"
+    /usr/libexec/PlistBuddy -c "Set :$key $value" "$plist" >/dev/null 2>&1 \
+        || /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist" >/dev/null
+}
+
 # ─── Pre-flight ───────────────────────────────────────────────────────────
 log "Pre-flight checks"
 [[ -d "$PKG_DIR" ]] || die "Pensieve/ not found at $PKG_DIR"
 [[ -f "$PKG_DIR/Package.swift" ]] || die "Package.swift missing"
+[[ -f "$VERSION_FILE" ]] || die "VERSION file missing at $VERSION_FILE"
 [[ -f "$INFO_PLIST_SRC" ]] || die "Info.plist template missing at $INFO_PLIST_SRC"
 [[ -f "$ENTITLEMENTS" ]] || die "Pensieve.entitlements missing"
 [[ -f "$ICON_SRC" ]] || die "App icon missing at $ICON_SRC"
@@ -83,6 +93,16 @@ if ! security find-identity -v -p codesigning | grep -q "$SIGNING_IDENTITY"; the
     die "Signing identity '$SIGNING_IDENTITY' not in Keychain"
 fi
 ok "Signing identity present in Keychain"
+
+APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+[[ "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]] \
+    || die "VERSION must be semver-like, got '$APP_VERSION'"
+BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD)"
+COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
+BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
+log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
 
 # ─── Clean ────────────────────────────────────────────────────────────────
 if (( DO_CLEAN )); then
@@ -115,8 +135,19 @@ chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 cp "$INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
 cp "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/$ICON_RESOURCE"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile $APP_NAME" "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1 \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string $APP_NAME" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleIconFile" "$APP_NAME"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleShortVersionString" "$APP_VERSION"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleVersion" "$BUILD_NUMBER"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleGetInfoString" "$APP_NAME $APP_VERSION ($COMMIT_SLUG)"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "PensieveBuildCommit" "$COMMIT_FULL"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "PensieveBuildCommitSlug" "$COMMIT_SLUG"
+plist_set_string "$APP_BUNDLE/Contents/Info.plist" "PensieveBuildDate" "$BUILD_DATE"
+/usr/libexec/PlistBuddy -c "Delete :PensieveComponentVersions" "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions dict" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+for component in Editor MarkdownRenderer Preview Search Storage Workspace; do
+    /usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:$component string $BUILD_LABEL" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+done
+/usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:Mermaid string 11.15.0" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 cp -R "$SPM_BUNDLE_DIR" "$APP_BUNDLE/Contents/Resources/"
 ok ".app bundle laid out at $APP_BUNDLE"
 
