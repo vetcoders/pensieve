@@ -6,32 +6,32 @@ import Foundation
 /// preview is robust to SPM bundle path quirks (sandboxing, spaces in paths,
 /// renderer security defaults). Memory cost is ~12 KB per theme — trivial.
 final class ThemeManager: ObservableObject {
-    enum Theme: String, CaseIterable, Identifiable {
-        case markdown
-        case gfm
+  enum Theme: String, CaseIterable, Identifiable {
+    case markdown
+    case gfm
 
-        var id: String { rawValue }
+    var id: String { rawValue }
 
-        var displayName: String {
-            switch self {
-            case .markdown: return "Markdown"
-            case .gfm:      return "GitHub Flavored"
-            }
-        }
-
-        fileprivate var resourceName: String { rawValue }
+    var displayName: String {
+      switch self {
+      case .markdown: return "Markdown"
+      case .gfm: return "GitHub Flavored"
+      }
     }
 
-    @Published var current: Theme = .markdown
+    fileprivate var resourceName: String { rawValue }
+  }
 
-    private var cache: [Theme: String] = [:]
+  @Published var current: Theme = .markdown
 
-    func css(for theme: Theme) -> String {
-        if let cached = cache[theme] {
-            return cached
-        }
-        let loaded = PreviewResourceLocator.css(named: theme.resourceName) ?? ""
-        cache[theme] = loaded
-        return loaded
+  private var cache: [Theme: String] = [:]
+
+  func css(for theme: Theme) -> String {
+    if let cached = cache[theme] {
+      return cached
     }
+    let loaded = PreviewResourceLocator.css(named: theme.resourceName) ?? ""
+    cache[theme] = loaded
+    return loaded
+  }
 }

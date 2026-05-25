@@ -2,79 +2,83 @@ import Darwin
 import Foundation
 
 final class FileWatcher {
-    enum WatchError: LocalizedError {
-        case cannotOpen(URL)
+  enum WatchError: LocalizedError {
+    case cannotOpen(URL)
 
-        var errorDescription: String? {
-            switch self {
-            case .cannotOpen(let url):
-                return "Could not watch folder at \(url.path)."
-            }
-        }
+    var errorDescription: String? {
+      switch self {
+      case .cannotOpen(let url):
+        return "Could not watch folder at \(url.path)."
+      }
     }
+  }
 
-    private let queue = DispatchQueue(label: "io.vetcoders.pensieve.file-watcher", qos: .utility)
-    private var sources: [any DispatchSourceFileSystemObject] = []
-    private var pendingChange: DispatchWorkItem?
+  private let queue = DispatchQueue(label: "io.vetcoders.pensieve.file-watcher", qos: .utility)
+  private var sources: [any DispatchSourceFileSystemObject] = []
+  private var pendingChange: DispatchWorkItem?
 
-    deinit {
-        stop()
-    }
+  deinit {
+    stop()
+  }
 
-    func start(watching url: URL, onChange: @escaping @Sendable () -> Void) throws {
-        try start(watching: [url], onChange: onChange)
-    }
+  func start(watching url: URL, onChange: @escaping @Sendable () -> Void) throws {
+    try start(watching: [url], onChange: onChange)
+  }
 
-    func start(watching urls: [URL], onChange: @escaping @Sendable () -> Void) throws {
-        stop()
+  func start(watching urls: [URL], onChange: @escaping @Sendable () -> Void) throws {
+    stop()
 
-        do {
-            sources = try urls.map { url in
-                let fileDescriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-                    guard let path else { return -1 }
-                    return Darwin.open(path, O_EVTONLY)
-                }
-
-                guard fileDescriptor >= 0 else {
-                    throw WatchError.cannotOpen(url)
-                }
-
-                let source = DispatchSource.makeFileSystemObjectSource(
-                    fileDescriptor: fileDescriptor,
-                    eventMask: [.write, .delete, .rename, .attrib, .extend],
-                    queue: queue
-                )
-
-                source.setEventHandler { [weak self] in
-                    self?.debounce(onChange)
-                }
-                source.setCancelHandler {
-                    Darwin.close(fileDescriptor)
-                }
-
-                return source
-            }
-        } catch {
-            stop()
-            throw error
+    do {
+      sources = try urls.map { url in
+        let fileDescriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+          guard let path else { return -1 }
+          return Darwin.open(path, O_EVTONLY)
         }
 
-        sources.forEach { $0.resume() }
-    }
-
-    func stop() {
-        pendingChange?.cancel()
-        pendingChange = nil
-        sources.forEach { $0.cancel() }
-        sources.removeAll()
-    }
-
-    private func debounce(_ onChange: @escaping @Sendable () -> Void) {
-        pendingChange?.cancel()
-        let item = DispatchWorkItem {
-            onChange()
+        guard fileDescriptor >= 0 else {
+          throw WatchError.cannotOpen(url)
         }
-        pendingChange = item
-        queue.asyncAfter(deadline: .now() + .milliseconds(500), execute: item)
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+          fileDescriptor: fileDescriptor,
+          eventMask: [.write, .delete, .rename, .attrib, .extend],
+          queue: queue
+        )
+
+        source.setEventHandler { [weak self] in
+          self?.debounce(onChange)
+        }
+        source.setCancelHandler {
+          Darwin.close(fileDescriptor)
+        }
+
+        return source
+      }
+    } catch {
+      stop()
+      throw error
     }
+
+    for source in sources {
+      source.resume()
+    }
+  }
+
+  func stop() {
+    pendingChange?.cancel()
+    pendingChange = nil
+    for source in sources {
+      source.cancel()
+    }
+    sources.removeAll()
+  }
+
+  private func debounce(_ onChange: @escaping @Sendable () -> Void) {
+    pendingChange?.cancel()
+    let item = DispatchWorkItem {
+      onChange()
+    }
+    pendingChange = item
+    queue.asyncAfter(deadline: .now() + .milliseconds(500), execute: item)
+  }
 }

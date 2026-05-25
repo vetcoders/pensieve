@@ -9,7 +9,8 @@ struct PensieveApp: App {
   init() {
     let appState = AppState()
     _appState = StateObject(wrappedValue: appState)
-    _controller = StateObject(wrappedValue: AppController(appState: appState))
+    _controller = StateObject(
+      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
     _themeManager = StateObject(wrappedValue: ThemeManager())
   }
 

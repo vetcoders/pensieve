@@ -4,180 +4,192 @@ import Foundation
 
 @MainActor
 final class AppController: ObservableObject {
-    private let appState: AppState
-    private let folderManager: FolderManager
-    private let documentStore: DocumentStore
-    private let indexDatabase: IndexDatabase
-    private var didStart = false
+  private let appState: AppState
+  private let folderManager: FolderManager
+  private let documentStore: DocumentStore
+  private let indexDatabase: IndexDatabase
+  private let importsFoldersInBackground: Bool
+  private var didStart = false
 
-    convenience init(appState: AppState) {
-        self.init(
-            appState: appState,
-            folderManager: FolderManager.shared,
-            documentStore: DocumentStore.shared,
-            indexDatabase: IndexDatabase.shared
-        )
+  convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
+    self.init(
+      appState: appState,
+      folderManager: FolderManager.shared,
+      documentStore: DocumentStore.shared,
+      indexDatabase: IndexDatabase.shared,
+      importsFoldersInBackground: importsFoldersInBackground
+    )
+  }
+
+  init(
+    appState: AppState,
+    folderManager: FolderManager,
+    documentStore: DocumentStore,
+    indexDatabase: IndexDatabase? = nil,
+    importsFoldersInBackground: Bool = false
+  ) {
+    self.appState = appState
+    self.folderManager = folderManager
+    self.documentStore = documentStore
+    self.indexDatabase = indexDatabase ?? .shared
+    self.importsFoldersInBackground = importsFoldersInBackground
+  }
+
+  func start() {
+    guard !didStart else { return }
+    didStart = true
+
+    indexDatabase.open(into: appState)
+    folderManager.restoreLastFolderInBackground(into: appState)
+  }
+
+  func openFolder(url: URL) {
+    if importsFoldersInBackground {
+      folderManager.openInBackground(url: url, into: appState)
+    } else {
+      folderManager.open(url: url, into: appState)
+    }
+  }
+
+  func openFile(url: URL) {
+    folderManager.openFile(url: url, into: appState)
+  }
+
+  @discardableResult
+  func createMarkdownFile(url: URL) -> Bool {
+    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
+      return false
     }
 
-    init(
-        appState: AppState,
-        folderManager: FolderManager,
-        documentStore: DocumentStore,
-        indexDatabase: IndexDatabase? = nil
-    ) {
-        self.appState = appState
-        self.folderManager = folderManager
-        self.documentStore = documentStore
-        self.indexDatabase = indexDatabase ?? .shared
+    return folderManager.createMarkdownFile(at: url, into: appState)
+  }
+
+  func restoreLastFolder() {
+    folderManager.restoreLastFolder(into: appState)
+  }
+
+  func excludeFromWorkspace(urls: [URL]) {
+    folderManager.addExcludedURLs(urls, into: appState)
+  }
+
+  func clearWorkspaceExclusions() {
+    folderManager.clearExclusions(into: appState)
+  }
+
+  func saveActiveDocument() {
+    documentStore.save(appState: appState)
+  }
+
+  /// Closes the active document session without exiting Pensieve.
+  /// Dirty sessions are routed through the existing save semantics in
+  /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
+  /// so the window stays alive and reverts to its empty state.
+  @discardableResult
+  func closeActiveDocument() -> Bool {
+    documentStore.select(ref: nil, into: appState)
+  }
+
+  func selectDocument(id: DocumentRef.ID?) {
+    guard let id else {
+      _ = documentStore.select(ref: nil, into: appState)
+      return
     }
 
-    func start() {
-        guard !didStart else { return }
-        didStart = true
-
-        indexDatabase.open(into: appState)
-        folderManager.restoreLastFolderInBackground(into: appState)
+    guard let ref = appState.allDocuments.first(where: { $0.id == id }) else {
+      return
     }
 
-    func openFolder(url: URL) {
-        folderManager.open(url: url, into: appState)
+    _ = documentStore.select(ref: ref, into: appState)
+  }
+
+  func closeDocumentTab(id: DocumentRef.ID) {
+    let closingActiveDocument =
+      appState.selectedDocumentID?.standardizedFileURL == id.standardizedFileURL
+    guard !closingActiveDocument || documentStore.prepareForDocumentSwitch(appState: appState)
+    else {
+      return
     }
 
-    func openFile(url: URL) {
-        folderManager.openFile(url: url, into: appState)
+    let currentTabs = appState.documentTabs
+    let closingIndex = currentTabs.firstIndex {
+      $0.id.standardizedFileURL == id.standardizedFileURL
     }
+    appState.forgetDocumentTab(id: id)
 
-    @discardableResult
-    func createMarkdownFile(url: URL) -> Bool {
-        guard documentStore.prepareForDocumentSwitch(appState: appState) else {
-            return false
-        }
+    guard closingActiveDocument else { return }
 
-        return folderManager.createMarkdownFile(at: url, into: appState)
+    let remainingTabs = appState.documentTabs
+    let replacementIndex = min(closingIndex ?? remainingTabs.count, remainingTabs.count - 1)
+    if replacementIndex >= 0, remainingTabs.indices.contains(replacementIndex) {
+      _ = documentStore.select(ref: remainingTabs[replacementIndex], into: appState)
+    } else {
+      _ = documentStore.select(ref: nil, into: appState)
     }
+  }
 
-    func restoreLastFolder() {
-        folderManager.restoreLastFolder(into: appState)
-    }
+  func selectSearchResult(_ result: WorkspaceSearchResult) {
+    selectDocument(id: result.document.id)
+  }
 
-    func excludeFromWorkspace(urls: [URL]) {
-        folderManager.addExcludedURLs(urls, into: appState)
-    }
+  func selectWorkspaceNode(_ node: WorkspaceNode) {
+    guard let documentID = node.documentID else { return }
+    selectDocument(id: documentID)
+  }
 
-    func clearWorkspaceExclusions() {
-        folderManager.clearExclusions(into: appState)
-    }
+  func updateWorkspaceSearch(query: String) {
+    appState.workspaceSearchQuery = query
+    indexDatabase.refreshSearchResults(in: appState)
+  }
 
-    func saveActiveDocument() {
-        documentStore.save(appState: appState)
-    }
+  func setMode(_ mode: EditorMode) {
+    appState.mode = mode
+  }
 
-    /// Closes the active document session without exiting Pensieve.
-    /// Dirty sessions are routed through the existing save semantics in
-    /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
-    /// so the window stays alive and reverts to its empty state.
-    @discardableResult
-    func closeActiveDocument() -> Bool {
-        documentStore.select(ref: nil, into: appState)
-    }
+  func toggleSidebar() {
+    appState.sidebarVisible.toggle()
+  }
 
-    func selectDocument(id: DocumentRef.ID?) {
-        guard let id else {
-            _ = documentStore.select(ref: nil, into: appState)
-            return
-        }
+  func toggleRichMarkdown() {
+    appState.richMarkdownEnabled.toggle()
+  }
 
-        guard let ref = appState.allDocuments.first(where: { $0.id == id }) else {
-            return
-        }
+  func bumpFontSize(by delta: CGFloat) {
+    appState.bumpFontSize(by: delta)
+  }
 
-        _ = documentStore.select(ref: ref, into: appState)
-    }
+  func resetFontSize() {
+    appState.resetFontSize()
+  }
 
-    func closeDocumentTab(id: DocumentRef.ID) {
-        let closingActiveDocument = appState.selectedDocumentID?.standardizedFileURL == id.standardizedFileURL
-        guard !closingActiveDocument || documentStore.prepareForDocumentSwitch(appState: appState) else {
-            return
-        }
+  func documentDidChange() {
+    documentStore.documentDidChange(appState: appState)
+  }
 
-        let currentTabs = appState.documentTabs
-        let closingIndex = currentTabs.firstIndex { $0.id.standardizedFileURL == id.standardizedFileURL }
-        appState.forgetDocumentTab(id: id)
+  // MARK: - Toolbar Actions
 
-        guard closingActiveDocument else { return }
+  func applyMarkdownFormat(_ format: MarkdownFormat) {
+    guard appState.documentSession.document != nil else { return }
+    appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(format: format)
+  }
 
-        let remainingTabs = appState.documentTabs
-        let replacementIndex = min(closingIndex ?? remainingTabs.count, remainingTabs.count - 1)
-        if replacementIndex >= 0, remainingTabs.indices.contains(replacementIndex) {
-            _ = documentStore.select(ref: remainingTabs[replacementIndex], into: appState)
-        } else {
-            _ = documentStore.select(ref: nil, into: appState)
-        }
-    }
-
-    func selectSearchResult(_ result: WorkspaceSearchResult) {
-        selectDocument(id: result.document.id)
-    }
-
-    func selectWorkspaceNode(_ node: WorkspaceNode) {
-        guard let documentID = node.documentID else { return }
-        selectDocument(id: documentID)
-    }
-
-    func updateWorkspaceSearch(query: String) {
-        appState.workspaceSearchQuery = query
-        indexDatabase.refreshSearchResults(in: appState)
-    }
-
-    func setMode(_ mode: EditorMode) {
-        appState.mode = mode
-    }
-
-    func toggleSidebar() {
-        appState.sidebarVisible.toggle()
-    }
-
-    func toggleRichMarkdown() {
-        appState.richMarkdownEnabled.toggle()
-    }
-
-    func bumpFontSize(by delta: CGFloat) {
-        appState.bumpFontSize(by: delta)
-    }
-
-    func resetFontSize() {
-        appState.resetFontSize()
-    }
-
-    func documentDidChange() {
-        documentStore.documentDidChange(appState: appState)
-    }
-
-    // MARK: - Toolbar Actions
-
-    func applyMarkdownFormat(_ format: MarkdownFormat) {
-        guard appState.documentSession.document != nil else { return }
-        appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(format: format)
-    }
-
-    func formatSelection(with wrapper: String) {
-        guard let format = MarkdownFormat(wrapper: wrapper) else { return }
-        applyMarkdownFormat(format)
-    }
+  func formatSelection(with wrapper: String) {
+    guard let format = MarkdownFormat(wrapper: wrapper) else { return }
+    applyMarkdownFormat(format)
+  }
 }
 
-private extension MarkdownFormat {
-    init?(wrapper: String) {
-        switch wrapper {
-        case "**": self = .bold
-        case "*": self = .italic
-        case "~~": self = .strike
-        case "`": self = .code
-        case ">": self = .quote
-        case "-": self = .bulletedList
-        case "1.": self = .numberedList
-        case "[]()": self = .link
-        default: return nil
-        }
+extension MarkdownFormat {
+  fileprivate init?(wrapper: String) {
+    switch wrapper {
+    case "**": self = .bold
+    case "*": self = .italic
+    case "~~": self = .strike
+    case "`": self = .code
+    case ">": self = .quote
+    case "-": self = .bulletedList
+    case "1.": self = .numberedList
+    case "[]()": self = .link
+    default: return nil
     }
+  }
 }

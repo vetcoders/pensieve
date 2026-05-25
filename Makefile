@@ -68,13 +68,12 @@ clean-deep: clean  ## Clean + nuke SwiftPM resolved deps cache
 test:  ## Run unit + integration tests
 	@cd $(PKG_DIR) && swift test 2>&1 | tail -25
 
+.PHONY: ui-smoke
+ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
+	@$(SCRIPTS)/ui-smoke.sh "$(APP_BUNDLE)"
+
 .PHONY: test-ui
-test-ui:  ## Run XCUITest UI tests (Wave 1.5+ — pending Xcode project)
-	@if [[ -d "PensieveApp/PensieveApp.xcodeproj" ]]; then \
-		xcodebuild test -project PensieveApp/PensieveApp.xcodeproj -scheme PensieveApp -destination 'platform=macOS' 2>&1 | tail -30; \
-	else \
-		printf "$(C_YELLOW)[skip]$(C_RESET) PensieveApp.xcodeproj not yet generated. See Wave 1.5 plan.\n"; \
-	fi
+test-ui: ui-smoke  ## Alias for the accessibility UI smoke harness
 
 .PHONY: lint
 lint:  ## Required format check; fails if swift-format is missing
@@ -172,5 +171,6 @@ help:  ## Show this help
 	@printf "\n  $(C_CYAN)Quick start:$(C_RESET)\n"
 	@printf "    make run             # build + launch (debug)\n"
 	@printf "    make test            # unit + integration tests\n"
+	@printf "    make ui-smoke        # launch .app + verify native UI surface\n"
 	@printf "    make release         # signed + notarized .app + .dmg\n"
 	@printf "    make info-artifacts  # inspect dist/ contents\n\n"
