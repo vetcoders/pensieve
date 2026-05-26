@@ -35,11 +35,12 @@ final class AppController: ObservableObject {
     self.importsFoldersInBackground = importsFoldersInBackground
   }
 
-  func start() {
+  func start(restoringWorkspace: Bool = true) {
     guard !didStart else { return }
     didStart = true
 
     indexDatabase.open(into: appState)
+    guard restoringWorkspace else { return }
     folderManager.restoreLastFolderInBackground(into: appState)
   }
 

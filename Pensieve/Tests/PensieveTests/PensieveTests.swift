@@ -430,6 +430,106 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testLaunchFileIntentLoadsBeforeRestoredWorkspaceCanScan() async throws {
+    let suiteName = "PensieveLaunchIntentTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let restoredFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRestoredWorkspace-\(UUID().uuidString)", isDirectory: true)
+    let launchFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveLaunchFile-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: restoredFolder, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: launchFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: restoredFolder)
+      try? FileManager.default.removeItem(at: launchFolder)
+    }
+
+    try "restored".write(
+      to: restoredFolder.appendingPathComponent("restored.md"), atomically: true, encoding: .utf8)
+    let launchURL = launchFolder.appendingPathComponent("clicked.md")
+    try "clicked first".write(to: launchURL, atomically: true, encoding: .utf8)
+
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    try bookmarkStore.persistRoot(url: restoredFolder, into: AppState())
+
+    let scanStarted = DispatchSemaphore(value: 0)
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      scanStarted.signal()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: restoredFolder)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceBuilder: builder
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: manager,
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [launchURL])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(scanStarted.wait(timeout: .now() + 0.1), .timedOut)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty)
+    XCTAssertEqual(appState.openFiles.map(\.url), [launchURL.standardizedFileURL])
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, launchURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "clicked first")
+  }
+
+  @MainActor
+  func testLaunchFileIntentKeepsFirstMarkdownActiveAndReportsUnsupportedURLs() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveMultiLaunchIntentTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let firstURL = folder.appendingPathComponent("first.md")
+    let secondURL = folder.appendingPathComponent("second.markdown")
+    let unsupportedURL = folder.appendingPathComponent("not-markdown.txt")
+    try "first body".write(to: firstURL, atomically: true, encoding: .utf8)
+    try "second body".write(to: secondURL, atomically: true, encoding: .utf8)
+    try "plain text".write(to: unsupportedURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: .shared,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [firstURL, secondURL, unsupportedURL])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(
+      appState.openFiles.map { $0.url.standardizedFileURL },
+      [firstURL.standardizedFileURL, secondURL.standardizedFileURL])
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, firstURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "first body")
+    XCTAssertTrue(appState.lastError?.contains(".md or .markdown") == true)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty)
+  }
+
+  @MainActor
   func testDirtyDocumentIsSavedBeforeFastSelectionLoad() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveDirtySwitchTests-\(UUID().uuidString)", isDirectory: true)

@@ -51,7 +51,8 @@ final class FolderManager {
       return
     }
 
-    if let ref = appState.documents.first(where: {
+    let standardizedURL = url.standardizedFileURL
+    if let ref = appState.allDocuments.first(where: {
       $0.url.standardizedFileURL == url.standardizedFileURL
     }) {
       DocumentStore.shared.select(ref: ref, into: appState)
@@ -60,14 +61,10 @@ final class FolderManager {
 
     do {
       try bookmarkStore.persistFile(url: url, into: appState)
-      let fileURLs = mergedRoots(current: appState.openFiles.map(\.url), adding: [url])
-      openResolvedWorkspace(
-        rootURLs: appState.workspaceRoots.map(\.url), fileURLs: fileURLs, into: appState)
-      if let ref = appState.openFiles.first(where: {
-        $0.url.standardizedFileURL == url.standardizedFileURL
-      }) {
-        DocumentStore.shared.select(ref: ref, into: appState)
-      }
+      let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
+      appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
+      appState.openFiles.append(ref)
+      DocumentStore.shared.load(ref: ref, into: appState)
     } catch {
       appState.lastError = "Could not open file: \(error.localizedDescription)"
     }
