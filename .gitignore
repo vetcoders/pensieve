@@ -82,6 +82,10 @@ dist/
 
 # Loctree atlas (regenerated per scan)
 .loctree/
+# Loctree per-repo scan config (kept local, like the atlas)
+.loctignore
 /.claude/
 /.vibecrafted/
 /agents
+*.md
+!AGENTS.md
