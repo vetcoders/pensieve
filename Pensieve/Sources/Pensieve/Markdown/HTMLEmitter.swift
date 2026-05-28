@@ -83,7 +83,8 @@ struct HTMLEmitter: MarkupVisitor {
     let inner = listItem.children.map { visit($0) }.joined()
     if let checkbox = listItem.checkbox {
       let checked = checkbox == .checked ? " checked" : ""
-      return "<li><input type=\"checkbox\" disabled\(checked) />\(inner)</li>"
+      return
+        "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled\(checked) />\(inner)</li>"
     }
     return "<li>\(inner)</li>"
   }

@@ -66,6 +66,15 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertTrue(html.contains("<li>"), html)
   }
 
+  func testTaskListEmitsCheckboxClassesAndState() {
+    let html = render("- [ ] todo\n- [x] done")
+    XCTAssertTrue(html.contains("<li class=\"task-list-item\">"), html)
+    XCTAssertTrue(
+      html.contains("class=\"task-list-item-checkbox\" disabled />"), html)
+    XCTAssertTrue(
+      html.contains("class=\"task-list-item-checkbox\" disabled checked />"), html)
+  }
+
   func testBlockquote() {
     let html = render("> quoted")
     XCTAssertTrue(html.contains("<blockquote"), html)

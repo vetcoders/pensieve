@@ -202,6 +202,13 @@ final class PreviewWebView: NSView {
       color: var(--vc-preview-text) !important;
       max-width: 100%;
       overflow-x: auto;
+      border: 1px solid var(--vc-preview-border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin: 1rem 0;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+      font-size: 0.92em;
+      line-height: 1.5;
     }
 
     .markdown-body pre code,
@@ -209,6 +216,22 @@ final class PreviewWebView: NSView {
       white-space: pre !important;
       overflow-wrap: normal;
       word-break: normal;
+      font-family: inherit;
+    }
+
+    /* Task lists: GFM-style — no bullet, checkbox inline with its label. */
+    .markdown-body .task-list-item {
+      list-style: none;
+    }
+
+    .markdown-body .task-list-item-checkbox {
+      margin: 0 0.45em 0 -1.35em;
+      vertical-align: middle;
+    }
+
+    .markdown-body .task-list-item > p {
+      display: inline;
+      margin: 0;
     }
 
     .markdown-body img {
