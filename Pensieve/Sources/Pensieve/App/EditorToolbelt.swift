@@ -48,7 +48,8 @@ struct EditorToolbelt: ToolbarContent {
       .help(
         appState.previewAutoReload
           ? "Auto reload on — preview re-renders as you type"
-          : "Auto reload off — use the reload button to refresh")
+          : "Auto reload off — use the reload button to refresh"
+      )
       .accessibilityIdentifier("pensieve.toolbar.autoReload")
     }
   }
@@ -85,7 +86,8 @@ struct EditorToolbelt: ToolbarContent {
     .help(
       appState.richMarkdownEnabled
         ? "Rich Markdown on (⌘/)"
-        : "Plain syntax (⌘/)")
+        : "Plain syntax (⌘/)"
+    )
     .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
   }
 
