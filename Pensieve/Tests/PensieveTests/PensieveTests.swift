@@ -1118,6 +1118,40 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDocumentTabsAreEmptyUntilDocumentsAreSelectedAndClosed() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveTabsEmptyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    XCTAssertTrue(appState.documentTabs.isEmpty)
+
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: alphaURL.standardizedFileURL)
+
+    XCTAssertFalse(appState.documentTabs.isEmpty)
+
+    controller.closeDocumentTab(id: alphaURL.standardizedFileURL)
+
+    XCTAssertTrue(appState.documentTabs.isEmpty)
+  }
+
+  @MainActor
   func testClosingActiveDocumentTabSelectsNeighborWithoutDroppingWorkspace() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveCloseTabTests-\(UUID().uuidString)", isDirectory: true)

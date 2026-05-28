@@ -12,8 +12,10 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       VStack(spacing: 0) {
-        DocumentTabStrip()
-        Divider()
+        if !appState.documentTabs.isEmpty {
+          DocumentTabStrip()
+          Divider()
+        }
         EditorPreviewSplit()
       }
     }
