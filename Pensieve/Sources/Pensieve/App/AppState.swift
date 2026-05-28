@@ -21,6 +21,9 @@ enum EditorMode: Int, CaseIterable, Identifiable {
 
 @MainActor
 final class AppState: ObservableObject {
+  private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
+  private let defaults: UserDefaults
+
   // Workspace + document selection
   @Published var folderURL: URL?
   @Published var workspaceRoots: [WorkspaceRoot] = []
@@ -79,7 +82,11 @@ final class AppState: ObservableObject {
   // "Automatically reload page" checkbox; `previewRefreshToken` is bumped
   // by the toolbar refresh button to force a re-render even when
   // auto-reload is paused or the markdown text is identical.
-  @Published var previewAutoReload: Bool = true
+  @Published var previewAutoReload: Bool {
+    didSet {
+      defaults.set(previewAutoReload, forKey: Self.previewAutoReloadKey)
+    }
+  }
   @Published var previewRefreshToken: Int = 0
 
   // Sidebar visibility
@@ -89,6 +96,15 @@ final class AppState: ObservableObject {
   @Published var bookmarkData: Data?
   @Published var lastError: String?
   @Published var workspaceActivity: WorkspaceActivity?
+
+  init(defaults: UserDefaults = .standard) {
+    self.defaults = defaults
+    if defaults.object(forKey: Self.previewAutoReloadKey) == nil {
+      self.previewAutoReload = false
+    } else {
+      self.previewAutoReload = defaults.bool(forKey: Self.previewAutoReloadKey)
+    }
+  }
 
   var selectedDocument: DocumentRef? {
     guard let id = selectedDocumentID else { return nil }
@@ -127,7 +143,26 @@ final class AppState: ObservableObject {
   func documentRef(for url: URL) -> DocumentRef {
     let standardizedURL = url.standardizedFileURL
     return allDocuments.first { $0.url.standardizedFileURL == standardizedURL }
-      ?? DocumentRef(id: standardizedURL, isAdHoc: workspaceRoots.isEmpty)
+      ?? makeDocumentRef(for: standardizedURL)
+  }
+
+  func makeDocumentRef(for url: URL) -> DocumentRef {
+    let standardizedURL = url.standardizedFileURL
+    if let root =
+      workspaceRoots
+      .map(\.url.standardizedFileURL)
+      .filter({ WorkspaceScanner.contains(standardizedURL, in: $0) })
+      .sorted(by: { $0.path.count > $1.path.count })
+      .first
+    {
+      return DocumentRef(
+        id: standardizedURL,
+        rootURL: root,
+        relativePath: WorkspaceScanner.relativePath(for: standardizedURL, root: root),
+        isAdHoc: false
+      )
+    }
+    return DocumentRef(id: standardizedURL, isAdHoc: true)
   }
 
   func rememberDocumentTab(_ ref: DocumentRef) {

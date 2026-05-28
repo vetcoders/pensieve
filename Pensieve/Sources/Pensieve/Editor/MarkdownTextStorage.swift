@@ -3,6 +3,7 @@ import AppKit
 class MarkdownTextStorage: NSTextContentStorage {
   let highlighter = SyntaxHighlighter()
   let codeBlockHighlighter = CodeBlockHighlighter()
+  private var highlightWorkItem: DispatchWorkItem?
 
   var syntaxHighlightingEnabled: Bool = true {
     didSet {
@@ -29,12 +30,22 @@ class MarkdownTextStorage: NSTextContentStorage {
       invalidatedRange: invalidatedCharRange)
 
     if editMask.contains(.editedCharacters) {
-      // For MVP, highlight the entire string to ensure multi-line blocks like ``` sync properly
-      refreshHighlighting()
+      scheduleHighlightingRefresh()
     }
   }
 
+  private func scheduleHighlightingRefresh() {
+    highlightWorkItem?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.refreshHighlighting()
+    }
+    highlightWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(70), execute: workItem)
+  }
+
   func refreshHighlighting() {
+    highlightWorkItem?.cancel()
+    highlightWorkItem = nil
     guard let textStorage = textStorage else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
 

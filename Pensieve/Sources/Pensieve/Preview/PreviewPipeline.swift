@@ -90,7 +90,7 @@ protocol PreviewSink: AnyObject {
 ///   1. Accept a `PreviewRenderRequest` via `submit(_:initial:)`.
 ///   2. Schedule rendering: the first request is applied immediately so the
 ///      reader never stares at an empty pane; subsequent requests are
-///      coalesced through `removeDuplicates` and debounced 200 ms on the main
+///      coalesced through `removeDuplicates` and debounced 400 ms on the main
 ///      run loop.
 ///   3. Render markdown to HTML via `MarkdownRenderer` and compose a
 ///      `PreviewDocument` via `PreviewDocument.make`.
@@ -120,7 +120,7 @@ final class PreviewPipeline {
     themeManager: ThemeManager,
     renderer: MarkdownRenderer = MarkdownRenderer(),
     scheduler: DispatchQueue = .main,
-    debounce: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(200)
+    debounce: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(400)
   ) {
     self.themeManager = themeManager
     self.renderer = renderer

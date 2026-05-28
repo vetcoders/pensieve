@@ -16,7 +16,7 @@ struct PensieveCommands: Commands {
     // File menu
     CommandGroup(replacing: .newItem) {
       Button("New File…") {
-        createNewFile()
+        controller.createUntitledDocument()
       }
       .keyboardShortcut("n", modifiers: [.command])
 
@@ -47,10 +47,25 @@ struct PensieveCommands: Commands {
       Divider()
 
       Button("Save") {
-        controller.saveActiveDocument()
+        saveActiveDocument()
       }
       .keyboardShortcut("s", modifiers: [.command])
-      .disabled(appState.selectedDocument == nil)
+      .disabled(!appState.documentSession.hasEditableBuffer)
+
+      Button("Save As…") {
+        saveActiveDocumentAs()
+      }
+      .keyboardShortcut("s", modifiers: [.command, .shift])
+      .disabled(!appState.documentSession.hasEditableBuffer)
+    }
+
+    CommandGroup(replacing: .appTermination) {
+      Button("Quit Pensieve") {
+        if controller.applicationShouldTerminate() {
+          NSApplication.shared.terminate(nil)
+        }
+      }
+      .keyboardShortcut("q", modifiers: [.command])
     }
 
     // File menu — replace the default Save/Close group so ⌘W closes the
@@ -61,7 +76,7 @@ struct PensieveCommands: Commands {
         controller.closeActiveDocument()
       }
       .keyboardShortcut("w", modifiers: [.command])
-      .disabled(appState.documentSession.document == nil)
+      .disabled(!appState.documentSession.hasEditableBuffer)
     }
 
     // Mode menu - editor modes and reading preferences
@@ -91,7 +106,7 @@ struct PensieveCommands: Commands {
         appState.requestPreviewRefresh()
       }
       .keyboardShortcut("r", modifiers: [.command])
-      .disabled(appState.documentSession.document == nil)
+      .disabled(!appState.documentSession.hasEditableBuffer)
 
       Button(appState.previewAutoReload ? "Pause Auto Reload" : "Resume Auto Reload") {
         appState.previewAutoReload.toggle()
@@ -106,49 +121,49 @@ struct PensieveCommands: Commands {
           controller.applyMarkdownFormat(.bold)
         }
         .keyboardShortcut("b", modifiers: [.command])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Italic") {
           controller.applyMarkdownFormat(.italic)
         }
         .keyboardShortcut("i", modifiers: [.command])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Strikethrough") {
           controller.applyMarkdownFormat(.strike)
         }
         .keyboardShortcut("x", modifiers: [.command, .shift])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Quote") {
           controller.applyMarkdownFormat(.quote)
         }
         .keyboardShortcut("'", modifiers: [.command])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Code") {
           controller.applyMarkdownFormat(.code)
         }
         .keyboardShortcut("`", modifiers: [.command])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Link") {
           controller.applyMarkdownFormat(.link)
         }
         .keyboardShortcut("k", modifiers: [.command])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Bulleted List") {
           controller.applyMarkdownFormat(.bulletedList)
         }
         .keyboardShortcut("8", modifiers: [.command, .shift])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
 
         Button("Numbered List") {
           controller.applyMarkdownFormat(.numberedList)
         }
         .keyboardShortcut("7", modifiers: [.command, .shift])
-        .disabled(appState.documentSession.document == nil)
+        .disabled(!appState.documentSession.hasEditableBuffer)
       }
 
       Divider()
@@ -170,15 +185,23 @@ struct PensieveCommands: Commands {
     }
   }
 
-  private func createNewFile() {
+  private func saveActiveDocument() {
+    if appState.documentSession.isUntitled {
+      saveActiveDocumentAs()
+    } else {
+      controller.saveActiveDocument()
+    }
+  }
+
+  private func saveActiveDocumentAs() {
     let panel = NSSavePanel()
     panel.allowedContentTypes = markdownContentTypes
     panel.canCreateDirectories = true
     panel.directoryURL = defaultNewFileDirectory()
-    panel.nameFieldStringValue = uniqueNewFileName(in: panel.directoryURL)
-    panel.prompt = "Create"
+    panel.nameFieldStringValue = defaultSaveFileName(in: panel.directoryURL)
+    panel.prompt = "Save"
     if panel.runModal() == .OK, let url = panel.url {
-      controller.createMarkdownFile(url: url)
+      controller.saveActiveDocument(as: url)
     }
   }
 
@@ -237,11 +260,16 @@ struct PensieveCommands: Commands {
     return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
   }
 
-  private func uniqueNewFileName(in directory: URL?) -> String {
-    guard let directory else { return "Untitled.md" }
+  private func defaultSaveFileName(in directory: URL?) -> String {
+    if let url = appState.documentSession.url {
+      return url.lastPathComponent
+    }
+    guard let directory else { return appState.documentSession.displayTitle }
 
     let fm = FileManager.default
-    let base = "Untitled"
+    let base = appState.documentSession.displayTitle
+      .replacingOccurrences(of: ".md", with: "")
+      .replacingOccurrences(of: ".markdown", with: "")
     let ext = "md"
     var candidate = "\(base).\(ext)"
     var index = 2

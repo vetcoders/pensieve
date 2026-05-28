@@ -65,6 +65,18 @@ final class AppController: ObservableObject {
     return folderManager.createMarkdownFile(at: url, into: appState)
   }
 
+  @discardableResult
+  func createUntitledDocument() -> Bool {
+    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
+      return false
+    }
+
+    appState.documentSession.createUntitled()
+    appState.selectedDocumentID = nil
+    appState.lastError = nil
+    return true
+  }
+
   func restoreLastFolder() {
     folderManager.restoreLastFolder(into: appState)
   }
@@ -79,6 +91,22 @@ final class AppController: ObservableObject {
 
   func saveActiveDocument() {
     documentStore.save(appState: appState)
+  }
+
+  @discardableResult
+  func saveActiveDocument(as url: URL) -> Bool {
+    let didSave = documentStore.saveAs(appState: appState, to: url)
+    if didSave, let savedURL = appState.documentSession.url,
+      appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(savedURL, in: $0.url) })
+    {
+      folderManager.refresh(into: appState)
+    }
+    return didSave
+  }
+
+  @discardableResult
+  func applicationShouldTerminate() -> Bool {
+    documentStore.prepareForDocumentSwitch(appState: appState)
   }
 
   /// Closes the active document session without exiting Pensieve.
@@ -169,7 +197,7 @@ final class AppController: ObservableObject {
   // MARK: - Toolbar Actions
 
   func applyMarkdownFormat(_ format: MarkdownFormat) {
-    guard appState.documentSession.document != nil else { return }
+    guard appState.documentSession.hasEditableBuffer else { return }
     appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(format: format)
   }
 

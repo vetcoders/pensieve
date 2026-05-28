@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct ContentView: View {
   @EnvironmentObject private var appState: AppState
@@ -12,14 +11,17 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       VStack(spacing: 0) {
-        if !appState.documentTabs.isEmpty {
+        if !appState.documentTabs.isEmpty || appState.documentSession.isUntitled {
           DocumentTabStrip()
           Divider()
         }
         EditorPreviewSplit()
       }
     }
-    .navigationTitle(appState.selectedDocument?.title ?? "Pensieve")
+    .navigationTitle(
+      appState.documentSession.hasEditableBuffer
+        ? appState.documentSession.displayTitle : "Pensieve"
+    )
     .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
     .toolbar {
       EditorToolbelt(
@@ -38,12 +40,16 @@ struct DocumentTabStrip: View {
   var body: some View {
     ScrollView(.horizontal, showsIndicators: false) {
       HStack(spacing: 0) {
+        if appState.documentSession.isUntitled {
+          untitledTabButton()
+        }
+
         ForEach(appState.documentTabs) { tab in
           tabButton(tab)
         }
 
         Button {
-          createNewFile()
+          controller.createUntitledDocument()
         } label: {
           Image(systemName: "plus")
             .font(.system(size: 13, weight: .semibold))
@@ -100,53 +106,38 @@ struct DocumentTabStrip: View {
       .fill(isSelected ? Color(NSColor.windowBackgroundColor) : Color.clear)
   }
 
-  private func createNewFile() {
-    let panel = NSSavePanel()
-    panel.allowedContentTypes = markdownContentTypes
-    panel.canCreateDirectories = true
-    panel.directoryURL = defaultNewFileDirectory
-    panel.nameFieldStringValue = uniqueNewFileName(in: panel.directoryURL)
-    panel.prompt = "Create"
-    if panel.runModal() == .OK, let url = panel.url {
-      controller.createMarkdownFile(url: url)
+  private func untitledTabButton() -> some View {
+    let isDirty = appState.activeDocumentDirty
+
+    return HStack(spacing: 6) {
+      Text(
+        isDirty
+          ? "\(appState.documentSession.displayTitle) *" : appState.documentSession.displayTitle
+      )
+      .font(.system(size: 12, weight: .semibold))
+      .lineLimit(1)
+      .truncationMode(.middle)
+
+      Button {
+        controller.closeActiveDocument()
+      } label: {
+        Image(systemName: "xmark")
+          .font(.system(size: 9, weight: .semibold))
+          .foregroundStyle(.secondary)
+      }
+      .buttonStyle(.plain)
+      .help("Close Tab")
     }
-  }
-
-  private var markdownContentTypes: [UTType] {
-    [
-      UTType(filenameExtension: "md"),
-      UTType(filenameExtension: "markdown"),
-    ].compactMap { $0 }
-  }
-
-  private var defaultNewFileDirectory: URL? {
-    if let activeURL = appState.documentSession.url {
-      return activeURL.deletingLastPathComponent()
+    .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
+    .padding(.horizontal, 8)
+    .background(tabBackground(true))
+    .overlay(alignment: .trailing) {
+      Rectangle()
+        .fill(Color(NSColor.separatorColor))
+        .frame(width: 1)
     }
-    if let rootURL = appState.workspaceRoots.first?.url {
-      return rootURL
-    }
-    if let openFileURL = appState.openFiles.first?.url {
-      return openFileURL.deletingLastPathComponent()
-    }
-    return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-  }
-
-  private func uniqueNewFileName(in directory: URL?) -> String {
-    guard let directory else { return "Untitled.md" }
-
-    let fm = FileManager.default
-    let base = "Untitled"
-    let ext = "md"
-    var candidate = "\(base).\(ext)"
-    var index = 2
-
-    while fm.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
-      candidate = "\(base) \(index).\(ext)"
-      index += 1
-    }
-
-    return candidate
+    .contentShape(Rectangle())
+    .help(appState.documentSession.displayTitle)
   }
 }
 
@@ -170,7 +161,7 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    if appState.documentSession.document == nil {
+    if !appState.documentSession.hasEditableBuffer {
       DocumentEmptyStateView(
         hasWorkspace: appState.hasWorkspaceContent,
         activity: appState.workspaceActivity

@@ -68,6 +68,41 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testMarkdownEditorSurfaceHighlightsCommonMarkdownGaps() {
+    let text = """
+      - unordered
+      1. ordered
+      - [x] done
+      ~~removed~~
+      ---
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+
+    let unorderedMarker = nsText.range(of: "- unordered")
+    let orderedMarker = nsText.range(of: "1. ordered")
+    let taskMarker = nsText.range(of: "- [x]")
+    let strikeRange = nsText.range(of: "~~removed~~")
+
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: unorderedMarker.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemBlue)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: orderedMarker.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemBlue)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: taskMarker.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemBlue)
+    XCTAssertEqual(
+      storage.attribute(.strikethroughStyle, at: strikeRange.location, effectiveRange: nil) as? Int,
+      NSUnderlineStyle.single.rawValue)
+  }
+
+  @MainActor
   func testMarkdownEditorSurfaceCanDisableSyntaxColors() {
     let surface = MarkdownEditorSurface(
       text: "# Heading\n\n`code`", fontSize: 14, syntaxHighlightingEnabled: false)
@@ -84,6 +119,77 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
       NSColor.systemPink)
+  }
+
+  @MainActor
+  func testPreviewAutoReloadDefaultsOffButPreservesStoredPreference() {
+    let suiteName = "PensievePreviewDefaultsTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    XCTAssertFalse(AppState(defaults: defaults).previewAutoReload)
+
+    defaults.set(true, forKey: "Pensieve.previewAutoReload")
+
+    XCTAssertTrue(AppState(defaults: defaults).previewAutoReload)
+  }
+
+  @MainActor
+  func testPreviewAutoReloadOffGatesTypingUpdatesFromPipeline() {
+    let themeManager = ThemeManager()
+    let coordinator = PreviewRepresentable.Coordinator(themeManager: themeManager)
+    let sink = RecordingPreviewSink()
+    coordinator.pipeline.attach(sink: sink)
+
+    let initial = PreviewRenderRequest(
+      markdown: "before",
+      fontSize: 14,
+      theme: .markdown,
+      documentURL: nil
+    )
+    let typed = PreviewRenderRequest(
+      markdown: "after typing",
+      fontSize: 14,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    coordinator.submit(request: initial, autoReload: false, initial: true)
+    coordinator.submit(request: typed, autoReload: false, initial: false)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+
+    XCTAssertEqual(coordinator.pipeline.lastApplied?.markdown, "before")
+    XCTAssertEqual(sink.loadedDocuments.count, 1)
+  }
+
+  @MainActor
+  func testPreviewAutoReloadOnAppliesTypingUpdatesAfterDebounce() {
+    let themeManager = ThemeManager()
+    let coordinator = PreviewRepresentable.Coordinator(themeManager: themeManager)
+    let sink = RecordingPreviewSink()
+    coordinator.pipeline.attach(sink: sink)
+
+    let initial = PreviewRenderRequest(
+      markdown: "before",
+      fontSize: 14,
+      theme: .markdown,
+      documentURL: nil
+    )
+    let typed = PreviewRenderRequest(
+      markdown: "after typing",
+      fontSize: 14,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    coordinator.submit(request: initial, autoReload: true, initial: true)
+    coordinator.submit(request: typed, autoReload: true, initial: false)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.55))
+
+    XCTAssertEqual(coordinator.pipeline.lastApplied?.markdown, "after typing")
+    XCTAssertEqual(sink.loadedDocuments.count, 2)
   }
 
   @MainActor
@@ -172,12 +278,59 @@ final class PensieveSmokeTests: XCTestCase {
     appState.activeDocumentDirty = true
     controller.documentDidChange()
 
-    try await Task.sleep(nanoseconds: 700_000_000)
+    try await Task.sleep(nanoseconds: 1_800_000_000)
 
     XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "changed")
     XCTAssertFalse(appState.activeDocumentDirty)
 
     BookmarkStore.shared.clear(into: appState)
+  }
+
+  @MainActor
+  func testBurstTypingCoalescesAutosaveAndIndexUpdate() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveBurstAutosaveTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("burst.md")
+    try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "initial")
+
+    var saveCount = 0
+    var indexCount = 0
+    let autosaver = Autosaver(saveDelayMilliseconds: 50, indexDelayMilliseconds: 140)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      writeDocument: { text, url in
+        saveCount += 1
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      },
+      indexDocument: { _, _, _ in
+        indexCount += 1
+      }
+    )
+
+    for character in ["a", "b", "c", "d", "e"] {
+      appState.activeDocumentText += character
+      store.documentDidChange(appState: appState)
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    try await Task.sleep(nanoseconds: 80_000_000)
+    XCTAssertEqual(saveCount, 1)
+    XCTAssertEqual(indexCount, 0)
+
+    try await Task.sleep(nanoseconds: 110_000_000)
+    XCTAssertEqual(saveCount, 1)
+    XCTAssertEqual(indexCount, 1)
   }
 
   @MainActor
@@ -915,6 +1068,123 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testControllerCreatesUntitledDocumentWithoutWritingAFile() {
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: DocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory))
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertNil(appState.documentSession.url)
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
+    XCTAssertEqual(appState.activeDocumentText, "")
+    XCTAssertFalse(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testUntitledDocumentSaveAsWritesFileAndSwitchesSession() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveUntitledSaveAsTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: DocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        bookmarkStore: temporaryBookmarkStore()
+      )
+    )
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "untitled body"
+    appState.activeDocumentDirty = true
+
+    let savedURL = folder.appendingPathComponent("saved-untitled.md")
+
+    XCTAssertTrue(controller.saveActiveDocument(as: savedURL))
+    XCTAssertEqual(try String(contentsOf: savedURL, encoding: .utf8), "untitled body")
+    XCTAssertFalse(appState.documentSession.isUntitled)
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, savedURL.standardizedFileURL)
+    XCTAssertFalse(appState.activeDocumentDirty)
+    XCTAssertTrue(
+      appState.openFiles.contains { $0.url.standardizedFileURL == savedURL.standardizedFileURL })
+  }
+
+  @MainActor
+  func testDirtyUntitledDocumentCanCancelTerminationPrompt() {
+    let appState = AppState()
+    var prompted = false
+    let documentStore = DocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+      dirtyUntitledPrompt: { session in
+        prompted = session.isUntitled
+        return .cancel
+      }
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "please keep me"
+    appState.activeDocumentDirty = true
+
+    XCTAssertFalse(controller.applicationShouldTerminate())
+    XCTAssertTrue(prompted)
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testSaveAsRegularDocumentCreatesCopyAndSwitchesSession() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRegularSaveAsTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let originalURL = folder.appendingPathComponent("original.md")
+    let copyURL = folder.appendingPathComponent("copy.md")
+    try "original body".write(to: originalURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let documentStore = DocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore()
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore
+    )
+    documentStore.load(ref: DocumentRef(id: originalURL.standardizedFileURL), into: appState)
+    appState.activeDocumentText = "copy body"
+    appState.activeDocumentDirty = true
+
+    XCTAssertTrue(controller.saveActiveDocument(as: copyURL))
+
+    XCTAssertEqual(try String(contentsOf: originalURL, encoding: .utf8), "original body")
+    XCTAssertEqual(try String(contentsOf: copyURL, encoding: .utf8), "copy body")
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, copyURL.standardizedFileURL)
+    XCTAssertFalse(appState.activeDocumentDirty)
+    XCTAssertTrue(
+      appState.openFiles.contains { $0.url.standardizedFileURL == copyURL.standardizedFileURL })
+  }
+
+  @MainActor
   func testControllerCreateMarkdownFileRefusesToOverwriteExistingFile() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveCreateExistingTests-\(UUID().uuidString)", isDirectory: true)
@@ -1329,5 +1599,21 @@ final class PensieveSmokeTests: XCTestCase {
   @MainActor
   private func temporaryIndexDatabase(in folder: URL) -> IndexDatabase {
     IndexDatabase(databaseURL: folder.appendingPathComponent("index.db", isDirectory: false))
+  }
+
+  @MainActor
+  private func temporaryBookmarkStore() -> BookmarkStore {
+    let suiteName = "PensieveBookmarkStoreTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    return BookmarkStore(defaults: defaults)
+  }
+}
+
+private final class RecordingPreviewSink: PreviewSink {
+  var loadedDocuments: [PreviewDocument] = []
+
+  func load(document: PreviewDocument) {
+    loadedDocuments.append(document)
   }
 }

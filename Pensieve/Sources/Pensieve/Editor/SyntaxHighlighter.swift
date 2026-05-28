@@ -18,6 +18,7 @@ class SyntaxHighlighter {
     textStorage.removeAttribute(.foregroundColor, range: targetRange)
     textStorage.removeAttribute(.backgroundColor, range: targetRange)
     textStorage.removeAttribute(.underlineStyle, range: targetRange)
+    textStorage.removeAttribute(.strikethroughStyle, range: targetRange)
 
     textStorage.addAttribute(.font, value: baseFont, range: targetRange)
     textStorage.addAttribute(.foregroundColor, value: baseColor, range: targetRange)
@@ -43,6 +44,39 @@ class SyntaxHighlighter {
         .foregroundColor: NSColor.secondaryLabelColor
       ])
 
+    // Horizontal rules: ---, ***, or ___ on their own line
+    highlightRegex(
+      #"(?m)^\s{0,3}([-*_])(?:\s*\1){2,}\s*$"#, in: string, storage: textStorage,
+      targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.separatorColor
+      ])
+
+    // Task list checkboxes: - [ ] / - [x]
+    highlightRegex(
+      #"(?m)^\s{0,3}[-*+]\s+\[[ xX]\]"#, in: string, storage: textStorage,
+      targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.systemBlue,
+        .font: NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .semibold),
+      ])
+
+    // Unordered and ordered list markers
+    highlightRegex(
+      #"(?m)^\s{0,3}[-*+](?=\s+)"#, in: string, storage: textStorage,
+      targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.systemBlue,
+        .font: NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .semibold),
+      ])
+    highlightRegex(
+      #"(?m)^\s{0,3}\d+\.(?=\s+)"#, in: string, storage: textStorage,
+      targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.systemBlue,
+        .font: NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .semibold),
+      ])
+
     // Headings: ^# text
     let headingRegex = try! NSRegularExpression(pattern: "(?m)^#{1,6}\\s+.*$", options: [])
     headingRegex.enumerateMatches(in: string as String, options: [], range: targetRange) {
@@ -62,6 +96,14 @@ class SyntaxHighlighter {
       "\\*\\*.*?\\*\\*|__.*?__", in: string, storage: textStorage, targetRange: targetRange,
       attributes: [
         .font: boldFont
+      ])
+
+    // Strikethrough: ~~text~~
+    highlightRegex(
+      "~~[^~\n]+~~", in: string, storage: textStorage, targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.systemOrange,
+        .strikethroughStyle: NSUnderlineStyle.single.rawValue,
       ])
 
     // Italic: *text* or _text_ (basic regex)

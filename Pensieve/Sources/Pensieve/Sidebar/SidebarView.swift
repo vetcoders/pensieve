@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct SidebarView: View {
   @EnvironmentObject private var appState: AppState
@@ -41,7 +40,7 @@ struct SidebarView: View {
         Spacer(minLength: 8)
 
         Button {
-          createNewFile(in: defaultNewFileDirectory)
+          controller.createUntitledDocument()
         } label: {
           Image(systemName: "square.and.pencil")
         }
@@ -81,7 +80,7 @@ struct SidebarView: View {
         .font(.caption)
         .foregroundColor(.secondary)
       Button("New File…") {
-        createNewFile(in: defaultNewFileDirectory)
+        controller.createUntitledDocument()
       }
       .accessibilityIdentifier("pensieve.sidebar.emptyState.newFile")
       Spacer()
@@ -375,8 +374,8 @@ struct SidebarView: View {
         }
       }
     } else if let url = node.url {
-      Button("New File in Folder…") {
-        createNewFile(in: url)
+      Button("New File…") {
+        controller.createUntitledDocument()
       }
 
       Divider()
@@ -457,55 +456,6 @@ struct SidebarView: View {
       return "Workspace"
     }
     return "Pensieve"
-  }
-
-  private var defaultNewFileDirectory: URL? {
-    if let activeURL = appState.documentSession.url {
-      return activeURL.deletingLastPathComponent()
-    }
-    if let rootURL = appState.workspaceRoots.first?.url {
-      return rootURL
-    }
-    if let openFileURL = appState.openFiles.first?.url {
-      return openFileURL.deletingLastPathComponent()
-    }
-    return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-  }
-
-  private func createNewFile(in directory: URL?) {
-    let panel = NSSavePanel()
-    panel.allowedContentTypes = markdownContentTypes
-    panel.canCreateDirectories = true
-    panel.directoryURL = directory
-    panel.nameFieldStringValue = uniqueNewFileName(in: directory)
-    panel.prompt = "Create"
-    if panel.runModal() == .OK, let url = panel.url {
-      controller.createMarkdownFile(url: url)
-    }
-  }
-
-  private var markdownContentTypes: [UTType] {
-    [
-      UTType(filenameExtension: "md"),
-      UTType(filenameExtension: "markdown"),
-    ].compactMap { $0 }
-  }
-
-  private func uniqueNewFileName(in directory: URL?) -> String {
-    guard let directory else { return "Untitled.md" }
-
-    let fm = FileManager.default
-    let base = "Untitled"
-    let ext = "md"
-    var candidate = "\(base).\(ext)"
-    var index = 2
-
-    while fm.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
-      candidate = "\(base) \(index).\(ext)"
-      index += 1
-    }
-
-    return candidate
   }
 
   private func isSelectedOrHovered(_ id: DocumentRef.ID) -> Bool {

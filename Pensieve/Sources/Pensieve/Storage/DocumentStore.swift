@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class FolderManager {
@@ -547,14 +549,46 @@ private struct WorkspaceDirectoryEntry: Sendable {
 
 @MainActor
 final class DocumentStore {
+  enum DirtyUntitledResponse {
+    case save
+    case discard
+    case cancel
+  }
+
   static let shared = DocumentStore()
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
+  private let bookmarkStore: BookmarkStore
+  private let writeDocument: (String, URL) throws -> Void
+  private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
+  private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> DirtyUntitledResponse
+  private let savePanelURLProvider: @MainActor (AppState) -> URL?
   private weak var appState: AppState?
 
-  init(autosaver: Autosaver? = nil, indexDatabase: IndexDatabase? = nil) {
+  init(
+    autosaver: Autosaver? = nil,
+    indexDatabase: IndexDatabase? = nil,
+    bookmarkStore: BookmarkStore? = nil,
+    writeDocument: ((String, URL) throws -> Void)? = nil,
+    indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
+    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
+    savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil
+  ) {
+    let resolvedIndexDatabase = indexDatabase ?? .shared
     self.autosaver = autosaver ?? .shared
-    self.indexDatabase = indexDatabase ?? .shared
+    self.indexDatabase = resolvedIndexDatabase
+    self.bookmarkStore = bookmarkStore ?? .shared
+    self.writeDocument =
+      writeDocument ?? { text, url in
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    self.indexDocument =
+      indexDocument
+      ?? { ref, body, appState in
+        resolvedIndexDatabase.index(document: ref, body: body, appState: appState)
+      }
+    self.dirtyUntitledPrompt = dirtyUntitledPrompt ?? Self.promptForDirtyUntitledSession
+    self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -603,32 +637,45 @@ final class DocumentStore {
   }
 
   func save(appState: AppState) {
+    _ = saveExisting(appState: appState, indexNow: true)
+  }
+
+  @discardableResult
+  func saveAs(appState: AppState, to url: URL) -> Bool {
     self.appState = appState
     autosaver.cancel()
 
-    guard let url = appState.documentSession.url else { return }
-    let ref = documentRef(for: url, appState: appState)
+    guard appState.documentSession.hasEditableBuffer else { return false }
+    let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
+    let previousID = appState.documentSession.id
 
     do {
-      try appState.documentSession.text.write(to: url, atomically: true, encoding: .utf8)
+      try FileManager.default.createDirectory(
+        at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try writeDocument(appState.documentSession.text, targetURL)
+      let ref = documentRef(for: targetURL, appState: appState)
+      registerSavedDocument(ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       appState.lastError = nil
-      indexDatabase.index(document: ref, body: appState.documentSession.text, appState: appState)
+      indexDocument(ref, appState.documentSession.text, appState)
+      return true
     } catch {
-      let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
+      let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
       appState.lastError = message
       NSLog(message)
+      return false
     }
   }
 
   func documentDidChange(appState: AppState) {
     self.appState = appState
-    guard appState.documentSession.document != nil else {
+    guard appState.documentSession.hasEditableBuffer else {
       return
     }
     appState.documentSession.isDirty = true
     scheduleAutosave(appState: appState)
+    scheduleIndexUpdate(appState: appState)
   }
 
   @discardableResult
@@ -642,9 +689,21 @@ final class DocumentStore {
       return
     }
 
-    autosaver.schedule { [weak self, weak appState] in
+    autosaver.scheduleSave { [weak self, weak appState] in
       guard let appState else { return }
-      self?.save(appState: appState)
+      self?.saveExisting(appState: appState, indexNow: false)
+    }
+  }
+
+  private func scheduleIndexUpdate(appState: AppState) {
+    guard appState.documentSession.document != nil else {
+      autosaver.cancelIndex()
+      return
+    }
+
+    autosaver.scheduleIndex { [weak self, weak appState] in
+      guard let self, let appState, let ref = appState.documentSession.document else { return }
+      self.indexDocument(ref, appState.documentSession.text, appState)
     }
   }
 
@@ -653,8 +712,21 @@ final class DocumentStore {
       return true
     }
 
+    if appState.documentSession.isUntitled {
+      switch dirtyUntitledPrompt(appState.documentSession) {
+      case .save:
+        guard let url = savePanelURLProvider(appState) else { return false }
+        return saveAs(appState: appState, to: url)
+      case .discard:
+        appState.documentSession.isDirty = false
+        return true
+      case .cancel:
+        return false
+      }
+    }
+
     let openSessionID = appState.documentSession.id
-    save(appState: appState)
+    _ = saveExisting(appState: appState, indexNow: true)
     guard !appState.documentSession.isDirty else {
       appState.selectedDocumentID = openSessionID
       return false
@@ -669,6 +741,115 @@ final class DocumentStore {
     }) {
       return existing
     }
-    return DocumentRef(id: standardizedURL, isAdHoc: appState.workspaceRoots.isEmpty)
+    return appState.makeDocumentRef(for: standardizedURL)
+  }
+
+  @discardableResult
+  private func saveExisting(appState: AppState, indexNow: Bool) -> Bool {
+    self.appState = appState
+    autosaver.cancelSave()
+
+    guard let url = appState.documentSession.url else { return false }
+    let ref = documentRef(for: url, appState: appState)
+
+    do {
+      try writeDocument(appState.documentSession.text, url)
+      registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
+      appState.documentSession.document = ref
+      appState.documentSession.isDirty = false
+      appState.lastError = nil
+      if indexNow {
+        autosaver.cancelIndex()
+        indexDocument(ref, appState.documentSession.text, appState)
+      }
+      return true
+    } catch {
+      let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
+      appState.lastError = message
+      NSLog(message)
+      return false
+    }
+  }
+
+  private func registerSavedDocument(
+    _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState
+  ) {
+    let isNewSessionURL = previousID?.standardizedFileURL != ref.id.standardizedFileURL
+
+    if ref.isAdHoc {
+      if !appState.openFiles.contains(where: {
+        $0.id.standardizedFileURL == ref.id.standardizedFileURL
+      }
+      ) {
+        appState.openFiles.append(ref)
+      }
+      if isNewSessionURL {
+        do {
+          try bookmarkStore.persistFile(url: ref.url, into: appState)
+        } catch {
+          appState.lastError =
+            "Could not persist bookmark for \(ref.url.lastPathComponent): \(error.localizedDescription)"
+        }
+      }
+    } else if !appState.documents.contains(where: {
+      $0.id.standardizedFileURL == ref.id.standardizedFileURL
+    }) {
+      appState.documents.append(ref)
+    }
+
+    if let previousID, isNewSessionURL {
+      appState.forgetDocumentTab(id: previousID)
+    }
+    appState.selectedDocumentID = ref.id
+    appState.rememberDocumentTab(ref)
+  }
+
+  private static func promptForDirtyUntitledSession(
+    _ session: DocumentSession
+  ) -> DirtyUntitledResponse {
+    let alert = NSAlert()
+    alert.messageText = "Do you want to save changes to \(session.displayTitle)?"
+    alert.informativeText = "Your changes will be lost if you don't save them."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Save")
+    alert.addButton(withTitle: "Don't Save")
+    alert.addButton(withTitle: "Cancel")
+
+    switch alert.runModal() {
+    case .alertFirstButtonReturn:
+      return .save
+    case .alertSecondButtonReturn:
+      return .discard
+    default:
+      return .cancel
+    }
+  }
+
+  private static func promptForSaveURL(appState: AppState) -> URL? {
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+    ].compactMap { $0 }
+    panel.canCreateDirectories = true
+    panel.directoryURL = defaultSaveDirectory(appState: appState)
+    panel.nameFieldStringValue =
+      appState.documentSession.displayTitle.isEmpty
+      ? "Untitled.md" : appState.documentSession.displayTitle
+    panel.prompt = "Save"
+    return panel.runModal() == .OK ? panel.url : nil
+  }
+
+  private static func defaultSaveDirectory(appState: AppState) -> URL? {
+    if let activeURL = appState.documentSession.url {
+      return activeURL.deletingLastPathComponent()
+    }
+    if let rootURL = appState.workspaceRoots.first?.url {
+      return rootURL
+    }
+    if let openFileURL = appState.openFiles.first?.url {
+      return openFileURL.deletingLastPathComponent()
+    }
+    return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
   }
 }
