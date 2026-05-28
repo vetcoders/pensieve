@@ -10,18 +10,21 @@ final class FolderManager {
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
   private let workspaceBuilder: WorkspaceScanner.Builder
+  private let workspaceSubstrate: WorkspaceSubstrate
   private var workspaceBuildTask: Task<Void, Never>?
 
   init(
     metadataStore: WorkspaceMetadataStore = .shared,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
-    workspaceBuilder: WorkspaceScanner.Builder? = nil
+    workspaceBuilder: WorkspaceScanner.Builder? = nil,
+    workspaceSubstrate: WorkspaceSubstrate = .shared
   ) {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.defaultBuilder
+    self.workspaceSubstrate = workspaceSubstrate
   }
 
   func open(url: URL, into appState: AppState) {
@@ -183,11 +186,23 @@ final class FolderManager {
 
   private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
     workspaceBuildTask?.cancel()
-    appState.workspaceActivity = .scanning(workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs))
+    let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
+    let metadata = metadataStore.load()
+    let exclusions = Set(metadata.excludedPaths)
+    if attemptHotReopen(rootURLs: rootURLs, exclusions: exclusions, into: appState) {
+      return
+    }
+
+    appState.workspaceActivity = .scanning(label)
     indexDatabase.open(into: appState)
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     rebuildWorkspace(into: appState)
+    commitWorkspaceManifest(
+      rootURLs: rootURLs,
+      exclusions: appState.excludedWorkspacePaths,
+      into: appState
+    )
     selectRestoredDocument(previousSelection: previousSelection, into: appState)
     startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
     appState.workspaceActivity = nil
@@ -197,18 +212,25 @@ final class FolderManager {
     rootURLs: [URL], fileURLs: [URL], into appState: AppState
   ) {
     workspaceBuildTask?.cancel()
+    let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
+    let metadata = metadataStore.load()
+    let exclusions = Set(metadata.excludedPaths)
+    if attemptHotReopen(rootURLs: rootURLs, exclusions: exclusions, into: appState) {
+      return
+    }
+
     indexDatabase.open(into: appState)
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
-    appState.workspaceActivity = .scanning(workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs))
+    appState.workspaceActivity = .scanning(label)
 
     let expectedRootPaths = appState.workspaceRoots.map { $0.url.standardizedFileURL.path }
     let expectedOpenFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
     let roots = appState.workspaceRoots.map(\.url)
-    let exclusions = appState.excludedWorkspacePaths
+    let scanExclusions = appState.excludedWorkspacePaths
     let workspaceBuilder = workspaceBuilder
     let scanTask = Task.detached(priority: .userInitiated) {
-      workspaceBuilder(roots, exclusions)
+      workspaceBuilder(roots, scanExclusions)
     }
 
     workspaceBuildTask = Task { [weak self, weak appState] in
@@ -225,6 +247,11 @@ final class FolderManager {
       }
 
       self.applyWorkspaceScans(scans, into: appState)
+      self.commitWorkspaceManifest(
+        rootURLs: appState.workspaceRoots.map(\.url),
+        exclusions: appState.excludedWorkspacePaths,
+        into: appState
+      )
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       appState.workspaceActivity = .indexing(documentCount: appState.allDocuments.count)
@@ -232,6 +259,64 @@ final class FolderManager {
         documents: appState.allDocuments, appState: appState)
       guard !Task.isCancelled else { return }
       appState.workspaceActivity = nil
+    }
+  }
+
+  private func attemptHotReopen(
+    rootURLs: [URL], exclusions: Set<String>, into appState: AppState
+  ) -> Bool {
+    let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
+    appState.workspaceActivity = .checkingCache(label)
+
+    guard rootURLs.count == 1 else {
+      appState.lastError = "Could not open cached workspace: multi-root not supported in B-1b"
+      appState.workspaceActivity = nil
+      return true
+    }
+
+    let identity = WorkspaceIdentity.make(
+      rootURL: rootURLs[0],
+      bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
+    )
+
+    do {
+      let verdict = try workspaceSubstrate.open(
+        identity: identity,
+        currentRoots: rootURLs,
+        currentExclusions: exclusions
+      )
+      switch verdict {
+      case .valid:
+        appState.workspaceActivity = .cacheHit(label)
+        let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
+        let openFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
+        guard
+          matchesCurrentWorkspace(
+            rootPaths: rootPaths,
+            openFilePaths: openFilePaths,
+            in: appState
+          ),
+          !appState.workspaceTree.isEmpty
+        else {
+          appState.workspaceActivity = .cacheMiss(label)
+          return false
+        }
+        indexDatabase.open(into: appState)
+        startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
+        appState.lastError = nil
+        appState.workspaceActivity = nil
+        return true
+      case .accessDenied(let reason):
+        appState.lastError = "Could not open cached workspace: \(reason)"
+        appState.workspaceActivity = nil
+        return true
+      case .missing, .stale, .incompatibleSchema, .corrupted:
+        appState.workspaceActivity = .cacheMiss(label)
+        return false
+      }
+    } catch {
+      appState.workspaceActivity = .cacheMiss(label)
+      return false
     }
   }
 
@@ -252,6 +337,28 @@ final class FolderManager {
       appState.workspaceRoots.map(\.url), appState.excludedWorkspacePaths)
     applyWorkspaceScans(scans, into: appState)
     indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
+  }
+
+  private func commitWorkspaceManifest(
+    rootURLs: [URL], exclusions: Set<String>, into appState: AppState
+  ) {
+    guard rootURLs.count == 1 else { return }
+    let identity = WorkspaceIdentity.make(
+      rootURL: rootURLs[0],
+      bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
+    )
+    do {
+      let fingerprint = try TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
+      _ = try workspaceSubstrate.commit(
+        identity: identity,
+        roots: rootURLs,
+        exclusions: exclusions,
+        fingerprint: fingerprint
+      )
+    } catch {
+      try? workspaceSubstrate.markFailure(identity: identity, kind: "manifestCommitFailed")
+      appState.lastError = "Could not update workspace cache: \(error.localizedDescription)"
+    }
   }
 
   private func applyWorkspaceScans(_ scans: [WorkspaceScan], into appState: AppState) {

@@ -514,6 +514,189 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testFolderManagerHotReopenSkipsScannerWhenCacheValid() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveHotReopenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("cached.md")
+    try "cached body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let buildCounter = BuildCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      buildCounter.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      workspaceSubstrate: WorkspaceSubstrate(store: store)
+    )
+
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(buildCounter.value, 1)
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+
+    manager.open(url: folder, into: appState)
+
+    XCTAssertEqual(buildCounter.value, 1)
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+    XCTAssertNil(appState.workspaceActivity)
+  }
+
+  @MainActor
+  func testFolderManagerCommitsManifestAfterColdScan() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveColdManifestTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    try "manifest body".write(
+      to: folder.appendingPathComponent("manifest.md"), atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: WorkspaceSubstrate(store: store)
+    )
+
+    manager.open(url: folder, into: appState)
+
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: appState.bookmarkData)
+    let manifest = try XCTUnwrap(try store.readManifest(for: identity))
+    let current = try TreeFingerprint.compute(rootURL: folder, exclusions: [])
+    XCTAssertEqual(manifest.workspaceID, identity.workspaceID)
+    XCTAssertEqual(manifest.treeFingerprint.treeHash, current.treeHash)
+  }
+
+  @MainActor
+  func testFolderManagerFallsBackToColdScanOnFileEvidenceChange() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveFileEvidenceTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("evidence.md")
+    try "before".write(
+      to: noteURL, atomically: true, encoding: .utf8)
+
+    let buildCounter = BuildCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      buildCounter.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      workspaceSubstrate: WorkspaceSubstrate(
+        store: WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory()))
+    )
+
+    manager.open(url: folder, into: appState)
+    try "after with more bytes".write(to: noteURL, atomically: true, encoding: .utf8)
+    manager.open(url: folder, into: appState)
+
+    XCTAssertEqual(buildCounter.value, 2)
+  }
+
+  @MainActor
+  func testFolderManagerFallsBackToColdScanOnExclusionsChange() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveExclusionReopenTests-\(UUID().uuidString)", isDirectory: true
+      )
+    let drafts = folder.appendingPathComponent("Drafts", isDirectory: true)
+    try FileManager.default.createDirectory(at: drafts, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    try "keep".write(
+      to: folder.appendingPathComponent("keep.md"), atomically: true, encoding: .utf8)
+    try "skip".write(
+      to: drafts.appendingPathComponent("skip.md"), atomically: true, encoding: .utf8)
+
+    let buildCounter = BuildCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      buildCounter.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let metadataStore = temporaryMetadataStore()
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let manager = FolderManager(
+      metadataStore: metadataStore,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      workspaceSubstrate: WorkspaceSubstrate(store: store)
+    )
+
+    manager.open(url: folder, into: appState)
+    try metadataStore.save(WorkspaceMetadata(excludedPaths: ["Drafts"]))
+    manager.open(url: folder, into: appState)
+
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: appState.bookmarkData)
+    let manifest = try XCTUnwrap(try store.readManifest(for: identity))
+    XCTAssertEqual(buildCounter.value, 2)
+    XCTAssertEqual(manifest.exclusions, ["Drafts"])
+    XCTAssertEqual(appState.documents.map(\.relativePath), ["keep.md"])
+  }
+
+  @MainActor
+  func testFolderManagerSurfacesAccessDeniedAsLastError() throws {
+    let firstRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveAccessDeniedOne-\(UUID().uuidString)", isDirectory: true)
+    let secondRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveAccessDeniedTwo-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: firstRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: firstRoot)
+      try? FileManager.default.removeItem(at: secondRoot)
+    }
+
+    try "one".write(
+      to: firstRoot.appendingPathComponent("one.md"), atomically: true, encoding: .utf8)
+    try "two".write(
+      to: secondRoot.appendingPathComponent("two.md"), atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: firstRoot),
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: WorkspaceSubstrate(
+        store: WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory()))
+    )
+
+    manager.open(url: firstRoot, into: appState)
+    manager.open(url: secondRoot, into: appState)
+
+    XCTAssertTrue(appState.lastError?.contains("multi-root") == true)
+    XCTAssertEqual(appState.workspaceRoots.map(\.url), [firstRoot.standardizedFileURL])
+    XCTAssertEqual(appState.documents.map(\.relativePath), ["one.md"])
+  }
+
+  @MainActor
   func testWorkspaceExclusionsPersistAndFilterImportedPaths() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveExclusionTests-\(UUID().uuidString)", isDirectory: true)
@@ -1608,6 +1791,16 @@ final class PensieveSmokeTests: XCTestCase {
     defaults.removePersistentDomain(forName: suiteName)
     return BookmarkStore(defaults: defaults)
   }
+
+  private func temporaryApplicationSupportDirectory() -> URL {
+    FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveApplicationSupportTests-\(UUID().uuidString)",
+        isDirectory: true
+      )
+      .appendingPathComponent("Application Support", isDirectory: true)
+      .appendingPathComponent("Pensieve", isDirectory: true)
+  }
 }
 
 private final class RecordingPreviewSink: PreviewSink {
@@ -1615,5 +1808,22 @@ private final class RecordingPreviewSink: PreviewSink {
 
   func load(document: PreviewDocument) {
     loadedDocuments.append(document)
+  }
+}
+
+private final class BuildCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+
+  var value: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return count
+  }
+
+  func increment() {
+    lock.lock()
+    count += 1
+    lock.unlock()
   }
 }

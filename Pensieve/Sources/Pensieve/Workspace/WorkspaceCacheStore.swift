@@ -107,6 +107,12 @@ final class WorkspaceCacheStore {
     try data.write(to: root.appendingPathComponent("tree-fingerprint.json"), options: [.atomic])
   }
 
+  func writeManifest(_ manifest: WorkspaceManifest, for identity: WorkspaceIdentity) throws {
+    let root = try ensureCacheRoot(for: identity)
+    let data = try encoder.encode(manifest)
+    try data.write(to: root.appendingPathComponent("manifest.json"), options: [.atomic])
+  }
+
   func clearCache(for identity: WorkspaceIdentity) throws {
     let root = cacheRootURL(for: identity)
     guard FileManager.default.fileExists(atPath: root.path) else { return }
@@ -129,6 +135,11 @@ final class WorkspaceCacheStore {
       .appendingPathComponent("tree-fingerprint.json", isDirectory: false)
   }
 
+  func manifestURL(for identity: WorkspaceIdentity) -> URL {
+    cacheRootURL(for: identity)
+      .appendingPathComponent("manifest.json", isDirectory: false)
+  }
+
   func readTreeFingerprint(for identity: WorkspaceIdentity) throws -> TreeFingerprint? {
     guard existingCacheRoot(for: identity) != nil else {
       return nil
@@ -139,6 +150,18 @@ final class WorkspaceCacheStore {
     }
     let data = try Data(contentsOf: url)
     return try decoder.decode(TreeFingerprint.self, from: data)
+  }
+
+  func readManifest(for identity: WorkspaceIdentity) throws -> WorkspaceManifest? {
+    guard existingCacheRoot(for: identity) != nil else {
+      return nil
+    }
+    let url = manifestURL(for: identity)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      return nil
+    }
+    let data = try Data(contentsOf: url)
+    return try decoder.decode(WorkspaceManifest.self, from: data)
   }
 
   private func cacheRootURL(for identity: WorkspaceIdentity) -> URL {

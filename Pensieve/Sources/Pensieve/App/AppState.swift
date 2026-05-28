@@ -239,4 +239,28 @@ struct WorkspaceActivity: Equatable, Sendable {
       progress: 0.68
     )
   }
+
+  static func checkingCache(_ label: String) -> WorkspaceActivity {
+    WorkspaceActivity(
+      title: "Checking Workspace Cache",
+      detail: "Validating \(label)",
+      progress: 0.05
+    )
+  }
+
+  static func cacheHit(_ label: String) -> WorkspaceActivity {
+    WorkspaceActivity(
+      title: "Opening Cached Workspace",
+      detail: "Using cached state for \(label)",
+      progress: 0.92
+    )
+  }
+
+  static func cacheMiss(_ label: String) -> WorkspaceActivity {
+    WorkspaceActivity(
+      title: "Importing Workspace",
+      detail: "Cache miss for \(label)",
+      progress: 0.1
+    )
+  }
 }
