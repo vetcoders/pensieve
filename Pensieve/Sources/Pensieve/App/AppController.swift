@@ -33,6 +33,9 @@ final class AppController: ObservableObject {
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.importsFoldersInBackground = importsFoldersInBackground
+    self.documentStore.observeSelfWrites { [weak folderManager] url in
+      folderManager?.noteSelfWrite(at: url)
+    }
   }
 
   func start(restoringWorkspace: Bool = true) {

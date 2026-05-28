@@ -1691,6 +1691,66 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testSavingWorkspaceDocumentDoesNotRebuildFromSelfWriteWatcher() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSelfWriteWatcherTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("watched.md")
+    try "before save".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let rebuildProbe = RebuildProbe()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      rebuildProbe.recordBuild()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      workspaceBuilder: builder
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: manager,
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    controller.openFolder(url: folder)
+    XCTAssertEqual(rebuildProbe.value, 1)
+
+    let externalRebuild = expectation(description: "external write triggers watcher refresh")
+    rebuildProbe.expectNextRebuild(externalRebuild)
+    try "external".write(
+      to: folder.appendingPathComponent("external.md"), atomically: true, encoding: .utf8)
+    await fulfillment(of: [externalRebuild], timeout: 2)
+    XCTAssertEqual(rebuildProbe.value, 2)
+
+    controller.selectDocument(id: noteURL.standardizedFileURL)
+
+    let unexpectedSelfWriteRebuild = expectation(
+      description: "self-write save does not trigger watcher rebuild")
+    unexpectedSelfWriteRebuild.isInverted = true
+    rebuildProbe.expectNextRebuild(unexpectedSelfWriteRebuild)
+    appState.activeDocumentText = "after save self-write-token"
+    appState.activeDocumentDirty = true
+    controller.saveActiveDocument()
+
+    await fulfillment(of: [unexpectedSelfWriteRebuild], timeout: 1.4)
+    XCTAssertEqual(rebuildProbe.value, 2)
+
+    controller.updateWorkspaceSearch(query: "self-write-token")
+    XCTAssertEqual(
+      appState.workspaceSearchResults.map(\.document.id), [noteURL.standardizedFileURL])
+  }
+
+  @MainActor
   func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
     let appState = AppState()
 
@@ -1825,5 +1885,34 @@ private final class BuildCounter: @unchecked Sendable {
     lock.lock()
     count += 1
     lock.unlock()
+  }
+}
+
+private final class RebuildProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  private var nextRebuildExpectation: XCTestExpectation?
+
+  var value: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return count
+  }
+
+  func expectNextRebuild(_ expectation: XCTestExpectation) {
+    lock.lock()
+    nextRebuildExpectation = expectation
+    lock.unlock()
+  }
+
+  func recordBuild() {
+    lock.lock()
+    count += 1
+    let expectation = count > 1 ? nextRebuildExpectation : nil
+    if expectation != nil {
+      nextRebuildExpectation = nil
+    }
+    lock.unlock()
+    expectation?.fulfill()
   }
 }

@@ -11,20 +11,24 @@ final class FolderManager {
   private let bookmarkStore: BookmarkStore
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
+  private let selfWriteSuppressionInterval: TimeInterval
   private var workspaceBuildTask: Task<Void, Never>?
+  private var recentSelfWritePaths: [String: Date] = [:]
 
   init(
     metadataStore: WorkspaceMetadataStore = .shared,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
-    workspaceSubstrate: WorkspaceSubstrate = .shared
+    workspaceSubstrate: WorkspaceSubstrate = .shared,
+    selfWriteSuppressionInterval: TimeInterval = 1.2
   ) {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.defaultBuilder
     self.workspaceSubstrate = workspaceSubstrate
+    self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
   }
 
   func open(url: URL, into appState: AppState) {
@@ -91,6 +95,7 @@ final class FolderManager {
         withIntermediateDirectories: true
       )
       try "".write(to: targetURL, atomically: true, encoding: .utf8)
+      noteSelfWrite(at: targetURL)
     } catch {
       appState.lastError =
         "Could not create \(targetURL.lastPathComponent): \(error.localizedDescription)"
@@ -133,6 +138,10 @@ final class FolderManager {
 
   func waitForPendingWorkspaceBuild() async {
     await workspaceBuildTask?.value
+  }
+
+  func noteSelfWrite(at url: URL) {
+    recentSelfWritePaths[url.standardizedFileURL.path] = Date()
   }
 
   func refresh(into appState: AppState) {
@@ -401,8 +410,9 @@ final class FolderManager {
     do {
       try watcher.start(watching: urls) { [weak self, weak appState] in
         Task { @MainActor in
-          guard let appState else { return }
-          self?.refresh(into: appState)
+          guard let self, let appState else { return }
+          guard !self.shouldSuppressWatcherRefresh(into: appState) else { return }
+          self.refresh(into: appState)
         }
       }
     } catch {
@@ -462,6 +472,24 @@ final class FolderManager {
       return "\(rootCount) folders"
     default:
       return "\(rootCount) folders and \(fileCount) files"
+    }
+  }
+
+  private func shouldSuppressWatcherRefresh(into appState: AppState) -> Bool {
+    pruneExpiredSelfWrites()
+    guard !recentSelfWritePaths.isEmpty else { return false }
+
+    let workspaceRoots = appState.workspaceRoots.map(\.url)
+    return recentSelfWritePaths.keys.contains { path in
+      let url = URL(fileURLWithPath: path)
+      return workspaceRoots.contains { WorkspaceScanner.contains(url, in: $0) }
+    }
+  }
+
+  private func pruneExpiredSelfWrites() {
+    let now = Date()
+    recentSelfWritePaths = recentSelfWritePaths.filter { _, writeDate in
+      now.timeIntervalSince(writeDate) <= selfWriteSuppressionInterval
     }
   }
 }
@@ -670,6 +698,7 @@ final class DocumentStore {
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
   private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> DirtyUntitledResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
+  private var selfWriteObserver: @MainActor (URL) -> Void
   private weak var appState: AppState?
 
   init(
@@ -679,7 +708,8 @@ final class DocumentStore {
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
-    savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil
+    savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
+    selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) {
     let resolvedIndexDatabase = indexDatabase ?? .shared
     self.autosaver = autosaver ?? .shared
@@ -696,6 +726,11 @@ final class DocumentStore {
       }
     self.dirtyUntitledPrompt = dirtyUntitledPrompt ?? Self.promptForDirtyUntitledSession
     self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL
+    self.selfWriteObserver = selfWriteObserver ?? { _ in }
+  }
+
+  func observeSelfWrites(_ observer: @escaping @MainActor (URL) -> Void) {
+    selfWriteObserver = observer
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -760,6 +795,7 @@ final class DocumentStore {
       try FileManager.default.createDirectory(
         at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
       try writeDocument(appState.documentSession.text, targetURL)
+      selfWriteObserver(targetURL)
       let ref = documentRef(for: targetURL, appState: appState)
       registerSavedDocument(ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
@@ -861,6 +897,7 @@ final class DocumentStore {
 
     do {
       try writeDocument(appState.documentSession.text, url)
+      selfWriteObserver(url)
       registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
