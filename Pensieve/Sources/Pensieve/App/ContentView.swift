@@ -49,11 +49,13 @@ struct DocumentTabStrip: View {
         }
         .buttonStyle(.plain)
         .help("New File")
+        .accessibilityIdentifier("pensieve.tabStrip.newFile")
       }
       .padding(.leading, 6)
     }
     .frame(height: 31)
     .background(Color(NSColor.controlBackgroundColor))
+    .accessibilityIdentifier("pensieve.tabStrip")
   }
 
   private func tabButton(_ tab: DocumentRef) -> some View {
@@ -210,6 +212,7 @@ struct DocumentEmptyStateView: View {
       if let activity {
         WorkspaceActivityView(activity: activity)
           .frame(maxWidth: 340)
+          .accessibilityIdentifier("pensieve.emptyState.activity")
       }
 
       VStack(spacing: 12) {
@@ -226,14 +229,17 @@ struct DocumentEmptyStateView: View {
           .foregroundStyle(.tertiary)
           .multilineTextAlignment(.center)
           .padding(.horizontal, 32)
+          .accessibilityIdentifier("pensieve.emptyState.message")
 
         Text(BuildIdentity.current.conciseLabel)
           .font(.caption)
           .foregroundStyle(.tertiary)
+          .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Color(NSColor.windowBackgroundColor))
+    .accessibilityIdentifier("pensieve.emptyState")
   }
 
   private var secondaryMessage: String {

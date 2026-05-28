@@ -36,6 +36,7 @@ struct SidebarView: View {
         Text(sidebarTitle)
           .font(.headline)
           .lineLimit(1)
+          .accessibilityIdentifier("pensieve.sidebar.title")
 
         Spacer(minLength: 8)
 
@@ -46,11 +47,13 @@ struct SidebarView: View {
         }
         .buttonStyle(.borderless)
         .help("New Markdown File")
+        .accessibilityIdentifier("pensieve.sidebar.newFile")
       }
 
       TextField("Search…", text: searchText)
         .textFieldStyle(.roundedBorder)
         .disabled(appState.allDocuments.isEmpty)
+        .accessibilityIdentifier("pensieve.sidebar.search")
 
       if !appState.excludedWorkspacePaths.isEmpty {
         Text("\(appState.excludedWorkspacePaths.count) excluded")
@@ -80,9 +83,11 @@ struct SidebarView: View {
       Button("New File…") {
         createNewFile(in: defaultNewFileDirectory)
       }
+      .accessibilityIdentifier("pensieve.sidebar.emptyState.newFile")
       Spacer()
     }
     .frame(maxWidth: .infinity)
+    .accessibilityIdentifier("pensieve.sidebar.emptyState")
   }
 
   private var explorer: some View {
@@ -105,6 +110,7 @@ struct SidebarView: View {
             }
           }
         }
+        .accessibilityIdentifier("pensieve.sidebar.list.openFiles")
       }
 
       if !appState.workspaceTree.isEmpty {
@@ -113,6 +119,7 @@ struct SidebarView: View {
             workspaceTreeRow(node, depth: 0)
           }
         }
+        .accessibilityIdentifier("pensieve.sidebar.list.workspace")
       }
     }
     .listStyle(.sidebar)
@@ -169,6 +176,7 @@ struct SidebarView: View {
       }
     }
     .listStyle(.sidebar)
+    .accessibilityIdentifier("pensieve.sidebar.list.searchResults")
   }
 
   private func documentRow(_ doc: DocumentRef, isSelected: Bool) -> some View {
@@ -533,5 +541,6 @@ private struct WorkspaceActivityMiniView: View {
     }
     .accessibilityElement(children: .combine)
     .accessibilityLabel("\(activity.title): \(activity.detail)")
+    .accessibilityIdentifier("pensieve.sidebar.activity")
   }
 }

@@ -1216,6 +1216,54 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testIndexDatabaseMigratorIsIdempotentAcrossTwoOpens() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveIndexMigrationTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let firstAppState = AppState()
+    let firstDatabase = IndexDatabase(databaseURL: databaseURL)
+
+    firstDatabase.open(into: firstAppState)
+
+    XCTAssertNil(firstAppState.lastError)
+    XCTAssertEqual(firstDatabase.databaseURL?.lastPathComponent, "index.db")
+    XCTAssertEqual(firstDatabase.databaseURL?.standardizedFileURL, databaseURL.standardizedFileURL)
+
+    let secondAppState = AppState()
+    let secondDatabase = IndexDatabase(databaseURL: databaseURL)
+
+    secondDatabase.open(into: secondAppState)
+
+    XCTAssertNil(secondAppState.lastError)
+    XCTAssertEqual(secondDatabase.databaseURL?.lastPathComponent, "index.db")
+    XCTAssertEqual(secondDatabase.databaseURL?.standardizedFileURL, databaseURL.standardizedFileURL)
+
+    let noteURL = folder.appendingPathComponent("idempotent-search.md", isDirectory: false)
+    try """
+    # Idempotent Search
+
+    Migration reopen keeps searchable content alive.
+    """.write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let ref = DocumentRef(
+      id: noteURL.standardizedFileURL,
+      rootURL: folder.standardizedFileURL,
+      relativePath: "idempotent-search.md"
+    )
+    secondDatabase.reindex(documents: [ref], appState: secondAppState)
+
+    let results = secondDatabase.search(
+      query: "searchable content", documents: [ref], appState: secondAppState)
+
+    XCTAssertEqual(results.map(\.document.id), [noteURL.standardizedFileURL])
+  }
+
+  @MainActor
   func testBookmarkRestoreClearsDeletedFolder() throws {
     let suiteName = "PensieveBookmarkTests-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!

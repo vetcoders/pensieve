@@ -39,6 +39,7 @@ struct EditorToolbelt: ToolbarContent {
       }
       .help("Reload Preview")
       .disabled(!hasDocument)
+      .accessibilityIdentifier("pensieve.toolbar.reload")
 
       Toggle(isOn: $appState.previewAutoReload) {
         Image(systemName: "arrow.triangle.2.circlepath")
@@ -48,6 +49,7 @@ struct EditorToolbelt: ToolbarContent {
         appState.previewAutoReload
           ? "Auto reload on — preview re-renders as you type"
           : "Auto reload off — use the reload button to refresh")
+      .accessibilityIdentifier("pensieve.toolbar.autoReload")
     }
   }
 
@@ -70,6 +72,7 @@ struct EditorToolbelt: ToolbarContent {
     .pickerStyle(.segmented)
     .help("Editor layout")
     .frame(minWidth: 140)
+    .accessibilityIdentifier("pensieve.toolbar.modePicker")
   }
 
   private var richMarkdownToggle: some View {
@@ -83,6 +86,7 @@ struct EditorToolbelt: ToolbarContent {
       appState.richMarkdownEnabled
         ? "Rich Markdown on (⌘/)"
         : "Plain syntax (⌘/)")
+    .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
   }
 
   private var previewThemePicker: some View {
@@ -94,6 +98,7 @@ struct EditorToolbelt: ToolbarContent {
     .pickerStyle(.menu)
     .help("Preview stylesheet")
     .frame(minWidth: 140)
+    .accessibilityIdentifier("pensieve.toolbar.themePicker")
   }
 
   @ViewBuilder
@@ -103,10 +108,26 @@ struct EditorToolbelt: ToolbarContent {
         Image(systemName: format.systemImageName)
       }
       .help(format.label)
+      .accessibilityIdentifier(format.toolbarAccessibilityIdentifier)
 
       if format == .strike || format == .quote || format == .numberedList {
         Divider()
       }
+    }
+  }
+}
+
+extension MarkdownFormat {
+  fileprivate var toolbarAccessibilityIdentifier: String {
+    switch self {
+    case .bold: return "pensieve.toolbar.format.bold"
+    case .italic: return "pensieve.toolbar.format.italic"
+    case .strike: return "pensieve.toolbar.format.strike"
+    case .quote: return "pensieve.toolbar.format.quote"
+    case .code: return "pensieve.toolbar.format.code"
+    case .link: return "pensieve.toolbar.format.link"
+    case .bulletedList: return "pensieve.toolbar.format.bulletedList"
+    case .numberedList: return "pensieve.toolbar.format.numberedList"
     }
   }
 }
