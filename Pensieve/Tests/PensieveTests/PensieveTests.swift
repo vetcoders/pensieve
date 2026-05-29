@@ -774,11 +774,11 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testFolderManagerSurfacesAccessDeniedAsLastError() throws {
+  func testFolderManagerColdScansAllRootsWhenMultipleFoldersAdded() throws {
     let firstRoot = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveAccessDeniedOne-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent("PensieveMultiRootOne-\(UUID().uuidString)", isDirectory: true)
     let secondRoot = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveAccessDeniedTwo-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent("PensieveMultiRootTwo-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: firstRoot, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
     defer {
@@ -803,9 +803,15 @@ final class PensieveSmokeTests: XCTestCase {
     manager.open(url: firstRoot, into: appState)
     manager.open(url: secondRoot, into: appState)
 
-    XCTAssertTrue(appState.lastError?.contains("multi-root") == true)
-    XCTAssertEqual(appState.workspaceRoots.map(\.url), [firstRoot.standardizedFileURL])
-    XCTAssertEqual(appState.documents.map(\.relativePath), ["one.md"])
+    // Multi-root falls back to the cold scan path (cache fast-path is single-root
+    // only), so adding a second folder must keep BOTH roots and import both files —
+    // not block with a multi-root error (that was the B-1b regression Maciej hit).
+    XCTAssertNil(appState.lastError)
+    XCTAssertEqual(
+      Set(appState.workspaceRoots.map(\.url)),
+      Set([firstRoot.standardizedFileURL, secondRoot.standardizedFileURL]))
+    XCTAssertEqual(
+      Set(appState.documents.map(\.relativePath)), Set(["one.md", "two.md"]))
   }
 
   @MainActor

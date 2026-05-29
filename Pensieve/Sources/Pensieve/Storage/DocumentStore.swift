@@ -277,10 +277,12 @@ final class FolderManager {
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
     appState.workspaceActivity = .checkingCache(label)
 
+    // Cache fast-path is single-root only. Multi-root workspaces fall back to
+    // the cold scan path (WorkspaceScanner.build handles multiple roots);
+    // returning true here would skip the scan and silently drop the added folder.
     guard rootURLs.count == 1 else {
-      appState.lastError = "Could not open cached workspace: multi-root not supported in B-1b"
-      appState.workspaceActivity = nil
-      return true
+      appState.workspaceActivity = .cacheMiss(label)
+      return false
     }
 
     let identity = WorkspaceIdentity.make(
