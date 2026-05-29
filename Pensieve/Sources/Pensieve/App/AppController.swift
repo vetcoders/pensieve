@@ -9,7 +9,9 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let importsFoldersInBackground: Bool
+  private let workspaceSearchDebounceNanoseconds: UInt64
   private var didStart = false
+  private var workspaceSearchTask: Task<Void, Never>?
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -26,13 +28,15 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
-    importsFoldersInBackground: Bool = false
+    importsFoldersInBackground: Bool = false,
+    workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
   ) {
     self.appState = appState
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.importsFoldersInBackground = importsFoldersInBackground
+    self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -169,8 +173,41 @@ final class AppController: ObservableObject {
   }
 
   func updateWorkspaceSearch(query: String) {
+    workspaceSearchTask?.cancel()
     appState.workspaceSearchQuery = query
-    indexDatabase.refreshSearchResults(in: appState)
+    let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedQuery.isEmpty else {
+      appState.workspaceSearchResults = []
+      workspaceSearchTask = nil
+      return
+    }
+
+    let documents = appState.allDocuments
+    let debounceNanoseconds = workspaceSearchDebounceNanoseconds
+    let appState = appState
+    let indexDatabase = indexDatabase
+    workspaceSearchTask = Task {
+      if debounceNanoseconds > 0 {
+        do {
+          try await Task.sleep(nanoseconds: debounceNanoseconds)
+        } catch {
+          return
+        }
+      }
+      guard !Task.isCancelled else { return }
+
+      let results = await indexDatabase.searchInBackground(
+        query: trimmedQuery,
+        documents: documents,
+        appState: appState
+      )
+      guard !Task.isCancelled, appState.workspaceSearchQuery == query else { return }
+      appState.workspaceSearchResults = results
+    }
+  }
+
+  func waitForPendingWorkspaceSearch() async {
+    await workspaceSearchTask?.value
   }
 
   func setMode(_ mode: EditorMode) {

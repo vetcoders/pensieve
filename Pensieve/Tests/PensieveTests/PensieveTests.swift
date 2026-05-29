@@ -1546,7 +1546,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testWorkspaceSearchDropsExcludedPathsAfterReindex() throws {
+  func testWorkspaceSearchDropsExcludedPathsAfterReindex() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSearchExclusionTests-\(UUID().uuidString)", isDirectory: true)
@@ -1574,6 +1574,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.openFolder(url: folder)
     controller.updateWorkspaceSearch(query: "nebula")
+    await controller.waitForPendingWorkspaceSearch()
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [skipURL.standardizedFileURL])
 
@@ -1584,7 +1585,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testSearchResultSelectionLoadsDocumentThroughController() throws {
+  func testSearchResultSelectionLoadsDocumentThroughController() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSearchSelectionTests-\(UUID().uuidString)", isDirectory: true)
@@ -1610,6 +1611,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.openFolder(url: folder)
     controller.updateWorkspaceSearch(query: "selection-token")
+    await controller.waitForPendingWorkspaceSearch()
     let result = try XCTUnwrap(appState.workspaceSearchResults.first)
 
     controller.selectSearchResult(result)
@@ -1766,7 +1768,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testSearchIndexUpdatesAfterSaveAndRefresh() throws {
+  func testSearchIndexUpdatesAfterSaveAndRefresh() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveSearchRefreshTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1797,15 +1799,118 @@ final class PensieveSmokeTests: XCTestCase {
     controller.saveActiveDocument()
 
     controller.updateWorkspaceSearch(query: "search-token")
+    await controller.waitForPendingWorkspaceSearch()
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [alphaURL.standardizedFileURL])
 
     try "beta externally refreshed-token".write(to: betaURL, atomically: true, encoding: .utf8)
     manager.refresh(into: appState)
     controller.updateWorkspaceSearch(query: "refreshed-token")
+    await controller.waitForPendingWorkspaceSearch()
 
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [betaURL.standardizedFileURL])
+  }
+
+  @MainActor
+  func testWorkspaceSearchCompletesWhileReindexWriteIsInFlight() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSearchConcurrentReadTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let oldURL = folder.appendingPathComponent("old.md")
+    let newURL = folder.appendingPathComponent("new.md")
+    try "old-token stable snapshot".write(to: oldURL, atomically: true, encoding: .utf8)
+    try "new-token pending rebuild".write(to: newURL, atomically: true, encoding: .utf8)
+
+    let writeStarted = expectation(description: "reindex write starts")
+    let releaseWrite = DispatchSemaphore(value: 0)
+    let holdFirstReindexBatch = BlockingBatchProbe(
+      onFirstBatch: {
+        writeStarted.fulfill()
+        _ = releaseWrite.wait(timeout: .now() + 2)
+      })
+    let appState = AppState()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in
+        holdFirstReindexBatch.recordBatch(size)
+      }
+    )
+    let oldRef = DocumentRef(
+      id: oldURL.standardizedFileURL,
+      rootURL: folder.standardizedFileURL,
+      relativePath: "old.md"
+    )
+    let newRef = DocumentRef(
+      id: newURL.standardizedFileURL,
+      rootURL: folder.standardizedFileURL,
+      relativePath: "new.md"
+    )
+    appState.documents = [oldRef]
+    indexDatabase.index(document: oldRef, body: "old-token stable snapshot", appState: appState)
+
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      workspaceSearchDebounceNanoseconds: 0
+    )
+
+    let reindexTask = Task {
+      await indexDatabase.reindexInBackground(documents: [newRef], appState: nil)
+    }
+    await fulfillment(of: [writeStarted], timeout: 1)
+
+    controller.updateWorkspaceSearch(query: "old-token")
+    await controller.waitForPendingWorkspaceSearch()
+
+    XCTAssertEqual(
+      appState.workspaceSearchResults.map(\.document.id), [oldURL.standardizedFileURL])
+    releaseWrite.signal()
+    await reindexTask.value
+  }
+
+  @MainActor
+  func testWorkspaceReindexBuildsSearchRecordsInBatches() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSearchBatchTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 2,
+      didInsertSearchIndexBatch: { @Sendable size in
+        recorder.record(size)
+      }
+    )
+    let refs = try (0..<5).map { index -> DocumentRef in
+      let url = folder.appendingPathComponent("note-\(index).md")
+      try "batch-token-\(index)".write(to: url, atomically: true, encoding: .utf8)
+      return DocumentRef(
+        id: url.standardizedFileURL,
+        rootURL: folder.standardizedFileURL,
+        relativePath: "note-\(index).md"
+      )
+    }
+
+    indexDatabase.reindex(documents: refs, appState: AppState())
+
+    XCTAssertEqual(recorder.values, [2, 2, 1])
+    XCTAssertEqual(
+      indexDatabase.search(query: "batch-token-4", documents: refs).map(\.document.id),
+      [refs[4].id])
   }
 
   @MainActor
@@ -1864,6 +1969,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(rebuildProbe.value, 2)
 
     controller.updateWorkspaceSearch(query: "self-write-token")
+    await controller.waitForPendingWorkspaceSearch()
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [noteURL.standardizedFileURL])
   }
@@ -2037,5 +2143,47 @@ private final class RebuildProbe: @unchecked Sendable {
     }
     lock.unlock()
     expectation?.fulfill()
+  }
+}
+
+private final class BatchSizeRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var recordedValues: [Int] = []
+
+  var values: [Int] {
+    lock.lock()
+    defer { lock.unlock() }
+    return recordedValues
+  }
+
+  func record(_ size: Int) {
+    lock.lock()
+    recordedValues.append(size)
+    lock.unlock()
+  }
+}
+
+private final class BlockingBatchProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var didBlock = false
+  private let onFirstBatch: @Sendable () -> Void
+
+  init(onFirstBatch: @escaping @Sendable () -> Void) {
+    self.onFirstBatch = onFirstBatch
+  }
+
+  func recordBatch(_ size: Int) {
+    guard size > 0 else { return }
+
+    lock.lock()
+    let shouldBlock = !didBlock
+    if shouldBlock {
+      didBlock = true
+    }
+    lock.unlock()
+
+    if shouldBlock {
+      onFirstBatch()
+    }
   }
 }

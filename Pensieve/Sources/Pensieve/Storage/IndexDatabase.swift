@@ -5,12 +5,20 @@ import GRDB
 final class IndexDatabase {
   static let shared = IndexDatabase()
 
-  private var databaseQueue: DatabaseQueue?
+  private var databasePool: DatabasePool?
   private(set) var databaseURL: URL?
   private let configuredDatabaseURL: URL?
+  private let searchIndexBatchSize: Int
+  private let didInsertSearchIndexBatch: (@Sendable (Int) -> Void)?
 
-  init(databaseURL: URL? = nil) {
+  init(
+    databaseURL: URL? = nil,
+    searchIndexBatchSize: Int = 32,
+    didInsertSearchIndexBatch: (@Sendable (Int) -> Void)? = nil
+  ) {
     self.configuredDatabaseURL = databaseURL
+    self.searchIndexBatchSize = max(1, searchIndexBatchSize)
+    self.didInsertSearchIndexBatch = didInsertSearchIndexBatch
   }
 
   func open(into appState: AppState? = nil) {
@@ -26,7 +34,7 @@ final class IndexDatabase {
       let directory = url.deletingLastPathComponent()
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-      let queue = try DatabaseQueue(path: url.path)
+      let pool = try DatabasePool(path: url.path)
 
       var migrator = DatabaseMigrator()
       migrator.registerMigration("mvp_workspace_search_fts") { db in
@@ -44,9 +52,9 @@ final class IndexDatabase {
             )
             """)
       }
-      try migrator.migrate(queue)
+      try migrator.migrate(pool)
 
-      databaseQueue = queue
+      databasePool = pool
       databaseURL = url
     } catch {
       let message = "Could not open Pensieve index database: \(error.localizedDescription)"
@@ -56,19 +64,23 @@ final class IndexDatabase {
   }
 
   func reindex(documents: [DocumentRef], appState: AppState? = nil) {
-    guard let queue = ensureOpen(into: appState) else { return }
-    let records = Self.searchDocumentRecords(from: documents)
-
-    reindex(records: records, queue: queue, appState: appState)
+    guard let pool = ensureOpen(into: appState) else { return }
+    reindex(documents: documents, pool: pool, appState: appState)
   }
 
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async {
-    guard let queue = ensureOpen(into: appState) else { return }
+    guard let pool = ensureOpen(into: appState) else { return }
+    let batchSize = searchIndexBatchSize
+    let didInsertBatch = didInsertSearchIndexBatch
 
     do {
       try await Task.detached(priority: .utility) {
-        let records = Self.searchDocumentRecords(from: documents)
-        try Self.replaceSearchIndex(with: records, queue: queue)
+        try Self.replaceSearchIndex(
+          with: documents,
+          pool: pool,
+          batchSize: batchSize,
+          didInsertBatch: didInsertBatch
+        )
       }.value
       refreshSearchResults(in: appState)
     } catch {
@@ -76,20 +88,14 @@ final class IndexDatabase {
     }
   }
 
-  private nonisolated static func searchDocumentRecords(from documents: [DocumentRef])
-    -> [SearchDocumentRecord]
-  {
-    documents.compactMap { document -> SearchDocumentRecord? in
-      guard let body = try? String(contentsOf: document.url, encoding: .utf8) else {
-        return nil
-      }
-      return SearchDocumentRecord(document: document, body: body)
-    }
-  }
-
-  private func reindex(records: [SearchDocumentRecord], queue: DatabaseQueue, appState: AppState?) {
+  private func reindex(documents: [DocumentRef], pool: DatabasePool, appState: AppState?) {
     do {
-      try Self.replaceSearchIndex(with: records, queue: queue)
+      try Self.replaceSearchIndex(
+        with: documents,
+        pool: pool,
+        batchSize: searchIndexBatchSize,
+        didInsertBatch: didInsertSearchIndexBatch
+      )
       refreshSearchResults(in: appState)
     } catch {
       report(error, appState: appState, action: "rebuild Pensieve search index")
@@ -97,11 +103,11 @@ final class IndexDatabase {
   }
 
   func index(document: DocumentRef, body: String, appState: AppState? = nil) {
-    guard let queue = ensureOpen(into: appState) else { return }
+    guard let pool = ensureOpen(into: appState) else { return }
     let record = SearchDocumentRecord(document: document, body: body)
 
     do {
-      try queue.write { db in
+      try pool.write { db in
         try db.execute(
           sql: "DELETE FROM workspace_search_documents WHERE path = ?",
           arguments: [record.path]
@@ -111,6 +117,31 @@ final class IndexDatabase {
       refreshSearchResults(in: appState)
     } catch {
       report(error, appState: appState, action: "update Pensieve search index")
+    }
+  }
+
+  func searchInBackground(
+    query: String,
+    documents: [DocumentRef],
+    limit: Int = 50,
+    appState: AppState? = nil
+  ) async -> [WorkspaceSearchResult] {
+    let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedQuery.isEmpty else { return [] }
+    guard let pool = ensureOpen(into: appState) else { return [] }
+
+    do {
+      return try await Task.detached(priority: .userInitiated) {
+        try Self.performSearch(
+          query: trimmedQuery,
+          documents: documents,
+          limit: limit,
+          pool: pool
+        )
+      }.value
+    } catch {
+      report(error, appState: appState, action: "search Pensieve index")
+      return []
     }
   }
 
@@ -131,28 +162,14 @@ final class IndexDatabase {
   ) -> [WorkspaceSearchResult] {
     let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedQuery.isEmpty else { return [] }
-    guard let queue = ensureOpen(into: appState) else { return [] }
-
-    let documentsByPath = Dictionary(
-      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
-    )
-    guard !documentsByPath.isEmpty else { return [] }
+    guard let pool = ensureOpen(into: appState) else { return [] }
 
     do {
-      let records = try fetchRecords(
-        matching: trimmedQuery, limit: max(limit * 3, limit), queue: queue)
-      let results = records.compactMap { record -> WorkspaceSearchResult? in
-        guard let document = documentsByPath[record.path] else { return nil }
-        return makeResult(record: record, document: document, query: trimmedQuery)
-      }
-      return Array(
-        results
-          .sorted { lhs, rhs in
-            if lhs.score != rhs.score { return lhs.score < rhs.score }
-            if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
-            return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
-          }
-          .prefix(limit)
+      return try Self.performSearch(
+        query: trimmedQuery,
+        documents: documents,
+        limit: limit,
+        pool: pool
       )
     } catch {
       report(error, appState: appState, action: "search Pensieve index")
@@ -171,11 +188,11 @@ final class IndexDatabase {
       .appendingPathComponent("Pensieve", isDirectory: true)
   }
 
-  private func ensureOpen(into appState: AppState?) -> DatabaseQueue? {
-    if databaseQueue == nil {
+  private func ensureOpen(into appState: AppState?) -> DatabasePool? {
+    if databasePool == nil {
       open(into: appState)
     }
-    return databaseQueue
+    return databasePool
   }
 
   private func insert(_ record: SearchDocumentRecord, into db: Database) throws {
@@ -183,14 +200,50 @@ final class IndexDatabase {
   }
 
   private nonisolated static func replaceSearchIndex(
-    with records: [SearchDocumentRecord],
-    queue: DatabaseQueue
+    with documents: [DocumentRef],
+    pool: DatabasePool,
+    batchSize: Int,
+    didInsertBatch: (@Sendable (Int) -> Void)?
   ) throws {
-    try queue.write { db in
+    try pool.write { db in
       try db.execute(sql: "DELETE FROM workspace_search_documents")
-      for record in records {
-        try insert(record, into: db)
+      var batch: [SearchDocumentRecord] = []
+      batch.reserveCapacity(batchSize)
+
+      for document in documents {
+        guard let record = searchDocumentRecord(from: document) else {
+          continue
+        }
+        batch.append(record)
+        if batch.count == batchSize {
+          try insert(batch, into: db)
+          didInsertBatch?(batch.count)
+          batch.removeAll(keepingCapacity: true)
+        }
       }
+
+      if !batch.isEmpty {
+        try insert(batch, into: db)
+        didInsertBatch?(batch.count)
+      }
+    }
+  }
+
+  private nonisolated static func searchDocumentRecord(from document: DocumentRef)
+    -> SearchDocumentRecord?
+  {
+    guard let body = try? String(contentsOf: document.url, encoding: .utf8) else {
+      return nil
+    }
+    return SearchDocumentRecord(document: document, body: body)
+  }
+
+  private nonisolated static func insert(
+    _ records: [SearchDocumentRecord],
+    into db: Database
+  ) throws {
+    for record in records {
+      try insert(record, into: db)
     }
   }
 
@@ -212,14 +265,42 @@ final class IndexDatabase {
     )
   }
 
-  private func fetchRecords(
+  private nonisolated static func performSearch(
+    query: String,
+    documents: [DocumentRef],
+    limit: Int,
+    pool: DatabasePool
+  ) throws -> [WorkspaceSearchResult] {
+    let documentsByPath = Dictionary(
+      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
+    )
+    guard !documentsByPath.isEmpty else { return [] }
+
+    let records = try fetchRecords(
+      matching: query, limit: max(limit * 3, limit), pool: pool)
+    let results = records.compactMap { record -> WorkspaceSearchResult? in
+      guard let document = documentsByPath[record.path] else { return nil }
+      return makeResult(record: record, document: document, query: query)
+    }
+    return Array(
+      results
+        .sorted { lhs, rhs in
+          if lhs.score != rhs.score { return lhs.score < rhs.score }
+          if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+          return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
+        }
+        .prefix(limit)
+    )
+  }
+
+  private nonisolated static func fetchRecords(
     matching query: String,
     limit: Int,
-    queue: DatabaseQueue
+    pool: DatabasePool
   ) throws -> [SearchDocumentRecord] {
     let ftsQuery = makeFTSQuery(from: query)
     if !ftsQuery.isEmpty,
-      let records = try? queue.read({ db in
+      let records = try? pool.read({ db in
         try SearchDocumentRecord.fetchAll(
           db,
           sql: """
@@ -236,7 +317,7 @@ final class IndexDatabase {
     }
 
     let pattern = "%\(query.lowercased())%"
-    return try queue.read { db in
+    return try pool.read { db in
       try SearchDocumentRecord.fetchAll(
         db,
         sql: """
@@ -252,7 +333,7 @@ final class IndexDatabase {
     }
   }
 
-  private func makeResult(
+  private nonisolated static func makeResult(
     record: SearchDocumentRecord,
     document: DocumentRef,
     query: String
@@ -306,13 +387,13 @@ final class IndexDatabase {
     )
   }
 
-  private func makeFTSQuery(from query: String) -> String {
+  private nonisolated static func makeFTSQuery(from query: String) -> String {
     searchTerms(in: query)
       .map { "\($0)*" }
       .joined(separator: " AND ")
   }
 
-  private func searchTerms(in text: String) -> [String] {
+  private nonisolated static func searchTerms(in text: String) -> [String] {
     text
       .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
       .lowercased()
@@ -321,17 +402,21 @@ final class IndexDatabase {
       .filter { !$0.isEmpty }
   }
 
-  private func normalize(_ text: String) -> String {
+  private nonisolated static func normalize(_ text: String) -> String {
     text
       .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
       .lowercased()
   }
 
-  private func containsAll(_ terms: [String], in text: String) -> Bool {
+  private nonisolated static func containsAll(_ terms: [String], in text: String) -> Bool {
     !terms.isEmpty && terms.allSatisfy { text.contains($0) }
   }
 
-  private func snippet(in body: String, query: String, terms: [String]) -> String? {
+  private nonisolated static func snippet(
+    in body: String,
+    query: String,
+    terms: [String]
+  ) -> String? {
     let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
     let matchRange =
       body.range(of: query, options: options)
