@@ -22,6 +22,8 @@ enum EditorMode: Int, CaseIterable, Identifiable {
 @MainActor
 final class AppState: ObservableObject {
   private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
+  private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
+  private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
   private let defaults: UserDefaults
 
   // Workspace + document selection
@@ -77,6 +79,16 @@ final class AppState: ObservableObject {
   @Published var fontSize: CGFloat = 14
   @Published var richMarkdownEnabled: Bool = true
   @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
+  @Published var tableTidyOnPaste: Bool {
+    didSet {
+      defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)
+    }
+  }
+  @Published var asciiSafeTables: Bool {
+    didSet {
+      defaults.set(asciiSafeTables, forKey: Self.asciiSafeTablesKey)
+    }
+  }
 
   // Preview behaviour. `previewAutoReload` mirrors the legacy
   // "Automatically reload page" checkbox; `previewRefreshToken` is bumped
@@ -103,6 +115,16 @@ final class AppState: ObservableObject {
       self.previewAutoReload = false
     } else {
       self.previewAutoReload = defaults.bool(forKey: Self.previewAutoReloadKey)
+    }
+    if defaults.object(forKey: Self.tableTidyOnPasteKey) == nil {
+      self.tableTidyOnPaste = true
+    } else {
+      self.tableTidyOnPaste = defaults.bool(forKey: Self.tableTidyOnPasteKey)
+    }
+    if defaults.object(forKey: Self.asciiSafeTablesKey) == nil {
+      self.asciiSafeTables = false
+    } else {
+      self.asciiSafeTables = defaults.bool(forKey: Self.asciiSafeTablesKey)
     }
   }
 

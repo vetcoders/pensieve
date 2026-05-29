@@ -130,10 +130,16 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     XCTAssertFalse(AppState(defaults: defaults).previewAutoReload)
+    XCTAssertTrue(AppState(defaults: defaults).tableTidyOnPaste)
+    XCTAssertFalse(AppState(defaults: defaults).asciiSafeTables)
 
     defaults.set(true, forKey: "Pensieve.previewAutoReload")
+    defaults.set(false, forKey: "Pensieve.tableTidyOnPaste")
+    defaults.set(true, forKey: "Pensieve.asciiSafeTables")
 
     XCTAssertTrue(AppState(defaults: defaults).previewAutoReload)
+    XCTAssertFalse(AppState(defaults: defaults).tableTidyOnPaste)
+    XCTAssertTrue(AppState(defaults: defaults).asciiSafeTables)
   }
 
   @MainActor
@@ -202,6 +208,8 @@ final class PensieveSmokeTests: XCTestCase {
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true

@@ -40,12 +40,22 @@ enum MarkdownFormat: CaseIterable, Identifiable {
 }
 
 struct MarkdownFormatCommand: Equatable, Identifiable {
+  enum Action: Equatable {
+    case format(MarkdownFormat)
+    case tidyTable(asciiSafe: Bool)
+  }
+
   let id: UUID
-  let format: MarkdownFormat
+  let action: Action
 
   init(format: MarkdownFormat, id: UUID = UUID()) {
     self.id = id
-    self.format = format
+    self.action = .format(format)
+  }
+
+  init(tidyTableAsciiSafe asciiSafe: Bool, id: UUID = UUID()) {
+    self.id = id
+    self.action = .tidyTable(asciiSafe: asciiSafe)
   }
 }
 

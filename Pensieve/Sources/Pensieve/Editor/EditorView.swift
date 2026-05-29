@@ -16,6 +16,8 @@ struct EditorView: View {
         fontSize: appState.fontSize,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
+        tableTidyOnPaste: appState.tableTidyOnPaste,
+        asciiSafeTables: appState.asciiSafeTables,
         isDirty: documentDirty,
         onDocumentChanged: controller.documentDidChange
       )
@@ -74,6 +76,8 @@ struct EditorRepresentable: NSViewRepresentable {
   let fontSize: CGFloat
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
+  let tableTidyOnPaste: Bool
+  let asciiSafeTables: Bool
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
 
@@ -81,7 +85,9 @@ struct EditorRepresentable: NSViewRepresentable {
     let surface = MarkdownEditorSurface(
       text: text,
       fontSize: fontSize,
-      syntaxHighlightingEnabled: syntaxHighlightingEnabled
+      syntaxHighlightingEnabled: syntaxHighlightingEnabled,
+      tableTidyOnPaste: tableTidyOnPaste,
+      asciiSafeTables: asciiSafeTables
     )
     surface.onTextChanged = { newText in
       self.text = newText
@@ -97,7 +103,9 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.update(
       text: text,
       fontSize: fontSize,
-      syntaxHighlightingEnabled: syntaxHighlightingEnabled
+      syntaxHighlightingEnabled: syntaxHighlightingEnabled,
+      tableTidyOnPaste: tableTidyOnPaste,
+      asciiSafeTables: asciiSafeTables
     )
     context.coordinator.apply(formattingCommand, to: surface)
   }
@@ -114,7 +122,7 @@ struct EditorRepresentable: NSViewRepresentable {
       guard let command else { return }
       guard command.id != lastAppliedFormattingCommandID else { return }
       lastAppliedFormattingCommandID = command.id
-      surface.applyMarkdownFormat(command.format)
+      surface.applyMarkdownCommand(command)
     }
   }
 }
@@ -130,7 +138,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onTextChanged: ((String) -> Void)?
   var isApplyingExternalText = false
 
-  init(text: String, fontSize: CGFloat, syntaxHighlightingEnabled: Bool = true) {
+  init(
+    text: String,
+    fontSize: CGFloat,
+    syntaxHighlightingEnabled: Bool = true,
+    tableTidyOnPaste: Bool = true,
+    asciiSafeTables: Bool = false
+  ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()
     textStorage = NSTextStorage()
@@ -166,14 +180,31 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     scrollView.documentView = textView
     textView.setupGutter(layoutManager: textLayoutManager)
+    textView.tableTidyOnPaste = tableTidyOnPaste
+    textView.asciiSafeTables = asciiSafeTables
 
     super.init()
 
     textView.delegate = self
-    update(text: text, fontSize: fontSize, syntaxHighlightingEnabled: syntaxHighlightingEnabled)
+    update(
+      text: text,
+      fontSize: fontSize,
+      syntaxHighlightingEnabled: syntaxHighlightingEnabled,
+      tableTidyOnPaste: tableTidyOnPaste,
+      asciiSafeTables: asciiSafeTables
+    )
   }
 
-  func update(text: String, fontSize: CGFloat, syntaxHighlightingEnabled: Bool) {
+  func update(
+    text: String,
+    fontSize: CGFloat,
+    syntaxHighlightingEnabled: Bool,
+    tableTidyOnPaste: Bool = true,
+    asciiSafeTables: Bool = false
+  ) {
+    textView.tableTidyOnPaste = tableTidyOnPaste
+    textView.asciiSafeTables = asciiSafeTables
+
     if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
       textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
     }
@@ -209,6 +240,41 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     let selectedText = (textStorage.string as NSString).substring(with: range)
     let replacement = MarkdownFormatter.format(selectedText, as: format)
+    guard textView.shouldChangeText(in: range, replacementString: replacement) else { return false }
+
+    textStorage.replaceCharacters(in: range, with: replacement)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(
+      NSRange(location: range.location, length: (replacement as NSString).length))
+    textView.didChangeText()
+    return true
+  }
+
+  @discardableResult
+  func applyMarkdownCommand(_ command: MarkdownFormatCommand) -> Bool {
+    switch command.action {
+    case .format(let format):
+      return applyMarkdownFormat(format)
+    case .tidyTable(let asciiSafe):
+      return tidyTable(asciiSafe: asciiSafe)
+    }
+  }
+
+  @discardableResult
+  func tidyTable(asciiSafe: Bool) -> Bool {
+    let storageString = textStorage.string as NSString
+    let selectedRange = textView.selectedRange()
+    let range =
+      selectedRange.length > 0
+      ? selectedRange
+      : NSRange(location: 0, length: storageString.length)
+    guard NSMaxRange(range) <= storageString.length else { return false }
+
+    let target = storageString.substring(with: range)
+    guard TableNormalizer.containsTableSmell(target) else { return false }
+
+    let replacement = TableNormalizer.normalize(target, asciiSafe: asciiSafe)
+    guard replacement != target else { return false }
     guard textView.shouldChangeText(in: range, replacementString: replacement) else { return false }
 
     textStorage.replaceCharacters(in: range, with: replacement)

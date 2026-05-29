@@ -40,6 +40,8 @@ final class MarkdownFormatterTests: XCTestCase {
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
@@ -69,5 +71,111 @@ final class MarkdownFormatterTests: XCTestCase {
     XCTAssertFalse(didApply)
     XCTAssertEqual(surface.textStorage.string, "plain")
     XCTAssertFalse(didRouteDocumentChange)
+  }
+
+  @MainActor
+  func testTidyTableCommandAppliesToSelectionAndMarksDirty() {
+    var boundText = "before\n| a | b |\n| c | d |\nafter"
+    var isDirty = false
+    var didRouteDocumentChange = false
+    let appState = AppState()
+    let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-table.md"))
+    appState.documentSession = DocumentSession(document: ref, text: boundText)
+    let controller = AppController(appState: appState)
+    let surface = MarkdownEditorSurface(text: boundText, fontSize: 14)
+    surface.onTextChanged = { newText in
+      boundText = newText
+      isDirty = true
+      didRouteDocumentChange = true
+    }
+    let selection = (boundText as NSString).range(of: "| a | b |\n| c | d |")
+    surface.textView.setSelectedRange(selection)
+
+    controller.tidyTable()
+    let command = appState.pendingMarkdownFormatCommand
+    let representable = EditorRepresentable(
+      text: Binding(get: { boundText }, set: { boundText = $0 }),
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      formattingCommand: command,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
+      onDocumentChanged: {
+        didRouteDocumentChange = true
+      }
+    )
+    let coordinator = representable.makeCoordinator()
+
+    coordinator.apply(command, to: surface)
+
+    XCTAssertEqual(surface.textStorage.string, "before\n| a | b |\n|---|---|\n| c | d |\nafter")
+    XCTAssertEqual(boundText, "before\n| a | b |\n|---|---|\n| c | d |\nafter")
+    XCTAssertTrue(isDirty)
+    XCTAssertTrue(didRouteDocumentChange)
+  }
+
+  @MainActor
+  func testTidyTableCommandUsesWholeDocumentWhenSelectionIsEmpty() {
+    let surface = MarkdownEditorSurface(text: "| a | b |\n| c | d |", fontSize: 14)
+    surface.textView.setSelectedRange(NSRange(location: 0, length: 0))
+
+    let didApply = surface.tidyTable(asciiSafe: false)
+
+    XCTAssertTrue(didApply)
+    XCTAssertEqual(surface.textStorage.string, "| a | b |\n|---|---|\n| c | d |")
+  }
+
+  @MainActor
+  func testTidyTableCommandNoOpsWithoutTableSmell() {
+    var didRouteDocumentChange = false
+    let surface = MarkdownEditorSurface(text: "plain", fontSize: 14)
+    surface.onTextChanged = { _ in
+      didRouteDocumentChange = true
+    }
+
+    let didApply = surface.tidyTable(asciiSafe: false)
+
+    XCTAssertFalse(didApply)
+    XCTAssertEqual(surface.textStorage.string, "plain")
+    XCTAssertFalse(didRouteDocumentChange)
+  }
+
+  @MainActor
+  func testSmartPasteNormalizesTableAndFirstUndoRestoresRawPaste() {
+    let surface = MarkdownEditorSurface(text: "prefix\n", fontSize: 14)
+    surface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+    surface.textView.tableTidyOnPaste = true
+    let pasteboard = NSPasteboard(
+      name: NSPasteboard.Name("PensieveTablePaste-\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    pasteboard.setString("| a | b |\n| c | d |", forType: .string)
+
+    let didPaste = surface.textView.pasteTableIfNeeded(from: pasteboard)
+
+    XCTAssertTrue(didPaste)
+    XCTAssertEqual(surface.textStorage.string, "prefix\n| a | b |\n|---|---|\n| c | d |")
+
+    surface.textView.undoManager?.undo()
+
+    XCTAssertEqual(surface.textStorage.string, "prefix\n| a | b |\n| c | d |")
+  }
+
+  @MainActor
+  func testSmartPasteFallsBackWhenToggleIsOffOrPasteHasNoTableSmell() {
+    let surface = MarkdownEditorSurface(text: "", fontSize: 14)
+    let pasteboard = NSPasteboard(
+      name: NSPasteboard.Name("PensievePlainPaste-\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    pasteboard.setString("plain", forType: .string)
+
+    XCTAssertFalse(surface.textView.pasteTableIfNeeded(from: pasteboard))
+
+    pasteboard.clearContents()
+    pasteboard.setString("| a | b |\n| c | d |", forType: .string)
+    surface.textView.tableTidyOnPaste = false
+
+    XCTAssertFalse(surface.textView.pasteTableIfNeeded(from: pasteboard))
+    XCTAssertEqual(surface.textStorage.string, "")
   }
 }

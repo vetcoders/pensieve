@@ -204,6 +204,12 @@ final class AppController: ObservableObject {
     appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(format: format)
   }
 
+  func tidyTable() {
+    guard appState.documentSession.hasEditableBuffer else { return }
+    appState.pendingMarkdownFormatCommand = MarkdownFormatCommand(
+      tidyTableAsciiSafe: appState.asciiSafeTables)
+  }
+
   func formatSelection(with wrapper: String) {
     guard let format = MarkdownFormat(wrapper: wrapper) else { return }
     applyMarkdownFormat(format)

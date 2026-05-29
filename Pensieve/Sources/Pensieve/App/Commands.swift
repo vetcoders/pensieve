@@ -164,6 +164,23 @@ struct PensieveCommands: Commands {
         }
         .keyboardShortcut("7", modifiers: [.command, .shift])
         .disabled(!appState.documentSession.hasEditableBuffer)
+
+        Button("Tidy Table") {
+          controller.tidyTable()
+        }
+        .keyboardShortcut("t", modifiers: [.command, .shift])
+        .disabled(!appState.documentSession.hasEditableBuffer)
+      }
+
+      Divider()
+
+      Button(appState.tableTidyOnPaste ? "Pause Tidy Table on Paste" : "Resume Tidy Table on Paste")
+      {
+        appState.tableTidyOnPaste.toggle()
+      }
+
+      Button(appState.asciiSafeTables ? "Disable ASCII-Safe Tables" : "Enable ASCII-Safe Tables") {
+        appState.asciiSafeTables.toggle()
       }
 
       Divider()
