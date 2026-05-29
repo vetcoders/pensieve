@@ -103,6 +103,110 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testMarkdownTextStorageScopesTypingHighlightRefreshToEditedParagraph() {
+    let text = """
+      edit this line
+
+      # Far Heading
+
+      **far bold**
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+    let editRange = nsText.range(of: "edit this line")
+    let farHeadingRange = nsText.range(of: "# Far Heading")
+
+    storage.addAttribute(.backgroundColor, value: NSColor.systemYellow, range: farHeadingRange)
+    storage.replaceCharacters(in: editRange, with: "# Edited line")
+    waitForHighlightingDebounce()
+
+    let updatedText = storage.string as NSString
+    let editedHeadingRange = updatedText.range(of: "# Edited line")
+    let updatedFarHeadingRange = updatedText.range(of: "# Far Heading")
+    let farBoldRange = updatedText.range(of: "**far bold**")
+
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: editedHeadingRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemGreen)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemGreen)
+    XCTAssertEqual(
+      storage.attribute(.backgroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemYellow)
+    XCTAssertNotNil(storage.attribute(.font, at: farBoldRange.location, effectiveRange: nil))
+  }
+
+  @MainActor
+  func testMarkdownTextStorageExtendsScopedRefreshToContainingFencedCodeBlock() {
+    let text = """
+      intro
+
+      ```swift
+      let value = "before"
+      return value
+      ```
+
+      after
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+    let editRange = nsText.range(of: "\"before\"")
+
+    storage.replaceCharacters(in: editRange, with: "\"after\"")
+    waitForHighlightingDebounce()
+
+    let updatedText = storage.string as NSString
+    let letRange = updatedText.range(of: "let value")
+    let returnRange = updatedText.range(of: "return value")
+    let stringRange = updatedText.range(of: "\"after\"")
+
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
+      NSColor.systemPink)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: returnRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemPink)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: stringRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemRed)
+  }
+
+  @MainActor
+  func testMarkdownTextStorageFallsBackToFullRefreshWhenFenceToggleClosesCodeBlock() {
+    let text = """
+      ```swift
+      let value = "one"
+      plain after
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+    let insertLocation = nsText.range(of: "plain after").location
+
+    storage.replaceCharacters(in: NSRange(location: insertLocation, length: 0), with: "```\n")
+    waitForHighlightingDebounce()
+
+    let updatedText = storage.string as NSString
+    let letRange = updatedText.range(of: "let value")
+    let plainRange = updatedText.range(of: "plain after")
+
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
+      NSColor.systemPink)
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: plainRange.location, effectiveRange: nil) as? NSColor,
+      NSColor.textColor)
+  }
+
+  @MainActor
   func testMarkdownEditorSurfaceCanDisableSyntaxColors() {
     let surface = MarkdownEditorSurface(
       text: "# Heading\n\n`code`", fontSize: 14, syntaxHighlightingEnabled: false)
@@ -1868,6 +1972,11 @@ final class PensieveSmokeTests: XCTestCase {
       )
       .appendingPathComponent("Application Support", isDirectory: true)
       .appendingPathComponent("Pensieve", isDirectory: true)
+  }
+
+  @MainActor
+  private func waitForHighlightingDebounce() {
+    RunLoop.main.run(until: Date().addingTimeInterval(0.16))
   }
 }
 
