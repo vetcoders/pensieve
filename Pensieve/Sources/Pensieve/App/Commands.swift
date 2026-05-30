@@ -79,6 +79,42 @@ struct PensieveCommands: Commands {
       .disabled(!appState.documentSession.hasEditableBuffer)
     }
 
+    // Edit menu — Find & Replace. Ported from the legacy MarkdownEditor
+    // storyboard which wired `performTextFinderAction:` with NSTextFinder tags
+    // (Find=1, ShowReplace=12, Next=2, Previous=3, SetSearchString=7). Our
+    // MarkdownTextView already sets `usesFindBar = true`, so the find bar (with
+    // replace mode) is ready — these menu items just route the action through
+    // the responder chain, which SwiftUI does not provide for a custom
+    // NSViewRepresentable editor.
+    CommandGroup(after: .textEditing) {
+      Divider()
+
+      Button("Find…") {
+        performFinderAction(.showFindInterface)
+      }
+      .keyboardShortcut("f", modifiers: [.command])
+
+      Button("Find and Replace…") {
+        performFinderAction(.showReplaceInterface)
+      }
+      .keyboardShortcut("f", modifiers: [.command, .option])
+
+      Button("Find Next") {
+        performFinderAction(.nextMatch)
+      }
+      .keyboardShortcut("g", modifiers: [.command])
+
+      Button("Find Previous") {
+        performFinderAction(.previousMatch)
+      }
+      .keyboardShortcut("g", modifiers: [.command, .shift])
+
+      Button("Use Selection for Find") {
+        performFinderAction(.setSearchString)
+      }
+      .keyboardShortcut("e", modifiers: [.command])
+    }
+
     // Mode menu - editor modes and reading preferences
     CommandMenu("Mode") {
       ForEach(EditorMode.allCases) { mode in
@@ -297,6 +333,20 @@ struct PensieveCommands: Commands {
     }
 
     return candidate
+  }
+
+  /// Routes a find-bar action to whichever NSTextView is first responder.
+  /// Mirrors the legacy storyboard's `performTextFinderAction:` wiring: build a
+  /// menu-item carrier holding the NSTextFinder.Action raw value as its tag and
+  /// send it down the responder chain. NSTextView (usesFindBar = true) answers
+  /// it and shows the find/replace bar.
+  private func performFinderAction(_ action: NSTextFinder.Action) {
+    let carrier = NSMenuItem()
+    carrier.tag = action.rawValue
+    NSApp.sendAction(
+      #selector(NSTextView.performTextFinderAction(_:)),
+      to: nil,
+      from: carrier)
   }
 
   private func showAboutPanel() {
