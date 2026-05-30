@@ -295,6 +295,45 @@ final class IndexDatabase {
     }
   }
 
+  func upsertWorkspace(
+    identity: WorkspaceIdentity,
+    roots: [URL],
+    lastSeenAt: Date = Date(),
+    documents: [DocumentRef],
+    appState: AppState? = nil
+  ) async {
+    guard let pool = ensureOpen(into: appState) else { return }
+
+    do {
+      let records = await Task.detached(priority: .utility) {
+        documents.compactMap(Self.documentRecord)
+      }.value
+      guard
+        databaseURL.map({ FileManager.default.fileExists(atPath: $0.path) }) ?? true
+      else {
+        return
+      }
+      try await Task.detached(priority: .utility) {
+        try pool.write { db in
+          try Self.upsertWorkspace(identity: identity, roots: roots, lastSeenAt: lastSeenAt, in: db)
+          try Self.upsertDocuments(
+            records: records,
+            workspaceID: identity.workspaceID,
+            indexedAt: lastSeenAt,
+            in: db
+          )
+          try Self.tombstoneDocumentsNotIn(
+            paths: records.map(\.path),
+            workspaceID: identity.workspaceID,
+            in: db
+          )
+        }
+      }.value
+    } catch {
+      report(error, appState: appState, action: "update Pensieve workspace index")
+    }
+  }
+
   private func applicationSupportDirectory() throws -> URL {
     try FileManager.default
       .url(
@@ -381,6 +420,128 @@ final class IndexDatabase {
         record.updatedAt,
       ]
     )
+  }
+
+  private nonisolated static func upsertWorkspace(
+    identity: WorkspaceIdentity,
+    roots: [URL],
+    lastSeenAt: Date,
+    in db: Database
+  ) throws {
+    let timestamp = Int(lastSeenAt.timeIntervalSince1970)
+    try db.execute(
+      sql: """
+        INSERT INTO workspaces
+            (workspace_id, canonical_path, volume_resource_id, bookmark_hash,
+             first_seen_at, last_seen_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'active')
+        ON CONFLICT(workspace_id) DO UPDATE SET
+            canonical_path = excluded.canonical_path,
+            volume_resource_id = excluded.volume_resource_id,
+            bookmark_hash = excluded.bookmark_hash,
+            last_seen_at = excluded.last_seen_at,
+            status = 'active'
+        """,
+      arguments: [
+        identity.workspaceID,
+        identity.canonicalRootURL.path,
+        identity.volumeResourceID,
+        identity.rootBookmarkHash,
+        timestamp,
+        timestamp,
+      ]
+    )
+  }
+
+  private nonisolated static func upsertDocuments(
+    records: [IndexDocumentRecord],
+    workspaceID: String,
+    indexedAt: Date,
+    in db: Database
+  ) throws {
+    let timestamp = Int(indexedAt.timeIntervalSince1970)
+    for record in records {
+      try db.execute(
+        sql: """
+          INSERT INTO documents
+              (workspace_id, path, title, body, mtime, size, is_ad_hoc, indexed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(workspace_id, path) DO UPDATE SET
+              title = excluded.title,
+              body = excluded.body,
+              mtime = excluded.mtime,
+              size = excluded.size,
+              is_ad_hoc = excluded.is_ad_hoc,
+              indexed_at = excluded.indexed_at
+          """,
+        arguments: [
+          workspaceID,
+          record.path,
+          record.title,
+          record.body,
+          record.mtime,
+          record.size,
+          record.isAdHoc ? 1 : 0,
+          timestamp,
+        ]
+      )
+    }
+  }
+
+  private nonisolated static func tombstoneDocumentsNotIn(
+    paths: [String],
+    workspaceID: String,
+    in db: Database
+  ) throws {
+    guard !paths.isEmpty else {
+      try db.execute(sql: "DELETE FROM documents WHERE workspace_id = ?", arguments: [workspaceID])
+      return
+    }
+
+    let placeholders = Array(repeating: "?", count: paths.count).joined(separator: ", ")
+    var arguments: StatementArguments = [workspaceID]
+    arguments += StatementArguments(paths)
+    try db.execute(
+      sql: """
+        DELETE FROM documents
+        WHERE workspace_id = ?
+          AND path NOT IN (\(placeholders))
+        """,
+      arguments: arguments
+    )
+  }
+
+  private nonisolated static func documentRecord(from document: DocumentRef)
+    -> IndexDocumentRecord?
+  {
+    let url = document.url.standardizedFileURL
+    guard let body = try? String(contentsOf: url, encoding: .utf8) else {
+      return nil
+    }
+    let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+    let modifiedAt =
+      values?.contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
+    let size = values?.fileSize ?? Data(body.utf8).count
+    return IndexDocumentRecord(
+      path: document.relativePath ?? document.displayPath,
+      title: title(fromMarkdown: body, fallback: document.title),
+      body: body,
+      mtime: Int(modifiedAt),
+      size: size,
+      isAdHoc: document.isAdHoc
+    )
+  }
+
+  private nonisolated static func title(fromMarkdown body: String, fallback: String) -> String {
+    for line in body.split(whereSeparator: \.isNewline) {
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      guard trimmed.hasPrefix("# ") else { continue }
+      let title = trimmed.dropFirst(2).trimmingCharacters(in: .whitespaces)
+      if !title.isEmpty {
+        return title
+      }
+    }
+    return fallback
   }
 
   private nonisolated static func performSearch(
@@ -592,4 +753,13 @@ private struct SearchDocumentRecord: FetchableRecord, Sendable {
     isAdHoc = (row["is_ad_hoc"] as Int) != 0
     updatedAt = row["updated_at"]
   }
+}
+
+private struct IndexDocumentRecord: Sendable {
+  var path: String
+  var title: String
+  var body: String
+  var mtime: Int
+  var size: Int
+  var isAdHoc: Bool
 }

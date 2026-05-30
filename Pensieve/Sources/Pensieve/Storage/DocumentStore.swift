@@ -207,7 +207,7 @@ final class FolderManager {
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     rebuildWorkspace(into: appState)
-    commitWorkspaceManifest(
+    _ = commitWorkspaceManifest(
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
       into: appState
@@ -256,7 +256,7 @@ final class FolderManager {
       }
 
       self.applyWorkspaceScans(scans, into: appState)
-      self.commitWorkspaceManifest(
+      let workspaceIndexWriteTask = self.commitWorkspaceManifest(
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
         into: appState
@@ -264,6 +264,7 @@ final class FolderManager {
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       appState.workspaceActivity = .indexing(documentCount: appState.allDocuments.count)
+      await workspaceIndexWriteTask?.value
       await self.indexDatabase.reindexInBackground(
         documents: appState.allDocuments, appState: appState)
       guard !Task.isCancelled else { return }
@@ -359,8 +360,8 @@ final class FolderManager {
 
   private func commitWorkspaceManifest(
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
-  ) {
-    guard rootURLs.count == 1 else { return }
+  ) -> Task<Void, Never>? {
+    guard rootURLs.count == 1 else { return nil }
     let identity = WorkspaceIdentity.make(
       rootURL: rootURLs[0],
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
@@ -373,9 +374,19 @@ final class FolderManager {
         exclusions: exclusions,
         fingerprint: fingerprint
       )
+      let documents = appState.documents
+      return Task {
+        await indexDatabase.upsertWorkspace(
+          identity: identity,
+          roots: rootURLs,
+          documents: documents,
+          appState: appState
+        )
+      }
     } catch {
       try? workspaceSubstrate.markFailure(identity: identity, kind: "manifestCommitFailed")
       appState.lastError = "Could not update workspace cache: \(error.localizedDescription)"
+      return nil
     }
   }
 
