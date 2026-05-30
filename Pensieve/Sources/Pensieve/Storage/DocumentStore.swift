@@ -285,6 +285,26 @@ final class FolderManager {
       return false
     }
 
+    // Cold-start short-circuit (STAB-R01 / B-01): if there is no in-memory
+    // workspace yet (empty tree) or the requested workspace does not match the
+    // one already loaded, skip the substrate validate-walk and hand off to the
+    // cold-scan path so the scanner owns the single tree walk. Without this,
+    // cold start with an existing manifest pays for the validate-walk only to
+    // fall through to the cold scan anyway.
+    let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
+    let openFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
+    guard
+      matchesCurrentWorkspace(
+        rootPaths: rootPaths,
+        openFilePaths: openFilePaths,
+        in: appState
+      ),
+      !appState.workspaceTree.isEmpty
+    else {
+      appState.workspaceActivity = .cacheMiss(label)
+      return false
+    }
+
     let identity = WorkspaceIdentity.make(
       rootURL: rootURLs[0],
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
@@ -299,19 +319,6 @@ final class FolderManager {
       switch verdict {
       case .valid:
         appState.workspaceActivity = .cacheHit(label)
-        let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
-        let openFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
-        guard
-          matchesCurrentWorkspace(
-            rootPaths: rootPaths,
-            openFilePaths: openFilePaths,
-            in: appState
-          ),
-          !appState.workspaceTree.isEmpty
-        else {
-          appState.workspaceActivity = .cacheMiss(label)
-          return false
-        }
         indexDatabase.open(into: appState)
         startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         appState.lastError = nil

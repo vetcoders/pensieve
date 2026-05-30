@@ -665,6 +665,73 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testFolderManagerColdStartWithManifestPerformsSingleBuilderCall() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveColdStartManifestTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("cold.md")
+    try "cold-start body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let buildCounter = BuildCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      buildCounter.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      workspaceSubstrate: substrate
+    )
+
+    // Warm-up: first open does the initial cold scan and commits a manifest.
+    // After this the manifest is on disk but the in-memory workspace state is
+    // populated.
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(buildCounter.value, 1)
+    let identity = WorkspaceIdentity.make(
+      rootURL: folder, bookmarkData: appState.bookmarkData)
+    XCTAssertNotNil(try store.readManifest(for: identity))
+
+    // Simulate cold start: in-memory workspace is gone but the manifest stays
+    // on disk (mirrors process relaunch with cache present). bookmarkData stays
+    // so identity round-trips.
+    appState.workspaceTree = []
+    appState.workspaceRoots = []
+    appState.documents = []
+    appState.openFiles = []
+    appState.selectedDocumentID = nil
+    let warmupBuilderCount = buildCounter.value
+
+    // Second open: with the cold-start guard ordered before workspaceSubstrate.open,
+    // the empty tree short-circuits the cache fast-path and hands the single
+    // tree walk to the cold scanner. Pins STAB-R01 / B-01: cold start always
+    // performs exactly one builder walk, even when a manifest already exists.
+    manager.open(url: folder, into: appState)
+
+    XCTAssertEqual(
+      buildCounter.value - warmupBuilderCount, 1,
+      "cold start with existing manifest must take the cold-scan path exactly once")
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+    XCTAssertFalse(appState.workspaceTree.isEmpty)
+    let postManifest = try XCTUnwrap(try store.readManifest(for: identity))
+    let currentFingerprint = try TreeFingerprint.compute(rootURL: folder, exclusions: [])
+    XCTAssertEqual(postManifest.workspaceID, identity.workspaceID)
+    XCTAssertEqual(postManifest.treeFingerprint.treeHash, currentFingerprint.treeHash)
+    XCTAssertNil(appState.workspaceActivity)
+  }
+
+  @MainActor
   func testFolderManagerCommitsManifestAfterColdScan() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveColdManifestTests-\(UUID().uuidString)", isDirectory: true)
