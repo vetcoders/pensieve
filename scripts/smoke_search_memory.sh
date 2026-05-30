@@ -308,6 +308,16 @@ cleanup() {
             mv "$BACKUP_APPSUP" "$REAL_APPSUP"
         fi
     fi
+    # Drop the smoke bundle id's cfprefsd state and leftover plist. cfprefsd
+    # writes NSWindow / NSOpenPanel cosmetic state during the AppleScript
+    # Open Folder drive; the smoke bundle id keeps it scoped away from the
+    # operator's real prefs, but the file lingers without this cleanup.
+    defaults delete "$APP_BUNDLE_ID" >/dev/null 2>&1 || true
+    local smoke_plist="$HOME/Library/Preferences/${APP_BUNDLE_ID}.plist"
+    if [[ -f "$smoke_plist" ]]; then
+        command -v trash >/dev/null 2>&1 && trash "$smoke_plist" >/dev/null 2>&1 \
+            || rm -f "$smoke_plist" 2>/dev/null || true
+    fi
     exit $exit_code
 }
 trap cleanup EXIT INT TERM
