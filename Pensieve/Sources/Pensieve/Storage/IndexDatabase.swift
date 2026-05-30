@@ -52,6 +52,7 @@ final class IndexDatabase {
             )
             """)
       }
+      registerIndexV2Migrations(&migrator)
       try migrator.migrate(pool)
 
       databasePool = pool
@@ -60,6 +61,123 @@ final class IndexDatabase {
       let message = "Could not open Pensieve index database: \(error.localizedDescription)"
       appState?.lastError = message
       NSLog(message)
+    }
+  }
+
+  /// B-2 IndexDatabase v2 schema (I-01, Wave A foundation).
+  ///
+  /// Registered AFTER `mvp_workspace_search_fts` so the existing FTS table is
+  /// created first; the `b2_v2_*` namespace stays separate from the MVP
+  /// migration for clarity. `DatabaseMigrator` runs each registered migration
+  /// exactly once per database, so adding these alongside the MVP migration is
+  /// idempotent by construction.
+  ///
+  /// Order matters: `documents` is created before the tables that FK to it
+  /// (`document_revisions`, `document_chunks`), and `workspaces` before the
+  /// tables that FK to it (`documents`, `scan_sessions`, `workspace_stats`).
+  ///
+  /// Active writers land in later waves — `workspaces`/`documents` in W-B-1
+  /// (I-02), FTS5 content-link in W-C-1 (I-03), `scan_sessions`/
+  /// `workspace_stats` in W-D-1 (I-04). `document_revisions` and
+  /// `document_chunks` are scaffolding DDL only this wave (writers in H-1 and
+  /// C-3 respectively). No FTS scaffolding migration is needed here — W-C-1
+  /// owns the full FTS5 content-link rebuild as a self-contained migration.
+  private func registerIndexV2Migrations(_ migrator: inout DatabaseMigrator) {
+    migrator.registerMigration("b2_v2_workspaces") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE workspaces (
+              workspace_id TEXT PRIMARY KEY,
+              canonical_path TEXT NOT NULL,
+              volume_resource_id TEXT,
+              bookmark_hash TEXT,
+              first_seen_at INTEGER NOT NULL,
+              last_seen_at INTEGER NOT NULL,
+              status TEXT NOT NULL
+          )
+          """)
+    }
+
+    migrator.registerMigration("b2_v2_documents") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE documents (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+              path TEXT NOT NULL,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              mtime INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              is_ad_hoc INTEGER NOT NULL,
+              indexed_at INTEGER NOT NULL,
+              UNIQUE(workspace_id, path)
+          )
+          """)
+      try db.execute(sql: "CREATE INDEX idx_documents_workspace ON documents(workspace_id)")
+      try db.execute(sql: "CREATE INDEX idx_documents_path ON documents(workspace_id, path)")
+    }
+
+    // Scaffolding DDL only; writer added in future H-1 version history pack.
+    migrator.registerMigration("b2_v2_document_revisions") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE document_revisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              document_id INTEGER NOT NULL REFERENCES documents(id),
+              revision_at INTEGER NOT NULL,
+              body_hash TEXT NOT NULL
+          )
+          """)
+    }
+
+    // Scaffolding DDL only; chunker writer + embedding column added in future
+    // C-3 vector layer pack.
+    migrator.registerMigration("b2_v2_document_chunks") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE document_chunks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              document_id INTEGER NOT NULL REFERENCES documents(id),
+              chunk_index INTEGER NOT NULL,
+              chunk_text TEXT NOT NULL,
+              chunk_hash TEXT NOT NULL
+          )
+          """)
+    }
+
+    migrator.registerMigration("b2_v2_scan_sessions") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE scan_sessions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+              started_at INTEGER NOT NULL,
+              finished_at INTEGER,
+              trigger TEXT NOT NULL,
+              scanner_version INTEGER NOT NULL,
+              fingerprint_hash TEXT,
+              file_count INTEGER,
+              folder_count INTEGER,
+              duration_ms INTEGER
+          )
+          """)
+      try db.execute(
+        sql: "CREATE INDEX idx_scan_sessions_workspace ON scan_sessions(workspace_id, started_at)")
+    }
+
+    migrator.registerMigration("b2_v2_workspace_stats") { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE workspace_stats (
+              workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id),
+              file_count INTEGER NOT NULL,
+              folder_count INTEGER NOT NULL,
+              last_scan_at INTEGER,
+              last_indexed_at INTEGER,
+              index_health TEXT NOT NULL
+          )
+          """)
     }
   }
 
