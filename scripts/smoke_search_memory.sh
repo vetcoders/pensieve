@@ -383,6 +383,7 @@ for i in $(seq 1 "$ROOTS"); do
 on run argv
   set bundleId to item 1 of argv
   set rootPath to item 2 of argv
+  set the clipboard to rootPath
   tell application id bundleId to activate
   delay 0.6
   tell application "System Events"
@@ -392,7 +393,10 @@ on run argv
     -- Go to Folder…  (⌘⇧G inside NSOpenPanel)
     keystroke "g" using {command down, shift down}
     delay 0.5
-    keystroke rootPath
+    -- Paste the path via ⌘V instead of character-by-character keystroke:
+    -- faster, robust against keyboard layout (AZERTY/QWERTZ remap `/`),
+    -- avoids race conditions on long paths. Per Gemini PR #4 review.
+    keystroke "v" using {command down}
     delay 0.3
     keystroke return
     delay 0.6
