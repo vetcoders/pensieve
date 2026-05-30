@@ -857,6 +857,94 @@ final class IndexDatabase {
     appState?.lastError = message
     NSLog(message)
   }
+
+  func appendScanSession(
+    workspaceID: String,
+    trigger: String,
+    startedAt: Date,
+    finishedAt: Date,
+    scannerVersion: Int,
+    fingerprintHash: String,
+    fileCount: Int,
+    folderCount: Int,
+    durationMs: Int,
+    appState: AppState? = nil
+  ) async {
+    guard let pool = ensureOpen(into: appState) else { return }
+    do {
+      try await Task.detached(priority: .utility) {
+        try pool.write { db in
+          try db.execute(
+            sql: """
+              INSERT INTO scan_sessions (
+                workspace_id, started_at, finished_at, trigger,
+                scanner_version, fingerprint_hash, file_count, folder_count, duration_ms
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              """,
+            arguments: [
+              workspaceID,
+              Int(startedAt.timeIntervalSince1970),
+              Int(finishedAt.timeIntervalSince1970),
+              trigger,
+              scannerVersion,
+              fingerprintHash,
+              fileCount,
+              folderCount,
+              durationMs,
+            ]
+          )
+        }
+      }.value
+    } catch {
+      report(error, appState: appState, action: "append Pensieve scan session")
+    }
+  }
+
+  func refreshWorkspaceStats(
+    workspaceID: String,
+    fileCount: Int,
+    folderCount: Int,
+    fingerprintMatches: Bool,
+    appState: AppState? = nil
+  ) async {
+    guard let pool = ensureOpen(into: appState) else { return }
+    do {
+      try await Task.detached(priority: .utility) {
+        try pool.write { db in
+          let indexHealth = fileCount == 0 ? "empty" : (fingerprintMatches ? "green" : "stale")
+          try db.execute(
+            sql: """
+              INSERT INTO workspace_stats (
+                workspace_id, file_count, folder_count,
+                last_scan_at, last_indexed_at, index_health
+              ) VALUES (
+                ?, ?, ?,
+                (SELECT finished_at FROM scan_sessions WHERE workspace_id = ? ORDER BY finished_at DESC LIMIT 1),
+                (SELECT max(indexed_at) FROM documents WHERE workspace_id = ?),
+                ?
+              )
+              ON CONFLICT(workspace_id) DO UPDATE SET
+                file_count = excluded.file_count,
+                folder_count = excluded.folder_count,
+                last_scan_at = excluded.last_scan_at,
+                last_indexed_at = excluded.last_indexed_at,
+                index_health = excluded.index_health
+              """,
+            arguments: [
+              workspaceID,
+              fileCount,
+              folderCount,
+              workspaceID,
+              workspaceID,
+              indexHealth,
+            ]
+          )
+        }
+      }.value
+    } catch {
+      report(error, appState: appState, action: "refresh Pensieve workspace stats")
+    }
+  }
 }
 
 private struct SearchDocumentRecord: FetchableRecord, Sendable {

@@ -362,13 +362,14 @@ final class FolderManager {
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
   ) -> Task<Void, Never>? {
     guard rootURLs.count == 1 else { return nil }
+    let startedAt = Date()
     let identity = WorkspaceIdentity.make(
       rootURL: rootURLs[0],
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
     do {
       let fingerprint = try TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
-      _ = try workspaceSubstrate.commit(
+      let manifest = try workspaceSubstrate.commit(
         identity: identity,
         roots: rootURLs,
         exclusions: exclusions,
@@ -380,6 +381,30 @@ final class FolderManager {
           identity: identity,
           roots: rootURLs,
           documents: documents,
+          appState: appState
+        )
+
+        let finishedAt = Date()
+        let durationMs = Int(finishedAt.timeIntervalSince(startedAt) * 1000)
+
+        await indexDatabase.appendScanSession(
+          workspaceID: identity.workspaceID,
+          trigger: "cold_scan",
+          startedAt: startedAt,
+          finishedAt: finishedAt,
+          scannerVersion: manifest.scannerVersion,
+          fingerprintHash: manifest.treeFingerprint.treeHash,
+          fileCount: manifest.fileCount,
+          folderCount: manifest.folderCount,
+          durationMs: durationMs,
+          appState: appState
+        )
+
+        await indexDatabase.refreshWorkspaceStats(
+          workspaceID: identity.workspaceID,
+          fileCount: manifest.fileCount,
+          folderCount: manifest.folderCount,
+          fingerprintMatches: true,
           appState: appState
         )
       }
