@@ -179,7 +179,109 @@ final class IndexDatabase {
           )
           """)
     }
+
+    // I-03 (W-C-1): FTS5 trigger-driven sync of WORKSPACE documents.
+    //
+    // The `documents` table (W-B-1) is the source of truth for workspace docs;
+    // these triggers mirror each `is_ad_hoc = 0` row into the existing
+    // `workspace_search_documents` FTS5 table so a documents write keeps its FTS
+    // row in sync without a separate inline-body rebuild.
+    //
+    // Friction 1 (path representation): the search join keys on the FULL
+    // standardized URL path (`performSearch` -> `documentsByPath[record.path]`),
+    // but `documents.path` is the workspace-relative path. The triggers
+    // reconstruct the full path as `workspaces.canonical_path || '/' ||
+    // documents.path` so the FTS `path` matches the join key.
+    //
+    // Friction 3 (column mapping): FTS `title` <- documents.title (markdown H1
+    // or filename fallback, per the W-B-1 writer), `display_path` <-
+    // documents.path (== DocumentRef.displayPath for scanned workspace docs),
+    // `body` <- documents.body, `is_ad_hoc` <- documents.is_ad_hoc,
+    // `updated_at` <- documents.mtime (file modification time; same source the
+    // inline path used for `SearchDocumentRecord.updatedAt`).
+    //
+    // Ad-hoc docs (`is_ad_hoc = 1`) are intentionally NOT mirrored — they reach
+    // FTS via `index(document:body:)` / `reindex` with their own absolute path
+    // (a relative-path reconstruction would be wrong for them). The WHEN guard
+    // keeps the triggers scoped to workspace docs.
+    //
+    // `DatabaseMigrator` runs this once per DB; plain `CREATE TRIGGER` is
+    // idempotent by construction (no IF NOT EXISTS needed).
+    migrator.registerMigration("b2_v2_fts_documents_triggers") { db in
+      try db.execute(
+        sql: """
+          CREATE TRIGGER documents_after_insert_fts
+          AFTER INSERT ON documents
+          WHEN NEW.is_ad_hoc = 0
+          BEGIN
+              DELETE FROM workspace_search_documents
+               WHERE path = (
+                   SELECT canonical_path FROM workspaces
+                    WHERE workspace_id = NEW.workspace_id
+               ) || '/' || NEW.path;
+              INSERT INTO workspace_search_documents
+                  (path, title, display_path, body, is_ad_hoc, updated_at)
+              VALUES (
+                  (SELECT canonical_path FROM workspaces
+                    WHERE workspace_id = NEW.workspace_id) || '/' || NEW.path,
+                  NEW.title,
+                  NEW.path,
+                  NEW.body,
+                  NEW.is_ad_hoc,
+                  NEW.mtime
+              );
+          END
+          """)
+      try db.execute(
+        sql: """
+          CREATE TRIGGER documents_after_update_fts
+          AFTER UPDATE OF body, title, mtime ON documents
+          WHEN NEW.is_ad_hoc = 0
+          BEGIN
+              DELETE FROM workspace_search_documents
+               WHERE path = (
+                   SELECT canonical_path FROM workspaces
+                    WHERE workspace_id = OLD.workspace_id
+               ) || '/' || OLD.path;
+              INSERT INTO workspace_search_documents
+                  (path, title, display_path, body, is_ad_hoc, updated_at)
+              VALUES (
+                  (SELECT canonical_path FROM workspaces
+                    WHERE workspace_id = NEW.workspace_id) || '/' || NEW.path,
+                  NEW.title,
+                  NEW.path,
+                  NEW.body,
+                  NEW.is_ad_hoc,
+                  NEW.mtime
+              );
+          END
+          """)
+      try db.execute(
+        sql: """
+          CREATE TRIGGER documents_after_delete_fts
+          AFTER DELETE ON documents
+          WHEN OLD.is_ad_hoc = 0
+          BEGIN
+              DELETE FROM workspace_search_documents
+               WHERE path = (
+                   SELECT canonical_path FROM workspaces
+                    WHERE workspace_id = OLD.workspace_id
+               ) || '/' || OLD.path;
+          END
+          """)
+    }
   }
+
+  /// Reconstructs the FULL standardized paths of all workspace documents
+  /// (`is_ad_hoc = 0`) currently mirrored into FTS by the
+  /// `b2_v2_fts_documents_triggers` triggers. `reindex` uses this set to leave
+  /// those trigger-owned rows untouched and avoid double-writing them.
+  private nonisolated static let ftsTriggerOwnedPathsSQL = """
+    SELECT w.canonical_path || '/' || d.path
+    FROM documents d
+    JOIN workspaces w ON w.workspace_id = d.workspace_id
+    WHERE d.is_ad_hoc = 0
+    """
 
   func reindex(documents: [DocumentRef], appState: AppState? = nil) {
     guard let pool = ensureOpen(into: appState) else { return }
@@ -363,13 +465,45 @@ final class IndexDatabase {
     didInsertBatch: (@Sendable (Int) -> Void)?
   ) throws {
     try pool.write { db in
-      try db.execute(sql: "DELETE FROM workspace_search_documents")
+      // Workspace documents (`is_ad_hoc = 0`) are mirrored into FTS by the
+      // `b2_v2_fts_documents_triggers` triggers, keyed on the full path
+      // reconstructed from `workspaces.canonical_path` + `documents.path`.
+      // reindex must NOT rewrite those rows: doing so would redo the trigger's
+      // work and, in the cold-scan flow (documents written THEN reindex),
+      // double the write. reindex owns only the rows the triggers do not —
+      // ad-hoc docs and any path not backed by the `documents` table.
+      let ownedPaths = try Set(String.fetchAll(db, sql: ftsTriggerOwnedPathsSQL))
+      try db.execute(
+        sql: """
+          DELETE FROM workspace_search_documents
+          WHERE path NOT IN (\(ftsTriggerOwnedPathsSQL))
+          """)
+
       var batch: [SearchDocumentRecord] = []
       batch.reserveCapacity(batchSize)
 
       for document in documents {
         guard let record = searchDocumentRecord(from: document) else {
           continue
+        }
+        // Trigger-owned workspace docs: skip the redundant write when the FTS row
+        // already matches the on-disk content — in the cold-scan flow the
+        // `documents` triggers just synced it, so this is the double-write
+        // collapse. But `manager.refresh` and the file watcher re-run reindex
+        // WITHOUT writing the `documents` table, so the triggers cannot see
+        // out-of-band file edits; when the file body differs from the trigger
+        // row, re-sync it here so the change stays searchable.
+        if ownedPaths.contains(record.path) {
+          let syncedBody = try String.fetchOne(
+            db,
+            sql: "SELECT body FROM workspace_search_documents WHERE path = ? LIMIT 1",
+            arguments: [record.path])
+          if syncedBody == record.body {
+            continue
+          }
+          try db.execute(
+            sql: "DELETE FROM workspace_search_documents WHERE path = ?",
+            arguments: [record.path])
         }
         batch.append(record)
         if batch.count == batchSize {
