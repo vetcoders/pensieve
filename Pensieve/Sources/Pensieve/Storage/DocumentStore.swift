@@ -14,6 +14,7 @@ final class FolderManager {
   private let selfWriteSuppressionInterval: TimeInterval
   private var workspaceBuildTask: Task<Void, Never>?
   private var recentSelfWritePaths: [String: Date] = [:]
+  private var lastWorkspaceFingerprintHash: String?
 
   init(
     metadataStore: WorkspaceMetadataStore = .shared,
@@ -147,9 +148,18 @@ final class FolderManager {
   func refresh(into appState: AppState) {
     guard appState.hasWorkspaceContent else { return }
 
+    let roots = appState.workspaceRoots.map(\.url)
+    let exclusions = appState.excludedWorkspacePaths
+    let fingerprintHash = currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+    if let fingerprintHash, fingerprintHash == lastWorkspaceFingerprintHash {
+      // The .md tree is unchanged — a non-.md change (screenshot, .DS_Store, sibling
+      // app writes) fired the watcher. Skip the full rebuild + FTS reindex storm.
+      return
+    }
+
     workspaceBuildTask?.cancel()
     let previousSelection = appState.selectedDocumentID
-    rebuildWorkspace(into: appState)
+    rebuildWorkspace(into: appState, fingerprintHash: fingerprintHash)
     let documents = appState.allDocuments
 
     if let previousSelection, documents.contains(where: { $0.id == previousSelection }) {
@@ -354,11 +364,41 @@ final class FolderManager {
     appState.lastError = nil
   }
 
-  private func rebuildWorkspace(into appState: AppState) {
-    let scans = workspaceBuilder(
-      appState.workspaceRoots.map(\.url), appState.excludedWorkspacePaths)
+  private func rebuildWorkspace(into appState: AppState, fingerprintHash: String? = nil) {
+    let roots = appState.workspaceRoots.map(\.url)
+    let exclusions = appState.excludedWorkspacePaths
+    let scans = workspaceBuilder(roots, exclusions)
     applyWorkspaceScans(scans, into: appState)
     indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
+    lastWorkspaceFingerprintHash =
+      fingerprintHash ?? currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+  }
+
+  /// Precise `.md`-tree signature (path | full-precision mtime | size) across all workspace
+  /// roots, used to gate the watcher-triggered rebuild. Non-`.md` churn (screenshots,
+  /// `.DS_Store`) leaves the `.md` set untouched, so the signature is unchanged and the full
+  /// FTS reindex is skipped. Unlike `TreeFingerprint` (whole-second mtime), this keeps the
+  /// sub-second modification time, so a same-second, same-length external edit is still
+  /// detected. Uses the STATIC scanner (not the injected builder) so the gate never counts
+  /// as a rebuild. Returns nil when there are no roots or a file cannot be stat'd — callers
+  /// then rebuild (fail open; never skip on uncertainty).
+  private func currentWorkspaceFingerprintHash(roots: [URL], exclusions: Set<String>) -> String? {
+    guard !roots.isEmpty else { return nil }
+    let documents = WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+      .flatMap(\.documents)
+    var entries: [String] = []
+    entries.reserveCapacity(documents.count)
+    for document in documents {
+      guard
+        let values = try? document.url.resourceValues(forKeys: [
+          .contentModificationDateKey, .fileSizeKey,
+        ])
+      else { return nil }
+      let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+      let size = values.fileSize ?? 0
+      entries.append("\(document.url.standardizedFileURL.path)|\(mtime)|\(size)")
+    }
+    return entries.sorted().joined(separator: "\n")
   }
 
   private func commitWorkspaceManifest(

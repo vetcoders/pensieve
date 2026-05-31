@@ -635,6 +635,54 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testRefreshSkipsRebuildWhenMarkdownUnchanged() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveReindexGateTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+    XCTAssertGreaterThan(afterOpen, 0, "open must scan once")
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+
+    // 1) refresh, nothing changed -> must skip rebuild (no new scan)
+    manager.refresh(into: appState)
+    XCTAssertEqual(calls.count, afterOpen, "refresh with unchanged .md must skip rebuild")
+
+    // 2) add a non-markdown file (e.g. screenshot/.DS_Store) -> must still skip
+    try Data().write(to: folder.appendingPathComponent("shot.png"))
+    manager.refresh(into: appState)
+    XCTAssertEqual(calls.count, afterOpen, "non-.md change must skip rebuild")
+
+    // 3) change .md content (size differs -> fingerprint changes even within same second) -> must rebuild
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    manager.refresh(into: appState)
+    XCTAssertGreaterThan(calls.count, afterOpen, ".md content change must trigger rebuild")
+  }
+
+  /// Reference-typed call counter so the @Sendable workspace builder closure can tally
+  /// invocations without capturing a mutable var (Swift 6 SendableClosureCaptures).
+  private final class BuilderCallCounter: @unchecked Sendable {
+    var count = 0
+  }
+
+  @MainActor
   func testFolderManagerHotReopenSkipsScannerWhenCacheValid() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveHotReopenTests-\(UUID().uuidString)", isDirectory: true)
