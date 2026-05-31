@@ -247,6 +247,32 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testWorkspaceSortKeepsFoldersBeforeFilesInNameModes() {
+    let appState = AppState()
+    appState.workspaceTree = [
+      WorkspaceNode(
+        id: "file-alpha",
+        name: "Alpha.md",
+        kind: .document,
+        url: URL(fileURLWithPath: "/tmp/Alpha.md")
+      ),
+      WorkspaceNode(
+        id: "folder-zulu",
+        name: "Zulu",
+        kind: .folder,
+        url: URL(fileURLWithPath: "/tmp/Zulu"),
+        children: []
+      ),
+    ]
+
+    appState.sidebarSortOrder = .nameAscending
+    XCTAssertEqual(appState.sortedWorkspaceTree.map(\.id), ["folder-zulu", "file-alpha"])
+
+    appState.sidebarSortOrder = .nameDescending
+    XCTAssertEqual(appState.sortedWorkspaceTree.map(\.id), ["folder-zulu", "file-alpha"])
+  }
+
+  @MainActor
   func testPreviewAutoReloadOffGatesTypingUpdatesFromPipeline() {
     let themeManager = ThemeManager()
     let coordinator = PreviewRepresentable.Coordinator(themeManager: themeManager)

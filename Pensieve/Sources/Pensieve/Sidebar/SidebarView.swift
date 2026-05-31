@@ -8,8 +8,11 @@ struct SidebarView: View {
   @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var knownRootNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var hoveredDocumentID: DocumentRef.ID?
+  @State private var hoveredFolderID: WorkspaceNode.ID?
+  @State private var dropTargetFolderID: WorkspaceNode.ID?
   @State private var renamingURL: URL?
   @State private var renameText: String = ""
+  @State private var renameFocusToken: Int = 0
   @AppStorage("pensieve.sidebar.tab") private var sidebarTab: SidebarTab = .openFiles
 
   /// Sidebar segments: open working set vs the workspace folder tree.
@@ -117,17 +120,7 @@ struct SidebarView: View {
 
   private var explorer: some View {
     VStack(spacing: 0) {
-      Picker("", selection: $sidebarTab) {
-        ForEach(SidebarTab.allCases) { tab in
-          Text(tab.label).tag(tab)
-        }
-      }
-      .pickerStyle(.segmented)
-      .labelsHidden()
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
-      .background(Color(NSColor.controlBackgroundColor).opacity(0.72))
-      .accessibilityIdentifier("pensieve.sidebar.tabPicker")
+      sidebarTabStrip
 
       HStack {
         Spacer()
@@ -143,6 +136,44 @@ struct SidebarView: View {
         workspaceList
       }
     }
+  }
+
+  private var sidebarTabStrip: some View {
+    HStack(spacing: 4) {
+      ForEach(SidebarTab.allCases) { tab in
+        sidebarTabButton(tab)
+      }
+    }
+    .padding(4)
+    .background(
+      RoundedRectangle(cornerRadius: 7, style: .continuous)
+        .fill(Color(NSColor.controlBackgroundColor).opacity(0.72))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 7, style: .continuous)
+        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+    )
+    .padding(.horizontal, 10)
+    .padding(.vertical, 6)
+    .accessibilityIdentifier("pensieve.sidebar.tabStrip")
+  }
+
+  private func sidebarTabButton(_ tab: SidebarTab) -> some View {
+    let isSelected = sidebarTab == tab
+    return Button {
+      sidebarTab = tab
+    } label: {
+      Text(tab.label)
+        .font(.caption.weight(isSelected ? .semibold : .regular))
+        .lineLimit(1)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .foregroundColor(isSelected ? .primary : .secondary)
+        .background(selectionBackground(isSelected))
+    }
+    .buttonStyle(.plain)
+    .accessibilityIdentifier("pensieve.sidebar.tab.\(tab.rawValue)")
   }
 
   private var openFilesList: some View {
@@ -355,6 +386,7 @@ struct SidebarView: View {
     } else {
       let children = node.children ?? []
       let isExpanded = isNodeExpanded(node)
+      let isDropTarget = dropTargetFolderID == node.id
 
       let content = VStack(alignment: .leading, spacing: 0) {
         Button {
@@ -363,10 +395,16 @@ struct SidebarView: View {
           }
           toggleExpanded(node.id)
         } label: {
-          folderRow(node, depth: depth, isExpanded: isExpanded)
+          folderRow(
+            node,
+            depth: depth,
+            isExpanded: isExpanded,
+            isHighlighted: hoveredFolderID == node.id || isDropTarget
+          )
         }
         .buttonStyle(.plain)
         .onHover { isHovered in
+          hoveredFolderID = isHovered ? node.id : nil
           if isHovered, let url = node.url {
             appState.sidebarFocusedURL = url.standardizedFileURL
           }
@@ -374,7 +412,7 @@ struct SidebarView: View {
         .contextMenu {
           nodeContextMenu(for: node)
         }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+        .onDrop(of: [.fileURL], isTargeted: dropTargetBinding(for: node.id)) { providers in
           handleDrop(providers, into: node.url)
         }
 
@@ -388,7 +426,12 @@ struct SidebarView: View {
     }
   }
 
-  private func folderRow(_ node: WorkspaceNode, depth: Int, isExpanded: Bool) -> some View {
+  private func folderRow(
+    _ node: WorkspaceNode,
+    depth: Int,
+    isExpanded: Bool,
+    isHighlighted: Bool
+  ) -> some View {
     HStack(spacing: 5) {
       Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
         .font(.caption2.weight(.semibold))
@@ -406,6 +449,7 @@ struct SidebarView: View {
     .help(node.url?.path ?? node.name)
     .frame(maxWidth: .infinity, alignment: .leading)
     .contentShape(Rectangle())
+    .background(selectionBackground(isHighlighted))
   }
 
   private func nodeRow(_ node: WorkspaceNode, depth: Int, isSelected: Bool) -> some View {
@@ -469,15 +513,17 @@ struct SidebarView: View {
   @ViewBuilder
   private func renameableTitle(for url: URL?, title: String) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      TextField("Name", text: $renameText)
-        .textFieldStyle(.plain)
-        .onSubmit {
+      InlineRenameField(
+        text: $renameText,
+        focusToken: renameFocusToken,
+        accessibilityIdentifier: "pensieve.sidebar.renameField",
+        onCommit: {
           commitRename(url)
-        }
-        .onExitCommand {
+        },
+        onCancel: {
           cancelRename()
         }
-        .accessibilityIdentifier("pensieve.sidebar.renameField")
+      )
     } else {
       Text(title)
         .lineLimit(1)
@@ -619,6 +665,7 @@ struct SidebarView: View {
   private func beginRename(url: URL, currentName: String) {
     renamingURL = url.standardizedFileURL
     renameText = currentName
+    renameFocusToken &+= 1
   }
 
   private func commitRename(_ url: URL) {
@@ -667,6 +714,15 @@ struct SidebarView: View {
       return true
     }
     return false
+  }
+
+  private func dropTargetBinding(for nodeID: WorkspaceNode.ID) -> Binding<Bool> {
+    Binding(
+      get: { dropTargetFolderID == nodeID },
+      set: { isTargeted in
+        dropTargetFolderID = isTargeted ? nodeID : nil
+      }
+    )
   }
 
   private var rootNodeIDs: [WorkspaceNode.ID] {
@@ -724,6 +780,100 @@ struct SidebarView: View {
       expandedNodeIDs.insert(id)
     }
   }
+}
+
+private struct InlineRenameField: NSViewRepresentable {
+  @Binding var text: String
+  var focusToken: Int
+  var accessibilityIdentifier: String
+  var onCommit: () -> Void
+  var onCancel: () -> Void
+
+  func makeNSView(context: Context) -> RenameTextField {
+    let field = RenameTextField(frame: .zero)
+    field.isBordered = false
+    field.drawsBackground = true
+    field.backgroundColor = .controlBackgroundColor
+    field.focusRingType = .none
+    field.lineBreakMode = .byTruncatingMiddle
+    field.delegate = context.coordinator
+    field.coordinator = context.coordinator
+    field.setAccessibilityIdentifier(accessibilityIdentifier)
+    return field
+  }
+
+  func updateNSView(_ field: RenameTextField, context: Context) {
+    context.coordinator.parent = self
+    if field.stringValue != text {
+      field.stringValue = text
+    }
+    guard context.coordinator.lastFocusToken != focusToken else { return }
+    context.coordinator.lastFocusToken = focusToken
+    context.coordinator.isCompleting = false
+    DispatchQueue.main.async {
+      field.window?.makeFirstResponder(field)
+      field.currentEditor()?.selectedRange = selectedNameRange(in: field.stringValue)
+    }
+  }
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(parent: self)
+  }
+
+  final class Coordinator: NSObject, NSTextFieldDelegate {
+    var parent: InlineRenameField
+    var lastFocusToken: Int
+    var isCompleting = false
+
+    init(parent: InlineRenameField) {
+      self.parent = parent
+      self.lastFocusToken = parent.focusToken
+    }
+
+    func commit(_ field: NSTextField) {
+      isCompleting = true
+      parent.text = field.stringValue
+      parent.onCommit()
+    }
+
+    func cancel() {
+      isCompleting = true
+      parent.onCancel()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+      guard let field = notification.object as? NSTextField else { return }
+      parent.text = field.stringValue
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+      guard !isCompleting, let field = notification.object as? NSTextField else { return }
+      commit(field)
+    }
+  }
+
+  final class RenameTextField: NSTextField {
+    weak var coordinator: Coordinator?
+
+    override func keyDown(with event: NSEvent) {
+      switch event.keyCode {
+      case 36, 76:
+        coordinator?.commit(self)
+      case 53:
+        coordinator?.cancel()
+      default:
+        super.keyDown(with: event)
+      }
+    }
+  }
+}
+
+private func selectedNameRange(in filename: String) -> NSRange {
+  let name = (filename as NSString).deletingPathExtension
+  guard !name.isEmpty else {
+    return NSRange(location: 0, length: (filename as NSString).length)
+  }
+  return NSRange(location: 0, length: (name as NSString).length)
 }
 
 private struct WorkspaceActivityMiniView: View {

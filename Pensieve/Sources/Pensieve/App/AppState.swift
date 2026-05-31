@@ -290,7 +290,7 @@ final class AppState: ObservableObject {
   }
 
   private func compareWorkspaceNodes(_ lhs: WorkspaceNode, _ rhs: WorkspaceNode) -> Bool {
-    if sidebarSortOrder == .type, lhs.kind != rhs.kind {
+    if lhs.kind != rhs.kind {
       return lhs.kind == .folder
     }
     return compareURLs(lhs.url, rhs.url, lhsTitle: lhs.name, rhsTitle: rhs.name)
