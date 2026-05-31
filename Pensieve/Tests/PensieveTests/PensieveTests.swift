@@ -374,7 +374,15 @@ final class PensieveSmokeTests: XCTestCase {
     try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
-    let controller = AppController(appState: appState)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
     controller.openFolder(url: folder)
 
     XCTAssertEqual(
@@ -471,7 +479,8 @@ final class PensieveSmokeTests: XCTestCase {
     try "git".write(to: git.appendingPathComponent("config.md"), atomically: true, encoding: .utf8)
 
     let appState = AppState()
-    let manager = FolderManager(metadataStore: temporaryMetadataStore())
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder))
     manager.open(url: folder, into: appState)
 
     XCTAssertEqual(
@@ -665,6 +674,73 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testFolderManagerColdStartWithManifestPerformsSingleBuilderCall() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveColdStartManifestTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("cold.md")
+    try "cold-start body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let buildCounter = BuildCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      buildCounter.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      workspaceSubstrate: substrate
+    )
+
+    // Warm-up: first open does the initial cold scan and commits a manifest.
+    // After this the manifest is on disk but the in-memory workspace state is
+    // populated.
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(buildCounter.value, 1)
+    let identity = WorkspaceIdentity.make(
+      rootURL: folder, bookmarkData: appState.bookmarkData)
+    XCTAssertNotNil(try store.readManifest(for: identity))
+
+    // Simulate cold start: in-memory workspace is gone but the manifest stays
+    // on disk (mirrors process relaunch with cache present). bookmarkData stays
+    // so identity round-trips.
+    appState.workspaceTree = []
+    appState.workspaceRoots = []
+    appState.documents = []
+    appState.openFiles = []
+    appState.selectedDocumentID = nil
+    let warmupBuilderCount = buildCounter.value
+
+    // Second open: with the cold-start guard ordered before workspaceSubstrate.open,
+    // the empty tree short-circuits the cache fast-path and hands the single
+    // tree walk to the cold scanner. Pins STAB-R01 / B-01: cold start always
+    // performs exactly one builder walk, even when a manifest already exists.
+    manager.open(url: folder, into: appState)
+
+    XCTAssertEqual(
+      buildCounter.value - warmupBuilderCount, 1,
+      "cold start with existing manifest must take the cold-scan path exactly once")
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+    XCTAssertFalse(appState.workspaceTree.isEmpty)
+    let postManifest = try XCTUnwrap(try store.readManifest(for: identity))
+    let currentFingerprint = try TreeFingerprint.compute(rootURL: folder, exclusions: [])
+    XCTAssertEqual(postManifest.workspaceID, identity.workspaceID)
+    XCTAssertEqual(postManifest.treeFingerprint.treeHash, currentFingerprint.treeHash)
+    XCTAssertNil(appState.workspaceActivity)
+  }
+
+  @MainActor
   func testFolderManagerCommitsManifestAfterColdScan() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveColdManifestTests-\(UUID().uuidString)", isDirectory: true)
@@ -830,8 +906,9 @@ final class PensieveSmokeTests: XCTestCase {
     try "skip".write(to: skipURL, atomically: true, encoding: .utf8)
 
     let metadataStore = temporaryMetadataStore()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
     let appState = AppState()
-    let manager = FolderManager(metadataStore: metadataStore)
+    let manager = FolderManager(metadataStore: metadataStore, indexDatabase: indexDatabase)
     manager.open(url: folder, into: appState)
     XCTAssertEqual(appState.documents.count, 2)
 
@@ -845,7 +922,8 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(appState.documents.contains(where: { $0.url == skipURL.standardizedFileURL }))
 
     let relaunchedState = AppState()
-    let relaunchedManager = FolderManager(metadataStore: metadataStore)
+    let relaunchedManager = FolderManager(
+      metadataStore: metadataStore, indexDatabase: indexDatabase)
     relaunchedManager.open(url: folder, into: relaunchedState)
     XCTAssertEqual(
       relaunchedState.documents.map { $0.url.resolvingSymlinksInPath() },
@@ -865,10 +943,13 @@ final class PensieveSmokeTests: XCTestCase {
     try "# Single".write(to: noteURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
     let controller = AppController(
       appState: appState,
-      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: .shared
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
     )
     controller.openFile(url: noteURL)
 
@@ -962,10 +1043,13 @@ final class PensieveSmokeTests: XCTestCase {
     try "plain text".write(to: unsupportedURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
     let controller = AppController(
       appState: appState,
-      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: .shared,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
@@ -999,7 +1083,14 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
-    let controller = AppController(appState: appState)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
     controller.selectDocument(id: alphaURL)
 
     appState.activeDocumentText = "alpha unsaved"
@@ -1139,8 +1230,16 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
-    DocumentStore.shared.load(ref: DocumentRef(id: alphaURL), into: appState)
-    let controller = AppController(appState: appState)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = DocumentStore(indexDatabase: indexDatabase)
+    documentStore.load(ref: DocumentRef(id: alphaURL), into: appState)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase
+    )
 
     appState.activeDocumentText = "alpha command save"
     appState.activeDocumentDirty = true
@@ -1282,7 +1381,14 @@ final class PensieveSmokeTests: XCTestCase {
   @MainActor
   func testControllerRoutesModeAndPreferenceCommands() {
     let appState = AppState()
-    let controller = AppController(appState: appState)
+    let indexDatabase = temporaryIndexDatabase(in: FileManager.default.temporaryDirectory)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
 
     controller.setMode(.preview)
     XCTAssertEqual(appState.mode, .preview)
@@ -1317,10 +1423,13 @@ final class PensieveSmokeTests: XCTestCase {
       to: hidden.appendingPathComponent("hidden.md"), atomically: true, encoding: .utf8)
 
     let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
     let controller = AppController(
       appState: appState,
-      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: .shared
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
     )
 
     controller.openFolder(url: folder)
@@ -1976,14 +2085,21 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testIndexDatabaseUsesCanonicalApplicationSupportPath() {
-    let appState = AppState()
+    let applicationSupportDirectory = FileManager.default.urls(
+      for: .applicationSupportDirectory, in: .userDomainMask
+    )[0]
+    let expectedDatabaseURL =
+      applicationSupportDirectory
+      .appendingPathComponent("Pensieve", isDirectory: true)
+      .appendingPathComponent("index.db", isDirectory: false)
 
-    IndexDatabase.shared.open(into: appState)
-
-    XCTAssertNil(appState.lastError)
-    XCTAssertEqual(IndexDatabase.shared.databaseURL?.lastPathComponent, "index.db")
+    XCTAssertEqual(expectedDatabaseURL.lastPathComponent, "index.db")
     XCTAssertEqual(
-      IndexDatabase.shared.databaseURL?.deletingLastPathComponent().lastPathComponent, "Pensieve")
+      expectedDatabaseURL.deletingLastPathComponent().lastPathComponent,
+      "Pensieve")
+    XCTAssertEqual(
+      expectedDatabaseURL.deletingLastPathComponent().deletingLastPathComponent(),
+      applicationSupportDirectory)
   }
 
   @MainActor

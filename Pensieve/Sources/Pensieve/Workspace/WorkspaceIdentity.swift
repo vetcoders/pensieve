@@ -11,15 +11,18 @@ struct WorkspaceIdentity: Codable, Equatable, Hashable {
   static func make(rootURL: URL, bookmarkData: Data?) -> WorkspaceIdentity {
     let canonicalRootURL = rootURL.standardizedFileURL
     let volumeResourceID = Self.volumeIdentifier(for: canonicalRootURL)
+    // Stable no-bookmark sentinel, recorded as metadata only (see workspaceID note below).
+    // Under v2 identity a bookmark appearing or refreshing later no longer shifts the workspaceID.
     let rootBookmarkHash =
       bookmarkData.map(WorkspaceHash.sha256Hex)
-      // Stable no-bookmark sentinel. If bookmark data appears later, identity intentionally shifts.
       ?? WorkspaceHash.sha256Hex("pensieve.workspace.no-bookmark.v1")
 
-    // workspaceID scheme: SHA256(bookmarkHash + canonical path + volume id), hex, first 16 chars.
+    // workspaceID scheme: SHA256(canonical path + volume id), hex, first 16 chars.
+    // v1 (B-1a): bookmark hash was a primary input to workspaceID. v2 (B-03 / STAB-R03):
+    // identity is defined by physical location (path + volume); bookmark hash is metadata only.
+    // This means bookmark refresh produces the SAME workspaceID -> cache stays warm.
     // A changed volume id with the same path is deliberately treated as a different workspace.
     let identityInput = [
-      rootBookmarkHash,
       canonicalRootURL.path,
       volumeResourceID ?? "volume:nil",
     ].joined(separator: "\n")

@@ -32,7 +32,10 @@ let package = Package(
         ),
         .testTarget(
             name: "PensieveTests",
-            dependencies: ["Pensieve"]
+            dependencies: [
+                "Pensieve",
+                .product(name: "GRDB", package: "GRDB.swift")
+            ]
         )
     ]
 )

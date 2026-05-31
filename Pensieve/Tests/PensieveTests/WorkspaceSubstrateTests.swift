@@ -27,13 +27,28 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertNotEqual(first.workspaceID, second.workspaceID)
   }
 
-  func testWorkspaceIdentityDiffersForDifferentBookmarks() throws {
+  func testWorkspaceIdentityIsStableAcrossBookmarkRefresh() throws {
     let root = try makeTemporaryWorkspace()
 
+    // Same physical root, different bookmark Data (e.g. OS regenerated the bookmark after a
+    // folder move + re-grant). v2 identity (B-03 / STAB-R03) is path+volume, so the workspaceID
+    // must stay stable across a bookmark refresh -> cache stays warm, no needless cold scan.
     let first = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark-a".utf8))
     let second = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark-b".utf8))
 
-    XCTAssertNotEqual(first.workspaceID, second.workspaceID)
+    XCTAssertEqual(first.workspaceID, second.workspaceID)
+  }
+
+  func testWorkspaceIdentityBookmarkHashRecordedButNotPartOfWorkspaceID() throws {
+    let root = try makeTemporaryWorkspace()
+
+    // The bookmark difference is captured in metadata (rootBookmarkHash) but must not bleed into
+    // identity: same path+volume -> same workspaceID, distinct bookmark -> distinct recorded hash.
+    let first = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark-a".utf8))
+    let second = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark-b".utf8))
+
+    XCTAssertEqual(first.workspaceID, second.workspaceID)
+    XCTAssertNotEqual(first.rootBookmarkHash, second.rootBookmarkHash)
   }
 
   func testWorkspaceIdentityCodableRoundtripPreservesAllFields() throws {
