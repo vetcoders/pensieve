@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
   @EnvironmentObject private var appState: AppState
@@ -7,6 +8,23 @@ struct SidebarView: View {
   @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var knownRootNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var hoveredDocumentID: DocumentRef.ID?
+  @State private var renamingURL: URL?
+  @State private var renameText: String = ""
+  @AppStorage("pensieve.sidebar.tab") private var sidebarTab: SidebarTab = .openFiles
+
+  /// Sidebar segments: open working set vs the workspace folder tree.
+  /// Persisted across launches via @AppStorage.
+  private enum SidebarTab: String, CaseIterable, Identifiable {
+    case openFiles
+    case workspace
+    var id: String { rawValue }
+    var label: String {
+      switch self {
+      case .openFiles: return "Open Files"
+      case .workspace: return "Workspace"
+      }
+    }
+  }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -26,6 +44,11 @@ struct SidebarView: View {
     }
     .onChange(of: rootNodeIDs) { _ in
       reconcileWorkspaceRootExpansion()
+    }
+    .onChange(of: appState.pendingSidebarRenameURL) { url in
+      guard let url else { return }
+      beginRename(url: url, currentName: url.lastPathComponent)
+      appState.pendingSidebarRenameURL = nil
     }
   }
 
@@ -49,10 +72,13 @@ struct SidebarView: View {
         .accessibilityIdentifier("pensieve.sidebar.newFile")
       }
 
-      TextField("Search…", text: searchText)
-        .textFieldStyle(.roundedBorder)
-        .disabled(appState.allDocuments.isEmpty)
-        .accessibilityIdentifier("pensieve.sidebar.search")
+      NativeSearchField(
+        text: searchText,
+        placeholder: "Search",
+        accessibilityIdentifier: "pensieve.sidebar.search"
+      )
+      .frame(height: 24)
+      .disabled(appState.allDocuments.isEmpty)
 
       if !appState.excludedWorkspacePaths.isEmpty {
         Text("\(appState.excludedWorkspacePaths.count) excluded")
@@ -90,11 +116,47 @@ struct SidebarView: View {
   }
 
   private var explorer: some View {
-    List {
-      if !appState.openFiles.isEmpty {
-        Section("Open Files") {
-          ForEach(appState.openFiles) { doc in
+    VStack(spacing: 0) {
+      Picker("", selection: $sidebarTab) {
+        ForEach(SidebarTab.allCases) { tab in
+          Text(tab.label).tag(tab)
+        }
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .background(Color(NSColor.controlBackgroundColor).opacity(0.72))
+      .accessibilityIdentifier("pensieve.sidebar.tabPicker")
+
+      HStack {
+        Spacer()
+        sortMenu
+      }
+      .padding(.horizontal, 10)
+      .padding(.bottom, 4)
+
+      switch sidebarTab {
+      case .openFiles:
+        openFilesList
+      case .workspace:
+        workspaceList
+      }
+    }
+  }
+
+  private var openFilesList: some View {
+    Group {
+      if appState.openFiles.isEmpty {
+        sidebarEmptyTab(
+          icon: "doc.text",
+          message: "No open files",
+          hint: "⌘O opens a file · ⌘N new file")
+      } else {
+        List {
+          ForEach(appState.sortedOpenFiles) { doc in
             Button {
+              appState.sidebarFocusedURL = doc.url.standardizedFileURL
               controller.selectDocument(id: doc.id)
             } label: {
               documentRow(
@@ -103,25 +165,79 @@ struct SidebarView: View {
               )
             }
             .buttonStyle(.plain)
-            .onHover { updateHoveredDocument(doc.id, isHovered: $0) }
+            .onHover {
+              updateHoveredDocument(doc.id, isHovered: $0)
+              if $0 {
+                appState.sidebarFocusedURL = doc.url.standardizedFileURL
+              }
+            }
             .contextMenu {
               documentContextMenu(for: doc)
             }
+            .onDrag {
+              NSItemProvider(object: doc.url as NSURL)
+            }
+          }
+          .onMove { source, destination in
+            controller.reorderOpenFiles(fromOffsets: source, toOffset: destination)
           }
         }
+        .listStyle(.sidebar)
         .accessibilityIdentifier("pensieve.sidebar.list.openFiles")
       }
+    }
+  }
 
-      if !appState.workspaceTree.isEmpty {
-        Section("Workspace") {
-          ForEach(appState.workspaceTree) { node in
+  private var workspaceList: some View {
+    Group {
+      if appState.workspaceTree.isEmpty {
+        sidebarEmptyTab(
+          icon: "folder",
+          message: "No workspace folder",
+          hint: "⌘⇧O opens a folder")
+      } else {
+        List {
+          ForEach(appState.sortedWorkspaceTree) { node in
             workspaceTreeRow(node, depth: 0)
           }
         }
+        .listStyle(.sidebar)
         .accessibilityIdentifier("pensieve.sidebar.list.workspace")
       }
     }
-    .listStyle(.sidebar)
+  }
+
+  private func sidebarEmptyTab(icon: String, message: String, hint: String) -> some View {
+    VStack(spacing: 8) {
+      Spacer()
+      Image(systemName: icon)
+        .font(.system(size: 28))
+        .foregroundColor(.secondary)
+      Text(message)
+        .font(.subheadline)
+        .foregroundColor(.secondary)
+      Text(hint)
+        .font(.caption2)
+        .foregroundColor(.secondary)
+      Spacer()
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private var sortMenu: some View {
+    Menu {
+      Picker("Sort", selection: $appState.sidebarSortOrder) {
+        ForEach(SidebarSortOrder.allCases) { order in
+          Text(order.label).tag(order)
+        }
+      }
+    } label: {
+      Image(systemName: "arrow.up.arrow.down")
+        .frame(width: 22, height: 20)
+    }
+    .menuStyle(.borderlessButton)
+    .help("Sort")
+    .accessibilityIdentifier("pensieve.sidebar.sort")
   }
 
   private var searchResults: some View {
@@ -138,6 +254,7 @@ struct SidebarView: View {
         Section("Workspace Results") {
           ForEach(workspaceResults) { result in
             Button {
+              appState.sidebarFocusedURL = result.document.url.standardizedFileURL
               controller.selectSearchResult(result)
             } label: {
               searchResultRow(
@@ -146,7 +263,12 @@ struct SidebarView: View {
               )
             }
             .buttonStyle(.plain)
-            .onHover { updateHoveredDocument(result.document.id, isHovered: $0) }
+            .onHover {
+              updateHoveredDocument(result.document.id, isHovered: $0)
+              if $0 {
+                appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              }
+            }
             .contextMenu {
               documentContextMenu(for: result.document)
             }
@@ -158,6 +280,7 @@ struct SidebarView: View {
         Section("Open Files") {
           ForEach(openFileResults) { result in
             Button {
+              appState.sidebarFocusedURL = result.document.url.standardizedFileURL
               controller.selectSearchResult(result)
             } label: {
               searchResultRow(
@@ -166,7 +289,12 @@ struct SidebarView: View {
               )
             }
             .buttonStyle(.plain)
-            .onHover { updateHoveredDocument(result.document.id, isHovered: $0) }
+            .onHover {
+              updateHoveredDocument(result.document.id, isHovered: $0)
+              if $0 {
+                appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              }
+            }
             .contextMenu {
               documentContextMenu(for: result.document)
             }
@@ -182,8 +310,7 @@ struct SidebarView: View {
     HStack {
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
-      Text(doc.title)
-        .lineLimit(1)
+      renameableTitle(for: doc.url, title: doc.title)
     }
     .padding(.vertical, 4)
     .padding(.horizontal, 6)
@@ -197,6 +324,9 @@ struct SidebarView: View {
     if node.kind == .document {
       return AnyView(
         Button {
+          if let url = node.url {
+            appState.sidebarFocusedURL = url.standardizedFileURL
+          }
           controller.selectWorkspaceNode(node)
         } label: {
           nodeRow(
@@ -209,9 +339,18 @@ struct SidebarView: View {
         .onHover { isHovered in
           guard let documentID = node.documentID else { return }
           updateHoveredDocument(documentID, isHovered: isHovered)
+          if isHovered, let url = node.url {
+            appState.sidebarFocusedURL = url.standardizedFileURL
+          }
         }
         .contextMenu {
           nodeContextMenu(for: node)
+        }
+        .onDrag {
+          if let url = node.url {
+            return NSItemProvider(object: url as NSURL)
+          }
+          return NSItemProvider()
         })
     } else {
       let children = node.children ?? []
@@ -219,13 +358,24 @@ struct SidebarView: View {
 
       let content = VStack(alignment: .leading, spacing: 0) {
         Button {
+          if let url = node.url {
+            appState.sidebarFocusedURL = url.standardizedFileURL
+          }
           toggleExpanded(node.id)
         } label: {
           folderRow(node, depth: depth, isExpanded: isExpanded)
         }
         .buttonStyle(.plain)
+        .onHover { isHovered in
+          if isHovered, let url = node.url {
+            appState.sidebarFocusedURL = url.standardizedFileURL
+          }
+        }
         .contextMenu {
           nodeContextMenu(for: node)
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+          handleDrop(providers, into: node.url)
         }
 
         if isExpanded {
@@ -248,8 +398,7 @@ struct SidebarView: View {
       Image(systemName: "folder")
         .foregroundColor(.secondary)
 
-      Text(node.name)
-        .lineLimit(1)
+      renameableTitle(for: node.url, title: node.name)
     }
     .padding(.leading, CGFloat(depth) * 14)
     .padding(.vertical, 4)
@@ -263,8 +412,7 @@ struct SidebarView: View {
     HStack {
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
-      Text(node.name)
-        .lineLimit(1)
+      renameableTitle(for: node.url, title: node.name)
     }
     .padding(.leading, CGFloat(depth) * 14 + 15)
     .padding(.vertical, 4)
@@ -319,6 +467,24 @@ struct SidebarView: View {
   }
 
   @ViewBuilder
+  private func renameableTitle(for url: URL?, title: String) -> some View {
+    if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
+      TextField("Name", text: $renameText)
+        .textFieldStyle(.plain)
+        .onSubmit {
+          commitRename(url)
+        }
+        .onExitCommand {
+          cancelRename()
+        }
+        .accessibilityIdentifier("pensieve.sidebar.renameField")
+    } else {
+      Text(title)
+        .lineLimit(1)
+    }
+  }
+
+  @ViewBuilder
   private func documentContextMenu(for doc: DocumentRef) -> some View {
     Button("Open") {
       controller.selectDocument(id: doc.id)
@@ -330,6 +496,20 @@ struct SidebarView: View {
 
     Button("Reveal in Finder") {
       revealInFinder(doc.url)
+    }
+
+    Divider()
+
+    Button("Rename") {
+      beginRename(url: doc.url, currentName: doc.url.lastPathComponent)
+    }
+
+    Button("Duplicate") {
+      controller.duplicateItem(url: doc.url)
+    }
+
+    Button("Move to Trash") {
+      controller.moveItemToTrash(url: doc.url)
     }
 
     Divider()
@@ -374,8 +554,26 @@ struct SidebarView: View {
         }
       }
     } else if let url = node.url {
-      Button("New File…") {
-        controller.createUntitledDocument()
+      Button("New File") {
+        controller.createMarkdownFile(url: url.appendingPathComponent("Untitled.md"))
+      }
+
+      Button("New Folder") {
+        controller.createFolder(url: url.appendingPathComponent("New Folder"))
+      }
+
+      Divider()
+
+      Button("Rename") {
+        beginRename(url: url, currentName: url.lastPathComponent)
+      }
+
+      Button("Duplicate") {
+        controller.duplicateItem(url: url)
+      }
+
+      Button("Move to Trash") {
+        confirmMoveFolderToTrash(url)
       }
 
       Divider()
@@ -416,6 +614,59 @@ struct SidebarView: View {
 
   private func markdownLinkPath(_ path: String) -> String {
     path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+  }
+
+  private func beginRename(url: URL, currentName: String) {
+    renamingURL = url.standardizedFileURL
+    renameText = currentName
+  }
+
+  private func commitRename(_ url: URL) {
+    let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      cancelRename()
+      return
+    }
+    controller.renameItem(url: url, to: trimmed)
+    cancelRename()
+  }
+
+  private func cancelRename() {
+    renamingURL = nil
+    renameText = ""
+  }
+
+  private func confirmMoveFolderToTrash(_ url: URL) {
+    let alert = NSAlert()
+    alert.messageText = "Move \(url.lastPathComponent) to Trash?"
+    alert.informativeText = "This folder and its contents will move to the system Trash."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Move to Trash")
+    alert.addButton(withTitle: "Cancel")
+    if alert.runModal() == .alertFirstButtonReturn {
+      controller.moveItemToTrash(url: url)
+    }
+  }
+
+  private func handleDrop(_ providers: [NSItemProvider], into folderURL: URL?) -> Bool {
+    guard let folderURL else { return false }
+    for provider in providers
+    where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+      provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+        let url: URL?
+        if let data = item as? Data {
+          url = URL(dataRepresentation: data, relativeTo: nil)
+        } else {
+          url = item as? URL
+        }
+        guard let url else { return }
+        Task { @MainActor in
+          controller.moveItem(url: url, toFolder: folderURL)
+        }
+      }
+      return true
+    }
+    return false
   }
 
   private var rootNodeIDs: [WorkspaceNode.ID] {

@@ -307,16 +307,24 @@ final class PensieveSmokeTests: XCTestCase {
     var boundText = "before"
     var isDirty = false
     var didRouteDocumentChange = false
+    var findQuery = ""
+    var findReplacement = ""
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,
+      findQuery: Binding(get: { findQuery }, set: { findQuery = $0 }),
+      findReplacement: Binding(get: { findReplacement }, set: { findReplacement = $0 }),
+      findBarVisible: false,
+      findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
+      },
+      onCloseFindBar: {
       }
     )
     let coordinator = representable.makeCoordinator()

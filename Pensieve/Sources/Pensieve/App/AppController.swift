@@ -73,12 +73,50 @@ final class AppController: ObservableObject {
   }
 
   @discardableResult
+  func createFolder(url: URL) -> Bool {
+    folderManager.createFolder(at: url, into: appState)
+  }
+
+  @discardableResult
+  func renameItem(url: URL, to name: String) -> Bool {
+    folderManager.rename(url: url, to: name, into: appState)
+  }
+
+  @discardableResult
+  func duplicateItem(url: URL) -> Bool {
+    folderManager.duplicate(url: url, into: appState)
+  }
+
+  @discardableResult
+  func moveItemToTrash(url: URL) -> Bool {
+    folderManager.moveToTrash(url: url, into: appState)
+  }
+
+  @discardableResult
+  func moveItem(url: URL, toFolder folderURL: URL) -> Bool {
+    folderManager.move(url: url, toFolder: folderURL, into: appState)
+  }
+
+  func reorderOpenFiles(fromOffsets source: IndexSet, toOffset destination: Int) {
+    var visibleFiles = appState.sortedOpenFiles
+    let moving = source.sorted().map { visibleFiles[$0] }
+    visibleFiles.removeAll { ref in
+      moving.contains { $0.id.standardizedFileURL == ref.id.standardizedFileURL }
+    }
+    let lowerRemovedCount = source.filter { $0 < destination }.count
+    let insertionIndex = max(0, min(destination - lowerRemovedCount, visibleFiles.count))
+    visibleFiles.insert(contentsOf: moving, at: insertionIndex)
+    appState.sidebarSortOrder = .manual
+    appState.openFiles = visibleFiles
+  }
+
+  @discardableResult
   func createUntitledDocument() -> Bool {
     guard documentStore.prepareForDocumentSwitch(appState: appState) else {
       return false
     }
 
-    appState.documentSession.createUntitled()
+    appState.documentSession.createUntitled(title: nextUntitledTitle())
     appState.selectedDocumentID = nil
     appState.lastError = nil
     return true
@@ -250,6 +288,22 @@ final class AppController: ObservableObject {
   func formatSelection(with wrapper: String) {
     guard let format = MarkdownFormat(wrapper: wrapper) else { return }
     applyMarkdownFormat(format)
+  }
+
+  private func nextUntitledTitle() -> String {
+    let existingTitles = Set(
+      ([appState.documentSession.displayTitle] + appState.documentTabs.map(\.title))
+        .filter { $0.hasPrefix("Untitled") }
+    )
+    guard existingTitles.contains("Untitled.md") else { return "Untitled.md" }
+
+    var index = 2
+    while existingTitles.contains("Untitled \(index).md")
+      || existingTitles.contains("Untitled \(index)")
+    {
+      index += 1
+    }
+    return "Untitled \(index).md"
   }
 }
 
