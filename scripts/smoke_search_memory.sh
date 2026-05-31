@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+# Pensieve multi-root search/index memory smoke (B-04 / audit F-8-R03).
+#
+# Generates a synthetic markdown vault (~1000 files across 3 root dirs),
+# wraps the release Pensieve binary in a minimal .app bundle with a smoke-
+# only bundle id so cfprefsd never touches the operator's real Pensieve
+# preferences, swaps the canonical Application Support/Pensieve directory
+# with a symlink into the session dir for AppSupport isolation, launches
+# Pensieve via LaunchServices, drives File → Open Folder for each fixture
+# root via AppleScript, polls index.db for reindex completion, captures
+# peak RSS + /usr/bin/sample stack profile, and probes search latency via
+# a direct sqlite3 FTS5 query against the populated index.db. On exit the
+# symlink is undone and the operator's real AppSupport/Pensieve dir is
+# restored from the backup name.
+#
+# WHY THE SYMLINK SWAP: macOS 26's NSHomeDirectory ignores the HOME env
+# var and reads getpwuid, so FileManager.default.url(for:.applicationSupp-
+# ortDirectory, ...) always returns ~/Library/Application Support no
+# matter what HOME is. The symlink swap is the only mechanism that gives
+# true AppSupport isolation without a Pensieve production-code change.
+#
+# Output: dist/smoke/search-memory-<ISO-timestamp>.md
+# Operator runs ad-hoc, NOT part of `swift test` / `make ci`.
+#
+# Usage:
+#   make smoke-search-memory                           # default
+#   FILES=2000 ROOTS=4 make smoke-search-memory       # override scale
+#   SAMPLE_DURATION_SEC=40 make smoke-search-memory   # longer profile window
+#
+# Requirements:
+#   - macOS (uses /usr/bin/sample, /usr/bin/sqlite3, osascript, codesign)
+#   - swift toolchain on PATH
+#   - Accessibility permission for the parent terminal (System Settings →
+#     Privacy & Security → Accessibility) so AppleScript can drive Open
+#     Folder via System Events keystrokes.
+#   - Pensieve.app must NOT be running before the smoke fires. The script
+#     refuses to start otherwise so the AppSupport swap can't race with a
+#     live Pensieve process.
+
+set -euo pipefail
+
+# ─── Resolve paths ────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_DIR="$REPO_ROOT/Pensieve"
+DIST_DIR="$REPO_ROOT/dist"
+SMOKE_DIR="$DIST_DIR/smoke"
+# Distinct bundle id keeps the smoke's cfprefsd entries scoped to itself.
+# Pensieve hardcodes the "Pensieve" subdirectory name under AppSupport, so
+# bundle id alone can't isolate the database file — the symlink swap does.
+APP_BUNDLE_ID="io.vetcoders.pensieve.smoke"
+REAL_APPSUP="$HOME/Library/Application Support/Pensieve"
+
+# ─── Config (env-overridable) ─────────────────────────────────────────────
+FILES="${FILES:-1000}"
+ROOTS="${ROOTS:-3}"
+SAMPLE_DURATION_SEC="${SAMPLE_DURATION_SEC:-30}"
+APP_LAUNCH_SETTLE_SEC="${APP_LAUNCH_SETTLE_SEC:-3}"
+REINDEX_MAX_WAIT_SEC="${REINDEX_MAX_WAIT_SEC:-90}"
+REINDEX_STABLE_TICKS="${REINDEX_STABLE_TICKS:-4}"
+SEARCH_QUERY="${SEARCH_QUERY:-note}"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────
+log()  { printf "\033[36m[smoke]\033[0m %s\n" "$*"; }
+ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
+warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
+die()  { printf "\033[31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
+
+# ─── Pre-flight ───────────────────────────────────────────────────────────
+[[ "$(uname -s)" = "Darwin" ]] || die "macOS-only (uses /usr/bin/sample + codesign)"
+[[ -x /usr/bin/sample ]] || die "/usr/bin/sample missing (Apple tool, ships with macOS)"
+[[ -x /usr/bin/sqlite3 ]] || die "/usr/bin/sqlite3 missing"
+command -v codesign >/dev/null 2>&1 || die "codesign missing"
+command -v osascript >/dev/null 2>&1 || die "osascript missing"
+command -v python3 >/dev/null 2>&1 || die "python3 missing (used to generate fixture)"
+command -v swift >/dev/null 2>&1 || die "swift missing"
+[[ -f "$PKG_DIR/Resources/Info.plist" ]] || die "Pensieve Info.plist template missing"
+
+# Refuse to run if Pensieve is alive — the symlink swap would race.
+if pgrep -x "Pensieve" >/dev/null 2>&1; then
+    die "Pensieve.app is running. Quit it first, then re-run the smoke."
+fi
+
+TS="$(date -u +"%Y%m%dT%H%M%SZ")"
+SESSION_DIR="$SMOKE_DIR/session-$TS"
+VAULT_DIR="$SESSION_DIR/vault"
+SMOKE_APP="$SESSION_DIR/Pensieve.app"
+SMOKE_APPSUP="$SESSION_DIR/smoke-appsupport"
+BACKUP_APPSUP="$REAL_APPSUP.OPERATOR-BACKUP-$TS"
+SAMPLE_OUTPUT="$SESSION_DIR/sample-profile.txt"
+RSS_TRACE="$SESSION_DIR/rss-trace.txt"
+APP_LOG="$SESSION_DIR/app.log"
+REPORT="$SMOKE_DIR/search-memory-$TS.md"
+
+mkdir -p "$SMOKE_DIR" "$SESSION_DIR" "$VAULT_DIR" "$SMOKE_APP/Contents/MacOS" \
+         "$SMOKE_APP/Contents/Resources" "$SMOKE_APPSUP"
+
+# Drop a one-time README so the operator finds context next to the reports.
+if [[ ! -f "$SMOKE_DIR/README.md" ]]; then
+    cat >"$SMOKE_DIR/README.md" <<'EOF'
+# Pensieve — Search/Index Memory Smoke
+
+Ad-hoc memory smoke for the multi-root reindex path. Auto-generated by
+`make smoke-search-memory` (see `scripts/smoke_search_memory.sh`). NOT part
+of `swift test` / `make ci`. Operator runs this when:
+
+- Auditing the F-8 streaming reindex bound on a real-shaped vault.
+- Verifying a change in `IndexDatabase.replaceSearchIndex` does not regress
+  the single-body-in-memory invariant.
+- Pre-release sanity on the workspace search hot path.
+
+## What it does
+
+The script generates a synthetic markdown vault (~1000 files × ~3 roots),
+wraps the release Pensieve binary in a minimal `.app` bundle with a
+smoke-only bundle id (`io.vetcoders.pensieve.smoke`), then **swaps the
+canonical `~/Library/Application Support/Pensieve` directory with a
+symlink** into the session dir for the duration of the run. After
+launching Pensieve via LaunchServices, AppleScript drives File → Open
+Folder for each fixture root; the normal workspace path then triggers a
+real `IndexDatabase.replaceSearchIndex` against the whole fixture inside
+the session dir. The smoke captures peak RSS, sample stack profile, and
+search latency, then restores the operator's real Pensieve dir on exit.
+
+## Why the symlink swap
+
+`NSHomeDirectory()` on macOS 13+ ignores the `HOME` env var (it reads
+`getpwuid`), so `FileManager.default.url(for: .applicationSupportDir-
+ectory, ...)` always points at the operator's real
+`~/Library/Application Support`. The only way to isolate Pensieve's
+`index.db` without changing production code is to swap the directory the
+app sees there with a symlink, restore it after.
+
+## Safety
+
+- The script refuses to start if Pensieve.app is already running.
+- Before the swap, the operator's real
+  `~/Library/Application Support/Pensieve` is **moved** (not deleted) to
+  `~/Library/Application Support/Pensieve.OPERATOR-BACKUP-<timestamp>`.
+- A trap on `EXIT INT TERM` removes the smoke symlink and moves the
+  backup back in place.
+- If the script dies hard between the swap and the restore (kernel
+  panic, SIGKILL), the backup directory still exists side-by-side with
+  the broken symlink — manual recovery is `mv` of the backup back.
+
+## Requirements
+
+The AppleScript Open Folder drive needs **Accessibility** access for the
+terminal that invoked `make` (System Settings → Privacy & Security →
+Accessibility → enable iTerm / Terminal / Claude). The script fails fast
+with a clear message if that permission is missing.
+
+## Each run produces
+
+- `search-memory-<ISO>.md` — human-readable report (this directory).
+- `session-<ISO>/` — vault fixture, `.app` bundle, sample profile, RSS
+  trace, app stdout/stderr, and the smoke's own `smoke-appsupport/` (the
+  symlink target with the smoke's `index.db`). Kept for forensic
+  inspection; safe to delete.
+
+## How to read the report
+
+- **Peak RSS** — physical footprint of the Pensieve process during reindex
+  (max over a 0.5s-cadence `ps -o rss=` poller). F-8 target: under 200 MB
+  for a ~1000-file vault.
+- **Reindex duration** — wall-clock from the first Open Folder drive to a
+  stable `workspace_search_documents` row count.
+- **Search latency** — direct FTS5 query latency via `sqlite3` against the
+  populated `index.db` (proxies the in-process `performSearch` cost).
+- **Top stack frames** — `/usr/bin/sample`'s Call graph excerpt: where the
+  process spent CPU during the sample window.
+
+If peak RSS exceeds 200 MB, surface it with the operator before shipping.
+EOF
+fi
+
+# ─── Fixture generation ────────────────────────────────────────────────────
+log "generating fixture: $FILES files × $ROOTS roots → $VAULT_DIR"
+START_FIXTURE=$(date +%s)
+python3 - "$VAULT_DIR" "$FILES" "$ROOTS" <<'PYEOF'
+import os, sys, random, string
+base, files, roots = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+random.seed(20260529)
+root_dirs = [os.path.join(base, f"root-{i+1}") for i in range(roots)]
+for r in root_dirs:
+    os.makedirs(r, exist_ok=True)
+words = [
+    "note", "memo", "todo", "idea", "draft", "plan", "review", "check",
+    "audit", "ship", "fix", "test", "build", "deploy", "release",
+    "spec", "rfc", "design", "arch", "pattern", "swift", "macos",
+    "markdown", "fts", "index", "search", "workspace", "pensieve",
+]
+alpha = string.ascii_lowercase + " " * 6
+for i in range(files):
+    root = root_dirs[i % roots]
+    size = random.randint(1024, 50 * 1024)
+    chunks = []
+    used = 0
+    while used < size:
+        if random.random() < 0.18:
+            w = random.choice(words)
+        else:
+            w_len = random.randint(2, 9)
+            w = "".join(random.choices(alpha, k=w_len)).strip() or "x"
+        chunks.append(w)
+        used += len(w) + 1
+    body = " ".join(chunks)[:size]
+    title = f"Note {i:04d} {random.choice(words)}"
+    path = os.path.join(root, f"note-{i:04d}.md")
+    with open(path, "w") as f:
+        f.write(f"# {title}\n\n{body}\n")
+PYEOF
+FIXTURE_SEC=$(( $(date +%s) - START_FIXTURE ))
+FIXTURE_SIZE="$(du -sh "$VAULT_DIR" | cut -f1 | tr -d ' ')"
+ok "fixture ready: $FIXTURE_SIZE in ${FIXTURE_SEC}s"
+
+# ─── Build Pensieve (release) ─────────────────────────────────────────────
+log "building Pensieve (release, arm64)"
+cd "$PKG_DIR"
+swift build -c release --arch arm64 >>"$APP_LOG" 2>&1
+PENSIEVE_BIN="$PKG_DIR/.build/arm64-apple-macosx/release/Pensieve"
+[[ -x "$PENSIEVE_BIN" ]] || die "Pensieve binary not built at $PENSIEVE_BIN"
+ok "binary: $PENSIEVE_BIN"
+cd "$REPO_ROOT"
+
+# ─── Synthesize minimal .app bundle ───────────────────────────────────────
+log "synthesizing minimal Pensieve.app at $SMOKE_APP (bundle id $APP_BUNDLE_ID)"
+cp "$PENSIEVE_BIN" "$SMOKE_APP/Contents/MacOS/Pensieve"
+chmod +x "$SMOKE_APP/Contents/MacOS/Pensieve"
+cp "$PKG_DIR/Resources/Info.plist" "$SMOKE_APP/Contents/Info.plist"
+
+# Swap the bundle id to the smoke id so cfprefsd never serves or writes
+# the operator's real Pensieve preferences.
+/usr/libexec/PlistBuddy -c \
+    "Set :CFBundleIdentifier $APP_BUNDLE_ID" \
+    "$SMOKE_APP/Contents/Info.plist" >>"$APP_LOG" 2>&1
+
+# Copy SwiftPM resource bundles so WKWebView / Mermaid don't log errors.
+SPM_BUILD_DIR="$PKG_DIR/.build/arm64-apple-macosx/release"
+for spm_bundle in "$SPM_BUILD_DIR"/*.bundle; do
+    [[ -d "$spm_bundle" ]] && cp -R "$spm_bundle" "$SMOKE_APP/Contents/Resources/"
+done
+
+# Ad-hoc sign so macOS accepts process control / AppleScript targeting.
+codesign --sign - --force --deep "$SMOKE_APP" >>"$APP_LOG" 2>&1 \
+    || warn "ad-hoc codesign failed (continuing — bundle is still launchable)"
+ok ".app bundle ready"
+
+# ─── Pre-flight: confirm AppleScript can drive System Events ──────────────
+log "checking AppleScript / Accessibility access"
+if ! osascript -e 'tell application "System Events" to get name of every process' \
+    >/dev/null 2>>"$APP_LOG"
+then
+    warn "AppleScript could not query System Events."
+    warn "System Settings → Privacy & Security → Accessibility → enable your terminal."
+    die "Accessibility permission missing — see $APP_LOG"
+fi
+ok "AppleScript / Accessibility OK"
+
+# ─── Symlink swap for AppSupport isolation ────────────────────────────────
+# The swap MUST be undone by the trap below so the operator's real Pensieve
+# state is restored even if the smoke fails partway through.
+log "swapping $REAL_APPSUP with smoke symlink"
+mkdir -p "$(dirname "$REAL_APPSUP")"
+if [[ -e "$REAL_APPSUP" || -L "$REAL_APPSUP" ]]; then
+    mv "$REAL_APPSUP" "$BACKUP_APPSUP"
+    log "  operator's AppSupport moved aside → $BACKUP_APPSUP"
+fi
+ln -s "$SMOKE_APPSUP" "$REAL_APPSUP"
+APPSUP_SWAPPED=1
+ok "AppSupport symlink in place: $REAL_APPSUP -> $SMOKE_APPSUP"
+
+# ─── Cleanup hook (restore AppSupport, kill children) ────────────────────
+PENSIEVE_PID=""
+SAMPLE_PID=""
+RSS_POLLER_PID=""
+
+cleanup() {
+    local exit_code=$?
+    set +e
+    if [[ -n "$RSS_POLLER_PID" ]]; then
+        kill "$RSS_POLLER_PID" 2>/dev/null
+        wait "$RSS_POLLER_PID" 2>/dev/null
+    fi
+    if [[ -n "$SAMPLE_PID" ]]; then
+        kill -INT "$SAMPLE_PID" 2>/dev/null
+        wait "$SAMPLE_PID" 2>/dev/null
+    fi
+    if [[ -n "$PENSIEVE_PID" ]] && kill -0 "$PENSIEVE_PID" 2>/dev/null; then
+        osascript -e "tell application id \"$APP_BUNDLE_ID\" to quit" \
+            >/dev/null 2>&1 || true
+        sleep 1
+        if kill -0 "$PENSIEVE_PID" 2>/dev/null; then
+            kill -TERM "$PENSIEVE_PID" 2>/dev/null
+            sleep 1
+            kill -KILL "$PENSIEVE_PID" 2>/dev/null
+        fi
+        wait "$PENSIEVE_PID" 2>/dev/null
+    fi
+    # Restore operator's real AppSupport. The smoke symlink is left where
+    # it was so the trap is idempotent: if a previous trap already moved
+    # the backup back, this is a no-op.
+    if [[ "${APPSUP_SWAPPED:-0}" = "1" ]]; then
+        if [[ -L "$REAL_APPSUP" ]]; then
+            rm "$REAL_APPSUP"
+        fi
+        if [[ -d "$BACKUP_APPSUP" ]]; then
+            mv "$BACKUP_APPSUP" "$REAL_APPSUP"
+        fi
+    fi
+    # Drop the smoke bundle id's cfprefsd state and leftover plist. cfprefsd
+    # writes NSWindow / NSOpenPanel cosmetic state during the AppleScript
+    # Open Folder drive; the smoke bundle id keeps it scoped away from the
+    # operator's real prefs, but the file lingers without this cleanup.
+    defaults delete "$APP_BUNDLE_ID" >/dev/null 2>&1 || true
+    local smoke_plist="$HOME/Library/Preferences/${APP_BUNDLE_ID}.plist"
+    if [[ -f "$smoke_plist" ]]; then
+        command -v trash >/dev/null 2>&1 && trash "$smoke_plist" >/dev/null 2>&1 \
+            || rm -f "$smoke_plist" 2>/dev/null || true
+    fi
+    exit $exit_code
+}
+trap cleanup EXIT INT TERM
+
+# ─── Launch Pensieve via LaunchServices ───────────────────────────────────
+# AppleScript needs a LaunchServices-registered app to drive menus by
+# bundle id. `open` registers it; HOME doesn't matter here since the
+# AppSupport symlink is what gives us isolation.
+log "launching Pensieve via open -n -a (LaunchServices)"
+open -n -a "$SMOKE_APP" >>"$APP_LOG" 2>&1 \
+    || die "open command failed; see $APP_LOG"
+
+# Wait for the spawned child process to appear and grab its PID. Use
+# awk to take the first line instead of `| head -1` so we don't risk a
+# SIGPIPE killing the pipeline under set -e -o pipefail.
+PENSIEVE_PID=""
+for _ in $(seq 1 10); do
+    PENSIEVE_PID="$(pgrep -f "$SMOKE_APP/Contents/MacOS/Pensieve" 2>/dev/null \
+        | awk 'NR==1 { print; exit }' || true)"
+    [[ -n "$PENSIEVE_PID" ]] && break
+    sleep 0.5
+done
+[[ -n "$PENSIEVE_PID" ]] || die "could not find Pensieve PID after open"
+
+sleep "$APP_LAUNCH_SETTLE_SEC"
+
+if ! kill -0 "$PENSIEVE_PID" 2>/dev/null; then
+    warn "Pensieve died during startup — last log lines:"
+    tail -20 "$APP_LOG" >&2 || true
+    die "Pensieve subprocess crashed (pid $PENSIEVE_PID); see $APP_LOG"
+fi
+ok "Pensieve up (pid $PENSIEVE_PID)"
+
+# Activate so menu keystrokes hit it instead of the previously-frontmost app.
+osascript -e "tell application id \"$APP_BUNDLE_ID\" to activate" \
+    >/dev/null 2>>"$APP_LOG" || warn "activate failed; AppleScript drive may miss"
+sleep 1
+
+# ─── RSS poller (background) ──────────────────────────────────────────────
+log "starting RSS poller → $RSS_TRACE"
+(
+    while kill -0 "$PENSIEVE_PID" 2>/dev/null; do
+        rss_kb="$(ps -o rss= -p "$PENSIEVE_PID" 2>/dev/null | tr -d ' ' || echo 0)"
+        printf "%s %s\n" "$(date +%s.%N)" "${rss_kb:-0}" >>"$RSS_TRACE"
+        sleep 0.5
+    done
+) &
+RSS_POLLER_PID=$!
+
+# ─── Sample profile (background) ──────────────────────────────────────────
+log "starting /usr/bin/sample for ${SAMPLE_DURATION_SEC}s → $SAMPLE_OUTPUT"
+/usr/bin/sample "$PENSIEVE_PID" "$SAMPLE_DURATION_SEC" -file "$SAMPLE_OUTPUT" -mayDie \
+    >/dev/null 2>&1 &
+SAMPLE_PID=$!
+
+# ─── Drive Open Folder dialog for each root via AppleScript ──────────────
+log "driving Open Folder dialog for $ROOTS root(s) via AppleScript"
+REINDEX_START=$(date +%s)
+for i in $(seq 1 "$ROOTS"); do
+    ROOT_PATH="$VAULT_DIR/root-$i"
+    log "  opening root-$i: $ROOT_PATH"
+    if ! osascript - "$APP_BUNDLE_ID" "$ROOT_PATH" <<'APPLESCRIPT' 2>>"$APP_LOG"
+on run argv
+  set bundleId to item 1 of argv
+  set rootPath to item 2 of argv
+  set the clipboard to rootPath
+  tell application id bundleId to activate
+  delay 0.6
+  tell application "System Events"
+    -- File → Open Folder…  (⌘⇧O in Commands.swift)
+    keystroke "o" using {command down, shift down}
+    delay 0.8
+    -- Go to Folder…  (⌘⇧G inside NSOpenPanel)
+    keystroke "g" using {command down, shift down}
+    delay 0.5
+    -- Paste the path via ⌘V instead of character-by-character keystroke:
+    -- faster, robust against keyboard layout (AZERTY/QWERTZ remap `/`),
+    -- avoids race conditions on long paths. Per Gemini PR #4 review.
+    keystroke "v" using {command down}
+    delay 0.3
+    keystroke return
+    delay 0.6
+    -- "Open" button in the panel (default action)
+    keystroke return
+    delay 0.5
+  end tell
+end run
+APPLESCRIPT
+    then
+        warn "AppleScript drive failed for root-$i; the smoke may produce 0 rows"
+    fi
+    sleep 2
+done
+ok "Open Folder drive complete for $ROOTS root(s)"
+
+# ─── Wait for reindex to settle ───────────────────────────────────────────
+INDEX_DB="$SMOKE_APPSUP/index.db"
+log "waiting up to ${REINDEX_MAX_WAIT_SEC}s for reindex to settle (polling index.db)"
+LAST_ROW_COUNT=-1
+STABLE_TICKS=0
+ELAPSED=0
+while (( ELAPSED < REINDEX_MAX_WAIT_SEC )); do
+    if [[ -f "$INDEX_DB" ]]; then
+        CURRENT_COUNT="$(/usr/bin/sqlite3 -readonly "$INDEX_DB" \
+            "SELECT count(*) FROM workspace_search_documents" 2>/dev/null || echo 0)"
+    else
+        CURRENT_COUNT=0
+    fi
+    if [[ "$CURRENT_COUNT" = "$LAST_ROW_COUNT" ]] && [[ "$CURRENT_COUNT" -gt 0 ]]; then
+        STABLE_TICKS=$(( STABLE_TICKS + 1 ))
+        if (( STABLE_TICKS >= REINDEX_STABLE_TICKS )); then
+            break
+        fi
+    else
+        STABLE_TICKS=0
+    fi
+    LAST_ROW_COUNT="$CURRENT_COUNT"
+    sleep 1
+    ELAPSED=$(( ELAPSED + 1 ))
+done
+REINDEX_SEC=$(( $(date +%s) - REINDEX_START ))
+INDEXED_ROWS="$LAST_ROW_COUNT"
+
+if (( INDEXED_ROWS == 0 )); then
+    warn "reindex never produced rows after ${ELAPSED}s; AppleScript Open Folder drive may have missed"
+    warn "check $APP_LOG and try the smoke after granting Accessibility to your terminal"
+    ok "reindex settled at 0 rows (degenerate) in ${REINDEX_SEC}s wall-clock"
+else
+    ok "reindex settled at $INDEXED_ROWS rows in ${REINDEX_SEC}s wall-clock"
+fi
+
+RSS_AFTER_INDEX="$(ps -o rss= -p "$PENSIEVE_PID" 2>/dev/null | awk '{print int($1/1024)}' || echo 0)"
+
+# ─── Search latency via direct FTS5 query ─────────────────────────────────
+log "probing search latency via sqlite3 FTS5 query: \"$SEARCH_QUERY\""
+SEARCH_MS="?"
+SEARCH_HITS="?"
+if [[ -f "$INDEX_DB" ]] && (( INDEXED_ROWS > 0 )); then
+    START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+    SEARCH_HITS="$(/usr/bin/sqlite3 -readonly "$INDEX_DB" \
+        "SELECT count(*) FROM workspace_search_documents WHERE workspace_search_documents MATCH '${SEARCH_QUERY}'" \
+        2>/dev/null || echo 0)"
+    END_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+    SEARCH_MS=$(( (END_NS - START_NS) / 1000000 ))
+else
+    warn "index.db empty or missing — search latency skipped"
+fi
+RSS_AFTER_SEARCH="$(ps -o rss= -p "$PENSIEVE_PID" 2>/dev/null | awk '{print int($1/1024)}' || echo 0)"
+
+# Wait for /usr/bin/sample to finish writing its file
+if kill -0 "$SAMPLE_PID" 2>/dev/null; then
+    wait "$SAMPLE_PID" 2>/dev/null || true
+fi
+SAMPLE_PID=""
+
+# ─── Peak RSS from poller trace ───────────────────────────────────────────
+PEAK_RSS_MB=0
+if [[ -s "$RSS_TRACE" ]]; then
+    PEAK_RSS_MB="$(awk '{ if ($2+0 > max) max = $2+0 } END { printf "%d", max/1024 }' "$RSS_TRACE")"
+fi
+
+# Stop RSS poller before quitting Pensieve so trace stops cleanly
+if [[ -n "$RSS_POLLER_PID" ]] && kill -0 "$RSS_POLLER_PID" 2>/dev/null; then
+    kill "$RSS_POLLER_PID" 2>/dev/null || true
+    wait "$RSS_POLLER_PID" 2>/dev/null || true
+fi
+RSS_POLLER_PID=""
+
+# ─── Physical footprint (peak) from sample output ─────────────────────────
+SAMPLE_PEAK_FOOTPRINT="?"
+if [[ -s "$SAMPLE_OUTPUT" ]]; then
+    SAMPLE_PEAK_FOOTPRINT="$(awk -F': *' '/Physical footprint \(peak\):/ { print $2; exit }' \
+        "$SAMPLE_OUTPUT" | tr -d ' ' || echo '?')"
+fi
+
+# ─── Extract top stack frames ─────────────────────────────────────────────
+# Cap line count in-awk so we don't pipe to `head` (which would SIGPIPE
+# the upstream awk under set -e -o pipefail and abort the script).
+TOP_STACKS_SNIPPET="(sample produced no Call graph; check $SAMPLE_OUTPUT)"
+if [[ -s "$SAMPLE_OUTPUT" ]]; then
+    TOP_STACKS_SNIPPET="$(awk -v max=60 '
+        /^Call graph:/ { capture=1; print; lines++; next }
+        /^Binary Images:/ { exit }
+        capture { if (lines < max) { print; lines++ } else { exit } }
+    ' "$SAMPLE_OUTPUT")"
+    if [[ -z "$TOP_STACKS_SNIPPET" ]]; then
+        TOP_STACKS_SNIPPET="$(awk -v max=60 'NR <= max { print }' "$SAMPLE_OUTPUT")"
+    fi
+fi
+
+# ─── Quit Pensieve gracefully ─────────────────────────────────────────────
+log "quitting Pensieve"
+osascript -e "tell application id \"$APP_BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+sleep 1
+if [[ -n "$PENSIEVE_PID" ]] && kill -0 "$PENSIEVE_PID" 2>/dev/null; then
+    kill -TERM "$PENSIEVE_PID" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$PENSIEVE_PID" 2>/dev/null || true
+fi
+wait "$PENSIEVE_PID" 2>/dev/null || true
+PENSIEVE_PID=""
+
+# ─── Write report ─────────────────────────────────────────────────────────
+COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+PEAK_VERDICT="under 200 MB target"
+if (( PEAK_RSS_MB > 200 )); then
+    PEAK_VERDICT="OVER 200 MB — flag for operator review"
+fi
+
+cat >"$REPORT" <<EOF
+# Search Memory Smoke — $TS
+
+| Metric                | Value                          |
+|-----------------------|--------------------------------|
+| Commit                | \`$COMMIT_SLUG\` ($COMMIT_FULL) |
+| Fixture               | $FILES files × $ROOTS roots ($FIXTURE_SIZE on disk) |
+| Fixture gen time      | ${FIXTURE_SEC}s                |
+| Reindex wall-clock    | ${REINDEX_SEC}s                |
+| Indexed rows          | $INDEXED_ROWS                  |
+| Peak RSS (poller)     | **${PEAK_RSS_MB} MB** — $PEAK_VERDICT |
+| Physical footprint    | $SAMPLE_PEAK_FOOTPRINT (sample) |
+| RSS after reindex     | ${RSS_AFTER_INDEX} MB          |
+| RSS after search      | ${RSS_AFTER_SEARCH} MB         |
+| Search query          | \`$SEARCH_QUERY\`              |
+| Search latency        | ${SEARCH_MS} ms (sqlite3 direct FTS5) |
+| Search hits           | $SEARCH_HITS                   |
+| Sample window         | ${SAMPLE_DURATION_SEC}s        |
+
+## Session artifacts
+
+\`\`\`
+$SESSION_DIR
+├── vault/                      # synthetic fixture (root-1 .. root-$ROOTS)
+├── Pensieve.app/               # synthesized smoke bundle (ad-hoc signed)
+├── smoke-appsupport/
+│   └── index.db                # populated by the smoke (symlink target during run)
+├── sample-profile.txt          # /usr/bin/sample output (stack profile)
+├── rss-trace.txt               # 0.5s-cadence RSS samples (epoch_sec rss_kb)
+└── app.log                     # Pensieve stdout/stderr + build log
+\`\`\`
+
+## /usr/bin/sample — Call graph excerpt
+
+\`\`\`
+$TOP_STACKS_SNIPPET
+\`\`\`
+
+## Notes
+
+- Brief: W-C-1 (B-04 / audit F-8-R03 close-out).
+- Bundle: $SMOKE_APP (ad-hoc signed, CFBundleIdentifier swapped to \`$APP_BUNDLE_ID\` so cfprefsd scopes everything the smoke bundle reads or writes to the smoke alone — operator's real \`io.vetcoders.pensieve\` prefs are untouched).
+- AppSupport isolation: \`~/Library/Application Support/Pensieve\` swapped with a symlink into \`$SMOKE_APPSUP\` for the run; the operator's real dir is moved aside to \`Pensieve.OPERATOR-BACKUP-<timestamp>\` and restored on exit by the EXIT/INT/TERM trap. macOS 26 \`NSHomeDirectory()\` ignores the \`HOME\` env var, so the symlink swap is the only mechanism that keeps the smoke's \`index.db\` out of the operator's real AppSupport.
+- Workspace populated by AppleScript driving File → Open Folder (⌘⇧O) → Go to Folder (⌘⇧G) → path → Return → Return, repeated for each root. Each \`controller.openFolder(url:)\` call appends a new root via \`mergedRoots(current:adding:)\`; the workspace builder reindexes against all roots together.
+- Search latency is the direct FTS5 query against the populated
+  \`workspace_search_documents\` table — proxies the in-process
+  \`IndexDatabase.performSearch\` cost; does not include the UI debounce
+  or main-thread hop.
+- Peak RSS is from a 0.5s-cadence \`ps -o rss=\` poller, max over the
+  reindex+search window. Physical footprint (peak) is from sample.
+- F-8 target: peak RSS under 200 MB for ~1000 files. Anything higher is
+  informational here (no test assertion) and should be triaged by the
+  operator.
+
+EOF
+
+ok "report written: $REPORT"
+echo ""
+echo "  Peak RSS: ${PEAK_RSS_MB} MB ($PEAK_VERDICT)"
+echo "  Sample:   physical footprint peak $SAMPLE_PEAK_FOOTPRINT"
+echo "  Reindex:  ${REINDEX_SEC}s wall-clock, $INDEXED_ROWS rows"
+echo "  Search:   ${SEARCH_MS} ms ($SEARCH_HITS hits for \"$SEARCH_QUERY\")"
+echo ""
+echo "  Report:   $REPORT"
+echo "  Session:  $SESSION_DIR"

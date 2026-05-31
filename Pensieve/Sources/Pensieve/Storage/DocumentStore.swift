@@ -384,7 +384,7 @@ final class FolderManager {
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     rebuildWorkspace(into: appState)
-    commitWorkspaceManifest(
+    _ = commitWorkspaceManifest(
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
       into: appState
@@ -433,7 +433,7 @@ final class FolderManager {
       }
 
       self.applyWorkspaceScans(scans, into: appState)
-      self.commitWorkspaceManifest(
+      let workspaceIndexWriteTask = self.commitWorkspaceManifest(
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
         into: appState
@@ -441,6 +441,7 @@ final class FolderManager {
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       appState.workspaceActivity = .indexing(documentCount: appState.allDocuments.count)
+      await workspaceIndexWriteTask?.value
       await self.indexDatabase.reindexInBackground(
         documents: appState.allDocuments, appState: appState)
       guard !Task.isCancelled else { return }
@@ -462,6 +463,26 @@ final class FolderManager {
       return false
     }
 
+    // Cold-start short-circuit (STAB-R01 / B-01): if there is no in-memory
+    // workspace yet (empty tree) or the requested workspace does not match the
+    // one already loaded, skip the substrate validate-walk and hand off to the
+    // cold-scan path so the scanner owns the single tree walk. Without this,
+    // cold start with an existing manifest pays for the validate-walk only to
+    // fall through to the cold scan anyway.
+    let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
+    let openFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
+    guard
+      matchesCurrentWorkspace(
+        rootPaths: rootPaths,
+        openFilePaths: openFilePaths,
+        in: appState
+      ),
+      !appState.workspaceTree.isEmpty
+    else {
+      appState.workspaceActivity = .cacheMiss(label)
+      return false
+    }
+
     let identity = WorkspaceIdentity.make(
       rootURL: rootURLs[0],
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
@@ -476,19 +497,6 @@ final class FolderManager {
       switch verdict {
       case .valid:
         appState.workspaceActivity = .cacheHit(label)
-        let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
-        let openFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
-        guard
-          matchesCurrentWorkspace(
-            rootPaths: rootPaths,
-            openFilePaths: openFilePaths,
-            in: appState
-          ),
-          !appState.workspaceTree.isEmpty
-        else {
-          appState.workspaceActivity = .cacheMiss(label)
-          return false
-        }
         indexDatabase.open(into: appState)
         startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         appState.lastError = nil
@@ -529,23 +537,58 @@ final class FolderManager {
 
   private func commitWorkspaceManifest(
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
-  ) {
-    guard rootURLs.count == 1 else { return }
+  ) -> Task<Void, Never>? {
+    guard rootURLs.count == 1 else { return nil }
+    let startedAt = Date()
     let identity = WorkspaceIdentity.make(
       rootURL: rootURLs[0],
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
     do {
       let fingerprint = try TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
-      _ = try workspaceSubstrate.commit(
+      let manifest = try workspaceSubstrate.commit(
         identity: identity,
         roots: rootURLs,
         exclusions: exclusions,
         fingerprint: fingerprint
       )
+      let documents = appState.documents
+      return Task {
+        await indexDatabase.upsertWorkspace(
+          identity: identity,
+          roots: rootURLs,
+          documents: documents,
+          appState: appState
+        )
+
+        let finishedAt = Date()
+        let durationMs = Int(finishedAt.timeIntervalSince(startedAt) * 1000)
+
+        await indexDatabase.appendScanSession(
+          workspaceID: identity.workspaceID,
+          trigger: "cold_scan",
+          startedAt: startedAt,
+          finishedAt: finishedAt,
+          scannerVersion: manifest.scannerVersion,
+          fingerprintHash: manifest.treeFingerprint.treeHash,
+          fileCount: manifest.fileCount,
+          folderCount: manifest.folderCount,
+          durationMs: durationMs,
+          appState: appState
+        )
+
+        await indexDatabase.refreshWorkspaceStats(
+          workspaceID: identity.workspaceID,
+          fileCount: manifest.fileCount,
+          folderCount: manifest.folderCount,
+          fingerprintMatches: true,
+          appState: appState
+        )
+      }
     } catch {
       try? workspaceSubstrate.markFailure(identity: identity, kind: "manifestCommitFailed")
       appState.lastError = "Could not update workspace cache: \(error.localizedDescription)"
+      return nil
     }
   }
 

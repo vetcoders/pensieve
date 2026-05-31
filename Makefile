@@ -154,6 +154,14 @@ ci: clean gates build-release  ## CI suite: clean + test + lint + release build
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) CI complete\n"
 
 # =========================================================================
+# SMOKE (operator-side, ad-hoc — not gated by `make ci`)
+# =========================================================================
+
+.PHONY: smoke-search-memory
+smoke-search-memory:  ## Multi-root reindex memory smoke (B-04, audit F-8-R03)
+	@$(SCRIPTS)/smoke_search_memory.sh
+
+# =========================================================================
 # HELP (default target)
 # =========================================================================
 
