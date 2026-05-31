@@ -521,10 +521,13 @@ final class FolderManager {
     appState.excludedWorkspacePaths = Set(metadata.excludedPaths)
     appState.workspaceRoots = rootURLs.map { WorkspaceRoot(id: $0.standardizedFileURL) }
     appState.folderURL = appState.workspaceRoots.first?.url
+    var seenOpenFileURLs = Set<URL>()
     appState.openFiles =
       fileURLs
       .filter(WorkspaceScanner.isMarkdownFile)
-      .map { DocumentRef(id: $0.standardizedFileURL, isAdHoc: true) }
+      .map { $0.standardizedFileURL }
+      .filter { seenOpenFileURLs.insert($0).inserted }
+      .map { DocumentRef(id: $0, isAdHoc: true) }
     appState.lastError = nil
   }
 
