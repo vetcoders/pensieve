@@ -591,8 +591,32 @@ struct SidebarView: View {
           controller.selectWorkspaceNode(node)
         }
 
+        Button("Open in Default App") {
+          openExternally(url)
+        }
+
         Button("Reveal in Finder") {
           revealInFinder(url)
+        }
+
+        Divider()
+
+        Button("Rename") {
+          beginRename(url: url, currentName: url.lastPathComponent)
+        }
+
+        Button("Duplicate") {
+          controller.duplicateItem(url: url)
+        }
+
+        Button("Move to Trash") {
+          controller.moveItemToTrash(url: url)
+        }
+
+        Divider()
+
+        Button("Copy Name") {
+          copyPath(url.lastPathComponent)
         }
 
         Button("Copy Path") {
@@ -671,10 +695,10 @@ struct SidebarView: View {
   private func commitRename(_ url: URL) {
     let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
-      cancelRename()
+      appState.lastError = "Name cannot be empty."
       return
     }
-    controller.renameItem(url: url, to: trimmed)
+    guard controller.renameItem(url: url, to: trimmed) else { return }
     cancelRename()
   }
 

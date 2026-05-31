@@ -12,6 +12,7 @@ final class AppController: ObservableObject {
   private let workspaceSearchDebounceNanoseconds: UInt64
   private var didStart = false
   private var workspaceSearchTask: Task<Void, Never>?
+  private var nextUntitledIndex = 1
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -295,15 +296,49 @@ final class AppController: ObservableObject {
       ([appState.documentSession.displayTitle] + appState.documentTabs.map(\.title))
         .filter { $0.hasPrefix("Untitled") }
     )
-    guard existingTitles.contains("Untitled.md") else { return "Untitled.md" }
 
-    var index = 2
-    while existingTitles.contains("Untitled \(index).md")
-      || existingTitles.contains("Untitled \(index)")
-    {
+    var index = max(1, nextUntitledIndex)
+    while existingTitles.contains(untitledTitle(for: index)) {
       index += 1
     }
-    return "Untitled \(index).md"
+    nextUntitledIndex = index + 1
+    return untitledTitle(for: index)
+  }
+
+  private func untitledTitle(for index: Int) -> String {
+    index == 1 ? "Untitled.md" : "Untitled \(index).md"
+  }
+
+  // MARK: - Tab Navigation (Quick Win)
+
+  func selectNextTab() {
+    cycleTab(forward: true)
+  }
+
+  func selectPreviousTab() {
+    cycleTab(forward: false)
+  }
+
+  private func cycleTab(forward: Bool) {
+    let tabs = appState.documentTabs
+    guard !tabs.isEmpty else { return }
+
+    let currentURL = appState.selectedDocumentID?.standardizedFileURL
+    let currentIndex = tabs.firstIndex { $0.id.standardizedFileURL == currentURL }
+
+    let nextIndex: Int
+    if let currentIndex {
+      if forward {
+        nextIndex = (currentIndex + 1) % tabs.count
+      } else {
+        nextIndex = (currentIndex - 1 + tabs.count) % tabs.count
+      }
+    } else {
+      nextIndex = 0
+    }
+
+    let target = tabs[nextIndex]
+    selectDocument(id: target.id)
   }
 }
 

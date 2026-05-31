@@ -16,7 +16,7 @@ struct NativeSearchField: NSViewRepresentable {
     field.delegate = context.coordinator
     field.sendsSearchStringImmediately = true
     field.sendsWholeSearchString = false
-    field.bezelStyle = .roundedBezel
+    field.bezelStyle = .squareBezel
     field.controlSize = .small
     field.setAccessibilityIdentifier(accessibilityIdentifier)
     return field

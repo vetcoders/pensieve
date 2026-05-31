@@ -189,13 +189,25 @@ private struct MarkdownFloatingFormatBar: View {
           Image(systemName: format.systemImageName)
             .frame(width: 24, height: 24)
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.plain)
+        .background(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
         .help(format.label)
         .accessibilityIdentifier(format.floatingAccessibilityIdentifier)
       }
     }
     .padding(.horizontal, 6)
     .padding(.vertical, 4)
+    .background(
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(Color(NSColor.windowBackgroundColor).opacity(0.96))
+    )
   }
 }
 

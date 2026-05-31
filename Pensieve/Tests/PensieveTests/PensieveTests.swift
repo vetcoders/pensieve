@@ -273,6 +273,20 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testSidebarSortOrderPersistsToDefaults() {
+    let suiteName = "PensieveSidebarSortTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let appState = AppState(defaults: defaults)
+    appState.sidebarSortOrder = .nameDescending
+
+    XCTAssertEqual(AppState(defaults: defaults).sidebarSortOrder, .nameDescending)
+  }
+
+  @MainActor
   func testPreviewAutoReloadOffGatesTypingUpdatesFromPipeline() {
     let themeManager = ThemeManager()
     let coordinator = PreviewRepresentable.Coordinator(themeManager: themeManager)
@@ -1529,6 +1543,26 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
     XCTAssertEqual(appState.activeDocumentText, "")
     XCTAssertFalse(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testControllerCreatesDistinctUntitledTitlesForFreshCommandN() {
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: DocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory))
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled 2.md")
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled 3.md")
   }
 
   @MainActor

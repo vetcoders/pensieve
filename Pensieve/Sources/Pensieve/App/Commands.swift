@@ -173,6 +173,19 @@ struct PensieveCommands: Commands {
       .keyboardShortcut("r", modifiers: [.command, .shift])
     }
 
+    // Tab navigation (Quick Win)
+    CommandGroup(after: .windowArrangement) {
+      Button("Show Next Tab") {
+        controller.selectNextTab()
+      }
+      .keyboardShortcut("]", modifiers: [.command, .shift])
+
+      Button("Show Previous Tab") {
+        controller.selectPreviousTab()
+      }
+      .keyboardShortcut("[", modifiers: [.command, .shift])
+    }
+
     // Format menu — Markdown formatting and font sizing
     CommandMenu("Format") {
       Section {

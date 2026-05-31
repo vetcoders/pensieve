@@ -23,13 +23,6 @@ struct ContentView: View {
         ? appState.documentSession.displayTitle : "Pensieve"
     )
     .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
-    .toolbar {
-      EditorToolbelt(
-        appState: appState,
-        controller: controller,
-        themeManager: themeManager
-      )
-    }
   }
 }
 
