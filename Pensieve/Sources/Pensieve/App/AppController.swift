@@ -96,6 +96,10 @@ final class AppController: ObservableObject {
     folderManager.clearExclusions(into: appState)
   }
 
+  func closeWorkspace() {
+    folderManager.closeWorkspace(into: appState)
+  }
+
   func saveActiveDocument() {
     documentStore.save(appState: appState)
   }

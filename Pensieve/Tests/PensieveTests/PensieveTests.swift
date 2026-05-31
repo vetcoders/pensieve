@@ -683,6 +683,47 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testCloseWorkspaceClearsWorkspaceAndProtectsDirtyDocument() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseWorkspaceTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore()
+    )
+
+    manager.open(url: folder, into: appState)
+    XCTAssertFalse(appState.workspaceRoots.isEmpty)
+    XCTAssertFalse(appState.documents.isEmpty)
+    XCTAssertTrue(appState.hasWorkspaceContent)
+
+    // Clean document -> close clears the entire workspace.
+    manager.closeWorkspace(into: appState)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty, "roots cleared")
+    XCTAssertTrue(appState.workspaceTree.isEmpty, "tree cleared")
+    XCTAssertTrue(appState.documents.isEmpty, "documents cleared")
+    XCTAssertFalse(appState.hasWorkspaceContent, "no workspace content after close")
+    XCTAssertNil(appState.selectedDocumentID)
+
+    // Dirty document -> close still clears the workspace but preserves the unsaved editor.
+    manager.open(url: folder, into: appState)
+    appState.activeDocumentText = "unsaved local edit"
+    appState.activeDocumentDirty = true
+    manager.closeWorkspace(into: appState)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty, "roots cleared even with a dirty document")
+    XCTAssertTrue(appState.documentSession.isDirty, "dirty session preserved (no data loss)")
+    XCTAssertEqual(
+      appState.documentSession.text, "unsaved local edit", "unsaved text preserved")
+  }
+
+  @MainActor
   func testFolderManagerHotReopenSkipsScannerWhenCacheValid() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveHotReopenTests-\(UUID().uuidString)", isDirectory: true)

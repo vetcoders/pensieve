@@ -203,6 +203,33 @@ final class FolderManager {
     refresh(into: appState)
   }
 
+  /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
+  /// persisted bookmarks and all workspace state, returning to the "No folder open" state.
+  /// Protects unsaved work — if the active document has unsaved edits it stays open in the
+  /// editor; otherwise the editor is cleared too.
+  func closeWorkspace(into appState: AppState) {
+    workspaceBuildTask?.cancel()
+    watcher.stop()
+    bookmarkStore.clear(into: appState)
+    lastWorkspaceFingerprintHash = nil
+    recentSelfWritePaths.removeAll()
+    appState.workspaceRoots = []
+    appState.workspaceTree = []
+    appState.documents = []
+    appState.openFiles = []
+    appState.documentTabs = []
+    appState.excludedWorkspacePaths = []
+    appState.workspaceSearchQuery = ""
+    appState.workspaceSearchResults = []
+    appState.workspaceActivity = nil
+    appState.folderURL = nil
+    if !appState.documentSession.isDirty {
+      appState.selectedDocumentID = nil
+      appState.documentSession.clear()
+    }
+    appState.lastError = nil
+  }
+
   private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
     workspaceBuildTask?.cancel()
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
