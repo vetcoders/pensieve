@@ -88,12 +88,8 @@ struct DocumentTabStrip: View {
     }
     .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
     .padding(.horizontal, 8)
+    .padding(.vertical, 2)
     .background(tabBackground(isSelected))
-    .overlay(alignment: .trailing) {
-      Rectangle()
-        .fill(Color(NSColor.separatorColor))
-        .frame(width: 1)
-    }
     .contentShape(Rectangle())
     .onTapGesture {
       controller.selectDocument(id: tab.id)
@@ -102,8 +98,8 @@ struct DocumentTabStrip: View {
   }
 
   private func tabBackground(_ isSelected: Bool) -> some View {
-    Rectangle()
-      .fill(isSelected ? Color(NSColor.windowBackgroundColor) : Color.clear)
+    RoundedRectangle(cornerRadius: 6, style: .continuous)
+      .fill(isSelected ? Color.accentColor.opacity(0.22) : Color.clear)
   }
 
   private func untitledTabButton() -> some View {
@@ -130,12 +126,8 @@ struct DocumentTabStrip: View {
     }
     .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
     .padding(.horizontal, 8)
+    .padding(.vertical, 2)
     .background(tabBackground(true))
-    .overlay(alignment: .trailing) {
-      Rectangle()
-        .fill(Color(NSColor.separatorColor))
-        .frame(width: 1)
-    }
     .contentShape(Rectangle())
     .help(appState.documentSession.displayTitle)
   }

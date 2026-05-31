@@ -82,15 +82,14 @@ final class FolderManager {
   @discardableResult
   func createMarkdownFile(at url: URL, into appState: AppState) -> Bool {
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
-    let fm = FileManager.default
 
-    guard !fm.fileExists(atPath: targetURL.path) else {
+    guard !FileManager.default.fileExists(atPath: targetURL.path) else {
       appState.lastError = "A file named \(targetURL.lastPathComponent) already exists."
       return false
     }
 
     do {
-      try fm.createDirectory(
+      try FileManager.default.createDirectory(
         at: targetURL.deletingLastPathComponent(),
         withIntermediateDirectories: true
       )
@@ -115,6 +114,184 @@ final class FolderManager {
 
     openFile(url: standardizedURL, into: appState)
     return appState.selectedDocumentID?.standardizedFileURL == standardizedURL
+  }
+
+  @discardableResult
+  func createFolder(at url: URL, into appState: AppState) -> Bool {
+    let targetURL = availableSiblingURL(for: url.standardizedFileURL)
+    do {
+      try FileManager.default.createDirectory(at: targetURL, withIntermediateDirectories: true)
+      noteSelfWrite(at: targetURL)
+      refresh(into: appState)
+      appState.lastError = nil
+      return true
+    } catch {
+      appState.lastError = "Could not create folder: \(error.localizedDescription)"
+      return false
+    }
+  }
+
+  @discardableResult
+  func rename(url: URL, to name: String, into appState: AppState) -> Bool {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return false }
+
+    let source = url.standardizedFileURL
+    let target =
+      source.deletingLastPathComponent()
+      .appendingPathComponent(trimmed)
+      .standardizedFileURL
+    guard source != target else { return true }
+    guard !FileManager.default.fileExists(atPath: target.path) else {
+      appState.lastError = "A file or folder named \(trimmed) already exists."
+      return false
+    }
+
+    do {
+      try FileManager.default.moveItem(at: source, to: target)
+      noteSelfWrite(at: source)
+      noteSelfWrite(at: target)
+      replaceReferences(from: source, to: target, into: appState)
+      refresh(into: appState)
+      appState.lastError = nil
+      return true
+    } catch {
+      appState.lastError =
+        "Could not rename \(source.lastPathComponent): \(error.localizedDescription)"
+      return false
+    }
+  }
+
+  @discardableResult
+  func duplicate(url: URL, into appState: AppState) -> Bool {
+    let source = url.standardizedFileURL
+    let target = availableDuplicateURL(for: source)
+    do {
+      try FileManager.default.copyItem(at: source, to: target)
+      noteSelfWrite(at: target)
+      refresh(into: appState)
+      if WorkspaceScanner.isMarkdownFile(target) {
+        openFile(url: target, into: appState)
+      }
+      appState.lastError = nil
+      return true
+    } catch {
+      appState.lastError =
+        "Could not duplicate \(source.lastPathComponent): \(error.localizedDescription)"
+      return false
+    }
+  }
+
+  @discardableResult
+  func moveToTrash(url: URL, into appState: AppState) -> Bool {
+    let source = url.standardizedFileURL
+    appState.lastError = nil
+    NSWorkspace.shared.recycle([source]) { [weak self, weak appState] _, error in
+      Task { @MainActor in
+        guard let self, let appState else { return }
+        if let error {
+          appState.lastError =
+            "Could not move \(source.lastPathComponent) to Trash: \(error.localizedDescription)"
+          return
+        }
+        self.noteSelfWrite(at: source)
+        self.removeReferences(for: source, into: appState)
+        self.refresh(into: appState)
+        appState.lastError = nil
+      }
+    }
+    return true
+  }
+
+  @discardableResult
+  func move(url: URL, toFolder folderURL: URL, into appState: AppState) -> Bool {
+    let source = url.standardizedFileURL
+    let target = availableSiblingURL(
+      for: folderURL.standardizedFileURL.appendingPathComponent(source.lastPathComponent)
+    )
+    guard source != target else { return true }
+
+    do {
+      try FileManager.default.moveItem(at: source, to: target)
+      noteSelfWrite(at: source)
+      noteSelfWrite(at: target)
+      replaceReferences(from: source, to: target, into: appState)
+      refresh(into: appState)
+      appState.lastError = nil
+      return true
+    } catch {
+      appState.lastError =
+        "Could not move \(source.lastPathComponent): \(error.localizedDescription)"
+      return false
+    }
+  }
+
+  private func replaceReferences(from source: URL, to target: URL, into appState: AppState) {
+    let sourceURL = source.standardizedFileURL
+    let targetURL = target.standardizedFileURL
+
+    appState.openFiles = appState.openFiles.map { ref in
+      ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
+    }
+    appState.documentTabs = appState.documentTabs.map { ref in
+      ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
+    }
+    if appState.selectedDocumentID?.standardizedFileURL == sourceURL {
+      appState.selectedDocumentID = targetURL
+      appState.documentSession.document = appState.makeDocumentRef(for: targetURL)
+    }
+  }
+
+  private func removeReferences(for source: URL, into appState: AppState) {
+    let sourceURL = source.standardizedFileURL
+    appState.openFiles.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
+    appState.documentTabs.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
+    if let selected = appState.selectedDocumentID, isSameOrDescendant(selected, of: sourceURL) {
+      appState.selectedDocumentID = nil
+      appState.documentSession.clear()
+    }
+  }
+
+  private func isSameOrDescendant(_ url: URL, of ancestor: URL) -> Bool {
+    let path = url.standardizedFileURL.path
+    let ancestorPath = ancestor.standardizedFileURL.path
+    return path == ancestorPath || path.hasPrefix(ancestorPath + "/")
+  }
+
+  private func availableDuplicateURL(for source: URL) -> URL {
+    let directory = source.deletingLastPathComponent()
+    let ext = source.pathExtension
+    let base =
+      ext.isEmpty
+      ? source.lastPathComponent
+      : source.deletingPathExtension().lastPathComponent
+    return availableSiblingURL(
+      for: directory.appendingPathComponent("\(base) Copy").appendingPathExtension(ext)
+    )
+  }
+
+  private func availableSiblingURL(for url: URL) -> URL {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: url.path) else { return url.standardizedFileURL }
+
+    let directory = url.deletingLastPathComponent()
+    let ext = url.pathExtension
+    let base =
+      ext.isEmpty
+      ? url.lastPathComponent
+      : url.deletingPathExtension().lastPathComponent
+    var index = 2
+    while true {
+      let name = "\(base) \(index)"
+      let candidate =
+        ext.isEmpty
+        ? directory.appendingPathComponent(name)
+        : directory.appendingPathComponent(name).appendingPathExtension(ext)
+      if !fm.fileExists(atPath: candidate.path) {
+        return candidate.standardizedFileURL
+      }
+      index += 1
+    }
   }
 
   func restoreLastFolder(into appState: AppState) {
