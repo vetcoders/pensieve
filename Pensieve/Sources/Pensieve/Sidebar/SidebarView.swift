@@ -114,8 +114,8 @@ struct SidebarView: View {
 
       if !appState.workspaceTree.isEmpty {
         Section("Workspace") {
-          ForEach(appState.workspaceTree) { node in
-            workspaceTreeRow(node, depth: 0)
+          ForEach(flattenedWorkspaceRows) { row in
+            workspaceRowView(row)
           }
         }
         .accessibilityIdentifier("pensieve.sidebar.list.workspace")
@@ -193,48 +193,44 @@ struct SidebarView: View {
     .background(selectionBackground(isSelected))
   }
 
-  private func workspaceTreeRow(_ node: WorkspaceNode, depth: Int) -> AnyView {
+  /// Currently-visible workspace rows, flattened so the `List` only materializes
+  /// on-screen rows instead of eagerly building the entire expanded subtree.
+  /// Walks only expanded branches (O(visible)).
+  private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
+    flattenWorkspaceTree(appState.workspaceTree, expandedNodeIDs: expandedNodeIDs)
+  }
+
+  @ViewBuilder
+  private func workspaceRowView(_ row: FlattenedWorkspaceRow) -> some View {
+    let node = row.node
     if node.kind == .document {
-      return AnyView(
-        Button {
-          controller.selectWorkspaceNode(node)
-        } label: {
-          nodeRow(
-            node,
-            depth: depth,
-            isSelected: node.documentID.map(isSelectedOrHovered) ?? false
-          )
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered in
-          guard let documentID = node.documentID else { return }
-          updateHoveredDocument(documentID, isHovered: isHovered)
-        }
-        .contextMenu {
-          nodeContextMenu(for: node)
-        })
-    } else {
-      let children = node.children ?? []
-      let isExpanded = isNodeExpanded(node)
-
-      let content = VStack(alignment: .leading, spacing: 0) {
-        Button {
-          toggleExpanded(node.id)
-        } label: {
-          folderRow(node, depth: depth, isExpanded: isExpanded)
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-          nodeContextMenu(for: node)
-        }
-
-        if isExpanded {
-          ForEach(children) { child in
-            workspaceTreeRow(child, depth: depth + 1)
-          }
-        }
+      Button {
+        controller.selectWorkspaceNode(node)
+      } label: {
+        nodeRow(
+          node,
+          depth: row.depth,
+          isSelected: node.documentID.map(isSelectedOrHovered) ?? false
+        )
       }
-      return AnyView(content)
+      .buttonStyle(.plain)
+      .onHover { isHovered in
+        guard let documentID = node.documentID else { return }
+        updateHoveredDocument(documentID, isHovered: isHovered)
+      }
+      .contextMenu {
+        nodeContextMenu(for: node)
+      }
+    } else {
+      Button {
+        toggleExpanded(node.id)
+      } label: {
+        folderRow(node, depth: row.depth, isExpanded: row.isExpanded)
+      }
+      .buttonStyle(.plain)
+      .contextMenu {
+        nodeContextMenu(for: node)
+      }
     }
   }
 
