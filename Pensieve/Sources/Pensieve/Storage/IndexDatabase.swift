@@ -11,6 +11,14 @@ final class IndexDatabase {
   private let searchIndexBatchSize: Int
   private let didInsertSearchIndexBatch: (@Sendable (Int) -> Void)?
 
+  /// Tracks the in-flight background index write (full reindex OR incremental
+  /// delta apply). Each new background update chains onto this task before
+  /// starting its own `pool.write`, so writes are serialized in submission
+  /// order: a newer delta cannot start until the prior one has finished, and a
+  /// stale update can never overwrite the rows a later one already wrote.
+  /// Tests await it via `waitForPendingReindex()` instead of sleeping.
+  private var pendingIndexUpdateTask: Task<Void, Never>?
+
   init(
     databaseURL: URL? = nil,
     searchIndexBatchSize: Int = 32,
@@ -292,20 +300,26 @@ final class IndexDatabase {
     guard let pool = ensureOpen(into: appState) else { return }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
+    let previous = pendingIndexUpdateTask
 
-    do {
-      try await Task.detached(priority: .utility) {
-        try Self.replaceSearchIndex(
-          with: documents,
-          pool: pool,
-          batchSize: batchSize,
-          didInsertBatch: didInsertBatch
-        )
-      }.value
-      refreshSearchResults(in: appState)
-    } catch {
-      report(error, appState: appState, action: "rebuild Pensieve search index")
+    let task = Task { [weak self] in
+      await previous?.value
+      do {
+        try await Task.detached(priority: .utility) {
+          try Self.replaceSearchIndex(
+            with: documents,
+            pool: pool,
+            batchSize: batchSize,
+            didInsertBatch: didInsertBatch
+          )
+        }.value
+        self?.refreshSearchResults(in: appState)
+      } catch {
+        self?.report(error, appState: appState, action: "rebuild Pensieve search index")
+      }
     }
+    pendingIndexUpdateTask = task
+    await task.value
   }
 
   private func reindex(documents: [DocumentRef], pool: DatabasePool, appState: AppState?) {
@@ -320,6 +334,90 @@ final class IndexDatabase {
     } catch {
       report(error, appState: appState, action: "rebuild Pensieve search index")
     }
+  }
+
+  /// Awaits the in-flight background index write (full reindex OR incremental
+  /// delta apply) so tests can drive `updateSearchIndexInBackground` /
+  /// `reindexInBackground` deterministically without sleeping. Returns
+  /// immediately when nothing is pending.
+  func waitForPendingReindex() async {
+    await pendingIndexUpdateTask?.value
+  }
+
+  /// Synchronous incremental index update: re-upsert each `upserting` doc
+  /// (reading its body from disk) and delete the FTS rows for each `deletingPaths`
+  /// entry, all inside a single serialized `pool.write` transaction. The update
+  /// is proportional to the CHANGE, not to the workspace size — only the
+  /// supplied docs/paths are touched; every other FTS row is left intact.
+  ///
+  /// Per-doc upsert mirrors `index(document:body:)` (DELETE-by-path + INSERT) so
+  /// a modified doc's stale row is replaced and a brand-new doc is added.
+  /// `deletingPaths` are the FULL standardized paths (== the search join key /
+  /// the FTS `path` column) of removed files.
+  ///
+  /// Used by the explicit one-shot callers (file create/exclusion edits, tests).
+  /// The watcher path uses `updateSearchIndexInBackground` so the body reads +
+  /// write run off the main actor.
+  func updateSearchIndex(
+    upserting documents: [DocumentRef],
+    deletingPaths: [String],
+    appState: AppState? = nil
+  ) {
+    guard let pool = ensureOpen(into: appState) else { return }
+    do {
+      try Self.applySearchIndexDelta(
+        upserting: documents,
+        deletingPaths: deletingPaths,
+        pool: pool,
+        batchSize: searchIndexBatchSize,
+        didInsertBatch: didInsertSearchIndexBatch
+      )
+      refreshSearchResults(in: appState)
+    } catch {
+      report(error, appState: appState, action: "update Pensieve search index")
+    }
+  }
+
+  /// Off-main incremental index update mirroring `reindexInBackground`'s
+  /// detached/`.utility`/batched pattern. The body reads + the single
+  /// `pool.write` transaction run on a detached background task; only the
+  /// `appState`-touching search refresh hops back to the main actor.
+  ///
+  /// Supersede-safe: each call chains onto `pendingIndexUpdateTask` before it
+  /// starts its own write, so concurrent updates are serialized in submission
+  /// order. GRDB already serializes `pool.write`; the chaining additionally
+  /// guarantees a stale delta cannot land AFTER a newer one. Because the apply
+  /// runs in one transaction, a cancelled/failed update either commits wholly or
+  /// not at all — it can never leave the FTS index half-written.
+  func updateSearchIndexInBackground(
+    upserting documents: [DocumentRef],
+    deletingPaths: [String],
+    appState: AppState? = nil
+  ) async {
+    guard let pool = ensureOpen(into: appState) else { return }
+    let batchSize = searchIndexBatchSize
+    let didInsertBatch = didInsertSearchIndexBatch
+    let previous = pendingIndexUpdateTask
+
+    let task = Task { [weak self] in
+      await previous?.value
+      do {
+        try await Task.detached(priority: .utility) {
+          try Self.applySearchIndexDelta(
+            upserting: documents,
+            deletingPaths: deletingPaths,
+            pool: pool,
+            batchSize: batchSize,
+            didInsertBatch: didInsertBatch
+          )
+        }.value
+        self?.refreshSearchResults(in: appState)
+      } catch {
+        self?.report(error, appState: appState, action: "update Pensieve search index")
+      }
+    }
+    pendingIndexUpdateTask = task
+    await task.value
   }
 
   func index(document: DocumentRef, body: String, appState: AppState? = nil) {
@@ -513,6 +611,61 @@ final class IndexDatabase {
         }
       }
 
+      if !batch.isEmpty {
+        try insert(batch, into: db)
+        didInsertBatch?(batch.count)
+      }
+    }
+  }
+
+  /// Incremental FTS apply: touches ONLY the supplied docs/paths, leaving every
+  /// other row intact (unlike `replaceSearchIndex`, which clears and rebuilds
+  /// the whole non-trigger-owned set). Runs as a single `pool.write`
+  /// transaction so a failed/cancelled apply commits wholly or not at all — the
+  /// index can never be left half-written.
+  ///
+  /// Per-doc upsert is the same DELETE-by-path + INSERT primitive as
+  /// `index(document:body:)`: the stale row (if any) is removed and the fresh
+  /// on-disk body is inserted. Deletes are plain DELETE-by-path. The `path`
+  /// column is the FULL standardized URL path (== the search join key), so a
+  /// delete keyed on that path removes the row regardless of which writer
+  /// (inline index or the `documents` FTS triggers) created it.
+  ///
+  /// `didInsertBatch` fires per upsert batch (same batching contract as
+  /// `replaceSearchIndex`) so callers/tests can observe write progress.
+  private nonisolated static func applySearchIndexDelta(
+    upserting documents: [DocumentRef],
+    deletingPaths: [String],
+    pool: DatabasePool,
+    batchSize: Int,
+    didInsertBatch: (@Sendable (Int) -> Void)?
+  ) throws {
+    // Read bodies off the write transaction so a slow/failed disk read can't
+    // hold the write lock open. A doc whose body cannot be read is skipped
+    // (matches `searchDocumentRecord` / cold reindex behaviour: never write a
+    // partial record).
+    let records = documents.compactMap(searchDocumentRecord(from:))
+
+    try pool.write { db in
+      for path in deletingPaths {
+        try db.execute(
+          sql: "DELETE FROM workspace_search_documents WHERE path = ?",
+          arguments: [path])
+      }
+
+      var batch: [SearchDocumentRecord] = []
+      batch.reserveCapacity(batchSize)
+      for record in records {
+        try db.execute(
+          sql: "DELETE FROM workspace_search_documents WHERE path = ?",
+          arguments: [record.path])
+        batch.append(record)
+        if batch.count == batchSize {
+          try insert(batch, into: db)
+          didInsertBatch?(batch.count)
+          batch.removeAll(keepingCapacity: true)
+        }
+      }
       if !batch.isEmpty {
         try insert(batch, into: db)
         didInsertBatch?(batch.count)

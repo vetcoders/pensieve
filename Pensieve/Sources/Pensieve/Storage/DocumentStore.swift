@@ -15,8 +15,17 @@ final class FolderManager {
   private let watcherDebounceNanoseconds: UInt64
   private var workspaceBuildTask: Task<Void, Never>?
   private var watcherRefreshTask: Task<Void, Never>?
+  /// Tracks the off-main FTS index write launched by `rebuildWorkspace` (incremental delta OR
+  /// full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so callers
+  /// can await it. The underlying `pool.write` is a single transaction inside
+  /// `IndexDatabase`, so cancelling here only abandons the await — it never half-writes the
+  /// index. The actual writes are serialized by `IndexDatabase.pendingIndexUpdateTask`.
+  private var indexUpdateTask: Task<Void, Never>?
   private var recentSelfWritePaths: [String: Date] = [:]
-  private var lastWorkspaceFingerprintHash: String?
+  /// Last applied `.md` signature (structured `path -> FileSignature` map). The
+  /// baseline the next watcher/refresh diffs against. `nil` means "no baseline"
+  /// (cold open, or after `closeWorkspace`) — the next rebuild full-indexes.
+  private var lastWorkspaceSignature: WorkspaceSignature?
 
   init(
     metadataStore: WorkspaceMetadataStore = .shared,
@@ -151,6 +160,14 @@ final class FolderManager {
     await watcherRefreshTask?.value
   }
 
+  /// Awaits the off-main FTS index write launched by the most recent `rebuildWorkspace` so
+  /// tests can assert on the index deterministically. This awaits the FolderManager-side
+  /// handle; the canonical write-completion sync point is `IndexDatabase.waitForPendingReindex()`
+  /// (which both background variants chain on and await internally).
+  func waitForPendingIndexUpdate() async {
+    await indexUpdateTask?.value
+  }
+
   func noteSelfWrite(at url: URL) {
     recentSelfWritePaths[url.standardizedFileURL.path] = Date()
   }
@@ -165,9 +182,8 @@ final class FolderManager {
 
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
-    let fingerprintHash = FolderManager.currentWorkspaceFingerprintHash(
-      roots: roots, exclusions: exclusions)
-    applyRefresh(into: appState, fingerprintHash: fingerprintHash)
+    let signature = FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
+    applyRefresh(into: appState, signature: signature)
   }
 
   /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
@@ -187,7 +203,7 @@ final class FolderManager {
   }
 
   /// Body of the debounced watcher refresh. The signature scan runs off the main actor; only
-  /// the comparison + rebuild touch `appState` / `lastWorkspaceFingerprintHash` on the main
+  /// the comparison + rebuild touch `appState` / `lastWorkspaceSignature` on the main
   /// actor. Re-checks `hasWorkspaceContent` after the hop in case the workspace was closed
   /// while the scan was in flight.
   private func performWatcherRefresh(into appState: AppState) async {
@@ -197,22 +213,26 @@ final class FolderManager {
 
     // Expensive: WorkspaceScanner.build (full enumeration) + per-file resourceValues stat.
     // Run it OFF the main actor on a detached background task.
-    let fingerprintHash = await Task.detached(priority: .utility) {
-      FolderManager.currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+    let signature = await Task.detached(priority: .utility) {
+      FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
     }.value
 
     guard !Task.isCancelled else { return }
     guard appState.hasWorkspaceContent else { return }
-    applyRefresh(into: appState, fingerprintHash: fingerprintHash)
+    applyRefresh(into: appState, signature: signature)
   }
 
   /// Shared rebuild tail used by both the synchronous `refresh` and the off-main watcher
-  /// path. Compares the freshly-computed signature against the last applied one; when
-  /// unchanged it skips the full rebuild + FTS reindex storm. When changed it rebuilds and
-  /// reselects, preserving dirty-session protection (a dirty active buffer is never
-  /// clobbered). Must run on the main actor — it mutates `appState`.
-  private func applyRefresh(into appState: AppState, fingerprintHash: String?) {
-    if let fingerprintHash, fingerprintHash == lastWorkspaceFingerprintHash {
+  /// path. Compares the freshly-computed `.md` signature against the last applied one; when
+  /// unchanged it skips the full rebuild + FTS reindex storm. When changed it rebuilds the
+  /// in-memory tree and updates the FTS index proportionally to the CHANGE (delta upsert/
+  /// delete) when a baseline exists — full reindex only on cold open. Reselects, preserving
+  /// dirty-session protection (a dirty active buffer is never clobbered). Must run on the main
+  /// actor — it mutates `appState`.
+  private func applyRefresh(into appState: AppState, signature: WorkspaceSignature?) {
+    if let signature, let baseline = lastWorkspaceSignature,
+      WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
+    {
       // The .md tree is unchanged — a non-.md change (screenshot, .DS_Store, sibling
       // app writes) fired the watcher. Skip the full rebuild + FTS reindex storm.
       return
@@ -220,7 +240,7 @@ final class FolderManager {
 
     workspaceBuildTask?.cancel()
     let previousSelection = appState.selectedDocumentID
-    rebuildWorkspace(into: appState, fingerprintHash: fingerprintHash)
+    rebuildWorkspace(into: appState, signature: signature)
     let documents = appState.allDocuments
 
     if let previousSelection, documents.contains(where: { $0.id == previousSelection }) {
@@ -271,9 +291,14 @@ final class FolderManager {
   func closeWorkspace(into appState: AppState) {
     workspaceBuildTask?.cancel()
     watcherRefreshTask?.cancel()
+    // Cancel any still-awaiting off-main index update. The underlying single-transaction
+    // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
+    indexUpdateTask?.cancel()
     watcher.stop()
     bookmarkStore.clear(into: appState)
-    lastWorkspaceFingerprintHash = nil
+    // Clearing the baseline means the next open of any workspace cold-starts with a FULL
+    // reindex (no stale delta against a foreign workspace's signature).
+    lastWorkspaceSignature = nil
     recentSelfWritePaths.removeAll()
     appState.workspaceRoots = []
     appState.workspaceTree = []
@@ -364,9 +389,15 @@ final class FolderManager {
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       appState.workspaceActivity = .indexing(documentCount: appState.allDocuments.count)
       await workspaceIndexWriteTask?.value
+      // Cold open: full reindex. Compute the baseline `.md` signature off the main actor so
+      // the first watcher refresh after this open can go INCREMENTAL instead of full.
+      let baselineSignature = await Task.detached(priority: .utility) {
+        FolderManager.currentWorkspaceSignature(roots: roots, exclusions: scanExclusions)
+      }.value
       await self.indexDatabase.reindexInBackground(
         documents: appState.allDocuments, appState: appState)
       guard !Task.isCancelled else { return }
+      self.lastWorkspaceSignature = baselineSignature
       appState.workspaceActivity = nil
     }
   }
@@ -453,38 +484,91 @@ final class FolderManager {
     appState.lastError = nil
   }
 
-  private func rebuildWorkspace(into appState: AppState, fingerprintHash: String? = nil) {
+  /// Rebuilds the in-memory document tree (always full — it is metadata-only and cheap) and
+  /// updates the FTS index. The index update is proportional to the CHANGE: when a previous
+  /// `.md` signature baseline exists, only the added/modified files are re-upserted and the
+  /// removed files' rows are deleted (delta). A FULL reindex happens ONLY on cold open — when
+  /// there is no baseline yet (first open, or after `closeWorkspace` cleared it). After the
+  /// rebuild the freshly-computed signature becomes the new baseline.
+  ///
+  /// `signature` is the pre-computed `.md` signature from the caller (already computed off the
+  /// main actor on the watcher path). When `nil` (a callsite that did not pre-compute, or a
+  /// stat failure), it is recomputed here so the baseline is never left stale.
+  private func rebuildWorkspace(into appState: AppState, signature: WorkspaceSignature? = nil) {
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
+    let baseline = lastWorkspaceSignature
     let scans = workspaceBuilder(roots, exclusions)
     applyWorkspaceScans(scans, into: appState)
-    indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
-    lastWorkspaceFingerprintHash =
-      fingerprintHash
-      ?? FolderManager.currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+
+    let newSignature =
+      signature ?? FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
+
+    // The FTS index write runs OFF the main actor on a tracked Task. FolderManager is
+    // @MainActor and this method is sync, so the body of either background variant — which
+    // performs the body reads + the single `pool.write` transaction on a detached `.utility`
+    // task — never blocks the main actor regardless of delta size. A LARGE delta (a batch of
+    // dropped `.md` files) and the cold/fallback FULL reindex both go through the same off-main
+    // path. The in-memory tree (`applyWorkspaceScans` above) already updated synchronously, so
+    // the sidebar + selection see the change immediately; only the searchable index lags.
+    //
+    // Snapshot the Sendable inputs BEFORE launching the Task. Both background variants chain on
+    // `IndexDatabase.pendingIndexUpdateTask` (serialized in submission order) and are awaitable
+    // via `IndexDatabase.waitForPendingReindex()` — tests sync on that. The FolderManager-side
+    // `indexUpdateTask` handle exists so `closeWorkspace` can cancel a still-awaiting update and
+    // so callers can await it (`waitForPendingIndexUpdate`).
+    let indexDatabase = indexDatabase
+    if let baseline, let newSignature {
+      // Incremental: touch only what changed. The tree already reflects the new set; map the
+      // changed paths back to DocumentRefs for the upsert.
+      let delta = WorkspaceSignature.delta(from: baseline, to: newSignature)
+      let documentsByPath = Dictionary(
+        appState.allDocuments.map { ($0.url.standardizedFileURL.path, $0) },
+        uniquingKeysWith: { first, _ in first }
+      )
+      let upserts = delta.upsertedPaths.compactMap { documentsByPath[$0] }
+      let deletingPaths = delta.removed
+      indexUpdateTask = Task { [weak appState] in
+        await indexDatabase.updateSearchIndexInBackground(
+          upserting: upserts, deletingPaths: deletingPaths, appState: appState)
+      }
+    } else {
+      // Cold open (no baseline) or signature uncertainty (fail open): full reindex, off-main.
+      let documents = appState.allDocuments
+      indexUpdateTask = Task { [weak appState] in
+        await indexDatabase.reindexInBackground(documents: documents, appState: appState)
+      }
+    }
+
+    lastWorkspaceSignature =
+      newSignature
+      ?? FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
   }
 
-  /// Precise `.md`-tree signature (path | full-precision mtime | size) across all workspace
-  /// roots, used to gate the watcher-triggered rebuild. Non-`.md` churn (screenshots,
-  /// `.DS_Store`) leaves the `.md` set untouched, so the signature is unchanged and the full
-  /// FTS reindex is skipped. Unlike `TreeFingerprint` (whole-second mtime), this keeps the
+  /// Precise structured `.md`-tree signature (`standardizedPath -> FileSignature{mtime,size}`)
+  /// across all workspace roots. Replaces the opaque joined-String fingerprint: the same
+  /// `path | full-precision mtime | size` evidence, now keyed by path so the watcher/refresh
+  /// path can DIFF it (added/modified/removed) and update the FTS index proportionally to the
+  /// change rather than full-replacing it. Equality still gates the skip-when-unchanged path,
+  /// so non-`.md` churn (screenshots, `.DS_Store`) leaves the signature unchanged and the
+  /// rebuild is skipped. Unlike `TreeFingerprint` (whole-second mtime), this keeps the
   /// sub-second modification time, so a same-second, same-length external edit is still
-  /// detected. Uses the STATIC scanner (not the injected builder) so the gate never counts
-  /// as a rebuild. Returns nil when there are no roots or a file cannot be stat'd — callers
-  /// then rebuild (fail open; never skip on uncertainty).
+  /// detected. Uses the STATIC scanner (not the injected builder) so the gate never counts as
+  /// a rebuild. Returns nil when there are no roots or a file cannot be stat'd — callers then
+  /// full-rebuild (fail open; never skip / never delta on uncertainty).
   ///
   /// `nonisolated static` so the watcher path can run this expensive full-directory
   /// enumeration + per-file `resourceValues` stat OFF the main actor (RC-2). Inputs (`[URL]`,
-  /// `Set<String>`) and the `String?` result are all `Sendable`, so it crosses the actor
-  /// boundary cleanly. Instance callers (the synchronous `refresh`) reach it via the same
-  /// static.
-  nonisolated static func currentWorkspaceFingerprintHash(roots: [URL], exclusions: Set<String>)
-    -> String?
+  /// `Set<String>`) and the `WorkspaceSignature?` result are all `Sendable`, so it crosses the
+  /// actor boundary cleanly. Instance callers (the synchronous `refresh`) reach it via the
+  /// same static.
+  nonisolated static func currentWorkspaceSignature(roots: [URL], exclusions: Set<String>)
+    -> WorkspaceSignature?
   {
     guard !roots.isEmpty else { return nil }
     let documents = WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
       .flatMap(\.documents)
-    var entries: [String] = []
+    var entries: [String: FileSignature] = [:]
     entries.reserveCapacity(documents.count)
     for document in documents {
       guard
@@ -494,9 +578,9 @@ final class FolderManager {
       else { return nil }
       let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
       let size = values.fileSize ?? 0
-      entries.append("\(document.url.standardizedFileURL.path)|\(mtime)|\(size)")
+      entries[document.url.standardizedFileURL.path] = FileSignature(mtime: mtime, size: size)
     }
-    return entries.sorted().joined(separator: "\n")
+    return WorkspaceSignature(entries: entries)
   }
 
   private func commitWorkspaceManifest(
@@ -695,6 +779,66 @@ private enum WorkspaceDefaults {
 struct WorkspaceScan: Sendable {
   var documents: [DocumentRef]
   var rootNode: WorkspaceNode
+}
+
+/// Per-file `.md` signature: full-precision modification time + byte size. Two
+/// files with the same path are considered "modified" when EITHER differs, so a
+/// same-second content edit that changes the size, OR a same-size edit that
+/// bumps the mtime, is detected. Full-precision `mtime` (not whole-second, as
+/// `TreeFingerprint` uses) preserves sub-second edits.
+struct FileSignature: Equatable, Sendable {
+  var mtime: TimeInterval
+  var size: Int
+}
+
+/// Structured workspace `.md` signature: `standardizedPath -> FileSignature`
+/// across all roots. Replaces the opaque joined-String fingerprint as the
+/// baseline the watcher/refresh path diffs against. Equality of two signatures
+/// is the skip-when-unchanged gate; the delta between two signatures drives the
+/// incremental FTS update. Computed off the main actor (RC-2) — all members are
+/// `Sendable`, so it crosses the actor boundary cleanly.
+struct WorkspaceSignature: Equatable, Sendable {
+  var entries: [String: FileSignature]
+
+  init(entries: [String: FileSignature] = [:]) {
+    self.entries = entries
+  }
+
+  /// Files in `new` but not in `old` (added), in both but with a changed
+  /// signature (modified), and in `old` but not in `new` (removed). Pure and
+  /// deterministic — the unit-testable core of the scan-diff. The FSEvents
+  /// stage will produce the same `Delta` shape from event paths and feed it to
+  /// the SAME apply step, so the apply path is reused unchanged.
+  struct Delta: Equatable, Sendable {
+    var added: [String]
+    var modified: [String]
+    var removed: [String]
+
+    var isEmpty: Bool { added.isEmpty && modified.isEmpty && removed.isEmpty }
+
+    /// Paths whose FTS row must be (re)written: added + modified.
+    var upsertedPaths: [String] { added + modified }
+  }
+
+  static func delta(from old: WorkspaceSignature, to new: WorkspaceSignature) -> Delta {
+    var added: [String] = []
+    var modified: [String] = []
+    for (path, signature) in new.entries {
+      if let previous = old.entries[path] {
+        if previous != signature {
+          modified.append(path)
+        }
+      } else {
+        added.append(path)
+      }
+    }
+    let removed = old.entries.keys.filter { new.entries[$0] == nil }
+    return Delta(
+      added: added.sorted(),
+      modified: modified.sorted(),
+      removed: removed.sorted()
+    )
+  }
 }
 
 enum WorkspaceScanner {
