@@ -12,7 +12,9 @@ final class FolderManager {
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
   private let selfWriteSuppressionInterval: TimeInterval
+  private let watcherDebounceNanoseconds: UInt64
   private var workspaceBuildTask: Task<Void, Never>?
+  private var watcherRefreshTask: Task<Void, Never>?
   private var recentSelfWritePaths: [String: Date] = [:]
   private var lastWorkspaceFingerprintHash: String?
 
@@ -22,7 +24,8 @@ final class FolderManager {
     bookmarkStore: BookmarkStore? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
-    selfWriteSuppressionInterval: TimeInterval = 1.2
+    selfWriteSuppressionInterval: TimeInterval = 1.2,
+    watcherDebounceMilliseconds: UInt64 = 300
   ) {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
@@ -30,6 +33,7 @@ final class FolderManager {
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.defaultBuilder
     self.workspaceSubstrate = workspaceSubstrate
     self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
+    self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
   }
 
   func open(url: URL, into appState: AppState) {
@@ -141,16 +145,73 @@ final class FolderManager {
     await workspaceBuildTask?.value
   }
 
+  /// Awaits the in-flight debounced watcher refresh (debounce sleep + off-main scan + rebuild)
+  /// so tests can drive `scheduleWatcherRefresh` deterministically instead of sleeping.
+  func waitForPendingWatcherRefresh() async {
+    await watcherRefreshTask?.value
+  }
+
   func noteSelfWrite(at url: URL) {
     recentSelfWritePaths[url.standardizedFileURL.path] = Date()
   }
 
+  /// Synchronous refresh. Computes the `.md` signature on the calling actor (cheap for the
+  /// explicit one-shot callers: file create, exclusion edits, tests) and rebuilds when it
+  /// differs from the last applied signature. The watcher path does NOT call this directly —
+  /// it goes through `scheduleWatcherRefresh` so the expensive scan runs off the main actor
+  /// (RC-2).
   func refresh(into appState: AppState) {
     guard appState.hasWorkspaceContent else { return }
 
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
-    let fingerprintHash = currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+    let fingerprintHash = FolderManager.currentWorkspaceFingerprintHash(
+      roots: roots, exclusions: exclusions)
+    applyRefresh(into: appState, fingerprintHash: fingerprintHash)
+  }
+
+  /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
+  /// single refresh after a short quiet period, then computes the `.md` signature on a
+  /// background task (full directory enumeration + per-file stat) so foreign filesystem churn
+  /// (Spotlight, a live folder, sibling app writes) never blocks the main actor. Only the
+  /// cheap signature comparison and — if it changed — the rebuild hop back to the main actor.
+  /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
+  func scheduleWatcherRefresh(into appState: AppState) {
+    watcherRefreshTask?.cancel()
+    watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
+      try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
+      guard !Task.isCancelled else { return }
+      guard let self, let appState else { return }
+      await self.performWatcherRefresh(into: appState)
+    }
+  }
+
+  /// Body of the debounced watcher refresh. The signature scan runs off the main actor; only
+  /// the comparison + rebuild touch `appState` / `lastWorkspaceFingerprintHash` on the main
+  /// actor. Re-checks `hasWorkspaceContent` after the hop in case the workspace was closed
+  /// while the scan was in flight.
+  private func performWatcherRefresh(into appState: AppState) async {
+    guard appState.hasWorkspaceContent else { return }
+    let roots = appState.workspaceRoots.map(\.url)
+    let exclusions = appState.excludedWorkspacePaths
+
+    // Expensive: WorkspaceScanner.build (full enumeration) + per-file resourceValues stat.
+    // Run it OFF the main actor on a detached background task.
+    let fingerprintHash = await Task.detached(priority: .utility) {
+      FolderManager.currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+    }.value
+
+    guard !Task.isCancelled else { return }
+    guard appState.hasWorkspaceContent else { return }
+    applyRefresh(into: appState, fingerprintHash: fingerprintHash)
+  }
+
+  /// Shared rebuild tail used by both the synchronous `refresh` and the off-main watcher
+  /// path. Compares the freshly-computed signature against the last applied one; when
+  /// unchanged it skips the full rebuild + FTS reindex storm. When changed it rebuilds and
+  /// reselects, preserving dirty-session protection (a dirty active buffer is never
+  /// clobbered). Must run on the main actor — it mutates `appState`.
+  private func applyRefresh(into appState: AppState, fingerprintHash: String?) {
     if let fingerprintHash, fingerprintHash == lastWorkspaceFingerprintHash {
       // The .md tree is unchanged — a non-.md change (screenshot, .DS_Store, sibling
       // app writes) fired the watcher. Skip the full rebuild + FTS reindex storm.
@@ -209,6 +270,7 @@ final class FolderManager {
   /// editor; otherwise the editor is cleared too.
   func closeWorkspace(into appState: AppState) {
     workspaceBuildTask?.cancel()
+    watcherRefreshTask?.cancel()
     watcher.stop()
     bookmarkStore.clear(into: appState)
     lastWorkspaceFingerprintHash = nil
@@ -398,7 +460,8 @@ final class FolderManager {
     applyWorkspaceScans(scans, into: appState)
     indexDatabase.reindex(documents: appState.allDocuments, appState: appState)
     lastWorkspaceFingerprintHash =
-      fingerprintHash ?? currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
+      fingerprintHash
+      ?? FolderManager.currentWorkspaceFingerprintHash(roots: roots, exclusions: exclusions)
   }
 
   /// Precise `.md`-tree signature (path | full-precision mtime | size) across all workspace
@@ -409,7 +472,15 @@ final class FolderManager {
   /// detected. Uses the STATIC scanner (not the injected builder) so the gate never counts
   /// as a rebuild. Returns nil when there are no roots or a file cannot be stat'd — callers
   /// then rebuild (fail open; never skip on uncertainty).
-  private func currentWorkspaceFingerprintHash(roots: [URL], exclusions: Set<String>) -> String? {
+  ///
+  /// `nonisolated static` so the watcher path can run this expensive full-directory
+  /// enumeration + per-file `resourceValues` stat OFF the main actor (RC-2). Inputs (`[URL]`,
+  /// `Set<String>`) and the `String?` result are all `Sendable`, so it crosses the actor
+  /// boundary cleanly. Instance callers (the synchronous `refresh`) reach it via the same
+  /// static.
+  nonisolated static func currentWorkspaceFingerprintHash(roots: [URL], exclusions: Set<String>)
+    -> String?
+  {
     guard !roots.isEmpty else { return nil }
     let documents = WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
       .flatMap(\.documents)
@@ -527,7 +598,8 @@ final class FolderManager {
         Task { @MainActor in
           guard let self, let appState else { return }
           guard !self.shouldSuppressWatcherRefresh(into: appState) else { return }
-          self.refresh(into: appState)
+          // RC-2: coalesce bursts + run the expensive .md scan off the main actor.
+          self.scheduleWatcherRefresh(into: appState)
         }
       }
     } catch {

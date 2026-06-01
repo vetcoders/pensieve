@@ -797,6 +797,158 @@ final class PensieveSmokeTests: XCTestCase {
     var count = 0
   }
 
+  // MARK: - RC-2: debounced, off-main watcher refresh
+
+  /// RC-2 invariant (2): a real `.md` change drives exactly one rebuild through the debounced
+  /// off-main watcher path. The debounce interval is injected small and driven deterministically
+  /// by awaiting the in-flight task (no sleep-based assertion).
+  @MainActor
+  func testScheduleWatcherRefreshRebuildsOnceForMarkdownChange() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherRefreshTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+    XCTAssertGreaterThan(afterOpen, 0, "open must scan once")
+
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(calls.count, afterOpen + 1, ".md change must trigger exactly one rebuild")
+  }
+
+  /// RC-2 invariant (1): a foreign change to a NON-`.md` file does NOT trigger a rebuild/reindex
+  /// when the `.md` set is unchanged — the off-main signature gate matches and the path returns
+  /// without touching the main-actor rebuild.
+  @MainActor
+  func testScheduleWatcherRefreshSkipsRebuildForNonMarkdownChange() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherSkipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+
+    // Foreign churn: a screenshot / .DS_Store sibling write leaves the .md set untouched.
+    try Data().write(to: folder.appendingPathComponent("shot.png"))
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+
+    XCTAssertEqual(calls.count, afterOpen, "non-.md change must not trigger a rebuild")
+  }
+
+  /// RC-2 invariant (3): a burst of N rapid watcher events collapses to a single rebuild. Each
+  /// `scheduleWatcherRefresh` cancels the prior in-flight debounce/scan, so only the last one
+  /// survives to rebuild.
+  @MainActor
+  func testScheduleWatcherRefreshCoalescesBurstIntoSingleRebuild() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherBurstTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 30
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+
+    // Real .md change, then a storm of watcher events before the debounce elapses.
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    for _ in 0..<20 {
+      manager.scheduleWatcherRefresh(into: appState)
+    }
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      calls.count, afterOpen + 1, "a burst of N watcher events must collapse to one rebuild")
+  }
+
+  /// RC-2 invariant (4): an external `.md` change delivered through the debounced watcher path
+  /// must NOT clobber an unsaved dirty editor buffer.
+  @MainActor
+  func testScheduleWatcherRefreshProtectsDirtySession() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherDirtyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "clean original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(appState.documentSession.text, "clean original")
+
+    appState.activeDocumentText = "dirty local edit"
+    appState.activeDocumentDirty = true
+    try "dirty external longer body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(appState.documentSession.text, "dirty local edit", "dirty buffer preserved")
+    XCTAssertTrue(appState.documentSession.isDirty, "dirty flag preserved")
+  }
+
   @MainActor
   func testCloseWorkspaceClearsWorkspaceAndProtectsDirtyDocument() throws {
     let folder = FileManager.default.temporaryDirectory
