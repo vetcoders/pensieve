@@ -211,7 +211,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textContentStorage.fontSize != fontSize {
       textContentStorage.fontSize = fontSize
-      textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
+      let baseFont = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+      textView.font = baseFont
+      // Keep typing attributes in lockstep with the base font so newly typed text renders in
+      // the monospaced face immediately (no system-font flash before the highlight pass).
+      textView.typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
       textView.gutter?.fontSize = fontSize
       textView.gutter?.needsDisplay = true
     }
