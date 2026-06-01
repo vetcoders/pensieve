@@ -10,6 +10,18 @@ struct TreeFingerprint: Codable, Equatable {
   static func compute(rootURL: URL, exclusions: Set<String>) throws -> TreeFingerprint {
     let root = rootURL.standardizedFileURL
     let scans = WorkspaceScanner.build(rootURLs: [root], exclusions: exclusions)
+    return try compute(from: scans, root: root)
+  }
+
+  /// Computes the SAME fingerprint v1 as `compute(rootURL:exclusions:)` but from an
+  /// already-walked `[WorkspaceScan]` instead of re-walking the filesystem. The cold-open path
+  /// has already built the workspace tree once (`workspaceBuilder`), so feeding that single walk
+  /// in here lets the cold-start skip-gate consult the substrate verdict WITHOUT a second tree
+  /// walk (the per-file `resourceValues` stat below is the same metadata read either way). The
+  /// hash, file/folder counts, and algorithm version are byte-for-byte identical to the
+  /// re-walking variant for the same tree, so the persisted `tree-fingerprint.json` (written via
+  /// `commit`) compares equal on an unchanged relaunch.
+  static func compute(from scans: [WorkspaceScan], root: URL) throws -> TreeFingerprint {
     let documents = scans.flatMap(\.documents)
 
     // Fingerprint v1: sorted "relativePath|mtimeSeconds|size" markdown-file tuples from WorkspaceScanner.
