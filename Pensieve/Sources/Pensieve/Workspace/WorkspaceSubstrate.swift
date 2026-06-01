@@ -29,7 +29,7 @@ enum WorkspaceBookmarkStatus {
 final class WorkspaceSubstrate {
   static let shared = WorkspaceSubstrate()
 
-  private let store: WorkspaceCacheStore
+  let store: WorkspaceCacheStore
   private let scannerVersion: Int
   private let cacheSchemaVersion: Int
   private let bookmarkStatus: (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus

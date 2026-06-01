@@ -420,6 +420,53 @@ final class IndexDatabase {
     await task.value
   }
 
+  /// Cheap content guard for the cold-open skip decision: how many FTS rows are already indexed
+  /// under any of `rootPaths`. The cold-open path must NEVER skip the reindex when the index is
+  /// empty/missing for this workspace (e.g. after the operator nuked Application Support) — a
+  /// non-zero count here is the proof that skipping is safe. Matches on the full standardized
+  /// `path` column (== the search join key); a row counts when its path is a descendant of a
+  /// root (`<root>/…`). Returns 0 when the index cannot be opened (treated as empty → caller
+  /// full-reindexes).
+  func indexedDocumentCount(forRootPaths rootPaths: [String], appState: AppState? = nil) -> Int {
+    guard !rootPaths.isEmpty, let pool = ensureOpen(into: appState) else { return 0 }
+    do {
+      return try pool.read { db in
+        var total = 0
+        for rootPath in rootPaths {
+          let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+          let count =
+            try Int.fetchOne(
+              db,
+              sql: """
+                SELECT COUNT(*) FROM workspace_search_documents
+                WHERE path LIKE ? ESCAPE '\\'
+                """,
+              arguments: [Self.likePrefixPattern(prefix) + "%"]
+            ) ?? 0
+          total += count
+        }
+        return total
+      }
+    } catch {
+      report(error, appState: appState, action: "count Pensieve search index rows")
+      return 0
+    }
+  }
+
+  /// Escapes LIKE wildcards (`%`, `_`) and the escape char itself in a literal path prefix so a
+  /// path containing them cannot widen the match. Pairs with `ESCAPE '\\'` in the query.
+  private nonisolated static func likePrefixPattern(_ prefix: String) -> String {
+    var escaped = ""
+    escaped.reserveCapacity(prefix.count)
+    for character in prefix {
+      if character == "\\" || character == "%" || character == "_" {
+        escaped.append("\\")
+      }
+      escaped.append(character)
+    }
+    return escaped
+  }
+
   func index(document: DocumentRef, body: String, appState: AppState? = nil) {
     guard let pool = ensureOpen(into: appState) else { return }
     let record = SearchDocumentRecord(document: document, body: body)

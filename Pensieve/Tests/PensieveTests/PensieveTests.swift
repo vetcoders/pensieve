@@ -1105,6 +1105,241 @@ final class PensieveSmokeTests: XCTestCase {
       "the untouched doc is unaffected")
   }
 
+  // MARK: - Persisted cold-open `.md` signature (cross-launch reindex avoidance)
+
+  /// SUBAGENT_08 / Invariant 1: a SECOND cold open of an UNCHANGED workspace with a populated
+  /// index + a persisted signature must SKIP the reindex entirely — 0 records written on relaunch.
+  @MainActor
+  func testColdOpenSkipsReindexWhenSignatureUnchangedAndIndexPopulated() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigSkipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "skip-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase (one pool) across both opens; the cross-launch survivor is the PERSISTED
+    // `.md` signature on disk read through the shared substrate cache.
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    // First launch: full reindex (no persisted signature) + persists the signature.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Second launch: same files, populated index, persisted signature → SKIP.
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), 5,
+      "second open of an unchanged, already-indexed workspace writes ZERO new records (skip)")
+    XCTAssertEqual(
+      indexDatabase.search(query: "skip-token", documents: secondState.allDocuments).count, 5,
+      "the pre-existing index is reused — all docs still searchable after the skip")
+  }
+
+  /// SUBAGENT_08 / Invariant 2: relaunch after a few `.md` changed → only the changed files are
+  /// upserted (INCREMENTAL), not a full reindex of the whole workspace.
+  @MainActor
+  func testColdOpenIncrementalWhenSomeMarkdownChangedAcrossLaunch() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigDeltaTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "orig-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase instance (one DatabasePool) across both opens. A real relaunch keeps a
+    // single pool on `index.db`; the cross-launch survivor is the PERSISTED `.md` signature on
+    // disk, which the second open reads via the shared substrate cache. (Two pools on one file is
+    // a test artifact that races SQLite WAL.)
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    let afterFirstLaunch = recorder.values.reduce(0, +)
+    XCTAssertEqual(afterFirstLaunch, 5, "first launch full-indexes all five docs")
+
+    // Simulate quitting the app between launches so the first session's watcher stops reacting
+    // to the edits below (otherwise it would re-persist a 6-file signature and the relaunch would
+    // skip). closeWorkspace stops the watcher; the persisted signature survives the close.
+    firstManager.closeWorkspace(into: firstState)
+
+    // Between launches the operator edits ONE file and adds ONE file.
+    try "changed-token modified content noticeably longer than before".write(
+      to: folder.appendingPathComponent("note-1.md"), atomically: true, encoding: .utf8)
+    try "added-token brand new file".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    let upsertedOnRelaunch = recorder.values.reduce(0, +) - afterFirstLaunch
+    XCTAssertEqual(
+      upsertedOnRelaunch, 2,
+      "relaunch upserts ONLY the 1 modified + 1 added file (incremental), not all 6")
+
+    let refs = secondState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "changed-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-1.md"], "the modified file's new content is searchable")
+    XCTAssertTrue(
+      indexDatabase.search(query: "orig-token", documents: refs)
+        .allSatisfy { $0.document.url.lastPathComponent != "note-1.md" },
+      "the modified file's stale content is gone")
+    XCTAssertEqual(
+      indexDatabase.search(query: "added-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-added.md"], "the added file is searchable")
+  }
+
+  /// SUBAGENT_08 / Invariant 3 + empty-index guard: a cold open with NO persisted signature does
+  /// a FULL reindex and persists. AND even with a persisted signature, if the on-disk index is
+  /// EMPTY (operator nuked Application Support), the open must NOT skip — it must full-reindex.
+  @MainActor
+  func testColdOpenFullReindexWhenNoSignatureThenSkipGuardOnEmptyIndex() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigEmptyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<4 {
+      try "full-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let firstIndexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    // Separate recorders: the second launch points at a DIFFERENT index file (nuke simulation),
+    // so isolating the recorders keeps the first index's lingering manifest writes out of the
+    // second's record count.
+    let firstRecorder = BatchSizeRecorder()
+    let secondRecorder = BatchSizeRecorder()
+
+    // First launch: NO persisted signature → FULL reindex + persists signature.
+    let firstIndex = IndexDatabase(
+      databaseURL: firstIndexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in firstRecorder.record(size) })
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: firstIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await firstIndex.waitForPendingReindex()
+    XCTAssertEqual(
+      firstRecorder.values.reduce(0, +), 4, "first launch with no signature full-indexes")
+
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+    XCTAssertNotNil(
+      substrate.store.readSearchSignature(for: identity),
+      "the signature is persisted after the first full reindex")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Second launch points at a BRAND-NEW (empty) index.db but the persisted signature still
+    // matches the files. The empty-index guard must force a FULL reindex, never a skip.
+    let secondIndexURL = folder.appendingPathComponent("index-2.db", isDirectory: false)
+    let secondIndex = IndexDatabase(
+      databaseURL: secondIndexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in secondRecorder.record(size) })
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: secondIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await secondIndex.waitForPendingReindex()
+
+    XCTAssertEqual(
+      secondRecorder.values.reduce(0, +), 4,
+      "empty index + matching signature must FULL-reindex (never skip an empty index)")
+    XCTAssertEqual(
+      secondIndex.search(query: "full-token", documents: secondState.allDocuments).count, 4,
+      "all docs searchable after the guarded full reindex into the fresh index")
+  }
+
+  /// SUBAGENT_08 / Invariant 4: the persisted signature round-trips through Codable and is keyed
+  /// by workspace identity (a different root => a different key => nil).
+  func testPersistedSignatureRoundTripsAndIsKeyedByIdentity() throws {
+    let cacheDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigCodableTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: cacheDir) }
+    let store = WorkspaceCacheStore(baseDirectory: cacheDir)
+
+    let rootA = URL(fileURLWithPath: "/tmp/pensieve-sig-root-a")
+    let rootB = URL(fileURLWithPath: "/tmp/pensieve-sig-root-b")
+    let identityA = WorkspaceIdentity.make(rootURL: rootA, bookmarkData: nil)
+    let identityB = WorkspaceIdentity.make(rootURL: rootB, bookmarkData: nil)
+
+    let signature = WorkspaceSignature(entries: [
+      "/tmp/pensieve-sig-root-a/one.md": FileSignature(mtime: 1234.5, size: 42),
+      "/tmp/pensieve-sig-root-a/two.md": FileSignature(mtime: 6789.0, size: 7),
+    ])
+    try store.writeSearchSignature(signature, for: identityA)
+
+    let roundTripped = store.readSearchSignature(for: identityA)
+    XCTAssertEqual(roundTripped, signature, "the signature round-trips losslessly through Codable")
+    XCTAssertNil(
+      store.readSearchSignature(for: identityB),
+      "a different identity has no persisted signature — keying is per workspace identity")
+  }
+
   /// Invariant 3: removing one `.md` deletes only its FTS row; it leaves search results, and
   /// the others remain. No upsert happens for a pure removal.
   @MainActor
