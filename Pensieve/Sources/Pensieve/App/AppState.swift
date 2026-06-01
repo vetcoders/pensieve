@@ -30,8 +30,12 @@ final class AppState: ObservableObject {
   @Published var folderURL: URL?
   @Published var workspaceRoots: [WorkspaceRoot] = []
   @Published var workspaceTree: [WorkspaceNode] = []
-  @Published var documents: [DocumentRef] = []
-  @Published var openFiles: [DocumentRef] = []
+  @Published var documents: [DocumentRef] = [] {
+    didSet { rebuildAllDocumentsCache() }
+  }
+  @Published var openFiles: [DocumentRef] = [] {
+    didSet { rebuildAllDocumentsCache() }
+  }
   @Published var documentTabs: [DocumentRef] = []
   @Published var excludedWorkspacePaths: Set<String> = []
   @Published var selectedDocumentID: DocumentRef.ID?
@@ -133,11 +137,31 @@ final class AppState: ObservableObject {
     return allDocuments.first(where: { $0.id == id })
   }
 
-  var allDocuments: [DocumentRef] {
+  /// Deduplicated union of workspace + open documents. CACHED: it was a computed
+  /// property that allocated a Set and rebuilt the dedup on every access — and SwiftUI
+  /// evaluates it once per sidebar context-menu row on every layout pass, so a single
+  /// keystroke (which re-lays-out the hosting view) cost O(rows × documents). Now rebuilt
+  /// only when `documents`/`openFiles` change. Profiler showed ~84% of the per-keystroke
+  /// main-thread time in `allDocuments.getter` via `nodeContextMenu`.
+  private(set) var allDocuments: [DocumentRef] = []
+  private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
+
+  /// O(1) lookup into `allDocuments` by id, avoiding a per-row linear `first(where:)`.
+  func document(id: DocumentRef.ID) -> DocumentRef? {
+    allDocumentsByID[id]
+  }
+
+  private func rebuildAllDocumentsCache() {
     var seen = Set<DocumentRef.ID>()
-    return (documents + openFiles).filter { ref in
-      seen.insert(ref.id).inserted
+    var result: [DocumentRef] = []
+    var byID: [DocumentRef.ID: DocumentRef] = [:]
+    result.reserveCapacity(documents.count + openFiles.count)
+    for ref in documents + openFiles where seen.insert(ref.id).inserted {
+      result.append(ref)
+      byID[ref.id] = ref
     }
+    allDocuments = result
+    allDocumentsByID = byID
   }
 
   var hasWorkspaceContent: Bool {

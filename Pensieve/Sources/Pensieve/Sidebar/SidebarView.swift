@@ -353,7 +353,7 @@ struct SidebarView: View {
   private func nodeContextMenu(for node: WorkspaceNode) -> some View {
     if node.kind == .document, let url = node.url {
       if let documentID = node.documentID,
-        let doc = appState.allDocuments.first(where: { $0.id == documentID })
+        let doc = appState.document(id: documentID)
       {
         documentContextMenu(for: doc)
       } else {
