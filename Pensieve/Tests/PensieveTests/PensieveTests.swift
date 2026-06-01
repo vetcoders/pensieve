@@ -206,6 +206,121 @@ final class PensieveSmokeTests: XCTestCase {
       NSColor.textColor)
   }
 
+  /// Invariant 1: consecutive plain-text keystrokes inside a fenced code block
+  /// keep re-highlighting the whole enclosing block. Pins the fence-cache reuse
+  /// path — the cache survives across non-fence edits and the bounded
+  /// `codeBlockAwareRange` lookup still extends to the full block each time.
+  @MainActor
+  func testMarkdownTextStorageReusesFenceCacheAcrossRepeatedInBlockEdits() {
+    let text = """
+      intro paragraph
+
+      ```swift
+      let alpha = 1
+      let beta = 2
+      let gamma = 3
+      ```
+
+      after
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+
+    // Three separate single-character edits on three different in-block lines,
+    // none of which touch a fence. None should trigger requiresFullRefresh, so
+    // the fence cache is reused — yet each must still extend to the full block.
+    for token in ["= 1", "= 2", "= 3"] {
+      let nsText = storage.string as NSString
+      let target = nsText.range(of: token)
+      storage.replaceCharacters(
+        in: NSRange(location: NSMaxRange(target), length: 0), with: "0")
+      waitForHighlightingDebounce()
+    }
+
+    let updatedText = storage.string as NSString
+    for token in ["let alpha", "let beta", "let gamma"] {
+      let range = updatedText.range(of: token)
+      XCTAssertEqual(
+        storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor,
+        NSColor.systemPink,
+        "in-block line \(token) must stay code-highlighted across cached edits")
+    }
+  }
+
+  /// Invariant 2: an edit OUTSIDE any code block must not over-extend the
+  /// highlight range into a distant block. The paragraph above a far-away
+  /// fenced block stays plain after editing a paragraph far from the fences.
+  @MainActor
+  func testMarkdownTextStorageDoesNotOverExtendForEditOutsideAnyBlock() {
+    let text = """
+      first plain paragraph here
+
+      second plain paragraph here
+
+      ```swift
+      let inside = 1
+      ```
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+    let editRange = nsText.range(of: "first plain paragraph here")
+
+    storage.replaceCharacters(
+      in: NSRange(location: NSMaxRange(editRange), length: 0), with: "!")
+    waitForHighlightingDebounce()
+
+    let updatedText = storage.string as NSString
+    // The edited paragraph stays plain (no code color leaked onto it).
+    let editedRange = updatedText.range(of: "first plain paragraph here!")
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: editedRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.textColor)
+    // The code block, untouched by this edit, retains its code highlighting.
+    let insideRange = updatedText.range(of: "let inside")
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: insideRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemPink)
+  }
+
+  /// Invariant 3: deleting a ``` fence line takes the full-refresh path and the
+  /// previously-fenced text reverts to plain rendering afterward.
+  @MainActor
+  func testMarkdownTextStorageFullRefreshWhenOpeningFenceDeleted() {
+    let text = """
+      ```swift
+      let value = "x"
+      ```
+      tail
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    var nsText = storage.string as NSString
+
+    // Sanity: the line is code-highlighted before the fence is removed.
+    XCTAssertEqual(
+      storage.attribute(
+        .foregroundColor, at: nsText.range(of: "let value").location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemPink)
+
+    // Delete the opening fence line (including its trailing newline).
+    let openingLine = nsText.range(of: "```swift\n")
+    storage.replaceCharacters(in: openingLine, with: "")
+    waitForHighlightingDebounce()
+
+    nsText = storage.string as NSString
+    let letRange = nsText.range(of: "let value")
+    XCTAssertNotNil(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil))
+    XCTAssertNotEqual(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
+      NSColor.systemPink,
+      "removing the opening fence must drop code highlighting from the former block body")
+  }
+
   @MainActor
   func testMarkdownEditorSurfaceCanDisableSyntaxColors() {
     let surface = MarkdownEditorSurface(
