@@ -20,8 +20,8 @@ struct PensieveCommands: Commands {
             .disabled(appState.selectedDocument == nil)
         }
 
-        // View menu — editor modes
-        CommandMenu("View") {
+        // Mode menu - editor modes and reading preferences
+        CommandMenu("Mode") {
             ForEach(EditorMode.allCases) { mode in
                 Button("\(mode.label) Mode") {
                     appState.mode = mode

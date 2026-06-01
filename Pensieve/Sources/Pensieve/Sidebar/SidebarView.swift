@@ -61,7 +61,7 @@ struct SidebarView: View {
     }
 
     private var documentList: some View {
-        List(filteredDocuments, selection: $appState.selectedDocumentID) { doc in
+        List(filteredDocuments, selection: documentSelection) { doc in
             HStack {
                 Image(systemName: "doc.text")
                     .foregroundColor(.secondary)
@@ -71,11 +71,22 @@ struct SidebarView: View {
             .tag(doc.id as DocumentRef.ID?)
         }
         .listStyle(.sidebar)
-        .onChange(of: appState.selectedDocumentID) { newID in
-            if let id = newID, let ref = appState.documents.first(where: { $0.id == id }) {
-                DocumentStore.shared.load(ref: ref, into: appState)
+    }
+
+    private var documentSelection: Binding<DocumentRef.ID?> {
+        Binding(
+            get: { appState.selectedDocumentID },
+            set: { newID in
+                guard let newID else {
+                    DocumentStore.shared.select(ref: nil, into: appState)
+                    return
+                }
+                guard let ref = appState.documents.first(where: { $0.id == newID }) else {
+                    return
+                }
+                DocumentStore.shared.select(ref: ref, into: appState)
             }
-        }
+        )
     }
 
     private var filteredDocuments: [DocumentRef] {

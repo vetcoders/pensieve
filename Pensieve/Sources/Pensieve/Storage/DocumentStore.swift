@@ -41,10 +41,10 @@ final class FolderManager {
         }
 
         if let first = documents.first {
-            appState.selectedDocumentID = first.id
-            DocumentStore.shared.load(ref: first, into: appState)
+            DocumentStore.shared.select(ref: first, into: appState)
         } else {
             appState.selectedDocumentID = nil
+            appState.activeDocumentURL = nil
             appState.activeDocumentText = ""
             appState.activeDocumentDirty = false
         }
@@ -57,10 +57,10 @@ final class FolderManager {
         appState.documents = scan(folder: url)
 
         if let first = appState.documents.first {
-            appState.selectedDocumentID = first.id
-            DocumentStore.shared.load(ref: first, into: appState)
+            DocumentStore.shared.select(ref: first, into: appState)
         } else {
             appState.selectedDocumentID = nil
+            appState.activeDocumentURL = nil
             appState.activeDocumentText = ""
             appState.activeDocumentDirty = false
         }
@@ -124,10 +124,22 @@ final class DocumentStore {
 
     func load(ref: DocumentRef, into appState: AppState) {
         self.appState = appState
+        let activeDocumentURL = appState.activeDocumentURL
+
+        if appState.activeDocumentDirty {
+            save(appState: appState)
+            guard !appState.activeDocumentDirty else {
+                appState.selectedDocumentID = activeDocumentURL
+                return
+            }
+        }
+
         autosaver.cancel()
 
         do {
             let text = try String(contentsOf: ref.url, encoding: .utf8)
+            appState.activeDocumentURL = ref.url
+            appState.selectedDocumentID = ref.id
             appState.activeDocumentText = text
             appState.activeDocumentDirty = false
             appState.lastError = nil
@@ -137,17 +149,42 @@ final class DocumentStore {
         }
     }
 
+    @discardableResult
+    func select(ref: DocumentRef?, into appState: AppState) -> Bool {
+        self.appState = appState
+
+        if appState.activeDocumentDirty {
+            save(appState: appState)
+            guard !appState.activeDocumentDirty else {
+                return false
+            }
+        }
+
+        guard let ref else {
+            autosaver.cancel()
+            appState.selectedDocumentID = nil
+            appState.activeDocumentURL = nil
+            appState.activeDocumentText = ""
+            appState.activeDocumentDirty = false
+            return true
+        }
+
+        load(ref: ref, into: appState)
+        return true
+    }
+
     func save(appState: AppState) {
         self.appState = appState
         autosaver.cancel()
 
-        guard let ref = appState.selectedDocument else { return }
+        guard let url = appState.activeDocumentURL ?? appState.selectedDocument?.url else { return }
         do {
-            try appState.activeDocumentText.write(to: ref.url, atomically: true, encoding: .utf8)
+            try appState.activeDocumentText.write(to: url, atomically: true, encoding: .utf8)
+            appState.activeDocumentURL = url
             appState.activeDocumentDirty = false
             appState.lastError = nil
         } catch {
-            let message = "Could not save \(ref.url.lastPathComponent): \(error.localizedDescription)"
+            let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
             appState.lastError = message
             NSLog(message)
         }

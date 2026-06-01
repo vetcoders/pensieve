@@ -77,13 +77,15 @@ test-ui:  ## Run XCUITest UI tests (Wave 1.5+ — pending Xcode project)
 	fi
 
 .PHONY: lint
-lint:  ## Format check + warnings audit (best-effort if tools missing)
-	@command -v swift-format >/dev/null 2>&1 \
-		&& cd $(PKG_DIR) && swift-format lint --recursive Sources/ Tests/ \
-		|| printf "$(C_YELLOW)[skip]$(C_RESET) swift-format not installed (brew install swift-format)\n"
+lint:  ## Required format check; fails if swift-format is missing
+	@if ! command -v swift-format >/dev/null 2>&1; then \
+		printf "$(C_YELLOW)[missing]$(C_RESET) swift-format is required for lint/release gates (brew install swift-format)\n"; \
+		exit 1; \
+	fi
+	@cd $(PKG_DIR) && swift-format lint --recursive Sources/ Tests/
 
 .PHONY: format
-format:  ## Apply swift-format in-place (writes files)
+format:  ## Apply swift-format in-place when installed (best-effort helper)
 	@command -v swift-format >/dev/null 2>&1 \
 		&& cd $(PKG_DIR) && swift-format format --in-place --recursive Sources/ Tests/ \
 		|| printf "$(C_YELLOW)[skip]$(C_RESET) swift-format not installed (brew install swift-format)\n"
@@ -101,11 +103,11 @@ release: gates  ## Full signed + notarized .app + .dmg (gated by test+lint)
 	@$(SCRIPTS)/build-release.sh
 
 .PHONY: release-local
-release-local:  ## Signed .app + .dmg, skip notarization (faster, local-only)
+release-local: gates  ## Signed .app + .dmg, skip notarization (gated, local-only)
 	@$(SCRIPTS)/build-release.sh --no-notarize
 
 .PHONY: release-clean
-release-clean:  ## Clean + full release (longest, most reproducible)
+release-clean: clean gates  ## Clean + full release (gated, most reproducible)
 	@$(SCRIPTS)/build-release.sh --clean
 
 # =========================================================================
