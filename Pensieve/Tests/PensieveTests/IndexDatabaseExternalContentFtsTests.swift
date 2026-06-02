@@ -201,6 +201,39 @@ final class IndexDatabaseExternalContentFtsTests: XCTestCase {
       [refA.url.standardizedFileURL, refB.url.standardizedFileURL])
   }
 
+  // MARK: - (6) Partial-name (infix) search falls back to substring LIKE
+
+  /// FTS5 `unicode61` does token-PREFIX matching, so an infix query ("liczek"
+  /// inside the token "pliczek") yields ZERO FTS hits. The search must then fall
+  /// through to the substring LIKE scan and still find the file by partial name.
+  /// Discriminating: the prior code returned the (empty) FTS result set without
+  /// falling back, so the infix queries below would return nothing.
+  func testPartialNameSearchFindsFileViaSubstringFallback() async throws {
+    let base = try makeBase()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let root = base.appendingPathComponent("ws", isDirectory: true).standardizedFileURL
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let databaseURL = base.appendingPathComponent("index.db", isDirectory: false)
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open()
+
+    let ref = try makeDoc(root: root, name: "pliczek.md", body: "some unrelated body text")
+    await database.upsertWorkspace(
+      identity: makeIdentity(root: root), roots: [root], documents: [ref])
+    let id = ref.url.standardizedFileURL
+
+    // Prefix query already worked via FTS token-prefix.
+    XCTAssertEqual(
+      database.search(query: "pliczek", documents: [ref]).map(\.document.id), [id])
+    // Infix queries (FTS yields nothing) must find the file via the substring fallback.
+    XCTAssertEqual(
+      database.search(query: "liczek", documents: [ref]).map(\.document.id), [id],
+      "an infix query must find the file by partial name (substring fallback)")
+    XCTAssertEqual(
+      database.search(query: "czek", documents: [ref]).map(\.document.id), [id],
+      "a short infix query must find the file by partial name (substring fallback)")
+  }
+
   // MARK: - (3) Ad-hoc stays searchable alongside a scoped workspace
 
   /// An ad-hoc doc indexed via `index(document:body:)` (no workspace) coexists

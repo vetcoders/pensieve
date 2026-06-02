@@ -1371,7 +1371,11 @@ final class IndexDatabase {
             """,
           arguments: matchArgs
         )
-      }) {
+      }), !records.isEmpty {
+        // FTS hit set wins (ranked by bm25). When MATCH yields ZERO rows — e.g. an
+        // infix query like "liczek" against the token "pliczek", which FTS5's
+        // token-prefix matching can't satisfy — fall through to the substring LIKE
+        // scan below so partial-name search still finds the file.
         return records
       }
     }
