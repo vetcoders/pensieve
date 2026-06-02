@@ -33,15 +33,16 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
     return (database, databaseURL, root)
   }
 
-  /// Memberwise identity (matches IndexDatabaseV2WriterTests): canonical_path is
-  /// set to the already-canonical `root`, so it equals the standardized doc path.
+  /// Production identity scheme (`WorkspaceIdentity.make`): the cold-scan
+  /// `documents` writer (`commitWorkspaceManifest`) and the reindex path BOTH
+  /// derive the workspace_id this way, so they converge on the SAME
+  /// `(workspace_id, path)` keys and a documents-write-then-reindex produces no
+  /// duplicate rows. A synthetic workspace_id would diverge from the id reindex
+  /// derives from the ref's root and spuriously double-insert — that mismatch is
+  /// a test artifact, not a production state. canonical_path is the already-
+  /// canonical `root`, so it equals the standardized doc path.
   private func makeIdentity(root: URL) -> WorkspaceIdentity {
-    WorkspaceIdentity(
-      workspaceID: "ws-\(root.lastPathComponent)",
-      canonicalRootURL: root,
-      rootBookmarkHash: "hash-1",
-      volumeResourceID: "vol-1",
-      computedAt: Date(timeIntervalSince1970: 0))
+    WorkspaceIdentity.make(rootURL: root, bookmarkData: nil)
   }
 
   @discardableResult
@@ -62,9 +63,13 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
     let isAdHoc: Bool
   }
 
-  /// Reads the raw FTS rows directly (a second read pool, as the writer tests do
-  /// for `documents`) so we can assert invariants `search()` would hide — most
-  /// importantly duplicate rows, which `performSearch` de-duplicates on read.
+  /// Reads the SEARCHABLE rows directly from the single source of truth
+  /// (`documents` joined to `workspaces`), reconstructing the full-path view the
+  /// retired contentful `workspace_search_documents` table used to expose
+  /// (`canonical_path || '/' || path` for workspace docs, `path` verbatim for
+  /// the reserved `__adhoc__` workspace). STAGE 1 moved body storage out of the
+  /// FTS into `documents` (external content), so this is where a duplicate /
+  /// stale row would now manifest.
   private func fetchSearchIndexRows(at databaseURL: URL) throws -> [SearchIndexRow] {
     let pool = try DatabasePool(path: databaseURL.path)
     defer { try? pool.close() }
@@ -72,8 +77,15 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
       try Row.fetchAll(
         db,
         sql: """
-          SELECT path, title, display_path, body, is_ad_hoc
-          FROM workspace_search_documents
+          SELECT
+              CASE WHEN w.canonical_path = '' THEN d.path
+                   ELSE w.canonical_path || '/' || d.path END AS path,
+              d.title AS title,
+              d.path AS display_path,
+              d.body AS body,
+              d.is_ad_hoc AS is_ad_hoc
+          FROM documents d
+          JOIN workspaces w ON w.workspace_id = d.workspace_id
           ORDER BY path
           """
       ).map { row in
@@ -87,7 +99,8 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
     }
   }
 
-  /// FTS paths that appear more than once — the acceptance no-duplicate probe.
+  /// Reconstructed full paths that appear more than once — the acceptance
+  /// no-duplicate probe, now over `documents` (the FTS source of truth).
   private func fetchDuplicatePaths(at databaseURL: URL) throws -> [String] {
     let pool = try DatabasePool(path: databaseURL.path)
     defer { try? pool.close() }
@@ -95,7 +108,11 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
       try String.fetchAll(
         db,
         sql: """
-          SELECT path FROM workspace_search_documents
+          SELECT
+              CASE WHEN w.canonical_path = '' THEN d.path
+                   ELSE w.canonical_path || '/' || d.path END AS path
+          FROM documents d
+          JOIN workspaces w ON w.workspace_id = d.workspace_id
           GROUP BY path HAVING COUNT(*) > 1
           """)
     }
