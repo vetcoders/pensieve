@@ -1314,6 +1314,99 @@ final class PensieveSmokeTests: XCTestCase {
       "all docs searchable after the guarded full reindex into the fresh index")
   }
 
+  /// SUBAGENT_10 / P1 (silent-failure fix): a cold-open reindex whose FTS write FAILS must NOT
+  /// persist the new `.md` signature. Without the fix the signature is written unconditionally
+  /// right after the `await`, so a relaunch sees signature==current over a stale/partial index and
+  /// the skip-gate silently skips a broken index. With the fix the persist is gated on the write's
+  /// `Bool` result, so the PRIOR signature survives unchanged and the next launch re-attempts a
+  /// full reindex.
+  ///
+  /// Failure is injected DETERMINISTICALLY without fighting a live pool's WAL lock: the FIRST
+  /// launch (real `index.db`) persists the 5-file signature to the substrate cache. The SECOND
+  /// launch points a SEPARATE `IndexDatabase` at a path whose parent is a regular FILE, not a
+  /// directory — so `IndexDatabase.open` cannot create the database (`createDirectory` /
+  /// `DatabasePool` both fail), `ensureOpen` returns nil, and `reindexInBackground` returns `false`
+  /// for EVERY launch deterministically (no SQLite, no chmod, no second connection on the live
+  /// file). The substrate-cache signature is independent of `index.db`, so the persisted 5-file
+  /// signature from launch one is what the assertion inspects after the failed launch two.
+  ///
+  /// This test FAILS against the pre-fix code (which persists the new 6-file signature regardless
+  /// of the write outcome) and PASSES after the fix (prior 5-file signature retained).
+  @MainActor
+  func testColdOpenDoesNotPersistSignatureWhenReindexWriteFails() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigFailTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "fail-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+
+    // ---- First launch: full reindex succeeds → persists the 5-file signature to the substrate.
+    let firstIndexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let firstIndex = IndexDatabase(databaseURL: firstIndexURL, searchIndexBatchSize: 1)
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: firstIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await firstIndex.waitForPendingReindex()
+
+    let persistedAfterFirstLaunch = substrate.store.readSearchSignature(for: identity)
+    XCTAssertEqual(
+      persistedAfterFirstLaunch?.entries.count, 5,
+      "first launch persists a 5-file signature after the successful full reindex")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Between launches the operator adds a 6th file, so the would-be-current signature differs
+    // (6 entries) from the persisted one (5 entries).
+    try "added-after-quit body".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    // ---- Deterministic write-failure injection: a db path whose PARENT is a regular file. Both
+    // `createDirectory` and `DatabasePool(path:)` fail in `open()` → `databasePool` stays nil →
+    // `ensureOpen` returns nil → every write (`reindexInBackground`) returns false.
+    let blockerFile = folder.appendingPathComponent("blocker", isDirectory: false)
+    try Data().write(to: blockerFile)  // a FILE where the second index expects a DIRECTORY
+    let unwritableIndexURL = blockerFile.appendingPathComponent("index.db", isDirectory: false)
+    let secondIndex = IndexDatabase(databaseURL: unwritableIndexURL, searchIndexBatchSize: 1)
+
+    // ---- Second launch: the index cannot open → cold path takes the FULL-reindex branch (no
+    // persisted-index rows visible) and `reindexInBackground` returns false → persist gated.
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: secondIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await secondIndex.waitForPendingReindex()
+
+    // The user-visible error report is preserved (the fix keeps `report(...)`); the failing index
+    // open itself reports an error, so `lastError` is non-nil either way.
+    XCTAssertNotNil(secondState.lastError, "a failed index open/reindex still reports an error")
+
+    // CORE ASSERTION: the persisted signature was NOT advanced to the new 6-file value. It must
+    // still be the prior 5-file signature, proving the failed write did not poison the skip-gate.
+    let persistedAfterFailedWrite = substrate.store.readSearchSignature(for: identity)
+    XCTAssertEqual(
+      persistedAfterFailedWrite, persistedAfterFirstLaunch,
+      "a FAILED reindex must NOT persist the new signature — the prior signature is retained")
+    XCTAssertEqual(
+      persistedAfterFailedWrite?.entries.count, 5,
+      "the persisted signature still maps the original 5 files, not the post-quit 6")
+  }
+
   /// SUBAGENT_08 / Invariant 4: the persisted signature round-trips through Codable and is keyed
   /// by workspace identity (a different root => a different key => nil).
   func testPersistedSignatureRoundTripsAndIsKeyedByIdentity() throws {
@@ -3071,7 +3164,7 @@ final class PensieveSmokeTests: XCTestCase {
     )
 
     let reindexTask = Task {
-      await indexDatabase.reindexInBackground(documents: [newRef], appState: nil)
+      _ = await indexDatabase.reindexInBackground(documents: [newRef], appState: nil)
     }
     await fulfillment(of: [writeStarted], timeout: 1)
 

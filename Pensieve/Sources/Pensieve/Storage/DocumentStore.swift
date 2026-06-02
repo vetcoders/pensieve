@@ -678,6 +678,11 @@ final class FolderManager {
     // reindexes, which is correct, just not optimal).
     let cacheStore = cacheStore
     let persistIdentity = cacheIdentity(rootURLs: roots, appState: appState)
+    // Pre-set the in-memory baseline so the synchronous return contract + the watcher see the
+    // just-applied tree immediately; the Task tails RESET it to the prior baseline if the FTS
+    // write FAILS, so the next in-session edit never diffs against a baseline the index does not
+    // actually reflect (the persisted on-disk signature is likewise gated on success below).
+    let priorBaseline = lastWorkspaceSignature
     if let baseline, let newSignature {
       // Incremental: touch only what changed. The tree already reflects the new set; map the
       // changed paths back to DocumentRefs for the upsert.
@@ -688,9 +693,13 @@ final class FolderManager {
       )
       let upserts = delta.upsertedPaths.compactMap { documentsByPath[$0] }
       let deletingPaths = delta.removed
-      indexUpdateTask = Task { [weak appState] in
-        await indexDatabase.updateSearchIndexInBackground(
+      indexUpdateTask = Task { [weak self, weak appState] in
+        let didWrite = await indexDatabase.updateSearchIndexInBackground(
           upserting: upserts, deletingPaths: deletingPaths, appState: appState)
+        guard didWrite else {
+          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: newSignature)
+          return
+        }
         if let persistIdentity {
           Self.persistSearchSignature(newSignature, for: persistIdentity, using: cacheStore)
         }
@@ -699,8 +708,13 @@ final class FolderManager {
       // Cold open (no baseline) or signature uncertainty (fail open): full reindex, off-main.
       let documents = appState.allDocuments
       let persistSignature = newSignature
-      indexUpdateTask = Task { [weak appState] in
-        await indexDatabase.reindexInBackground(documents: documents, appState: appState)
+      indexUpdateTask = Task { [weak self, weak appState] in
+        let didWrite = await indexDatabase.reindexInBackground(
+          documents: documents, appState: appState)
+        guard didWrite else {
+          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: persistSignature)
+          return
+        }
         if let persistIdentity, let persistSignature {
           Self.persistSearchSignature(persistSignature, for: persistIdentity, using: cacheStore)
         }
@@ -710,6 +724,20 @@ final class FolderManager {
     lastWorkspaceSignature =
       newSignature
       ?? FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
+  }
+
+  /// Restores the in-memory `.md` baseline to `priorBaseline` after a FAILED FTS write, but ONLY
+  /// if no later rebuild has already advanced it past `advancedSignature` (the value this write
+  /// optimistically set). This keeps the in-memory baseline consistent with what the index
+  /// actually reflects: a failed write means the index is stale/empty for the changed set, so the
+  /// next in-session edit must NOT diff against the would-be-current baseline (it would miss the
+  /// files the failed write never wrote). The guard avoids clobbering a newer, successful rebuild
+  /// that landed while this failure was in flight. Runs on the main actor (mutates `self`).
+  private func revertBaselineOnFailedWrite(
+    to priorBaseline: WorkspaceSignature?, ifAdvancedTo advancedSignature: WorkspaceSignature?
+  ) {
+    guard lastWorkspaceSignature == advancedSignature else { return }
+    lastWorkspaceSignature = priorBaseline
   }
 
   /// Precise structured `.md`-tree signature (`standardizedPath -> FileSignature{mtime,size}`)
@@ -796,12 +824,20 @@ final class FolderManager {
     let indexDatabase = indexDatabase
     let identity = cacheIdentity(rootURLs: rootURLs, appState: appState)
     let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
+    // Prior in-memory baseline; the Task tails reset to it if the FTS write fails (see
+    // `revertBaselineOnFailedWrite`). At true cold open this is nil — a failed write then leaves
+    // the baseline nil so the first edit FULL-reindexes (fail open), which is correct.
+    let priorBaseline = lastWorkspaceSignature
 
     guard let identity, let currentSignature else {
       // Multi-root or signature scan failure: full reindex, persist nothing.
       lastWorkspaceSignature = currentSignature
-      return Task { [weak appState] in
-        await indexDatabase.reindexInBackground(documents: documents, appState: appState)
+      return Task { [weak self, weak appState] in
+        let didWrite = await indexDatabase.reindexInBackground(
+          documents: documents, appState: appState)
+        if !didWrite {
+          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
+        }
       }
     }
 
@@ -828,9 +864,13 @@ final class FolderManager {
       let deletingPaths = delta.removed
       let cacheStore = cacheStore
       lastWorkspaceSignature = currentSignature
-      return Task { [weak appState] in
-        await indexDatabase.updateSearchIndexInBackground(
+      return Task { [weak self, weak appState] in
+        let didWrite = await indexDatabase.updateSearchIndexInBackground(
           upserting: upserts, deletingPaths: deletingPaths, appState: appState)
+        guard didWrite else {
+          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
+          return
+        }
         Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
       }
     }
@@ -838,8 +878,13 @@ final class FolderManager {
     // FULL: no persisted signature, or the index is empty/missing for this workspace.
     let cacheStore = cacheStore
     lastWorkspaceSignature = currentSignature
-    return Task { [weak appState] in
-      await indexDatabase.reindexInBackground(documents: documents, appState: appState)
+    return Task { [weak self, weak appState] in
+      let didWrite = await indexDatabase.reindexInBackground(
+        documents: documents, appState: appState)
+      guard didWrite else {
+        self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
+        return
+      }
       Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
     }
   }

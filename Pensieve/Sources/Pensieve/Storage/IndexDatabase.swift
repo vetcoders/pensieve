@@ -296,13 +296,22 @@ final class IndexDatabase {
     reindex(documents: documents, pool: pool, appState: appState)
   }
 
-  func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+  /// Returns `true` when the off-main FTS write committed, `false` when it threw (the error is
+  /// still reported to the user via `report(...)`). Callers gate the on-disk `.md` search
+  /// signature persist on this result so a FAILED write never leaves a signature claiming the
+  /// index is current — which would make the next cold-start skip-gate silently skip over a
+  /// stale/partial index. The result is discardable for callers that do not persist a signature.
+  ///
+  /// The `pendingIndexUpdateTask` chain returns `Void` (its supersede contract is unchanged); the
+  /// success flag is observed by awaiting the dedicated `write` task this call owns.
+  @discardableResult
+  func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
+    guard let pool = ensureOpen(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
     let previous = pendingIndexUpdateTask
 
-    let task = Task { [weak self] in
+    let write = Task { [weak self] () -> Bool in
       await previous?.value
       do {
         try await Task.detached(priority: .utility) {
@@ -314,12 +323,16 @@ final class IndexDatabase {
           )
         }.value
         self?.refreshSearchResults(in: appState)
+        return true
       } catch {
         self?.report(error, appState: appState, action: "rebuild Pensieve search index")
+        return false
       }
     }
-    pendingIndexUpdateTask = task
-    await task.value
+    // Keep the supersede chain `Void`-typed: a later update awaits "the prior write finished",
+    // not its boolean result.
+    pendingIndexUpdateTask = Task { _ = await write.value }
+    return await write.value
   }
 
   private func reindex(documents: [DocumentRef], pool: DatabasePool, appState: AppState?) {
@@ -389,17 +402,23 @@ final class IndexDatabase {
   /// guarantees a stale delta cannot land AFTER a newer one. Because the apply
   /// runs in one transaction, a cancelled/failed update either commits wholly or
   /// not at all — it can never leave the FTS index half-written.
+  ///
+  /// Returns `true` when the off-main delta write committed, `false` when it threw (still
+  /// reported). Mirrors `reindexInBackground`: callers persist the on-disk `.md` signature ONLY on
+  /// `true`, so a failed delta never advances the persisted cross-launch baseline. Discardable for
+  /// non-persisting callers.
+  @discardableResult
   func updateSearchIndexInBackground(
     upserting documents: [DocumentRef],
     deletingPaths: [String],
     appState: AppState? = nil
-  ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+  ) async -> Bool {
+    guard let pool = ensureOpen(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
     let previous = pendingIndexUpdateTask
 
-    let task = Task { [weak self] in
+    let write = Task { [weak self] () -> Bool in
       await previous?.value
       do {
         try await Task.detached(priority: .utility) {
@@ -412,12 +431,15 @@ final class IndexDatabase {
           )
         }.value
         self?.refreshSearchResults(in: appState)
+        return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")
+        return false
       }
     }
-    pendingIndexUpdateTask = task
-    await task.value
+    // Supersede chain stays `Void`-typed (see `reindexInBackground`).
+    pendingIndexUpdateTask = Task { _ = await write.value }
+    return await write.value
   }
 
   /// Cheap content guard for the cold-open skip decision: how many FTS rows are already indexed
