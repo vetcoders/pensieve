@@ -352,9 +352,15 @@ final class FolderManager {
     }
 
     coldRebuildWorkspace(scans: scans, into: appState)
+    // Hand the manifest commit the fingerprint derived from THIS walk so it does not re-walk.
+    let coldFingerprint =
+      rootURLs.count == 1
+      ? try? TreeFingerprint.compute(from: scans, root: rootURLs[0].standardizedFileURL)
+      : nil
     _ = commitWorkspaceManifest(
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
+      precomputedFingerprint: coldFingerprint,
       into: appState
     )
     selectRestoredDocument(previousSelection: previousSelection, into: appState)
@@ -522,6 +528,7 @@ final class FolderManager {
       let workspaceIndexWriteTask = self.commitWorkspaceManifest(
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
+        precomputedFingerprint: coldStartFingerprint,
         into: appState
       )
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
@@ -903,7 +910,9 @@ final class FolderManager {
   }
 
   private func commitWorkspaceManifest(
-    rootURLs: [URL], exclusions: Set<String>, into appState: AppState
+    rootURLs: [URL], exclusions: Set<String>,
+    precomputedFingerprint: TreeFingerprint? = nil,
+    into appState: AppState
   ) -> Task<Void, Never>? {
     guard rootURLs.count == 1 else { return nil }
     let startedAt = Date()
@@ -912,7 +921,14 @@ final class FolderManager {
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
     do {
-      let fingerprint = try TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
+      // Reuse the fingerprint the single cold-open walk already produced instead of walking the
+      // tree a SECOND time. `compute(from:scans:root:)` is byte-for-byte identical to
+      // `compute(rootURL:exclusions:)` for the same tree, so the persisted manifest/fingerprint
+      // are unchanged (no STAB-R01 regression — the scanner still owns the only walk). Falls back
+      // to a fresh walk only when no precomputed fingerprint is supplied (defensive).
+      let fingerprint =
+        try precomputedFingerprint
+        ?? TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
       let manifest = try workspaceSubstrate.commit(
         identity: identity,
         roots: rootURLs,

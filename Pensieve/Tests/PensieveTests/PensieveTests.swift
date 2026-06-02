@@ -1,4 +1,5 @@
 import AppKit
+import GRDB
 import SwiftUI
 import XCTest
 
@@ -1242,6 +1243,188 @@ final class PensieveSmokeTests: XCTestCase {
       indexDatabase.search(query: "added-token", documents: refs)
         .map(\.document.url.lastPathComponent),
       ["note-added.md"], "the added file is searchable")
+  }
+
+  // MARK: - Stage 2: cheap file add / remove (no full-workspace re-commit / FTS storm)
+
+  /// STAGE 2 / file-add cheapness: a cold open that finds ONE extra `.md` since the last launch
+  /// must upsert ONLY that one `documents` row — never re-commit all N. A redundant
+  /// `ON CONFLICT DO UPDATE` on an unchanged row both bumps its `indexed_at` AND fires the
+  /// `documents` AU trigger that re-tokenizes the whole external-content FTS (the "Indexing N"
+  /// storm). We snapshot each row's `indexed_at` before and after the second open, with a >1s
+  /// real-time gap so a re-upsert lands a STRICTLY greater whole-second timestamp and is therefore
+  /// observable. DISCRIMINATING: the prior full-recommit re-upserted every pre-existing row (all
+  /// five `indexed_at` advance); the incremental upsert leaves all five untouched.
+  @MainActor
+  func testColdOpenFileAddUpsertsOnlyAddedDocumentNotEntireWorkspace() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveS2AddTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "addcheap body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase (one pool) across both opens; the cross-launch survivor is the PERSISTED
+    // `.md` signature read via the shared substrate cache.
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    // First launch: full reindex of all five + persists signature + documents rows.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    // Background open serializes the manifest commit (`upsertWorkspace`) + stats writes inside the
+    // build task, so awaiting it leaves the index quiescent for the raw-DB read below.
+    firstManager.openInBackground(url: folder, into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit + stop the watcher
+
+    let before = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertEqual(before.count, 5, "five documents rows after the first full index")
+
+    // Force a STRICTLY greater whole-second timestamp for any second-open write, so a re-upsert of
+    // an unchanged row is detectable (`indexed_at` is whole-second `Int(Date()...)`).
+    try await Task.sleep(nanoseconds: 1_100_000_000)
+
+    // Operator adds ONE file between launches.
+    try "addcheap brandnew added file".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.openInBackground(url: folder, into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+
+    let after = try readDocumentsIndexedAt(at: indexURL)
+    let rewrittenOriginals = (0..<5)
+      .map { "note-\($0).md" }
+      .filter { after[$0] != before[$0] }
+    XCTAssertEqual(
+      rewrittenOriginals, [],
+      "a file add upserts ONLY the added row — no pre-existing row is re-written (the prior "
+        + "full-recommit re-upserted all five and re-synced the whole FTS)")
+    XCTAssertNotNil(after["note-added.md"], "the added file is indexed")
+
+    // FTS reflects the change AND every original stays searchable (originals were tokenized on the
+    // first launch and never re-tokenized; the added file was tokenized incrementally).
+    let refs = secondState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "brandnew", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-added.md"], "the added file is searchable")
+    XCTAssertEqual(
+      indexDatabase.search(query: "addcheap", documents: refs).count, 6,
+      "originals + added all remain searchable")
+  }
+
+  /// STAGE 2 / file-remove cheapness: a cold open that finds ONE fewer `.md` must tombstone ONLY
+  /// the removed row and leave every remaining row untouched. DISCRIMINATING: the prior
+  /// full-recommit re-upserted all surviving rows (their `indexed_at` advances); the incremental
+  /// path writes none of them.
+  @MainActor
+  func testColdOpenFileRemoveTombstonesOnlyRemovedDocumentNotReupsertingRest() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveS2RemoveTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      let unique = index == 2 ? " vanishtoken" : ""
+      try "tombcheap body \(index)\(unique)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.openInBackground(url: folder, into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)
+
+    let before = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertEqual(before.count, 5, "five documents rows after the first full index")
+
+    try await Task.sleep(nanoseconds: 1_100_000_000)
+
+    // Operator removes ONE file between launches.
+    try FileManager.default.removeItem(at: folder.appendingPathComponent("note-2.md"))
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.openInBackground(url: folder, into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+
+    let after = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertNil(after["note-2.md"], "the removed file's documents row is tombstoned")
+    XCTAssertEqual(after.count, 4, "exactly the four surviving rows remain")
+    let rewrittenSurvivors = [0, 1, 3, 4]
+      .map { "note-\($0).md" }
+      .filter { after[$0] != before[$0] }
+    XCTAssertEqual(
+      rewrittenSurvivors, [],
+      "a file remove tombstones ONLY the removed row — no surviving row is re-written (the prior "
+        + "full-recommit re-upserted all four)")
+
+    let refs = secondState.allDocuments
+    XCTAssertTrue(
+      indexDatabase.search(query: "vanishtoken", documents: refs).isEmpty,
+      "the removed file's content is gone from the FTS")
+    XCTAssertEqual(
+      indexDatabase.search(query: "tombcheap", documents: refs).count, 4,
+      "the four surviving docs remain searchable")
+  }
+
+  /// Reads `path -> indexed_at` for every `documents` row via a separate read-only connection
+  /// (safe in WAL while the IndexDatabase pool is open — same pattern as the other DB-inspecting
+  /// suites).
+  private func readDocumentsIndexedAt(at databaseURL: URL) throws -> [String: Int] {
+    let queue = try DatabaseQueue(path: databaseURL.path)
+    defer { try? queue.close() }
+    return try queue.read { db in
+      var result: [String: Int] = [:]
+      for row in try Row.fetchAll(db, sql: "SELECT path, indexed_at FROM documents") {
+        result[row["path"]] = row["indexed_at"]
+      }
+      return result
+    }
   }
 
   /// SUBAGENT_08 / Invariant 3 + empty-index guard: a cold open with NO persisted signature does

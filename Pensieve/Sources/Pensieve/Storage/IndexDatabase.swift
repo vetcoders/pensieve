@@ -1133,10 +1133,17 @@ final class IndexDatabase {
     let timestamp = Int(indexedAt.timeIntervalSince1970)
     var changedInBatch = 0
     for record in records {
-      // Count only rows this write actually (re)indexes: a new row, or one whose
-      // indexed content (title/body/mtime/size) changed. An unchanged re-upsert
-      // is a no-op for the FTS index and is not counted.
+      // INCREMENTAL: only (re)write a row whose indexed content (title/body/mtime/
+      // size) is new or changed. An unchanged re-upsert is not just a no-op for the
+      // content — its `ON CONFLICT DO UPDATE` still fires the `documents` AU trigger,
+      // which deletes + reinserts the row's entry in the external-content
+      // `document_fts`. Re-committing all N documents on a cold open therefore
+      // re-tokenizes the WHOLE workspace even when a single file changed — the
+      // "Indexing N" reindex storm. Skipping the matching rows means only the
+      // genuinely added/modified file fires a trigger, so a file add/remove is cheap.
+      // Removed paths are tombstoned by the caller's `tombstoneDocumentsNotIn`.
       let changed = try !workspaceDocumentMatches(record, workspaceID: workspaceID, in: db)
+      guard changed else { continue }
       try db.execute(
         sql: """
           INSERT INTO documents
@@ -1161,12 +1168,10 @@ final class IndexDatabase {
           timestamp,
         ]
       )
-      if changed {
-        changedInBatch += 1
-        if changedInBatch == batchSize {
-          didInsertBatch?(changedInBatch)
-          changedInBatch = 0
-        }
+      changedInBatch += 1
+      if changedInBatch == batchSize {
+        didInsertBatch?(changedInBatch)
+        changedInBatch = 0
       }
     }
     if changedInBatch > 0 {
