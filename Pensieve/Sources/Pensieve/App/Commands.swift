@@ -32,6 +32,12 @@ struct PensieveCommands: Commands {
       }
       .keyboardShortcut("o", modifiers: [.command, .shift])
 
+      Button("New Folder") {
+        createFolder()
+      }
+      .keyboardShortcut("n", modifiers: [.command, .shift])
+      .disabled(defaultNewFileDirectory() == nil)
+
       Divider()
 
       Button("Exclude from Workspace…") {
@@ -63,6 +69,26 @@ struct PensieveCommands: Commands {
       }
       .keyboardShortcut("s", modifiers: [.command, .shift])
       .disabled(!appState.documentSession.hasEditableBuffer)
+
+      Divider()
+
+      Button("Rename") {
+        requestSidebarRename()
+      }
+      .keyboardShortcut(.return, modifiers: [])
+      .disabled(sidebarActionTargetURL == nil)
+
+      Button("Duplicate") {
+        duplicateSidebarTarget()
+      }
+      .keyboardShortcut("d", modifiers: [.command])
+      .disabled(sidebarActionTargetURL == nil)
+
+      Button("Move to Trash") {
+        moveSidebarTargetToTrash()
+      }
+      .keyboardShortcut(.delete, modifiers: [.command])
+      .disabled(sidebarActionTargetURL == nil)
     }
 
     CommandGroup(replacing: .appTermination) {
@@ -83,6 +109,39 @@ struct PensieveCommands: Commands {
       }
       .keyboardShortcut("w", modifiers: [.command])
       .disabled(!appState.documentSession.hasEditableBuffer)
+    }
+
+    // Edit menu — Find & Replace routes into Pensieve's own squared find bar.
+    // The text field remains native NSSearchField, but NSTextFinder's system
+    // bar is intentionally bypassed so the layout belongs to the app surface.
+    CommandGroup(after: .textEditing) {
+      Divider()
+
+      Button("Find…") {
+        showFindBar(replace: false)
+      }
+      .keyboardShortcut("f", modifiers: [.command])
+
+      Button("Find and Replace…") {
+        showFindBar(replace: true)
+      }
+      .keyboardShortcut("f", modifiers: [.command, .option])
+
+      Button("Find Next") {
+        appState.pendingFindCommand = FindBarCommand(action: .next)
+      }
+      .keyboardShortcut("g", modifiers: [.command])
+
+      Button("Find Previous") {
+        appState.pendingFindCommand = FindBarCommand(action: .previous)
+      }
+      .keyboardShortcut("g", modifiers: [.command, .shift])
+
+      Button("Use Selection for Find") {
+        showFindBar(replace: false)
+        appState.pendingFindCommand = FindBarCommand(action: .useSelection)
+      }
+      .keyboardShortcut("e", modifiers: [.command])
     }
 
     // Mode menu - editor modes and reading preferences
@@ -118,6 +177,19 @@ struct PensieveCommands: Commands {
         appState.previewAutoReload.toggle()
       }
       .keyboardShortcut("r", modifiers: [.command, .shift])
+    }
+
+    // Tab navigation (Quick Win)
+    CommandGroup(after: .windowArrangement) {
+      Button("Show Next Tab") {
+        controller.selectNextTab()
+      }
+      .keyboardShortcut("]", modifiers: [.command, .shift])
+
+      Button("Show Previous Tab") {
+        controller.selectPreviousTab()
+      }
+      .keyboardShortcut("[", modifiers: [.command, .shift])
     }
 
     // Format menu — Markdown formatting and font sizing
@@ -251,6 +323,35 @@ struct PensieveCommands: Commands {
     }
   }
 
+  private func createFolder() {
+    guard let directory = defaultNewFileDirectory() else { return }
+    controller.createFolder(url: directory.appendingPathComponent("New Folder"))
+  }
+
+  private func requestSidebarRename() {
+    guard let url = sidebarActionTargetURL else { return }
+    appState.pendingSidebarRenameURL = url.standardizedFileURL
+  }
+
+  private func duplicateSidebarTarget() {
+    guard let url = sidebarActionTargetURL else { return }
+    controller.duplicateItem(url: url)
+  }
+
+  private func moveSidebarTargetToTrash() {
+    guard let url = sidebarActionTargetURL else { return }
+    if isDirectory(url) {
+      let alert = NSAlert()
+      alert.messageText = "Move \(url.lastPathComponent) to Trash?"
+      alert.informativeText = "This folder and its contents will move to the system Trash."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Move to Trash")
+      alert.addButton(withTitle: "Cancel")
+      guard alert.runModal() == .alertFirstButtonReturn else { return }
+    }
+    controller.moveItemToTrash(url: url)
+  }
+
   private func excludeFromWorkspace() {
     let panel = NSOpenPanel()
     panel.canChooseFiles = true
@@ -270,7 +371,25 @@ struct PensieveCommands: Commands {
     ].compactMap { $0 }
   }
 
+  private var sidebarActionTargetURL: URL? {
+    appState.sidebarFocusedURL
+      ?? appState.documentSession.url
+      ?? appState.selectedDocumentID
+  }
+
+  private func isDirectory(_ url: URL) -> Bool {
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+      && isDirectory.boolValue
+  }
+
   private func defaultNewFileDirectory() -> URL? {
+    if let focusedURL = appState.sidebarFocusedURL {
+      if isDirectory(focusedURL) {
+        return focusedURL
+      }
+      return focusedURL.deletingLastPathComponent()
+    }
     if let activeURL = appState.documentSession.url {
       return activeURL.deletingLastPathComponent()
     }
@@ -303,6 +422,12 @@ struct PensieveCommands: Commands {
     }
 
     return candidate
+  }
+
+  private func showFindBar(replace: Bool) {
+    appState.findReplaceMode = replace
+    appState.findBarVisible = true
+    appState.findFocusToken &+= 1
   }
 
   private func showAboutPanel() {

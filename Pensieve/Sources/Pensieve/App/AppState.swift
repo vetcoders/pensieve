@@ -19,11 +19,46 @@ enum EditorMode: Int, CaseIterable, Identifiable {
   }
 }
 
+enum SidebarSortOrder: String, CaseIterable, Identifiable {
+  case manual
+  case nameAscending
+  case nameDescending
+  case modifiedNewest
+  case type
+
+  var id: String { rawValue }
+
+  var label: String {
+    switch self {
+    case .manual: return "Manual"
+    case .nameAscending: return "Name A-Z"
+    case .nameDescending: return "Name Z-A"
+    case .modifiedNewest: return "Modified"
+    case .type: return "Type"
+    }
+  }
+}
+
+struct FindBarCommand: Equatable, Identifiable {
+  enum Action: Equatable {
+    case next
+    case previous
+    case replace
+    case replaceAll
+    case useSelection
+    case clear
+  }
+
+  let id = UUID()
+  let action: Action
+}
+
 @MainActor
 final class AppState: ObservableObject {
   private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
   private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
+  private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
   private let defaults: UserDefaults
 
   // Workspace + document selection
@@ -41,6 +76,13 @@ final class AppState: ObservableObject {
   @Published var selectedDocumentID: DocumentRef.ID?
   @Published var workspaceSearchQuery: String = ""
   @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
+  @Published var sidebarFocusedURL: URL?
+  @Published var pendingSidebarRenameURL: URL?
+  @Published var sidebarSortOrder: SidebarSortOrder {
+    didSet {
+      defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
+    }
+  }
 
   // Active document
   @Published var documentSession: DocumentSession = .empty
@@ -83,6 +125,12 @@ final class AppState: ObservableObject {
   @Published var fontSize: CGFloat = 14
   @Published var richMarkdownEnabled: Bool = true
   @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
+  @Published var findBarVisible: Bool = false
+  @Published var findReplaceMode: Bool = false
+  @Published var findQuery: String = ""
+  @Published var findReplaceQuery: String = ""
+  @Published var findFocusToken: Int = 0
+  @Published var pendingFindCommand: FindBarCommand?
   @Published var tableTidyOnPaste: Bool {
     didSet {
       defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)
@@ -130,6 +178,13 @@ final class AppState: ObservableObject {
     } else {
       self.asciiSafeTables = defaults.bool(forKey: Self.asciiSafeTablesKey)
     }
+    if let rawSort = defaults.string(forKey: Self.sidebarSortOrderKey),
+      let sortOrder = SidebarSortOrder(rawValue: rawSort)
+    {
+      self.sidebarSortOrder = sortOrder
+    } else {
+      self.sidebarSortOrder = .nameAscending
+    }
   }
 
   var selectedDocument: DocumentRef? {
@@ -162,6 +217,14 @@ final class AppState: ObservableObject {
     }
     allDocuments = result
     allDocumentsByID = byID
+  }
+
+  var sortedOpenFiles: [DocumentRef] {
+    sortDocuments(openFiles)
+  }
+
+  var sortedWorkspaceTree: [WorkspaceNode] {
+    sortNodes(workspaceTree)
   }
 
   var hasWorkspaceContent: Bool {
@@ -226,6 +289,57 @@ final class AppState: ObservableObject {
   func pruneDocumentTabs() {
     let liveIDs = Set(allDocuments.map { $0.id.standardizedFileURL })
     documentTabs.removeAll { !liveIDs.contains($0.id.standardizedFileURL) }
+  }
+
+  private func sortDocuments(_ documents: [DocumentRef]) -> [DocumentRef] {
+    guard sidebarSortOrder != .manual else { return documents }
+    return documents.sorted { lhs, rhs in
+      compareURLs(lhs.url, rhs.url, lhsTitle: lhs.title, rhsTitle: rhs.title)
+    }
+  }
+
+  private func sortNodes(_ nodes: [WorkspaceNode]) -> [WorkspaceNode] {
+    guard sidebarSortOrder != .manual else { return nodes }
+
+    let sortedChildren =
+      nodes
+      .map { node in
+        var copy = node
+        copy.children = node.children.map(sortNodes)
+        return copy
+      }
+    return sortedChildren.sorted { lhs, rhs in
+      compareWorkspaceNodes(lhs, rhs)
+    }
+  }
+
+  private func compareWorkspaceNodes(_ lhs: WorkspaceNode, _ rhs: WorkspaceNode) -> Bool {
+    if lhs.kind != rhs.kind {
+      return lhs.kind == .folder
+    }
+    return compareURLs(lhs.url, rhs.url, lhsTitle: lhs.name, rhsTitle: rhs.name)
+  }
+
+  private func compareURLs(_ lhs: URL?, _ rhs: URL?, lhsTitle: String, rhsTitle: String) -> Bool {
+    switch sidebarSortOrder {
+    case .manual:
+      return false
+    case .nameAscending, .type:
+      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedAscending
+    case .nameDescending:
+      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedDescending
+    case .modifiedNewest:
+      let lhsDate = lhs.flatMap(Self.modifiedDate) ?? .distantPast
+      let rhsDate = rhs.flatMap(Self.modifiedDate) ?? .distantPast
+      if lhsDate != rhsDate {
+        return lhsDate > rhsDate
+      }
+      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedAscending
+    }
+  }
+
+  private static func modifiedDate(for url: URL) -> Date? {
+    try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
   }
 }
 

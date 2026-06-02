@@ -363,6 +363,46 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testWorkspaceSortKeepsFoldersBeforeFilesInNameModes() {
+    let appState = AppState()
+    appState.workspaceTree = [
+      WorkspaceNode(
+        id: "file-alpha",
+        name: "Alpha.md",
+        kind: .document,
+        url: URL(fileURLWithPath: "/tmp/Alpha.md")
+      ),
+      WorkspaceNode(
+        id: "folder-zulu",
+        name: "Zulu",
+        kind: .folder,
+        url: URL(fileURLWithPath: "/tmp/Zulu"),
+        children: []
+      ),
+    ]
+
+    appState.sidebarSortOrder = .nameAscending
+    XCTAssertEqual(appState.sortedWorkspaceTree.map(\.id), ["folder-zulu", "file-alpha"])
+
+    appState.sidebarSortOrder = .nameDescending
+    XCTAssertEqual(appState.sortedWorkspaceTree.map(\.id), ["folder-zulu", "file-alpha"])
+  }
+
+  @MainActor
+  func testSidebarSortOrderPersistsToDefaults() {
+    let suiteName = "PensieveSidebarSortTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let appState = AppState(defaults: defaults)
+    appState.sidebarSortOrder = .nameDescending
+
+    XCTAssertEqual(AppState(defaults: defaults).sidebarSortOrder, .nameDescending)
+  }
+
+  @MainActor
   func testPreviewAutoReloadOffGatesTypingUpdatesFromPipeline() {
     let themeManager = ThemeManager()
     let coordinator = PreviewRepresentable.Coordinator(themeManager: themeManager)
@@ -423,16 +463,24 @@ final class PensieveSmokeTests: XCTestCase {
     var boundText = "before"
     var isDirty = false
     var didRouteDocumentChange = false
+    var findQuery = ""
+    var findReplacement = ""
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,
+      findQuery: Binding(get: { findQuery }, set: { findQuery = $0 }),
+      findReplacement: Binding(get: { findReplacement }, set: { findReplacement = $0 }),
+      findBarVisible: false,
+      findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
+      },
+      onCloseFindBar: {
       }
     )
     let coordinator = representable.makeCoordinator()
@@ -2864,6 +2912,26 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
     XCTAssertEqual(appState.activeDocumentText, "")
     XCTAssertFalse(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testControllerCreatesDistinctUntitledTitlesForFreshCommandN() {
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: DocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory))
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled 2.md")
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled 3.md")
   }
 
   @MainActor

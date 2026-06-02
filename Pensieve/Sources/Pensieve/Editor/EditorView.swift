@@ -7,8 +7,8 @@ struct EditorView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      MarkdownFormattingToolbelt { format in
-        controller.applyMarkdownFormat(format)
+      if appState.findBarVisible {
+        FindBar()
       }
 
       EditorRepresentable(
@@ -16,10 +16,15 @@ struct EditorView: View {
         fontSize: appState.fontSize,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
+        findQuery: $appState.findQuery,
+        findReplacement: $appState.findReplaceQuery,
+        findBarVisible: appState.findBarVisible,
+        findCommand: appState.pendingFindCommand,
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
         isDirty: documentDirty,
-        onDocumentChanged: controller.documentDidChange
+        onDocumentChanged: controller.documentDidChange,
+        onCloseFindBar: closeFindBar
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -39,33 +44,10 @@ struct EditorView: View {
       set: { appState.documentSession.isDirty = $0 }
     )
   }
-}
 
-struct MarkdownFormattingToolbelt: View {
-  let apply: (MarkdownFormat) -> Void
-
-  var body: some View {
-    ScrollView(.horizontal, showsIndicators: false) {
-      HStack(spacing: 4) {
-        ForEach(MarkdownFormat.allCases) { format in
-          Button {
-            apply(format)
-          } label: {
-            Image(systemName: format.systemImageName)
-              .frame(width: 22, height: 22)
-          }
-          .buttonStyle(.borderless)
-          .help(format.label)
-        }
-      }
-      .padding(.horizontal, 8)
-      .padding(.vertical, 4)
-    }
-    .frame(height: 32)
-    .background(Color(NSColor.controlBackgroundColor))
-    .overlay(alignment: .bottom) {
-      Divider()
-    }
+  private func closeFindBar() {
+    appState.findBarVisible = false
+    appState.pendingFindCommand = FindBarCommand(action: .clear)
   }
 }
 
@@ -76,10 +58,15 @@ struct EditorRepresentable: NSViewRepresentable {
   let fontSize: CGFloat
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
+  @Binding var findQuery: String
+  @Binding var findReplacement: String
+  let findBarVisible: Bool
+  let findCommand: FindBarCommand?
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
+  let onCloseFindBar: @MainActor () -> Void
 
   func makeNSView(context: Context) -> NSScrollView {
     let surface = MarkdownEditorSurface(
@@ -94,6 +81,9 @@ struct EditorRepresentable: NSViewRepresentable {
       self.isDirty = true
       self.onDocumentChanged()
     }
+    surface.onCloseFindBar = {
+      self.onCloseFindBar()
+    }
     context.coordinator.surface = surface
     return surface.scrollView
   }
@@ -105,9 +95,19 @@ struct EditorRepresentable: NSViewRepresentable {
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
-      asciiSafeTables: asciiSafeTables
+      asciiSafeTables: asciiSafeTables,
+      findQuery: findQuery,
+      findBarVisible: findBarVisible
     )
     context.coordinator.apply(formattingCommand, to: surface)
+    if let selectedText = context.coordinator.applyFind(
+      findCommand,
+      to: surface,
+      query: findQuery,
+      replacement: findReplacement
+    ) {
+      findQuery = selectedText
+    }
   }
 
   func makeCoordinator() -> Coordinator {
@@ -117,12 +117,45 @@ struct EditorRepresentable: NSViewRepresentable {
   final class Coordinator {
     var surface: MarkdownEditorSurface?
     private var lastAppliedFormattingCommandID: UUID?
+    private var lastAppliedFindCommandID: UUID?
 
     func apply(_ command: MarkdownFormatCommand?, to surface: MarkdownEditorSurface) {
       guard let command else { return }
       guard command.id != lastAppliedFormattingCommandID else { return }
       lastAppliedFormattingCommandID = command.id
       surface.applyMarkdownCommand(command)
+    }
+
+    func applyFind(
+      _ command: FindBarCommand?,
+      to surface: MarkdownEditorSurface,
+      query: String,
+      replacement: String
+    ) -> String? {
+      guard let command else { return nil }
+      guard command.id != lastAppliedFindCommandID else { return nil }
+      lastAppliedFindCommandID = command.id
+
+      switch command.action {
+      case .next:
+        surface.selectFindMatch(direction: .forward)
+      case .previous:
+        surface.selectFindMatch(direction: .backward)
+      case .replace:
+        surface.replaceCurrentFindMatch(query: query, replacement: replacement)
+      case .replaceAll:
+        surface.replaceAllFindMatches(query: query, replacement: replacement)
+      case .useSelection:
+        let selectedText = surface.selectedTextForFind()
+        if !selectedText.isEmpty {
+          surface.updateFind(query: selectedText, visible: true)
+          surface.selectFindMatch(direction: .forward)
+          return selectedText
+        }
+      case .clear:
+        surface.clearFindHighlights()
+      }
+      return nil
     }
   }
 }
@@ -136,7 +169,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   let textContainer: NSTextContainer
 
   var onTextChanged: ((String) -> Void)?
+  var onCloseFindBar: (() -> Void)?
   var isApplyingExternalText = false
+  private var findQuery = ""
+  private var findMatches: [NSRange] = []
+  private var activeFindMatchIndex: Int?
+  private var isFindBarVisible = false
 
   init(
     text: String,
@@ -186,6 +224,15 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     super.init()
 
     textView.delegate = self
+    textView.onFormatRequest = { [weak self] format in
+      _ = self?.applyMarkdownFormat(format)
+    }
+    textView.onEscape = { [weak self] in
+      guard self?.isFindBarVisible == true else { return false }
+      self?.clearFindHighlights()
+      self?.onCloseFindBar?()
+      return true
+    }
     update(
       text: text,
       fontSize: fontSize,
@@ -200,7 +247,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool,
     tableTidyOnPaste: Bool = true,
-    asciiSafeTables: Bool = false
+    asciiSafeTables: Bool = false,
+    findQuery: String = "",
+    findBarVisible: Bool = false
   ) {
     textView.tableTidyOnPaste = tableTidyOnPaste
     textView.asciiSafeTables = asciiSafeTables
@@ -227,6 +276,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       textContentStorage.refreshHighlighting()
       isApplyingExternalText = false
     }
+
+    updateFind(query: findQuery, visible: findBarVisible)
   }
 
   func textDidChange(_ notification: Notification) {
@@ -234,6 +285,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
     onTextChanged?(textStorage.string)
+    refreshFindMatches()
+  }
+
+  func textViewDidChangeSelection(_ notification: Notification) {
+    guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
+    else { return }
+    if textView.selectedRange().length > 0 {
+      textView.showFormattingPopover()
+    } else {
+      textView.hideFormattingPopover()
+    }
   }
 
   @discardableResult
@@ -251,6 +313,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.setSelectedRange(
       NSRange(location: range.location, length: (replacement as NSString).length))
     textView.didChangeText()
+    textView.hideFormattingPopover()
     return true
   }
 
@@ -287,5 +350,166 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       NSRange(location: range.location, length: (replacement as NSString).length))
     textView.didChangeText()
     return true
+  }
+
+  enum FindDirection {
+    case forward
+    case backward
+  }
+
+  func updateFind(query: String, visible: Bool) {
+    isFindBarVisible = visible
+    guard visible, !query.isEmpty else {
+      findQuery = ""
+      clearFindHighlights()
+      return
+    }
+
+    guard query != findQuery || findMatches.isEmpty else {
+      applyFindHighlights()
+      return
+    }
+
+    findQuery = query
+    refreshFindMatches()
+  }
+
+  func clearFindHighlights() {
+    removeFindHighlights()
+    findMatches = []
+    activeFindMatchIndex = nil
+  }
+
+  func selectFindMatch(direction: FindDirection) {
+    guard !findQuery.isEmpty else { return }
+    if findMatches.isEmpty {
+      refreshFindMatches()
+    }
+    guard !findMatches.isEmpty else { return }
+
+    let selectedLocation = textView.selectedRange().location
+    let nextIndex: Int
+    switch direction {
+    case .forward:
+      if let activeFindMatchIndex {
+        nextIndex = (activeFindMatchIndex + 1) % findMatches.count
+      } else {
+        nextIndex =
+          findMatches.firstIndex { $0.location >= selectedLocation }
+          ?? 0
+      }
+    case .backward:
+      if let activeFindMatchIndex {
+        nextIndex = (activeFindMatchIndex - 1 + findMatches.count) % findMatches.count
+      } else {
+        nextIndex =
+          findMatches.lastIndex { $0.location < selectedLocation }
+          ?? (findMatches.count - 1)
+      }
+    }
+
+    activeFindMatchIndex = nextIndex
+    let range = findMatches[nextIndex]
+    textView.setSelectedRange(range)
+    textView.scrollRangeToVisible(range)
+    applyFindHighlights()
+  }
+
+  func replaceCurrentFindMatch(query: String, replacement: String) {
+    updateFind(query: query, visible: true)
+    if activeFindMatchIndex == nil {
+      selectFindMatch(direction: .forward)
+    }
+    guard let activeFindMatchIndex, findMatches.indices.contains(activeFindMatchIndex) else {
+      return
+    }
+
+    let range = findMatches[activeFindMatchIndex]
+    guard textView.shouldChangeText(in: range, replacementString: replacement) else { return }
+    removeFindHighlights()
+    textStorage.replaceCharacters(in: range, with: replacement)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(
+      NSRange(location: range.location, length: (replacement as NSString).length))
+    textView.didChangeText()
+    refreshFindMatches()
+    selectFindMatch(direction: .forward)
+  }
+
+  func replaceAllFindMatches(query: String, replacement: String) {
+    updateFind(query: query, visible: true)
+    guard !findMatches.isEmpty else { return }
+
+    let fullRange = NSRange(location: 0, length: (textStorage.string as NSString).length)
+    let mutable = NSMutableString(string: textStorage.string)
+    var replaced = false
+    for range in findMatches.reversed() {
+      mutable.replaceCharacters(in: range, with: replacement)
+      replaced = true
+    }
+    guard replaced else { return }
+    let newText = mutable as String
+    guard textView.shouldChangeText(in: fullRange, replacementString: newText) else { return }
+    removeFindHighlights()
+    textStorage.replaceCharacters(in: fullRange, with: newText)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(NSRange(location: 0, length: 0))
+    textView.didChangeText()
+    refreshFindMatches()
+  }
+
+  func selectedTextForFind() -> String {
+    let range = textView.selectedRange()
+    guard range.length > 0, NSMaxRange(range) <= (textStorage.string as NSString).length else {
+      return ""
+    }
+    return (textStorage.string as NSString).substring(with: range)
+  }
+
+  private func refreshFindMatches() {
+    removeFindHighlights()
+    guard !findQuery.isEmpty else {
+      findMatches = []
+      activeFindMatchIndex = nil
+      return
+    }
+
+    let haystack = textStorage.string as NSString
+    var ranges: [NSRange] = []
+    var searchRange = NSRange(location: 0, length: haystack.length)
+    while searchRange.length > 0 {
+      let found = haystack.range(
+        of: findQuery,
+        options: [.caseInsensitive, .diacriticInsensitive],
+        range: searchRange
+      )
+      guard found.location != NSNotFound, found.length > 0 else { break }
+      ranges.append(found)
+      let nextLocation = found.location + found.length
+      searchRange = NSRange(location: nextLocation, length: haystack.length - nextLocation)
+    }
+    findMatches = ranges
+    if let activeFindMatchIndex, !findMatches.indices.contains(activeFindMatchIndex) {
+      self.activeFindMatchIndex = nil
+    }
+    applyFindHighlights()
+  }
+
+  private func applyFindHighlights() {
+    removeFindHighlights()
+    let passiveColor = NSColor.controlAccentColor.withAlphaComponent(0.18)
+    let activeColor = NSColor.controlAccentColor.withAlphaComponent(0.34)
+    for (index, range) in findMatches.enumerated() {
+      textStorage.addAttribute(
+        .backgroundColor,
+        value: index == activeFindMatchIndex ? activeColor : passiveColor,
+        range: range
+      )
+    }
+  }
+
+  private func removeFindHighlights() {
+    let fullRange = NSRange(location: 0, length: textStorage.length)
+    textStorage.removeAttribute(.backgroundColor, range: fullRange)
   }
 }

@@ -21,6 +21,8 @@ final class MarkdownFormatterTests: XCTestCase {
     var boundText = "alpha beta"
     var isDirty = false
     var didRouteDocumentChange = false
+    var findQuery = ""
+    var findReplacement = ""
     let appState = AppState()
     let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format.md"))
     appState.documentSession = DocumentSession(document: ref, text: boundText)
@@ -40,11 +42,17 @@ final class MarkdownFormatterTests: XCTestCase {
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
+      findQuery: Binding(get: { findQuery }, set: { findQuery = $0 }),
+      findReplacement: Binding(get: { findReplacement }, set: { findReplacement = $0 }),
+      findBarVisible: false,
+      findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
+      },
+      onCloseFindBar: {
       }
     )
     let coordinator = representable.makeCoordinator()
@@ -74,10 +82,60 @@ final class MarkdownFormatterTests: XCTestCase {
   }
 
   @MainActor
+  func testCustomFindReplaceAllUsesEditorUndoPath() {
+    var changedText = ""
+    let surface = MarkdownEditorSurface(text: "Alpha beta alpha", fontSize: 14)
+    surface.onTextChanged = { changedText = $0 }
+
+    surface.replaceAllFindMatches(query: "alpha", replacement: "omega")
+
+    XCTAssertEqual(surface.textStorage.string, "omega beta omega")
+    XCTAssertEqual(changedText, "omega beta omega")
+  }
+
+  @MainActor
+  func testUseSelectionForFindFeedsRepresentableBinding() {
+    var boundText = "find needle now"
+    var findQuery = ""
+    var findReplacement = ""
+    var isDirty = false
+    let command = FindBarCommand(action: .useSelection)
+    let representable = EditorRepresentable(
+      text: Binding(get: { boundText }, set: { boundText = $0 }),
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      formattingCommand: nil,
+      findQuery: Binding(get: { findQuery }, set: { findQuery = $0 }),
+      findReplacement: Binding(get: { findReplacement }, set: { findReplacement = $0 }),
+      findBarVisible: true,
+      findCommand: command,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
+      onDocumentChanged: {},
+      onCloseFindBar: {}
+    )
+    let coordinator = representable.makeCoordinator()
+    let surface = MarkdownEditorSurface(text: boundText, fontSize: 14)
+    surface.textView.setSelectedRange((boundText as NSString).range(of: "needle"))
+
+    let selectedText = coordinator.applyFind(
+      command,
+      to: surface,
+      query: findQuery,
+      replacement: findReplacement
+    )
+
+    XCTAssertEqual(selectedText, "needle")
+  }
+
+  @MainActor
   func testTidyTableCommandAppliesToSelectionAndMarksDirty() {
     var boundText = "before\n| a | b |\n| c | d |\nafter"
     var isDirty = false
     var didRouteDocumentChange = false
+    var findQuery = ""
+    var findReplacement = ""
     let appState = AppState()
     let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-table.md"))
     appState.documentSession = DocumentSession(document: ref, text: boundText)
@@ -98,11 +156,17 @@ final class MarkdownFormatterTests: XCTestCase {
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
+      findQuery: Binding(get: { findQuery }, set: { findQuery = $0 }),
+      findReplacement: Binding(get: { findReplacement }, set: { findReplacement = $0 }),
+      findBarVisible: false,
+      findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
+      },
+      onCloseFindBar: {
       }
     )
     let coordinator = representable.makeCoordinator()

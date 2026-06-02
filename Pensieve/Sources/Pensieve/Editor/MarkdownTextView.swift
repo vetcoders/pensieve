@@ -1,11 +1,15 @@
 import AppKit
+import SwiftUI
 
 class MarkdownTextView: NSTextView {
 
   weak var gutter: LineNumberGutter?
   var tableTidyOnPaste = true
   var asciiSafeTables = false
+  var onFormatRequest: ((MarkdownFormat) -> Void)?
+  var onEscape: (() -> Bool)?
   private let fallbackUndoManager = UndoManager()
+  private var formattingPopover: NSPopover?
 
   override var undoManager: UndoManager? {
     super.undoManager ?? fallbackUndoManager
@@ -27,7 +31,7 @@ class MarkdownTextView: NSTextView {
     isAutomaticTextReplacementEnabled = false
     isAutomaticSpellingCorrectionEnabled = false
     allowsUndo = true
-    usesFindBar = true
+    usesFindBar = false
     isRichText = false
 
     // Seed the editor's font + typing attributes with the same monospaced base the
@@ -67,6 +71,64 @@ class MarkdownTextView: NSTextView {
       super.paste(sender)
       return
     }
+  }
+
+  override func keyDown(with event: NSEvent) {
+    if event.keyCode == 53, onEscape?() == true {
+      return
+    }
+    super.keyDown(with: event)
+  }
+
+  override func menu(for event: NSEvent) -> NSMenu? {
+    let menu = super.menu(for: event) ?? NSMenu()
+    guard selectedRange().length > 0 else { return menu }
+
+    if menu.items.isEmpty == false {
+      menu.addItem(.separator())
+    }
+    for format in MarkdownFormat.allCases {
+      let item = NSMenuItem(
+        title: format.label,
+        action: #selector(applyMarkdownFormatFromMenu(_:)),
+        keyEquivalent: "")
+      item.image = NSImage(systemSymbolName: format.systemImageName, accessibilityDescription: nil)
+      item.target = self
+      item.representedObject = format
+      menu.addItem(item)
+    }
+    return menu
+  }
+
+  func showFormattingPopover() {
+    guard selectedRange().length > 0, window?.firstResponder === self else { return }
+    guard formattingPopover?.isShown != true else { return }
+
+    let popover = NSPopover()
+    popover.behavior = .transient
+    popover.animates = false
+    popover.contentSize = NSSize(width: 244, height: 36)
+    popover.contentViewController = NSHostingController(
+      rootView: MarkdownFloatingFormatBar { [weak self] format in
+        self?.applyFloatingFormat(format)
+      })
+    formattingPopover = popover
+
+    let selection = selectedRange()
+    var actualRange = NSRange(location: 0, length: 0)
+    let screenRect = firstRect(forCharacterRange: selection, actualRange: &actualRange)
+    let localRect: NSRect
+    if let window {
+      localRect = convert(window.convertFromScreen(screenRect), from: nil)
+    } else {
+      localRect = visibleRect
+    }
+    popover.show(relativeTo: localRect, of: self, preferredEdge: .maxY)
+  }
+
+  func hideFormattingPopover() {
+    formattingPopover?.close()
+    formattingPopover = nil
   }
 
   @discardableResult
@@ -111,5 +173,64 @@ class MarkdownTextView: NSTextView {
     setSelectedRange(NSRange(location: location + (replacement as NSString).length, length: 0))
     didChangeText()
     registerSmartPasteUndo(location: location, current: replacement, replacement: current)
+  }
+
+  @objc private func applyMarkdownFormatFromMenu(_ sender: NSMenuItem) {
+    guard let format = sender.representedObject as? MarkdownFormat else { return }
+    applyFloatingFormat(format)
+  }
+
+  private func applyFloatingFormat(_ format: MarkdownFormat) {
+    hideFormattingPopover()
+    onFormatRequest?(format)
+  }
+}
+
+private struct MarkdownFloatingFormatBar: View {
+  let apply: (MarkdownFormat) -> Void
+
+  var body: some View {
+    HStack(spacing: 2) {
+      ForEach(MarkdownFormat.allCases) { format in
+        Button {
+          apply(format)
+        } label: {
+          Image(systemName: format.systemImageName)
+            .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.plain)
+        .background(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .help(format.label)
+        .accessibilityIdentifier(format.floatingAccessibilityIdentifier)
+      }
+    }
+    .padding(.horizontal, 6)
+    .padding(.vertical, 4)
+    .background(
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(Color(NSColor.windowBackgroundColor).opacity(0.96))
+    )
+  }
+}
+
+extension MarkdownFormat {
+  fileprivate var floatingAccessibilityIdentifier: String {
+    switch self {
+    case .bold: return "pensieve.editor.floatingFormat.bold"
+    case .italic: return "pensieve.editor.floatingFormat.italic"
+    case .strike: return "pensieve.editor.floatingFormat.strike"
+    case .quote: return "pensieve.editor.floatingFormat.quote"
+    case .code: return "pensieve.editor.floatingFormat.code"
+    case .link: return "pensieve.editor.floatingFormat.link"
+    case .bulletedList: return "pensieve.editor.floatingFormat.bulletedList"
+    case .numberedList: return "pensieve.editor.floatingFormat.numberedList"
+    }
   }
 }
