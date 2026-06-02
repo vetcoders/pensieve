@@ -368,6 +368,7 @@ struct PensieveCommands: Commands {
     [
       UTType(filenameExtension: "md"),
       UTType(filenameExtension: "markdown"),
+      .plainText,
     ].compactMap { $0 }
   }
 
@@ -412,6 +413,7 @@ struct PensieveCommands: Commands {
     let base = appState.documentSession.displayTitle
       .replacingOccurrences(of: ".md", with: "")
       .replacingOccurrences(of: ".markdown", with: "")
+      .replacingOccurrences(of: ".txt", with: "")
     let ext = "md"
     var candidate = "\(base).\(ext)"
     var index = 2

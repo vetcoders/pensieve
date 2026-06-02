@@ -75,7 +75,8 @@ final class FolderManager {
 
   func openFile(url: URL, into appState: AppState) {
     guard WorkspaceScanner.isMarkdownFile(url) else {
-      appState.lastError = "Pensieve can open Markdown files with .md or .markdown extensions."
+      appState.lastError =
+        "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
       return
     }
 
@@ -89,13 +90,14 @@ final class FolderManager {
 
     do {
       try bookmarkStore.persistFile(url: url, into: appState)
-      let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
-      appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
-      appState.openFiles.append(ref)
-      DocumentStore.shared.load(ref: ref, into: appState)
     } catch {
       appState.lastError = "Could not open file: \(error.localizedDescription)"
     }
+
+    let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
+    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
+    appState.openFiles.append(ref)
+    DocumentStore.shared.load(ref: ref, into: appState)
   }
 
   @discardableResult
@@ -141,7 +143,7 @@ final class FolderManager {
     do {
       try FileManager.default.createDirectory(at: targetURL, withIntermediateDirectories: true)
       noteSelfWrite(at: targetURL)
-      refresh(into: appState)
+      refresh(into: appState, force: true)
       appState.lastError = nil
       return true
     } catch {
@@ -359,13 +361,13 @@ final class FolderManager {
   /// differs from the last applied signature. The watcher path does NOT call this directly —
   /// it goes through `scheduleWatcherRefresh` so the expensive scan runs off the main actor
   /// (RC-2).
-  func refresh(into appState: AppState) {
+  func refresh(into appState: AppState, force: Bool = false) {
     guard appState.hasWorkspaceContent else { return }
 
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
     let signature = FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
-    applyRefresh(into: appState, signature: signature)
+    applyRefresh(into: appState, signature: signature, force: force)
   }
 
   /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
@@ -411,8 +413,12 @@ final class FolderManager {
   /// delete) when a baseline exists — full reindex only on cold open. Reselects, preserving
   /// dirty-session protection (a dirty active buffer is never clobbered). Must run on the main
   /// actor — it mutates `appState`.
-  private func applyRefresh(into appState: AppState, signature: WorkspaceSignature?) {
-    if let signature, let baseline = lastWorkspaceSignature,
+  private func applyRefresh(
+    into appState: AppState,
+    signature: WorkspaceSignature?,
+    force: Bool = false
+  ) {
+    if !force, let signature, let baseline = lastWorkspaceSignature,
       WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
     {
       // The .md tree is unchanged — a non-.md change (screenshot, .DS_Store, sibling
@@ -1365,12 +1371,12 @@ enum WorkspaceScanner {
   }
 
   static func isMarkdownFile(_ url: URL) -> Bool {
-    ["md", "markdown"].contains(url.pathExtension.lowercased())
+    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
   }
 
   static func normalizedMarkdownFileURL(for url: URL) -> URL {
     let ext = url.pathExtension.lowercased()
-    if ext == "md" || ext == "markdown" {
+    if ext == "md" || ext == "markdown" || ext == "txt" {
       return url.standardizedFileURL
     }
     if ext.isEmpty {
@@ -1434,7 +1440,6 @@ enum WorkspaceScanner {
     for entry in entries {
       if entry.isDirectory {
         let childScan = scanChildren(folder: entry.url, root: root, exclusions: exclusions)
-        guard !childScan.nodes.isEmpty else { continue }
         documents.append(contentsOf: childScan.documents)
         nodes.append(
           WorkspaceNode(
@@ -1817,6 +1822,7 @@ final class DocumentStore {
     panel.allowedContentTypes = [
       UTType(filenameExtension: "md"),
       UTType(filenameExtension: "markdown"),
+      .plainText,
     ].compactMap { $0 }
     panel.canCreateDirectories = true
     panel.directoryURL = defaultSaveDirectory(appState: appState)

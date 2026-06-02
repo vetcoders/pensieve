@@ -54,20 +54,24 @@ final class LaunchIntentCoordinator: ObservableObject {
     let urls = pendingURLs
     pendingURLs.removeAll()
 
-    let validMarkdownURLs = urls.filter(WorkspaceScanner.isMarkdownFile)
-    let unsupportedURLs = urls.filter { !WorkspaceScanner.isMarkdownFile($0) }
+    let supportedFileURLs = urls.filter(isSupportedLaunchFile)
+    let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }
 
-    for url in validMarkdownURLs {
+    for url in supportedFileURLs {
       controller.openFile(url: url)
     }
 
-    if let firstURL = validMarkdownURLs.first {
+    if let firstURL = supportedFileURLs.first {
       controller.selectDocument(id: firstURL.standardizedFileURL)
     }
 
     for url in unsupportedURLs {
       controller.openFile(url: url)
     }
+  }
+
+  private func isSupportedLaunchFile(_ url: URL) -> Bool {
+    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
   }
 }
 

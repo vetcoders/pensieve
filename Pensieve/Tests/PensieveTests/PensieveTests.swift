@@ -634,10 +634,10 @@ final class PensieveSmokeTests: XCTestCase {
 
     let alphaURL = folder.appendingPathComponent("alpha.md")
     let betaURL = nested.appendingPathComponent("beta.markdown")
+    let textURL = nested.appendingPathComponent("plain.txt")
     try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
     try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
-    try "ignored".write(
-      to: nested.appendingPathComponent("ignored.txt"), atomically: true, encoding: .utf8)
+    try "plain".write(to: textURL, atomically: true, encoding: .utf8)
     try "package".write(
       to: nodeModules.appendingPathComponent("package.md"), atomically: true, encoding: .utf8)
     try "git".write(to: git.appendingPathComponent("config.md"), atomically: true, encoding: .utf8)
@@ -649,7 +649,11 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       Set(appState.documents.map { $0.url.resolvingSymlinksInPath() }),
-      Set([alphaURL.resolvingSymlinksInPath(), betaURL.resolvingSymlinksInPath()])
+      Set([
+        alphaURL.resolvingSymlinksInPath(),
+        betaURL.resolvingSymlinksInPath(),
+        textURL.resolvingSymlinksInPath(),
+      ])
     )
     XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
     XCTAssertEqual(appState.workspaceTree.first?.name, folder.lastPathComponent)
@@ -2454,10 +2458,12 @@ final class PensieveSmokeTests: XCTestCase {
 
     let firstURL = folder.appendingPathComponent("first.md")
     let secondURL = folder.appendingPathComponent("second.markdown")
-    let unsupportedURL = folder.appendingPathComponent("not-markdown.txt")
+    let plainURL = folder.appendingPathComponent("plain.txt")
+    let unsupportedURL = folder.appendingPathComponent("not-markdown.rtf")
     try "first body".write(to: firstURL, atomically: true, encoding: .utf8)
     try "second body".write(to: secondURL, atomically: true, encoding: .utf8)
-    try "plain text".write(to: unsupportedURL, atomically: true, encoding: .utf8)
+    try "plain text".write(to: plainURL, atomically: true, encoding: .utf8)
+    try "rich text".write(to: unsupportedURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
@@ -2471,16 +2477,16 @@ final class PensieveSmokeTests: XCTestCase {
     )
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
 
-    coordinator.handle(urls: [firstURL, secondURL, unsupportedURL])
+    coordinator.handle(urls: [firstURL, secondURL, plainURL, unsupportedURL])
     coordinator.startWhenLaunchIntentsSettle(controller: controller)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(
       appState.openFiles.map { $0.url.standardizedFileURL },
-      [firstURL.standardizedFileURL, secondURL.standardizedFileURL])
+      [firstURL.standardizedFileURL, secondURL.standardizedFileURL, plainURL.standardizedFileURL])
     XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, firstURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "first body")
-    XCTAssertTrue(appState.lastError?.contains(".md or .markdown") == true)
+    XCTAssertTrue(appState.lastError?.contains(".md, .markdown, or .txt") == true)
     XCTAssertTrue(appState.workspaceRoots.isEmpty)
   }
 
@@ -2895,6 +2901,71 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testControllerCreatesDocumentAndFolderWithCollisionNames() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveCreateCollisionTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let existingDocumentURL = folder.appendingPathComponent("Untitled.md")
+    let existingFolderURL = folder.appendingPathComponent("New Folder", isDirectory: true)
+    try "keep existing".write(to: existingDocumentURL, atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(
+      at: existingFolderURL,
+      withIntermediateDirectories: true
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    controller.openFolder(url: folder)
+
+    let createdDocumentURL = try XCTUnwrap(controller.createDocument(in: nil))
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      createdDocumentURL.standardizedFileURL,
+      folder.appendingPathComponent("Untitled 2.md").standardizedFileURL)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: createdDocumentURL.path))
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, createdDocumentURL)
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, createdDocumentURL)
+    XCTAssertFalse(appState.activeDocumentDirty)
+    XCTAssertEqual(appState.pendingSidebarRenameURL?.standardizedFileURL, createdDocumentURL)
+    XCTAssertTrue(
+      appState.documents.contains {
+        $0.url.standardizedFileURL == createdDocumentURL.standardizedFileURL
+      })
+
+    let createdFolderURL = try XCTUnwrap(controller.createFolder(in: nil))
+
+    XCTAssertEqual(
+      createdFolderURL.standardizedFileURL,
+      folder.appendingPathComponent("New Folder 2", isDirectory: true).standardizedFileURL)
+    var isDirectory = ObjCBool(false)
+    XCTAssertTrue(
+      FileManager.default.fileExists(
+        atPath: createdFolderURL.path,
+        isDirectory: &isDirectory
+      ))
+    XCTAssertTrue(isDirectory.boolValue)
+    XCTAssertEqual(appState.pendingSidebarRenameURL?.standardizedFileURL, createdFolderURL)
+    XCTAssertTrue(
+      appState.workspaceTree.first?.children?.contains {
+        $0.url?.standardizedFileURL == createdFolderURL.standardizedFileURL
+      } == true)
+  }
+
+  @MainActor
   func testControllerCreatesUntitledDocumentWithoutWritingAFile() {
     let appState = AppState()
     let controller = AppController(
@@ -3029,6 +3100,53 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(appState.activeDocumentDirty)
     XCTAssertTrue(
       appState.openFiles.contains { $0.url.standardizedFileURL == copyURL.standardizedFileURL })
+  }
+
+  @MainActor
+  func testPlainTextDocumentRoundTripsThroughOpenEditAndSave() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensievePlainTextRoundTripTests-\(UUID().uuidString)",
+        isDirectory: true
+      )
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let textURL = folder.appendingPathComponent("plain-note.txt")
+    try "plain-token original".write(to: textURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    controller.openFolder(url: folder)
+
+    XCTAssertTrue(
+      appState.documents.contains { $0.url.standardizedFileURL == textURL.standardizedFileURL })
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, textURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "plain-token original")
+
+    appState.activeDocumentText = "plain-token edited"
+    appState.activeDocumentDirty = true
+    controller.saveActiveDocument()
+
+    XCTAssertEqual(try String(contentsOf: textURL, encoding: .utf8), "plain-token edited")
+    XCTAssertEqual(textURL.pathExtension, "txt")
+    XCTAssertFalse(appState.activeDocumentDirty)
+
+    let copyURL = folder.appendingPathComponent("plain-copy.txt")
+    XCTAssertTrue(controller.saveActiveDocument(as: copyURL))
+    XCTAssertEqual(try String(contentsOf: copyURL, encoding: .utf8), "plain-token edited")
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, copyURL.standardizedFileURL)
+    XCTAssertEqual(copyURL.pathExtension, "txt")
   }
 
   @MainActor
