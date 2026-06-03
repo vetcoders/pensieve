@@ -10,6 +10,18 @@ struct TreeFingerprint: Codable, Equatable {
   static func compute(rootURL: URL, exclusions: Set<String>) throws -> TreeFingerprint {
     let root = rootURL.standardizedFileURL
     let scans = WorkspaceScanner.build(rootURLs: [root], exclusions: exclusions)
+    return try compute(from: scans, root: root)
+  }
+
+  /// Computes the SAME fingerprint v1 as `compute(rootURL:exclusions:)` but from an
+  /// already-walked `[WorkspaceScan]` instead of re-walking the filesystem. The cold-open path
+  /// has already built the workspace tree once (`workspaceBuilder`), so feeding that single walk
+  /// in here lets the cold-start skip-gate consult the substrate verdict WITHOUT a second tree
+  /// walk (the per-file `resourceValues` stat below is the same metadata read either way). The
+  /// hash, file/folder counts, and algorithm version are byte-for-byte identical to the
+  /// re-walking variant for the same tree, so the persisted `tree-fingerprint.json` (written via
+  /// `commit`) compares equal on an unchanged relaunch.
+  static func compute(from scans: [WorkspaceScan], root: URL) throws -> TreeFingerprint {
     let documents = scans.flatMap(\.documents)
 
     // Fingerprint v1: sorted "relativePath|mtimeSeconds|size" markdown-file tuples from WorkspaceScanner.
@@ -113,6 +125,19 @@ final class WorkspaceCacheStore {
     try data.write(to: root.appendingPathComponent("manifest.json"), options: [.atomic])
   }
 
+  /// Persists the workspace's `.md` signature alongside the identity-keyed cache
+  /// (`Workspaces/<workspaceID>/search-signature.json`). Written ONLY after the matching FTS
+  /// index write succeeds so the persisted signature never points at an index that was not
+  /// actually written. Used by the cold-open path to decide skip / incremental / full on the
+  /// NEXT launch.
+  func writeSearchSignature(
+    _ signature: WorkspaceSignature, for identity: WorkspaceIdentity
+  ) throws {
+    let root = try ensureCacheRoot(for: identity)
+    let data = try encoder.encode(signature)
+    try data.write(to: root.appendingPathComponent("search-signature.json"), options: [.atomic])
+  }
+
   func clearCache(for identity: WorkspaceIdentity) throws {
     let root = cacheRootURL(for: identity)
     guard FileManager.default.fileExists(atPath: root.path) else { return }
@@ -140,6 +165,11 @@ final class WorkspaceCacheStore {
       .appendingPathComponent("manifest.json", isDirectory: false)
   }
 
+  func searchSignatureURL(for identity: WorkspaceIdentity) -> URL {
+    cacheRootURL(for: identity)
+      .appendingPathComponent("search-signature.json", isDirectory: false)
+  }
+
   func readTreeFingerprint(for identity: WorkspaceIdentity) throws -> TreeFingerprint? {
     guard existingCacheRoot(for: identity) != nil else {
       return nil
@@ -162,6 +192,22 @@ final class WorkspaceCacheStore {
     }
     let data = try Data(contentsOf: url)
     return try decoder.decode(WorkspaceManifest.self, from: data)
+  }
+
+  /// Reads the persisted `.md` signature for this workspace identity, or nil when none exists
+  /// (true first run / post-reset) or it cannot be decoded (schema drift → treat as absent →
+  /// full reindex; never crash). Best-effort: a decode failure is swallowed, returning nil.
+  func readSearchSignature(for identity: WorkspaceIdentity) -> WorkspaceSignature? {
+    guard existingCacheRoot(for: identity) != nil else {
+      return nil
+    }
+    let url = searchSignatureURL(for: identity)
+    guard FileManager.default.fileExists(atPath: url.path),
+      let data = try? Data(contentsOf: url)
+    else {
+      return nil
+    }
+    return try? decoder.decode(WorkspaceSignature.self, from: data)
   }
 
   private func cacheRootURL(for identity: WorkspaceIdentity) -> URL {

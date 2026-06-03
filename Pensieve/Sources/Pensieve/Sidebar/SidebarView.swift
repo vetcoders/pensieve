@@ -228,8 +228,8 @@ struct SidebarView: View {
           hint: "⌘⇧O opens a folder")
       } else {
         List {
-          ForEach(appState.sortedWorkspaceTree) { node in
-            workspaceTreeRow(node, depth: 0)
+          ForEach(flattenedWorkspaceRows) { row in
+            workspaceRowView(row)
           }
         }
         .listStyle(.sidebar)
@@ -351,78 +351,73 @@ struct SidebarView: View {
     .background(selectionBackground(isSelected))
   }
 
-  private func workspaceTreeRow(_ node: WorkspaceNode, depth: Int) -> AnyView {
+  /// Currently-visible workspace rows, flattened so the `List` only materializes
+  /// on-screen rows instead of eagerly building the entire expanded subtree.
+  /// Walks only expanded branches (O(visible)).
+  private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
+    flattenWorkspaceTree(appState.workspaceTree, expandedNodeIDs: expandedNodeIDs)
+  }
+
+  @ViewBuilder
+  private func workspaceRowView(_ row: FlattenedWorkspaceRow) -> some View {
+    let node = row.node
     if node.kind == .document {
-      return AnyView(
-        Button {
-          if let url = node.url {
-            appState.sidebarFocusedURL = url.standardizedFileURL
-          }
-          controller.selectWorkspaceNode(node)
-        } label: {
-          nodeRow(
-            node,
-            depth: depth,
-            isSelected: node.documentID.map(isSelectedOrHovered) ?? false
-          )
+      Button {
+        if let url = node.url {
+          appState.sidebarFocusedURL = url.standardizedFileURL
         }
-        .buttonStyle(.plain)
-        .onHover { isHovered in
-          guard let documentID = node.documentID else { return }
-          updateHoveredDocument(documentID, isHovered: isHovered)
-          if isHovered, let url = node.url {
-            appState.sidebarFocusedURL = url.standardizedFileURL
-          }
-        }
-        .contextMenu {
-          nodeContextMenu(for: node)
-        }
-        .onDrag {
-          if let url = node.url {
-            return NSItemProvider(object: url as NSURL)
-          }
-          return NSItemProvider()
-        })
-    } else {
-      let children = node.children ?? []
-      let isExpanded = isNodeExpanded(node)
-      let isDropTarget = dropTargetFolderID == node.id
-
-      let content = VStack(alignment: .leading, spacing: 0) {
-        Button {
-          if let url = node.url {
-            appState.sidebarFocusedURL = url.standardizedFileURL
-          }
-          toggleExpanded(node.id)
-        } label: {
-          folderRow(
-            node,
-            depth: depth,
-            isExpanded: isExpanded,
-            isHighlighted: hoveredFolderID == node.id || isDropTarget
-          )
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered in
-          hoveredFolderID = isHovered ? node.id : nil
-          if isHovered, let url = node.url {
-            appState.sidebarFocusedURL = url.standardizedFileURL
-          }
-        }
-        .contextMenu {
-          nodeContextMenu(for: node)
-        }
-        .onDrop(of: [.fileURL], isTargeted: dropTargetBinding(for: node.id)) { providers in
-          handleDrop(providers, into: node.url)
-        }
-
-        if isExpanded {
-          ForEach(children) { child in
-            workspaceTreeRow(child, depth: depth + 1)
-          }
+        controller.selectWorkspaceNode(node)
+      } label: {
+        nodeRow(
+          node,
+          depth: row.depth,
+          isSelected: node.documentID.map(isSelectedOrHovered) ?? false
+        )
+      }
+      .buttonStyle(.plain)
+      .onHover { isHovered in
+        guard let documentID = node.documentID else { return }
+        updateHoveredDocument(documentID, isHovered: isHovered)
+        if isHovered, let url = node.url {
+          appState.sidebarFocusedURL = url.standardizedFileURL
         }
       }
-      return AnyView(content)
+      .contextMenu {
+        nodeContextMenu(for: node)
+      }
+      .onDrag {
+        if let url = node.url {
+          return NSItemProvider(object: url as NSURL)
+        }
+        return NSItemProvider()
+      }
+    } else {
+      Button {
+        if let url = node.url {
+          appState.sidebarFocusedURL = url.standardizedFileURL
+        }
+        toggleExpanded(node.id)
+      } label: {
+        folderRow(
+          node,
+          depth: row.depth,
+          isExpanded: row.isExpanded,
+          isHighlighted: hoveredFolderID == node.id || dropTargetFolderID == node.id
+        )
+      }
+      .buttonStyle(.plain)
+      .onHover { isHovered in
+        hoveredFolderID = isHovered ? node.id : nil
+        if isHovered, let url = node.url {
+          appState.sidebarFocusedURL = url.standardizedFileURL
+        }
+      }
+      .contextMenu {
+        nodeContextMenu(for: node)
+      }
+      .onDrop(of: [.fileURL], isTargeted: dropTargetBinding(for: node.id)) { providers in
+        handleDrop(providers, into: node.url)
+      }
     }
   }
 
@@ -583,7 +578,7 @@ struct SidebarView: View {
   private func nodeContextMenu(for node: WorkspaceNode) -> some View {
     if node.kind == .document, let url = node.url {
       if let documentID = node.documentID,
-        let doc = appState.allDocuments.first(where: { $0.id == documentID })
+        let doc = appState.document(id: documentID)
       {
         documentContextMenu(for: doc)
       } else {

@@ -1,4 +1,5 @@
 import AppKit
+import GRDB
 import SwiftUI
 import XCTest
 
@@ -204,6 +205,121 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: plainRange.location, effectiveRange: nil) as? NSColor,
       NSColor.textColor)
+  }
+
+  /// Invariant 1: consecutive plain-text keystrokes inside a fenced code block
+  /// keep re-highlighting the whole enclosing block. Pins the fence-cache reuse
+  /// path — the cache survives across non-fence edits and the bounded
+  /// `codeBlockAwareRange` lookup still extends to the full block each time.
+  @MainActor
+  func testMarkdownTextStorageReusesFenceCacheAcrossRepeatedInBlockEdits() {
+    let text = """
+      intro paragraph
+
+      ```swift
+      let alpha = 1
+      let beta = 2
+      let gamma = 3
+      ```
+
+      after
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+
+    // Three separate single-character edits on three different in-block lines,
+    // none of which touch a fence. None should trigger requiresFullRefresh, so
+    // the fence cache is reused — yet each must still extend to the full block.
+    for token in ["= 1", "= 2", "= 3"] {
+      let nsText = storage.string as NSString
+      let target = nsText.range(of: token)
+      storage.replaceCharacters(
+        in: NSRange(location: NSMaxRange(target), length: 0), with: "0")
+      waitForHighlightingDebounce()
+    }
+
+    let updatedText = storage.string as NSString
+    for token in ["let alpha", "let beta", "let gamma"] {
+      let range = updatedText.range(of: token)
+      XCTAssertEqual(
+        storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor,
+        NSColor.systemPink,
+        "in-block line \(token) must stay code-highlighted across cached edits")
+    }
+  }
+
+  /// Invariant 2: an edit OUTSIDE any code block must not over-extend the
+  /// highlight range into a distant block. The paragraph above a far-away
+  /// fenced block stays plain after editing a paragraph far from the fences.
+  @MainActor
+  func testMarkdownTextStorageDoesNotOverExtendForEditOutsideAnyBlock() {
+    let text = """
+      first plain paragraph here
+
+      second plain paragraph here
+
+      ```swift
+      let inside = 1
+      ```
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let nsText = storage.string as NSString
+    let editRange = nsText.range(of: "first plain paragraph here")
+
+    storage.replaceCharacters(
+      in: NSRange(location: NSMaxRange(editRange), length: 0), with: "!")
+    waitForHighlightingDebounce()
+
+    let updatedText = storage.string as NSString
+    // The edited paragraph stays plain (no code color leaked onto it).
+    let editedRange = updatedText.range(of: "first plain paragraph here!")
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: editedRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.textColor)
+    // The code block, untouched by this edit, retains its code highlighting.
+    let insideRange = updatedText.range(of: "let inside")
+    XCTAssertEqual(
+      storage.attribute(.foregroundColor, at: insideRange.location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemPink)
+  }
+
+  /// Invariant 3: deleting a ``` fence line takes the full-refresh path and the
+  /// previously-fenced text reverts to plain rendering afterward.
+  @MainActor
+  func testMarkdownTextStorageFullRefreshWhenOpeningFenceDeleted() {
+    let text = """
+      ```swift
+      let value = "x"
+      ```
+      tail
+      """
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    var nsText = storage.string as NSString
+
+    // Sanity: the line is code-highlighted before the fence is removed.
+    XCTAssertEqual(
+      storage.attribute(
+        .foregroundColor, at: nsText.range(of: "let value").location, effectiveRange: nil)
+        as? NSColor,
+      NSColor.systemPink)
+
+    // Delete the opening fence line (including its trailing newline).
+    let openingLine = nsText.range(of: "```swift\n")
+    storage.replaceCharacters(in: openingLine, with: "")
+    waitForHighlightingDebounce()
+
+    nsText = storage.string as NSString
+    let letRange = nsText.range(of: "let value")
+    XCTAssertNotNil(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil))
+    XCTAssertNotEqual(
+      storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
+      NSColor.systemPink,
+      "removing the opening fence must drop code highlighting from the former block body")
   }
 
   @MainActor
@@ -680,6 +796,1259 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertNil(appState.workspaceActivity)
     XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+  }
+
+  @MainActor
+  func testRefreshSkipsRebuildWhenMarkdownUnchanged() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveReindexGateTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+    XCTAssertGreaterThan(afterOpen, 0, "open must scan once")
+    XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+
+    // 1) refresh, nothing changed -> must skip rebuild (no new scan)
+    manager.refresh(into: appState)
+    XCTAssertEqual(calls.count, afterOpen, "refresh with unchanged .md must skip rebuild")
+
+    // 2) add a non-markdown file (e.g. screenshot/.DS_Store) -> must still skip
+    try Data().write(to: folder.appendingPathComponent("shot.png"))
+    manager.refresh(into: appState)
+    XCTAssertEqual(calls.count, afterOpen, "non-.md change must skip rebuild")
+
+    // 3) change .md content (size differs -> fingerprint changes even within same second) -> must rebuild
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    manager.refresh(into: appState)
+    XCTAssertGreaterThan(calls.count, afterOpen, ".md content change must trigger rebuild")
+  }
+
+  /// Reference-typed call counter so the @Sendable workspace builder closure can tally
+  /// invocations without capturing a mutable var (Swift 6 SendableClosureCaptures).
+  private final class BuilderCallCounter: @unchecked Sendable {
+    var count = 0
+  }
+
+  // MARK: - RC-2: debounced, off-main watcher refresh
+
+  /// RC-2 invariant (2): a real `.md` change drives exactly one rebuild through the debounced
+  /// off-main watcher path. The debounce interval is injected small and driven deterministically
+  /// by awaiting the in-flight task (no sleep-based assertion).
+  @MainActor
+  func testScheduleWatcherRefreshRebuildsOnceForMarkdownChange() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherRefreshTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+    XCTAssertGreaterThan(afterOpen, 0, "open must scan once")
+
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(calls.count, afterOpen + 1, ".md change must trigger exactly one rebuild")
+  }
+
+  /// RC-2 invariant (1): a foreign change to a NON-`.md` file does NOT trigger a rebuild/reindex
+  /// when the `.md` set is unchanged — the off-main signature gate matches and the path returns
+  /// without touching the main-actor rebuild.
+  @MainActor
+  func testScheduleWatcherRefreshSkipsRebuildForNonMarkdownChange() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherSkipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+
+    // Foreign churn: a screenshot / .DS_Store sibling write leaves the .md set untouched.
+    try Data().write(to: folder.appendingPathComponent("shot.png"))
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+
+    XCTAssertEqual(calls.count, afterOpen, "non-.md change must not trigger a rebuild")
+  }
+
+  /// RC-2 invariant (3): a burst of N rapid watcher events collapses to a single rebuild. Each
+  /// `scheduleWatcherRefresh` cancels the prior in-flight debounce/scan, so only the last one
+  /// survives to rebuild.
+  @MainActor
+  func testScheduleWatcherRefreshCoalescesBurstIntoSingleRebuild() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherBurstTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      workspaceBuilder: builder,
+      watcherDebounceMilliseconds: 30
+    )
+
+    manager.open(url: folder, into: appState)
+    let afterOpen = calls.count
+
+    // Real .md change, then a storm of watcher events before the debounce elapses.
+    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    for _ in 0..<20 {
+      manager.scheduleWatcherRefresh(into: appState)
+    }
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      calls.count, afterOpen + 1, "a burst of N watcher events must collapse to one rebuild")
+  }
+
+  /// RC-2 invariant (4): an external `.md` change delivered through the debounced watcher path
+  /// must NOT clobber an unsaved dirty editor buffer.
+  @MainActor
+  func testScheduleWatcherRefreshProtectsDirtySession() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveWatcherDirtyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "clean original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      watcherDebounceMilliseconds: 10
+    )
+
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(appState.documentSession.text, "clean original")
+
+    appState.activeDocumentText = "dirty local edit"
+    appState.activeDocumentDirty = true
+    try "dirty external longer body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(appState.documentSession.text, "dirty local edit", "dirty buffer preserved")
+    XCTAssertTrue(appState.documentSession.isDirty, "dirty flag preserved")
+  }
+
+  // MARK: - Stage A: incremental delta reindex
+
+  /// Delta computation is the pure, testable core of the scan-diff. Direct unit coverage of
+  /// added / modified / removed plus the documented edge cases (same path same mtime different
+  /// size; same-second mtime change; unicode path). No filesystem, no DB.
+  func testWorkspaceSignatureDeltaClassifiesAddedModifiedRemoved() {
+    let old = WorkspaceSignature(entries: [
+      "/ws/kept.md": FileSignature(mtime: 100, size: 10),
+      "/ws/changed.md": FileSignature(mtime: 100, size: 10),
+      "/ws/gone.md": FileSignature(mtime: 100, size: 10),
+    ])
+    let new = WorkspaceSignature(entries: [
+      "/ws/kept.md": FileSignature(mtime: 100, size: 10),
+      "/ws/changed.md": FileSignature(mtime: 200, size: 10),
+      "/ws/fresh.md": FileSignature(mtime: 300, size: 5),
+    ])
+
+    let delta = WorkspaceSignature.delta(from: old, to: new)
+    XCTAssertEqual(delta.added, ["/ws/fresh.md"])
+    XCTAssertEqual(delta.modified, ["/ws/changed.md"])
+    XCTAssertEqual(delta.removed, ["/ws/gone.md"])
+    XCTAssertEqual(delta.upsertedPaths, ["/ws/fresh.md", "/ws/changed.md"])
+    XCTAssertFalse(delta.isEmpty)
+  }
+
+  func testWorkspaceSignatureDeltaEmptyWhenIdentical() {
+    let signature = WorkspaceSignature(entries: [
+      "/ws/a.md": FileSignature(mtime: 100, size: 10),
+      "/ws/b.md": FileSignature(mtime: 200, size: 20),
+    ])
+    let delta = WorkspaceSignature.delta(from: signature, to: signature)
+    XCTAssertTrue(delta.isEmpty)
+  }
+
+  func testWorkspaceSignatureDeltaEdgeCases() {
+    // Same path, SAME mtime, DIFFERENT size -> modified (size alone is enough).
+    let sizeOnly = WorkspaceSignature.delta(
+      from: WorkspaceSignature(entries: ["/ws/x.md": FileSignature(mtime: 100, size: 10)]),
+      to: WorkspaceSignature(entries: ["/ws/x.md": FileSignature(mtime: 100, size: 11)]))
+    XCTAssertEqual(sizeOnly.modified, ["/ws/x.md"])
+
+    // Same-second mtime change (full-precision mtime is preserved) -> modified even with
+    // identical size. A whole-second fingerprint would have MISSED this.
+    let subSecond = WorkspaceSignature.delta(
+      from: WorkspaceSignature(entries: ["/ws/x.md": FileSignature(mtime: 100.0, size: 10)]),
+      to: WorkspaceSignature(entries: ["/ws/x.md": FileSignature(mtime: 100.4, size: 10)]))
+    XCTAssertEqual(subSecond.modified, ["/ws/x.md"])
+
+    // Unicode path round-trips through the diff as a normal key.
+    let unicodePath = "/ws/zażółć-gęślą-jaźń-日本語.md"
+    let unicode = WorkspaceSignature.delta(
+      from: WorkspaceSignature(entries: [:]),
+      to: WorkspaceSignature(entries: [unicodePath: FileSignature(mtime: 1, size: 1)]))
+    XCTAssertEqual(unicode.added, [unicodePath])
+  }
+
+  /// Invariant 1: adding one `.md` to an existing indexed workspace upserts ONLY that file
+  /// into FTS — the batch recorder proves exactly one record was inserted (not the whole
+  /// workspace) — while existing docs remain searchable.
+  @MainActor
+  func testIncrementalRefreshUpsertsOnlyAddedFile() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDeltaAddTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "alpha-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+    let recordsAfterColdOpen = recorder.values.reduce(0, +)
+    XCTAssertEqual(recordsAfterColdOpen, 5, "cold open full-indexes all five docs")
+
+    // Add a sixth file, then refresh: the delta must upsert ONLY the new file.
+    try "beta-token brand new".write(
+      to: folder.appendingPathComponent("note-new.md"), atomically: true, encoding: .utf8)
+    manager.refresh(into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    let recordsAfterAdd = recorder.values.reduce(0, +) - recordsAfterColdOpen
+    XCTAssertEqual(recordsAfterAdd, 1, "adding one .md must upsert exactly one FTS record")
+
+    let refs = appState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "beta-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-new.md"], "the added file is searchable")
+    XCTAssertEqual(
+      indexDatabase.search(query: "alpha-token", documents: refs).count, 5,
+      "all pre-existing docs remain searchable (their rows were not dropped)")
+  }
+
+  /// Invariant 2: modifying one `.md` re-upserts only that file; its new content is
+  /// searchable and the old content is gone.
+  @MainActor
+  func testIncrementalRefreshReupsertsOnlyModifiedFile() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDeltaModifyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let targetURL = folder.appendingPathComponent("target.md")
+    try "before-token original content".write(to: targetURL, atomically: true, encoding: .utf8)
+    try "stable-token untouched".write(
+      to: folder.appendingPathComponent("other.md"), atomically: true, encoding: .utf8)
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+    let afterColdOpen = recorder.values.reduce(0, +)
+
+    try "after-token replacement content noticeably longer".write(
+      to: targetURL, atomically: true, encoding: .utf8)
+    manager.refresh(into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    let upsertedOnModify = recorder.values.reduce(0, +) - afterColdOpen
+    XCTAssertEqual(upsertedOnModify, 1, "modifying one .md must re-upsert exactly one record")
+
+    let refs = appState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "after-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["target.md"], "new content is searchable")
+    XCTAssertTrue(
+      indexDatabase.search(query: "before-token", documents: refs).isEmpty,
+      "old content is gone")
+    XCTAssertEqual(
+      indexDatabase.search(query: "stable-token", documents: refs).count, 1,
+      "the untouched doc is unaffected")
+  }
+
+  // MARK: - Persisted cold-open `.md` signature (cross-launch reindex avoidance)
+
+  /// SUBAGENT_08 / Invariant 1: a SECOND cold open of an UNCHANGED workspace with a populated
+  /// index + a persisted signature must SKIP the reindex entirely — 0 records written on relaunch.
+  @MainActor
+  func testColdOpenSkipsReindexWhenSignatureUnchangedAndIndexPopulated() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigSkipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "skip-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase (one pool) across both opens; the cross-launch survivor is the PERSISTED
+    // `.md` signature on disk read through the shared substrate cache.
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    // First launch: full reindex (no persisted signature) + persists the signature.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Second launch: same files, populated index, persisted signature → SKIP.
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), 5,
+      "second open of an unchanged, already-indexed workspace writes ZERO new records (skip)")
+    XCTAssertEqual(
+      indexDatabase.search(query: "skip-token", documents: secondState.allDocuments).count, 5,
+      "the pre-existing index is reused — all docs still searchable after the skip")
+  }
+
+  /// SUBAGENT_08 / Invariant 2: relaunch after a few `.md` changed → only the changed files are
+  /// upserted (INCREMENTAL), not a full reindex of the whole workspace.
+  @MainActor
+  func testColdOpenIncrementalWhenSomeMarkdownChangedAcrossLaunch() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigDeltaTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "orig-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase instance (one DatabasePool) across both opens. A real relaunch keeps a
+    // single pool on `index.db`; the cross-launch survivor is the PERSISTED `.md` signature on
+    // disk, which the second open reads via the shared substrate cache. (Two pools on one file is
+    // a test artifact that races SQLite WAL.)
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    let afterFirstLaunch = recorder.values.reduce(0, +)
+    XCTAssertEqual(afterFirstLaunch, 5, "first launch full-indexes all five docs")
+
+    // Simulate quitting the app between launches so the first session's watcher stops reacting
+    // to the edits below (otherwise it would re-persist a 6-file signature and the relaunch would
+    // skip). closeWorkspace stops the watcher; the persisted signature survives the close.
+    firstManager.closeWorkspace(into: firstState)
+
+    // Between launches the operator edits ONE file and adds ONE file.
+    try "changed-token modified content noticeably longer than before".write(
+      to: folder.appendingPathComponent("note-1.md"), atomically: true, encoding: .utf8)
+    try "added-token brand new file".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    let upsertedOnRelaunch = recorder.values.reduce(0, +) - afterFirstLaunch
+    XCTAssertEqual(
+      upsertedOnRelaunch, 2,
+      "relaunch upserts ONLY the 1 modified + 1 added file (incremental), not all 6")
+
+    let refs = secondState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "changed-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-1.md"], "the modified file's new content is searchable")
+    XCTAssertTrue(
+      indexDatabase.search(query: "orig-token", documents: refs)
+        .allSatisfy { $0.document.url.lastPathComponent != "note-1.md" },
+      "the modified file's stale content is gone")
+    XCTAssertEqual(
+      indexDatabase.search(query: "added-token", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-added.md"], "the added file is searchable")
+  }
+
+  // MARK: - Stage 2: cheap file add / remove (no full-workspace re-commit / FTS storm)
+
+  /// STAGE 2 / file-add cheapness: a cold open that finds ONE extra `.md` since the last launch
+  /// must upsert ONLY that one `documents` row — never re-commit all N. A redundant
+  /// `ON CONFLICT DO UPDATE` on an unchanged row both bumps its `indexed_at` AND fires the
+  /// `documents` AU trigger that re-tokenizes the whole external-content FTS (the "Indexing N"
+  /// storm). We snapshot each row's `indexed_at` before and after the second open, with a >1s
+  /// real-time gap so a re-upsert lands a STRICTLY greater whole-second timestamp and is therefore
+  /// observable. DISCRIMINATING: the prior full-recommit re-upserted every pre-existing row (all
+  /// five `indexed_at` advance); the incremental upsert leaves all five untouched.
+  @MainActor
+  func testColdOpenFileAddUpsertsOnlyAddedDocumentNotEntireWorkspace() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveS2AddTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "addcheap body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    // One IndexDatabase (one pool) across both opens; the cross-launch survivor is the PERSISTED
+    // `.md` signature read via the shared substrate cache.
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    // First launch: full reindex of all five + persists signature + documents rows.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    // Background open serializes the manifest commit (`upsertWorkspace`) + stats writes inside the
+    // build task, so awaiting it leaves the index quiescent for the raw-DB read below.
+    firstManager.openInBackground(url: folder, into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit + stop the watcher
+
+    let before = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertEqual(before.count, 5, "five documents rows after the first full index")
+
+    // Force a STRICTLY greater whole-second timestamp for any second-open write, so a re-upsert of
+    // an unchanged row is detectable (`indexed_at` is whole-second `Int(Date()...)`).
+    try await Task.sleep(nanoseconds: 1_100_000_000)
+
+    // Operator adds ONE file between launches.
+    try "addcheap brandnew added file".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.openInBackground(url: folder, into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+
+    let after = try readDocumentsIndexedAt(at: indexURL)
+    let rewrittenOriginals = (0..<5)
+      .map { "note-\($0).md" }
+      .filter { after[$0] != before[$0] }
+    XCTAssertEqual(
+      rewrittenOriginals, [],
+      "a file add upserts ONLY the added row — no pre-existing row is re-written (the prior "
+        + "full-recommit re-upserted all five and re-synced the whole FTS)")
+    XCTAssertNotNil(after["note-added.md"], "the added file is indexed")
+
+    // FTS reflects the change AND every original stays searchable (originals were tokenized on the
+    // first launch and never re-tokenized; the added file was tokenized incrementally).
+    let refs = secondState.allDocuments
+    XCTAssertEqual(
+      indexDatabase.search(query: "brandnew", documents: refs)
+        .map(\.document.url.lastPathComponent),
+      ["note-added.md"], "the added file is searchable")
+    XCTAssertEqual(
+      indexDatabase.search(query: "addcheap", documents: refs).count, 6,
+      "originals + added all remain searchable")
+  }
+
+  /// STAGE 2 / file-remove cheapness: a cold open that finds ONE fewer `.md` must tombstone ONLY
+  /// the removed row and leave every remaining row untouched. DISCRIMINATING: the prior
+  /// full-recommit re-upserted all surviving rows (their `indexed_at` advances); the incremental
+  /// path writes none of them.
+  @MainActor
+  func testColdOpenFileRemoveTombstonesOnlyRemovedDocumentNotReupsertingRest() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveS2RemoveTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      let unique = index == 2 ? " vanishtoken" : ""
+      try "tombcheap body \(index)\(unique)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let indexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let recorder = BatchSizeRecorder()
+
+    let indexDatabase = IndexDatabase(
+      databaseURL: indexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.openInBackground(url: folder, into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(recorder.values.reduce(0, +), 5, "first launch full-indexes all five docs")
+    firstManager.closeWorkspace(into: firstState)
+
+    let before = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertEqual(before.count, 5, "five documents rows after the first full index")
+
+    try await Task.sleep(nanoseconds: 1_100_000_000)
+
+    // Operator removes ONE file between launches.
+    try FileManager.default.removeItem(at: folder.appendingPathComponent("note-2.md"))
+
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.openInBackground(url: folder, into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await indexDatabase.waitForPendingReindex()
+
+    let after = try readDocumentsIndexedAt(at: indexURL)
+    XCTAssertNil(after["note-2.md"], "the removed file's documents row is tombstoned")
+    XCTAssertEqual(after.count, 4, "exactly the four surviving rows remain")
+    let rewrittenSurvivors = [0, 1, 3, 4]
+      .map { "note-\($0).md" }
+      .filter { after[$0] != before[$0] }
+    XCTAssertEqual(
+      rewrittenSurvivors, [],
+      "a file remove tombstones ONLY the removed row — no surviving row is re-written (the prior "
+        + "full-recommit re-upserted all four)")
+
+    let refs = secondState.allDocuments
+    XCTAssertTrue(
+      indexDatabase.search(query: "vanishtoken", documents: refs).isEmpty,
+      "the removed file's content is gone from the FTS")
+    XCTAssertEqual(
+      indexDatabase.search(query: "tombcheap", documents: refs).count, 4,
+      "the four surviving docs remain searchable")
+  }
+
+  /// Reads `path -> indexed_at` for every `documents` row via a separate read-only connection
+  /// (safe in WAL while the IndexDatabase pool is open — same pattern as the other DB-inspecting
+  /// suites).
+  private func readDocumentsIndexedAt(at databaseURL: URL) throws -> [String: Int] {
+    let queue = try DatabaseQueue(path: databaseURL.path)
+    defer { try? queue.close() }
+    return try queue.read { db in
+      var result: [String: Int] = [:]
+      for row in try Row.fetchAll(db, sql: "SELECT path, indexed_at FROM documents") {
+        result[row["path"]] = row["indexed_at"]
+      }
+      return result
+    }
+  }
+
+  /// SUBAGENT_08 / Invariant 3 + empty-index guard: a cold open with NO persisted signature does
+  /// a FULL reindex and persists. AND even with a persisted signature, if the on-disk index is
+  /// EMPTY (operator nuked Application Support), the open must NOT skip — it must full-reindex.
+  @MainActor
+  func testColdOpenFullReindexWhenNoSignatureThenSkipGuardOnEmptyIndex() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigEmptyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<4 {
+      try "full-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let firstIndexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    // Separate recorders: the second launch points at a DIFFERENT index file (nuke simulation),
+    // so isolating the recorders keeps the first index's lingering manifest writes out of the
+    // second's record count.
+    let firstRecorder = BatchSizeRecorder()
+    let secondRecorder = BatchSizeRecorder()
+
+    // First launch: NO persisted signature → FULL reindex + persists signature.
+    let firstIndex = IndexDatabase(
+      databaseURL: firstIndexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in firstRecorder.record(size) })
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: firstIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await firstIndex.waitForPendingReindex()
+    XCTAssertEqual(
+      firstRecorder.values.reduce(0, +), 4, "first launch with no signature full-indexes")
+
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+    XCTAssertNotNil(
+      substrate.store.readSearchSignature(for: identity),
+      "the signature is persisted after the first full reindex")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Second launch points at a BRAND-NEW (empty) index.db but the persisted signature still
+    // matches the files. The empty-index guard must force a FULL reindex, never a skip.
+    let secondIndexURL = folder.appendingPathComponent("index-2.db", isDirectory: false)
+    let secondIndex = IndexDatabase(
+      databaseURL: secondIndexURL, searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in secondRecorder.record(size) })
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: secondIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await secondIndex.waitForPendingReindex()
+
+    XCTAssertEqual(
+      secondRecorder.values.reduce(0, +), 4,
+      "empty index + matching signature must FULL-reindex (never skip an empty index)")
+    XCTAssertEqual(
+      secondIndex.search(query: "full-token", documents: secondState.allDocuments).count, 4,
+      "all docs searchable after the guarded full reindex into the fresh index")
+  }
+
+  /// SUBAGENT_10 / P1 (silent-failure fix): a cold-open reindex whose FTS write FAILS must NOT
+  /// persist the new `.md` signature. Without the fix the signature is written unconditionally
+  /// right after the `await`, so a relaunch sees signature==current over a stale/partial index and
+  /// the skip-gate silently skips a broken index. With the fix the persist is gated on the write's
+  /// `Bool` result, so the PRIOR signature survives unchanged and the next launch re-attempts a
+  /// full reindex.
+  ///
+  /// Failure is injected DETERMINISTICALLY without fighting a live pool's WAL lock: the FIRST
+  /// launch (real `index.db`) persists the 5-file signature to the substrate cache. The SECOND
+  /// launch points a SEPARATE `IndexDatabase` at a path whose parent is a regular FILE, not a
+  /// directory — so `IndexDatabase.open` cannot create the database (`createDirectory` /
+  /// `DatabasePool` both fail), `ensureOpen` returns nil, and `reindexInBackground` returns `false`
+  /// for EVERY launch deterministically (no SQLite, no chmod, no second connection on the live
+  /// file). The substrate-cache signature is independent of `index.db`, so the persisted 5-file
+  /// signature from launch one is what the assertion inspects after the failed launch two.
+  ///
+  /// This test FAILS against the pre-fix code (which persists the new 6-file signature regardless
+  /// of the write outcome) and PASSES after the fix (prior 5-file signature retained).
+  @MainActor
+  func testColdOpenDoesNotPersistSignatureWhenReindexWriteFails() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigFailTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<5 {
+      try "fail-token body \(index)".write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+
+    // ---- First launch: full reindex succeeds → persists the 5-file signature to the substrate.
+    let firstIndexURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let firstIndex = IndexDatabase(databaseURL: firstIndexURL, searchIndexBatchSize: 1)
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: firstIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    firstManager.open(url: folder, into: firstState)
+    await firstManager.waitForPendingIndexUpdate()
+    await firstIndex.waitForPendingReindex()
+
+    let persistedAfterFirstLaunch = substrate.store.readSearchSignature(for: identity)
+    XCTAssertEqual(
+      persistedAfterFirstLaunch?.entries.count, 5,
+      "first launch persists a 5-file signature after the successful full reindex")
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Between launches the operator adds a 6th file, so the would-be-current signature differs
+    // (6 entries) from the persisted one (5 entries).
+    try "added-after-quit body".write(
+      to: folder.appendingPathComponent("note-added.md"), atomically: true, encoding: .utf8)
+
+    // ---- Deterministic write-failure injection: a db path whose PARENT is a regular file. Both
+    // `createDirectory` and `DatabasePool(path:)` fail in `open()` → `databasePool` stays nil →
+    // `ensureOpen` returns nil → every write (`reindexInBackground`) returns false.
+    let blockerFile = folder.appendingPathComponent("blocker", isDirectory: false)
+    try Data().write(to: blockerFile)  // a FILE where the second index expects a DIRECTORY
+    let unwritableIndexURL = blockerFile.appendingPathComponent("index.db", isDirectory: false)
+    let secondIndex = IndexDatabase(databaseURL: unwritableIndexURL, searchIndexBatchSize: 1)
+
+    // ---- Second launch: the index cannot open → cold path takes the FULL-reindex branch (no
+    // persisted-index rows visible) and `reindexInBackground` returns false → persist gated.
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: secondIndex,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceSubstrate: substrate)
+    secondManager.open(url: folder, into: secondState)
+    await secondManager.waitForPendingIndexUpdate()
+    await secondIndex.waitForPendingReindex()
+
+    // The user-visible error report is preserved (the fix keeps `report(...)`); the failing index
+    // open itself reports an error, so `lastError` is non-nil either way.
+    XCTAssertNotNil(secondState.lastError, "a failed index open/reindex still reports an error")
+
+    // CORE ASSERTION: the persisted signature was NOT advanced to the new 6-file value. It must
+    // still be the prior 5-file signature, proving the failed write did not poison the skip-gate.
+    let persistedAfterFailedWrite = substrate.store.readSearchSignature(for: identity)
+    XCTAssertEqual(
+      persistedAfterFailedWrite, persistedAfterFirstLaunch,
+      "a FAILED reindex must NOT persist the new signature — the prior signature is retained")
+    XCTAssertEqual(
+      persistedAfterFailedWrite?.entries.count, 5,
+      "the persisted signature still maps the original 5 files, not the post-quit 6")
+  }
+
+  /// SUBAGENT_08 / Invariant 4: the persisted signature round-trips through Codable and is keyed
+  /// by workspace identity (a different root => a different key => nil).
+  func testPersistedSignatureRoundTripsAndIsKeyedByIdentity() throws {
+    let cacheDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSigCodableTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: cacheDir) }
+    let store = WorkspaceCacheStore(baseDirectory: cacheDir)
+
+    let rootA = URL(fileURLWithPath: "/tmp/pensieve-sig-root-a")
+    let rootB = URL(fileURLWithPath: "/tmp/pensieve-sig-root-b")
+    let identityA = WorkspaceIdentity.make(rootURL: rootA, bookmarkData: nil)
+    let identityB = WorkspaceIdentity.make(rootURL: rootB, bookmarkData: nil)
+
+    let signature = WorkspaceSignature(entries: [
+      "/tmp/pensieve-sig-root-a/one.md": FileSignature(mtime: 1234.5, size: 42),
+      "/tmp/pensieve-sig-root-a/two.md": FileSignature(mtime: 6789.0, size: 7),
+    ])
+    try store.writeSearchSignature(signature, for: identityA)
+
+    let roundTripped = store.readSearchSignature(for: identityA)
+    XCTAssertEqual(roundTripped, signature, "the signature round-trips losslessly through Codable")
+    XCTAssertNil(
+      store.readSearchSignature(for: identityB),
+      "a different identity has no persisted signature — keying is per workspace identity")
+  }
+
+  /// Invariant 3: removing one `.md` deletes only its FTS row; it leaves search results, and
+  /// the others remain. No upsert happens for a pure removal.
+  @MainActor
+  func testIncrementalRefreshDeletesOnlyRemovedFile() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDeltaRemoveTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let goneURL = folder.appendingPathComponent("gone.md")
+    try "doomed-token will be removed".write(to: goneURL, atomically: true, encoding: .utf8)
+    try "survivor-token stays".write(
+      to: folder.appendingPathComponent("keep.md"), atomically: true, encoding: .utf8)
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+    let afterColdOpen = recorder.values.reduce(0, +)
+
+    try FileManager.default.removeItem(at: goneURL)
+    manager.refresh(into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    let upsertedOnRemove = recorder.values.reduce(0, +) - afterColdOpen
+    XCTAssertEqual(upsertedOnRemove, 0, "a pure removal must not upsert anything")
+
+    let refs = appState.allDocuments
+    XCTAssertTrue(
+      indexDatabase.search(query: "doomed-token", documents: refs).isEmpty,
+      "the removed file is no longer searchable")
+    XCTAssertEqual(
+      indexDatabase.search(query: "survivor-token", documents: refs).count, 1,
+      "the surviving doc remains searchable")
+  }
+
+  /// Invariant 4: cold open (no prior baseline) full-indexes everything and search works.
+  @MainActor
+  func testColdOpenFullIndexesEntireWorkspace() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveColdOpenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<4 {
+      try "gamma-token entry \(index)".write(
+        to: folder.appendingPathComponent("doc-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    XCTAssertEqual(recorder.values.reduce(0, +), 4, "cold open indexes all docs")
+    XCTAssertEqual(
+      indexDatabase.search(query: "gamma-token", documents: appState.allDocuments).count, 4,
+      "every cold-indexed doc is searchable")
+  }
+
+  /// Invariant 5: the skip-when-unchanged gate still returns early when the `.md` set is
+  /// identical (non-.md churn) — no rebuild, no upsert.
+  @MainActor
+  func testRefreshSkipsAndDoesNotReindexWhenMarkdownUnchanged() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDeltaSkipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    try "delta-token sole note".write(
+      to: folder.appendingPathComponent("note.md"), atomically: true, encoding: .utf8)
+
+    let recorder = BatchSizeRecorder()
+    let calls = BuilderCallCounter()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      calls.count += 1
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder)
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+    let scansAfterOpen = calls.count
+    let recordsAfterOpen = recorder.values.reduce(0, +)
+
+    // Non-.md churn: a screenshot leaves the .md set untouched.
+    try Data().write(to: folder.appendingPathComponent("shot.png"))
+    manager.refresh(into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    XCTAssertEqual(calls.count, scansAfterOpen, "unchanged .md set must skip the rebuild")
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), recordsAfterOpen, "skip path must not touch the FTS index")
+  }
+
+  // MARK: - Stage A1: off-main index write (rebuildWorkspace)
+
+  /// A watcher-triggered rebuild does NOT block the main actor: after the refresh returns, the
+  /// in-memory document tree (`appState.allDocuments`) already reflects the change synchronously
+  /// (the metadata-only `applyWorkspaceScans` ran on the main actor), while the FTS index write
+  /// is still pending off-main. Only after `waitForPendingReindex()` does the index reflect the
+  /// change. The observable gap between "tree updated" and "index updated" structurally proves
+  /// the index write is OFF the main actor.
+  @MainActor
+  func testRebuildIndexWriteIsOffMainTreeObservableBeforeIndex() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveOffMainTreeTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    try "seed-token original".write(
+      to: folder.appendingPathComponent("seed.md"), atomically: true, encoding: .utf8)
+
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    // Add a new file, then refresh. The refresh returns synchronously after the tree update;
+    // the index write is launched off-main and is NOT awaited by `refresh`.
+    let freshURL = folder.appendingPathComponent("fresh.md")
+    try "fresh-token freshly added".write(to: freshURL, atomically: true, encoding: .utf8)
+    manager.refresh(into: appState)
+
+    // Tree reflects the new file IMMEDIATELY (sync metadata path) — before the index write.
+    XCTAssertTrue(
+      appState.allDocuments.contains(where: {
+        $0.url.standardizedFileURL == freshURL.standardizedFileURL
+      }),
+      "the document tree sees the new file synchronously, before the off-main index write")
+
+    // Only after awaiting the off-main write does the FTS index reflect the change.
+    await manager.waitForPendingIndexUpdate()
+    XCTAssertEqual(
+      indexDatabase.search(query: "fresh-token", documents: appState.allDocuments)
+        .map(\.document.url.lastPathComponent),
+      ["fresh.md"], "the new file is searchable after the off-main write completes")
+  }
+
+  /// A LARGE delta — a batch of `.md` files dropped at once — goes through the off-main
+  /// background path and the index is correct after awaiting. The cold open establishes a
+  /// baseline so the subsequent refresh is an incremental delta (not a full reindex).
+  @MainActor
+  func testLargeDeltaGoesThroughBackgroundPathAndIsCorrect() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveLargeDeltaTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    try "anchor-token baseline note".write(
+      to: folder.appendingPathComponent("anchor.md"), atomically: true, encoding: .utf8)
+
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    manager.open(url: folder, into: appState)
+    await manager.waitForPendingIndexUpdate()
+    let recordsAfterColdOpen = recorder.values.reduce(0, +)
+    XCTAssertEqual(recordsAfterColdOpen, 1, "cold open indexes the single baseline note")
+
+    // Drop a batch of 25 new .md files at once, then refresh once. The delta must upsert
+    // exactly the 25 new files through the background path.
+    for index in 0..<25 {
+      try "batch-token member \(index)".write(
+        to: folder.appendingPathComponent("batch-\(index).md"), atomically: true, encoding: .utf8)
+    }
+    manager.refresh(into: appState)
+    await manager.waitForPendingIndexUpdate()
+
+    let recordsAfterBatch = recorder.values.reduce(0, +) - recordsAfterColdOpen
+    XCTAssertEqual(recordsAfterBatch, 25, "a large delta upserts exactly the 25 added files")
+    XCTAssertEqual(
+      indexDatabase.search(query: "batch-token", documents: appState.allDocuments).count, 25,
+      "all batch-added files are searchable after the off-main write")
+    XCTAssertEqual(
+      indexDatabase.search(query: "anchor-token", documents: appState.allDocuments).count, 1,
+      "the pre-existing baseline note remains searchable")
+  }
+
+  /// The cold / fallback (no baseline) FULL reindex also runs off-main: after `open` returns and
+  /// the tree is observable synchronously, the FTS index is correct only after awaiting. Proven
+  /// by the tree-before-index ordering plus correct search after the await.
+  @MainActor
+  func testColdFallbackReindexRunsOffMain() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveColdOffMainTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<6 {
+      try "delta-cold-token entry \(index)".write(
+        to: folder.appendingPathComponent("cold-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    // `open` is the cold path (no baseline) → rebuildWorkspace takes the FULL reindex branch.
+    manager.open(url: folder, into: appState)
+
+    // Tree is fully populated synchronously, before the off-main full reindex completes.
+    XCTAssertEqual(appState.allDocuments.count, 6, "cold open populates the tree synchronously")
+
+    await manager.waitForPendingIndexUpdate()
+    XCTAssertEqual(
+      indexDatabase.search(query: "delta-cold-token", documents: appState.allDocuments).count, 6,
+      "the cold full reindex indexed every doc off-main and they are all searchable")
+  }
+
+  /// `closeWorkspace` cancels a pending index task without leaving the index half-written. The
+  /// underlying `pool.write` is a single transaction, so even if the close races the write the
+  /// index is whole. After close the workspace state is cleared and no further index work is
+  /// pending. This drives the close immediately after launching the rebuild's off-main write.
+  @MainActor
+  func testCloseWorkspaceCancelsPendingIndexTaskCleanly() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseIndexTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    for index in 0..<8 {
+      try "close-token entry \(index)".write(
+        to: folder.appendingPathComponent("doc-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore())
+
+    // Cold open launches an off-main full reindex; close immediately, racing the write.
+    manager.open(url: folder, into: appState)
+    manager.closeWorkspace(into: appState)
+
+    // Workspace state is cleared regardless of the in-flight index write.
+    XCTAssertTrue(appState.workspaceRoots.isEmpty, "roots cleared on close")
+    XCTAssertTrue(appState.documents.isEmpty, "documents cleared on close")
+    XCTAssertFalse(appState.hasWorkspaceContent, "no workspace content after close")
+
+    // Let any in-flight single-transaction write settle. The index is never half-written: the
+    // FTS table is either empty (cancelled before commit) or holds exactly the 8 whole docs
+    // (committed before cancel) — never a torn partial. Search must not crash and the count
+    // must be one of the two whole states.
+    await indexDatabase.waitForPendingReindex()
+    await manager.waitForPendingIndexUpdate()
+    let refs = (0..<8).map {
+      DocumentRef(id: folder.appendingPathComponent("doc-\($0).md").standardizedFileURL)
+    }
+    let indexedCount = indexDatabase.search(query: "close-token", documents: refs).count
+    XCTAssertTrue(
+      indexedCount == 0 || indexedCount == 8,
+      "the index is whole — either nothing committed or all 8 docs, never a torn partial "
+        + "(got \(indexedCount))")
+  }
+
+  /// Invariant 6 (self-write suppression + dirty protection): a self-write within the
+  /// suppression window is gated so the watcher path is not even scheduled, and a dirty
+  /// editor buffer survives an external delta refresh.
+  @MainActor
+  func testIncrementalRefreshPreservesDirtySessionOnExternalModify() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDeltaDirtyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "clean original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: temporaryBookmarkStore(),
+      watcherDebounceMilliseconds: 10)
+
+    manager.open(url: folder, into: appState)
+    XCTAssertEqual(appState.documentSession.text, "clean original")
+
+    appState.activeDocumentText = "dirty local edit"
+    appState.activeDocumentDirty = true
+    try "external rewrite token noticeably longer".write(
+      to: noteURL, atomically: true, encoding: .utf8)
+
+    manager.scheduleWatcherRefresh(into: appState)
+    await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingWorkspaceBuild()
+    await manager.waitForPendingIndexUpdate()
+
+    XCTAssertEqual(
+      appState.documentSession.text, "dirty local edit", "dirty buffer preserved through delta")
+    XCTAssertTrue(appState.documentSession.isDirty, "dirty flag preserved")
+    // The external change is still applied to the index (searchable) even though the buffer
+    // was left dirty.
+    XCTAssertEqual(
+      indexDatabase.search(query: "external rewrite token", documents: appState.allDocuments)
+        .map(\.document.url.lastPathComponent),
+      ["note.md"])
+  }
+
+  @MainActor
+  func testCloseWorkspaceClearsWorkspaceAndProtectsDirtyDocument() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseWorkspaceTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore()
+    )
+
+    manager.open(url: folder, into: appState)
+    XCTAssertFalse(appState.workspaceRoots.isEmpty)
+    XCTAssertFalse(appState.documents.isEmpty)
+    XCTAssertTrue(appState.hasWorkspaceContent)
+
+    // Clean document -> close clears the entire workspace.
+    manager.closeWorkspace(into: appState)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty, "roots cleared")
+    XCTAssertTrue(appState.workspaceTree.isEmpty, "tree cleared")
+    XCTAssertTrue(appState.documents.isEmpty, "documents cleared")
+    XCTAssertFalse(appState.hasWorkspaceContent, "no workspace content after close")
+    XCTAssertNil(appState.selectedDocumentID)
+
+    // Dirty document -> close still clears the workspace but preserves the unsaved editor.
+    manager.open(url: folder, into: appState)
+    appState.activeDocumentText = "unsaved local edit"
+    appState.activeDocumentDirty = true
+    manager.closeWorkspace(into: appState)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty, "roots cleared even with a dirty document")
+    XCTAssertTrue(appState.documentSession.isDirty, "dirty session preserved (no data loss)")
+    XCTAssertEqual(
+      appState.documentSession.text, "unsaved local edit", "unsaved text preserved")
   }
 
   @MainActor
@@ -1750,12 +3119,16 @@ final class PensieveSmokeTests: XCTestCase {
     )
 
     controller.openFolder(url: folder)
+    await manager.waitForPendingIndexUpdate()
     controller.updateWorkspaceSearch(query: "nebula")
     await controller.waitForPendingWorkspaceSearch()
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [skipURL.standardizedFileURL])
 
     controller.excludeFromWorkspace(urls: [drafts])
+    // The exclusion edit refreshes the workspace, which now writes the FTS delta off-main and
+    // re-runs the search projection on completion. Await that before asserting on results.
+    await manager.waitForPendingIndexUpdate()
 
     XCTAssertFalse(appState.documents.contains { $0.url == skipURL.standardizedFileURL })
     XCTAssertTrue(appState.workspaceSearchResults.isEmpty)
@@ -2042,7 +3415,7 @@ final class PensieveSmokeTests: XCTestCase {
     )
 
     let reindexTask = Task {
-      await indexDatabase.reindexInBackground(documents: [newRef], appState: nil)
+      _ = await indexDatabase.reindexInBackground(documents: [newRef], appState: nil)
     }
     await fulfillment(of: [writeStarted], timeout: 1)
 

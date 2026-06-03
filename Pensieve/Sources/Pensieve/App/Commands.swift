@@ -50,6 +50,12 @@ struct PensieveCommands: Commands {
       }
       .disabled(appState.excludedWorkspacePaths.isEmpty)
 
+      Button("Close Folder") {
+        controller.closeWorkspace()
+      }
+      .keyboardShortcut("w", modifiers: [.command, .shift])
+      .disabled(appState.workspaceRoots.isEmpty)
+
       Divider()
 
       Button("Save") {

@@ -8,6 +8,17 @@ class MarkdownTextStorage: NSTextContentStorage {
   private var pendingRequiresFullRefresh = false
   private var lastProcessedString = ""
 
+  /// Cached, document-order list of every ``` fence line's `NSRange`.
+  ///
+  /// Whether a line sits inside a fenced code block depends on the PARITY of
+  /// fences counted from the start of the document, so `codeBlockAwareRange`
+  /// needs the full fence set — but recomputing it on every keystroke is the
+  /// O(document-length) scan that caused per-keystroke typing lag. The set only
+  /// changes when an edit touches a fence line, which the `requiresFullRefresh`
+  /// path already detects, so we rebuild the cache there and reuse it for plain
+  /// keystrokes. `nil` means "stale / not yet built" — rebuild on next use.
+  private var fenceLineRangesCache: [NSRange]?
+
   var syntaxHighlightingEnabled: Bool = true {
     didSet {
       refreshHighlighting()
@@ -70,6 +81,9 @@ class MarkdownTextStorage: NSTextContentStorage {
     if requiresFullRefresh {
       pendingRequiresFullRefresh = true
       pendingHighlightRange = nil
+      // A fence line was touched/created/deleted, so the cached fence set is
+      // stale. Drop it; it rebuilds lazily on the next `codeBlockAwareRange`.
+      fenceLineRangesCache = nil
     } else if !pendingRequiresFullRefresh {
       adjustPendingHighlightRange(
         for: editedRange,
@@ -109,6 +123,9 @@ class MarkdownTextStorage: NSTextContentStorage {
     highlightWorkItem = nil
     pendingHighlightRange = nil
     pendingRequiresFullRefresh = false
+    // Full refresh can follow a wholesale text replacement (document load,
+    // font/syntax toggle), so invalidate the fence cache here too.
+    fenceLineRangesCache = nil
     guard let textStorage = textStorage else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
 
@@ -167,33 +184,87 @@ class MarkdownTextStorage: NSTextContentStorage {
     guard let textStorage = textStorage else { return range }
     let string = textStorage.string as NSString
     var result = clampedRange(range, textLength: string.length)
-    var openFenceLineRange: NSRange?
-    var location = 0
 
+    let fences = fenceLineRanges(in: string)
+    guard fences.count >= 2 else { return result }
+
+    // Fences pair in document order: index 0 opens, 1 closes, 2 opens, ... .
+    // A complete code block spans [open.location, NSMaxRange(close)). Blocks
+    // are disjoint and sorted, so binary-search the first fence at/after
+    // `result.location` and inspect only the few blocks bracketing `result`
+    // instead of walking the whole document.
+    let pivot = lowerBound(of: result.location, in: fences)
+
+    // Candidate block-opener indices (even) near the pivot. Looking a couple of
+    // pairs to each side covers a block that starts before `result` and the one
+    // that starts after it.
+    let firstOpener = max(0, ((pivot - 2) / 2) * 2)
+    var openerIndex = firstOpener
+    while openerIndex + 1 < fences.count {
+      let open = fences[openerIndex]
+      let close = fences[openerIndex + 1]
+      let blockRange = NSRange(
+        location: open.location,
+        length: NSMaxRange(close) - open.location
+      )
+
+      // Sorted blocks: once a block starts past the end of `result`, no later
+      // block can touch it either.
+      if blockRange.location > NSMaxRange(result) {
+        break
+      }
+
+      if rangesTouchOrIntersect(blockRange, result) {
+        result = NSUnionRange(result, blockRange)
+      }
+
+      openerIndex += 2
+    }
+
+    return result
+  }
+
+  /// Returns the cached document-order fence-line ranges, rebuilding the cache
+  /// with a single full-document walk if it is stale (`nil`). The rebuild only
+  /// happens on full-refresh / fence-touching edits, never on plain keystrokes.
+  private func fenceLineRanges(in string: NSString) -> [NSRange] {
+    if let cached = fenceLineRangesCache {
+      return cached
+    }
+    let computed = computeFenceLineRanges(in: string)
+    fenceLineRangesCache = computed
+    return computed
+  }
+
+  private func computeFenceLineRanges(in string: NSString) -> [NSRange] {
+    var fences: [NSRange] = []
+    var location = 0
     while location < string.length {
       let lineRange = lineRange(at: location, in: string)
       let contentRange = lineContentRange(from: lineRange, in: string)
-
       if isFenceLine(in: string, range: contentRange) {
-        if let openingRange = openFenceLineRange {
-          let blockRange = NSRange(
-            location: openingRange.location,
-            length: NSMaxRange(lineRange) - openingRange.location
-          )
-          if rangesTouchOrIntersect(blockRange, result) {
-            result = NSUnionRange(result, blockRange)
-          }
-          openFenceLineRange = nil
-        } else {
-          openFenceLineRange = lineRange
-        }
+        fences.append(lineRange)
       }
 
       guard NSMaxRange(lineRange) > location else { break }
       location = NSMaxRange(lineRange)
     }
+    return fences
+  }
 
-    return result
+  /// Index of the first fence whose `location` is `>= target` (binary search).
+  private func lowerBound(of target: Int, in fences: [NSRange]) -> Int {
+    var low = 0
+    var high = fences.count
+    while low < high {
+      let mid = (low + high) / 2
+      if fences[mid].location < target {
+        low = mid + 1
+      } else {
+        high = mid
+      }
+    }
+    return low
   }
 
   private func editTouchesFence(

@@ -72,6 +72,18 @@ final class LaunchIntentCoordinator: ObservableObject {
 }
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    // A bare `swift run` executable (no `.app` bundle, e.g. `make run`) launches as a
+    // background process: no Dock icon, window stuck behind other apps, can't be brought
+    // to the foreground. Force a regular activation policy in that case so the dev build
+    // is actually usable. A packaged `.app` already runs as `.regular`, so this is a no-op
+    // there — guarded on a nil bundle identifier to keep shipped behavior untouched.
+    if Bundle.main.bundleIdentifier == nil {
+      NSApp.setActivationPolicy(.regular)
+      NSApp.activate(ignoringOtherApps: true)
+    }
+  }
+
   func application(_ application: NSApplication, open urls: [URL]) {
     Task { @MainActor in
       LaunchIntentCoordinator.shared.handle(urls: urls)

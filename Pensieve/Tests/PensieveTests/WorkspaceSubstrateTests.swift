@@ -39,6 +39,26 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(first.workspaceID, second.workspaceID)
   }
 
+  /// SUBAGENT_10 / P3: the exact first-open-vs-restore case. A workspace is FIRST opened with no
+  /// security-scoped bookmark yet (`bookmarkData: nil`) and LATER restored with a real bookmark.
+  /// Because `WorkspaceIdentity.make` derives `workspaceID` from path+volume only (the bookmark is
+  /// metadata), both must yield the SAME `workspaceID` — otherwise the restore would key a NEW
+  /// cache/manifest/signature dir, the cold-start `.valid` skip-gate would miss, and every relaunch
+  /// would full-reindex. The sibling test above only covers real-vs-real bookmark data; this pins
+  /// the nil-vs-real boundary so a future regression cannot silently break the cold-start skip.
+  func testWorkspaceIdentityStableWhetherBookmarkPresentOrNil() throws {
+    let root = try makeTemporaryWorkspace()
+
+    let firstOpenNoBookmark = WorkspaceIdentity.make(rootURL: root, bookmarkData: nil)
+    let restoreWithBookmark = WorkspaceIdentity.make(
+      rootURL: root, bookmarkData: Data("real-bookmark".utf8))
+
+    XCTAssertEqual(
+      firstOpenNoBookmark.workspaceID, restoreWithBookmark.workspaceID,
+      "workspaceID must be identical whether the first open had no bookmark or a later restore "
+        + "supplied a real one — it is derived from path+volume, not the bookmark")
+  }
+
   func testWorkspaceIdentityBookmarkHashRecordedButNotPartOfWorkspaceID() throws {
     let root = try makeTemporaryWorkspace()
 

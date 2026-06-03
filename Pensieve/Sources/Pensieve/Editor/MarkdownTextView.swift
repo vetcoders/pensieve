@@ -33,6 +33,15 @@ class MarkdownTextView: NSTextView {
     allowsUndo = true
     usesFindBar = false
     isRichText = false
+
+    // Seed the editor's font + typing attributes with the same monospaced base the
+    // highlighter applies. Without this, freshly typed text inherits NSTextView's default
+    // (proportional system) font and visibly "pops" to monospace only once the debounced
+    // highlight pass re-applies attributes — the font-jump the operator saw per keystroke.
+    // `EditorRepresentable.update` keeps these in sync when the font size changes.
+    let baseFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    font = baseFont
+    typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
   }
 
   func setupGutter(layoutManager: NSTextLayoutManager) {

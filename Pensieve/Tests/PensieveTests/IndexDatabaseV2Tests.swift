@@ -37,9 +37,15 @@ final class IndexDatabaseV2Tests: XCTestCase {
     XCTAssertTrue(
       expectedV2Tables.isSubset(of: tables),
       "missing v2 tables: \(expectedV2Tables.subtracting(tables).sorted())")
+    // STAGE 1 (external-content FTS): the legacy CONTENTFUL `workspace_search_documents`
+    // table is RETIRED and replaced by the external-content `document_fts` index over
+    // `documents`. The search-index surface must still exist — now as `document_fts`.
     XCTAssertTrue(
+      tables.contains("document_fts"),
+      "external-content FTS table document_fts must exist after the v2 migrations")
+    XCTAssertFalse(
       tables.contains("workspace_search_documents"),
-      "existing FTS table workspace_search_documents must survive v2 migrations")
+      "legacy contentful FTS table workspace_search_documents must be retired (no double body)")
 
     let indices = try readIndexNames(at: databaseURL)
     let expectedIndices: Set<String> = [

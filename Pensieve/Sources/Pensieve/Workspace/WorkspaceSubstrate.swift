@@ -29,7 +29,7 @@ enum WorkspaceBookmarkStatus {
 final class WorkspaceSubstrate {
   static let shared = WorkspaceSubstrate()
 
-  private let store: WorkspaceCacheStore
+  let store: WorkspaceCacheStore
   private let scannerVersion: Int
   private let cacheSchemaVersion: Int
   private let bookmarkStatus: (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus
@@ -52,6 +52,28 @@ final class WorkspaceSubstrate {
     identity: WorkspaceIdentity,
     currentRoots: [URL],
     currentExclusions: Set<String>
+  ) throws -> WorkspaceCacheVerdict {
+    try validate(
+      identity: identity,
+      currentRoots: currentRoots,
+      currentExclusions: currentExclusions,
+      precomputedFingerprint: nil
+    )
+  }
+
+  /// Same verdict logic as `validate(identity:currentRoots:currentExclusions:)` but lets the
+  /// caller supply an ALREADY-COMPUTED `TreeFingerprint` instead of re-walking the filesystem.
+  /// The cold-open path walks the tree exactly once (via `workspaceBuilder`) and derives the
+  /// fingerprint from that single walk (`TreeFingerprint.compute(from:root:)`); passing it here
+  /// lets the cold-start skip-gate consult the SAME substrate verdict (schema / scanner /
+  /// exclusions / roots / bookmark / file-evidence checks) without the substrate doing its own
+  /// second walk. When `precomputedFingerprint` is `nil` the substrate computes it itself (the
+  /// original behavior), so every existing caller is unchanged.
+  func validate(
+    identity: WorkspaceIdentity,
+    currentRoots: [URL],
+    currentExclusions: Set<String>,
+    precomputedFingerprint: TreeFingerprint?
   ) throws -> WorkspaceCacheVerdict {
     guard currentRoots.count == 1 else {
       return .accessDenied(reason: "multi-root not supported in B-1b")
@@ -83,8 +105,9 @@ final class WorkspaceSubstrate {
       return .accessDenied(reason: "workspace root is not reachable: \(root.path)")
     }
 
-    let currentFingerprint = try TreeFingerprint.compute(
-      rootURL: root, exclusions: currentExclusions)
+    let currentFingerprint =
+      try precomputedFingerprint
+      ?? TreeFingerprint.compute(rootURL: root, exclusions: currentExclusions)
 
     // Diagnostic order is pinned by tests: schema, scanner, exclusions, roots,
     // bookmark, file evidence, then valid.
@@ -127,7 +150,25 @@ final class WorkspaceSubstrate {
     try validate(
       identity: identity,
       currentRoots: currentRoots,
-      currentExclusions: currentExclusions
+      currentExclusions: currentExclusions,
+      precomputedFingerprint: nil
+    )
+  }
+
+  /// `open` variant fed a fingerprint computed from the cold-open's single tree walk, so the
+  /// cold-start skip-gate reuses the substrate verdict without a second walk. See the matching
+  /// `validate(...:precomputedFingerprint:)`.
+  func open(
+    identity: WorkspaceIdentity,
+    currentRoots: [URL],
+    currentExclusions: Set<String>,
+    precomputedFingerprint: TreeFingerprint?
+  ) throws -> WorkspaceCacheVerdict {
+    try validate(
+      identity: identity,
+      currentRoots: currentRoots,
+      currentExclusions: currentExclusions,
+      precomputedFingerprint: precomputedFingerprint
     )
   }
 
