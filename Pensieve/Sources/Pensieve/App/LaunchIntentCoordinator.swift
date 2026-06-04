@@ -77,6 +77,13 @@ final class LaunchIntentCoordinator: ObservableObject {
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
+    // Pensieve owns its own in-app document tabs (`DocumentTabStrip`) backed by a single
+    // shared `AppState`/`documentSession`. macOS automatic window tabbing layered a second,
+    // native tab bar on top of that — and because every window shares the one session, the
+    // native tabs all rendered the same document. Disable automatic tabbing so the only tab
+    // surface is the app's own, which actually tracks the active document.
+    NSWindow.allowsAutomaticWindowTabbing = false
+
     // A bare `swift run` executable (no `.app` bundle, e.g. `make run`) launches as a
     // background process: no Dock icon, window stuck behind other apps, can't be brought
     // to the foreground. Force a regular activation policy in that case so the dev build

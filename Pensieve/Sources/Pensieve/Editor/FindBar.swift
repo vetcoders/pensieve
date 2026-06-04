@@ -6,6 +6,20 @@ struct FindBar: View {
 
   var body: some View {
     HStack(spacing: 6) {
+      // Disclosure toggle next to the search field: reveals/hides the Replace
+      // row inline so Replace is discoverable from the bar itself, not only via
+      // the ⌘⌥F menu shortcut.
+      Button {
+        appState.findReplaceMode.toggle()
+      } label: {
+        Image(systemName: appState.findReplaceMode ? "chevron.down" : "chevron.right")
+          .font(.system(size: 11, weight: .semibold))
+          .frame(width: 16, height: 16)
+      }
+      .buttonStyle(.borderless)
+      .help(appState.findReplaceMode ? "Hide Replace" : "Show Replace")
+      .accessibilityIdentifier("pensieve.find.toggleReplace")
+
       NativeSearchField(
         text: $appState.findQuery,
         placeholder: "Find",

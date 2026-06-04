@@ -70,6 +70,12 @@ struct PensieveCommands: Commands {
       .keyboardShortcut("s", modifiers: [.command, .shift])
       .disabled(!appState.documentSession.hasEditableBuffer)
 
+      Button("Share…") {
+        DocumentSharing.share(session: appState.documentSession)
+      }
+      .keyboardShortcut("s", modifiers: [.command, .control])
+      .disabled(!appState.documentSession.hasEditableBuffer)
+
       Divider()
 
       Button("Rename") {

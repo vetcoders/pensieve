@@ -91,3 +91,4 @@ dist/
 !AGENTS.md
 /.junie
 *.txt
+*.log

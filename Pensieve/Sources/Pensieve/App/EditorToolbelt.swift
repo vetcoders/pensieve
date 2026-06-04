@@ -33,6 +33,13 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     ToolbarItemGroup(placement: .primaryAction) {
+      Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
+        Image(systemName: "square.and.arrow.up")
+      }
+      .help("Share")
+      .disabled(!hasDocument)
+      .accessibilityIdentifier("pensieve.toolbar.share")
+
       previewThemePicker
       Button(action: { appState.requestPreviewRefresh() }) {
         Image(systemName: "arrow.clockwise")
