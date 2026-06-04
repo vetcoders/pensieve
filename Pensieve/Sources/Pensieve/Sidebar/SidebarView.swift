@@ -66,13 +66,23 @@ struct SidebarView: View {
         Spacer(minLength: 8)
 
         Button {
-          controller.createUntitledDocument()
+          createRootDocument()
         } label: {
           Image(systemName: "square.and.pencil")
         }
         .buttonStyle(.borderless)
-        .help("New Markdown File")
+        .help("New File")
         .accessibilityIdentifier("pensieve.sidebar.newFile")
+
+        Button {
+          createRootFolder()
+        } label: {
+          Image(systemName: "folder.badge.plus")
+        }
+        .buttonStyle(.borderless)
+        .help("New Folder")
+        .disabled(rootCreationURL == nil)
+        .accessibilityIdentifier("pensieve.sidebar.newFolder")
       }
 
       NativeSearchField(
@@ -222,10 +232,14 @@ struct SidebarView: View {
   private var workspaceList: some View {
     Group {
       if appState.workspaceTree.isEmpty {
-        sidebarEmptyTab(
-          icon: "folder",
-          message: "No workspace folder",
-          hint: "⌘⇧O opens a folder")
+        if appState.workspaceRoots.isEmpty {
+          sidebarEmptyTab(
+            icon: "folder",
+            message: "No workspace folder",
+            hint: "⌘⇧O opens a folder")
+        } else {
+          emptyWorkspaceRoot
+        }
       } else {
         List {
           ForEach(flattenedWorkspaceRows) { row in
@@ -250,6 +264,28 @@ struct SidebarView: View {
       Text(hint)
         .font(.caption2)
         .foregroundColor(.secondary)
+      Spacer()
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private var emptyWorkspaceRoot: some View {
+    VStack(spacing: 12) {
+      Spacer()
+      Image(systemName: "folder")
+        .font(.system(size: 28))
+        .foregroundColor(.secondary)
+      Text("Empty workspace")
+        .font(.subheadline)
+        .foregroundColor(.secondary)
+      HStack(spacing: 8) {
+        Button("New File") {
+          createRootDocument()
+        }
+        Button("New Folder") {
+          createRootFolder()
+        }
+      }
       Spacer()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -355,7 +391,7 @@ struct SidebarView: View {
   /// on-screen rows instead of eagerly building the entire expanded subtree.
   /// Walks only expanded branches (O(visible)).
   private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
-    flattenWorkspaceTree(appState.workspaceTree, expandedNodeIDs: expandedNodeIDs)
+    flattenWorkspaceTree(appState.sortedWorkspaceTree, expandedNodeIDs: expandedNodeIDs)
   }
 
   @ViewBuilder
@@ -539,6 +575,12 @@ struct SidebarView: View {
       revealInFinder(doc.url)
     }
 
+    if isExistingFile(doc.url) {
+      ShareLink(item: doc.url) {
+        Text("Share…")
+      }
+    }
+
     Divider()
 
     Button("Rename") {
@@ -620,11 +662,13 @@ struct SidebarView: View {
       }
     } else if let url = node.url {
       Button("New File") {
-        controller.createMarkdownFile(url: url.appendingPathComponent("Untitled.md"))
+        expandedNodeIDs.insert(node.id)
+        _ = controller.createDocument(in: url)
       }
 
       Button("New Folder") {
-        controller.createFolder(url: url.appendingPathComponent("New Folder"))
+        expandedNodeIDs.insert(node.id)
+        _ = controller.createFolder(in: url)
       }
 
       Divider()
@@ -665,6 +709,28 @@ struct SidebarView: View {
 
   private func openExternally(_ url: URL) {
     NSWorkspace.shared.open(url)
+  }
+
+  private var rootCreationURL: URL? {
+    appState.workspaceRoots.first?.url.standardizedFileURL ?? appState.folderURL
+  }
+
+  private func createRootDocument() {
+    if rootCreationURL != nil {
+      _ = controller.createDocument(in: nil)
+    } else {
+      controller.createUntitledDocument()
+    }
+  }
+
+  private func createRootFolder() {
+    _ = controller.createFolder(in: nil)
+  }
+
+  private func isExistingFile(_ url: URL) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+      && !isDirectory.boolValue
   }
 
   private func revealInFinder(_ url: URL) {

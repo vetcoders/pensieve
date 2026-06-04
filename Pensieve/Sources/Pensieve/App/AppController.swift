@@ -74,8 +74,52 @@ final class AppController: ObservableObject {
   }
 
   @discardableResult
+  func createDocument(in folderURL: URL?) -> URL? {
+    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
+      return nil
+    }
+    guard let directoryURL = documentCreationDirectory(folderURL) else {
+      appState.lastError = "Open a workspace folder before creating a workspace file."
+      return nil
+    }
+
+    let targetURL = availableSiblingURL(
+      for: directoryURL.appendingPathComponent("Untitled").appendingPathExtension("md")
+    )
+    appState.documentSession.createUntitled(title: targetURL.lastPathComponent)
+    appState.selectedDocumentID = nil
+    appState.lastError = nil
+
+    guard saveActiveDocument(as: targetURL) else {
+      return nil
+    }
+
+    let standardizedURL = targetURL.standardizedFileURL
+    appState.pendingSidebarRenameURL = standardizedURL
+    reindexCreatedDocument(at: standardizedURL)
+    return standardizedURL
+  }
+
+  @discardableResult
   func createFolder(url: URL) -> Bool {
     folderManager.createFolder(at: url, into: appState)
+  }
+
+  @discardableResult
+  func createFolder(in folderURL: URL?) -> URL? {
+    guard let directoryURL = documentCreationDirectory(folderURL) else {
+      appState.lastError = "Open a workspace folder before creating a workspace folder."
+      return nil
+    }
+
+    let targetURL = availableSiblingURL(for: directoryURL.appendingPathComponent("New Folder"))
+    guard folderManager.createFolder(at: targetURL, into: appState) else {
+      return nil
+    }
+
+    let standardizedURL = targetURL.standardizedFileURL
+    appState.pendingSidebarRenameURL = standardizedURL
+    return standardizedURL
   }
 
   @discardableResult
@@ -311,6 +355,46 @@ final class AppController: ObservableObject {
 
   private func untitledTitle(for index: Int) -> String {
     index == 1 ? "Untitled.md" : "Untitled \(index).md"
+  }
+
+  private func documentCreationDirectory(_ folderURL: URL?) -> URL? {
+    if let folderURL {
+      return folderURL.standardizedFileURL
+    }
+    return appState.workspaceRoots.first?.url.standardizedFileURL ?? appState.folderURL
+  }
+
+  private func availableSiblingURL(for url: URL) -> URL {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: url.path) else { return url.standardizedFileURL }
+
+    let directory = url.deletingLastPathComponent()
+    let ext = url.pathExtension
+    let base =
+      ext.isEmpty
+      ? url.lastPathComponent
+      : url.deletingPathExtension().lastPathComponent
+    var index = 2
+    while true {
+      let name = "\(base) \(index)"
+      let candidate =
+        ext.isEmpty
+        ? directory.appendingPathComponent(name)
+        : directory.appendingPathComponent(name).appendingPathExtension(ext)
+      if !fm.fileExists(atPath: candidate.path) {
+        return candidate.standardizedFileURL
+      }
+      index += 1
+    }
+  }
+
+  private func reindexCreatedDocument(at url: URL) {
+    let ref = appState.documentRef(for: url.standardizedFileURL)
+    let indexDatabase = indexDatabase
+    let appState = appState
+    Task {
+      _ = await indexDatabase.reindexInBackground(documents: [ref], appState: appState)
+    }
   }
 
   // MARK: - Tab Navigation (Quick Win)
