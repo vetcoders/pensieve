@@ -53,7 +53,17 @@ run-release: release-local  ## Build + launch signed .app (no notarize)
 .PHONY: clean
 clean:  ## Remove .build/ + dist/
 	@printf "$(C_CYAN)[clean]$(C_RESET) removing .build + dist\n"
-	@rm -rf $(BUILD_DIR) $(DIST)
+	@# Rename-aside before delete: a live SourceKit/IDE indexer writing into
+	@# .build/index-build races a plain `rm -rf` (it repopulates a dir mid-delete,
+	@# so rmdir hits ENOTEMPTY). An atomic rename detaches the tree from the path
+	@# the indexer holds, so the delete can't lose that race. Best-effort: never
+	@# abort the gated release if a stray file lingers.
+	@for d in $(BUILD_DIR) $(DIST); do \
+		[ -e "$$d" ] || continue; \
+		trash="$$d.trash.$$$$"; \
+		mv "$$d" "$$trash" 2>/dev/null || trash="$$d"; \
+		rm -rf "$$trash" 2>/dev/null || rm -rf "$$trash" 2>/dev/null || true; \
+	done
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) cleaned\n"
 
 .PHONY: clean-deep
