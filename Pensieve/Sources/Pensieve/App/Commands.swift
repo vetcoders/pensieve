@@ -3,6 +3,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct PensieveCommands: Commands {
+  @FocusedObject private var appState: AppState?
+  @FocusedObject private var controller: AppController?
+
+  var body: some Commands {
+    if let appState, let controller {
+      ActivePensieveCommands(appState: appState, controller: controller)
+    }
+  }
+}
+
+private struct ActivePensieveCommands: Commands {
   @ObservedObject var appState: AppState
   @ObservedObject var controller: AppController
 

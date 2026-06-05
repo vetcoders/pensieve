@@ -198,7 +198,7 @@ struct SidebarView: View {
           ForEach(appState.sortedOpenFiles) { doc in
             Button {
               appState.sidebarFocusedURL = doc.url.standardizedFileURL
-              controller.selectDocument(id: doc.id)
+              controller.openDocumentWindow(id: doc.id)
             } label: {
               documentRow(
                 doc,
@@ -564,7 +564,7 @@ struct SidebarView: View {
   @ViewBuilder
   private func documentContextMenu(for doc: DocumentRef) -> some View {
     Button("Open") {
-      controller.selectDocument(id: doc.id)
+      controller.openDocumentWindow(id: doc.id)
     }
 
     Button("Open in Default App") {

@@ -74,30 +74,40 @@ final class FolderManager {
   }
 
   func openFile(url: URL, into appState: AppState) {
+    guard let ref = registerOpenFile(url: url, into: appState) else {
+      return
+    }
+
+    DocumentStore.shared.load(ref: ref, into: appState)
+  }
+
+  func registerOpenFile(url: URL, into appState: AppState) -> DocumentRef? {
     guard WorkspaceScanner.isMarkdownFile(url) else {
       appState.lastError =
         "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
-      return
+      return nil
     }
 
     let standardizedURL = url.standardizedFileURL
     if let ref = appState.allDocuments.first(where: {
       $0.url.standardizedFileURL == url.standardizedFileURL
     }) {
-      DocumentStore.shared.select(ref: ref, into: appState)
-      return
+      appState.lastError = nil
+      return ref
     }
 
     do {
       try bookmarkStore.persistFile(url: url, into: appState)
     } catch {
       appState.lastError = "Could not open file: \(error.localizedDescription)"
+      return nil
     }
 
     let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
     appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
     appState.openFiles.append(ref)
-    DocumentStore.shared.load(ref: ref, into: appState)
+    appState.lastError = nil
+    return ref
   }
 
   @discardableResult
@@ -254,9 +264,6 @@ final class FolderManager {
     appState.openFiles = appState.openFiles.map { ref in
       ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
     }
-    appState.documentTabs = appState.documentTabs.map { ref in
-      ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
-    }
     if appState.selectedDocumentID?.standardizedFileURL == sourceURL {
       appState.selectedDocumentID = targetURL
       appState.documentSession.document = appState.makeDocumentRef(for: targetURL)
@@ -266,7 +273,6 @@ final class FolderManager {
   private func removeReferences(for source: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
     appState.openFiles.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
-    appState.documentTabs.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
     if let selected = appState.selectedDocumentID, isSameOrDescendant(selected, of: sourceURL) {
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
@@ -492,7 +498,6 @@ final class FolderManager {
     appState.workspaceTree = []
     appState.documents = []
     appState.openFiles = []
-    appState.documentTabs = []
     appState.excludedWorkspacePaths = []
     appState.workspaceSearchQuery = ""
     appState.workspaceSearchResults = []
@@ -1164,7 +1169,6 @@ final class FolderManager {
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
-    appState.pruneDocumentTabs()
   }
 
   private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
@@ -1598,7 +1602,6 @@ final class DocumentStore {
       let text = try String(contentsOf: ref.url, encoding: .utf8)
       appState.selectedDocumentID = ref.id
       appState.documentSession.load(document: ref, text: text)
-      appState.rememberDocumentTab(ref)
       appState.lastError = nil
     } catch {
       appState.lastError =
@@ -1789,11 +1792,7 @@ final class DocumentStore {
       appState.documents.append(ref)
     }
 
-    if let previousID, isNewSessionURL {
-      appState.forgetDocumentTab(id: previousID)
-    }
     appState.selectedDocumentID = ref.id
-    appState.rememberDocumentTab(ref)
   }
 
   private static func promptForDirtyUntitledSession(

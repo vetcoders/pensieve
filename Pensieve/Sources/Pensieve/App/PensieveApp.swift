@@ -1,42 +1,113 @@
+import AppKit
 import SwiftUI
 
 @main
 struct PensieveApp: App {
   @NSApplicationDelegateAdaptor(PensieveAppDelegate.self) private var appDelegate
-  @StateObject private var appState: AppState
-  @StateObject private var controller: AppController
+  @StateObject private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
 
   init() {
-    let appState = AppState()
-    _appState = StateObject(wrappedValue: appState)
-    _controller = StateObject(
-      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+    _workspaceStore = StateObject(wrappedValue: WorkspaceStore())
     _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
     _themeManager = StateObject(wrappedValue: ThemeManager())
   }
 
   var body: some Scene {
-    WindowGroup("Pensieve") {
-      ContentView()
-        .environmentObject(appState)
-        .environmentObject(controller)
-        .environmentObject(themeManager)
-        .frame(minWidth: 720, minHeight: 480)
-        .task {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
-        }
-        .onOpenURL { url in
-          launchIntentCoordinator.handle(urls: [url])
-        }
+    WindowGroup("Pensieve", for: DocumentRef.self) { document in
+      PensieveWindowRoot(
+        workspaceStore: workspaceStore,
+        launchIntentCoordinator: launchIntentCoordinator,
+        themeManager: themeManager,
+        initialDocument: document.wrappedValue
+      )
     }
     .windowStyle(.titleBar)
     .windowToolbarStyle(.unified(showsTitle: true))
     .defaultSize(width: 1180, height: 760)
     .windowResizability(.contentMinSize)
     .commands {
-      PensieveCommands(appState: appState, controller: controller)
+      PensieveCommands()
     }
+  }
+}
+
+private struct PensieveWindowRoot: View {
+  @Environment(\.openWindow) private var openWindow
+
+  let launchIntentCoordinator: LaunchIntentCoordinator
+  let themeManager: ThemeManager
+  let initialDocument: DocumentRef?
+
+  @StateObject private var appState: AppState
+  @StateObject private var controller: AppController
+  @State private var loadedInitialDocumentID: DocumentRef.ID?
+  @State private var currentWindow: NSWindow?
+
+  init(
+    workspaceStore: WorkspaceStore,
+    launchIntentCoordinator: LaunchIntentCoordinator,
+    themeManager: ThemeManager,
+    initialDocument: DocumentRef?
+  ) {
+    self.launchIntentCoordinator = launchIntentCoordinator
+    self.themeManager = themeManager
+    self.initialDocument = initialDocument
+
+    let appState = AppState(workspaceStore: workspaceStore)
+    _appState = StateObject(wrappedValue: appState)
+    _controller = StateObject(
+      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+  }
+
+  var body: some View {
+    ContentView()
+      .environmentObject(appState)
+      .environmentObject(controller)
+      .environmentObject(themeManager)
+      .focusedSceneObject(appState)
+      .focusedSceneObject(controller)
+      .background(
+        DocumentWindowAccessor(documentID: appState.selectedDocumentID) { window in
+          currentWindow = window
+        }
+      )
+      .frame(minWidth: 720, minHeight: 480)
+      .task {
+        configureDocumentRouting()
+        if let initialDocument {
+          openInitialDocument(initialDocument)
+        } else {
+          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
+        }
+      }
+      .onChange(of: initialDocument?.id) { _ in
+        if let initialDocument {
+          openInitialDocument(initialDocument)
+        }
+      }
+      .onOpenURL { url in
+        controller.openFile(url: url)
+      }
+  }
+
+  private func configureDocumentRouting() {
+    controller.requestOpenDocumentWindow = { ref in
+      DocumentWindowRegistry.shared.open(ref, openWindow: openWindow)
+    }
+    controller.requestCloseCurrentWindowIfEmpty = {
+      guard !appState.documentSession.hasEditableBuffer else { return }
+      currentWindow?.close()
+    }
+  }
+
+  private func openInitialDocument(_ ref: DocumentRef) {
+    guard loadedInitialDocumentID?.standardizedFileURL != ref.id.standardizedFileURL else {
+      return
+    }
+    loadedInitialDocumentID = ref.id.standardizedFileURL
+    controller.start(restoringWorkspace: false)
+    controller.openFileInCurrentWindow(url: ref.url)
   }
 }

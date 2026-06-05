@@ -57,11 +57,18 @@ final class LaunchIntentCoordinator: ObservableObject {
     let supportedFileURLs = urls.filter(isSupportedLaunchFile)
     let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }
 
-    for url in supportedFileURLs {
-      controller.openFile(url: url)
+    if controller.requestOpenDocumentWindow != nil, let firstURL = supportedFileURLs.first {
+      controller.openFileInCurrentWindow(url: firstURL)
+      for url in supportedFileURLs.dropFirst() {
+        controller.openFile(url: url)
+      }
+    } else {
+      for url in supportedFileURLs {
+        controller.openFile(url: url)
+      }
     }
 
-    if let firstURL = supportedFileURLs.first {
+    if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first {
       controller.selectDocument(id: firstURL.standardizedFileURL)
     }
 
@@ -77,12 +84,7 @@ final class LaunchIntentCoordinator: ObservableObject {
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
-    // Pensieve owns its own in-app document tabs (`DocumentTabStrip`) backed by a single
-    // shared `AppState`/`documentSession`. macOS automatic window tabbing layered a second,
-    // native tab bar on top of that — and because every window shares the one session, the
-    // native tabs all rendered the same document. Disable automatic tabbing so the only tab
-    // surface is the app's own, which actually tracks the active document.
-    NSWindow.allowsAutomaticWindowTabbing = false
+    NSWindow.allowsAutomaticWindowTabbing = true
 
     // A bare `swift run` executable (no `.app` bundle, e.g. `make run`) launches as a
     // background process: no Dock icon, window stuck behind other apps, can't be brought

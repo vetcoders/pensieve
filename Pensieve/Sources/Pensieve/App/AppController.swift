@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CoreGraphics
 import Foundation
@@ -13,6 +14,8 @@ final class AppController: ObservableObject {
   private var didStart = false
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
+  var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  var requestCloseCurrentWindowIfEmpty: (() -> Void)?
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -61,6 +64,21 @@ final class AppController: ObservableObject {
   }
 
   func openFile(url: URL) {
+    guard let ref = folderManager.registerOpenFile(url: url, into: appState) else {
+      return
+    }
+
+    if let requestOpenDocumentWindow {
+      requestOpenDocumentWindow(ref)
+      if !appState.documentSession.hasEditableBuffer {
+        requestCloseCurrentWindowIfEmpty?()
+      }
+    } else {
+      documentStore.load(ref: ref, into: appState)
+    }
+  }
+
+  func openFileInCurrentWindow(url: URL) {
     folderManager.openFile(url: url, into: appState)
   }
 
@@ -225,38 +243,25 @@ final class AppController: ObservableObject {
     _ = documentStore.select(ref: ref, into: appState)
   }
 
-  func closeDocumentTab(id: DocumentRef.ID) {
-    let closingActiveDocument =
-      appState.selectedDocumentID?.standardizedFileURL == id.standardizedFileURL
-    guard !closingActiveDocument || documentStore.prepareForDocumentSwitch(appState: appState)
-    else {
+  func openDocumentWindow(id: DocumentRef.ID?) {
+    guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
       return
     }
 
-    let currentTabs = appState.documentTabs
-    let closingIndex = currentTabs.firstIndex {
-      $0.id.standardizedFileURL == id.standardizedFileURL
-    }
-    appState.forgetDocumentTab(id: id)
-
-    guard closingActiveDocument else { return }
-
-    let remainingTabs = appState.documentTabs
-    let replacementIndex = min(closingIndex ?? remainingTabs.count, remainingTabs.count - 1)
-    if replacementIndex >= 0, remainingTabs.indices.contains(replacementIndex) {
-      _ = documentStore.select(ref: remainingTabs[replacementIndex], into: appState)
+    if let requestOpenDocumentWindow {
+      requestOpenDocumentWindow(ref)
     } else {
-      _ = documentStore.select(ref: nil, into: appState)
+      selectDocument(id: ref.id)
     }
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {
-    selectDocument(id: result.document.id)
+    openDocumentWindow(id: result.document.id)
   }
 
   func selectWorkspaceNode(_ node: WorkspaceNode) {
     guard let documentID = node.documentID else { return }
-    selectDocument(id: documentID)
+    openDocumentWindow(id: documentID)
   }
 
   func updateWorkspaceSearch(query: String) {
@@ -341,8 +346,7 @@ final class AppController: ObservableObject {
 
   private func nextUntitledTitle() -> String {
     let existingTitles = Set(
-      ([appState.documentSession.displayTitle] + appState.documentTabs.map(\.title))
-        .filter { $0.hasPrefix("Untitled") }
+      [appState.documentSession.displayTitle].filter { $0.hasPrefix("Untitled") }
     )
 
     var index = max(1, nextUntitledIndex)
@@ -397,36 +401,12 @@ final class AppController: ObservableObject {
     }
   }
 
-  // MARK: - Tab Navigation (Quick Win)
-
   func selectNextTab() {
-    cycleTab(forward: true)
+    NSApp.sendAction(#selector(NSWindow.selectNextTab(_:)), to: nil, from: nil)
   }
 
   func selectPreviousTab() {
-    cycleTab(forward: false)
-  }
-
-  private func cycleTab(forward: Bool) {
-    let tabs = appState.documentTabs
-    guard !tabs.isEmpty else { return }
-
-    let currentURL = appState.selectedDocumentID?.standardizedFileURL
-    let currentIndex = tabs.firstIndex { $0.id.standardizedFileURL == currentURL }
-
-    let nextIndex: Int
-    if let currentIndex {
-      if forward {
-        nextIndex = (currentIndex + 1) % tabs.count
-      } else {
-        nextIndex = (currentIndex - 1 + tabs.count) % tabs.count
-      }
-    } else {
-      nextIndex = 0
-    }
-
-    let target = tabs[nextIndex]
-    selectDocument(id: target.id)
+    NSApp.sendAction(#selector(NSWindow.selectPreviousTab(_:)), to: nil, from: nil)
   }
 }
 

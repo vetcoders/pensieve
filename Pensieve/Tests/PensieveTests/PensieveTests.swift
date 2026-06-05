@@ -3354,12 +3354,12 @@ final class PensieveSmokeTests: XCTestCase {
     controller.selectDocument(id: betaURL.standardizedFileURL)
     controller.selectDocument(id: alphaURL.standardizedFileURL)
 
-    XCTAssertEqual(appState.documentTabs.map { $0.url.lastPathComponent }, ["beta.md", "alpha.md"])
     XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
   }
 
   @MainActor
-  func testDocumentTabsAreEmptyUntilDocumentsAreSelectedAndClosed() throws {
+  func testCloseActiveDocumentClearsWindowSessionWithoutDroppingWorkspace() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveTabsEmptyTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3380,16 +3380,16 @@ final class PensieveSmokeTests: XCTestCase {
       indexDatabase: indexDatabase
     )
 
-    XCTAssertTrue(appState.documentTabs.isEmpty)
-
     controller.openFolder(url: folder)
     controller.selectDocument(id: alphaURL.standardizedFileURL)
 
-    XCTAssertFalse(appState.documentTabs.isEmpty)
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
 
-    controller.closeDocumentTab(id: alphaURL.standardizedFileURL)
+    controller.closeActiveDocument()
 
-    XCTAssertTrue(appState.documentTabs.isEmpty)
+    XCTAssertNil(appState.selectedDocumentID)
+    XCTAssertNil(appState.documentSession.document)
+    XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
   }
 
   @MainActor
@@ -3420,16 +3420,8 @@ final class PensieveSmokeTests: XCTestCase {
     controller.selectDocument(id: alphaURL.standardizedFileURL)
     controller.selectDocument(id: betaURL.standardizedFileURL)
 
-    controller.closeDocumentTab(id: betaURL.standardizedFileURL)
+    controller.closeActiveDocument()
 
-    XCTAssertEqual(appState.documentTabs.map { $0.url.lastPathComponent }, ["alpha.md"])
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
-    XCTAssertEqual(appState.activeDocumentText, "alpha")
-    XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
-
-    controller.closeDocumentTab(id: alphaURL.standardizedFileURL)
-
-    XCTAssertTrue(appState.documentTabs.isEmpty)
     XCTAssertNil(appState.selectedDocumentID)
     XCTAssertNil(appState.documentSession.document)
     XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
