@@ -90,8 +90,10 @@ dist/
 /.junie
 *.txt
 *.log
-/*.md
-/docs/*.md
+# Broad on purpose: internal docs (specs, plans, agent prompts) sync between
+# machines over Tailscale + rsync, NOT through git/GitHub. Keep all markdown out
+# except the named governance/root files below.
+*.md
 !README.md
 !CODE_OF_CONDUCT.md
 !CHANGELOG.md
