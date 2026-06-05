@@ -50,7 +50,11 @@ final class AppController: ObservableObject {
     guard !didStart else { return }
     didStart = true
 
-    indexDatabase.open(into: appState)
+    // Warm the index OFF the main thread. Opening the GRDB pool + running migrations (incl. the FTS5
+    // content-link rebuild) on main here was the launch-time beachball; the workspace-restore path
+    // also opens lazily, so this is just an early, non-blocking warm-up.
+    let indexDatabase = indexDatabase
+    Task { await indexDatabase.openInBackground(into: appState) }
     guard restoringWorkspace else { return }
     folderManager.restoreLastFolderInBackground(into: appState)
   }

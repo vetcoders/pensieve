@@ -19,6 +19,11 @@ final class IndexDatabase {
   /// Tests await it via `waitForPendingReindex()` instead of sleeping.
   private var pendingIndexUpdateTask: Task<Void, Never>?
 
+  /// Coalesces concurrent off-main opens: the first `ensureOpenInBackground` that finds no pool
+  /// starts the migration on a detached executor and parks this task; later callers await the SAME
+  /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
+  private var openTask: Task<DatabasePool, Error>?
+
   init(
     databaseURL: URL? = nil,
     searchIndexBatchSize: Int = 32,
@@ -29,47 +34,102 @@ final class IndexDatabase {
     self.didInsertSearchIndexBatch = didInsertSearchIndexBatch
   }
 
+  /// Synchronous open — retained for the legacy synchronous workspace path and for tests that drive
+  /// the index directly. The LIVE app (background import path) opens via `openInBackground` so the
+  /// migration never blocks the main run loop. Building the pool + migrating is the heaviest cost
+  /// (incl. the FTS5 content-link rebuild migration), so this must not be on the hot import path.
   func open(into appState: AppState? = nil) {
     do {
-      let url: URL
-      if let configuredDatabaseURL {
-        url = configuredDatabaseURL
-      } else {
-        let directory = try applicationSupportDirectory()
-        url = directory.appendingPathComponent("index.db", isDirectory: false)
-      }
-
-      let directory = url.deletingLastPathComponent()
-      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-      let pool = try DatabasePool(path: url.path)
-
-      var migrator = DatabaseMigrator()
-      migrator.registerMigration("mvp_workspace_search_fts") { db in
-        try db.execute(
-          sql: """
-            CREATE VIRTUAL TABLE IF NOT EXISTS workspace_search_documents
-            USING fts5(
-                path UNINDEXED,
-                title,
-                display_path,
-                body,
-                is_ad_hoc UNINDEXED,
-                updated_at UNINDEXED,
-                tokenize = 'unicode61'
-            )
-            """)
-      }
-      registerIndexV2Migrations(&migrator)
-      try migrator.migrate(pool)
-
+      let url = try resolveDatabaseURL()
+      let pool = try Self.makeDatabasePool(at: url)
       databasePool = pool
       databaseURL = url
     } catch {
-      let message = "Could not open Pensieve index database: \(error.localizedDescription)"
-      appState?.lastError = message
-      NSLog(message)
+      reportOpenFailure(error, appState: appState)
     }
+  }
+
+  /// Opens the index off the main thread. Idempotent and concurrency-safe: returns the existing pool
+  /// immediately, joins an in-flight open, or starts one whose `DatabasePool(path:)` + migrations run
+  /// on a detached background executor. Only the cheap pool/url assignment happens back on the main
+  /// actor. This is the keystone of the P0 fix — every background DB path routes its first-open here.
+  func openInBackground(into appState: AppState? = nil) async {
+    _ = await ensureOpenInBackground(into: appState)
+  }
+
+  private func ensureOpenInBackground(into appState: AppState?) async -> DatabasePool? {
+    if let databasePool { return databasePool }
+    if let openTask { return try? await openTask.value }
+
+    let url: URL
+    do {
+      url = try resolveDatabaseURL()
+    } catch {
+      reportOpenFailure(error, appState: appState)
+      return nil
+    }
+
+    let task = Task<DatabasePool, Error> {
+      try await Task.detached(priority: .userInitiated) {
+        try Self.makeDatabasePool(at: url)
+      }.value
+    }
+    openTask = task
+    defer { openTask = nil }
+
+    do {
+      let pool = try await task.value
+      databasePool = pool
+      databaseURL = url
+      return pool
+    } catch {
+      reportOpenFailure(error, appState: appState)
+      return nil
+    }
+  }
+
+  private func resolveDatabaseURL() throws -> URL {
+    if let configuredDatabaseURL {
+      return configuredDatabaseURL
+    }
+    let directory = try applicationSupportDirectory()
+    return directory.appendingPathComponent("index.db", isDirectory: false)
+  }
+
+  private func reportOpenFailure(_ error: Error, appState: AppState?) {
+    let message = "Could not open Pensieve index database: \(error.localizedDescription)"
+    appState?.lastError = message
+    NSLog(message)
+  }
+
+  /// Builds the GRDB pool and runs all migrations. `nonisolated static` so it can execute on a
+  /// detached background executor (off main). `DatabasePool` already serializes its own reads/writes
+  /// across a managed thread pool; migrations are idempotent (`DatabaseMigrator` runs each once).
+  private nonisolated static func makeDatabasePool(at url: URL) throws -> DatabasePool {
+    let directory = url.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+    let pool = try DatabasePool(path: url.path)
+
+    var migrator = DatabaseMigrator()
+    migrator.registerMigration("mvp_workspace_search_fts") { db in
+      try db.execute(
+        sql: """
+          CREATE VIRTUAL TABLE IF NOT EXISTS workspace_search_documents
+          USING fts5(
+              path UNINDEXED,
+              title,
+              display_path,
+              body,
+              is_ad_hoc UNINDEXED,
+              updated_at UNINDEXED,
+              tokenize = 'unicode61'
+          )
+          """)
+    }
+    registerIndexV2Migrations(&migrator)
+    try migrator.migrate(pool)
+    return pool
   }
 
   /// B-2 IndexDatabase v2 schema (I-01, Wave A foundation).
@@ -90,7 +150,7 @@ final class IndexDatabase {
   /// `document_chunks` are scaffolding DDL only this wave (writers in H-1 and
   /// C-3 respectively). No FTS scaffolding migration is needed here — W-C-1
   /// owns the full FTS5 content-link rebuild as a self-contained migration.
-  private func registerIndexV2Migrations(_ migrator: inout DatabaseMigrator) {
+  private nonisolated static func registerIndexV2Migrations(_ migrator: inout DatabaseMigrator) {
     migrator.registerMigration("b2_v2_workspaces") { db in
       try db.execute(
         sql: """
@@ -452,10 +512,10 @@ final class IndexDatabase {
   /// success flag is observed by awaiting the dedicated `write` task this call owns.
   @discardableResult
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
-    guard let pool = ensureOpen(into: appState) else { return false }
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
-    let previous = pendingIndexUpdateTask
 
     let write = Task { [weak self] () -> Bool in
       await previous?.value
@@ -468,7 +528,7 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        self?.refreshSearchResults(in: appState)
+        await self?.refreshSearchResultsInBackground(in: appState)
         return true
       } catch {
         self?.report(error, appState: appState, action: "rebuild Pensieve search index")
@@ -559,10 +619,10 @@ final class IndexDatabase {
     deletingPaths: [String],
     appState: AppState? = nil
   ) async -> Bool {
-    guard let pool = ensureOpen(into: appState) else { return false }
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
-    let previous = pendingIndexUpdateTask
 
     let write = Task { [weak self] () -> Bool in
       await previous?.value
@@ -576,7 +636,7 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        self?.refreshSearchResults(in: appState)
+        await self?.refreshSearchResultsInBackground(in: appState)
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")
@@ -600,27 +660,52 @@ final class IndexDatabase {
   func indexedDocumentCount(forRootPaths rootPaths: [String], appState: AppState? = nil) -> Int {
     guard !rootPaths.isEmpty, let pool = ensureOpen(into: appState) else { return 0 }
     do {
-      return try pool.read { db in
-        var total = 0
-        for rootPath in rootPaths {
-          let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-          let count =
-            try Int.fetchOne(
-              db,
-              sql: """
-                SELECT COUNT(*) FROM documents d
-                JOIN workspaces w ON w.workspace_id = d.workspace_id
-                WHERE (w.canonical_path || '/' || d.path) LIKE ? ESCAPE '\\'
-                """,
-              arguments: [Self.likePrefixPattern(prefix) + "%"]
-            ) ?? 0
-          total += count
-        }
-        return total
-      }
+      return try Self.indexedDocumentCount(forRootPaths: rootPaths, pool: pool)
     } catch {
       report(error, appState: appState, action: "count Pensieve search index rows")
       return 0
+    }
+  }
+
+  /// Off-main twin of `indexedDocumentCount`. The cold-open skip-gate consults this on the background
+  /// workspace-build task; routing it through `ensureOpenInBackground` + a detached `pool.read` keeps
+  /// the "Scanning…" decision from blocking the run loop.
+  func indexedDocumentCountInBackground(forRootPaths rootPaths: [String], appState: AppState? = nil)
+    async -> Int
+  {
+    guard !rootPaths.isEmpty, let pool = await ensureOpenInBackground(into: appState) else {
+      return 0
+    }
+    do {
+      return try await Task.detached(priority: .userInitiated) {
+        try Self.indexedDocumentCount(forRootPaths: rootPaths, pool: pool)
+      }.value
+    } catch {
+      report(error, appState: appState, action: "count Pensieve search index rows")
+      return 0
+    }
+  }
+
+  private nonisolated static func indexedDocumentCount(
+    forRootPaths rootPaths: [String], pool: DatabasePool
+  ) throws -> Int {
+    try pool.read { db in
+      var total = 0
+      for rootPath in rootPaths {
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        let count =
+          try Int.fetchOne(
+            db,
+            sql: """
+              SELECT COUNT(*) FROM documents d
+              JOIN workspaces w ON w.workspace_id = d.workspace_id
+              WHERE (w.canonical_path || '/' || d.path) LIKE ? ESCAPE '\\'
+              """,
+            arguments: [Self.likePrefixPattern(prefix) + "%"]
+          ) ?? 0
+        total += count
+      }
+      return total
     }
   }
 
@@ -667,7 +752,7 @@ final class IndexDatabase {
   ) async -> [WorkspaceSearchResult] {
     let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedQuery.isEmpty else { return [] }
-    guard let pool = ensureOpen(into: appState) else { return [] }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return [] }
 
     do {
       return try await Task.detached(priority: .userInitiated) {
@@ -691,6 +776,18 @@ final class IndexDatabase {
       documents: appState.allDocuments,
       appState: appState
     )
+  }
+
+  /// Off-main twin of `refreshSearchResults`. The background index writers used to call the sync
+  /// `refreshSearchResults` on return — which runs `search` (a `pool.read`) ON THE MAIN ACTOR after
+  /// every reindex/delta. This reads the query/documents on the main actor, runs the actual FTS read
+  /// off-main via `searchInBackground`, then publishes the results back on the main actor.
+  func refreshSearchResultsInBackground(in appState: AppState?) async {
+    guard let appState else { return }
+    let query = appState.workspaceSearchQuery
+    let documents = appState.allDocuments
+    let results = await searchInBackground(query: query, documents: documents, appState: appState)
+    appState.workspaceSearchResults = results
   }
 
   func search(
@@ -723,7 +820,7 @@ final class IndexDatabase {
     documents: [DocumentRef],
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     let didInsertBatch = didInsertSearchIndexBatch
     let batchSize = searchIndexBatchSize
 
@@ -1530,7 +1627,7 @@ final class IndexDatabase {
     durationMs: Int,
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in
@@ -1567,7 +1664,7 @@ final class IndexDatabase {
     fingerprintMatches: Bool,
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in

@@ -9,7 +9,11 @@ class MarkdownTextView: NSTextView {
   var onFormatRequest: ((MarkdownFormat) -> Void)?
   var onEscape: (() -> Bool)?
   private let fallbackUndoManager = UndoManager()
-  private var formattingPopover: NSPopover?
+  // In-window floating accessory (a subview of this text view) — NOT an NSPopover. A popover is a
+  // separate key window: showing it makes the text view resign first-responder, so the user had to
+  // press Esc before typing/copying again. A non-responder subview in the SAME window never becomes
+  // key, so the text view keeps first-responder → no focus theft, no Esc. The bar is also draggable.
+  private var formattingAccessory: FloatingFormatBarView?
 
   override var undoManager: UndoManager? {
     super.undoManager ?? fallbackUndoManager
@@ -74,8 +78,13 @@ class MarkdownTextView: NSTextView {
   }
 
   override func keyDown(with event: NSEvent) {
-    if event.keyCode == 53, onEscape?() == true {
-      return
+    if event.keyCode == 53 {
+      // Esc dismisses the floating bar too (parity with the old transient popover), without
+      // consuming the key event meant for `onEscape` (find-bar / selection clearing).
+      hideFormattingPopover()
+      if onEscape?() == true {
+        return
+      }
     }
     super.keyDown(with: event)
   }
@@ -101,34 +110,61 @@ class MarkdownTextView: NSTextView {
   }
 
   func showFormattingPopover() {
-    guard selectedRange().length > 0, window?.firstResponder === self else { return }
-    guard formattingPopover?.isShown != true else { return }
-
-    let popover = NSPopover()
-    popover.behavior = .transient
-    popover.animates = false
-    popover.contentSize = NSSize(width: 244, height: 36)
-    popover.contentViewController = NSHostingController(
-      rootView: MarkdownFloatingFormatBar { [weak self] format in
-        self?.applyFloatingFormat(format)
-      })
-    formattingPopover = popover
+    guard selectedRange().length > 0, window?.firstResponder === self else {
+      hideFormattingPopover()
+      return
+    }
 
     let selection = selectedRange()
     var actualRange = NSRange(location: 0, length: 0)
     let screenRect = firstRect(forCharacterRange: selection, actualRange: &actualRange)
+    // The selection rect lives in this (flipped) text view's own coordinate space; anchoring the
+    // accessory there makes it scroll in lockstep with the text, so it never sits over a stale spot.
     let localRect: NSRect
     if let window {
       localRect = convert(window.convertFromScreen(screenRect), from: nil)
     } else {
       localRect = visibleRect
     }
-    popover.show(relativeTo: localRect, of: self, preferredEdge: .maxY)
+
+    let accessory =
+      formattingAccessory
+      ?? FloatingFormatBarView { [weak self] format in
+        self?.applyFloatingFormat(format)
+      }
+    if accessory.superview !== self {
+      accessory.removeFromSuperview()
+      addSubview(accessory)
+    }
+    formattingAccessory = accessory
+
+    let size = accessory.fittingBarSize
+    accessory.setFrameSize(size)
+    accessory.setFrameOrigin(accessoryOrigin(for: localRect, size: size))
+  }
+
+  /// Default position near the current selection, clamped into the visible rect. The bar prefers to
+  /// sit just above the selection's first line; if there is no room above, it drops below. The user
+  /// can drag it from here via the grip.
+  private func accessoryOrigin(for selectionRect: NSRect, size: NSSize) -> NSPoint {
+    let gap: CGFloat = 6
+    let visible = visibleRect
+    var y: CGFloat
+    if isFlipped {
+      y = selectionRect.minY - size.height - gap
+      if y < visible.minY { y = selectionRect.maxY + gap }
+    } else {
+      y = selectionRect.maxY + gap
+      if y + size.height > visible.maxY { y = selectionRect.minY - size.height - gap }
+    }
+    var x = selectionRect.minX
+    x = min(max(x, visible.minX + 4), max(visible.minX + 4, visible.maxX - size.width - 4))
+    return NSPoint(x: x, y: y)
   }
 
   func hideFormattingPopover() {
-    formattingPopover?.close()
-    formattingPopover = nil
+    formattingAccessory?.removeFromSuperview()
+    formattingAccessory = nil
   }
 
   @discardableResult
@@ -217,6 +253,93 @@ private struct MarkdownFloatingFormatBar: View {
       RoundedRectangle(cornerRadius: 6, style: .continuous)
         .fill(Color(NSColor.windowBackgroundColor).opacity(0.96))
     )
+  }
+}
+
+/// In-window host for the floating format bar. It is a plain `NSView` subview of the text view, so it
+/// never becomes the window's key/first-responder — the text view keeps focus while the bar is shown.
+/// A leading grip lets the user drag the whole bar to reposition it without intercepting button taps.
+private final class FloatingFormatBarView: NSView {
+  private let grip = FormatBarGrip()
+  private let hostingView: NSHostingView<MarkdownFloatingFormatBar>
+  private let gripWidth: CGFloat = 14
+
+  init(apply: @escaping (MarkdownFormat) -> Void) {
+    hostingView = NSHostingView(rootView: MarkdownFloatingFormatBar(apply: apply))
+    super.init(frame: .zero)
+    wantsLayer = true
+    layer?.cornerRadius = 6
+    layer?.masksToBounds = false
+    layer?.shadowColor = NSColor.black.cgColor
+    layer?.shadowOpacity = 0.18
+    layer?.shadowRadius = 6
+    layer?.shadowOffset = .zero
+    hostingView.translatesAutoresizingMaskIntoConstraints = true
+    addSubview(grip)
+    addSubview(hostingView)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  // Never participate in the responder chain — that is the whole point of not using NSPopover.
+  override var acceptsFirstResponder: Bool { false }
+
+  /// Intrinsic size of the SwiftUI bar plus the drag grip.
+  var fittingBarSize: NSSize {
+    let inner = hostingView.fittingSize
+    return NSSize(width: inner.width + gripWidth, height: max(inner.height, 28))
+  }
+
+  override func layout() {
+    super.layout()
+    grip.frame = NSRect(x: 0, y: 0, width: gripWidth, height: bounds.height)
+    hostingView.frame = NSRect(
+      x: gripWidth, y: 0, width: max(0, bounds.width - gripWidth), height: bounds.height)
+  }
+}
+
+/// Drag handle drawn as a column of dots. Dragging it moves the parent `FloatingFormatBarView` within
+/// its superview (the text view), clamped to the visible rect so the bar cannot be lost off-screen.
+private final class FormatBarGrip: NSView {
+  private var lastWindowPoint: NSPoint = .zero
+
+  override func resetCursorRects() {
+    addCursorRect(bounds, cursor: .openHand)
+  }
+
+  override func draw(_ dirtyRect: NSRect) {
+    NSColor.secondaryLabelColor.withAlphaComponent(0.5).setFill()
+    let dot: CGFloat = 2
+    let columnX = (bounds.width - dot) / 2
+    var y = bounds.midY - (dot * 3 + 4)
+    for _ in 0..<3 {
+      NSBezierPath(ovalIn: NSRect(x: columnX, y: y, width: dot, height: dot)).fill()
+      y += dot + 4
+    }
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    lastWindowPoint = event.locationInWindow
+  }
+
+  override func mouseDragged(with event: NSEvent) {
+    guard let bar = superview, let canvas = bar.superview else { return }
+    let now = event.locationInWindow
+    let dx = now.x - lastWindowPoint.x
+    let dy = now.y - lastWindowPoint.y
+    lastWindowPoint = now
+
+    var origin = bar.frame.origin
+    origin.x += dx
+    // Window y grows upward; a flipped canvas (NSTextView) grows downward, so invert there.
+    origin.y += canvas.isFlipped ? -dy : dy
+
+    let visible = canvas.visibleRect
+    origin.x = min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - bar.frame.width))
+    origin.y = min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - bar.frame.height))
+    bar.setFrameOrigin(origin)
   }
 }
 

@@ -597,6 +597,7 @@ final class FolderManager {
     rootURLs: [URL],
     exclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint? = nil,
+    precomputedIndexedDocumentCount: Int? = nil,
     into appState: AppState
   ) -> Bool {
     guard rootURLs.count == 1 else { return false }
@@ -621,11 +622,13 @@ final class FolderManager {
       guard case .valid = verdict else { return false }
 
       // Empty/missing index guard (invariant 2): a matching fingerprint over an index with no
-      // rows for this workspace must NOT skip — the operator may have nuked the index.
+      // rows for this workspace must NOT skip — the operator may have nuked the index. The background
+      // path pre-computes the count OFF the main actor and passes it in; the sync path computes here.
       let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
-      guard
-        indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: appState) > 0
-      else {
+      let indexedCount =
+        precomputedIndexedDocumentCount
+        ?? indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: appState)
+      guard indexedCount > 0 else {
         return false
       }
 
@@ -654,7 +657,9 @@ final class FolderManager {
       return
     }
 
-    indexDatabase.open(into: appState)
+    // The index is opened OFF the main thread inside `workspaceBuildTask` below (every DB consumer on
+    // this path — the skip-gate count, manifest commit, cold index — now opens via the background
+    // path). Opening + migrating here on main was a source of the "Scanning…" hang.
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     appState.workspaceActivity = .scanning(label)
@@ -683,6 +688,10 @@ final class FolderManager {
 
       self.applyWorkspaceScans(scans, into: appState)
 
+      // Open the index OFF the main thread (coalesced — subsequent DB consumers reuse this pool).
+      await self.indexDatabase.openInBackground(into: appState)
+      guard !Task.isCancelled else { return }
+
       // Cold-start skip-gate: a fresh launch hits this background path (empty in-memory tree, so
       // `attemptHotReopen` short-circuited). Before re-committing every document + re-running the
       // FTS reindex + flashing "Indexing N", consult the EXISTING substrate verdict against the
@@ -696,12 +705,20 @@ final class FolderManager {
         }.value
         : nil
       guard !Task.isCancelled else { return }
+      // The empty-index guard reads a COUNT — also off the main thread — before the skip decision.
+      let coldStartIndexedCount =
+        liveRoots.count == 1
+        ? await self.indexDatabase.indexedDocumentCountInBackground(
+          forRootPaths: liveRoots.map { $0.standardizedFileURL.path }, appState: appState)
+        : 0
+      guard !Task.isCancelled else { return }
       if let coldStartFingerprint,
         self.attemptColdStartValidSkip(
           scans: scans,
           rootURLs: liveRoots,
           exclusions: appState.excludedWorkspacePaths,
           precomputedFingerprint: coldStartFingerprint,
+          precomputedIndexedDocumentCount: coldStartIndexedCount,
           into: appState
         )
       {
@@ -730,9 +747,17 @@ final class FolderManager {
         FolderManager.currentWorkspaceSignature(roots: roots, exclusions: scanExclusions)
       }.value
       guard !Task.isCancelled else { return }
+      // Content guard for the cold-index decision, read OFF the main thread (the sync read inside
+      // `performColdIndex` would otherwise run on main during "Indexing…").
+      let coldRoots = appState.workspaceRoots.map(\.url)
+      let coldIndexHasContent =
+        await self.indexDatabase.indexedDocumentCountInBackground(
+          forRootPaths: coldRoots.map { $0.standardizedFileURL.path }, appState: appState) > 0
+      guard !Task.isCancelled else { return }
       let indexTask = self.performColdIndex(
-        rootURLs: appState.workspaceRoots.map(\.url),
+        rootURLs: coldRoots,
         currentSignature: currentSignature,
+        precomputedIndexHasContent: coldIndexHasContent,
         into: appState
       )
       self.indexUpdateTask = indexTask
@@ -790,7 +815,10 @@ final class FolderManager {
       switch verdict {
       case .valid:
         appState.workspaceActivity = .cacheHit(label)
-        indexDatabase.open(into: appState)
+        // In-session hot-reopen: the pool is already open from the initial cold open, so this is a
+        // no-op fast return; the rare first-open runs OFF the main thread rather than blocking it.
+        let indexDatabase = indexDatabase
+        Task { await indexDatabase.openInBackground(into: appState) }
         startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         // Restore the in-memory `.md` baseline so the FIRST edit after this in-session hot-reopen
         // goes INCREMENTAL (fixes the prior "hot-reopen leaves baseline nil → first change
@@ -1013,6 +1041,7 @@ final class FolderManager {
   private func performColdIndex(
     rootURLs: [URL],
     currentSignature: WorkspaceSignature?,
+    precomputedIndexHasContent: Bool? = nil,
     into appState: AppState
   ) -> Task<Void, Never>? {
     let documents = appState.allDocuments
@@ -1037,8 +1066,11 @@ final class FolderManager {
     }
 
     let persisted = cacheStore.readSearchSignature(for: identity)
+    // The background import path pre-computes this content guard OFF the main actor and passes it in;
+    // the legacy synchronous path computes it here (its `pool.read` then runs on the caller's thread).
     let indexHasContent =
-      indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: appState) > 0
+      precomputedIndexHasContent
+      ?? (indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: appState) > 0)
 
     // SKIP: nothing changed and the index is already populated for this workspace.
     if let persisted, indexHasContent,
