@@ -50,6 +50,19 @@ run: build  ## Build + launch app (debug, no .app bundle)
 run-release: release-local  ## Build + launch signed .app (no notarize)
 	@open "$(APP_BUNDLE)"
 
+.PHONY: install-app
+install-app: release-local  ## Build signed .app + swap the production bundle in /Applications
+	@printf "$(C_CYAN)[install]$(C_RESET) quitting running Pensieve — a live process + bundle swap = SIGKILL (code signature invalid)\n"
+	@osascript -e 'tell application id "io.vetcoders.pensieve" to quit' >/dev/null 2>&1 || true
+	@pkill -x Pensieve >/dev/null 2>&1 || true
+	@sleep 0.6
+	@printf "$(C_CYAN)[install]$(C_RESET) swapping /Applications/Pensieve.app\n"
+	@rm -rf "/Applications/Pensieve.app"
+	@ditto "$(APP_BUNDLE)" "/Applications/Pensieve.app"
+	@printf "$(C_CYAN)[install]$(C_RESET) relaunching from /Applications\n"
+	@open "/Applications/Pensieve.app"
+	@printf "$(C_GREEN)[ ok ]$(C_RESET) installed $(APP_BUNDLE) → /Applications/Pensieve.app\n"
+
 .PHONY: clean
 clean:  ## Remove .build/ + dist/
 	@printf "$(C_CYAN)[clean]$(C_RESET) removing .build + dist\n"
