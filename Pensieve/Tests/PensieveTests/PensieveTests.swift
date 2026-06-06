@@ -3359,6 +3359,54 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDocumentWindowAttachDefersNativeTabMutationDuringModalRunLoop() throws {
+    var canMutateWindowTabs = false
+    var scheduledWork: [@MainActor () -> Void] = []
+    var mergeCount = 0
+    var orderCount = 0
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { canMutateWindowTabs },
+      scheduleDeferredMainWork: { scheduledWork.append($0) },
+      mergeWindowIntoTabs: { _, _ in mergeCount += 1 },
+      orderAndActivateWindow: { _ in orderCount += 1 }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-modal-safe.md").standardizedFileURL
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    defer {
+      window.close()
+    }
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(scheduledWork.count, 1)
+    XCTAssertEqual(mergeCount, 0)
+    XCTAssertEqual(orderCount, 0)
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(scheduledWork.count, 1, "repeated SwiftUI window accessors coalesce retries")
+    XCTAssertEqual(mergeCount, 0)
+    XCTAssertEqual(orderCount, 0)
+
+    canMutateWindowTabs = true
+    let deferredAttach = try XCTUnwrap(scheduledWork.popLast())
+    deferredAttach()
+
+    XCTAssertEqual(scheduledWork.count, 0)
+    XCTAssertEqual(mergeCount, 0)
+    XCTAssertEqual(orderCount, 1)
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(orderCount, 1, "same window/document attach stays idempotent after completion")
+  }
+
+  @MainActor
   func testCloseActiveDocumentClearsWindowSessionWithoutDroppingWorkspace() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveTabsEmptyTests-\(UUID().uuidString)", isDirectory: true)
