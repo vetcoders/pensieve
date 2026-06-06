@@ -401,15 +401,32 @@ final class FolderManager {
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
 
-    // Expensive: WorkspaceScanner.build (full enumeration) + per-file resourceValues stat.
-    // Run it OFF the main actor on a detached background task.
+    // Step 1 — the `.md` signature scan OFF the main actor (full enumeration + per-file stat).
     let signature = await Task.detached(priority: .utility) {
       FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
     }.value
-
     guard !Task.isCancelled else { return }
     guard appState.hasWorkspaceContent else { return }
-    applyRefresh(into: appState, signature: signature)
+
+    // Step 2 — cheap delta check on the main actor. A non-`.md` change (screenshot, .DS_Store,
+    // .git, sibling app writes) leaves the `.md` signature unchanged → skip the rebuild entirely.
+    // Only a genuine `.md` change pays for the rebuild scan.
+    if let baseline = lastWorkspaceSignature, let signature,
+      WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
+    {
+      return
+    }
+
+    // Step 3 — a `.md` file actually changed: enumerate the tree for the rebuild OFF the main
+    // actor too, then hop to main only to assign it. Previously `rebuildWorkspace` re-enumerated
+    // the whole tree (54k+ files) ON the main actor here — the steady beachball under live churn.
+    let workspaceBuilder = workspaceBuilder
+    let scans = await Task.detached(priority: .utility) {
+      workspaceBuilder(roots, exclusions)
+    }.value
+    guard !Task.isCancelled else { return }
+    guard appState.hasWorkspaceContent else { return }
+    applyRefresh(into: appState, signature: signature, scans: scans)
   }
 
   /// Shared rebuild tail used by both the synchronous `refresh` and the off-main watcher
@@ -422,7 +439,8 @@ final class FolderManager {
   private func applyRefresh(
     into appState: AppState,
     signature: WorkspaceSignature?,
-    force: Bool = false
+    force: Bool = false,
+    scans: [WorkspaceScan]? = nil
   ) {
     if !force, let signature, let baseline = lastWorkspaceSignature,
       WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
@@ -434,7 +452,7 @@ final class FolderManager {
 
     workspaceBuildTask?.cancel()
     let previousSelection = appState.selectedDocumentID
-    rebuildWorkspace(into: appState, signature: signature)
+    rebuildWorkspace(into: appState, signature: signature, precomputedScans: scans)
     let documents = appState.allDocuments
 
     if let previousSelection, documents.contains(where: { $0.id == previousSelection }) {
@@ -871,11 +889,17 @@ final class FolderManager {
   /// `signature` is the pre-computed `.md` signature from the caller (already computed off the
   /// main actor on the watcher path). When `nil` (a callsite that did not pre-compute, or a
   /// stat failure), it is recomputed here so the baseline is never left stale.
-  private func rebuildWorkspace(into appState: AppState, signature: WorkspaceSignature? = nil) {
+  private func rebuildWorkspace(
+    into appState: AppState, signature: WorkspaceSignature? = nil,
+    precomputedScans: [WorkspaceScan]? = nil
+  ) {
     let roots = appState.workspaceRoots.map(\.url)
     let exclusions = appState.excludedWorkspacePaths
     let baseline = lastWorkspaceSignature
-    let scans = workspaceBuilder(roots, exclusions)
+    // Reuse an off-main enumeration when the caller already walked the tree (watcher path), so
+    // the main actor never re-enumerates a large workspace (54k+ files) just to rebuild it —
+    // that on-main re-walk was the steady beachball under live `.md` churn.
+    let scans = precomputedScans ?? workspaceBuilder(roots, exclusions)
     applyWorkspaceScans(scans, into: appState)
 
     let newSignature =
