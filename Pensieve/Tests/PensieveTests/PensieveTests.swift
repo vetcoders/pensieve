@@ -3359,6 +3359,39 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDocumentWindowOpenDefersWindowCreationDuringModalRunLoop() throws {
+    var canMutateWindowTabs = false
+    var scheduledWork: [@MainActor () -> Void] = []
+    var openedRefs: [DocumentRef] = []
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { canMutateWindowTabs },
+      scheduleDeferredMainWork: { scheduledWork.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-modal-open-safe.md").standardizedFileURL
+    let ref = DocumentRef(id: documentID)
+
+    registry.open(ref) { openedRefs.append($0) }
+
+    XCTAssertEqual(scheduledWork.count, 1)
+    XCTAssertTrue(openedRefs.isEmpty)
+
+    registry.open(ref) { openedRefs.append($0) }
+
+    XCTAssertEqual(scheduledWork.count, 1, "modal-time open retries coalesce per document")
+    XCTAssertTrue(openedRefs.isEmpty)
+
+    canMutateWindowTabs = true
+    let deferredOpen = try XCTUnwrap(scheduledWork.popLast())
+    deferredOpen()
+
+    XCTAssertEqual(scheduledWork.count, 0)
+    XCTAssertEqual(openedRefs.map(\.id), [documentID])
+  }
+
+  @MainActor
   func testDocumentWindowAttachDefersNativeTabMutationDuringModalRunLoop() throws {
     var canMutateWindowTabs = false
     var scheduledWork: [@MainActor () -> Void] = []

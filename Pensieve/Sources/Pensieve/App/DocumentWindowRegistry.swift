@@ -6,6 +6,7 @@ final class DocumentWindowRegistry {
   static let shared = DocumentWindowRegistry()
 
   typealias DeferredMainWork = @MainActor () -> Void
+  typealias DocumentOpener = @MainActor (DocumentRef) -> Void
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
   private var pendingMergeTargets: [URL: WeakWindow] = [:]
@@ -38,10 +39,10 @@ final class DocumentWindowRegistry {
     self.orderAndActivateWindow = orderAndActivateWindow
   }
 
-  func open(_ ref: DocumentRef, openWindow: OpenWindowAction) {
+  func open(_ ref: DocumentRef, openDocument: @escaping DocumentOpener) {
     let documentID = ref.id.standardizedFileURL
     guard canMutateWindowTabs() else {
-      deferOpen(ref, documentID: documentID, openWindow: openWindow)
+      deferOpen(ref, documentID: documentID, openDocument: openDocument)
       return
     }
 
@@ -53,10 +54,10 @@ final class DocumentWindowRegistry {
     windowsByDocumentID[documentID] = nil
     orderedDocumentIDs.remove(documentID)
 
-    if let target = NSApp.keyWindow ?? NSApp.mainWindow {
+    if let target = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow {
       pendingMergeTargets[documentID] = WeakWindow(target)
     }
-    openWindow(value: ref)
+    openDocument(ref)
   }
 
   func attach(_ window: NSWindow, documentID: URL?) {
@@ -94,12 +95,16 @@ final class DocumentWindowRegistry {
     }
   }
 
-  private func deferOpen(_ ref: DocumentRef, documentID: URL, openWindow: OpenWindowAction) {
+  private func deferOpen(
+    _ ref: DocumentRef,
+    documentID: URL,
+    openDocument: @escaping DocumentOpener
+  ) {
     guard deferredOpenDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self] in
       guard let self else { return }
       deferredOpenDocumentIDs.remove(documentID)
-      open(ref, openWindow: openWindow)
+      open(ref, openDocument: openDocument)
     }
   }
 

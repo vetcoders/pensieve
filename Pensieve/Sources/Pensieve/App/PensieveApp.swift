@@ -94,7 +94,9 @@ private struct PensieveWindowRoot: View {
 
   private func configureDocumentRouting() {
     controller.requestOpenDocumentWindow = { ref in
-      DocumentWindowRegistry.shared.open(ref, openWindow: openWindow)
+      DocumentWindowRegistry.shared.open(ref) { ref in
+        openWindow(value: ref)
+      }
     }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
