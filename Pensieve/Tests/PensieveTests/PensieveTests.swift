@@ -3377,6 +3377,10 @@ final class PensieveSmokeTests: XCTestCase {
       styleMask: [.titled],
       backing: .buffered,
       defer: false)
+    // A window from this initializer defaults to `isReleasedWhenClosed = true`: `close()` would then
+    // release it, and ARC releases the local reference again at scope exit → double free (objc_release
+    // EXC_BAD_ACCESS, SIGSEGV). Let ARC own the single reference so teardown is balanced.
+    window.isReleasedWhenClosed = false
     defer {
       window.close()
     }
