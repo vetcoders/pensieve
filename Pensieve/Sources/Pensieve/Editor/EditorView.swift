@@ -90,6 +90,14 @@ struct EditorRepresentable: NSViewRepresentable {
 
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     guard let surface = context.coordinator.surface else { return }
+    // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
+    // objectWillChange on every keystroke, re-laying out this representable; without this the
+    // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
+    // A genuine text change (document load) is allowed to scroll; a pure re-render keeps the
+    // viewport where the user left it — caret only moves scroll when typing pushes it past
+    // the edge, which AppKit already did before this re-render ran.
+    let textUnchanged = surface.textStorage.string == text
+    let savedOrigin = scroll.contentView.bounds.origin
     surface.update(
       text: text,
       fontSize: fontSize,
@@ -99,6 +107,10 @@ struct EditorRepresentable: NSViewRepresentable {
       findQuery: findQuery,
       findBarVisible: findBarVisible
     )
+    if textUnchanged {
+      scroll.contentView.scroll(to: savedOrigin)
+      scroll.reflectScrolledClipView(scroll.contentView)
+    }
     context.coordinator.apply(formattingCommand, to: surface)
     if let selectedText = context.coordinator.applyFind(
       findCommand,
@@ -271,9 +283,20 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textStorage.string != text {
       isApplyingExternalText = true
+      // A model→view text re-sync must NOT yank the viewport to the caret. Preserve the
+      // caret + scroll across the full re-apply so a re-render never resets selection to 0
+      // and scrolls there (the "screen goes wild on every letter" regression).
+      let savedSelection = textView.selectedRange()
+      let savedOrigin = scrollView.contentView.bounds.origin
       textStorage.replaceCharacters(
         in: NSRange(location: 0, length: textStorage.length), with: text)
       textContentStorage.refreshHighlighting()
+      let newLength = (textStorage.string as NSString).length
+      let caret = min(savedSelection.location, newLength)
+      textView.setSelectedRange(
+        NSRange(location: caret, length: min(savedSelection.length, newLength - caret)))
+      scrollView.contentView.scroll(to: savedOrigin)
+      scrollView.reflectScrolledClipView(scrollView.contentView)
       isApplyingExternalText = false
     }
 

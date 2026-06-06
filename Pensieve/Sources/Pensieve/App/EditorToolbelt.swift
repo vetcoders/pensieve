@@ -20,6 +20,13 @@ struct EditorToolbelt: ToolbarContent {
     appState.documentSession.document != nil
   }
 
+  /// The format strip and editor-facing controls light up for ANY editable buffer —
+  /// untitled scratch notes included — not only file-backed documents. Gating them on
+  /// `document != nil` made the whole edit toolbar vanish while editing an untitled note.
+  private var hasEditableBuffer: Bool {
+    appState.documentSession.hasEditableBuffer
+  }
+
   var body: some ToolbarContent {
     ToolbarItemGroup(placement: .navigation) {
       modePicker
@@ -27,7 +34,7 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     ToolbarItemGroup(placement: .principal) {
-      if hasDocument {
+      if hasEditableBuffer {
         formatStrip
       }
     }
@@ -37,7 +44,7 @@ struct EditorToolbelt: ToolbarContent {
         Image(systemName: "square.and.arrow.up")
       }
       .help("Share")
-      .disabled(!hasDocument)
+      .disabled(!hasEditableBuffer)
       .accessibilityIdentifier("pensieve.toolbar.share")
 
       previewThemePicker
@@ -45,7 +52,7 @@ struct EditorToolbelt: ToolbarContent {
         Image(systemName: "arrow.clockwise")
       }
       .help("Reload Preview")
-      .disabled(!hasDocument)
+      .disabled(!hasEditableBuffer)
       .accessibilityIdentifier("pensieve.toolbar.reload")
 
       Toggle(isOn: $appState.previewAutoReload) {

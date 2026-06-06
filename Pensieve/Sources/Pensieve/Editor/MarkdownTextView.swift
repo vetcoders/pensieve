@@ -56,6 +56,10 @@ class MarkdownTextView: NSTextView {
     scrollView.rulersVisible = true
     self.gutter = newGutter
 
+    // Force a FULL gutter redraw on every scroll. Without explicit bounds-change posting the
+    // ruler can repaint only a partial dirty rect, leaving stale line numbers behind at the old
+    // scroll offset — the doubled/ghosted gutter the operator saw while the viewport jumped.
+    scrollView.contentView.postsBoundsChangedNotifications = true
     NotificationCenter.default.addObserver(
       self, selector: #selector(boundsDidChange), name: NSView.boundsDidChangeNotification,
       object: scrollView.contentView)
