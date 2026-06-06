@@ -1606,7 +1606,14 @@ final class DocumentStore {
     self.indexDocument =
       indexDocument
       ?? { ref, body, appState in
-        resolvedIndexDatabase.index(document: ref, body: body, appState: appState)
+        // Off-main autosave/save index tail: the single-doc `pool.write` + search refresh used to run
+        // synchronously on the main actor on every persisted edit (a per-save SQLite stall). Routing
+        // it through the off-main `indexInBackground` twin keeps the file write synchronous while the
+        // FTS update commits in the background; tests sync on it via `waitForPendingReindex()`.
+        Task {
+          await resolvedIndexDatabase.indexInBackground(
+            document: ref, body: body, appState: appState)
+        }
       }
     self.dirtyUntitledPrompt = dirtyUntitledPrompt ?? Self.promptForDirtyUntitledSession
     self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL

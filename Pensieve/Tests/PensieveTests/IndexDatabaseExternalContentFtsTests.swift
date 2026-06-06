@@ -236,7 +236,7 @@ final class IndexDatabaseExternalContentFtsTests: XCTestCase {
 
   // MARK: - (3) Ad-hoc stays searchable alongside a scoped workspace
 
-  /// An ad-hoc doc indexed via `index(document:body:)` (no workspace) coexists
+  /// An ad-hoc doc indexed via `indexInBackground(document:body:)` (no workspace) coexists
   /// with a scoped workspace doc and stays searchable; searching with only the
   /// workspace doc in scope does NOT surface the ad-hoc doc (scope respected),
   /// while including the ad-hoc ref surfaces it.
@@ -256,7 +256,9 @@ final class IndexDatabaseExternalContentFtsTests: XCTestCase {
     let adHocURL = base.appendingPathComponent("loose.md")
     try "adhoc rhodium content".write(to: adHocURL, atomically: true, encoding: .utf8)
     let adHocRef = DocumentRef(id: adHocURL.standardizedFileURL, isAdHoc: true)
-    database.index(document: adHocRef, body: "adhoc rhodium content")
+    // Awaiting the off-main twin is the write-completion sync point (it returns after the detached
+    // `pool.write` commits + the search refresh), so the synchronous asserts below see the row.
+    await database.indexInBackground(document: adHocRef, body: "adhoc rhodium content")
 
     // Ad-hoc doc is searchable when its ref is in scope.
     XCTAssertEqual(

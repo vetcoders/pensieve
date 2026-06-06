@@ -723,12 +723,19 @@ final class IndexDatabase {
     return escaped
   }
 
-  /// Single-doc index entry (autosave tail, ad-hoc open files). Writes the doc as
+  /// Single-doc index entry (ad-hoc open files, explicit one-shot, tests). Writes the doc as
   /// a `documents` row — the single FTS source — so the AI/AU triggers sync
   /// `document_fts`. An ad-hoc / rootless doc lands under the reserved
   /// `__adhoc__` workspace (full standardized path as its `documents.path`); a
   /// workspace doc lands under its own workspace row (relative path). The body is
   /// provided by the caller (the live editor text) rather than re-read from disk.
+  ///
+  /// SYNC: runs `ensureOpen` + `pool.write` + `refreshSearchResults` (a `pool.read`) on the calling
+  /// actor. The production autosave/save tail does NOT use this — it routes through the off-main
+  /// `indexInBackground` twin so a save never stalls the run loop on SQLite. Kept for the explicit
+  /// one-shot/test callers that want a synchronous, immediately-queryable write (the same
+  /// sync/background duality as `reindex` / `reindexInBackground` and `updateSearchIndex` /
+  /// `updateSearchIndexInBackground`).
   func index(document: DocumentRef, body: String, appState: AppState? = nil) {
     guard let pool = ensureOpen(into: appState) else { return }
     let record = Self.documentWriteRecord(from: document, body: body)
@@ -742,6 +749,47 @@ final class IndexDatabase {
     } catch {
       report(error, appState: appState, action: "update Pensieve search index")
     }
+  }
+
+  /// Off-main twin of `index(document:body:)` — the single-doc index entry the production autosave /
+  /// save tail uses. The sync `index` ran `ensureOpen` + `pool.write` (ensure-workspace + upsert) AND
+  /// `refreshSearchResults` (a `pool.read`) ON THE MAIN ACTOR on every persisted edit — a synchronous
+  /// SQLite stall on the run loop per save. This routes the write through the shared supersede chain
+  /// (`pendingIndexUpdateTask`) on a detached `.utility` task and hops back to the main actor only to
+  /// publish the refreshed search results, so a save never blocks typing/scrolling. Mirrors
+  /// `updateSearchIndexInBackground`'s detached/chained/`refreshSearchResultsInBackground` shape, so
+  /// concurrent index writes serialize in submission order and a failed write can never leave the FTS
+  /// index half-applied (single transaction).
+  ///
+  /// Returns `true` when the off-main write committed, `false` when it threw (still reported). Tests
+  /// sync on completion via `waitForPendingReindex()` instead of sleeping.
+  @discardableResult
+  func indexInBackground(
+    document: DocumentRef, body: String, appState: AppState? = nil
+  ) async -> Bool {
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
+    let record = Self.documentWriteRecord(from: document, body: body)
+
+    let write = Task { [weak self] () -> Bool in
+      await previous?.value
+      do {
+        try await Task.detached(priority: .utility) {
+          try pool.write { db in
+            try Self.ensureWorkspaceRow(for: record, in: db)
+            try Self.upsertDocument(record, in: db)
+          }
+        }.value
+        await self?.refreshSearchResultsInBackground(in: appState)
+        return true
+      } catch {
+        self?.report(error, appState: appState, action: "update Pensieve search index")
+        return false
+      }
+    }
+    // Supersede chain stays `Void`-typed (see `reindexInBackground`).
+    pendingIndexUpdateTask = Task { _ = await write.value }
+    return await write.value
   }
 
   func searchInBackground(
