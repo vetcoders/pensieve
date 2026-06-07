@@ -5,10 +5,15 @@ import UniformTypeIdentifiers
 struct PensieveCommands: Commands {
   @FocusedObject private var appState: AppState?
   @FocusedObject private var controller: AppController?
+  @ObservedObject var themeManager: ThemeManager
 
   var body: some Commands {
     if let appState, let controller {
-      ActivePensieveCommands(appState: appState, controller: controller)
+      ActivePensieveCommands(
+        appState: appState,
+        controller: controller,
+        themeManager: themeManager
+      )
     }
   }
 }
@@ -16,6 +21,7 @@ struct PensieveCommands: Commands {
 private struct ActivePensieveCommands: Commands {
   @ObservedObject var appState: AppState
   @ObservedObject var controller: AppController
+  @ObservedObject var themeManager: ThemeManager
 
   var body: some Commands {
     CommandGroup(replacing: .appInfo) {
@@ -85,6 +91,26 @@ private struct ActivePensieveCommands: Commands {
         DocumentSharing.share(session: appState.documentSession)
       }
       .keyboardShortcut("s", modifiers: [.command, .control])
+      .disabled(!appState.documentSession.hasEditableBuffer)
+
+      Button("Export HTML…") {
+        DocumentExport.exportHTML(
+          session: appState.documentSession,
+          theme: themeManager.current,
+          fontSize: appState.fontSize,
+          themeManager: themeManager
+        )
+      }
+      .disabled(!appState.documentSession.hasEditableBuffer)
+
+      Button("Export PDF…") {
+        DocumentExport.exportPDF(
+          session: appState.documentSession,
+          theme: themeManager.current,
+          fontSize: appState.fontSize,
+          themeManager: themeManager
+        )
+      }
       .disabled(!appState.documentSession.hasEditableBuffer)
 
       Divider()

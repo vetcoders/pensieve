@@ -57,9 +57,14 @@ extension PreviewDocument {
       body.contains("data-vc-math=")
       ? "<script>\(PreviewWebView.mathBootstrapScript)</script>"
       : ""
+    let baseElement =
+      baseURL.map { url in
+        "<base href=\"\(HTMLEmitter.escapeAttribute(url.absoluteString))\">"
+      } ?? ""
     let html = """
       <!DOCTYPE html>
       <html><head><meta charset="utf-8">
+      \(baseElement)
       <style>
       \(safeCSS)
       \(PreviewWebView.appearanceCSS(fontSize: fontSize))

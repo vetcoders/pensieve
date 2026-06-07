@@ -28,7 +28,7 @@ struct PensieveApp: App {
     .defaultSize(width: 1180, height: 760)
     .windowResizability(.contentMinSize)
     .commands {
-      PensieveCommands()
+      PensieveCommands(themeManager: themeManager)
     }
   }
 }
