@@ -817,6 +817,29 @@ final class IndexDatabase {
     }
   }
 
+  func backlinksInBackground(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int = 50,
+    appState: AppState? = nil
+  ) async -> [WorkspaceBacklinkResult] {
+    guard let pool = await ensureOpenInBackground(into: appState) else { return [] }
+
+    do {
+      return try await Task.detached(priority: .userInitiated) {
+        try Self.performBacklinkSearch(
+          to: target,
+          documents: documents,
+          limit: limit,
+          pool: pool
+        )
+      }.value
+    } catch {
+      report(error, appState: appState, action: "read Pensieve backlinks")
+      return []
+    }
+  }
+
   func refreshSearchResults(in appState: AppState?) {
     guard let appState else { return }
     appState.workspaceSearchResults = search(
@@ -857,6 +880,27 @@ final class IndexDatabase {
       )
     } catch {
       report(error, appState: appState, action: "search Pensieve index")
+      return []
+    }
+  }
+
+  func backlinks(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int = 50,
+    appState: AppState? = nil
+  ) -> [WorkspaceBacklinkResult] {
+    guard let pool = ensureOpen(into: appState) else { return [] }
+
+    do {
+      return try Self.performBacklinkSearch(
+        to: target,
+        documents: documents,
+        limit: limit,
+        pool: pool
+      )
+    } catch {
+      report(error, appState: appState, action: "read Pensieve backlinks")
       return []
     }
   }
@@ -1419,15 +1463,9 @@ final class IndexDatabase {
     // search in workspace A therefore never reads workspace B's rows out of
     // `documents`. The in-memory `documentsByPath` join remains as a safety net
     // (it also maps each hit back to its live `DocumentRef`).
-    var rootScopes = Set<String>()
-    var includeAdHoc = false
-    for document in documents {
-      if !document.isAdHoc, let rootURL = document.rootURL {
-        rootScopes.insert(rootURL.standardizedFileURL.path)
-      } else {
-        includeAdHoc = true
-      }
-    }
+    let scope = searchScope(for: documents)
+    let rootScopes = scope.rootScopes
+    let includeAdHoc = scope.includeAdHoc
     guard !rootScopes.isEmpty || includeAdHoc else { return [] }
 
     let records = try fetchRecords(
@@ -1441,6 +1479,56 @@ final class IndexDatabase {
       results
         .sorted { lhs, rhs in
           if lhs.score != rhs.score { return lhs.score < rhs.score }
+          if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+          return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
+        }
+        .prefix(limit)
+    )
+  }
+
+  private nonisolated static func performBacklinkSearch(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int,
+    pool: DatabasePool
+  ) throws -> [WorkspaceBacklinkResult] {
+    let documentsByPath = Dictionary(
+      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
+    )
+    guard !documentsByPath.isEmpty else { return [] }
+
+    let scope = searchScope(for: documents)
+    guard !scope.rootScopes.isEmpty || scope.includeAdHoc else { return [] }
+
+    let records = try fetchBacklinkRecords(
+      rootScopes: Array(scope.rootScopes),
+      includeAdHoc: scope.includeAdHoc,
+      pool: pool
+    )
+    let targetPath = target.url.standardizedFileURL.path
+    let targetRecord = records.first(where: { $0.path == targetPath })
+    let targetSlugs = backlinkTargetSlugs(for: target, indexedRecord: targetRecord)
+
+    let results = records.compactMap { record -> WorkspaceBacklinkResult? in
+      guard record.path != targetPath, let sourceDocument = documentsByPath[record.path] else {
+        return nil
+      }
+      let links = MarkdownWikilinks.extract(from: record.body)
+      guard let matchedLink = links.first(where: { targetSlugs.contains($0.slug) }) else {
+        return nil
+      }
+      return WorkspaceBacklinkResult(
+        sourceDocument: sourceDocument,
+        displayPath: record.displayPath,
+        snippet: backlinkSnippet(in: record.body, matching: targetSlugs),
+        matchedTarget: matchedLink.target,
+        updatedAt: Date(timeIntervalSince1970: record.updatedAt)
+      )
+    }
+
+    return Array(
+      results
+        .sorted { lhs, rhs in
           if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
           return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
         }
@@ -1486,25 +1574,14 @@ final class IndexDatabase {
           d.mtime AS updated_at
       """
 
-    // Scope predicate over `workspaces`: canonical_path in the caller's roots,
-    // and/or the reserved ad-hoc workspace. Bound args are appended in order.
-    var scopeClauses: [String] = []
-    var scopeArgs: [DatabaseValueConvertible] = []
-    if !rootScopes.isEmpty {
-      let placeholders = Array(repeating: "?", count: rootScopes.count).joined(separator: ", ")
-      scopeClauses.append("w.canonical_path IN (\(placeholders))")
-      scopeArgs.append(contentsOf: rootScopes)
-    }
-    if includeAdHoc {
-      scopeClauses.append("d.workspace_id = ?")
-      scopeArgs.append(Self.adHocWorkspaceID)
-    }
-    let scopePredicate = "(" + scopeClauses.joined(separator: " OR ") + ")"
+    let scope = scopePredicate(rootScopes: rootScopes, includeAdHoc: includeAdHoc)
+    let scopePredicate = scope.predicate
+    let scopeArgs = scope.arguments
 
     let ftsQuery = makeFTSQuery(from: query)
     if !ftsQuery.isEmpty {
       var matchArgs: StatementArguments = [ftsQuery]
-      matchArgs += StatementArguments(scopeArgs)
+      matchArgs += scopeArgs
       matchArgs += [limit]
       if let records = try? pool.read({ db in
         try SearchDocumentRecord.fetchAll(
@@ -1531,7 +1608,7 @@ final class IndexDatabase {
     }
 
     let pattern = "%\(query.lowercased())%"
-    var likeArgs: StatementArguments = StatementArguments(scopeArgs)
+    var likeArgs = scopeArgs
     likeArgs += [pattern, pattern, pattern, limit]
     return try pool.read { db in
       try SearchDocumentRecord.fetchAll(
@@ -1549,6 +1626,113 @@ final class IndexDatabase {
         arguments: likeArgs
       )
     }
+  }
+
+  private nonisolated static func fetchBacklinkRecords(
+    rootScopes: [String],
+    includeAdHoc: Bool,
+    pool: DatabasePool
+  ) throws -> [BacklinkDocumentRecord] {
+    let selectClause = """
+      SELECT
+          CASE WHEN w.canonical_path = '' THEN d.path
+               ELSE w.canonical_path || '/' || d.path END AS path,
+          d.title AS title,
+          CASE WHEN w.canonical_path = ''
+               THEN replace(d.path, rtrim(d.path, replace(d.path, '/', '')), '')
+               ELSE d.path END AS display_path,
+          d.body AS body,
+          d.is_ad_hoc AS is_ad_hoc,
+          d.mtime AS updated_at
+      """
+    let scope = scopePredicate(rootScopes: rootScopes, includeAdHoc: includeAdHoc)
+    var arguments = scope.arguments
+    arguments += ["%[[%"]
+
+    return try pool.read { db in
+      try BacklinkDocumentRecord.fetchAll(
+        db,
+        sql: """
+          \(selectClause)
+          FROM documents d
+          JOIN workspaces w ON w.workspace_id = d.workspace_id
+          WHERE \(scope.predicate)
+            AND d.body LIKE ?
+          """,
+        arguments: arguments
+      )
+    }
+  }
+
+  private nonisolated static func searchScope(for documents: [DocumentRef]) -> (
+    rootScopes: Set<String>, includeAdHoc: Bool
+  ) {
+    var rootScopes = Set<String>()
+    var includeAdHoc = false
+    for document in documents {
+      if !document.isAdHoc, let rootURL = document.rootURL {
+        rootScopes.insert(rootURL.standardizedFileURL.path)
+      } else {
+        includeAdHoc = true
+      }
+    }
+    return (rootScopes, includeAdHoc)
+  }
+
+  private nonisolated static func scopePredicate(
+    rootScopes: [String],
+    includeAdHoc: Bool
+  ) -> (predicate: String, arguments: StatementArguments) {
+    var scopeClauses: [String] = []
+    var scopeArgs: [DatabaseValueConvertible] = []
+    if !rootScopes.isEmpty {
+      let placeholders = Array(repeating: "?", count: rootScopes.count).joined(separator: ", ")
+      scopeClauses.append("w.canonical_path IN (\(placeholders))")
+      scopeArgs.append(contentsOf: rootScopes)
+    }
+    if includeAdHoc {
+      scopeClauses.append("d.workspace_id = ?")
+      scopeArgs.append(Self.adHocWorkspaceID)
+    }
+    return (
+      "(" + scopeClauses.joined(separator: " OR ") + ")",
+      StatementArguments(scopeArgs)
+    )
+  }
+
+  private nonisolated static func backlinkTargetSlugs(
+    for target: DocumentRef,
+    indexedRecord: BacklinkDocumentRecord?
+  ) -> Set<String> {
+    let candidates = [
+      target.title,
+      target.displayPath,
+      (target.displayPath as NSString).deletingPathExtension,
+      indexedRecord?.title,
+      indexedRecord?.displayPath,
+      indexedRecord.map { ($0.displayPath as NSString).deletingPathExtension },
+    ]
+    return Set(
+      candidates
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .map(MarkdownWikilinks.slug(for:))
+        .filter { !$0.isEmpty }
+    )
+  }
+
+  private nonisolated static func backlinkSnippet(
+    in body: String,
+    matching targetSlugs: Set<String>
+  ) -> String? {
+    for line in body.split(whereSeparator: \.isNewline) {
+      let text = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+      let links = MarkdownWikilinks.extract(from: text)
+      guard links.contains(where: { targetSlugs.contains($0.slug) }) else { continue }
+      if text.count <= 180 { return text }
+      return String(text.prefix(177)) + "..."
+    }
+    return nil
   }
 
   private nonisolated static func makeResult(
@@ -1757,6 +1941,24 @@ final class IndexDatabase {
 /// join key), `display_path`/`title`/`body` come from `documents`, `is_ad_hoc`
 /// from `documents.is_ad_hoc`, `updated_at` from `documents.mtime`.
 private struct SearchDocumentRecord: FetchableRecord, Sendable {
+  var path: String
+  var title: String
+  var displayPath: String
+  var body: String
+  var isAdHoc: Bool
+  var updatedAt: TimeInterval
+
+  init(row: Row) throws {
+    path = row["path"]
+    title = row["title"]
+    displayPath = row["display_path"]
+    body = row["body"]
+    isAdHoc = (row["is_ad_hoc"] as Int) != 0
+    updatedAt = row["updated_at"]
+  }
+}
+
+private struct BacklinkDocumentRecord: FetchableRecord, Sendable {
   var path: String
   var title: String
   var displayPath: String

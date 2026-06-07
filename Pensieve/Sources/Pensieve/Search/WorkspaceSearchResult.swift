@@ -18,3 +18,15 @@ struct WorkspaceSearchResult: Identifiable, Hashable {
   var title: String { document.title }
   var isAdHoc: Bool { document.isAdHoc }
 }
+
+struct WorkspaceBacklinkResult: Identifiable, Hashable {
+  var sourceDocument: DocumentRef
+  var displayPath: String
+  var snippet: String?
+  var matchedTarget: String
+  var updatedAt: Date
+
+  var id: URL { sourceDocument.id }
+  var title: String { sourceDocument.title }
+  var isAdHoc: Bool { sourceDocument.isAdHoc }
+}

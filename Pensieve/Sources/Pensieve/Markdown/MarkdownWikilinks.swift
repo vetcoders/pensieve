@@ -80,7 +80,7 @@ enum MarkdownWikilinks {
       + " data-vc-wikilink-title=\"\(title)\">\(label)</a>"
   }
 
-  private static func slug(for target: String) -> String {
+  static func slug(for target: String) -> String {
     let folded = target.folding(
       options: [.diacriticInsensitive, .caseInsensitive],
       locale: .current
