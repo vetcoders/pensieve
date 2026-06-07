@@ -65,6 +65,7 @@ private struct PensieveWindowRoot: View {
     ContentView()
       .environmentObject(appState)
       .environmentObject(controller)
+      .environmentObject(controller.transcriptionService)
       .environmentObject(themeManager)
       .focusedSceneObject(appState)
       .focusedSceneObject(controller)

@@ -11,6 +11,7 @@ final class AppController: ObservableObject {
   private let indexDatabase: IndexDatabase
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
+  let transcriptionService: TranscriptionService
   private var didStart = false
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
@@ -32,6 +33,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    transcriptionService: TranscriptionService? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
   ) {
@@ -39,6 +41,7 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
     self.documentStore.observeSelfWrites { [weak folderManager] url in
