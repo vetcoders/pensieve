@@ -99,6 +99,7 @@ final class PreviewWebView: NSView {
       --vc-preview-diagram-bg: #ffffff;
       --vc-preview-diagram-error-bg: #fff1f1;
       --vc-preview-diagram-error-text: #8c1d18;
+      --vc-preview-math-bg: #f6f8fa;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -114,6 +115,7 @@ final class PreviewWebView: NSView {
         --vc-preview-diagram-bg: #18181b;
         --vc-preview-diagram-error-bg: #3f1d1d;
         --vc-preview-diagram-error-text: #fecaca;
+        --vc-preview-math-bg: #27272a;
       }
     }
 
@@ -266,6 +268,34 @@ final class PreviewWebView: NSView {
       color: var(--vc-preview-mark-text) !important;
     }
 
+    .markdown-body .vc-math {
+      background: var(--vc-preview-math-bg);
+      border-radius: 4px;
+      color: var(--vc-preview-text);
+      font-family: "KaTeX_Main", "STIX Two Math", "Times New Roman", serif;
+      overflow-wrap: anywhere;
+    }
+
+    .markdown-body .vc-math-inline {
+      display: inline-block;
+      padding: 0 0.22em;
+      vertical-align: baseline;
+    }
+
+    .markdown-body .vc-math-display {
+      border: 1px solid var(--vc-preview-border);
+      display: block;
+      margin: 1rem 0;
+      overflow-x: auto;
+      padding: 0.85rem 1rem;
+      text-align: center;
+      white-space: pre-wrap;
+    }
+
+    .markdown-body .vc-math.vc-math-error {
+      color: var(--vc-preview-diagram-error-text);
+    }
+
     /* Mermaid preview support added by pensieve-mermaid-preview-20260525. */
     .markdown-body .mermaid {
       background: var(--vc-preview-diagram-bg);
@@ -378,6 +408,35 @@ final class PreviewWebView: NSView {
           report();
         });
       }, {passive: true});
+    })();
+    """
+
+  static let mathBootstrapScript: String = """
+    (function() {
+      const nodes = Array.from(document.querySelectorAll('[data-vc-math]'));
+      if (!nodes.length) return;
+
+      if (!window.katex || typeof window.katex.render !== 'function') {
+        nodes.forEach(function(node) {
+          node.setAttribute('title', 'KaTeX runtime unavailable');
+        });
+        return;
+      }
+
+      nodes.forEach(function(node) {
+        const tex = node.getAttribute('data-vc-tex') || '';
+        const displayMode = node.getAttribute('data-vc-math') === 'display';
+        try {
+          window.katex.render(tex, node, {
+            displayMode: displayMode,
+            throwOnError: false,
+            strict: false
+          });
+        } catch (error) {
+          node.classList.add('vc-math-error');
+          node.setAttribute('title', error && error.message ? error.message : String(error));
+        }
+      });
     })();
     """
 

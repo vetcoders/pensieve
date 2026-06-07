@@ -53,6 +53,10 @@ extension PreviewDocument {
           <script>\(PreviewWebView.mermaidBootstrapScript)</script>
           """
       } ?? ""
+    let mathScript =
+      body.contains("data-vc-math=")
+      ? "<script>\(PreviewWebView.mathBootstrapScript)</script>"
+      : ""
     let html = """
       <!DOCTYPE html>
       <html><head><meta charset="utf-8">
@@ -65,6 +69,7 @@ extension PreviewDocument {
       \(body)
       </article>
       \(mermaidScripts)
+      \(mathScript)
       <script>\(PreviewWebView.bridgeScript)</script>
       </body></html>
       """

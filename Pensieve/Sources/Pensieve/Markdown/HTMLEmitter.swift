@@ -33,6 +33,9 @@ struct HTMLEmitter: MarkupVisitor {
   }
 
   mutating func visitParagraph(_ paragraph: Paragraph) -> String {
+    if let displayMath = MarkdownMath.renderDisplayParagraph(paragraph.plainText) {
+      return wrappedBlock("div", inner: displayMath)
+    }
     let inner = paragraph.children.map { visit($0) }.joined()
     return wrappedBlock("p", inner: inner)
   }
@@ -126,9 +129,7 @@ struct HTMLEmitter: MarkupVisitor {
   // MARK: - Inline
 
   mutating func visitText(_ text: Text) -> String {
-    rendersWikilinks
-      ? MarkdownWikilinks.renderText(text.string)
-      : Self.escapeText(text.string)
+    MarkdownMath.renderText(text.string, wikilinks: rendersWikilinks)
   }
 
   mutating func visitSoftBreak(_ softBreak: SoftBreak) -> String {

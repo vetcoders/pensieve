@@ -47,6 +47,36 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertFalse(html.contains("language-mermaid"), html)
   }
 
+  func testInlineMathEmitsMathNodeWithoutChangingSourceText() {
+    let html = render("Energy is $E = mc^2$ today.")
+    XCTAssertTrue(html.contains("class=\"vc-math vc-math-inline\""), html)
+    XCTAssertTrue(html.contains("data-vc-math=\"inline\""), html)
+    XCTAssertTrue(html.contains("data-vc-tex=\"E = mc^2\""), html)
+    XCTAssertTrue(html.contains(">E = mc^2</span>"), html)
+    XCTAssertTrue(html.contains("Energy is "), html)
+  }
+
+  func testDisplayMathParagraphEmitsBlockMathNode() {
+    let html = render("$$\n\\int_0^1 x^2 dx\n$$")
+    XCTAssertTrue(html.contains("class=\"vc-math vc-math-display\""), html)
+    XCTAssertTrue(html.contains("data-vc-math=\"display\""), html)
+    XCTAssertTrue(html.contains("data-vc-tex=\"\\int_0^1 x^2 dx\""), html)
+    XCTAssertTrue(html.contains(">\\int_0^1 x^2 dx</div>"), html)
+  }
+
+  func testMathEscapesHtmlAndLeavesEscapedDelimiterAlone() {
+    let html = render("Safe $a < b & c$ and cost \\$5")
+    XCTAssertTrue(html.contains("data-vc-tex=\"a &lt; b &amp; c\""), html)
+    XCTAssertTrue(html.contains(">a &lt; b &amp; c</span>"), html)
+    XCTAssertTrue(html.contains("cost $5"), html)
+  }
+
+  func testMathAndWikilinksCanCoexistInPlainText() {
+    let html = render("See [[Draft]] and $x+y$.")
+    XCTAssertTrue(html.contains("class=\"wikilink\""), html)
+    XCTAssertTrue(html.contains("data-vc-tex=\"x+y\""), html)
+  }
+
   func testFencedCodeBlockNoLanguage() {
     let html = render("```\nplain\n```")
     XCTAssertTrue(html.contains("<pre"), html)

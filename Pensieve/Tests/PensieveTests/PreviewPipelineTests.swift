@@ -70,6 +70,28 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(withMermaid.html.contains("suppressErrors: true"))
   }
 
+  func testMakeDocumentIncludesMathBootstrapOnlyForMathBody() {
+    let withoutMath = PreviewDocument.make(
+      body: "<p data-vc-block=\"0\">hello</p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertFalse(withoutMath.html.contains("window.katex"))
+    XCTAssertFalse(withoutMath.html.contains("data-vc-math"))
+
+    let withMath = PreviewDocument.make(
+      body:
+        "<p data-vc-block=\"0\">A <span class=\"vc-math vc-math-inline\" data-vc-math=\"inline\" data-vc-tex=\"x+y\">x+y</span></p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertTrue(withMath.html.contains("window.katex"))
+    XCTAssertTrue(withMath.html.contains("KaTeX runtime unavailable"))
+    XCTAssertTrue(withMath.html.contains("data-vc-tex=\"x+y\""))
+  }
+
   func testMakeDocumentEscapesEmbeddedStyleClose() {
     // A hostile theme CSS string trying to break out of the <style> block
     // must be neutralized.
@@ -189,6 +211,23 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("mermaid.run"))
     XCTAssertFalse(document.html.contains("cdn.jsdelivr"))
     XCTAssertFalse(document.html.contains("unpkg.com"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentRendersMathThroughHTMLEmitter() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let request = PreviewRenderRequest(
+      markdown: "Inline $a^2+b^2=c^2$",
+      fontSize: 16,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    let document = pipeline.makeDocument(for: request)
+
+    XCTAssertTrue(document.html.contains("class=\"vc-math vc-math-inline\""), document.html)
+    XCTAssertTrue(document.html.contains("data-vc-tex=\"a^2+b^2=c^2\""), document.html)
+    XCTAssertTrue(document.html.contains("window.katex"))
   }
 
   @MainActor
