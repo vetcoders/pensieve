@@ -16,6 +16,88 @@ final class MarkdownFormatterTests: XCTestCase {
     XCTAssertEqual(MarkdownFormatter.format("one\ntwo", as: .numberedList), "1. one\n1. two\n")
   }
 
+  func testTypingReturnContinuesMarkdownListsAndQuotes() {
+    let unordered = MarkdownFormatter.autoconversion(
+      in: "- alpha",
+      range: NSRange(location: 7, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(unordered?.range, NSRange(location: 7, length: 0))
+    XCTAssertEqual(unordered?.replacement, "\n- ")
+    XCTAssertEqual(unordered?.selectedRange, NSRange(location: 10, length: 0))
+
+    let ordered = MarkdownFormatter.autoconversion(
+      in: "  9. alpha",
+      range: NSRange(location: 10, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(ordered?.replacement, "\n  10. ")
+
+    let task = MarkdownFormatter.autoconversion(
+      in: "- [x] done",
+      range: NSRange(location: 10, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(task?.replacement, "\n- [ ] ")
+
+    let quote = MarkdownFormatter.autoconversion(
+      in: "> thought",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(quote?.replacement, "\n> ")
+  }
+
+  func testTypingReturnOnEmptyMarkdownMarkerExitsTheContainer() {
+    let conversion = MarkdownFormatter.autoconversion(
+      in: "- ",
+      range: NSRange(location: 2, length: 0),
+      replacement: "\n"
+    )
+
+    XCTAssertEqual(conversion?.range, NSRange(location: 0, length: 2))
+    XCTAssertEqual(conversion?.replacement, "")
+    XCTAssertEqual(conversion?.selectedRange, NSRange(location: 0, length: 0))
+  }
+
+  @MainActor
+  func testEditorAutoconversionRunsOnlyWhenRichMarkdownIsEnabled() {
+    let richSurface = MarkdownEditorSurface(
+      text: "- alpha",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true
+    )
+    richSurface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    let didLetAppKitHandleRichReturn =
+      richSurface.textView.delegate?.textView?(
+        richSurface.textView,
+        shouldChangeTextIn: NSRange(location: 7, length: 0),
+        replacementString: "\n"
+      ) ?? true
+
+    XCTAssertFalse(didLetAppKitHandleRichReturn)
+    XCTAssertEqual(richSurface.textStorage.string, "- alpha\n- ")
+    XCTAssertEqual(richSurface.textView.selectedRange(), NSRange(location: 10, length: 0))
+
+    let plainSurface = MarkdownEditorSurface(
+      text: "- alpha",
+      fontSize: 14,
+      syntaxHighlightingEnabled: false
+    )
+    plainSurface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    let didLetAppKitHandlePlainReturn =
+      plainSurface.textView.delegate?.textView?(
+        plainSurface.textView,
+        shouldChangeTextIn: NSRange(location: 7, length: 0),
+        replacementString: "\n"
+      ) ?? false
+
+    XCTAssertTrue(didLetAppKitHandlePlainReturn)
+    XCTAssertEqual(plainSurface.textStorage.string, "- alpha")
+  }
+
   @MainActor
   func testControllerMarkdownFormatCommandAppliesToEditorSelectionAndMarksDirty() {
     var boundText = "alpha beta"

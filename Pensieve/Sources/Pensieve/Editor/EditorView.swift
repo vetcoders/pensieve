@@ -311,6 +311,35 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     refreshFindMatches()
   }
 
+  func textView(
+    _ changedTextView: NSTextView,
+    shouldChangeTextIn affectedCharRange: NSRange,
+    replacementString: String?
+  ) -> Bool {
+    guard changedTextView === textView else { return true }
+    guard !isApplyingExternalText else { return true }
+    guard textContentStorage.syntaxHighlightingEnabled else { return true }
+    guard let replacementString else { return true }
+    guard
+      let conversion = MarkdownFormatter.autoconversion(
+        in: textStorage.string,
+        range: affectedCharRange,
+        replacement: replacementString
+      )
+    else {
+      return true
+    }
+
+    guard NSMaxRange(conversion.range) <= (textStorage.string as NSString).length else {
+      return true
+    }
+    textStorage.replaceCharacters(in: conversion.range, with: conversion.replacement)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(conversion.selectedRange)
+    textView.didChangeText()
+    return false
+  }
+
   func textViewDidChangeSelection(_ notification: Notification) {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
