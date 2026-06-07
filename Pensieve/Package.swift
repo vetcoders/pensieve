@@ -1,7 +1,11 @@
 // swift-tools-version:5.9
 // Pensieve — native macOS markdown editor (file-first, source-first)
 
+import Foundation
 import PackageDescription
+
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
+let qubeFFILibraryPath = "\(packageRoot)/Vendor/qube-ffi/debug"
 
 let package = Package(
     name: "Pensieve",
@@ -19,6 +23,7 @@ let package = Package(
         .executableTarget(
             name: "Pensieve",
             dependencies: [
+                "qube_ffiFFI",
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
@@ -28,7 +33,19 @@ let package = Package(
                 .copy("Resources/gfm.css"),
                 .copy("Resources/mermaid.min.js"),
                 .copy("Resources/sample.md")
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-L", qubeFFILibraryPath,
+                    "-lqube_ffi",
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", qubeFFILibraryPath
+                ])
             ]
+        ),
+        .systemLibrary(
+            name: "qube_ffiFFI",
+            path: "Sources/qube_ffiFFI"
         ),
         .testTarget(
             name: "PensieveTests",
