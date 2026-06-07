@@ -538,13 +538,15 @@ final class PensieveSmokeTests: XCTestCase {
     try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
+    appState.workspaceSearchQuery = "changed"
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    let autosaver = Autosaver(saveDelayMilliseconds: 50, indexDelayMilliseconds: 120)
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: DocumentStore(autosaver: autosaver, indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     controller.openFolder(url: folder)
@@ -562,10 +564,20 @@ final class PensieveSmokeTests: XCTestCase {
     appState.activeDocumentDirty = true
     controller.documentDidChange()
 
-    try await Task.sleep(nanoseconds: 1_800_000_000)
+    try await waitUntil {
+      try String(contentsOf: noteURL, encoding: .utf8) == "changed"
+    }
+    try await waitUntil {
+      await indexDatabase.waitForPendingReindex()
+      return appState.workspaceSearchResults.map(\.document.id) == [noteURL.standardizedFileURL]
+    }
 
     XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "changed")
     XCTAssertFalse(appState.activeDocumentDirty)
+    XCTAssertEqual(
+      appState.workspaceSearchResults.map(\.document.id),
+      [noteURL.standardizedFileURL]
+    )
 
     BookmarkStore.shared.clear(into: appState)
   }
@@ -3841,6 +3853,30 @@ final class PensieveSmokeTests: XCTestCase {
   @MainActor
   private func waitForHighlightingDebounce() {
     RunLoop.main.run(until: Date().addingTimeInterval(0.16))
+  }
+
+  private func waitUntil(
+    timeoutNanoseconds: UInt64 = 2_000_000_000,
+    pollNanoseconds: UInt64 = 20_000_000,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ condition: () async throws -> Bool
+  ) async throws {
+    let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+
+    while true {
+      if try await condition() {
+        return
+      }
+
+      let now = DispatchTime.now().uptimeNanoseconds
+      if now >= deadline {
+        XCTFail("Timed out waiting for condition", file: file, line: line)
+        return
+      }
+
+      try await Task.sleep(nanoseconds: min(pollNanoseconds, deadline - now))
+    }
   }
 }
 
