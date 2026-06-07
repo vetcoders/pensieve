@@ -392,6 +392,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   @objc private func handlePreviewViewportChanged(_ note: Notification) {
+    // Whoever is focused drives the scroll. While the user is typing in the editor it is first
+    // responder, and in split mode the preview re-renders on every keystroke and emits a viewport
+    // change — honouring it here would `scrollRangeToVisible` the editor to the caret on every
+    // character (a feedback loop with the editor→preview push), i.e. "every char jumps the whole
+    // document". Only let preview-driven scroll move the editor when the user is actually
+    // interacting with the preview (the editor is not first responder).
+    if let responder = textView.window?.firstResponder as? NSView,
+      responder === textView || responder.isDescendant(of: textView)
+    {
+      return
+    }
     guard let block = note.userInfo?["block"] as? Int else { return }
     guard block != lastPreviewAppliedBlock else { return }
     guard
