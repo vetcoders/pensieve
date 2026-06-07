@@ -60,6 +60,48 @@ final class MarkdownFormatterTests: XCTestCase {
     XCTAssertEqual(conversion?.selectedRange, NSRange(location: 0, length: 0))
   }
 
+  func testTypingEqualsClosesInlineHighlightWhenRichMarkdownIsEnabled() {
+    let conversion = MarkdownFormatter.autoconversion(
+      in: "This is ==important",
+      range: NSRange(location: 19, length: 0),
+      replacement: "="
+    )
+
+    XCTAssertEqual(conversion?.range, NSRange(location: 19, length: 0))
+    XCTAssertEqual(conversion?.replacement, "==")
+    XCTAssertEqual(conversion?.selectedRange, NSRange(location: 21, length: 0))
+  }
+
+  func testTypingEqualsDoesNotCloseEmptyOrAlreadyClosedHighlight() {
+    let opening = MarkdownFormatter.autoconversion(
+      in: "=",
+      range: NSRange(location: 1, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(opening)
+
+    let whitespaceOnly = MarkdownFormatter.autoconversion(
+      in: "== ",
+      range: NSRange(location: 3, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(whitespaceOnly)
+
+    let alreadyClosed = MarkdownFormatter.autoconversion(
+      in: "==done==",
+      range: NSRange(location: 8, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(alreadyClosed)
+
+    let textAfterClosedHighlight = MarkdownFormatter.autoconversion(
+      in: "==done== later",
+      range: NSRange(location: 14, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(textAfterClosedHighlight)
+  }
+
   @MainActor
   func testEditorAutoconversionRunsOnlyWhenRichMarkdownIsEnabled() {
     let richSurface = MarkdownEditorSurface(

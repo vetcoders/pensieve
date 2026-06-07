@@ -103,13 +103,19 @@ enum MarkdownFormatter {
     range: NSRange,
     replacement: String
   ) -> MarkdownAutoconversion? {
-    guard range.length == 0, replacement == "\n" else { return nil }
+    guard range.length == 0 else { return nil }
 
     let nsText = text as NSString
     guard range.location >= 0, range.location <= nsText.length else { return nil }
 
     let line = lineBeforeCaret(in: nsText, caret: range.location)
     guard !line.text.isEmpty else { return nil }
+
+    if replacement == "=" {
+      return highlightClosure(in: line, caretRange: range)
+    }
+
+    guard replacement == "\n" else { return nil }
 
     if let conversion = continuation(
       matching: AutoconversionPatterns.taskList,
@@ -157,6 +163,44 @@ enum MarkdownFormatter {
         return "\(captures[0])> "
       }
     )
+  }
+
+  private static func highlightClosure(
+    in line: CurrentLine,
+    caretRange: NSRange
+  ) -> MarkdownAutoconversion? {
+    guard delimiterCount("==", in: line.text).isMultiple(of: 2) == false else {
+      return nil
+    }
+    guard let openRange = line.text.range(of: "==", options: .backwards) else {
+      return nil
+    }
+
+    let markedText = line.text[openRange.upperBound...]
+    guard !markedText.isEmpty, !markedText.contains("="), !markedText.contains("\n") else {
+      return nil
+    }
+    guard markedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+      return nil
+    }
+
+    let replacement = "=="
+    let selectedLocation = caretRange.location + (replacement as NSString).length
+    return MarkdownAutoconversion(
+      range: caretRange,
+      replacement: replacement,
+      selectedRange: NSRange(location: selectedLocation, length: 0)
+    )
+  }
+
+  private static func delimiterCount(_ delimiter: String, in text: String) -> Int {
+    var count = 0
+    var searchStart = text.startIndex
+    while let range = text.range(of: delimiter, range: searchStart..<text.endIndex) {
+      count += 1
+      searchStart = range.upperBound
+    }
+    return count
   }
 
   private static func prefixLines(in text: String, with prefix: String) -> String {
