@@ -467,6 +467,7 @@ final class PensieveSmokeTests: XCTestCase {
     var findReplacement = ""
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,

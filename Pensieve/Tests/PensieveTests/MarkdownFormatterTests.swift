@@ -121,6 +121,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = appState.pendingMarkdownFormatCommand
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
@@ -184,6 +185,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = FindBarCommand(action: .useSelection)
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,
@@ -235,6 +237,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = appState.pendingMarkdownFormatCommand
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
@@ -323,5 +326,40 @@ final class MarkdownFormatterTests: XCTestCase {
 
     XCTAssertFalse(surface.textView.pasteTableIfNeeded(from: pasteboard))
     XCTAssertEqual(surface.textStorage.string, "")
+  }
+
+  func testTypewriterScrollCentersCaretAndClampsToDocumentBounds() {
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 500,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      400
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 40,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      0
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 1180,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      1000
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 500,
+        visibleHeight: 300,
+        documentHeight: 250
+      ),
+      0
+    )
   }
 }

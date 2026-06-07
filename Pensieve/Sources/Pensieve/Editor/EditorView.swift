@@ -13,6 +13,7 @@ struct EditorView: View {
 
       EditorRepresentable(
         text: documentText,
+        editorMode: appState.mode,
         fontSize: appState.fontSize,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
@@ -55,6 +56,7 @@ struct EditorView: View {
 
 struct EditorRepresentable: NSViewRepresentable {
   @Binding var text: String
+  let editorMode: EditorMode
   let fontSize: CGFloat
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
@@ -84,6 +86,7 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onCloseFindBar = {
       self.onCloseFindBar()
     }
+    surface.typewriterScrollEnabled = editorMode == .focus
     context.coordinator.surface = surface
     return surface.scrollView
   }
@@ -98,6 +101,7 @@ struct EditorRepresentable: NSViewRepresentable {
     // the edge, which AppKit already did before this re-render ran.
     let textUnchanged = surface.textStorage.string == text
     let savedOrigin = scroll.contentView.bounds.origin
+    surface.typewriterScrollEnabled = editorMode == .focus
     surface.update(
       text: text,
       fontSize: fontSize,
@@ -108,8 +112,12 @@ struct EditorRepresentable: NSViewRepresentable {
       findBarVisible: findBarVisible
     )
     if textUnchanged {
-      scroll.contentView.scroll(to: savedOrigin)
-      scroll.reflectScrolledClipView(scroll.contentView)
+      if surface.typewriterScrollEnabled {
+        surface.centerCaretLineIfNeeded()
+      } else {
+        scroll.contentView.scroll(to: savedOrigin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+      }
     }
     context.coordinator.apply(formattingCommand, to: surface)
     if let selectedText = context.coordinator.applyFind(
@@ -182,6 +190,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   var onTextChanged: ((String) -> Void)?
   var onCloseFindBar: (() -> Void)?
+  var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var findQuery = ""
   private var findMatches: [NSRange] = []
@@ -309,8 +318,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       let caret = min(savedSelection.location, newLength)
       textView.setSelectedRange(
         NSRange(location: caret, length: min(savedSelection.length, newLength - caret)))
-      scrollView.contentView.scroll(to: savedOrigin)
-      scrollView.reflectScrolledClipView(scrollView.contentView)
+      if typewriterScrollEnabled {
+        centerCaretLineIfNeeded()
+      } else {
+        scrollView.contentView.scroll(to: savedOrigin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+      }
       isApplyingExternalText = false
     }
 
@@ -328,6 +341,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     else { return }
     onTextChanged?(textStorage.string)
     refreshFindMatches()
+    centerCaretLineIfNeeded()
     postEditorViewportIfNeeded()
   }
 
@@ -356,6 +370,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textStorage.replaceCharacters(in: conversion.range, with: conversion.replacement)
     textContentStorage.refreshHighlighting()
     textView.setSelectedRange(conversion.selectedRange)
+    centerCaretLineIfNeeded()
     textView.didChangeText()
     return false
   }
@@ -368,6 +383,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     } else {
       textView.hideFormattingPopover()
     }
+    centerCaretLineIfNeeded()
     postEditorViewportIfNeeded()
   }
 
@@ -413,6 +429,49 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       atUTF16Location: min(max(rawLocation, 0), maxLocation),
       in: textStorage.string
     )
+  }
+
+  func centerCaretLineIfNeeded() {
+    guard typewriterScrollEnabled else { return }
+
+    let textLength = (textStorage.string as NSString).length
+    let selection = textView.selectedRange()
+    let location = min(max(selection.location, 0), textLength)
+    let range = NSRange(location: location, length: 0)
+    var actualRange = NSRange(location: NSNotFound, length: 0)
+    let screenRect = textView.firstRect(forCharacterRange: range, actualRange: &actualRange)
+    guard screenRect != .zero else {
+      textView.scrollRangeToVisible(range)
+      return
+    }
+
+    let caretRect: NSRect
+    if let window = textView.window {
+      caretRect = textView.convert(window.convertFromScreen(screenRect), from: nil)
+    } else {
+      caretRect = screenRect
+    }
+
+    let visible = scrollView.contentView.bounds
+    let documentHeight = max(textView.bounds.height, visible.height)
+    let targetY = Self.centeredScrollY(
+      caretMidY: caretRect.midY,
+      visibleHeight: visible.height,
+      documentHeight: documentHeight
+    )
+    scrollView.contentView.scroll(to: NSPoint(x: visible.origin.x, y: targetY))
+    scrollView.reflectScrolledClipView(scrollView.contentView)
+  }
+
+  static func centeredScrollY(
+    caretMidY: CGFloat,
+    visibleHeight: CGFloat,
+    documentHeight: CGFloat
+  ) -> CGFloat {
+    guard visibleHeight > 0, documentHeight > visibleHeight else { return 0 }
+    let maxY = documentHeight - visibleHeight
+    let centeredY = caretMidY - (visibleHeight / 2)
+    return min(max(centeredY, 0), maxY)
   }
 
   @discardableResult
