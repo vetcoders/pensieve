@@ -111,6 +111,33 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(try store.readTreeFingerprint(for: identity), fingerprint)
   }
 
+  func testWorkspaceCacheStoreWritesCacheArtifactsWithCompleteFileProtection() throws {
+    let root = try makeTemporaryWorkspace()
+    let identity = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let fingerprint = TreeFingerprint(
+      treeHash: "abc123",
+      fileCount: 2,
+      folderCount: 1,
+      computedAt: Date(timeIntervalSince1970: 42),
+      algorithmVersion: 1
+    )
+    let signature = WorkspaceSignature(
+      entries: [
+        "notes.md": FileSignature(mtime: 42, size: 12)
+      ])
+
+    let cacheRoot = try store.ensureCacheRoot(for: identity)
+    try store.writeTreeFingerprint(fingerprint, for: identity)
+    try store.writeManifest(sampleManifest(identity: identity, root: root), for: identity)
+    try store.writeSearchSignature(signature, for: identity)
+
+    try assertUsesCompleteFileProtection(cacheRoot.appendingPathComponent("identity.json"))
+    try assertUsesCompleteFileProtection(store.fingerprintURL(for: identity))
+    try assertUsesCompleteFileProtection(store.manifestURL(for: identity))
+    try assertUsesCompleteFileProtection(store.searchSignatureURL(for: identity))
+  }
+
   func testWorkspaceCacheStoreReturnsNilForMissingFingerprint() throws {
     let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
     let identity = try makeIdentity()
@@ -185,6 +212,17 @@ final class WorkspaceSubstrateTests: XCTestCase {
     let decoded = try JSONDecoder().decode(WorkspaceIdentity.self, from: data)
 
     XCTAssertEqual(decoded, identity)
+  }
+
+  func testWorkspaceMetadataStoreSavesMetadataWithCompleteFileProtection() throws {
+    let directory = temporaryApplicationSupportDirectory()
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let metadataURL = directory.appendingPathComponent("workspace.json", isDirectory: false)
+    let store = WorkspaceMetadataStore(metadataURL: metadataURL)
+
+    try store.save(WorkspaceMetadata(excludedPaths: ["Drafts", "Archive"]))
+
+    try assertUsesCompleteFileProtection(metadataURL)
   }
 
   func testWorkspaceManifestRoundtripsCodableExactly() throws {
@@ -779,5 +817,20 @@ final class WorkspaceSubstrateTests: XCTestCase {
 
   private func cacheRootURL(for identity: WorkspaceIdentity, in store: WorkspaceCacheStore) -> URL {
     store.fingerprintURL(for: identity).deletingLastPathComponent()
+  }
+
+  private func assertUsesCompleteFileProtection(
+    _ url: URL,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    XCTAssertEqual(
+      attributes[.protectionKey] as? FileProtectionType,
+      .complete,
+      "Expected complete file protection for \(url.lastPathComponent)",
+      file: file,
+      line: line
+    )
   }
 }

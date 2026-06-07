@@ -92,6 +92,11 @@ enum BasicCacheVerdict: Equatable {
 final class WorkspaceCacheStore {
   static let shared = WorkspaceCacheStore()
 
+  private static let protectedWriteOptions: Data.WritingOptions = [
+    .atomic,
+    .completeFileProtection,
+  ]
+
   private let baseDirectory: URL
   private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
@@ -116,13 +121,19 @@ final class WorkspaceCacheStore {
   {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(fingerprint)
-    try data.write(to: root.appendingPathComponent("tree-fingerprint.json"), options: [.atomic])
+    try data.write(
+      to: root.appendingPathComponent("tree-fingerprint.json"),
+      options: Self.protectedWriteOptions
+    )
   }
 
   func writeManifest(_ manifest: WorkspaceManifest, for identity: WorkspaceIdentity) throws {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(manifest)
-    try data.write(to: root.appendingPathComponent("manifest.json"), options: [.atomic])
+    try data.write(
+      to: root.appendingPathComponent("manifest.json"),
+      options: Self.protectedWriteOptions
+    )
   }
 
   /// Persists the workspace's `.md` signature alongside the identity-keyed cache
@@ -135,7 +146,10 @@ final class WorkspaceCacheStore {
   ) throws {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(signature)
-    try data.write(to: root.appendingPathComponent("search-signature.json"), options: [.atomic])
+    try data.write(
+      to: root.appendingPathComponent("search-signature.json"),
+      options: Self.protectedWriteOptions
+    )
   }
 
   func clearCache(for identity: WorkspaceIdentity) throws {
@@ -221,6 +235,6 @@ final class WorkspaceCacheStore {
     if let existing = try? Data(contentsOf: url), existing == data {
       return
     }
-    try data.write(to: url, options: [.atomic])
+    try data.write(to: url, options: Self.protectedWriteOptions)
   }
 }

@@ -7,6 +7,11 @@ struct WorkspaceMetadata: Codable, Equatable {
 final class WorkspaceMetadataStore {
   static let shared = WorkspaceMetadataStore()
 
+  private static let protectedWriteOptions: Data.WritingOptions = [
+    .atomic,
+    .completeFileProtection,
+  ]
+
   private let metadataURL: URL
   private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
@@ -31,7 +36,7 @@ final class WorkspaceMetadataStore {
     let directory = metadataURL.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let data = try encoder.encode(metadata)
-    try data.write(to: metadataURL, options: [.atomic])
+    try data.write(to: metadataURL, options: Self.protectedWriteOptions)
   }
 
   static func defaultMetadataURL() -> URL {
