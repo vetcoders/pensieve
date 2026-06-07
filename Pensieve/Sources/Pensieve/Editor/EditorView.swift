@@ -187,6 +187,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
+  private var lastPostedEditorBlock: Int?
+  private var lastPreviewAppliedBlock: Int?
 
   init(
     text: String,
@@ -245,6 +247,18 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self?.onCloseFindBar?()
       return true
     }
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(editorBoundsDidChange),
+      name: NSView.boundsDidChangeNotification,
+      object: scrollView.contentView
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handlePreviewViewportChanged(_:)),
+      name: .vcPreviewViewportChanged,
+      object: nil
+    )
     update(
       text: text,
       fontSize: fontSize,
@@ -301,6 +315,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
+    postEditorViewportIfNeeded()
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
   }
 
   func textDidChange(_ notification: Notification) {
@@ -309,6 +328,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     else { return }
     onTextChanged?(textStorage.string)
     refreshFindMatches()
+    postEditorViewportIfNeeded()
   }
 
   func textView(
@@ -348,6 +368,51 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     } else {
       textView.hideFormattingPopover()
     }
+    postEditorViewportIfNeeded()
+  }
+
+  @objc private func editorBoundsDidChange() {
+    postEditorViewportIfNeeded()
+  }
+
+  @objc private func handlePreviewViewportChanged(_ note: Notification) {
+    guard let block = note.userInfo?["block"] as? Int else { return }
+    guard block != lastPreviewAppliedBlock else { return }
+    guard
+      let location = MarkdownBlockMapper.utf16Location(
+        forBlockIndex: block,
+        in: textStorage.string
+      )
+    else { return }
+
+    lastPreviewAppliedBlock = block
+    lastPostedEditorBlock = block
+    textView.scrollRangeToVisible(NSRange(location: location, length: 0))
+  }
+
+  private func postEditorViewportIfNeeded() {
+    guard let block = currentTopVisibleBlockIndex() else { return }
+    guard block != lastPostedEditorBlock else { return }
+
+    lastPostedEditorBlock = block
+    NotificationCenter.default.post(
+      name: .vcEditorViewportChanged,
+      object: nil,
+      userInfo: ["block": block]
+    )
+  }
+
+  private func currentTopVisibleBlockIndex() -> Int? {
+    let point = NSPoint(
+      x: textView.textContainerInset.width + 1,
+      y: scrollView.contentView.bounds.minY + textView.textContainerInset.height + 1
+    )
+    let rawLocation = textView.characterIndexForInsertion(at: point)
+    let maxLocation = (textStorage.string as NSString).length
+    return MarkdownBlockMapper.blockIndex(
+      atUTF16Location: min(max(rawLocation, 0), maxLocation),
+      in: textStorage.string
+    )
   }
 
   @discardableResult
