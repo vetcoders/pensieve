@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pensieve - Native macOS Markdown Editor</title>
+    <style>
+        :root {
+            --bg-color: #f9f9f9;
+            --text-color: #222;
+            --accent-color: #007aff;
+            --code-bg: #ececec;
+            --font-stack: "iA Writer Duo", "Menlo", "Courier", monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-color: #1a1a1a;
+                --text-color: #e0e0e0;
+                --accent-color: #0a84ff;
+                --code-bg: #2a2a2a;
+            }
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: var(--font-stack);
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            text-rendering: optimizeLegibility;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        h1, h2, h3 {
+            font-weight: 600;
+            margin-top: 2em;
+            margin-bottom: 0.5em;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            letter-spacing: -0.05em;
+            border-bottom: 2px solid var(--text-color);
+            padding-bottom: 10px;
+            display: inline-block;
+        }
+
+        p {
+            margin-bottom: 1.5em;
+            font-size: 1.1rem;
+        }
+
+        a {
+            color: var(--accent-color);
+            text-decoration: none;
+            border-bottom: 1px solid transparent;
+            transition: border-bottom 0.2s;
+        }
+
+        a:hover {
+            border-bottom: 1px solid var(--accent-color);
+        }
+
+        code {
+            background-color: var(--code-bg);
+            padding: 0.2em 0.4em;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+
+        pre code {
+            display: block;
+            padding: 15px;
+            overflow-x: auto;
+            background-color: var(--code-bg);
+            border-radius: 5px;
+            margin-bottom: 1.5em;
+        }
+
+        .cta {
+            margin-top: 3em;
+            text-align: center;
+        }
+
+        .btn {
+            display: inline-block;
+            background-color: var(--text-color);
+            color: var(--bg-color);
+            padding: 12px 24px;
+            font-weight: bold;
+            border-radius: 6px;
+            font-size: 1.1rem;
+            transition: transform 0.1s, opacity 0.2s;
+        }
+
+        .btn:hover {
+            opacity: 0.9;
+            border-bottom: none;
+            color: var(--bg-color);
+            transform: translateY(-1px);
+        }
+        
+        .footer {
+            margin-top: 5em;
+            font-size: 0.9rem;
+            opacity: 0.6;
+            text-align: center;
+            border-top: 1px solid var(--code-bg);
+            padding-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>Pensieve</h1>
+        <p>A fast, native macOS markdown editor for structured thought.</p>
+    </header>
+
+    <main>
+        <section>
+            <h2>Focus First</h2>
+            <p>Pensieve is built with native macOS primitives to be incredibly fast and lightweight. It strips away the noise, leaving you with pure text and a distraction-free writing environment. The aesthetic is heavily inspired by the source-first purity of iA Writer.</p>
+        </section>
+
+        <section>
+            <h2>Features</h2>
+            <ul>
+                <li><strong>Native Performance:</strong> Written in Swift, avoiding Electron bloat.</li>
+                <li><strong>Source-First Identity:</strong> Focus on the markdown source, not a heavy WYSIWYG facade.</li>
+                <li><strong>Local First:</strong> Your files stay on your machine. No cloud lock-in.</li>
+                <li><strong>Dark Mode Support:</strong> Seamless integration with macOS system themes.</li>
+            </ul>
+        </section>
+        
+        <section>
+            <h2>Get Started</h2>
+            <p>You can build Pensieve directly from source. Clone the repository and use the standard <code>make</code> commands.</p>
+            <pre><code>git clone https://github.com/vetcoders/pensieve.git
+cd pensieve
+make run</code></pre>
+        </section>
+
+        <div class="cta">
+            <a href="https://github.com/vetcoders/pensieve" class="btn">View on GitHub</a>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <p>&copy; 2026 VetCoders. Built for thinkers.</p>
+    </footer>
+
+</body>
+</html>
