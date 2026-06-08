@@ -1,9 +1,34 @@
+import GRDB
 import XCTest
 
 @testable import Pensieve
 
 @MainActor
 final class IndexDatabaseBacklinksTests: XCTestCase {
+  func testExactWikilinkInSourceDocumentResolvesBacklinkToTarget() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let targetURL = folder.appendingPathComponent("target.md")
+    let sourceURL = folder.appendingPathComponent("doc-a.md")
+    try "# Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
+    try "Doc A links [[Target]].".write(to: sourceURL, atomically: true, encoding: .utf8)
+
+    let documents = [
+      document(targetURL, root: folder),
+      document(sourceURL, root: folder),
+    ]
+    let database = IndexDatabase(databaseURL: folder.appendingPathComponent("index.db"))
+    database.reindex(documents: documents)
+
+    let backlinks = database.backlinks(to: documents[0], documents: documents)
+
+    XCTAssertEqual(backlinks.map(\.sourceDocument), [documents[1]])
+    XCTAssertEqual(backlinks.map(\.displayPath), ["doc-a.md"])
+    XCTAssertEqual(backlinks.map(\.matchedTarget), ["Target"])
+    XCTAssertEqual(backlinks.first?.snippet, "Doc A links [[Target]].")
+  }
+
   func testBacklinksResolveFilenameTitleAndHeadingAliases() throws {
     let folder = try makeTemporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -61,6 +86,67 @@ final class IndexDatabaseBacklinksTests: XCTestCase {
     XCTAssertEqual(backlinks.map(\.displayPath), ["in-scope.md"])
   }
 
+  func testBacklinksIgnoreStaleRenameAliasAndMissingTargetLinks() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let targetURL = folder.appendingPathComponent("target.md")
+    let sourceURL = folder.appendingPathComponent("rename-edge.md")
+    try "# Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
+    try """
+      Stale rename alias [[Old Target]].
+      Missing target [[Missing Target]].
+      Current link [[Target]].
+      """.write(to: sourceURL, atomically: true, encoding: .utf8)
+
+    let documents = [
+      document(targetURL, root: folder),
+      document(sourceURL, root: folder),
+    ]
+    let database = IndexDatabase(databaseURL: folder.appendingPathComponent("index.db"))
+    database.reindex(documents: documents)
+
+    let backlinks = database.backlinks(to: documents[0], documents: documents)
+
+    XCTAssertEqual(backlinks.map(\.displayPath), ["rename-edge.md"])
+    XCTAssertEqual(backlinks.map(\.matchedTarget), ["Target"])
+    XCTAssertEqual(backlinks.first?.snippet, "Current link [[Target]].")
+  }
+
+  func testBacklinkLookupAndFTSSearchReadIndexedRowsAfterDiskMutation() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let databaseURL = folder.appendingPathComponent("index.db")
+    let targetURL = folder.appendingPathComponent("target.md")
+    let sourceURL = folder.appendingPathComponent("indexed-source.md")
+    try "# Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
+    try "Indexed row keeps [[Target]] with backlinkneedle.".write(
+      to: sourceURL, atomically: true, encoding: .utf8)
+
+    let documents = [
+      document(targetURL, root: folder),
+      document(sourceURL, root: folder),
+    ]
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.reindex(documents: documents)
+
+    try "Disk no longer mentions the link or token.".write(
+      to: sourceURL, atomically: true, encoding: .utf8)
+
+    let backlinks = database.backlinks(to: documents[0], documents: documents)
+    let searchResults = database.search(query: "backlinkneedle", documents: documents)
+    let ftsPaths = try ftsHitPaths(matching: "backlinkneedle", at: databaseURL)
+
+    XCTAssertEqual(backlinks.map(\.displayPath), ["indexed-source.md"])
+    XCTAssertEqual(backlinks.map(\.matchedTarget), ["Target"])
+    XCTAssertEqual(
+      searchResults.map(\.document.id),
+      [sourceURL.standardizedFileURL],
+      "FTS-backed workspace search should read the indexed source row, not the mutated file")
+    XCTAssertEqual(ftsPaths, ["indexed-source.md"])
+  }
+
   private func makeTemporaryFolder(prefix: String = "PensieveBacklinksTests") throws -> URL {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
@@ -73,5 +159,25 @@ final class IndexDatabaseBacklinksTests: XCTestCase {
       id: url.standardizedFileURL,
       rootURL: root.standardizedFileURL,
       relativePath: url.lastPathComponent)
+  }
+
+  private func ftsHitPaths(matching query: String, at databaseURL: URL) throws -> [String] {
+    let pool = try DatabasePool(path: databaseURL.path)
+    defer { try? pool.close() }
+    return try pool.read { db in
+      try Row.fetchAll(
+        db,
+        sql: """
+          SELECT d.path
+          FROM document_fts
+          JOIN documents d ON d.id = document_fts.rowid
+          WHERE document_fts MATCH ?
+          ORDER BY d.path
+          """,
+        arguments: [query]
+      ).map { row in
+        row["path"]
+      }
+    }
   }
 }
