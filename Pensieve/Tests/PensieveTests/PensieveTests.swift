@@ -765,6 +765,68 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testWorkspaceScannerHonorsGitIgnoreRules() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveGitIgnoreTests-\(UUID().uuidString)", isDirectory: true)
+    let nested = folder.appendingPathComponent("nested", isDirectory: true)
+    let ignoredDirectory = folder.appendingPathComponent("ignored-dir", isDirectory: true)
+    let nestedIgnoredDirectory = nested.appendingPathComponent("subignored", isDirectory: true)
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: ignoredDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+      at: nestedIgnoredDirectory, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    try """
+    *.scratch.md
+    !keep.scratch.md
+    /root-only.md
+    ignored-dir/
+    """.write(to: folder.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+    try """
+    local-*.md
+    !local-keep.md
+    subignored/
+    """.write(to: nested.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+
+    let keepURL = folder.appendingPathComponent("keep.md")
+    let keepScratchURL = folder.appendingPathComponent("keep.scratch.md")
+    let nestedRootOnlyURL = nested.appendingPathComponent("root-only.md")
+    let nestedKeepURL = nested.appendingPathComponent("local-keep.md")
+    try "keep".write(to: keepURL, atomically: true, encoding: .utf8)
+    try "kept scratch".write(to: keepScratchURL, atomically: true, encoding: .utf8)
+    try "drop scratch".write(
+      to: folder.appendingPathComponent("drop.scratch.md"), atomically: true, encoding: .utf8)
+    try "root anchored".write(
+      to: folder.appendingPathComponent("root-only.md"), atomically: true, encoding: .utf8)
+    try "nested root".write(to: nestedRootOnlyURL, atomically: true, encoding: .utf8)
+    try "nested drop".write(
+      to: nested.appendingPathComponent("local-drop.md"), atomically: true, encoding: .utf8)
+    try "nested keep".write(to: nestedKeepURL, atomically: true, encoding: .utf8)
+    try "ignored".write(
+      to: ignoredDirectory.appendingPathComponent("child.md"), atomically: true, encoding: .utf8)
+    try "nested ignored".write(
+      to: nestedIgnoredDirectory.appendingPathComponent("child.md"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    let scans = WorkspaceScanner.build(rootURLs: [folder], exclusions: [])
+
+    XCTAssertEqual(
+      Set(scans.flatMap(\.documents).map(\.url)),
+      Set([
+        keepURL.standardizedFileURL,
+        keepScratchURL.standardizedFileURL,
+        nestedRootOnlyURL.standardizedFileURL,
+        nestedKeepURL.standardizedFileURL,
+      ])
+    )
+  }
+
+  @MainActor
   func testOpenFilesWorkingSetIsBoundedToRecentFiles() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(

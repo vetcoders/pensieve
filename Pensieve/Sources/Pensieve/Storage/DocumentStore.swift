@@ -1470,7 +1470,7 @@ enum WorkspaceScanner {
 
   private static func scan(folder url: URL, exclusions: Set<String>) -> WorkspaceScan {
     let root = url.standardizedFileURL
-    let scan = scanChildren(folder: root, root: root, exclusions: exclusions)
+    let scan = scanChildren(folder: root, root: root, exclusions: exclusions, gitIgnoreRules: [])
     return WorkspaceScan(
       documents: scan.documents,
       rootNode: WorkspaceNode(
@@ -1486,7 +1486,8 @@ enum WorkspaceScanner {
   private static func scanChildren(
     folder url: URL,
     root: URL,
-    exclusions: Set<String>
+    exclusions: Set<String>,
+    gitIgnoreRules inheritedGitIgnoreRules: [GitIgnoreRule]
   ) -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
     let fm = FileManager.default
     guard
@@ -1501,12 +1502,21 @@ enum WorkspaceScanner {
 
     var documents: [DocumentRef] = []
     var nodes: [WorkspaceNode] = []
-    let entries = urls.compactMap { entry(for: $0, root: root, exclusions: exclusions) }
-      .sorted(by: workspaceSort)
+    let gitIgnoreRules =
+      inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
+    let entries = urls.compactMap {
+      entry(for: $0, root: root, exclusions: exclusions, gitIgnoreRules: gitIgnoreRules)
+    }
+    .sorted(by: workspaceSort)
 
     for entry in entries {
       if entry.isDirectory {
-        let childScan = scanChildren(folder: entry.url, root: root, exclusions: exclusions)
+        let childScan = scanChildren(
+          folder: entry.url,
+          root: root,
+          exclusions: exclusions,
+          gitIgnoreRules: gitIgnoreRules
+        )
         documents.append(contentsOf: childScan.documents)
         nodes.append(
           WorkspaceNode(
@@ -1540,20 +1550,35 @@ enum WorkspaceScanner {
     return (documents, nodes)
   }
 
-  private static func entry(for url: URL, root: URL, exclusions: Set<String>)
+  private static func entry(
+    for url: URL,
+    root: URL,
+    exclusions: Set<String>,
+    gitIgnoreRules: [GitIgnoreRule]
+  )
     -> WorkspaceDirectoryEntry?
   {
+    let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
     let relativePath = relativePath(for: url, root: root)
-    guard shouldInclude(url, relativePath: relativePath, exclusions: exclusions) else {
+    let isDirectory = values?.isDirectory == true
+    let isRegularFile = values?.isRegularFile == true
+    guard
+      shouldInclude(
+        url,
+        relativePath: relativePath,
+        isDirectory: isDirectory,
+        exclusions: exclusions,
+        gitIgnoreRules: gitIgnoreRules
+      )
+    else {
       return nil
     }
 
-    let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
     return WorkspaceDirectoryEntry(
       url: url,
       relativePath: relativePath,
-      isDirectory: values?.isDirectory == true,
-      isRegularFile: values?.isRegularFile == true
+      isDirectory: isDirectory,
+      isRegularFile: isRegularFile
     )
   }
 
@@ -1569,7 +1594,13 @@ enum WorkspaceScanner {
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
-  private static func shouldInclude(_ url: URL, relativePath: String, exclusions: Set<String>)
+  private static func shouldInclude(
+    _ url: URL,
+    relativePath: String,
+    isDirectory: Bool,
+    exclusions: Set<String>,
+    gitIgnoreRules: [GitIgnoreRule]
+  )
     -> Bool
   {
     let name = url.lastPathComponent
@@ -1579,6 +1610,121 @@ enum WorkspaceScanner {
     return !exclusions.contains { excluded in
       relativePath == excluded || relativePath.hasPrefix("\(excluded)/")
     }
+      && !isIgnored(
+        relativePath: relativePath,
+        name: name,
+        isDirectory: isDirectory,
+        rules: gitIgnoreRules
+      )
+  }
+
+  private static func loadGitIgnoreRules(folder: URL, root: URL) -> [GitIgnoreRule] {
+    let ignoreURL = folder.appendingPathComponent(".gitignore")
+    guard let text = try? String(contentsOf: ignoreURL, encoding: .utf8) else { return [] }
+    let baseRelativePath = relativePath(for: folder, root: root)
+    return text.split(separator: "\n", omittingEmptySubsequences: false).compactMap {
+      GitIgnoreRule(line: String($0), baseRelativePath: baseRelativePath)
+    }
+  }
+
+  private static func isIgnored(
+    relativePath: String,
+    name: String,
+    isDirectory: Bool,
+    rules: [GitIgnoreRule]
+  ) -> Bool {
+    var ignored = false
+    for rule in rules
+    where rule.matches(relativePath: relativePath, name: name, isDirectory: isDirectory) {
+      ignored = !rule.isNegated
+    }
+    return ignored
+  }
+}
+
+private struct GitIgnoreRule: Sendable {
+  let pattern: String
+  let baseRelativePath: String
+  let isNegated: Bool
+  let isDirectoryOnly: Bool
+  let isAnchored: Bool
+  let containsSlash: Bool
+
+  init?(line rawLine: String, baseRelativePath: String) {
+    var line = rawLine.trimmingCharacters(in: .whitespaces)
+    guard !line.isEmpty else { return nil }
+    if line.hasPrefix("\\#") {
+      line.removeFirst()
+    } else if line.hasPrefix("#") {
+      return nil
+    }
+
+    var isNegated = false
+    if line.hasPrefix("!") {
+      isNegated = true
+      line.removeFirst()
+    }
+    guard !line.isEmpty else { return nil }
+
+    let isDirectoryOnly = line.hasSuffix("/")
+    if isDirectoryOnly {
+      line.removeLast()
+    }
+    let isAnchored = line.hasPrefix("/")
+    if isAnchored {
+      line.removeFirst()
+    }
+    guard !line.isEmpty else { return nil }
+
+    self.pattern = line
+    self.baseRelativePath = baseRelativePath
+    self.isNegated = isNegated
+    self.isDirectoryOnly = isDirectoryOnly
+    self.isAnchored = isAnchored
+    self.containsSlash = line.contains("/")
+  }
+
+  func matches(relativePath: String, name: String, isDirectory: Bool) -> Bool {
+    if isDirectoryOnly, !isDirectory {
+      return false
+    }
+    guard let candidate = candidatePath(for: relativePath) else {
+      return false
+    }
+
+    if isAnchored || containsSlash {
+      return Self.glob(pattern, matches: candidate)
+    }
+    return Self.glob(pattern, matches: name)
+  }
+
+  private func candidatePath(for relativePath: String) -> String? {
+    guard !baseRelativePath.isEmpty else { return relativePath }
+    if relativePath == baseRelativePath {
+      return ""
+    }
+    guard relativePath.hasPrefix(baseRelativePath + "/") else {
+      return nil
+    }
+    return String(relativePath.dropFirst(baseRelativePath.count + 1))
+  }
+
+  private static func glob(_ pattern: String, matches value: String) -> Bool {
+    let regex =
+      "^"
+      + pattern.reduce(into: "") { result, character in
+        switch character {
+        case "*":
+          result += "[^/]*"
+        case "?":
+          result += "[^/]"
+        case ".", "+", "(", ")", "{", "}", "[", "]", "^", "$", "|", "\\":
+          result += "\\\(character)"
+        default:
+          result.append(character)
+        }
+      } + "$"
+    return value.range(of: regex, options: .regularExpression) != nil
   }
 }
 
