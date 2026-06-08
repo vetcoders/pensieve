@@ -58,7 +58,11 @@ final class AppController: ObservableObject {
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
+    let restoredDraft = documentStore.restoreRecoveredDraft(into: appState)
     guard restoringWorkspace else { return }
+    if restoredDraft {
+      appState.lastError = nil
+    }
     folderManager.restoreLastFolderInBackground(into: appState)
   }
 
@@ -178,6 +182,18 @@ final class AppController: ObservableObject {
     visibleFiles.insert(contentsOf: moving, at: insertionIndex)
     appState.sidebarSortOrder = .manual
     appState.openFiles = visibleFiles
+  }
+
+  func closeOpenFile(id: DocumentRef.ID) {
+    let standardizedID = id.standardizedFileURL
+    if appState.selectedDocumentID?.standardizedFileURL == standardizedID {
+      guard documentStore.select(ref: nil, into: appState) else { return }
+    }
+    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedID }
+  }
+
+  func clearOpenFiles() {
+    appState.openFiles = []
   }
 
   @discardableResult

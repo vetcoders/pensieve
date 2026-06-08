@@ -133,6 +133,17 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
+        if sidebarTab == .openFiles, !appState.openFiles.isEmpty {
+          Button {
+            controller.clearOpenFiles()
+          } label: {
+            Image(systemName: "xmark.circle")
+          }
+          .buttonStyle(.borderless)
+          .help("Clear Open Files")
+          .accessibilityIdentifier("pensieve.sidebar.clearOpenFiles")
+        }
+
         Spacer()
         sortMenu
       }
@@ -569,6 +580,12 @@ struct SidebarView: View {
 
     Button("Open in Default App") {
       openExternally(doc.url)
+    }
+
+    if doc.isAdHoc {
+      Button("Close from Open Files") {
+        controller.closeOpenFile(id: doc.id)
+      }
     }
 
     Button("Reveal in Finder") {

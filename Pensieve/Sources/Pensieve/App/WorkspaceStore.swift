@@ -4,6 +4,7 @@ import SwiftUI
 
 @MainActor
 final class WorkspaceStore: ObservableObject {
+  static let maxOpenFiles = 12
   private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
   private let defaults: UserDefaults
 

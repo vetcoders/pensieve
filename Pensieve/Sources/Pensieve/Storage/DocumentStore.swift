@@ -106,6 +106,7 @@ final class FolderManager {
     let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
     appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
     appState.openFiles.append(ref)
+    pruneOpenFiles(into: appState, protecting: standardizedURL)
     appState.lastError = nil
     return ref
   }
@@ -1228,6 +1229,8 @@ final class FolderManager {
   }
 
   private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
+    guard !appState.documentSession.isDirty else { return }
+
     let documents = appState.allDocuments
     if let currentSelection = appState.selectedDocumentID,
       documents.contains(where: { $0.id == currentSelection })
@@ -1340,6 +1343,10 @@ final class FolderManager {
     recentSelfWritePaths = recentSelfWritePaths.filter { _, writeDate in
       now.timeIntervalSince(writeDate) <= selfWriteSuppressionInterval
     }
+  }
+
+  private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
+    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
   }
 }
 
@@ -1602,6 +1609,7 @@ final class DocumentStore {
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
+  private let recoveryStore: RecoveryStore
   private let writeDocument: (String, URL) throws -> Void
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
   private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> DirtyUntitledResponse
@@ -1613,6 +1621,7 @@ final class DocumentStore {
     autosaver: Autosaver? = nil,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
+    recoveryStore: RecoveryStore? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
@@ -1623,6 +1632,7 @@ final class DocumentStore {
     self.autosaver = autosaver ?? .shared
     self.indexDatabase = resolvedIndexDatabase
     self.bookmarkStore = bookmarkStore ?? .shared
+    self.recoveryStore = recoveryStore ?? .shared
     self.writeDocument =
       writeDocument ?? { text, url in
         try text.write(to: url, atomically: true, encoding: .utf8)
@@ -1646,6 +1656,23 @@ final class DocumentStore {
 
   func observeSelfWrites(_ observer: @escaping @MainActor (URL) -> Void) {
     selfWriteObserver = observer
+  }
+
+  @discardableResult
+  func restoreRecoveredDraft(into appState: AppState) -> Bool {
+    guard !appState.documentSession.hasEditableBuffer else { return false }
+    guard let draft = recoveryStore.loadDrafts().first else { return false }
+
+    self.appState = appState
+    autosaver.cancel()
+    appState.selectedDocumentID = nil
+    appState.documentSession.restoreUntitled(
+      title: draft.title,
+      text: draft.text,
+      recoveryID: draft.id
+    )
+    appState.lastError = nil
+    return true
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -1704,6 +1731,7 @@ final class DocumentStore {
     guard appState.documentSession.hasEditableBuffer else { return false }
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
     let previousID = appState.documentSession.id
+    let recoveryID = appState.documentSession.recoveryID
 
     do {
       try FileManager.default.createDirectory(
@@ -1714,6 +1742,7 @@ final class DocumentStore {
       registerSavedDocument(ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
+      recoveryStore.deleteDraft(id: recoveryID)
       appState.lastError = nil
       indexDocument(ref, appState.documentSession.text, appState)
       return true
@@ -1742,13 +1771,33 @@ final class DocumentStore {
   }
 
   private func scheduleAutosave(appState: AppState) {
-    guard appState.documentSession.document != nil, appState.documentSession.isDirty else {
+    guard appState.documentSession.isDirty else {
       return
     }
 
     autosaver.scheduleSave { [weak self, weak appState] in
-      guard let appState else { return }
-      self?.saveExisting(appState: appState, indexNow: false)
+      guard let self, let appState else { return }
+      if appState.documentSession.isUntitled {
+        self.saveRecoveryDraft(appState: appState)
+      } else {
+        self.saveExisting(appState: appState, indexNow: false)
+      }
+    }
+  }
+
+  private func saveRecoveryDraft(appState: AppState) {
+    guard appState.documentSession.isUntitled, appState.documentSession.isDirty else { return }
+
+    do {
+      let draft = try recoveryStore.saveDraft(
+        id: appState.documentSession.recoveryID,
+        title: appState.documentSession.displayTitle,
+        text: appState.documentSession.text
+      )
+      appState.documentSession.recoveryID = draft.id
+      appState.lastError = nil
+    } catch {
+      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
     }
   }
 
@@ -1775,6 +1824,7 @@ final class DocumentStore {
         guard let url = savePanelURLProvider(appState) else { return false }
         return saveAs(appState: appState, to: url)
       case .discard:
+        recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
         appState.documentSession.isDirty = false
         return true
       case .cancel:
@@ -1840,6 +1890,7 @@ final class DocumentStore {
       }
       ) {
         appState.openFiles.append(ref)
+        pruneOpenFiles(into: appState, protecting: ref.id)
       }
       if isNewSessionURL {
         do {
@@ -1856,6 +1907,10 @@ final class DocumentStore {
     }
 
     appState.selectedDocumentID = ref.id
+  }
+
+  private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
+    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
   }
 
   private static func promptForDirtyUntitledSession(
@@ -1907,4 +1962,27 @@ final class DocumentStore {
     }
     return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
   }
+}
+
+@MainActor
+private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
+  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
+
+  let activeID =
+    protectedID?.standardizedFileURL
+    ?? appState.selectedDocumentID?.standardizedFileURL
+  var protected: DocumentRef?
+  var candidates = appState.openFiles
+  if let activeID,
+    let index = candidates.firstIndex(where: { $0.id.standardizedFileURL == activeID })
+  {
+    protected = candidates.remove(at: index)
+  }
+
+  let allowedCount = WorkspaceStore.maxOpenFiles - (protected == nil ? 0 : 1)
+  candidates = Array(candidates.suffix(max(allowedCount, 0)))
+  if let protected {
+    candidates.append(protected)
+  }
+  appState.openFiles = candidates
 }

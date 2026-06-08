@@ -631,6 +631,70 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDirtyUntitledAutosavesRecoveryDraftAndRestoresIt() async throws {
+    let recoveryDirectory = temporaryApplicationSupportDirectory()
+      .appendingPathComponent("Recovery", isDirectory: true)
+    defer {
+      try? FileManager.default.removeItem(at: recoveryDirectory.deletingLastPathComponent())
+    }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
+    let appState = AppState()
+    let documentStore = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: recoveryDirectory),
+      recoveryStore: recoveryStore
+    )
+
+    appState.documentSession.createUntitled(title: "Untitled.md")
+    appState.activeDocumentText = "keep this crash draft"
+    documentStore.documentDidChange(appState: appState)
+
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "keep this crash draft"
+    }
+
+    let restoredState = AppState()
+    XCTAssertTrue(documentStore.restoreRecoveredDraft(into: restoredState))
+    XCTAssertTrue(restoredState.documentSession.isUntitled)
+    XCTAssertTrue(restoredState.activeDocumentDirty)
+    XCTAssertEqual(restoredState.activeDocumentText, "keep this crash draft")
+  }
+
+  @MainActor
+  func testSaveAsDeletesUntitledRecoveryDraft() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRecoverySaveAsTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
+    let appState = AppState()
+    let documentStore = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: recoveryStore
+    )
+
+    appState.documentSession.createUntitled(title: "Untitled.md")
+    appState.activeDocumentText = "draft before save"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntil {
+      !recoveryStore.loadDrafts().isEmpty
+    }
+
+    let savedURL = folder.appendingPathComponent("saved.md")
+    XCTAssertTrue(documentStore.saveAs(appState: appState, to: savedURL))
+    XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
+  }
+
+  @MainActor
   func testFolderOpenImportsMarkdownRecursivelyAndSkipsDefaultNoise() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
@@ -672,6 +736,63 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.workspaceTree.first?.name, folder.lastPathComponent)
     XCTAssertTrue(
       appState.workspaceTree.first?.children?.contains(where: { $0.name == "Nested" }) == true)
+  }
+
+  @MainActor
+  func testWorkspaceScannerSkipsDotfilesAndDefaultNoiseDirectories() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveDefaultNoiseTests-\(UUID().uuidString)", isDirectory: true)
+    let nodeModules = folder.appendingPathComponent("node_modules", isDirectory: true)
+    let dotFolder = folder.appendingPathComponent(".hidden", isDirectory: true)
+    try FileManager.default.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: dotFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let keepURL = folder.appendingPathComponent("keep.md")
+    try "keep".write(to: keepURL, atomically: true, encoding: .utf8)
+    try "package".write(
+      to: nodeModules.appendingPathComponent("package.md"), atomically: true, encoding: .utf8)
+    try "dotfile".write(
+      to: folder.appendingPathComponent(".env.md"), atomically: true, encoding: .utf8)
+    try "hidden".write(
+      to: dotFolder.appendingPathComponent("hidden.md"), atomically: true, encoding: .utf8)
+
+    let scans = WorkspaceScanner.build(rootURLs: [folder], exclusions: [])
+
+    XCTAssertEqual(scans.flatMap(\.documents).map(\.url), [keepURL.standardizedFileURL])
+  }
+
+  @MainActor
+  func testOpenFilesWorkingSetIsBoundedToRecentFiles() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveWorkingSetBoundTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let appState = AppState()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore()
+    )
+    var openedURLs: [URL] = []
+    for index in 0..<20 {
+      let url = folder.appendingPathComponent("ad-hoc-\(index).md")
+      try "doc \(index)".write(to: url, atomically: true, encoding: .utf8)
+      openedURLs.append(url.standardizedFileURL)
+      manager.openFile(url: url, into: appState)
+    }
+
+    XCTAssertEqual(appState.openFiles.count, WorkspaceStore.maxOpenFiles)
+    XCTAssertEqual(
+      appState.openFiles.map(\.url),
+      Array(openedURLs.suffix(WorkspaceStore.maxOpenFiles))
+    )
   }
 
   @MainActor

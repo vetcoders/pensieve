@@ -3,7 +3,7 @@ import Foundation
 struct DocumentSession: Equatable {
   enum Kind: Equatable {
     case empty
-    case untitled(title: String)
+    case untitled(title: String, recoveryID: UUID?)
     case fileBacked(DocumentRef)
   }
 
@@ -14,7 +14,7 @@ struct DocumentSession: Equatable {
   static let empty = DocumentSession(kind: .empty, text: "", isDirty: false)
 
   static func untitled(title: String = "Untitled.md") -> DocumentSession {
-    DocumentSession(kind: .untitled(title: title), text: "", isDirty: false)
+    DocumentSession(kind: .untitled(title: title, recoveryID: nil), text: "", isDirty: false)
   }
 
   var document: DocumentRef? {
@@ -40,6 +40,17 @@ struct DocumentSession: Equatable {
     return true
   }
 
+  var recoveryID: UUID? {
+    get {
+      guard case .untitled(_, let recoveryID) = kind else { return nil }
+      return recoveryID
+    }
+    set {
+      guard case .untitled(let title, _) = kind else { return }
+      kind = .untitled(title: title, recoveryID: newValue)
+    }
+  }
+
   var hasEditableBuffer: Bool {
     switch kind {
     case .empty:
@@ -53,7 +64,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return ""
-    case .untitled(let title):
+    case .untitled(let title, _):
       return title
     case .fileBacked(let document):
       return document.title
@@ -79,9 +90,15 @@ struct DocumentSession: Equatable {
   }
 
   mutating func createUntitled(title: String = "Untitled.md") {
-    self.kind = .untitled(title: title)
+    self.kind = .untitled(title: title, recoveryID: nil)
     self.text = ""
     self.isDirty = false
+  }
+
+  mutating func restoreUntitled(title: String, text: String, recoveryID: UUID) {
+    self.kind = .untitled(title: title, recoveryID: recoveryID)
+    self.text = text
+    self.isDirty = true
   }
 
   mutating func clear() {
