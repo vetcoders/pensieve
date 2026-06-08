@@ -24,19 +24,24 @@ final class PreviewPipelineTests: XCTestCase {
   // MARK: - Document construction
 
   func testMakeDocumentEmbedsBodyThemeCSSAndFontSize() {
+    let sourceURL = URL(fileURLWithPath: "/tmp/notes/a.md")
     let document = PreviewDocument.make(
       body: "<p data-vc-block=\"0\">hello</p>",
       css: ".markdown-body { color: tomato; }",
       fontSize: 17,
-      baseURL: URL(fileURLWithPath: "/tmp")
+      baseURL: URL(fileURLWithPath: "/tmp"),
+      sourceURL: sourceURL,
+      refreshToken: 3
     )
 
     // Body wrapped in the markdown-body article.
     XCTAssertTrue(document.html.contains("<article class=\"markdown-body\">"))
     XCTAssertTrue(document.html.contains("<p data-vc-block=\"0\">hello</p>"))
+    XCTAssertEqual(document.bodyHTML, "<p data-vc-block=\"0\">hello</p>")
 
     // Theme CSS is inlined.
     XCTAssertTrue(document.html.contains(".markdown-body { color: tomato; }"))
+    XCTAssertTrue(document.styleHTML.contains(".markdown-body { color: tomato; }"))
 
     // Responsive appearance CSS is composed in with the requested font size.
     XCTAssertTrue(document.html.contains("--vc-font-size: 17px"))
@@ -47,6 +52,8 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertFalse(document.html.contains("window.mermaid"))
 
     XCTAssertEqual(document.baseURL?.path, URL(fileURLWithPath: "/tmp").path)
+    XCTAssertEqual(document.sourceURL, sourceURL)
+    XCTAssertEqual(document.refreshToken, 3)
   }
 
   func testMakeDocumentIncludesMermaidRuntimeOnlyWhenProvided() {

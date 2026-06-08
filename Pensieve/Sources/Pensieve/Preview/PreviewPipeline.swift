@@ -29,6 +29,12 @@ struct PreviewRenderRequest: Equatable {
 struct PreviewDocument: Equatable {
   let html: String
   let baseURL: URL?
+  let bodyHTML: String
+  let styleHTML: String
+  let mermaidJavaScript: String?
+  let containsMath: Bool
+  let sourceURL: URL?
+  let refreshToken: Int
 }
 
 extension PreviewDocument {
@@ -42,9 +48,15 @@ extension PreviewDocument {
     css: String,
     fontSize: CGFloat,
     baseURL: URL?,
-    mermaidJavaScript: String? = nil
+    mermaidJavaScript: String? = nil,
+    sourceURL: URL? = nil,
+    refreshToken: Int = 0
   ) -> PreviewDocument {
     let safeCSS = css.replacingOccurrences(of: "</style>", with: "<\\/style>")
+    let styleHTML = """
+      \(safeCSS)
+      \(PreviewWebView.appearanceCSS(fontSize: fontSize))
+      """
     let mermaidScripts =
       mermaidJavaScript.map { javascript in
         let safeJavaScript = javascript.replacingOccurrences(of: "</script>", with: "<\\/script>")
@@ -61,13 +73,13 @@ extension PreviewDocument {
       baseURL.map { url in
         "<base href=\"\(HTMLEmitter.escapeAttribute(url.absoluteString))\">"
       } ?? ""
+    let containsMath = body.contains("data-vc-math=")
     let html = """
       <!DOCTYPE html>
       <html><head><meta charset="utf-8">
       \(baseElement)
-      <style>
-      \(safeCSS)
-      \(PreviewWebView.appearanceCSS(fontSize: fontSize))
+      <style id="vc-preview-style">
+      \(styleHTML)
       </style>
       </head><body>
       <article class="markdown-body">
@@ -78,7 +90,15 @@ extension PreviewDocument {
       <script>\(PreviewWebView.bridgeScript)</script>
       </body></html>
       """
-    return PreviewDocument(html: html, baseURL: baseURL)
+    return PreviewDocument(
+      html: html,
+      baseURL: baseURL,
+      bodyHTML: body,
+      styleHTML: styleHTML,
+      mermaidJavaScript: mermaidJavaScript,
+      containsMath: containsMath,
+      sourceURL: sourceURL,
+      refreshToken: refreshToken)
   }
 }
 
@@ -183,7 +203,9 @@ final class PreviewPipeline {
       css: css,
       fontSize: request.fontSize,
       baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL),
-      mermaidJavaScript: mermaidJavaScript
+      mermaidJavaScript: mermaidJavaScript,
+      sourceURL: request.documentURL,
+      refreshToken: request.refreshToken
     )
   }
 

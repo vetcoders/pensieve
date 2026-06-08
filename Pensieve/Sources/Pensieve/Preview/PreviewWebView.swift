@@ -30,6 +30,7 @@ final class PreviewWebView: NSView {
 
   private var lastReportedBlock: Int = -1
   private var lastAppliedBlock: Int = -1
+  private var loadedIdentity: PreviewLoadIdentity?
 
   var onViewportChanged: ((Int) -> Void)?
 
@@ -74,13 +75,68 @@ final class PreviewWebView: NSView {
 
   // MARK: - Public
 
-  /// Load a composed `PreviewDocument` into the WebView. This is the only
-  /// sink path the pipeline uses; document composition happens upstream so
-  /// this method stays focused on the WKWebView contract.
+  /// Load a composed `PreviewDocument` into the WebView. The first load, manual
+  /// refreshes, and document switches use a full HTML load; same-document edits
+  /// update the already-loaded article/style in place so scroll position and the
+  /// WKWebView process stay stable while typing.
   func load(document: PreviewDocument) {
+    let identity = PreviewLoadIdentity(document: document)
+    guard loadedIdentity == identity else {
+      loadFullPage(document, identity: identity)
+      return
+    }
+    updateLoadedPage(document)
+  }
+
+  private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
+    loadedIdentity = identity
     lastReportedBlock = -1
     lastAppliedBlock = -1
+  }
+
+  private func updateLoadedPage(_ document: PreviewDocument) {
+    let script = """
+      (function() {
+        const previousX = window.scrollX || 0;
+        const previousY = window.scrollY || 0;
+        const article = document.querySelector('article.markdown-body');
+        if (!article) {
+          return false;
+        }
+
+        let style = document.getElementById('vc-preview-style');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'vc-preview-style';
+          document.head.appendChild(style);
+        }
+        style.textContent = \(PreviewWebView.javaScriptStringLiteral(document.styleHTML));
+        article.innerHTML = \(PreviewWebView.javaScriptStringLiteral(document.bodyHTML));
+
+        const mermaidRuntime = \(PreviewWebView.javaScriptStringLiteral(document.mermaidJavaScript ?? ""));
+        if (mermaidRuntime && !window.mermaid) {
+          const script = document.createElement('script');
+          script.text = mermaidRuntime;
+          document.head.appendChild(script);
+        }
+
+        \(document.containsMath ? Self.mathBootstrapScript : "")
+        \(document.mermaidJavaScript == nil ? "" : Self.mermaidBootstrapScript)
+
+        requestAnimationFrame(function() {
+          const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+          window.scrollTo(previousX, Math.min(previousY, maxY));
+        });
+        return true;
+      })();
+      """
+    webView.evaluateJavaScript(script) { [weak self, document] result, error in
+      guard error == nil, (result as? Bool) == true else {
+        self?.loadFullPage(document, identity: PreviewLoadIdentity(document: document))
+        return
+      }
+    }
   }
 
   static func appearanceCSS(fontSize: CGFloat) -> String {
@@ -522,6 +578,30 @@ final class PreviewWebView: NSView {
       }
     })();
     """
+
+  private static func javaScriptStringLiteral(_ value: String) -> String {
+    guard
+      let data = try? JSONSerialization.data(
+        withJSONObject: value,
+        options: [.fragmentsAllowed]),
+      let literal = String(data: data, encoding: .utf8)
+    else {
+      return "\"\""
+    }
+    return literal
+  }
+}
+
+private struct PreviewLoadIdentity: Equatable {
+  let baseURL: URL?
+  let sourceURL: URL?
+  let refreshToken: Int
+
+  init(document: PreviewDocument) {
+    baseURL = document.baseURL
+    sourceURL = document.sourceURL
+    refreshToken = document.refreshToken
+  }
 }
 
 // MARK: - PreviewSink conformance
