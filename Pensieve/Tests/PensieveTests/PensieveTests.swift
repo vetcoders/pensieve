@@ -3640,7 +3640,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testDocumentWindowAttachReapsExistingEmptyLauncherWindows() throws {
+  func testDocumentWindowAttachReapsRegisteredEmptyLauncherWindows() throws {
     var scheduledSweeps: [@MainActor () -> Void] = []
     var closedWindows: [NSWindow] = []
 
@@ -3659,12 +3659,17 @@ final class PensieveSmokeTests: XCTestCase {
       styleMask: [.titled],
       backing: .buffered,
       defer: false)
-    for window in [launcherA, launcherB, documentWindow] {
+    let strayWindow = NSWindow(
+      contentRect: NSRect(x: 30, y: 30, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [launcherA, launcherB, documentWindow, strayWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
     }
     defer {
-      for window in [launcherA, launcherB, documentWindow] {
+      for window in [launcherA, launcherB, documentWindow, strayWindow] {
         window.close()
       }
     }
@@ -3675,16 +3680,22 @@ final class PensieveSmokeTests: XCTestCase {
       scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
-      applicationWindows: { [launcherA, launcherB, documentWindow] },
+      applicationWindows: { [launcherA, launcherB, documentWindow, strayWindow] },
       closeWindow: { closedWindows.append($0) }
     )
-    let documentID = URL(fileURLWithPath: "/tmp/pensieve-reap-launchers.md").standardizedFileURL
+    let documentID = URL(fileURLWithPath: "/tmp/foo.md").standardizedFileURL
 
     registry.attach(launcherA, documentID: nil)
+    registry.attach(launcherB, documentID: nil)
 
     XCTAssertTrue(scheduledSweeps.isEmpty, "empty launchers stay open until a document tab exists")
 
-    registry.attach(documentWindow, documentID: documentID)
+    registry.attach(
+      documentWindow,
+      documentID: documentID,
+      title: "foo",
+      representedURL: documentID,
+      hasEditableBuffer: true)
 
     XCTAssertEqual(scheduledSweeps.count, 1)
     let sweep = try XCTUnwrap(scheduledSweeps.popLast())
@@ -3695,6 +3706,61 @@ final class PensieveSmokeTests: XCTestCase {
       Set([ObjectIdentifier(launcherA), ObjectIdentifier(launcherB)])
     )
     XCTAssertFalse(closedWindows.contains { $0 === documentWindow })
+    XCTAssertFalse(closedWindows.contains { $0 === strayWindow })
+    XCTAssertEqual(documentWindow.title, "foo")
+    XCTAssertEqual(documentWindow.representedURL?.standardizedFileURL, documentID)
+  }
+
+  @MainActor
+  func testDocumentWindowAttachDoesNotReapEditableUntitledWindowAsLauncher() throws {
+    var scheduledSweeps: [@MainActor () -> Void] = []
+    var closedWindows: [NSWindow] = []
+
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [untitledWindow, documentWindow] {
+      window.isReleasedWhenClosed = false
+      window.title = "Pensieve"
+    }
+    defer {
+      for window in [untitledWindow, documentWindow] {
+        window.close()
+      }
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [untitledWindow, documentWindow] },
+      closeWindow: { closedWindows.append($0) }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-real-document.md").standardizedFileURL
+
+    registry.attach(
+      untitledWindow,
+      documentID: nil,
+      title: "Draft note",
+      representedURL: nil,
+      hasEditableBuffer: true)
+    registry.attach(documentWindow, documentID: documentID)
+
+    XCTAssertEqual(untitledWindow.title, "Draft note")
+    XCTAssertEqual(scheduledSweeps.count, 1)
+    let sweep = try XCTUnwrap(scheduledSweeps.popLast())
+    sweep()
+
+    XCTAssertTrue(closedWindows.isEmpty)
   }
 
   @MainActor

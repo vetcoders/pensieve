@@ -9,6 +9,7 @@ final class DocumentWindowRegistry {
   typealias DocumentOpener = @MainActor (DocumentRef) -> Void
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
+  private var launcherWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var pendingMergeTargets: [URL: WeakWindow] = [:]
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
@@ -75,14 +76,32 @@ final class DocumentWindowRegistry {
     openDocument(ref)
   }
 
-  func attach(_ window: NSWindow, documentID: URL?) {
-    window.tabbingMode = .preferred
+  func attach(
+    _ window: NSWindow,
+    documentID: URL?,
+    title: String? = nil,
+    representedURL: URL? = nil,
+    hasEditableBuffer: Bool = false
+  ) {
+    window.tabbingMode = .automatic
     window.tabbingIdentifier = "Pensieve.DocumentWindow"
 
     guard let documentID = documentID?.standardizedFileURL else {
+      if hasEditableBuffer {
+        launcherWindows.removeValue(forKey: ObjectIdentifier(window))
+        window.title = normalizedTitle(title, fallback: "Untitled")
+        window.representedURL = representedURL
+        return
+      }
+      registerLauncher(window)
       closeEmptyLauncherWindowIfDocumentTabsExist(window)
       return
     }
+    launcherWindows.removeValue(forKey: ObjectIdentifier(window))
+    let fallbackTitle = documentID.deletingPathExtension().lastPathComponent
+    window.title = normalizedTitle(title, fallback: fallbackTitle)
+    window.representedURL = representedURL ?? documentID
+
     if windowsByDocumentID[documentID]?.window !== window {
       orderedDocumentIDs.remove(documentID)
     }
@@ -100,7 +119,7 @@ final class DocumentWindowRegistry {
     if let target = pendingMergeTargets.removeValue(forKey: documentID)?.window,
       target !== window
     {
-      target.tabbingMode = .preferred
+      target.tabbingMode = .automatic
       target.tabbingIdentifier = window.tabbingIdentifier
       mergeWindowIntoTabs(target, window)
     }
@@ -144,6 +163,7 @@ final class DocumentWindowRegistry {
   private func closeEmptyLauncherWindows(except activeWindow: NSWindow?) {
     scheduleLauncherWindowSweep { [weak self, activeWindow] in
       guard let self else { return }
+      purgeClosedLauncherWindows()
       for window in applicationWindows()
       where window !== activeWindow && isEmptyLauncherWindow(window) {
         closeWindow(window)
@@ -152,8 +172,25 @@ final class DocumentWindowRegistry {
   }
 
   private func isEmptyLauncherWindow(_ window: NSWindow) -> Bool {
-    guard window.title == "Pensieve" else { return false }
+    let windowID = ObjectIdentifier(window)
+    guard launcherWindows[windowID]?.window === window else { return false }
     return !windowsByDocumentID.values.contains { $0.window === window }
+  }
+
+  private func registerLauncher(_ window: NSWindow) {
+    purgeClosedLauncherWindows()
+    window.title = "Pensieve"
+    window.representedURL = nil
+    launcherWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  }
+
+  private func purgeClosedLauncherWindows() {
+    launcherWindows = launcherWindows.filter { $0.value.window != nil }
+  }
+
+  private func normalizedTitle(_ title: String?, fallback: String) -> String {
+    let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? fallback : trimmed
   }
 }
 
@@ -167,6 +204,9 @@ private final class WeakWindow {
 
 struct DocumentWindowAccessor: NSViewRepresentable {
   let documentID: URL?
+  let title: String?
+  let representedURL: URL?
+  let hasEditableBuffer: Bool
   var onWindow: ((NSWindow) -> Void)?
 
   func makeNSView(context: Context) -> NSView {
@@ -174,7 +214,12 @@ struct DocumentWindowAccessor: NSViewRepresentable {
     DispatchQueue.main.async {
       if let window = view.window {
         onWindow?(window)
-        DocumentWindowRegistry.shared.attach(window, documentID: documentID)
+        DocumentWindowRegistry.shared.attach(
+          window,
+          documentID: documentID,
+          title: title,
+          representedURL: representedURL,
+          hasEditableBuffer: hasEditableBuffer)
       }
     }
     return view
@@ -184,7 +229,12 @@ struct DocumentWindowAccessor: NSViewRepresentable {
     DispatchQueue.main.async {
       if let window = nsView.window {
         onWindow?(window)
-        DocumentWindowRegistry.shared.attach(window, documentID: documentID)
+        DocumentWindowRegistry.shared.attach(
+          window,
+          documentID: documentID,
+          title: title,
+          representedURL: representedURL,
+          hasEditableBuffer: hasEditableBuffer)
       }
     }
   }

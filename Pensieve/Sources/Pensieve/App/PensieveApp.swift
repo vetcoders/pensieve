@@ -70,7 +70,12 @@ private struct PensieveWindowRoot: View {
       .focusedSceneObject(appState)
       .focusedSceneObject(controller)
       .background(
-        DocumentWindowAccessor(documentID: appState.selectedDocumentID) { window in
+        DocumentWindowAccessor(
+          documentID: appState.selectedDocumentID,
+          title: appState.documentSession.displayTitle,
+          representedURL: appState.documentSession.url,
+          hasEditableBuffer: appState.documentSession.hasEditableBuffer
+        ) { window in
           currentWindow = window
         }
       )
