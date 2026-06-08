@@ -34,9 +34,14 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM scan_sessions")!
       XCTAssertEqual(count, 1)
 
-      let row = try Row.fetchOne(
-        db, sql: "SELECT * FROM scan_sessions WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+      let recordedWorkspaceIDs = try String.fetchAll(
+        db, sql: "SELECT workspace_id FROM scan_sessions ORDER BY id")
+      let row = try XCTUnwrap(
+        Row.fetchOne(
+          db, sql: "SELECT * FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected cold_scan session for workspace_id \(identity.workspaceID); recorded \(recordedWorkspaceIDs)"
+      )
       XCTAssertEqual(row["trigger"] as String, "cold_scan")
       XCTAssertEqual(row["file_count"] as Int, 1)
       XCTAssertGreaterThanOrEqual(row["folder_count"] as Int, 0)
@@ -48,9 +53,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // Check workspace_stats
     try await dbQueue.read { db in
-      let stats = try Row.fetchOne(
+      let statsRow = try Row.fetchOne(
         db, sql: "SELECT * FROM workspace_stats WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+        arguments: [identity.workspaceID])
+      let stats = try XCTUnwrap(
+        statsRow, "Expected workspace_stats row for workspace_id \(identity.workspaceID)")
       XCTAssertEqual(stats["file_count"] as Int, 1)
       XCTAssertGreaterThanOrEqual(stats["folder_count"] as Int, 0)
       XCTAssertEqual(stats["index_health"] as String, "green")
@@ -97,6 +104,8 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       let rows = try Row.fetchAll(
         db, sql: "SELECT * FROM scan_sessions WHERE workspace_id = ? ORDER BY finished_at ASC",
         arguments: [identity.workspaceID])
+      XCTAssertEqual(rows.count, 2, "Expected two scan_sessions for workspace_id \(identity.workspaceID)")
+      guard rows.count >= 2 else { return }
       XCTAssertEqual(rows[0]["file_count"] as Int, 1)
       XCTAssertEqual(rows[1]["file_count"] as Int, 2)
     }
@@ -106,9 +115,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workspace_stats")!
       XCTAssertEqual(count, 1)  // Updated in place
 
-      let stats = try Row.fetchOne(
+      let statsRow = try Row.fetchOne(
         db, sql: "SELECT * FROM workspace_stats WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+        arguments: [identity.workspaceID])
+      let stats = try XCTUnwrap(
+        statsRow, "Expected updated workspace_stats row for workspace_id \(identity.workspaceID)")
       XCTAssertEqual(stats["file_count"] as Int, 2)
       XCTAssertEqual(stats["index_health"] as String, "green")
     }
@@ -135,9 +146,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let dbQueue = try DatabaseQueue(path: databaseURL.path)
 
     try await dbQueue.read { db in
-      let stats = try Row.fetchOne(
+      let statsRow = try Row.fetchOne(
         db, sql: "SELECT * FROM workspace_stats WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+        arguments: [identity.workspaceID])
+      let stats = try XCTUnwrap(
+        statsRow, "Expected empty-workspace stats row for workspace_id \(identity.workspaceID)")
       XCTAssertEqual(stats["file_count"] as Int, 0)
       XCTAssertGreaterThanOrEqual(stats["folder_count"] as Int, 0)
       XCTAssertEqual(stats["index_health"] as String, "empty")
@@ -166,9 +179,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     try await dbQueue.read { db in
       let start = Date()
-      let stats = try Row.fetchOne(
+      let statsRow = try Row.fetchOne(
         db, sql: "SELECT * FROM workspace_stats WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+        arguments: [identity.workspaceID])
+      let stats = try XCTUnwrap(
+        statsRow, "Expected fast-lookup stats row for workspace_id \(identity.workspaceID)")
       let durationMs = Date().timeIntervalSince(start) * 1000
       XCTAssertLessThan(durationMs, 10.0)  // < 10ms target
       XCTAssertEqual(stats["file_count"] as Int, 0)

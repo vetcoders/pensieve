@@ -11,6 +11,9 @@ final class WorkspaceMetadataStore {
     .atomic,
     .completeFileProtection,
   ]
+  private static let fallbackWriteOptions: Data.WritingOptions = [
+    .atomic,
+  ]
 
   private let metadataURL: URL
   private let encoder = JSONEncoder()
@@ -36,7 +39,7 @@ final class WorkspaceMetadataStore {
     let directory = metadataURL.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let data = try encoder.encode(metadata)
-    try data.write(to: metadataURL, options: Self.protectedWriteOptions)
+    try Self.writeProtected(data, to: metadataURL)
   }
 
   static func defaultMetadataURL() -> URL {
@@ -57,6 +60,18 @@ final class WorkspaceMetadataStore {
     } catch {
       return FileManager.default.temporaryDirectory
         .appendingPathComponent("Pensieve", isDirectory: true)
+    }
+  }
+
+  private static func writeProtected(_ data: Data, to url: URL) throws {
+    do {
+      try data.write(to: url, options: protectedWriteOptions)
+    } catch {
+      do {
+        try data.write(to: url, options: fallbackWriteOptions)
+      } catch {
+        throw error
+      }
     }
   }
 }

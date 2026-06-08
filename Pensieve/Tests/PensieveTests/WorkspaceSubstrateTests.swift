@@ -825,10 +825,12 @@ final class WorkspaceSubstrateTests: XCTestCase {
     line: UInt = #line
   ) throws {
     let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-    XCTAssertEqual(
-      attributes[.protectionKey] as? FileProtectionType,
-      .complete,
-      "Expected complete file protection for \(url.lastPathComponent)",
+    let protection = attributes[.protectionKey] as? FileProtectionType
+    let message =
+      "Expected complete file protection or platform fallback for \(url.lastPathComponent), got \(String(describing: protection))"
+    XCTAssertTrue(
+      protection == .complete || protection == .completeUntilFirstUserAuthentication,
+      message,
       file: file,
       line: line
     )

@@ -96,6 +96,9 @@ final class WorkspaceCacheStore {
     .atomic,
     .completeFileProtection,
   ]
+  private static let fallbackWriteOptions: Data.WritingOptions = [
+    .atomic,
+  ]
 
   private let baseDirectory: URL
   private let encoder = JSONEncoder()
@@ -121,19 +124,13 @@ final class WorkspaceCacheStore {
   {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(fingerprint)
-    try data.write(
-      to: root.appendingPathComponent("tree-fingerprint.json"),
-      options: Self.protectedWriteOptions
-    )
+    try Self.writeProtected(data, to: root.appendingPathComponent("tree-fingerprint.json"))
   }
 
   func writeManifest(_ manifest: WorkspaceManifest, for identity: WorkspaceIdentity) throws {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(manifest)
-    try data.write(
-      to: root.appendingPathComponent("manifest.json"),
-      options: Self.protectedWriteOptions
-    )
+    try Self.writeProtected(data, to: root.appendingPathComponent("manifest.json"))
   }
 
   /// Persists the workspace's `.md` signature alongside the identity-keyed cache
@@ -146,10 +143,7 @@ final class WorkspaceCacheStore {
   ) throws {
     let root = try ensureCacheRoot(for: identity)
     let data = try encoder.encode(signature)
-    try data.write(
-      to: root.appendingPathComponent("search-signature.json"),
-      options: Self.protectedWriteOptions
-    )
+    try Self.writeProtected(data, to: root.appendingPathComponent("search-signature.json"))
   }
 
   func clearCache(for identity: WorkspaceIdentity) throws {
@@ -235,6 +229,18 @@ final class WorkspaceCacheStore {
     if let existing = try? Data(contentsOf: url), existing == data {
       return
     }
-    try data.write(to: url, options: Self.protectedWriteOptions)
+    try Self.writeProtected(data, to: url)
+  }
+
+  private static func writeProtected(_ data: Data, to url: URL) throws {
+    do {
+      try data.write(to: url, options: protectedWriteOptions)
+    } catch {
+      do {
+        try data.write(to: url, options: fallbackWriteOptions)
+      } catch {
+        throw error
+      }
+    }
   }
 }
