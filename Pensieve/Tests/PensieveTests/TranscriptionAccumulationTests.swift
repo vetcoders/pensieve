@@ -75,4 +75,72 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.preview, "")
     XCTAssertEqual(service.rendered, "")
   }
+
+  func testFinalUtterancesAccumulateInArrivalOrderWithTrimmedBoundaries() {
+    let service = TranscriptionService()
+
+    service.receiveFinal(" first utterance\n", language: "en")
+    service.receiveFinal("\tsecond utterance", language: "pl")
+    service.receiveFinal("third utterance  ", language: "de")
+
+    XCTAssertEqual(
+      service.committed,
+      """
+      first utterance
+      second utterance
+      third utterance
+      """
+    )
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, service.committed)
+    XCTAssertEqual(service.lastLanguage, "de")
+  }
+
+  func testFinalFlushReplacesPreviewTailAndClearsBuffer() {
+    let service = TranscriptionService()
+
+    service.receivePreview("draft phrase")
+    XCTAssertEqual(service.rendered, "draft phrase")
+
+    service.receiveFinal("confirmed phrase", language: "en")
+
+    XCTAssertEqual(service.committed, "confirmed phrase")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "confirmed phrase")
+  }
+
+  func testResetTranscriptClearsBuffersAndAllowsFreshAccumulation() {
+    let service = TranscriptionService()
+
+    service.receiveFinal("stale utterance", language: "en")
+    service.receivePreview("stale preview")
+    service.resetTranscript()
+
+    XCTAssertEqual(service.committed, "")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "")
+    XCTAssertNil(service.lastLanguage)
+    XCTAssertNil(service.lastError)
+
+    service.receivePreview("fresh preview")
+    service.receiveFinal("fresh final", language: "es")
+
+    XCTAssertEqual(service.committed, "fresh final")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "fresh final")
+    XCTAssertEqual(service.lastLanguage, "es")
+  }
+
+  func testBlankPreviewAndBlankFinalKeepCommittedTextStable() {
+    let service = TranscriptionService()
+
+    service.receiveFinal("kept utterance", language: "en")
+    service.receivePreview("")
+    service.receiveFinal("", language: "en")
+
+    XCTAssertEqual(service.committed, "kept utterance")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "kept utterance")
+    XCTAssertEqual(service.lastLanguage, "en")
+  }
 }
