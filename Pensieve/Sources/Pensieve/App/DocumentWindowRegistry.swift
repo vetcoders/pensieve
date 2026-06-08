@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 final class DocumentWindowRegistry {
   static let shared = DocumentWindowRegistry()
+  private let documentTabbingIdentifier = "Pensieve.DocumentWindow"
 
   typealias DeferredMainWork = @MainActor () -> Void
   typealias DocumentOpener = @MainActor (DocumentRef) -> Void
@@ -21,6 +22,7 @@ final class DocumentWindowRegistry {
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
+  private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
 
@@ -43,6 +45,9 @@ final class DocumentWindowRegistry {
       window.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
     },
+    currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
+      NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow ?? NSApp.windows.first
+    },
     applicationWindows: @escaping @MainActor () -> [NSWindow] = { NSApp.windows },
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
@@ -53,6 +58,7 @@ final class DocumentWindowRegistry {
     self.scheduleLauncherWindowSweep = scheduleLauncherWindowSweep
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.orderAndActivateWindow = orderAndActivateWindow
+    self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
     self.closeWindow = closeWindow
   }
@@ -72,7 +78,7 @@ final class DocumentWindowRegistry {
     windowsByDocumentID[documentID] = nil
     orderedDocumentIDs.remove(documentID)
 
-    if let target = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow {
+    if let target = currentMergeTarget() {
       pendingMergeTargets[documentID] = WeakWindow(target)
     }
     openDocument(ref)
@@ -85,8 +91,7 @@ final class DocumentWindowRegistry {
     representedURL: URL? = nil,
     hasEditableBuffer: Bool = false
   ) {
-    window.tabbingMode = .automatic
-    window.tabbingIdentifier = "Pensieve.DocumentWindow"
+    prepareStandaloneTabbing(for: window)
 
     guard let documentID = documentID?.standardizedFileURL else {
       if hasEditableBuffer {
@@ -130,8 +135,8 @@ final class DocumentWindowRegistry {
     if let target = pendingMergeTargets.removeValue(forKey: documentID)?.window,
       target !== window
     {
-      target.tabbingMode = .automatic
-      target.tabbingIdentifier = window.tabbingIdentifier
+      prepareTabbedWindow(target)
+      prepareTabbedWindow(window)
       mergeWindowIntoTabs(target, window)
     }
 
@@ -211,6 +216,18 @@ final class DocumentWindowRegistry {
     let windowID = ObjectIdentifier(window)
     launcherWindows.removeValue(forKey: windowID)
     contentWindows[windowID] = WeakWindow(window)
+  }
+
+  private func prepareStandaloneTabbing(for window: NSWindow) {
+    window.tabbingMode = .automatic
+    if (window.tabbedWindows?.count ?? 1) <= 1 {
+      window.setValue(nil, forKey: "tabbingIdentifier")
+    }
+  }
+
+  private func prepareTabbedWindow(_ window: NSWindow) {
+    window.tabbingMode = .automatic
+    window.tabbingIdentifier = documentTabbingIdentifier
   }
 
   private func reconcileLauncherWindows() {

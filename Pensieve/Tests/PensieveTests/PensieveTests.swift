@@ -3680,6 +3680,78 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDocumentWindowAttachDoesNotForceTabbedIdentifierForStandaloneDocument() throws {
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      mergeWindowIntoTabs: { _, _ in XCTFail("standalone document should not merge") },
+      orderAndActivateWindow: { _ in }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-standalone-tab.md").standardizedFileURL
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer {
+      window.close()
+    }
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(window.tabbingMode, .automatic)
+    XCTAssertNotEqual(window.tabbingIdentifier, "Pensieve.DocumentWindow")
+  }
+
+  @MainActor
+  func testDocumentWindowAttachAssignsTabbedIdentifierOnlyWhenMerging() throws {
+    var openedRefs: [DocumentRef] = []
+    var mergeCount = 0
+    let expectedIdentifier = "Pensieve.DocumentWindow"
+    let targetWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [targetWindow, documentWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      targetWindow.close()
+      documentWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      mergeWindowIntoTabs: { target, window in
+        mergeCount += 1
+        XCTAssertEqual(target.tabbingIdentifier, expectedIdentifier)
+        XCTAssertEqual(window.tabbingIdentifier, expectedIdentifier)
+      },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { targetWindow },
+      applicationWindows: { [targetWindow, documentWindow] }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-merged-tab.md").standardizedFileURL
+    let ref = DocumentRef(id: documentID)
+
+    registry.open(ref) { openedRefs.append($0) }
+    registry.attach(documentWindow, documentID: documentID)
+
+    XCTAssertEqual(openedRefs.map(\.id), [documentID])
+    XCTAssertEqual(mergeCount, 1)
+    XCTAssertEqual(targetWindow.tabbingIdentifier, expectedIdentifier)
+    XCTAssertEqual(documentWindow.tabbingIdentifier, expectedIdentifier)
+  }
+
+  @MainActor
   func testDocumentWindowAttachReapsRegisteredEmptyLauncherWindows() throws {
     var scheduledSweeps: [@MainActor () -> Void] = []
     var closedWindows: [NSWindow] = []
