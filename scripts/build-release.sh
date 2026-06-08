@@ -155,6 +155,32 @@ ok ".app bundle laid out at $APP_BUNDLE"
 log "Bundle contents:"
 find "$APP_BUNDLE" -maxdepth 3 -print | head -20 | sed 's|'"$APP_BUNDLE"'|  ./|'
 
+# ─── Embed qube-ffi dylib ───────────────────────────────────────────────────
+# The release binary links libqube_ffi.dylib via an ABSOLUTE dev path baked into
+# its load command (the dylib ships from vista-kernel with an absolute install_name
+# and is only ad-hoc signed). An installed hardened-runtime app cannot load it —
+# the dev path is gone and the Team IDs differ — so dyld aborts at launch (build 133
+# crashed exactly here). Embed it in Contents/Frameworks, repoint to @rpath, and
+# re-sign with our identity so it loads from inside the bundle.
+QUBE_DYLIB_SRC="$PKG_DIR/Vendor/qube-ffi/debug/libqube_ffi.dylib"
+if [[ -f "$QUBE_DYLIB_SRC" ]]; then
+    log "Embedding qube-ffi dylib (repoint to @rpath + re-sign)"
+    FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
+    mkdir -p "$FRAMEWORKS_DIR"
+    cp "$QUBE_DYLIB_SRC" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    chmod u+w "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    QUBE_OLD_REF="$(otool -L "$APP_BUNDLE/Contents/MacOS/$APP_NAME" | awk '/libqube_ffi\.dylib/{print $1; exit}')"
+    install_name_tool -id "@rpath/libqube_ffi.dylib" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    if [[ -n "$QUBE_OLD_REF" ]]; then
+        install_name_tool -change "$QUBE_OLD_REF" "@rpath/libqube_ffi.dylib" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+    fi
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    ok "qube-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
+else
+    warn "qube-ffi dylib not found at $QUBE_DYLIB_SRC — skipping embed (transcription will be unavailable)"
+fi
+
 # ─── Sign ─────────────────────────────────────────────────────────────────
 log "Signing with Hardened Runtime"
 # Sign nested first if any (none yet, but template safe)
