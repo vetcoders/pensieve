@@ -15,13 +15,21 @@ final class DocumentWindowRegistry {
   private var orderedDocumentIDs: Set<URL> = []
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
+  private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
+  private let applicationWindows: @MainActor () -> [NSWindow]
+  private let closeWindow: @MainActor (NSWindow) -> Void
 
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
     scheduleDeferredMainWork: @escaping (@escaping DeferredMainWork) -> Void = { work in
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        Task { @MainActor in work() }
+      }
+    },
+    scheduleLauncherWindowSweep: @escaping (@escaping DeferredMainWork) -> Void = { work in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
         Task { @MainActor in work() }
       }
     },
@@ -31,12 +39,19 @@ final class DocumentWindowRegistry {
     orderAndActivateWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
+    },
+    applicationWindows: @escaping @MainActor () -> [NSWindow] = { NSApp.windows },
+    closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
+      window.close()
     }
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
     self.scheduleDeferredMainWork = scheduleDeferredMainWork
+    self.scheduleLauncherWindowSweep = scheduleLauncherWindowSweep
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.orderAndActivateWindow = orderAndActivateWindow
+    self.applicationWindows = applicationWindows
+    self.closeWindow = closeWindow
   }
 
   func open(_ ref: DocumentRef, openDocument: @escaping DocumentOpener) {
@@ -93,6 +108,7 @@ final class DocumentWindowRegistry {
     if orderedDocumentIDs.insert(documentID).inserted {
       orderAndActivateWindow(window)
     }
+    closeEmptyLauncherWindows(except: window)
   }
 
   private func deferOpen(
@@ -122,19 +138,22 @@ final class DocumentWindowRegistry {
     guard windowsByDocumentID.values.contains(where: { $0.window != nil }) else {
       return
     }
-    DispatchQueue.main.async {
-      if window.title == "Pensieve" {
-        window.close()
+    closeEmptyLauncherWindows(except: nil)
+  }
+
+  private func closeEmptyLauncherWindows(except activeWindow: NSWindow?) {
+    scheduleLauncherWindowSweep { [weak self, activeWindow] in
+      guard let self else { return }
+      for window in applicationWindows()
+      where window !== activeWindow && isEmptyLauncherWindow(window) {
+        closeWindow(window)
       }
     }
   }
 
-  private func closeEmptyLauncherWindows(except activeWindow: NSWindow) {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-      for window in NSApp.windows where window !== activeWindow && window.title == "Pensieve" {
-        window.close()
-      }
-    }
+  private func isEmptyLauncherWindow(_ window: NSWindow) -> Bool {
+    guard window.title == "Pensieve" else { return false }
+    return !windowsByDocumentID.values.contains { $0.window === window }
   }
 }
 

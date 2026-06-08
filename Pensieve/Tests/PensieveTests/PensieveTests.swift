@@ -3640,6 +3640,64 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDocumentWindowAttachReapsExistingEmptyLauncherWindows() throws {
+    var scheduledSweeps: [@MainActor () -> Void] = []
+    var closedWindows: [NSWindow] = []
+
+    let launcherA = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let launcherB = NSWindow(
+      contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [launcherA, launcherB, documentWindow] {
+      window.isReleasedWhenClosed = false
+      window.title = "Pensieve"
+    }
+    defer {
+      for window in [launcherA, launcherB, documentWindow] {
+        window.close()
+      }
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [launcherA, launcherB, documentWindow] },
+      closeWindow: { closedWindows.append($0) }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-reap-launchers.md").standardizedFileURL
+
+    registry.attach(launcherA, documentID: nil)
+
+    XCTAssertTrue(scheduledSweeps.isEmpty, "empty launchers stay open until a document tab exists")
+
+    registry.attach(documentWindow, documentID: documentID)
+
+    XCTAssertEqual(scheduledSweeps.count, 1)
+    let sweep = try XCTUnwrap(scheduledSweeps.popLast())
+    sweep()
+
+    XCTAssertEqual(
+      Set(closedWindows.map { ObjectIdentifier($0) }),
+      Set([ObjectIdentifier(launcherA), ObjectIdentifier(launcherB)])
+    )
+    XCTAssertFalse(closedWindows.contains { $0 === documentWindow })
+  }
+
+  @MainActor
   func testCloseActiveDocumentClearsWindowSessionWithoutDroppingWorkspace() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveTabsEmptyTests-\(UUID().uuidString)", isDirectory: true)
