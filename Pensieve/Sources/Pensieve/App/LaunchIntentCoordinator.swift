@@ -5,18 +5,25 @@ import Foundation
 final class LaunchIntentCoordinator: ObservableObject {
   static let shared = LaunchIntentCoordinator()
 
+  typealias StartupDecisionHandler = @MainActor () -> Void
+
   private let settleDelayNanoseconds: UInt64
   private weak var controller: AppController?
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
+  private var startupDecisionHandler: StartupDecisionHandler?
   private var hasExplicitURLIntent = false
 
   init(settleDelayNanoseconds: UInt64 = 150_000_000) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
   }
 
-  func startWhenLaunchIntentsSettle(controller: AppController) {
+  func startWhenLaunchIntentsSettle(
+    controller: AppController,
+    onStartupDecision: @escaping StartupDecisionHandler = {}
+  ) {
     attach(controller: controller)
+    startupDecisionHandler = onStartupDecision
     startupTask?.cancel()
     startupTask = Task { @MainActor [weak self, weak controller] in
       guard let self, let controller else { return }
@@ -26,6 +33,7 @@ final class LaunchIntentCoordinator: ObservableObject {
 
       self.drainPendingURLs()
       controller.start(restoringWorkspace: !self.hasExplicitURLIntent)
+      self.finishStartupDecision()
     }
   }
 
@@ -37,6 +45,9 @@ final class LaunchIntentCoordinator: ObservableObject {
     startupTask?.cancel()
     drainPendingURLs()
     controller?.start(restoringWorkspace: false)
+    if controller != nil {
+      finishStartupDecision()
+    }
   }
 
   func waitForStartupDecision() async {
@@ -46,6 +57,12 @@ final class LaunchIntentCoordinator: ObservableObject {
   private func attach(controller: AppController) {
     self.controller = controller
     drainPendingURLs()
+  }
+
+  private func finishStartupDecision() {
+    let handler = startupDecisionHandler
+    startupDecisionHandler = nil
+    handler?()
   }
 
   private func drainPendingURLs() {

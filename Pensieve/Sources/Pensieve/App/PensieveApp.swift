@@ -44,6 +44,7 @@ private struct PensieveWindowRoot: View {
   @StateObject private var controller: AppController
   @State private var loadedInitialDocumentID: DocumentRef.ID?
   @State private var currentWindow: NSWindow?
+  @State private var startupPresentationReady = false
 
   init(
     workspaceStore: WorkspaceStore,
@@ -77,6 +78,7 @@ private struct PensieveWindowRoot: View {
           hasEditableBuffer: appState.documentSession.hasEditableBuffer
         ) { window in
           currentWindow = window
+          applyStartupPresentation(to: window)
         }
       )
       .frame(minWidth: 720, minHeight: 480)
@@ -84,13 +86,19 @@ private struct PensieveWindowRoot: View {
         configureDocumentRouting()
         if let initialDocument {
           openInitialDocument(initialDocument)
+          revealStartupWindow()
         } else {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
+          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
+            revealStartupWindow()
+          }
         }
       }
       .onChange(of: initialDocument?.id) { _ in
         if let initialDocument {
+          startupPresentationReady = false
+          applyStartupPresentation(to: currentWindow)
           openInitialDocument(initialDocument)
+          revealStartupWindow()
         }
       }
       .onOpenURL { url in
@@ -106,7 +114,7 @@ private struct PensieveWindowRoot: View {
     }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
-      currentWindow?.close()
+      DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
     }
   }
 
@@ -117,5 +125,14 @@ private struct PensieveWindowRoot: View {
     loadedInitialDocumentID = ref.id.standardizedFileURL
     controller.start(restoringWorkspace: false)
     controller.openFileInCurrentWindow(url: ref.url)
+  }
+
+  private func revealStartupWindow() {
+    startupPresentationReady = true
+    applyStartupPresentation(to: currentWindow)
+  }
+
+  private func applyStartupPresentation(to window: NSWindow?) {
+    window?.alphaValue = startupPresentationReady ? 1 : 0
   }
 }

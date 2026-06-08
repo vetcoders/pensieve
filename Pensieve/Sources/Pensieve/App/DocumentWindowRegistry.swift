@@ -10,6 +10,8 @@ final class DocumentWindowRegistry {
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
   private var launcherWindows: [ObjectIdentifier: WeakWindow] = [:]
+  private var contentWindows: [ObjectIdentifier: WeakWindow] = [:]
+  private var preferredLauncherID: ObjectIdentifier?
   private var pendingMergeTargets: [URL: WeakWindow] = [:]
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
@@ -88,16 +90,17 @@ final class DocumentWindowRegistry {
 
     guard let documentID = documentID?.standardizedFileURL else {
       if hasEditableBuffer {
-        launcherWindows.removeValue(forKey: ObjectIdentifier(window))
+        markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
         window.representedURL = representedURL
+        closeEmptyLauncherWindows(except: window)
         return
       }
       registerLauncher(window)
       closeEmptyLauncherWindowIfDocumentTabsExist(window)
       return
     }
-    launcherWindows.removeValue(forKey: ObjectIdentifier(window))
+    markContentWindow(window)
     let fallbackTitle = documentID.deletingPathExtension().lastPathComponent
     window.title = normalizedTitle(title, fallback: fallbackTitle)
     window.representedURL = representedURL ?? documentID
@@ -113,6 +116,14 @@ final class DocumentWindowRegistry {
     }
 
     completeAttach(window, documentID: documentID)
+  }
+
+  func closeWindowIfEmptyLauncher(_ window: NSWindow?) {
+    guard let window else { return }
+    let windowID = ObjectIdentifier(window)
+    guard contentWindows[windowID]?.window == nil else { return }
+    launcherWindows.removeValue(forKey: windowID)
+    closeWindow(window)
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
@@ -154,7 +165,7 @@ final class DocumentWindowRegistry {
   }
 
   private func closeEmptyLauncherWindowIfDocumentTabsExist(_ window: NSWindow) {
-    guard windowsByDocumentID.values.contains(where: { $0.window != nil }) else {
+    guard hasContentWindow else {
       return
     }
     closeEmptyLauncherWindows(except: nil)
@@ -165,27 +176,79 @@ final class DocumentWindowRegistry {
       guard let self else { return }
       purgeClosedLauncherWindows()
       for window in applicationWindows()
-      where window !== activeWindow && isEmptyLauncherWindow(window) {
+      where window !== activeWindow && isEmptyLauncherWindow(window, includingUntracked: true) {
         closeWindow(window)
       }
     }
   }
 
-  private func isEmptyLauncherWindow(_ window: NSWindow) -> Bool {
+  private func isEmptyLauncherWindow(
+    _ window: NSWindow,
+    includingUntracked: Bool = false
+  ) -> Bool {
     let windowID = ObjectIdentifier(window)
-    guard launcherWindows[windowID]?.window === window else { return false }
-    return !windowsByDocumentID.values.contains { $0.window === window }
+    let isTrackedLauncher = launcherWindows[windowID]?.window === window
+    let isUntrackedLauncher =
+      includingUntracked && window.title == "Pensieve" && window.representedURL == nil
+    guard isTrackedLauncher || isUntrackedLauncher else { return false }
+    return contentWindows[windowID]?.window == nil
+      && !windowsByDocumentID.values.contains { $0.window === window }
   }
 
   private func registerLauncher(_ window: NSWindow) {
     purgeClosedLauncherWindows()
+    let windowID = ObjectIdentifier(window)
+    contentWindows.removeValue(forKey: windowID)
     window.title = "Pensieve"
     window.representedURL = nil
-    launcherWindows[ObjectIdentifier(window)] = WeakWindow(window)
+    launcherWindows[windowID] = WeakWindow(window)
+    preferredLauncherID = windowID
+    reconcileLauncherWindows()
+  }
+
+  private func markContentWindow(_ window: NSWindow) {
+    purgeClosedLauncherWindows()
+    let windowID = ObjectIdentifier(window)
+    launcherWindows.removeValue(forKey: windowID)
+    contentWindows[windowID] = WeakWindow(window)
+  }
+
+  private func reconcileLauncherWindows() {
+    scheduleLauncherWindowSweep { [weak self] in
+      guard let self else { return }
+      purgeClosedLauncherWindows()
+      let preferredLauncher = preferredLauncherID.flatMap { self.launcherWindows[$0]?.window }
+      let shouldCloseAllLaunchers =
+        hasContentWindow || hasVisibleContentWindow(except: preferredLauncher)
+      for window in applicationWindows()
+      where isEmptyLauncherWindow(window, includingUntracked: shouldCloseAllLaunchers)
+        && (shouldCloseAllLaunchers
+          || window !== preferredLauncher)
+      {
+        closeWindow(window)
+      }
+    }
   }
 
   private func purgeClosedLauncherWindows() {
     launcherWindows = launcherWindows.filter { $0.value.window != nil }
+    contentWindows = contentWindows.filter { $0.value.window != nil }
+    if let preferredLauncherID, launcherWindows[preferredLauncherID]?.window == nil {
+      self.preferredLauncherID = nil
+    }
+  }
+
+  private var hasContentWindow: Bool {
+    purgeClosedLauncherWindows()
+    return contentWindows.values.contains { $0.window != nil }
+  }
+
+  private func hasVisibleContentWindow(except launcherWindow: NSWindow?) -> Bool {
+    applicationWindows().contains { window in
+      guard window !== launcherWindow else { return false }
+      guard launcherWindows[ObjectIdentifier(window)]?.window == nil else { return false }
+      return window.representedURL != nil || window.title != "Pensieve"
+    }
   }
 
   private func normalizedTitle(_ title: String?, fallback: String) -> String {

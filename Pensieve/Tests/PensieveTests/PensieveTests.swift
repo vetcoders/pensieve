@@ -2687,6 +2687,46 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testLaunchFileIntentInterruptingSettleSignalsStartupDecisionOnce() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveLaunchInterruptTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let launchURL = folder.appendingPathComponent("clicked-during-settle.md")
+    try "clicked during settle".write(to: launchURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 10_000_000_000)
+    var startupDecisionCount = 0
+
+    coordinator.startWhenLaunchIntentsSettle(controller: controller) {
+      startupDecisionCount += 1
+    }
+    XCTAssertEqual(startupDecisionCount, 0)
+
+    coordinator.handle(urls: [launchURL])
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(startupDecisionCount, 1)
+    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, launchURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "clicked during settle")
+    XCTAssertTrue(appState.workspaceRoots.isEmpty)
+  }
+
+  @MainActor
   func testDirtyDocumentIsSavedBeforeFastSelectionLoad() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveDirtySwitchTests-\(UUID().uuidString)", isDirectory: true)
@@ -3643,6 +3683,8 @@ final class PensieveSmokeTests: XCTestCase {
   func testDocumentWindowAttachReapsRegisteredEmptyLauncherWindows() throws {
     var scheduledSweeps: [@MainActor () -> Void] = []
     var closedWindows: [NSWindow] = []
+    var closedWindowIDs: Set<ObjectIdentifier> = []
+    var documentWindowIsAttached = false
 
     let launcherA = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
@@ -3668,6 +3710,7 @@ final class PensieveSmokeTests: XCTestCase {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
     }
+    strayWindow.title = "Preferences"
     defer {
       for window in [launcherA, launcherB, documentWindow, strayWindow] {
         window.close()
@@ -3680,16 +3723,35 @@ final class PensieveSmokeTests: XCTestCase {
       scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
-      applicationWindows: { [launcherA, launcherB, documentWindow, strayWindow] },
-      closeWindow: { closedWindows.append($0) }
+      applicationWindows: {
+        var windows = [launcherA, launcherB, strayWindow]
+        if documentWindowIsAttached {
+          windows.append(documentWindow)
+        }
+        return windows.filter {
+          !closedWindowIDs.contains(ObjectIdentifier($0))
+        }
+      },
+      closeWindow: {
+        closedWindowIDs.insert(ObjectIdentifier($0))
+        closedWindows.append($0)
+      }
     )
     let documentID = URL(fileURLWithPath: "/tmp/foo.md").standardizedFileURL
 
     registry.attach(launcherA, documentID: nil)
     registry.attach(launcherB, documentID: nil)
 
-    XCTAssertTrue(scheduledSweeps.isEmpty, "empty launchers stay open until a document tab exists")
+    XCTAssertEqual(scheduledSweeps.count, 2, "empty launchers reconcile after registration")
+    while let duplicateSweep = scheduledSweeps.popLast() {
+      duplicateSweep()
+    }
 
+    XCTAssertGreaterThanOrEqual(Set(closedWindows.map { ObjectIdentifier($0) }).count, 1)
+    XCTAssertLessThanOrEqual(Set(closedWindows.map { ObjectIdentifier($0) }).count, 2)
+    XCTAssertTrue(closedWindows.allSatisfy { $0 === launcherA || $0 === launcherB })
+
+    documentWindowIsAttached = true
     registry.attach(
       documentWindow,
       documentID: documentID,
@@ -3698,8 +3760,8 @@ final class PensieveSmokeTests: XCTestCase {
       hasEditableBuffer: true)
 
     XCTAssertEqual(scheduledSweeps.count, 1)
-    let sweep = try XCTUnwrap(scheduledSweeps.popLast())
-    sweep()
+    let contentSweep = try XCTUnwrap(scheduledSweeps.popLast())
+    contentSweep()
 
     XCTAssertEqual(
       Set(closedWindows.map { ObjectIdentifier($0) }),
@@ -3715,9 +3777,15 @@ final class PensieveSmokeTests: XCTestCase {
   func testDocumentWindowAttachDoesNotReapEditableUntitledWindowAsLauncher() throws {
     var scheduledSweeps: [@MainActor () -> Void] = []
     var closedWindows: [NSWindow] = []
+    var closedWindowIDs: Set<ObjectIdentifier> = []
 
-    let untitledWindow = NSWindow(
+    let launcherWindow = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
       defer: false)
@@ -3726,12 +3794,12 @@ final class PensieveSmokeTests: XCTestCase {
       styleMask: [.titled],
       backing: .buffered,
       defer: false)
-    for window in [untitledWindow, documentWindow] {
+    for window in [launcherWindow, untitledWindow, documentWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
     }
     defer {
-      for window in [untitledWindow, documentWindow] {
+      for window in [launcherWindow, untitledWindow, documentWindow] {
         window.close()
       }
     }
@@ -3742,11 +3810,19 @@ final class PensieveSmokeTests: XCTestCase {
       scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
-      applicationWindows: { [untitledWindow, documentWindow] },
-      closeWindow: { closedWindows.append($0) }
+      applicationWindows: {
+        [launcherWindow, untitledWindow, documentWindow].filter {
+          !closedWindowIDs.contains(ObjectIdentifier($0))
+        }
+      },
+      closeWindow: {
+        closedWindowIDs.insert(ObjectIdentifier($0))
+        closedWindows.append($0)
+      }
     )
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-real-document.md").standardizedFileURL
 
+    registry.attach(launcherWindow, documentID: nil)
     registry.attach(
       untitledWindow,
       documentID: nil,
@@ -3756,11 +3832,58 @@ final class PensieveSmokeTests: XCTestCase {
     registry.attach(documentWindow, documentID: documentID)
 
     XCTAssertEqual(untitledWindow.title, "Draft note")
+    XCTAssertEqual(scheduledSweeps.count, 3)
+    while let sweep = scheduledSweeps.popLast() {
+      sweep()
+    }
+
+    XCTAssertEqual(closedWindows.map { ObjectIdentifier($0) }, [ObjectIdentifier(launcherWindow)])
+    XCTAssertFalse(closedWindows.contains { $0 === untitledWindow })
+    XCTAssertFalse(closedWindows.contains { $0 === documentWindow })
+  }
+
+  @MainActor
+  func testDocumentWindowAttachReapsLauncherBesideVisibleUntrackedContentWindow() throws {
+    var scheduledSweeps: [@MainActor () -> Void] = []
+    var closedWindows: [NSWindow] = []
+
+    let launcherWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let restoredContentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    launcherWindow.isReleasedWhenClosed = false
+    restoredContentWindow.isReleasedWhenClosed = false
+    launcherWindow.title = "Pensieve"
+    restoredContentWindow.title = "SKILL"
+    defer {
+      launcherWindow.close()
+      restoredContentWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [launcherWindow, restoredContentWindow] },
+      closeWindow: { closedWindows.append($0) }
+    )
+
+    registry.attach(launcherWindow, documentID: nil)
+
     XCTAssertEqual(scheduledSweeps.count, 1)
     let sweep = try XCTUnwrap(scheduledSweeps.popLast())
     sweep()
 
-    XCTAssertTrue(closedWindows.isEmpty)
+    XCTAssertEqual(closedWindows.map { ObjectIdentifier($0) }, [ObjectIdentifier(launcherWindow)])
+    XCTAssertFalse(closedWindows.contains { $0 === restoredContentWindow })
   }
 
   @MainActor
