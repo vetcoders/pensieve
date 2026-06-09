@@ -1500,12 +1500,13 @@ final class IndexDatabase {
     let scope = searchScope(for: documents)
     guard !scope.rootScopes.isEmpty || scope.includeAdHoc else { return [] }
 
+    let targetPath = target.url.standardizedFileURL.path
     let records = try fetchBacklinkRecords(
       rootScopes: Array(scope.rootScopes),
       includeAdHoc: scope.includeAdHoc,
+      targetPath: targetPath,
       pool: pool
     )
-    let targetPath = target.url.standardizedFileURL.path
     let targetRecord = records.first(where: { $0.path == targetPath })
     let targetSlugs = backlinkTargetSlugs(for: target, indexedRecord: targetRecord)
 
@@ -1631,6 +1632,7 @@ final class IndexDatabase {
   private nonisolated static func fetchBacklinkRecords(
     rootScopes: [String],
     includeAdHoc: Bool,
+    targetPath: String,
     pool: DatabasePool
   ) throws -> [BacklinkDocumentRecord] {
     let selectClause = """
@@ -1648,6 +1650,7 @@ final class IndexDatabase {
     let scope = scopePredicate(rootScopes: rootScopes, includeAdHoc: includeAdHoc)
     var arguments = scope.arguments
     arguments += ["%[[%"]
+    arguments += [targetPath]
 
     return try pool.read { db in
       try BacklinkDocumentRecord.fetchAll(
@@ -1657,7 +1660,11 @@ final class IndexDatabase {
           FROM documents d
           JOIN workspaces w ON w.workspace_id = d.workspace_id
           WHERE \(scope.predicate)
-            AND d.body LIKE ?
+            AND (
+              d.body LIKE ?
+              OR (CASE WHEN w.canonical_path = '' THEN d.path
+                       ELSE w.canonical_path || '/' || d.path END) = ?
+            )
           """,
         arguments: arguments
       )

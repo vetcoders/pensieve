@@ -147,6 +147,31 @@ final class IndexDatabaseBacklinksTests: XCTestCase {
     XCTAssertEqual(ftsPaths, ["indexed-source.md"])
   }
 
+  func testBacklinksUseIndexedTargetTitleAfterTargetDiskMutation() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let targetURL = folder.appendingPathComponent("renamed-file.md")
+    let sourceURL = folder.appendingPathComponent("indexed-title-source.md")
+    try "# Indexed Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
+    try "Source links [[Indexed Target]].".write(to: sourceURL, atomically: true, encoding: .utf8)
+
+    let documents = [
+      document(targetURL, root: folder),
+      document(sourceURL, root: folder),
+    ]
+    let database = IndexDatabase(databaseURL: folder.appendingPathComponent("index.db"))
+    database.reindex(documents: documents)
+
+    try "# Mutated Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
+
+    let backlinks = database.backlinks(to: documents[0], documents: documents)
+
+    XCTAssertEqual(backlinks.map(\.displayPath), ["indexed-title-source.md"])
+    XCTAssertEqual(backlinks.map(\.matchedTarget), ["Indexed Target"])
+    XCTAssertEqual(backlinks.first?.snippet, "Source links [[Indexed Target]].")
+  }
+
   private func makeTemporaryFolder(prefix: String = "PensieveBacklinksTests") throws -> URL {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
