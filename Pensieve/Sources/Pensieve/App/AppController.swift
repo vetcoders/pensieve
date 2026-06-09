@@ -79,11 +79,17 @@ final class AppController: ObservableObject {
       return
     }
 
+    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+      return
+    }
+
+    guard appState.documentSession.hasEditableBuffer else {
+      documentStore.load(ref: ref, into: appState)
+      return
+    }
+
     if let requestOpenDocumentWindow {
       requestOpenDocumentWindow(ref)
-      if !appState.documentSession.hasEditableBuffer {
-        requestCloseCurrentWindowIfEmpty?()
-      }
     } else {
       documentStore.load(ref: ref, into: appState)
     }
@@ -268,6 +274,15 @@ final class AppController: ObservableObject {
 
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
+      return
+    }
+
+    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+      return
+    }
+
+    guard appState.documentSession.hasEditableBuffer else {
+      selectDocument(id: ref.id)
       return
     }
 

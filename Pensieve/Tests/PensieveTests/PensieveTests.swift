@@ -3595,6 +3595,86 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenFileReusesEmptyLauncherWindowBeforeCreatingDocumentWindow() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveOpenFileReuseTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: alphaURL)
+
+    XCTAssertTrue(requestedRefs.isEmpty)
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+
+    controller.openFile(url: betaURL)
+
+    XCTAssertEqual(requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL])
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+  }
+
+  @MainActor
+  func testOpenDocumentWindowReusesEmptyLauncherWindowBeforeCreatingTab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFolder(url: folder)
+    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
+
+    XCTAssertTrue(requestedRefs.isEmpty)
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL])
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+  }
+
+  @MainActor
   func testDocumentWindowOpenDefersWindowCreationDuringModalRunLoop() throws {
     var canMutateWindowTabs = false
     var scheduledWork: [@MainActor () -> Void] = []
@@ -3749,6 +3829,78 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(mergeCount, 1)
     XCTAssertEqual(targetWindow.tabbingIdentifier, expectedIdentifier)
     XCTAssertEqual(documentWindow.tabbingIdentifier, expectedIdentifier)
+  }
+
+  @MainActor
+  func testDocumentWindowOpenMergesExistingDocumentWindowIntoCurrentTabs() throws {
+    var openedRefs: [DocumentRef] = []
+    var mergeCount = 0
+    var orderedWindows: [NSWindow] = []
+    var scheduledSweeps: [@MainActor () -> Void] = []
+    var closedWindows: [NSWindow] = []
+    let expectedIdentifier = "Pensieve.DocumentWindow"
+    let launcherWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [launcherWindow, documentWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    launcherWindow.title = "Pensieve"
+    defer {
+      launcherWindow.close()
+      documentWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
+      mergeWindowIntoTabs: { target, window in
+        mergeCount += 1
+        XCTAssertTrue(target === launcherWindow)
+        XCTAssertTrue(window === documentWindow)
+        XCTAssertEqual(target.tabbingIdentifier, expectedIdentifier)
+        XCTAssertEqual(window.tabbingIdentifier, expectedIdentifier)
+      },
+      orderAndActivateWindow: { orderedWindows.append($0) },
+      currentMergeTarget: { launcherWindow },
+      applicationWindows: { [launcherWindow, documentWindow] },
+      closeWindow: { closedWindows.append($0) }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-existing-document.md").standardizedFileURL
+    let ref = DocumentRef(id: documentID)
+
+    registry.attach(launcherWindow, documentID: nil)
+    scheduledSweeps.removeAll()
+
+    registry.attach(
+      documentWindow,
+      documentID: documentID,
+      title: "existing",
+      representedURL: documentID,
+      hasEditableBuffer: true)
+    scheduledSweeps.removeAll()
+    closedWindows.removeAll()
+
+    registry.open(ref) { openedRefs.append($0) }
+
+    XCTAssertTrue(openedRefs.isEmpty)
+    XCTAssertEqual(mergeCount, 1)
+    XCTAssertEqual(orderedWindows.last, documentWindow)
+    XCTAssertEqual(scheduledSweeps.count, 1)
+
+    let sweep = try XCTUnwrap(scheduledSweeps.popLast())
+    sweep()
+
+    XCTAssertEqual(closedWindows.map { ObjectIdentifier($0) }, [ObjectIdentifier(launcherWindow)])
+    XCTAssertFalse(closedWindows.contains { $0 === documentWindow })
   }
 
   @MainActor

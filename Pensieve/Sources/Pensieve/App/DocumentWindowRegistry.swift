@@ -71,6 +71,7 @@ final class DocumentWindowRegistry {
     }
 
     if let existing = windowsByDocumentID[documentID]?.window {
+      mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
       orderAndActivateWindow(existing)
       closeEmptyLauncherWindows(except: existing)
       return
@@ -144,6 +145,24 @@ final class DocumentWindowRegistry {
       orderAndActivateWindow(window)
     }
     closeEmptyLauncherWindows(except: window)
+  }
+
+  private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
+    guard let target = currentMergeTarget(),
+      target !== window,
+      !areWindowsInSameTabGroup(target, window)
+    else {
+      return
+    }
+
+    prepareTabbedWindow(target)
+    prepareTabbedWindow(window)
+    mergeWindowIntoTabs(target, window)
+  }
+
+  private func areWindowsInSameTabGroup(_ lhs: NSWindow, _ rhs: NSWindow) -> Bool {
+    lhs.tabbedWindows?.contains { $0 === rhs } == true
+      || rhs.tabbedWindows?.contains { $0 === lhs } == true
   }
 
   private func deferOpen(
