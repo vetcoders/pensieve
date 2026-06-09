@@ -72,46 +72,46 @@ private struct PensieveWindowRoot: View {
         StartupPresentationView()
       }
     }
-      .environmentObject(appState)
-      .environmentObject(controller)
-      .environmentObject(controller.transcriptionService)
-      .environmentObject(themeManager)
-      .focusedSceneObject(appState)
-      .focusedSceneObject(controller)
-      .background(
-        DocumentWindowAccessor(
-          documentID: appState.selectedDocumentID,
-          title: appState.documentSession.displayTitle,
-          representedURL: appState.documentSession.url,
-          hasEditableBuffer: appState.documentSession.hasEditableBuffer
-        ) { window in
-          currentWindow = window
-          applyStartupPresentation(to: window)
-        }
-      )
-      .frame(minWidth: 720, minHeight: 480)
-      .task {
-        configureDocumentRouting()
-        if let initialDocument {
-          openInitialDocument(initialDocument)
-          revealStartupWindow()
-        } else {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
-            revealStartupWindow()
-          }
-        }
+    .environmentObject(appState)
+    .environmentObject(controller)
+    .environmentObject(controller.transcriptionService)
+    .environmentObject(themeManager)
+    .focusedSceneObject(appState)
+    .focusedSceneObject(controller)
+    .background(
+      DocumentWindowAccessor(
+        documentID: appState.selectedDocumentID,
+        title: appState.documentSession.displayTitle,
+        representedURL: appState.documentSession.url,
+        hasEditableBuffer: appState.documentSession.hasEditableBuffer
+      ) { window in
+        currentWindow = window
+        applyStartupPresentation(to: window)
       }
-      .onChange(of: initialDocument?.id) { _ in
-        if let initialDocument {
-          startupPresentationReady = false
-          applyStartupPresentation(to: currentWindow)
-          openInitialDocument(initialDocument)
+    )
+    .frame(minWidth: 720, minHeight: 480)
+    .task {
+      configureDocumentRouting()
+      if let initialDocument {
+        openInitialDocument(initialDocument)
+        revealStartupWindow()
+      } else {
+        launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
           revealStartupWindow()
         }
       }
-      .onOpenURL { url in
-        controller.openFile(url: url)
+    }
+    .onChange(of: initialDocument?.id) { _ in
+      if let initialDocument {
+        startupPresentationReady = false
+        applyStartupPresentation(to: currentWindow)
+        openInitialDocument(initialDocument)
+        revealStartupWindow()
       }
+    }
+    .onOpenURL { url in
+      controller.openFile(url: url)
+    }
   }
 
   private func configureDocumentRouting() {
