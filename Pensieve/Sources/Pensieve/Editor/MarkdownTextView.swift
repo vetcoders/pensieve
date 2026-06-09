@@ -8,7 +8,11 @@ class MarkdownTextView: NSTextView {
   var asciiSafeTables = false
   var onFormatRequest: ((MarkdownFormat) -> Void)?
   var onEscape: (() -> Bool)?
+  var onAcceptAutocomplete: (() -> Bool)?
   private let fallbackUndoManager = UndoManager()
+  private var autocompleteGhostField: NSTextField?
+  private(set) var autocompleteGhostText: String?
+  private(set) var autocompleteGhostAnchor: Int?
   // In-window floating accessory (a subview of this text view) — NOT an NSPopover. A popover is a
   // separate key window: showing it makes the text view resign first-responder, so the user had to
   // press Esc before typing/copying again. A non-responder subview in the SAME window never becomes
@@ -82,6 +86,9 @@ class MarkdownTextView: NSTextView {
   }
 
   override func keyDown(with event: NSEvent) {
+    if event.keyCode == 48, onAcceptAutocomplete?() == true {
+      return
+    }
     if event.keyCode == 53 {
       // Esc dismisses the floating bar too (parity with the old transient popover), without
       // consuming the key event meant for `onEscape` (find-bar / selection clearing).
@@ -91,6 +98,69 @@ class MarkdownTextView: NSTextView {
       }
     }
     super.keyDown(with: event)
+  }
+
+  var hasAutocompleteGhost: Bool {
+    autocompleteGhostText != nil
+  }
+
+  func setAutocompleteGhost(_ suggestion: String, at caretLocation: Int) {
+    guard !suggestion.isEmpty else {
+      dismissAutocompleteGhost()
+      return
+    }
+    autocompleteGhostText = suggestion
+    autocompleteGhostAnchor = caretLocation
+
+    let ghostField = autocompleteGhostField ?? makeAutocompleteGhostField()
+    if ghostField.superview !== self {
+      addSubview(ghostField)
+    }
+    ghostField.stringValue = suggestion
+    ghostField.font = font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ghostField.sizeToFit()
+    ghostField.setFrameOrigin(
+      autocompleteGhostOrigin(caretLocation: caretLocation, size: ghostField.frame.size))
+    autocompleteGhostField = ghostField
+  }
+
+  func dismissAutocompleteGhost() {
+    autocompleteGhostText = nil
+    autocompleteGhostAnchor = nil
+    autocompleteGhostField?.removeFromSuperview()
+  }
+
+  private func makeAutocompleteGhostField() -> NSTextField {
+    let field = NSTextField(labelWithString: "")
+    field.isEditable = false
+    field.isSelectable = false
+    field.drawsBackground = false
+    field.isBordered = false
+    field.textColor = NSColor.placeholderTextColor
+    field.alphaValue = 0.9
+    field.lineBreakMode = .byClipping
+    field.setAccessibilityIdentifier("pensieve.autocomplete.ghostText")
+    return field
+  }
+
+  private func autocompleteGhostOrigin(caretLocation: Int, size: NSSize) -> NSPoint {
+    let textLength = (textStorage?.string as NSString?)?.length ?? 0
+    let location = min(max(caretLocation, 0), textLength)
+    let range = NSRange(location: location, length: 0)
+    var actualRange = NSRange(location: NSNotFound, length: 0)
+    let screenRect = firstRect(forCharacterRange: range, actualRange: &actualRange)
+    guard screenRect != .zero else {
+      return NSPoint(x: textContainerInset.width, y: textContainerInset.height)
+    }
+
+    let localRect: NSRect
+    if let window {
+      localRect = convert(window.convertFromScreen(screenRect), from: nil)
+    } else {
+      localRect = screenRect
+    }
+    let baselineY = localRect.minY + max(0, (localRect.height - size.height) / 2)
+    return NSPoint(x: localRect.maxX + 1, y: baselineY)
   }
 
   override func menu(for event: NSEvent) -> NSMenu? {

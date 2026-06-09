@@ -160,6 +160,15 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut("t", modifiers: [.command, .option])
       .accessibilityIdentifier("pensieve.tafla.menu.viewToggle")
+
+      Toggle(
+        "AI Autocomplete",
+        isOn: Binding(
+          get: { appState.aiAutocompleteEnabled },
+          set: { appState.aiAutocompleteEnabled = $0 }
+        )
+      )
+      .accessibilityIdentifier("pensieve.autocomplete.menuToggle")
     }
 
     // Edit menu — Find & Replace routes into Pensieve's own squared find bar.

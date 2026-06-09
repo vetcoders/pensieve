@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct EditorView: View {
@@ -23,6 +24,7 @@ struct EditorView: View {
         findCommand: appState.pendingFindCommand,
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
+        aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
         isDirty: documentDirty,
         onDocumentChanged: controller.documentDidChange,
         onCloseFindBar: closeFindBar
@@ -66,6 +68,7 @@ struct EditorRepresentable: NSViewRepresentable {
   let findCommand: FindBarCommand?
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
+  let aiAutocompleteEnabled: Bool
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
   let onCloseFindBar: @MainActor () -> Void
@@ -76,7 +79,8 @@ struct EditorRepresentable: NSViewRepresentable {
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
-      asciiSafeTables: asciiSafeTables
+      asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled
     )
     surface.onTextChanged = { newText in
       self.text = newText
@@ -108,6 +112,7 @@ struct EditorRepresentable: NSViewRepresentable {
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled,
       findQuery: findQuery,
       findBarVisible: findBarVisible
     )
@@ -193,6 +198,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onCloseFindBar: (() -> Void)?
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
+  private var aiAutocompleteEnabled: Bool
+  private var autocompleteCancellable: AnyCancellable?
+  private var lastTextChangeSelection: NSRange?
   private var findQuery = ""
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
@@ -206,12 +214,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     syntaxHighlightingEnabled: Bool = true,
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
+    aiAutocompleteEnabled: Bool = false,
     autocompleteController: AutocompleteController = AutocompleteController()
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()
     textStorage = NSTextStorage()
     self.autocompleteController = autocompleteController
+    self.aiAutocompleteEnabled = aiAutocompleteEnabled
     textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
 
     textContentStorage.textStorage = textStorage
@@ -255,11 +265,18 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       _ = self?.applyMarkdownFormat(format)
     }
     textView.onEscape = { [weak self] in
+      if self?.dismissAutocompleteSuggestion() == true {
+        return true
+      }
       guard self?.isFindBarVisible == true else { return false }
       self?.clearFindHighlights()
       self?.onCloseFindBar?()
       return true
     }
+    textView.onAcceptAutocomplete = { [weak self] in
+      self?.acceptAutocompleteSuggestion() ?? false
+    }
+    bindAutocomplete()
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(editorBoundsDidChange),
@@ -287,11 +304,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     syntaxHighlightingEnabled: Bool,
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
+    aiAutocompleteEnabled: Bool = false,
     findQuery: String = "",
     findBarVisible: Bool = false
   ) {
     textView.tableTidyOnPaste = tableTidyOnPaste
     textView.asciiSafeTables = asciiSafeTables
+    setAIAutocompleteEnabled(aiAutocompleteEnabled)
 
     if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
       textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
@@ -310,6 +329,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textStorage.string != text {
       isApplyingExternalText = true
+      invalidateAutocomplete()
       // A model→view text re-sync must NOT yank the viewport to the caret. Preserve the
       // caret + scroll across the full re-apply so a re-render never resets selection to 0
       // and scrolls there (the "screen goes wild on every letter" regression).
@@ -344,8 +364,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
     let latestText = textStorage.string
+    invalidateAutocomplete()
     onTextChanged?(latestText)
-    autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
+    if aiAutocompleteEnabled {
+      lastTextChangeSelection = textView.selectedRange()
+      autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
+    }
     refreshFindMatches()
     centerCaretLineIfNeeded()
     postEditorViewportIfNeeded()
@@ -357,6 +381,73 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     return nsText.substring(to: caret)
   }
 
+  private func bindAutocomplete() {
+    autocompleteCancellable = autocompleteController.$suggestion
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] suggestion in
+        self?.scheduleAutocompleteRender(suggestion)
+      }
+  }
+
+  private func setAIAutocompleteEnabled(_ enabled: Bool) {
+    guard aiAutocompleteEnabled != enabled else { return }
+    aiAutocompleteEnabled = enabled
+    if !enabled {
+      invalidateAutocomplete()
+      autocompleteController.cancel()
+    }
+  }
+
+  private func scheduleAutocompleteRender(_ suggestion: String?) {
+    let selection = textView.selectedRange()
+    guard aiAutocompleteEnabled, selection.length == 0, let suggestion, !suggestion.isEmpty else {
+      textView.dismissAutocompleteGhost()
+      return
+    }
+    let caret = selection.location
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      guard self.aiAutocompleteEnabled, self.textView.selectedRange() == selection else { return }
+      self.textView.setAutocompleteGhost(suggestion, at: caret)
+    }
+  }
+
+  @discardableResult
+  func acceptAutocompleteSuggestion() -> Bool {
+    guard let suggestion = textView.autocompleteGhostText, !suggestion.isEmpty else { return false }
+    let range = textView.selectedRange()
+    guard range.length == 0 else {
+      invalidateAutocomplete()
+      return false
+    }
+    guard textView.autocompleteGhostAnchor == range.location else {
+      invalidateAutocomplete()
+      return false
+    }
+    guard textView.shouldChangeText(in: range, replacementString: suggestion) else { return false }
+
+    autocompleteController.cancel()
+    textView.dismissAutocompleteGhost()
+    textStorage.replaceCharacters(in: range, with: suggestion)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(
+      NSRange(location: range.location + (suggestion as NSString).length, length: 0))
+    textView.didChangeText()
+    return true
+  }
+
+  @discardableResult
+  func dismissAutocompleteSuggestion() -> Bool {
+    let hadGhost = textView.hasAutocompleteGhost
+    invalidateAutocomplete()
+    autocompleteController.cancel()
+    return hadGhost
+  }
+
+  func invalidateAutocomplete() {
+    textView.dismissAutocompleteGhost()
+  }
+
   func textView(
     _ changedTextView: NSTextView,
     shouldChangeTextIn affectedCharRange: NSRange,
@@ -364,6 +455,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   ) -> Bool {
     guard changedTextView === textView else { return true }
     guard !isApplyingExternalText else { return true }
+    invalidateAutocomplete()
     guard textContentStorage.syntaxHighlightingEnabled else { return true }
     guard let replacementString else { return true }
     guard
@@ -395,6 +487,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     } else {
       textView.hideFormattingPopover()
     }
+    let currentSelection = textView.selectedRange()
+    if currentSelection != lastTextChangeSelection {
+      dismissAutocompleteSuggestion()
+    }
+    lastTextChangeSelection = nil
     centerCaretLineIfNeeded()
     postEditorViewportIfNeeded()
   }

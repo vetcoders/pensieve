@@ -6,6 +6,7 @@ final class DocumentWindowModel: ObservableObject {
   private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
   private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
+  private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private let defaults: UserDefaults
 
   @Published var selectedDocumentID: DocumentRef.ID?
@@ -28,6 +29,11 @@ final class DocumentWindowModel: ObservableObject {
   @Published var asciiSafeTables: Bool {
     didSet {
       defaults.set(asciiSafeTables, forKey: Self.asciiSafeTablesKey)
+    }
+  }
+  @Published var aiAutocompleteEnabled: Bool {
+    didSet {
+      defaults.set(aiAutocompleteEnabled, forKey: Self.aiAutocompleteEnabledKey)
     }
   }
   @Published var previewAutoReload: Bool {
@@ -55,6 +61,11 @@ final class DocumentWindowModel: ObservableObject {
       self.asciiSafeTables = false
     } else {
       self.asciiSafeTables = defaults.bool(forKey: Self.asciiSafeTablesKey)
+    }
+    if defaults.object(forKey: Self.aiAutocompleteEnabledKey) == nil {
+      self.aiAutocompleteEnabled = false
+    } else {
+      self.aiAutocompleteEnabled = defaults.bool(forKey: Self.aiAutocompleteEnabledKey)
     }
   }
 

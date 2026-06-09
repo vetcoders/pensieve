@@ -221,6 +221,11 @@ final class AppState: ObservableObject {
     set { windowModel.asciiSafeTables = newValue }
   }
 
+  var aiAutocompleteEnabled: Bool {
+    get { windowModel.aiAutocompleteEnabled }
+    set { windowModel.aiAutocompleteEnabled = newValue }
+  }
+
   var previewAutoReload: Bool {
     get { windowModel.previewAutoReload }
     set { windowModel.previewAutoReload = newValue }

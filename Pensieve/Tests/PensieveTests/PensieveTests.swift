@@ -477,6 +477,7 @@ final class PensieveSmokeTests: XCTestCase {
       findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
