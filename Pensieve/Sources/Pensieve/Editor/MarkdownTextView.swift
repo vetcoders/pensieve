@@ -263,6 +263,24 @@ class MarkdownTextView: NSTextView {
     return true
   }
 
+  @discardableResult
+  func insertTextAtSelection(_ text: String) -> Bool {
+    let insertionRange = selectedRange()
+    let currentLength = (string as NSString).length
+    guard NSMaxRange(insertionRange) <= currentLength else { return false }
+    guard shouldChangeText(in: insertionRange, replacementString: text) else { return false }
+
+    if let textStorage {
+      textStorage.replaceCharacters(in: insertionRange, with: text)
+    } else {
+      replaceCharacters(in: insertionRange, with: text)
+    }
+    setSelectedRange(
+      NSRange(location: insertionRange.location + (text as NSString).length, length: 0))
+    didChangeText()
+    return true
+  }
+
   private func registerSmartPasteUndo(location: Int, current: String, replacement: String) {
     undoManager?.registerUndo(withTarget: self) { target in
       target.replaceSmartPasteText(location: location, current: current, replacement: replacement)

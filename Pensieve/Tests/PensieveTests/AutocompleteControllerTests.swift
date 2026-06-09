@@ -7,11 +7,11 @@ import XCTest
 @MainActor
 final class AutocompleteControllerTests: XCTestCase {
   func testTypingPauseYieldsSuggestion() async {
-    let engine = MockVistaAutocompleteEngine { prefix, maxTokens in
+    let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, maxTokens in
       XCTAssertEqual(prefix, "hello")
       XCTAssertEqual(maxTokens, 32)
       return " world"
-    }
+    })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 20_000_000)
 
     controller.textDidChange(prefix: "hello")
@@ -24,14 +24,14 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 
   func testNewKeystrokeSuppressesPriorCompletion() async {
-    let engine = MockVistaAutocompleteEngine { prefix, _ in
+    let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, _ in
       if prefix == "alpha" {
         await nonCancellableSleep(nanoseconds: 150_000_000)
         return " stale"
       }
       await nonCancellableSleep(nanoseconds: 10_000_000)
       return " fresh"
-    }
+    })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
     controller.textDidChange(prefix: "alpha")

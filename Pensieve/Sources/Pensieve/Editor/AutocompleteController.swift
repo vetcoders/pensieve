@@ -91,14 +91,21 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
 final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendable {
   typealias CompletionHandler = @Sendable (String, UInt32) async throws -> String
+  typealias FormattingHandler = @Sendable (String, Bool) async throws -> String
 
   private let completionHandler: CompletionHandler
+  private let formattingAvailable: Bool
+  private let formattingHandler: FormattingHandler
 
   init(
     completionHandler: @escaping CompletionHandler =
-      MockVistaAutocompleteEngine.defaultCompletionHandler
+      MockVistaAutocompleteEngine.defaultCompletionHandler,
+    formattingAvailable: Bool = false,
+    formattingHandler: @escaping FormattingHandler = { text, _ in text }
   ) {
     self.completionHandler = completionHandler
+    self.formattingAvailable = formattingAvailable
+    self.formattingHandler = formattingHandler
   }
 
   func complete(prefix: String, maxTokens: UInt32) async throws -> String {
@@ -113,7 +120,9 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
 
   func configDir() -> String { "" }
 
-  func formatText(text: String, assistive: Bool) async throws -> String { text }
+  func formatText(text: String, assistive: Bool) async throws -> String {
+    try await formattingHandler(text, assistive)
+  }
 
   func getAssistivePrompt() -> String { "" }
 
@@ -123,7 +132,7 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
 
   func initModel() throws {}
 
-  func isFormattingAvailable() -> Bool { false }
+  func isFormattingAvailable() -> Bool { formattingAvailable }
 
   func isModelLoaded() -> Bool { true }
 

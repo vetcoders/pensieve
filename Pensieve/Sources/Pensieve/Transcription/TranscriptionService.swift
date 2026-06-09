@@ -9,23 +9,35 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var preview: String
   @Published private(set) var rendered: String
   @Published private(set) var isRecording: Bool
+  @Published private(set) var isFormatting: Bool
   @Published private(set) var lastLanguage: String?
   @Published private(set) var lastStatus: VistaStatusSignal?
   @Published private(set) var lastError: String?
 
   private let engineFactory: EngineFactory
+  private let cadenceCommitNanoseconds: UInt64
   private var engine: VistaEngineProtocol?
+  private var cadenceCommitTask: Task<Void, Never>?
+  private var lastRawPreview: String = ""
+  private var promotedPreviewPrefix: String?
 
   init(
     engine: VistaEngineProtocol? = nil,
-    engineFactory: @escaping EngineFactory = { VistaEngine() }
+    engineFactory: @escaping EngineFactory = { VistaEngine() },
+    cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
     self.engine = engine
     self.engineFactory = engineFactory
+    self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""
     self.rendered = ""
     self.isRecording = false
+    self.isFormatting = false
+  }
+
+  deinit {
+    cadenceCommitTask?.cancel()
   }
 
   func startRecording(language: String? = nil) throws {
@@ -37,17 +49,21 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     try engine.startRecording(language: language)
     isRecording = true
     lastError = nil
+    startCadenceCommitLoop()
   }
 
   @discardableResult
   func stopRecording() throws -> String {
     guard let engine else {
       isRecording = false
+      stopCadenceCommitLoop()
       return rendered
     }
 
     let finalText = try engine.stopRecording()
+    commitActivePreviewForCadence()
     isRecording = false
+    stopCadenceCommitLoop()
     return finalText
   }
 
@@ -55,8 +71,53 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     committed = ""
     preview = ""
     rendered = ""
+    lastRawPreview = ""
+    promotedPreviewPrefix = nil
     lastLanguage = nil
     lastError = nil
+  }
+
+  var hasComposedText: Bool {
+    !rendered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var isFormattingAvailable: Bool {
+    activeEngine().isFormattingAvailable()
+  }
+
+  @discardableResult
+  func formatComposition() async -> String {
+    let source = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !source.isEmpty else { return "" }
+
+    let engine = activeEngine()
+    guard engine.isFormattingAvailable() else {
+      lastError = nil
+      return source
+    }
+
+    isFormatting = true
+    defer { isFormatting = false }
+
+    do {
+      let formatted = try await engine.formatText(text: source, assistive: false)
+      let cleaned = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
+      replaceComposition(with: cleaned.isEmpty ? source : cleaned)
+      lastError = nil
+      return rendered
+    } catch {
+      lastError = error.localizedDescription
+      return source
+    }
+  }
+
+  func replaceComposition(with text: String) {
+    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    committed = cleaned
+    preview = ""
+    lastRawPreview = ""
+    promotedPreviewPrefix = nil
+    refreshRendered()
   }
 
   nonisolated func onTranscriptionPreview(text: String) {
@@ -84,21 +145,35 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   func receivePreview(_ text: String) {
-    preview = text
+    lastRawPreview = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    preview = uncommittedTail(from: lastRawPreview)
     refreshRendered()
   }
 
   func receiveFinal(_ text: String, language: String) {
-    let finalText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let finalText = uncommittedTail(from: text)
     guard !finalText.isEmpty else {
       preview = ""
+      lastRawPreview = ""
+      promotedPreviewPrefix = nil
       refreshRendered()
       return
     }
 
     appendCommitted(finalText)
     preview = ""
+    lastRawPreview = ""
+    promotedPreviewPrefix = nil
     lastLanguage = language
+    refreshRendered()
+  }
+
+  func commitActivePreviewForCadence() {
+    let previewText = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !previewText.isEmpty else { return }
+    appendCommitted(previewText)
+    promotedPreviewPrefix = lastRawPreview.isEmpty ? previewText : lastRawPreview
+    preview = ""
     refreshRendered()
   }
 
@@ -109,6 +184,26 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     let engine = engineFactory()
     self.engine = engine
     return engine
+  }
+
+  private func startCadenceCommitLoop() {
+    guard cadenceCommitNanoseconds > 0 else { return }
+    cadenceCommitTask?.cancel()
+    cadenceCommitTask = Task { [weak self, cadenceCommitNanoseconds] in
+      while !Task.isCancelled {
+        do {
+          try await Task.sleep(nanoseconds: cadenceCommitNanoseconds)
+        } catch {
+          return
+        }
+        await self?.commitActivePreviewForCadence()
+      }
+    }
+  }
+
+  private func stopCadenceCommitLoop() {
+    cadenceCommitTask?.cancel()
+    cadenceCommitTask = nil
   }
 
   private func appendCommitted(_ text: String) {
@@ -128,5 +223,56 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     } else {
       rendered = committed + "\n" + preview
     }
+  }
+
+  private func uncommittedTail(from text: String) -> String {
+    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty else { return "" }
+
+    if let promotedPreviewPrefix,
+      let tail = tailByRemovingPrefix(promotedPreviewPrefix, from: cleaned)
+    {
+      return tail
+    }
+
+    if let tail = tailByRemovingPrefix(committed, from: cleaned) {
+      return tail
+    }
+
+    return cleaned
+  }
+
+  private func tailByRemovingPrefix(_ prefix: String, from text: String) -> String? {
+    let cleanedPrefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanedPrefix.isEmpty else { return nil }
+
+    if text == cleanedPrefix {
+      return ""
+    }
+
+    if text.hasPrefix(cleanedPrefix) {
+      let index = text.index(text.startIndex, offsetBy: cleanedPrefix.count)
+      return String(text[index...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    let normalizedPrefix = Self.normalizedSpeechText(cleanedPrefix)
+    let normalizedText = Self.normalizedSpeechText(text)
+    guard !normalizedPrefix.isEmpty else { return nil }
+
+    if normalizedText == normalizedPrefix {
+      return ""
+    }
+
+    let prefixWithBoundary = normalizedPrefix + " "
+    guard normalizedText.hasPrefix(prefixWithBoundary) else { return nil }
+    let index = normalizedText.index(normalizedText.startIndex, offsetBy: prefixWithBoundary.count)
+    return String(normalizedText[index...]).trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func normalizedSpeechText(_ text: String) -> String {
+    text
+      .components(separatedBy: .whitespacesAndNewlines)
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
   }
 }

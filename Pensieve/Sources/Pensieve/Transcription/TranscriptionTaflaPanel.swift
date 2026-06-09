@@ -6,10 +6,19 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   var onVisibilityChanged: (() -> Void)?
 
   private let service: TranscriptionService
+  private let onSend: () -> Bool
   private var panel: NSPanel?
+  private var sendEventMonitor: Any?
 
-  init(service: TranscriptionService) {
+  init(service: TranscriptionService, onSend: @escaping () -> Bool = { false }) {
     self.service = service
+    self.onSend = onSend
+  }
+
+  deinit {
+    if let sendEventMonitor {
+      NSEvent.removeMonitor(sendEventMonitor)
+    }
   }
 
   var isVisible: Bool {
@@ -24,11 +33,13 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     let panel = panel ?? makePanel()
     self.panel = panel
     panel.orderFront(nil)
+    installSendEventMonitor()
     onVisibilityChanged?()
   }
 
   func hide() {
     panel?.orderOut(nil)
+    removeSendEventMonitor()
     onVisibilityChanged?()
   }
 
@@ -63,8 +74,10 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
     let root = TranscriptionTaflaPanelView(
       service: service,
+      onSend: { [weak self] in self?.sendComposition() == true },
       onClose: { [weak panel, weak self] in
         panel?.orderOut(nil)
+        self?.removeSendEventMonitor()
         self?.onVisibilityChanged?()
       }
     )
@@ -72,6 +85,28 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     hostingView.setAccessibilityIdentifier("pensieve.tafla.panel")
     panel.contentView = hostingView
     return panel
+  }
+
+  private func sendComposition() -> Bool {
+    onSend()
+  }
+
+  private func installSendEventMonitor() {
+    guard sendEventMonitor == nil else { return }
+    sendEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+      guard let self, self.isVisible else { return event }
+      guard event.keyCode == 36 else { return event }
+      let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+      guard flags.contains(.shift) else { return event }
+      return self.sendComposition() ? nil : event
+    }
+  }
+
+  private func removeSendEventMonitor() {
+    if let sendEventMonitor {
+      NSEvent.removeMonitor(sendEventMonitor)
+    }
+    sendEventMonitor = nil
   }
 }
 
@@ -82,9 +117,11 @@ private final class NonActivatingTaflaPanel: NSPanel {
 
 private struct TranscriptionTaflaPanelView: View {
   @ObservedObject var service: TranscriptionService
+  let onSend: () -> Bool
   let onClose: () -> Void
 
   @State private var controlError: String?
+  @State private var isFormatting = false
 
   var body: some View {
     ZStack {
@@ -130,6 +167,30 @@ private struct TranscriptionTaflaPanelView: View {
       .buttonStyle(.bordered)
       .help("Reset Transcript")
       .accessibilityIdentifier("pensieve.tafla.reset")
+
+      Button(action: format) {
+        Image(systemName: formatSystemImageName)
+      }
+      .buttonStyle(.bordered)
+      .disabled(!service.hasComposedText || isFormatting || service.isFormatting)
+      .help("Format Transcript")
+      .accessibilityIdentifier("pensieve.tafla.format")
+
+      Button(action: copyTranscript) {
+        Image(systemName: "doc.on.doc")
+      }
+      .buttonStyle(.bordered)
+      .disabled(!service.hasComposedText)
+      .help("Copy Transcript")
+      .accessibilityIdentifier("pensieve.tafla.copy")
+
+      Button(action: send) {
+        Image(systemName: "paperplane.fill")
+      }
+      .buttonStyle(.borderedProminent)
+      .disabled(!service.hasComposedText)
+      .help("Send Transcript")
+      .accessibilityIdentifier("pensieve.tafla.send")
 
       Button(action: onClose) {
         Image(systemName: "xmark")
@@ -200,6 +261,10 @@ private struct TranscriptionTaflaPanelView: View {
     controlError ?? service.lastError
   }
 
+  private var formatSystemImageName: String {
+    isFormatting || service.isFormatting ? "wand.and.stars.inverse" : "wand.and.stars"
+  }
+
   private func start() {
     do {
       try service.startRecording()
@@ -221,6 +286,31 @@ private struct TranscriptionTaflaPanelView: View {
   private func reset() {
     service.resetTranscript()
     controlError = nil
+  }
+
+  private func format() {
+    isFormatting = true
+    Task {
+      _ = await service.formatComposition()
+      isFormatting = false
+      controlError = service.lastError
+    }
+  }
+
+  private func copyTranscript() {
+    let text = service.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    controlError = nil
+  }
+
+  private func send() {
+    if onSend() {
+      controlError = nil
+    } else {
+      controlError = "No active editor target."
+    }
   }
 }
 

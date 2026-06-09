@@ -13,7 +13,10 @@ final class AppController: ObservableObject {
   private let workspaceSearchDebounceNanoseconds: UInt64
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
-    let panel = TranscriptionTaflaPanelController(service: transcriptionService)
+    let panel = TranscriptionTaflaPanelController(
+      service: transcriptionService,
+      onSend: { [weak self] in self?.sendTranscriptionToActiveEditor() == true }
+    )
     panel.onVisibilityChanged = { [weak self] in
       self?.objectWillChange.send()
     }
@@ -375,6 +378,29 @@ final class AppController: ObservableObject {
     transcriptionTaflaPanel.hide()
   }
 
+  @discardableResult
+  func sendTranscriptionToActiveEditor(activeTextView: MarkdownTextView? = nil) -> Bool {
+    let text = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return false }
+    guard appState.documentSession.hasEditableBuffer else {
+      appState.lastError = "Open an editable document before sending from Tafla."
+      return false
+    }
+
+    if let textView = activeTextView ?? NSApp.keyWindow?.firstResponder as? MarkdownTextView,
+      textView.insertTextAtSelection(text)
+    {
+      transcriptionService.resetTranscript()
+      appState.lastError = nil
+      return true
+    }
+
+    appendTranscriptionToDocument(text)
+    transcriptionService.resetTranscript()
+    appState.lastError = nil
+    return true
+  }
+
   func bumpFontSize(by delta: CGFloat) {
     appState.bumpFontSize(by: delta)
   }
@@ -460,6 +486,16 @@ final class AppController: ObservableObject {
     Task {
       _ = await indexDatabase.reindexInBackground(documents: [ref], appState: appState)
     }
+  }
+
+  private func appendTranscriptionToDocument(_ text: String) {
+    if appState.documentSession.text.isEmpty {
+      appState.documentSession.text = text
+    } else {
+      appState.documentSession.text += "\n" + text
+    }
+    appState.documentSession.isDirty = true
+    documentDidChange()
   }
 
   func selectNextTab() {
