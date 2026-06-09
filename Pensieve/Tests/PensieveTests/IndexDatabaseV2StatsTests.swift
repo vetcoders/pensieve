@@ -19,7 +19,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: folder))
     )
 
@@ -31,7 +31,9 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // Check scan_sessions
     try await dbQueue.read { db in
-      let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM scan_sessions")!
+      let count = try XCTUnwrap(
+        Int.fetchOne(db, sql: "SELECT COUNT(*) FROM scan_sessions"),
+        "Expected COUNT(*) over scan_sessions to return a row")
       XCTAssertEqual(count, 1)
 
       let recordedWorkspaceIDs = try String.fetchAll(
@@ -79,7 +81,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: folder))
     )
 
@@ -98,13 +100,16 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // Check scan_sessions
     try await dbQueue.read { db in
-      let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM scan_sessions")!
+      let count = try XCTUnwrap(
+        Int.fetchOne(db, sql: "SELECT COUNT(*) FROM scan_sessions"),
+        "Expected COUNT(*) over scan_sessions to return a row")
       XCTAssertEqual(count, 2)
 
       let rows = try Row.fetchAll(
         db, sql: "SELECT * FROM scan_sessions WHERE workspace_id = ? ORDER BY finished_at ASC",
         arguments: [identity.workspaceID])
-      XCTAssertEqual(rows.count, 2, "Expected two scan_sessions for workspace_id \(identity.workspaceID)")
+      XCTAssertEqual(
+        rows.count, 2, "Expected two scan_sessions for workspace_id \(identity.workspaceID)")
       guard rows.count >= 2 else { return }
       XCTAssertEqual(rows[0]["file_count"] as Int, 1)
       XCTAssertEqual(rows[1]["file_count"] as Int, 2)
@@ -112,7 +117,9 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // Check workspace_stats
     try await dbQueue.read { db in
-      let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workspace_stats")!
+      let count = try XCTUnwrap(
+        Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workspace_stats"),
+        "Expected COUNT(*) over workspace_stats to return a row")
       XCTAssertEqual(count, 1)  // Updated in place
 
       let statsRow = try Row.fetchOne(
@@ -135,7 +142,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: folder))
     )
 
@@ -167,7 +174,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: folder))
     )
 
@@ -241,7 +248,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let firstManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceBuilder: firstBuilder,
       workspaceSubstrate: substrate)
     firstManager.openInBackground(url: folder, into: firstState)
@@ -257,9 +264,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     let dbQueue = try DatabaseQueue(path: databaseURL.path)
     let sessionsAfterFirst = try await dbQueue.read { db in
-      try Int.fetchOne(
-        db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected first-launch scan_session count for workspace_id \(identity.workspaceID)")
     }
     XCTAssertEqual(sessionsAfterFirst, 1, "first launch writes exactly one cold_scan session")
     firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
@@ -275,7 +284,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let secondManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceBuilder: secondBuilder,
       workspaceSubstrate: substrate)
     secondManager.openInBackground(url: folder, into: secondState)
@@ -290,9 +299,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // (2) NO new cold_scan session written on the unchanged relaunch.
     let sessionsAfterSecond = try await dbQueue.read { db in
-      try Int.fetchOne(
-        db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected second-launch scan_session count for workspace_id \(identity.workspaceID)")
     }
     XCTAssertEqual(
       sessionsAfterSecond, 1,
@@ -341,7 +352,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let firstManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: substrate)
     firstManager.openInBackground(url: folder, into: firstState)
     await firstManager.waitForPendingWorkspaceBuild()
@@ -358,7 +369,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let secondManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: substrate)
     secondManager.openInBackground(url: folder, into: secondState)
     await secondManager.waitForPendingWorkspaceBuild()
@@ -367,9 +378,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     let dbQueue = try DatabaseQueue(path: databaseURL.path)
     let sessions = try await dbQueue.read { db in
-      try Int.fetchOne(
-        db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected changed-workspace scan_session count for workspace_id \(identity.workspaceID)")
     }
     XCTAssertEqual(
       sessions, 2, "a changed workspace does NOT skip — a second cold_scan session is written")
@@ -408,7 +421,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let firstManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: firstIndex,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: substrate)
     firstManager.openInBackground(url: folder, into: firstState)
     await firstManager.waitForPendingWorkspaceBuild()
@@ -429,7 +442,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let secondManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: secondIndex,
-      bookmarkStore: temporaryBookmarkStore(),
+      bookmarkStore: try temporaryBookmarkStore(),
       workspaceSubstrate: substrate)
     secondManager.openInBackground(url: folder, into: secondState)
     await secondManager.waitForPendingWorkspaceBuild()
@@ -441,9 +454,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       "empty index + matching fingerprint must FULL-reindex (never skip an empty index)")
     let dbQueue = try DatabaseQueue(path: secondURL.path)
     let sessions = try await dbQueue.read { db in
-      try Int.fetchOne(
-        db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
-        arguments: [identity.workspaceID])!
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected empty-index scan_session count for workspace_id \(identity.workspaceID)")
     }
     XCTAssertEqual(
       sessions, 1, "the empty-index relaunch writes a fresh cold_scan session (no skip)")
@@ -469,9 +484,11 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       metadataURL: folder.appendingPathComponent("workspace.json", isDirectory: false))
   }
 
-  private func temporaryBookmarkStore() -> BookmarkStore {
+  private func temporaryBookmarkStore() throws -> BookmarkStore {
     let suiteName = "PensieveIndexV2StatsBookmarkTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
+    let defaults = try XCTUnwrap(
+      UserDefaults(suiteName: suiteName),
+      "Expected UserDefaults suite \(suiteName) to be creatable")
     defaults.removePersistentDomain(forName: suiteName)
     return BookmarkStore(defaults: defaults)
   }
