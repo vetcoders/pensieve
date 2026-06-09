@@ -40,6 +40,7 @@ final class PreviewWebView: NSView {
     config.userContentController = userContent
     webView = WKWebView(frame: .zero, configuration: config)
     webView.setValue(false, forKey: "drawsBackground")
+    webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
 
     userContent.add(MessageProxy(target: self), name: scrollMessageName)
