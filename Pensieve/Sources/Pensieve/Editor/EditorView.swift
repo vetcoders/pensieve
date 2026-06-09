@@ -388,7 +388,15 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     postEditorViewportIfNeeded()
   }
 
+  private var isApplyingPreviewScroll = false
+
   @objc private func editorBoundsDidChange() {
+    // Re-entrancy guard (crash fix): handlePreviewViewportChanged scrolls the editor, whose clip-view
+    // bounds change fires this SYNCHRONOUSLY; re-posting the editor viewport here recurses back into
+    // NSTextView layout (postEditorViewportIfNeeded → currentTopVisibleBlockIndex →
+    // characterIndexForInsertion) mid-scroll and crashed with EXC_BAD_ACCESS in objc_msgSend
+    // (build 146). Suppress the echo while a preview-driven scroll is applying.
+    guard !isApplyingPreviewScroll else { return }
     postEditorViewportIfNeeded()
   }
 
@@ -415,7 +423,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     lastPreviewAppliedBlock = block
     lastPostedEditorBlock = block
+    isApplyingPreviewScroll = true
     textView.scrollRangeToVisible(NSRange(location: location, length: 0))
+    // Clear on the next runloop turn so both the synchronous bounds-change and any coalesced async
+    // one are swallowed by the guard above — breaking the preview↔editor scroll feedback loop.
+    DispatchQueue.main.async { [weak self] in self?.isApplyingPreviewScroll = false }
   }
 
   private func postEditorViewportIfNeeded() {
