@@ -17,13 +17,7 @@ struct ContentView: View {
       appState.documentSession.hasEditableBuffer
         ? appState.documentSession.displayTitle : "Pensieve"
     )
-    // TEMP DIAGNOSTIC (revert after title bug confirmed): surface the per-window session state in the
-    // subtitle so a screenshot reveals why the tab reads "Pensieve" — buf=false means this window's
-    // documentSession is .empty for a shown doc (per-window desync), not a navigationTitle problem.
-    .navigationSubtitle(
-      "⟨dbg buf=\(appState.documentSession.hasEditableBuffer) t=[\(appState.documentSession.displayTitle)]⟩"
-        + (appState.activeDocumentDirty ? " ·Edited" : "")
-    )
+    .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
     .toolbar {
       EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
     }
