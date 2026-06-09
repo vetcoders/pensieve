@@ -401,45 +401,22 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   @objc private func handlePreviewViewportChanged(_ note: Notification) {
-    // Whoever is focused drives the scroll. While the user is typing in the editor it is first
-    // responder, and in split mode the preview re-renders on every keystroke and emits a viewport
-    // change — honouring it here would `scrollRangeToVisible` the editor to the caret on every
-    // character (a feedback loop with the editor→preview push), i.e. "every char jumps the whole
-    // document". Only let preview-driven scroll move the editor when the user is actually
-    // interacting with the preview (the editor is not first responder).
-    if let responder = textView.window?.firstResponder as? NSView,
-      responder === textView || responder.isDescendant(of: textView)
-    {
-      return
-    }
-    guard let block = note.userInfo?["block"] as? Int else { return }
-    guard block != lastPreviewAppliedBlock else { return }
-    guard
-      let location = MarkdownBlockMapper.utf16Location(
-        forBlockIndex: block,
-        in: textStorage.string
-      )
-    else { return }
-
-    lastPreviewAppliedBlock = block
-    lastPostedEditorBlock = block
-    isApplyingPreviewScroll = true
-    textView.scrollRangeToVisible(NSRange(location: location, length: 0))
-    // Clear on the next runloop turn so both the synchronous bounds-change and any coalesced async
-    // one are swallowed by the guard above — breaking the preview↔editor scroll feedback loop.
-    DispatchQueue.main.async { [weak self] in self?.isApplyingPreviewScroll = false }
+    // DISABLED (P0 crash, builds 146/148): driving the editor's scroll from the preview re-enters
+    // TextKit2 layout (scrollRangeToVisible → bounds-change → editorBoundsDidChange →
+    // currentTopVisibleBlockIndex → characterIndexForInsertion) and crashes with EXC_BAD_ACCESS in
+    // objc_msgSend. Two targeted guards (bbdb719 first-responder, d4aa124 re-entrancy flag) did NOT
+    // hold — the crashing layout query also fires from textDidChange / selection paths. Until two-way
+    // scroll-sync is re-implemented OFF the layout pass (async/coalesced, never querying layout inside
+    // a notification), the preview must NOT move the editor. Panes scroll independently.
+    _ = note
   }
 
   private func postEditorViewportIfNeeded() {
-    guard let block = currentTopVisibleBlockIndex() else { return }
-    guard block != lastPostedEditorBlock else { return }
-
-    lastPostedEditorBlock = block
-    NotificationCenter.default.post(
-      name: .vcEditorViewportChanged,
-      object: nil,
-      userInfo: ["block": block]
-    )
+    // DISABLED (P0 crash, builds 146/148): currentTopVisibleBlockIndex() → characterIndexForInsertion
+    // triggers TextKit2 viewport layout (a nested scroll) when invoked from a bounds-change / text /
+    // selection notification → EXC_BAD_ACCESS. The editor no longer pushes its viewport to the
+    // preview; both panes scroll independently. Re-enable only with an async/coalesced, layout-safe
+    // top-block computation that never runs characterIndexForInsertion inside a notification.
   }
 
   private func currentTopVisibleBlockIndex() -> Int? {
