@@ -1,6 +1,56 @@
 import Combine
 import Foundation
 
+enum TranscriptionFormatMode: String, CaseIterable, Identifiable, Sendable {
+  case polish
+  case kurier
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .polish:
+      return "Polish"
+    case .kurier:
+      return "Kurier"
+    }
+  }
+
+  var assistive: Bool {
+    switch self {
+    case .polish:
+      return false
+    case .kurier:
+      return true
+    }
+  }
+}
+
+enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
+  case editor
+  case agent
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .editor:
+      return "Editor"
+    case .agent:
+      return "Dispatch to agent"
+    }
+  }
+
+  var failureMessage: String {
+    switch self {
+    case .editor:
+      return "No active editor target."
+    case .agent:
+      return "Agent dispatch did not start."
+    }
+  }
+}
+
 @MainActor
 final class TranscriptionService: ObservableObject, VistaEventListener, @unchecked Sendable {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
@@ -13,6 +63,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var lastLanguage: String?
   @Published private(set) var lastStatus: VistaStatusSignal?
   @Published private(set) var lastError: String?
+  @Published private(set) var dispatchStatus: String?
 
   private let engineFactory: EngineFactory
   private let cadenceCommitNanoseconds: UInt64
@@ -85,8 +136,12 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     activeEngine().isFormattingAvailable()
   }
 
+  func updateDispatchStatus(_ status: String?) {
+    dispatchStatus = status
+  }
+
   @discardableResult
-  func formatComposition() async -> String {
+  func formatComposition(mode: TranscriptionFormatMode = .polish) async -> String {
     let source = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !source.isEmpty else { return "" }
 
@@ -100,7 +155,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     defer { isFormatting = false }
 
     do {
-      let formatted = try await engine.formatText(text: source, assistive: false)
+      let formatted = try await engine.formatText(text: source, assistive: mode.assistive)
       let cleaned = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
       replaceComposition(with: cleaned.isEmpty ? source : cleaned)
       lastError = nil

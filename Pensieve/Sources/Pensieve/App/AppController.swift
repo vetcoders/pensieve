@@ -9,13 +9,15 @@ final class AppController: ObservableObject {
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let agentPromptLauncher: AgentPromptLaunching
+  private let agentWorkspaceRoot: URL
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
       service: transcriptionService,
-      onSend: { [weak self] in self?.sendTranscriptionToActiveEditor() == true }
+      onSend: { [weak self] target in self?.sendTranscription(target: target) == true }
     )
     panel.onVisibilityChanged = { [weak self] in
       self?.objectWillChange.send()
@@ -44,6 +46,9 @@ final class AppController: ObservableObject {
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
     transcriptionService: TranscriptionService? = nil,
+    agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
+    agentWorkspaceRoot: URL = URL(
+      fileURLWithPath: "/Users/maciejgad/vc-workspace/vetcoders/pensieve"),
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
   ) {
@@ -51,6 +56,8 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.agentPromptLauncher = agentPromptLauncher
+    self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
@@ -379,6 +386,19 @@ final class AppController: ObservableObject {
   }
 
   @discardableResult
+  func sendTranscription(
+    target: TranscriptionSendTarget,
+    activeTextView: MarkdownTextView? = nil
+  ) -> Bool {
+    switch target {
+    case .editor:
+      return sendTranscriptionToActiveEditor(activeTextView: activeTextView)
+    case .agent:
+      return dispatchTranscriptionToAgent()
+    }
+  }
+
+  @discardableResult
   func sendTranscriptionToActiveEditor(activeTextView: MarkdownTextView? = nil) -> Bool {
     let text = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return false }
@@ -398,6 +418,39 @@ final class AppController: ObservableObject {
     appendTranscriptionToDocument(text)
     transcriptionService.resetTranscript()
     appState.lastError = nil
+    return true
+  }
+
+  @discardableResult
+  private func dispatchTranscriptionToAgent() -> Bool {
+    let prompt = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !prompt.isEmpty else { return false }
+
+    transcriptionService.updateDispatchStatus("Dispatching to agent...")
+    let launcher = agentPromptLauncher
+    let workingDirectoryURL = agentWorkspaceRoot
+    let transcriptionService = transcriptionService
+
+    Task.detached(priority: .utility) {
+      do {
+        let metadata = try launcher.dispatch(
+          prompt: prompt,
+          workingDirectoryURL: workingDirectoryURL
+        )
+        await MainActor.run {
+          if metadata.exitCode == 0 {
+            transcriptionService.resetTranscript()
+          }
+          transcriptionService.updateDispatchStatus(metadata.statusLine)
+        }
+      } catch {
+        await MainActor.run {
+          transcriptionService.updateDispatchStatus(
+            "Dispatch failed: \(error.localizedDescription)")
+        }
+      }
+    }
+
     return true
   }
 

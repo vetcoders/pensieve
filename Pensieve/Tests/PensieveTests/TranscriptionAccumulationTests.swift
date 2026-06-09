@@ -111,6 +111,27 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertNil(service.lastError)
   }
 
+  func testFormatCompositionUsesKurierAssistiveFormatterWhenSelected() async {
+    let engine = MockVistaAutocompleteEngine(
+      formattingAvailable: true,
+      formattingHandler: { text, assistive in
+        XCTAssertTrue(assistive)
+        return "kurier: \(text)"
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.receivePreview("chaotic spoken mission")
+    let formatted = await service.formatComposition(mode: .kurier)
+
+    XCTAssertEqual(formatted, "kurier: chaotic spoken mission")
+    XCTAssertEqual(service.committed, "kurier: chaotic spoken mission")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "kurier: chaotic spoken mission")
+    XCTAssertFalse(service.isFormatting)
+    XCTAssertNil(service.lastError)
+  }
+
   func testFormatCompositionFallsBackToRawTextWhenFormatterUnavailable() async {
     let engine = MockVistaAutocompleteEngine(formattingAvailable: false)
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
@@ -154,6 +175,65 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(surface.textStorage.string, "targettafla text")
     XCTAssertEqual(service.rendered, "")
     XCTAssertNil(appState.lastError)
+  }
+
+  func testAppControllerRoutesEditorTargetWithoutLaunchingAgent() {
+    let appState = AppState()
+    appState.documentSession.createUntitled()
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let launcher = MockAgentPromptLauncher()
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher
+    )
+    let surface = MarkdownEditorSurface(text: "target", fontSize: 14)
+    surface.textView.setSelectedRange(NSRange(location: 6, length: 0))
+
+    service.receiveFinal("editor route", language: "en")
+
+    XCTAssertTrue(controller.sendTranscription(target: .editor, activeTextView: surface.textView))
+    XCTAssertEqual(surface.textStorage.string, "targeteditor route")
+    XCTAssertEqual(service.rendered, "")
+    XCTAssertTrue(launcher.dispatchedPrompts().isEmpty)
+  }
+
+  func testAppControllerRoutesAgentTargetThroughLauncherWithoutRealDispatch() async {
+    let appState = AppState()
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let reportPath =
+      "/Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
+    let launcher = MockAgentPromptLauncher(
+      result: AgentDispatchMetadata.parse(
+        output: """
+          run_id: just-test-123
+          Report path: \(reportPath)
+          """,
+        exitCode: 0
+      )
+    )
+    let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-agent-root")
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: workspaceRoot
+    )
+
+    service.receiveFinal("agent ready prompt", language: "en")
+
+    XCTAssertTrue(controller.sendTranscription(target: .agent))
+    XCTAssertEqual(service.dispatchStatus, "Dispatching to agent...")
+    await waitForDispatchStatus(service, containing: "just-test-123")
+
+    XCTAssertEqual(launcher.dispatchedPrompts(), ["agent ready prompt"])
+    XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
+    XCTAssertEqual(service.rendered, "")
+    XCTAssertEqual(service.dispatchStatus, "Dispatch completed: just-test-123 | \(reportPath)")
   }
 
   func testVistaEventListenerCallbacksMarshalIntoAccumulationState() async {
@@ -250,5 +330,60 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.preview, "")
     XCTAssertEqual(service.rendered, "kept utterance")
     XCTAssertEqual(service.lastLanguage, "en")
+  }
+
+  private func waitForDispatchStatus(
+    _ service: TranscriptionService,
+    containing needle: String,
+    timeout: TimeInterval = 1.0
+  ) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if service.dispatchStatus?.contains(needle) == true {
+        return
+      }
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
+}
+
+private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
+  private let lock = NSLock()
+  private let result: AgentDispatchMetadata
+  private var prompts: [String] = []
+  private var directories: [URL] = []
+
+  init(
+    result: AgentDispatchMetadata = AgentDispatchMetadata(
+      runID: nil,
+      reportPath: nil,
+      exitCode: 0,
+      output: ""
+    )
+  ) {
+    self.result = result
+  }
+
+  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+    lock.lock()
+    prompts.append(prompt)
+    directories.append(workingDirectoryURL)
+    lock.unlock()
+    return result
+  }
+
+  func dispatchedPrompts() -> [String] {
+    lock.lock()
+    let snapshot = prompts
+    lock.unlock()
+    return snapshot
+  }
+
+  func workingDirectoryURLs() -> [URL] {
+    lock.lock()
+    let snapshot = directories
+    lock.unlock()
+    return snapshot
   }
 }

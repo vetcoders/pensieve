@@ -106,3 +106,4 @@ dist/
 /docs/superpowers
 *.backup
 /docs/workforce
+/.claude

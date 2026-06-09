@@ -6,11 +6,15 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   var onVisibilityChanged: (() -> Void)?
 
   private let service: TranscriptionService
-  private let onSend: () -> Bool
+  private let routingState = TranscriptionTaflaRoutingState()
+  private let onSend: (TranscriptionSendTarget) -> Bool
   private var panel: NSPanel?
   private var sendEventMonitor: Any?
 
-  init(service: TranscriptionService, onSend: @escaping () -> Bool = { false }) {
+  init(
+    service: TranscriptionService,
+    onSend: @escaping (TranscriptionSendTarget) -> Bool = { _ in false }
+  ) {
     self.service = service
     self.onSend = onSend
   }
@@ -74,7 +78,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
     let root = TranscriptionTaflaPanelView(
       service: service,
-      onSend: { [weak self] in self?.sendComposition() == true },
+      routingState: routingState,
+      onSend: { [weak self] target in self?.sendComposition(target: target) == true },
       onClose: { [weak panel, weak self] in
         panel?.orderOut(nil)
         self?.removeSendEventMonitor()
@@ -87,8 +92,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     return panel
   }
 
-  private func sendComposition() -> Bool {
-    onSend()
+  private func sendComposition(target: TranscriptionSendTarget) -> Bool {
+    onSend(target)
   }
 
   private func installSendEventMonitor() {
@@ -98,7 +103,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       guard event.keyCode == 36 else { return event }
       let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
       guard flags.contains(.shift) else { return event }
-      return self.sendComposition() ? nil : event
+      return self.sendComposition(target: self.routingState.sendTarget) ? nil : event
     }
   }
 
@@ -115,9 +120,16 @@ private final class NonActivatingTaflaPanel: NSPanel {
   override var canBecomeMain: Bool { false }
 }
 
+@MainActor
+private final class TranscriptionTaflaRoutingState: ObservableObject {
+  @Published var formatMode: TranscriptionFormatMode = .polish
+  @Published var sendTarget: TranscriptionSendTarget = .editor
+}
+
 private struct TranscriptionTaflaPanelView: View {
   @ObservedObject var service: TranscriptionService
-  let onSend: () -> Bool
+  @ObservedObject var routingState: TranscriptionTaflaRoutingState
+  let onSend: (TranscriptionSendTarget) -> Bool
   let onClose: () -> Void
 
   @State private var controlError: String?
@@ -128,6 +140,7 @@ private struct TranscriptionTaflaPanelView: View {
       TaflaVisualEffect()
       VStack(alignment: .leading, spacing: 12) {
         header
+        modeControls
         transcript
         footer
       }
@@ -135,6 +148,30 @@ private struct TranscriptionTaflaPanelView: View {
     }
     .frame(minWidth: 360, minHeight: 240)
     .accessibilityIdentifier("pensieve.tafla.root")
+  }
+
+  private var modeControls: some View {
+    HStack(spacing: 12) {
+      Picker("Format", selection: $routingState.formatMode) {
+        ForEach(TranscriptionFormatMode.allCases) { mode in
+          Text(mode.title).tag(mode)
+        }
+      }
+      .pickerStyle(.segmented)
+      .frame(width: 168)
+      .accessibilityIdentifier("pensieve.tafla.mode")
+
+      Picker("Target", selection: $routingState.sendTarget) {
+        ForEach(TranscriptionSendTarget.allCases) { target in
+          Text(target.title).tag(target)
+        }
+      }
+      .pickerStyle(.segmented)
+      .frame(width: 244)
+      .accessibilityIdentifier("pensieve.tafla.target")
+
+      Spacer()
+    }
   }
 
   private var header: some View {
@@ -236,6 +273,7 @@ private struct TranscriptionTaflaPanelView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
         .lineLimit(1)
+        .truncationMode(.middle)
         .accessibilityIdentifier("pensieve.tafla.status")
 
       Spacer()
@@ -252,6 +290,9 @@ private struct TranscriptionTaflaPanelView: View {
   }
 
   private var statusText: String {
+    if let dispatchStatus = service.dispatchStatus {
+      return dispatchStatus
+    }
     let recordingState = service.isRecording ? "Recording" : "Idle"
     guard let lastStatus = service.lastStatus else { return recordingState }
     return "\(recordingState) - \(lastStatus.label)"
@@ -291,7 +332,7 @@ private struct TranscriptionTaflaPanelView: View {
   private func format() {
     isFormatting = true
     Task {
-      _ = await service.formatComposition()
+      _ = await service.formatComposition(mode: routingState.formatMode)
       isFormatting = false
       controlError = service.lastError
     }
@@ -306,10 +347,10 @@ private struct TranscriptionTaflaPanelView: View {
   }
 
   private func send() {
-    if onSend() {
+    if onSend(routingState.sendTarget) {
       controlError = nil
     } else {
-      controlError = "No active editor target."
+      controlError = routingState.sendTarget.failureMessage
     }
   }
 }
