@@ -63,7 +63,15 @@ private struct PensieveWindowRoot: View {
   }
 
   var body: some View {
-    ContentView()
+    ZStack {
+      ContentView()
+        .opacity(startupPresentationReady ? 1 : 0)
+        .allowsHitTesting(startupPresentationReady)
+
+      if !startupPresentationReady {
+        StartupPresentationView()
+      }
+    }
       .environmentObject(appState)
       .environmentObject(controller)
       .environmentObject(controller.transcriptionService)
@@ -128,11 +136,33 @@ private struct PensieveWindowRoot: View {
   }
 
   private func revealStartupWindow() {
-    startupPresentationReady = true
-    applyStartupPresentation(to: currentWindow)
+    DispatchQueue.main.async {
+      startupPresentationReady = true
+      applyStartupPresentation(to: currentWindow)
+    }
   }
 
   private func applyStartupPresentation(to window: NSWindow?) {
-    window?.alphaValue = startupPresentationReady ? 1 : 0
+    window?.alphaValue = 1
+  }
+}
+
+private struct StartupPresentationView: View {
+  var body: some View {
+    VStack(spacing: 10) {
+      ProgressView()
+        .controlSize(.small)
+
+      Text("Pensieve")
+        .font(.headline)
+        .foregroundStyle(.secondary)
+
+      Text(BuildIdentity.current.conciseLabel)
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(NSColor.windowBackgroundColor))
+    .accessibilityIdentifier("pensieve.startupPresentation")
   }
 }
