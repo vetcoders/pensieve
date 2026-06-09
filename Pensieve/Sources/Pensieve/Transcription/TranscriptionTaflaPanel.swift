@@ -23,7 +23,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   func show() {
     let panel = panel ?? makePanel()
     self.panel = panel
-    panel.orderFrontRegardless()
+    panel.orderFront(nil)
     onVisibilityChanged?()
   }
 
@@ -53,6 +53,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     panel.isFloatingPanel = true
     panel.level = .floating
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    panel.becomesKeyOnlyIfNeeded = true
     panel.hidesOnDeactivate = false
     panel.isReleasedWhenClosed = false
     panel.delegate = self

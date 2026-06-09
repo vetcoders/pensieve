@@ -159,6 +159,7 @@ private struct ActivePensieveCommands: Commands {
         controller.toggleTranscriptionTafla()
       }
       .keyboardShortcut("t", modifiers: [.command, .option])
+      .accessibilityIdentifier("pensieve.tafla.menu.viewToggle")
     }
 
     // Edit menu — Find & Replace routes into Pensieve's own squared find bar.
@@ -238,6 +239,13 @@ private struct ActivePensieveCommands: Commands {
 
     // Tab navigation (Quick Win)
     CommandGroup(after: .windowArrangement) {
+      Button(transcriptionTaflaMenuTitle) {
+        controller.toggleTranscriptionTafla()
+      }
+      .accessibilityIdentifier("pensieve.tafla.menu.windowToggle")
+
+      Divider()
+
       Button("Show Next Tab") {
         controller.selectNextTab()
       }
