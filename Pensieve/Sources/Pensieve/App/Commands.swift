@@ -222,6 +222,13 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("r", modifiers: [.command, .shift])
     }
 
+    CommandGroup(after: .toolbar) {
+      Button("Show/Hide Tab Bar") {
+        NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
+      }
+      .disabled(NSApp.keyWindow == nil && NSApp.mainWindow == nil)
+    }
+
     // Tab navigation (Quick Win)
     CommandGroup(after: .windowArrangement) {
       Button("Show Next Tab") {
