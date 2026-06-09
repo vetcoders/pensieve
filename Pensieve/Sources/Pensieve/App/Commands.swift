@@ -154,6 +154,13 @@ private struct ActivePensieveCommands: Commands {
       .disabled(!appState.documentSession.hasEditableBuffer)
     }
 
+    CommandGroup(after: .toolbar) {
+      Button(transcriptionTaflaMenuTitle) {
+        controller.toggleTranscriptionTafla()
+      }
+      .keyboardShortcut("t", modifiers: [.command, .option])
+    }
+
     // Edit menu — Find & Replace routes into Pensieve's own squared find bar.
     // The text field remains native NSSearchField, but NSTextFinder's system
     // bar is intentionally bypassed so the layout belongs to the app surface.
@@ -426,6 +433,12 @@ private struct ActivePensieveCommands: Commands {
     appState.sidebarFocusedURL
       ?? appState.documentSession.url
       ?? appState.selectedDocumentID
+  }
+
+  private var transcriptionTaflaMenuTitle: String {
+    controller.isTranscriptionTaflaVisible
+      ? "Hide Transcription Tafla"
+      : "Show Transcription Tafla"
   }
 
   private func isDirectory(_ url: URL) -> Bool {

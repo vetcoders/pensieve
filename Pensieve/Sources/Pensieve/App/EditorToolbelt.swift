@@ -27,6 +27,16 @@ struct EditorToolbelt: ToolbarContent {
     appState.documentSession.hasEditableBuffer
   }
 
+  private var transcriptionTaflaSystemImage: String {
+    controller.isTranscriptionTaflaVisible ? "waveform.circle.fill" : "waveform.circle"
+  }
+
+  private var transcriptionTaflaHelp: String {
+    controller.isTranscriptionTaflaVisible
+      ? "Hide Transcription Tafla"
+      : "Show Transcription Tafla"
+  }
+
   var body: some ToolbarContent {
     ToolbarItemGroup(placement: .navigation) {
       modePicker
@@ -40,6 +50,12 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     ToolbarItemGroup(placement: .primaryAction) {
+      Button(action: { controller.toggleTranscriptionTafla() }) {
+        Image(systemName: transcriptionTaflaSystemImage)
+      }
+      .help(transcriptionTaflaHelp)
+      .accessibilityIdentifier("pensieve.toolbar.taflaToggle")
+
       Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
         Image(systemName: "square.and.arrow.up")
       }

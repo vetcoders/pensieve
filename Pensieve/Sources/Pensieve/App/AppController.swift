@@ -12,6 +12,13 @@ final class AppController: ObservableObject {
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   let transcriptionService: TranscriptionService
+  private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
+    let panel = TranscriptionTaflaPanelController(service: transcriptionService)
+    panel.onVisibilityChanged = { [weak self] in
+      self?.objectWillChange.send()
+    }
+    return panel
+  }()
   private var didStart = false
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
@@ -350,6 +357,22 @@ final class AppController: ObservableObject {
 
   func toggleRichMarkdown() {
     appState.richMarkdownEnabled.toggle()
+  }
+
+  var isTranscriptionTaflaVisible: Bool {
+    transcriptionTaflaPanel.isVisible
+  }
+
+  func toggleTranscriptionTafla() {
+    transcriptionTaflaPanel.toggle()
+  }
+
+  func showTranscriptionTafla() {
+    transcriptionTaflaPanel.show()
+  }
+
+  func hideTranscriptionTafla() {
+    transcriptionTaflaPanel.hide()
   }
 
   func bumpFontSize(by delta: CGFloat) {
