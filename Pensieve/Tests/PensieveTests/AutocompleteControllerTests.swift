@@ -44,6 +44,31 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertNotEqual(controller.suggestion, " stale")
   }
 
+  func testNewKeystrokeCancelsPriorTaskBeforeEngineCompletes() async {
+    let staleTaskObservedCancellation = expectation(
+      description: "stale completion task observed cancellation")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, _ in
+      if prefix == "alpha" {
+        await nonCancellableSleep(nanoseconds: 80_000_000)
+        XCTAssertTrue(Task.isCancelled)
+        staleTaskObservedCancellation.fulfill()
+        return " stale"
+      }
+      return " fresh"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "alpha")
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    controller.textDidChange(prefix: "alpha b")
+
+    await fulfillment(of: [staleTaskObservedCancellation], timeout: 1.0)
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(controller.suggestion, " fresh")
+    XCTAssertNotEqual(controller.suggestion, " stale")
+  }
+
   func testAcceptAutocompleteInsertsSuggestionOnce() {
     let surface = makeSurface(text: "hello")
     surface.textView.setSelectedRange(NSRange(location: 5, length: 0))

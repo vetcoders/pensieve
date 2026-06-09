@@ -46,7 +46,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     let engine = activeEngine()
     let debounceNanoseconds = debounceNanoseconds
     let maxTokens = maxTokens
-    completionTask = Task { [weak self] in
+    completionTask = Task(priority: .userInitiated) { [weak self] in
       do {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
         try Task.checkCancellation()
@@ -77,6 +77,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     completionTask?.cancel()
     completionTask = nil
     suggestion = nil
+    lastError = nil
   }
 
   private func activeEngine() -> VistaEngineProtocol {
