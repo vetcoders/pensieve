@@ -71,11 +71,13 @@ class MarkdownTextView: NSTextView {
 
   @objc private func boundsDidChange() {
     gutter?.needsDisplay = true
+    scheduleAutocompleteGhostReposition()
   }
 
   override func layout() {
     super.layout()
     gutter?.needsDisplay = true
+    scheduleAutocompleteGhostReposition()
   }
 
   override func paste(_ sender: Any?) {
@@ -128,6 +130,27 @@ class MarkdownTextView: NSTextView {
     autocompleteGhostText = nil
     autocompleteGhostAnchor = nil
     autocompleteGhostField?.removeFromSuperview()
+  }
+
+  func scheduleAutocompleteGhostReposition() {
+    guard let ghostField = autocompleteGhostField,
+      ghostField.superview === self,
+      let anchor = autocompleteGhostAnchor
+    else {
+      return
+    }
+
+    DispatchQueue.main.async { [weak self, weak ghostField] in
+      guard let self,
+        let ghostField,
+        ghostField.superview === self,
+        self.autocompleteGhostAnchor == anchor
+      else {
+        return
+      }
+      ghostField.setFrameOrigin(
+        self.autocompleteGhostOrigin(caretLocation: anchor, size: ghostField.frame.size))
+    }
   }
 
   private func makeAutocompleteGhostField() -> NSTextField {

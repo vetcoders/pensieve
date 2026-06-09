@@ -112,6 +112,31 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(surface.textStorage.string, "hello")
     XCTAssertFalse(surface.textView.hasAutocompleteGhost)
   }
+
+  func testEditInvalidatesAutocompleteAndPreventsStaleInsert() {
+    let surface = makeSurface(text: "hello")
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    surface.textView.setAutocompleteGhost(" world", at: 5)
+
+    XCTAssertTrue(surface.textView.insertTextAtSelection("!"))
+    XCTAssertFalse(surface.acceptAutocompleteSuggestion())
+
+    XCTAssertEqual(surface.textStorage.string, "hello!")
+    XCTAssertFalse(surface.textView.hasAutocompleteGhost)
+  }
+
+  func testAIAutocompleteSettingDefaultsOffAndPersists() {
+    let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let model = DocumentWindowModel(defaults: defaults)
+    XCTAssertFalse(model.aiAutocompleteEnabled)
+
+    model.aiAutocompleteEnabled = true
+    let reloaded = DocumentWindowModel(defaults: defaults)
+    XCTAssertTrue(reloaded.aiAutocompleteEnabled)
+  }
 }
 
 private func nonCancellableSleep(nanoseconds: UInt64) async {

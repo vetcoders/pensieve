@@ -200,6 +200,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
   private var autocompleteCancellable: AnyCancellable?
+  private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
   private var findQuery = ""
   private var findMatches: [NSRange] = []
@@ -400,6 +401,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   private func scheduleAutocompleteRender(_ suggestion: String?) {
     let selection = textView.selectedRange()
+    let renderGeneration = autocompleteRenderGeneration
     guard aiAutocompleteEnabled, selection.length == 0, let suggestion, !suggestion.isEmpty else {
       textView.dismissAutocompleteGhost()
       return
@@ -407,7 +409,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     let caret = selection.location
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
-      guard self.aiAutocompleteEnabled, self.textView.selectedRange() == selection else { return }
+      guard self.aiAutocompleteEnabled,
+        self.autocompleteRenderGeneration == renderGeneration,
+        self.textView.selectedRange() == selection
+      else { return }
       self.textView.setAutocompleteGhost(suggestion, at: caret)
     }
   }
@@ -445,6 +450,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   func invalidateAutocomplete() {
+    autocompleteRenderGeneration &+= 1
     textView.dismissAutocompleteGhost()
   }
 
