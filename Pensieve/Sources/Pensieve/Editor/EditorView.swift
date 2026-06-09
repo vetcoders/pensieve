@@ -187,6 +187,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   let textContentStorage: MarkdownTextStorage
   let textLayoutManager: NSTextLayoutManager
   let textContainer: NSTextContainer
+  let autocompleteController: AutocompleteController
 
   var onTextChanged: ((String) -> Void)?
   var onCloseFindBar: (() -> Void)?
@@ -204,11 +205,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool = true,
     tableTidyOnPaste: Bool = true,
-    asciiSafeTables: Bool = false
+    asciiSafeTables: Bool = false,
+    autocompleteController: AutocompleteController = AutocompleteController()
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()
     textStorage = NSTextStorage()
+    self.autocompleteController = autocompleteController
     textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
 
     textContentStorage.textStorage = textStorage
@@ -340,10 +343,18 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard !isApplyingExternalText else { return }
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
-    onTextChanged?(textStorage.string)
+    let latestText = textStorage.string
+    onTextChanged?(latestText)
+    autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
     refreshFindMatches()
     centerCaretLineIfNeeded()
     postEditorViewportIfNeeded()
+  }
+
+  private func autocompletePrefix(from text: String) -> String {
+    let nsText = text as NSString
+    let caret = min(max(textView.selectedRange().location, 0), nsText.length)
+    return nsText.substring(to: caret)
   }
 
   func textView(
