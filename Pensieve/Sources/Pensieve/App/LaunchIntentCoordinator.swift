@@ -100,29 +100,11 @@ final class LaunchIntentCoordinator: ObservableObject {
 }
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
-  private var keyWindowObserver: NSObjectProtocol?
   private var traceObservers: [NSObjectProtocol] = []
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
-
-    // A document window opened via SwiftUI `openWindow` becomes key at
-    // presentation, long before its scene finishes materializing (0.5-1.2s of
-    // cold state). This notification is the only hook early enough —
-    // synchronous, pre-first-frame — to hide the window so it debuts as a
-    // merged tab instead of flashing standalone; the registry's completeAttach
-    // (or its failsafe) reveals it.
-    keyWindowObserver = NotificationCenter.default.addObserver(
-      forName: NSWindow.didBecomeKeyNotification,
-      object: nil,
-      queue: nil
-    ) { notification in
-      guard let window = notification.object as? NSWindow else { return }
-      MainActor.assumeIsolated {
-        DocumentWindowRegistry.shared.suppressIfMaterializingDocumentWindow(window)
-      }
-    }
 
     // A bare `swift run` executable (no `.app` bundle, e.g. `make run`) launches as a
     // background process: no Dock icon, window stuck behind other apps, can't be brought

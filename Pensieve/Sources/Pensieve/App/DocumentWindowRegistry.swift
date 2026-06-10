@@ -7,28 +7,32 @@ final class DocumentWindowRegistry {
   private let documentTabbingIdentifier = "Pensieve.DocumentWindow"
 
   typealias DeferredMainWork = @MainActor () -> Void
-  typealias DocumentOpener = @MainActor (DocumentRef) -> Void
+  /// Builds a fully configured document window WITHOUT ordering it on screen.
+  /// `nil` ref means an untitled (launcher-mode) document tab. The registry
+  /// attaches the returned window as a native tab BEFORE first presentation,
+  /// which makes the legacy standalone-window flash impossible by
+  /// construction.
+  typealias DocumentWindowFactoryClosure = @MainActor (DocumentRef?) -> NSWindow?
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
   private var launcherWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var contentWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var preferredLauncherID: ObjectIdentifier?
-  private var pendingMergeTargets: [URL: WeakWindow] = [:]
-  private var openInFlightDocumentIDs: Set<URL> = []
-  private var suppressionRunLoopObserver: CFRunLoopObserver?
-  private var contentReadyWindowIDs: Set<ObjectIdentifier> = []
-  private var attachedWindowsAwaitingContent: [ObjectIdentifier: WeakWindow] = [:]
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
+  /// Windows born from the tab bar's "+" button: launcher-mode content living
+  /// as a document tab. They report no document and no editable buffer on
+  /// first attach, which would otherwise classify them as empty launchers and
+  /// feed them to the reaping sweeps.
+  private var untitledTabWindows: [ObjectIdentifier: WeakWindow] = [:]
+  var makeDocumentWindow: DocumentWindowFactoryClosure?
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
   private let currentMergeTarget: @MainActor () -> NSWindow?
-  private let revealWindow: @MainActor (NSWindow) -> Void
-  private let scheduleSuppressionFailsafe: (@escaping DeferredMainWork) -> Void
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
 
@@ -54,18 +58,11 @@ final class DocumentWindowRegistry {
     currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
       NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow ?? NSApp.windows.first
     },
-    revealWindow: @escaping @MainActor (NSWindow) -> Void = { window in
-      window.alphaValue = 1
-    },
-    scheduleSuppressionFailsafe: @escaping (@escaping DeferredMainWork) -> Void = { work in
-      DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-        Task { @MainActor in work() }
-      }
-    },
     applicationWindows: @escaping @MainActor () -> [NSWindow] = { NSApp.windows },
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
-    }
+    },
+    makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
     self.scheduleDeferredMainWork = scheduleDeferredMainWork
@@ -73,126 +70,103 @@ final class DocumentWindowRegistry {
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.orderAndActivateWindow = orderAndActivateWindow
     self.currentMergeTarget = currentMergeTarget
-    self.revealWindow = revealWindow
-    self.scheduleSuppressionFailsafe = scheduleSuppressionFailsafe
     self.applicationWindows = applicationWindows
     self.closeWindow = closeWindow
+    self.makeDocumentWindow = makeDocumentWindow
   }
 
-  /// Called from the `NSWindow.didBecomeKey` observer, synchronously within the
-  /// window's first presentation — BEFORE its first frame commits. A SwiftUI
-  /// `openWindow` scene takes 0.5-1.2s to materialize (fresh AppState +
-  /// controller), and the window is presented at the start of that gap: the
-  /// SwiftUI-side accessor (`DocumentWindowAccessor`) only runs at the end, far
-  /// too late to stop the standalone-window flash. Hiding the window here and
-  /// revealing in `completeAttach` (or the failsafe) closes that gap.
-  func suppressIfMaterializingDocumentWindow(_ window: NSWindow) {
-    guard !openInFlightDocumentIDs.isEmpty else { return }
-    guard window.alphaValue > 0 else { return }
-    let windowID = ObjectIdentifier(window)
-    guard contentWindows[windowID]?.window == nil,
-      launcherWindows[windowID]?.window == nil,
-      !windowsByDocumentID.values.contains(where: { $0.window === window })
-    else { return }
-
-    DebugTrace.log("suppress materializing window '\(window.title)'")
-    window.alphaValue = 0
-    // The scene may never attach (open failed, window closed mid-flight, or a
-    // mis-identified bystander window) — never leave anything invisible.
-    scheduleSuppressionFailsafe { [weak self, weak window] in
-      guard let self, let window else { return }
-      revealWindow(window)
-    }
-  }
-
-  /// Sweeps every application window through the suppression check. Runs from
-  /// a main-runloop observer ordered BEFORE the CoreAnimation transaction
-  /// commit, so a window SwiftUI ordered on screen earlier in the same turn is
-  /// hidden before its first frame ever reaches the screen. (`didBecomeKey`
-  /// alone is ~50ms / a few committed frames too late.)
-  func suppressMaterializingWindowsBeforeFrameCommit() {
-    guard !openInFlightDocumentIDs.isEmpty else {
-      removeSuppressionObserverIfIdle()
-      return
-    }
-    for window in applicationWindows() {
-      suppressIfMaterializingDocumentWindow(window)
-    }
-  }
-
-  private func installSuppressionObserverIfNeeded() {
-    guard suppressionRunLoopObserver == nil else { return }
-    // Order 0 runs ahead of the CA commit observer (order 2_000_000): the
-    // alpha change lands in the same transaction as the window's first frame.
-    let observer = CFRunLoopObserverCreateWithHandler(
-      kCFAllocatorDefault,
-      CFRunLoopActivity.beforeWaiting.rawValue,
-      true,
-      0
-    ) { [weak self] _, _ in
-      MainActor.assumeIsolated {
-        self?.suppressMaterializingWindowsBeforeFrameCommit()
-      }
-    }
-    suppressionRunLoopObserver = observer
-    CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
-  }
-
-  private func removeSuppressionObserverIfIdle() {
-    guard openInFlightDocumentIDs.isEmpty, let observer = suppressionRunLoopObserver else {
-      return
-    }
-    CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
-    suppressionRunLoopObserver = nil
-  }
-
-  /// True between `open()` and the matching `attach()` for a document whose
-  /// upcoming window will be merged into an existing window's native tab
-  /// group. Presentation uses this to keep the freshly created window
-  /// invisible so the user never sees it flash standalone before the merge;
-  /// `completeAttach` reveals it once it is already a tab.
-  func expectsMerge(for documentID: URL?) -> Bool {
-    guard let documentID = documentID?.standardizedFileURL else {
-      return false
-    }
-    let result = pendingMergeTargets[documentID]?.window != nil
-    return result
-  }
-
-  func open(_ ref: DocumentRef, openDocument: @escaping DocumentOpener) {
+  /// Opens (or activates) the window for a document. The whole flow is
+  /// synchronous on the main actor: the factory builds the window, the
+  /// registry records it and merges it into the current window's native tab
+  /// group BEFORE the window is ever ordered on screen, so it first appears
+  /// already as a tab. The per-window SwiftUI scene cold-starts AFTER
+  /// presentation, inside the tab, behind the in-tab startup spinner.
+  func open(_ ref: DocumentRef) {
     let documentID = ref.id.standardizedFileURL
     guard canMutateWindowTabs() else {
-      deferOpen(ref, documentID: documentID, openDocument: openDocument)
+      deferOpen(ref, documentID: documentID)
       return
     }
 
     if let existing = windowsByDocumentID[documentID]?.window {
-      DebugTrace.log(
-        "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
-      mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
-      orderAndActivateWindow(existing)
-      closeEmptyLauncherWindows(except: existing)
+      // Belt to handleDocumentWindowClosed's braces: a closed DocumentWindow
+      // has its contentView torn down — never resurrect it; drop the dead
+      // mapping and fall through to creating a fresh window.
+      if existing.contentView != nil {
+        DebugTrace.log(
+          "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
+        mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
+        orderAndActivateWindow(existing)
+        closeEmptyLauncherWindows(except: existing)
+        return
+      }
+      DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
+      windowsByDocumentID.removeValue(forKey: documentID)
+      orderedDocumentIDs.remove(documentID)
+    }
+
+    guard let makeDocumentWindow else {
+      DebugTrace.log("registry.open \(documentID.lastPathComponent) -> no window factory wired")
       return
     }
-    // A document window takes a beat to materialize (new scene, cold state).
-    // Re-clicks in that gap would spawn a second window for the same document
-    // AND clobber pendingMergeTargets with the half-built window — which makes
-    // completeAttach see target === window and silently skip the merge.
-    // Coalesce: the first attach for this document clears the latch.
-    guard openInFlightDocumentIDs.insert(documentID).inserted else {
-      DebugTrace.log("registry.open \(documentID.lastPathComponent) coalesced (in flight)")
+    guard let window = makeDocumentWindow(ref) else {
+      DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned nil")
       return
     }
-    installSuppressionObserverIfNeeded()
+    DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory created window")
 
-    windowsByDocumentID[documentID] = nil
-    orderedDocumentIDs.remove(documentID)
+    // Register synchronously — there is no in-flight gap: a re-click for the
+    // same document hits the existing-window path above instead of spawning a
+    // second window.
+    markContentWindow(window)
+    windowsByDocumentID[documentID] = WeakWindow(window)
+    orderedDocumentIDs.insert(documentID)
 
-    if let target = currentMergeTarget() {
-      pendingMergeTargets[documentID] = WeakWindow(target)
+    if let target = currentMergeTarget(), target !== window {
+      prepareTabbedWindow(target)
+      prepareTabbedWindow(window)
+      mergeWindowIntoTabs(target, window)
+      DebugTrace.log("merged '\(window.title)' into '\(target.title)' before first presentation")
     }
-    DebugTrace.log("registry.open \(documentID.lastPathComponent) spawning scene")
-    openDocument(ref)
+    orderAndActivateWindow(window)
+    closeEmptyLauncherWindows(except: window)
+  }
+
+  /// Called from `DocumentWindow.close()` before AppKit tears the window
+  /// down: drops every registry mapping so the document can re-open in a
+  /// fresh window instead of resurrecting the closed (retained) one.
+  func handleDocumentWindowClosed(_ window: NSWindow) {
+    let windowID = ObjectIdentifier(window)
+    DebugTrace.log("registry.windowClosed '\(window.title)'")
+    releaseStaleDocumentMappings(for: window, keeping: nil)
+    contentWindows.removeValue(forKey: windowID)
+    launcherWindows.removeValue(forKey: windowID)
+    untitledTabWindows.removeValue(forKey: windowID)
+  }
+
+  /// The tab bar's "+" button: opens a NEW untitled document tab in the same
+  /// tab group instead of the system default (a detached standalone window).
+  /// Mirrors `open()`'s modal contract: deferred, not dropped, while a modal
+  /// run loop blocks native tab mutation.
+  func newUntitledTab(from window: NSWindow) {
+    guard canMutateWindowTabs() else {
+      scheduleDeferredMainWork { [weak self, weak window] in
+        guard let self, let window else { return }
+        newUntitledTab(from: window)
+      }
+      return
+    }
+    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil) else {
+      DebugTrace.log("newUntitledTab -> no window factory wired")
+      return
+    }
+    DebugTrace.log("newUntitledTab from '\(window.title)'")
+    untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
+    markContentWindow(newWindow)
+    prepareTabbedWindow(window)
+    prepareTabbedWindow(newWindow)
+    mergeWindowIntoTabs(window, newWindow)
+    orderAndActivateWindow(newWindow)
   }
 
   func attach(
@@ -203,9 +177,15 @@ final class DocumentWindowRegistry {
     hasEditableBuffer: Bool = false
   ) {
     DebugTrace.log(
-      "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)' alpha=\(window.alphaValue)"
+      "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)'"
     )
-    prepareStandaloneTabbing(for: window)
+    // Factory-built document windows keep their tabbing identifier so the
+    // system keeps grouping them (and keeps showing "+"); only windows from
+    // other origins (launcher scene, restored scenes) are normalized back to
+    // standalone tabbing.
+    if window.tabbingIdentifier != documentTabbingIdentifier {
+      prepareStandaloneTabbing(for: window)
+    }
 
     guard let documentID = documentID?.standardizedFileURL else {
       releaseStaleDocumentMappings(for: window, keeping: nil)
@@ -213,17 +193,20 @@ final class DocumentWindowRegistry {
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
         window.representedURL = representedURL
-        revealWindow(window)
         closeEmptyLauncherWindows(except: window)
         return
       }
+      if untitledTabWindows[ObjectIdentifier(window)]?.window === window {
+        // A "+" tab in its launcher-mode state: content by fiat, never reaped.
+        markContentWindow(window)
+        window.title = normalizedTitle(title, fallback: "Untitled")
+        window.representedURL = nil
+        return
+      }
       registerLauncher(window)
-      revealWindow(window)
       closeEmptyLauncherWindowIfDocumentTabsExist(window)
       return
     }
-    openInFlightDocumentIDs.remove(documentID)
-    removeSuppressionObserverIfIdle()
     markContentWindow(window)
     let fallbackTitle = documentID.deletingPathExtension().lastPathComponent
     window.title = normalizedTitle(title, fallback: fallbackTitle)
@@ -240,10 +223,6 @@ final class DocumentWindowRegistry {
     windowsByDocumentID[documentID] = WeakWindow(window)
 
     guard canMutateWindowTabs() else {
-      // A modal can outlive any reasonable suppression window — reveal now and
-      // accept the legacy standalone-then-merge visual rather than an
-      // invisible window for the modal's lifetime.
-      revealWindow(window)
       deferAttach(window, documentID: documentID)
       return
     }
@@ -260,45 +239,10 @@ final class DocumentWindowRegistry {
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
-    let pendingTarget = pendingMergeTargets.removeValue(forKey: documentID)?.window
-    if let target = pendingTarget,
-      target !== window
-    {
-      prepareTabbedWindow(target)
-      prepareTabbedWindow(window)
-      mergeWindowIntoTabs(target, window)
-      DebugTrace.log("merged '\(window.title)' into '\(target.title)'")
-    }
-
     if orderedDocumentIDs.insert(documentID).inserted {
       orderAndActivateWindow(window)
     }
-    // Reveal strictly after the merge so a presentation-suppressed window
-    // first becomes visible as a tab, never as a standalone window. A window
-    // we hid pre-first-frame additionally waits for its scene to report the
-    // content as actually rendered — `alphaValue` flips on the window server
-    // immediately, so revealing before the first content commit shows a black
-    // tab for the rest of the scene build (~1s).
-    let windowID = ObjectIdentifier(window)
-    if window.alphaValue > 0 || contentReadyWindowIDs.remove(windowID) != nil {
-      revealWindow(window)
-    } else {
-      attachedWindowsAwaitingContent[windowID] = WeakWindow(window)
-    }
     closeEmptyLauncherWindows(except: window)
-  }
-
-  /// Called by the window's scene once its content is past the startup
-  /// presentation (first real frame is in the same transaction). Completes the
-  /// suppressed-window handshake: merge done + content ready -> reveal.
-  func noteWindowContentReady(_ window: NSWindow) {
-    let windowID = ObjectIdentifier(window)
-    if attachedWindowsAwaitingContent.removeValue(forKey: windowID)?.window === window {
-      DebugTrace.log("content ready -> reveal '\(window.title)'")
-      revealWindow(window)
-      return
-    }
-    contentReadyWindowIDs.insert(windowID)
   }
 
   private func releaseStaleDocumentMappings(for window: NSWindow, keeping documentID: URL?) {
@@ -330,16 +274,12 @@ final class DocumentWindowRegistry {
       || rhs.tabbedWindows?.contains { $0 === lhs } == true
   }
 
-  private func deferOpen(
-    _ ref: DocumentRef,
-    documentID: URL,
-    openDocument: @escaping DocumentOpener
-  ) {
+  private func deferOpen(_ ref: DocumentRef, documentID: URL) {
     guard deferredOpenDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self] in
       guard let self else { return }
       deferredOpenDocumentIDs.remove(documentID)
-      open(ref, openDocument: openDocument)
+      open(ref)
     }
   }
 
@@ -376,6 +316,11 @@ final class DocumentWindowRegistry {
     includingUntracked: Bool = false
   ) -> Bool {
     let windowID = ObjectIdentifier(window)
+    // A launcher that is a MEMBER of a document tab group is the result of
+    // the native tab bar's "+" pressed on a SwiftUI-origin tab (the system
+    // spawns a WindowGroup scene as a new tab there). That is an intentional
+    // new-tab gesture — reaping it would make "+" appear to do nothing.
+    if (window.tabbedWindows?.count ?? 1) > 1 { return false }
     let isTrackedLauncher = launcherWindows[windowID]?.window === window
     let isUntrackedLauncher =
       includingUntracked && window.title == "Pensieve" && window.representedURL == nil
@@ -434,6 +379,7 @@ final class DocumentWindowRegistry {
   private func purgeClosedLauncherWindows() {
     launcherWindows = launcherWindows.filter { $0.value.window != nil }
     contentWindows = contentWindows.filter { $0.value.window != nil }
+    untitledTabWindows = untitledTabWindows.filter { $0.value.window != nil }
     if let preferredLauncherID, launcherWindows[preferredLauncherID]?.window == nil {
       self.preferredLauncherID = nil
     }

@@ -15,8 +15,13 @@ struct PensieveApp: App {
   }
 
   var body: some Scene {
+    // The WindowGroup scene serves the launcher window and any state-restored
+    // legacy document scenes (`initialDocument`). Document opens do NOT go
+    // through `openWindow(value:)` anymore: DocumentWindowRegistry builds
+    // document windows directly in AppKit (DocumentWindowFactory) and attaches
+    // them as native tabs before first presentation.
     WindowGroup("Pensieve", for: DocumentRef.self) { document in
-      PensieveWindowRoot(
+      DocumentWindowRootView(
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
@@ -33,9 +38,8 @@ struct PensieveApp: App {
   }
 }
 
-private struct PensieveWindowRoot: View {
-  @Environment(\.openWindow) private var openWindow
-
+struct DocumentWindowRootView: View {
+  let workspaceStore: WorkspaceStore
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
@@ -52,6 +56,7 @@ private struct PensieveWindowRoot: View {
     themeManager: ThemeManager,
     initialDocument: DocumentRef?
   ) {
+    self.workspaceStore = workspaceStore
     self.launchIntentCoordinator = launchIntentCoordinator
     self.themeManager = themeManager
     self.initialDocument = initialDocument
@@ -81,8 +86,8 @@ private struct PensieveWindowRoot: View {
     .background(
       DocumentWindowAccessor(
         // Fall back to the scene's initialDocument so the FIRST attach already
-        // carries the document identity: the registry can merge the window
-        // into the native tab group before the (async) document load finishes,
+        // carries the document identity: the registry can track the window as
+        // a document window before the (async) document load finishes,
         // instead of briefly registering a document window as a launcher.
         documentID: appState.selectedDocumentID ?? initialDocument?.id,
         title: appState.documentSession.displayTitle,
@@ -90,7 +95,6 @@ private struct PensieveWindowRoot: View {
         hasEditableBuffer: appState.documentSession.hasEditableBuffer
       ) { window in
         currentWindow = window
-        applyStartupPresentation(to: window)
       }
     )
     .frame(minWidth: 720, minHeight: 480)
@@ -108,7 +112,6 @@ private struct PensieveWindowRoot: View {
     .onChange(of: initialDocument?.id) { _ in
       if let initialDocument {
         startupPresentationReady = false
-        applyStartupPresentation(to: currentWindow)
         openInitialDocument(initialDocument)
         revealStartupWindow()
       }
@@ -119,10 +122,16 @@ private struct PensieveWindowRoot: View {
   }
 
   private func configureDocumentRouting() {
+    let factory = DocumentWindowFactory(
+      workspaceStore: workspaceStore,
+      launchIntentCoordinator: launchIntentCoordinator,
+      themeManager: themeManager
+    )
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
+      factory.makeWindow(for: ref)
+    }
     controller.requestOpenDocumentWindow = { ref in
-      DocumentWindowRegistry.shared.open(ref) { ref in
-        openWindow(value: ref)
-      }
+      DocumentWindowRegistry.shared.open(ref)
     }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
@@ -142,32 +151,11 @@ private struct PensieveWindowRoot: View {
   private func revealStartupWindow() {
     DispatchQueue.main.async {
       startupPresentationReady = true
-      if let currentWindow {
-        DocumentWindowRegistry.shared.noteWindowContentReady(currentWindow)
-      }
-      applyStartupPresentation(to: currentWindow)
     }
-  }
-
-  private func applyStartupPresentation(to window: NSWindow?) {
-    guard let window else { return }
-    // A window born to merge into another window's native tab group stays
-    // invisible until DocumentWindowRegistry.completeAttach reveals it as a
-    // tab; otherwise it flashes standalone for the document-load beat before
-    // addTabbedWindow pulls it in.
-    if let initialDocument, DocumentWindowRegistry.shared.expectsMerge(for: initialDocument.id) {
-      window.alphaValue = 0
-      return
-    }
-    // Only force visibility once the scene content actually renders; touching
-    // alpha earlier would re-reveal a suppressed window into a black tab
-    // (never-suppressed windows are visible by default anyway).
-    guard startupPresentationReady else { return }
-    window.alphaValue = 1
   }
 }
 
-private struct StartupPresentationView: View {
+struct StartupPresentationView: View {
   var body: some View {
     VStack(spacing: 10) {
       ProgressView()
