@@ -33,6 +33,13 @@ cp "$VISTA_KERNEL_ROOT/app/CodeScribe/Bridge/qube_ffiFFI.h" \
   "$PENSIEVE_ROOT/Sources/qube_ffiFFI/qube_ffiFFI.h"
 cp "$VISTA_KERNEL_ROOT/target/debug/libqube_ffi.dylib" \
   "$PENSIEVE_ROOT/Vendor/qube-ffi/debug/libqube_ffi.dylib"
+# Cargo bakes an absolute install_name (builder's checkout path) into the dylib,
+# so binaries linked against it dlopen-fail on every other machine, including CI.
+# Repoint to @rpath — Package.swift already adds the matching -rpath — and ad-hoc
+# re-sign (install_name_tool invalidates the signature; release re-signs properly).
+install_name_tool -id "@rpath/libqube_ffi.dylib" \
+  "$PENSIEVE_ROOT/Vendor/qube-ffi/debug/libqube_ffi.dylib"
+codesign -f -s - "$PENSIEVE_ROOT/Vendor/qube-ffi/debug/libqube_ffi.dylib"
 cat >"$PENSIEVE_ROOT/Sources/qube_ffiFFI/module.modulemap" <<'MODULEMAP'
 module qube_ffiFFI {
   header "qube_ffiFFI.h"
