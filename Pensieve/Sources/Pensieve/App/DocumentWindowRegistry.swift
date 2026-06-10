@@ -95,6 +95,7 @@ final class DocumentWindowRegistry {
       !windowsByDocumentID.values.contains(where: { $0.window === window })
     else { return }
 
+    DebugTrace.log("suppress materializing window '\(window.title)'")
     window.alphaValue = 0
     // The scene may never attach (open failed, window closed mid-flight, or a
     // mis-identified bystander window) — never leave anything invisible.
@@ -166,6 +167,8 @@ final class DocumentWindowRegistry {
     }
 
     if let existing = windowsByDocumentID[documentID]?.window {
+      DebugTrace.log(
+        "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
       mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
       orderAndActivateWindow(existing)
       closeEmptyLauncherWindows(except: existing)
@@ -177,6 +180,7 @@ final class DocumentWindowRegistry {
     // completeAttach see target === window and silently skip the merge.
     // Coalesce: the first attach for this document clears the latch.
     guard openInFlightDocumentIDs.insert(documentID).inserted else {
+      DebugTrace.log("registry.open \(documentID.lastPathComponent) coalesced (in flight)")
       return
     }
     installSuppressionObserverIfNeeded()
@@ -186,8 +190,8 @@ final class DocumentWindowRegistry {
 
     if let target = currentMergeTarget() {
       pendingMergeTargets[documentID] = WeakWindow(target)
-    } else {
     }
+    DebugTrace.log("registry.open \(documentID.lastPathComponent) spawning scene")
     openDocument(ref)
   }
 
@@ -198,6 +202,9 @@ final class DocumentWindowRegistry {
     representedURL: URL? = nil,
     hasEditableBuffer: Bool = false
   ) {
+    DebugTrace.log(
+      "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)' alpha=\(window.alphaValue)"
+    )
     prepareStandaloneTabbing(for: window)
 
     guard let documentID = documentID?.standardizedFileURL else {
@@ -260,6 +267,7 @@ final class DocumentWindowRegistry {
       prepareTabbedWindow(target)
       prepareTabbedWindow(window)
       mergeWindowIntoTabs(target, window)
+      DebugTrace.log("merged '\(window.title)' into '\(target.title)'")
     }
 
     if orderedDocumentIDs.insert(documentID).inserted {
@@ -286,6 +294,7 @@ final class DocumentWindowRegistry {
   func noteWindowContentReady(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
     if attachedWindowsAwaitingContent.removeValue(forKey: windowID)?.window === window {
+      DebugTrace.log("content ready -> reveal '\(window.title)'")
       revealWindow(window)
       return
     }
@@ -297,6 +306,7 @@ final class DocumentWindowRegistry {
       value.window === window && key != documentID ? key : nil
     }
     for staleID in staleIDs {
+      DebugTrace.log("release stale mapping \(staleID.lastPathComponent) from '\(window.title)'")
       windowsByDocumentID.removeValue(forKey: staleID)
       orderedDocumentIDs.remove(staleID)
     }

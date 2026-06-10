@@ -104,6 +104,7 @@ final class AppController: ObservableObject {
       return
     }
 
+    DebugTrace.log("openFile -> load in current window: \(ref.id.lastPathComponent)")
     documentStore.load(ref: ref, into: appState)
   }
 
@@ -298,6 +299,7 @@ final class AppController: ObservableObject {
       return
     }
 
+    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
     selectDocument(id: ref.id)
   }
 
@@ -319,6 +321,7 @@ final class AppController: ObservableObject {
       return
     }
 
+    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
   }
 

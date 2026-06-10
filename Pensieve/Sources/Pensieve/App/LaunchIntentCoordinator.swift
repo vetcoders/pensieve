@@ -101,9 +101,11 @@ final class LaunchIntentCoordinator: ObservableObject {
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   private var keyWindowObserver: NSObjectProtocol?
+  private var traceObservers: [NSObjectProtocol] = []
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
+    traceObservers = DebugTrace.installWindowLifecycleObservers()
 
     // A document window opened via SwiftUI `openWindow` becomes key at
     // presentation, long before its scene finishes materializing (0.5-1.2s of
