@@ -32,6 +32,8 @@ struct PreviewDocument: Equatable {
   let bodyHTML: String
   let styleHTML: String
   let mermaidJavaScript: String?
+  let katexJavaScript: String?
+  let katexCSS: String?
   let containsMath: Bool
   let sourceURL: URL?
   let refreshToken: Int
@@ -49,25 +51,41 @@ extension PreviewDocument {
     fontSize: CGFloat,
     baseURL: URL?,
     mermaidJavaScript: String? = nil,
+    katexJavaScript: String? = nil,
+    katexCSS: String? = nil,
     sourceURL: URL? = nil,
     refreshToken: Int = 0
   ) -> PreviewDocument {
-    let safeCSS = css.replacingOccurrences(of: "</style>", with: "<\\/style>")
+    let safeCSS = sanitizedForInlineEmbedding(css)
     let styleHTML = """
       \(safeCSS)
       \(PreviewWebView.appearanceCSS(fontSize: fontSize))
       """
     let mermaidScripts =
       mermaidJavaScript.map { javascript in
-        let safeJavaScript = javascript.replacingOccurrences(of: "</script>", with: "<\\/script>")
-        return """
-          <script>\(safeJavaScript)</script>
-          <script>\(PreviewWebView.mermaidBootstrapScript)</script>
-          """
+        """
+        <script>\(sanitizedForInlineEmbedding(javascript))</script>
+        <script>\(PreviewWebView.mermaidBootstrapScript)</script>
+        """
+      } ?? ""
+    // KaTeX runtime mirrors the mermaid dance: the bundled <style> and runtime
+    // <script> must precede the math bootstrap so `window.katex` exists when
+    // the bootstrap runs.
+    let katexStyle =
+      katexCSS.map { css in
+        "<style id=\"vc-katex-style\">\(sanitizedForInlineEmbedding(css))</style>"
+      } ?? ""
+    let katexRuntime =
+      katexJavaScript.map { javascript in
+        "<script>\(sanitizedForInlineEmbedding(javascript))</script>"
       } ?? ""
     let mathScript =
       body.contains("data-vc-math=")
-      ? "<script>\(PreviewWebView.mathBootstrapScript)</script>"
+      ? """
+      \(katexStyle)
+      \(katexRuntime)
+      <script>\(PreviewWebView.mathBootstrapScript)</script>
+      """
       : ""
     let baseElement =
       baseURL.map { url in
@@ -96,9 +114,25 @@ extension PreviewDocument {
       bodyHTML: body,
       styleHTML: styleHTML,
       mermaidJavaScript: mermaidJavaScript,
+      katexJavaScript: katexJavaScript,
+      katexCSS: katexCSS,
       containsMath: containsMath,
       sourceURL: sourceURL,
       refreshToken: refreshToken)
+  }
+
+  /// Neutralizes element-closing sequences inside inline <script>/<style>
+  /// payloads. The HTML parser closes those elements on `</script` / `</style`
+  /// case-insensitively, so a plain lowercase `</script>` replacement leaves
+  /// `</SCRIPT>` or `</style >` breakouts open; escape the `</` for every case
+  /// variant instead.
+  private static func sanitizedForInlineEmbedding(_ payload: String) -> String {
+    // Template note: "\\" collapses to one literal backslash, yielding "<\/".
+    payload.replacingOccurrences(
+      of: #"</(?=script|style)"#,
+      with: #"<\\/"#,
+      options: [.regularExpression, .caseInsensitive]
+    )
   }
 }
 
@@ -191,19 +225,33 @@ final class PreviewPipeline {
   /// Synchronously build the document for a request without applying it.
   /// Exposed for tests that exercise document construction independently of
   /// the sink and scheduler.
+  // The vendored runtimes are immutable bundle resources but heavy (mermaid
+  // ~3.3MB, KaTeX runtime + inline-font CSS ~640KB), and `apply` runs on the
+  // main queue per debounced keystroke — cache the disk read + decode once.
+  private static let cachedMermaidJavaScript = PreviewResourceLocator.javascript(
+    named: "mermaid.min")
+  private static let cachedKatexJavaScript = PreviewResourceLocator.javascript(named: "katex.min")
+  private static let cachedKatexCSS = PreviewResourceLocator.css(named: "katex.inline.min")
+
   func makeDocument(for request: PreviewRenderRequest) -> PreviewDocument {
     let output = renderer.render(request.markdown)
     let css = themeManager.css(for: request.theme)
     let mermaidJavaScript =
       output.body.contains("class=\"mermaid\"")
-      ? PreviewResourceLocator.javascript(named: "mermaid.min")
+      ? Self.cachedMermaidJavaScript
       : nil
+    // Embed the KaTeX payload only when the rendered body actually contains math.
+    let containsMath = output.body.contains("data-vc-math=")
+    let katexJavaScript = containsMath ? Self.cachedKatexJavaScript : nil
+    let katexCSS = containsMath ? Self.cachedKatexCSS : nil
     return PreviewDocument.make(
       body: output.body,
       css: css,
       fontSize: request.fontSize,
       baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL),
       mermaidJavaScript: mermaidJavaScript,
+      katexJavaScript: katexJavaScript,
+      katexCSS: katexCSS,
       sourceURL: request.documentURL,
       refreshToken: request.refreshToken
     )

@@ -32,6 +32,8 @@ let package = Package(
                 .copy("Resources/markdown.css"),
                 .copy("Resources/gfm.css"),
                 .copy("Resources/mermaid.min.js"),
+                .copy("Resources/katex.min.js"),
+                .copy("Resources/katex.inline.min.css"),
                 .copy("Resources/sample.md")
             ],
             linkerSettings: [

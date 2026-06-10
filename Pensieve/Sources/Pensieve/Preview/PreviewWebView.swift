@@ -122,6 +122,26 @@ final class PreviewWebView: NSView {
           document.head.appendChild(script);
         }
 
+        const katexCSS = \(PreviewWebView.javaScriptStringLiteral(document.katexCSS ?? ""));
+        if (katexCSS) {
+          let katexStyle = document.getElementById('vc-katex-style');
+          if (!katexStyle) {
+            katexStyle = document.createElement('style');
+            katexStyle.id = 'vc-katex-style';
+            document.head.appendChild(katexStyle);
+          }
+          if (katexStyle.textContent !== katexCSS) {
+            katexStyle.textContent = katexCSS;
+          }
+        }
+
+        const katexRuntime = \(PreviewWebView.javaScriptStringLiteral(document.katexJavaScript ?? ""));
+        if (katexRuntime && !window.katex) {
+          const script = document.createElement('script');
+          script.text = katexRuntime;
+          document.head.appendChild(script);
+        }
+
         \(document.containsMath ? Self.mathBootstrapScript : "")
         \(document.mermaidJavaScript == nil ? "" : Self.mermaidBootstrapScript)
 
