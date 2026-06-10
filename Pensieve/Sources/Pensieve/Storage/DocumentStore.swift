@@ -661,6 +661,7 @@ final class FolderManager {
       appState.lastError = nil
       return true
     } catch {
+      NSLog("%@", "Cold-start valid-skip check failed, falling back to cold open: \(error)")
       return false
     }
   }
@@ -860,6 +861,7 @@ final class FolderManager {
         return false
       }
     } catch {
+      NSLog("%@", "Hot-reopen cache validation failed, falling back to cold open: \(error)")
       appState.workspaceActivity = .cacheMiss(label)
       return false
     }

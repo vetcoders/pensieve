@@ -99,7 +99,7 @@ final class IndexDatabase {
   private func reportOpenFailure(_ error: Error, appState: AppState?) {
     let message = "Could not open Pensieve index database: \(error.localizedDescription)"
     appState?.lastError = message
-    NSLog(message)
+    NSLog("%@", message)
   }
 
   /// Builds the GRDB pool and runs all migrations. `nonisolated static` so it can execute on a
@@ -1851,7 +1851,7 @@ final class IndexDatabase {
   private func report(_ error: Error, appState: AppState?, action: String) {
     let message = "Could not \(action): \(error.localizedDescription)"
     appState?.lastError = message
-    NSLog(message)
+    NSLog("%@", message)
   }
 
   func appendScanSession(

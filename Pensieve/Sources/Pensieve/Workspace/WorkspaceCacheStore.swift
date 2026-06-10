@@ -236,11 +236,11 @@ final class WorkspaceCacheStore {
     do {
       try data.write(to: url, options: protectedWriteOptions)
     } catch {
-      do {
-        try data.write(to: url, options: fallbackWriteOptions)
-      } catch {
-        throw error
-      }
+      NSLog(
+        "%@",
+        "WorkspaceCacheStore: protected write failed for \(url.lastPathComponent), "
+          + "falling back to unprotected atomic write: \(error)")
+      try data.write(to: url, options: fallbackWriteOptions)
     }
   }
 }
