@@ -23,9 +23,18 @@ final class DocumentWindow: NSWindow {
     // owns the window; without this teardown every closed tab leaks its
     // window plus the per-window AppState/AppController stack, and the
     // registry mapping would resurrect the closed window as a zombie.
-    contentView = nil
-    onNewWindowForTab = nil
-    onClose = nil
+    //
+    // The teardown MUST be deferred one runloop turn: closing a tabbed window
+    // triggers AppKit's tab-group reshuffle (neighbor selection, host
+    // re-parenting), and ripping the content view out synchronously mid-dance
+    // leaves a half-dead ghost window on screen (visible, unmovable, invalid
+    // for accessibility) and can re-host sibling tabs into phantom windows.
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.contentView = nil
+      self.onNewWindowForTab = nil
+      self.onClose = nil
+    }
   }
 }
 

@@ -3923,6 +3923,9 @@ final class PensieveSmokeTests: XCTestCase {
     firstWindow.onClose = { registry.handleDocumentWindowClosed($0) }
 
     firstWindow.close()
+    // The hosting-view teardown is deferred one runloop turn so AppKit can
+    // finish its tab-group reshuffle first.
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
 
     XCTAssertNil(
       firstWindow.contentView,
@@ -3933,6 +3936,45 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       createdWindows.count, 2,
       "a closed document must re-open in a fresh window, never resurrect the closed one")
+  }
+
+  @MainActor
+  func testLateAccessorAttachOnClosedWindowIsRejected() throws {
+    var createdWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        let window = DocumentWindow(
+          contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+          styleMask: [.titled, .closable],
+          backing: .buffered,
+          defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: .zero)
+        createdWindows.append(window)
+        return window
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-late-attach.md").standardizedFileURL
+
+    registry.open(DocumentRef(id: documentID))
+    let window = try XCTUnwrap(createdWindows.first as? DocumentWindow)
+    window.onClose = { registry.handleDocumentWindowClosed($0) }
+    window.close()
+
+    // Simulates the closed window's SwiftUI accessor firing one last
+    // main-queue pass after the close.
+    registry.attach(window, documentID: documentID)
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(
+      createdWindows.count, 2,
+      "a late accessor pass must not re-register the closed window; the document re-opens fresh")
   }
 
   @MainActor
@@ -3972,6 +4014,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     registry.attach(zombie, documentID: documentID)
     zombie.close()  // no onClose handler wired -> mapping survives, content torn down
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
 
     registry.open(DocumentRef(id: documentID))
 

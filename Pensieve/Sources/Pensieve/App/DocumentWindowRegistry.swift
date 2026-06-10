@@ -26,6 +26,7 @@ final class DocumentWindowRegistry {
   /// first attach, which would otherwise classify them as empty launchers and
   /// feed them to the reaping sweeps.
   private var untitledTabWindows: [ObjectIdentifier: WeakWindow] = [:]
+  private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   var makeDocumentWindow: DocumentWindowFactoryClosure?
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
@@ -142,6 +143,11 @@ final class DocumentWindowRegistry {
     contentWindows.removeValue(forKey: windowID)
     launcherWindows.removeValue(forKey: windowID)
     untitledTabWindows.removeValue(forKey: windowID)
+    // The window's SwiftUI accessor may still have an in-flight main-queue
+    // pass that would re-register the closed window (and resurrect it as a
+    // phantom tab). Remember the closed identity for as long as the window
+    // object is alive so attach() can reject those late passes.
+    closedWindows[windowID] = WeakWindow(window)
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
@@ -179,6 +185,13 @@ final class DocumentWindowRegistry {
     DebugTrace.log(
       "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)'"
     )
+    // A closed window's SwiftUI accessor can fire one last main-queue pass
+    // AFTER the close; re-registering it would resurrect the window as a
+    // phantom tab that is visible but half-dead.
+    if closedWindows[ObjectIdentifier(window)]?.window === window {
+      DebugTrace.log("registry.attach rejected: window already closed")
+      return
+    }
     // Factory-built document windows keep their tabbing identifier so the
     // system keeps grouping them (and keeps showing "+"); only windows from
     // other origins (launcher scene, restored scenes) are normalized back to
@@ -316,11 +329,13 @@ final class DocumentWindowRegistry {
     includingUntracked: Bool = false
   ) -> Bool {
     let windowID = ObjectIdentifier(window)
-    // A launcher that is a MEMBER of a document tab group is the result of
-    // the native tab bar's "+" pressed on a SwiftUI-origin tab (the system
-    // spawns a WindowGroup scene as a new tab there). That is an intentional
-    // new-tab gesture — reaping it would make "+" appear to do nothing.
-    if (window.tabbedWindows?.count ?? 1) > 1 { return false }
+    // A KEY launcher that is a member of a document tab group is the result
+    // of the native tab bar's "+" pressed on a SwiftUI-origin tab (the system
+    // spawns a WindowGroup scene as a new tab there) — an intentional new-tab
+    // gesture the user is looking at; reaping it would make "+" appear to do
+    // nothing. Stale group-member launchers (no longer key) ARE reaped, or
+    // they accumulate as empty "Pensieve" tabs during tab churn.
+    if (window.tabbedWindows?.count ?? 1) > 1 && window.isKeyWindow { return false }
     let isTrackedLauncher = launcherWindows[windowID]?.window === window
     let isUntrackedLauncher =
       includingUntracked && window.title == "Pensieve" && window.representedURL == nil
