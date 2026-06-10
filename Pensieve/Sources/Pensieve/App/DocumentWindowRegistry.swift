@@ -271,6 +271,16 @@ final class DocumentWindowRegistry {
     }
   }
 
+  private func releaseStaleDocumentMappings(for window: NSWindow, keeping documentID: URL?) {
+    let staleIDs = windowsByDocumentID.compactMap { key, value in
+      value.window === window && key != documentID ? key : nil
+    }
+    for staleID in staleIDs {
+      windowsByDocumentID.removeValue(forKey: staleID)
+      orderedDocumentIDs.remove(staleID)
+    }
+  }
+
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
     guard let target = currentMergeTarget(),
       target !== window,
