@@ -178,7 +178,7 @@ if [[ -f "$QUBE_DYLIB_SRC" ]]; then
     codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
     ok "qube-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
 else
-    warn "qube-ffi dylib not found at $QUBE_DYLIB_SRC — skipping embed (transcription will be unavailable)"
+    die "qube-ffi dylib not found at $QUBE_DYLIB_SRC — the app binary links libqube_ffi.dylib unconditionally, so a bundle without it aborts in dyld at launch. Run Pensieve/scripts/build-ffi.sh to produce it, then re-run this script."
 fi
 
 # ─── Sign ─────────────────────────────────────────────────────────────────
