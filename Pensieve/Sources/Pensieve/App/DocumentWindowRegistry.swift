@@ -201,6 +201,7 @@ final class DocumentWindowRegistry {
     prepareStandaloneTabbing(for: window)
 
     guard let documentID = documentID?.standardizedFileURL else {
+      releaseStaleDocumentMappings(for: window, keeping: nil)
       if hasEditableBuffer {
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
@@ -221,6 +222,11 @@ final class DocumentWindowRegistry {
     window.title = normalizedTitle(title, fallback: fallbackTitle)
     window.representedURL = representedURL ?? documentID
 
+    // A window displays exactly one document: switching documents in place
+    // (the default in-window click routing) must release the previous
+    // mapping, or `open()` keeps "activating" this window for documents it no
+    // longer shows and Open in New Window becomes a silent no-op.
+    releaseStaleDocumentMappings(for: window, keeping: documentID)
     if windowsByDocumentID[documentID]?.window !== window {
       orderedDocumentIDs.remove(documentID)
     }
@@ -284,6 +290,16 @@ final class DocumentWindowRegistry {
       return
     }
     contentReadyWindowIDs.insert(windowID)
+  }
+
+  private func releaseStaleDocumentMappings(for window: NSWindow, keeping documentID: URL?) {
+    let staleIDs = windowsByDocumentID.compactMap { key, value in
+      value.window === window && key != documentID ? key : nil
+    }
+    for staleID in staleIDs {
+      windowsByDocumentID.removeValue(forKey: staleID)
+      orderedDocumentIDs.remove(staleID)
+    }
   }
 
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {

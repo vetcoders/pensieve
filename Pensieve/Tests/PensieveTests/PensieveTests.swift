@@ -3962,6 +3962,42 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testWindowSwitchingDocumentsReleasesStaleDocumentMapping() throws {
+    var openedRefs: [DocumentRef] = []
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer {
+      window.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { window }
+    )
+    let alphaID = URL(fileURLWithPath: "/tmp/pensieve-stale-alpha.md").standardizedFileURL
+    let betaID = URL(fileURLWithPath: "/tmp/pensieve-stale-beta.md").standardizedFileURL
+
+    // The window displays alpha, then switches to beta in place (the default
+    // in-window click routing does this constantly).
+    registry.attach(window, documentID: alphaID)
+    registry.attach(window, documentID: betaID)
+
+    registry.open(DocumentRef(id: alphaID)) { openedRefs.append($0) }
+
+    XCTAssertEqual(
+      openedRefs.map(\.id), [alphaID],
+      "alpha no longer lives in this window; Open in New Window must spawn one, not activate the stale mapping"
+    )
+  }
+
+  @MainActor
   func testSuppressionHidesUnknownWindowOnlyWhileOpenIsInFlight() throws {
     var failsafes: [@MainActor () -> Void] = []
     var openedRefs: [DocumentRef] = []
