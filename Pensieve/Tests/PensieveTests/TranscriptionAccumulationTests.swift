@@ -90,6 +90,45 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.rendered, "alpha\nbeta\ngamma")
   }
 
+  @MainActor
+  func testStartRecordingLoadsModelOffMainAndEntersRecordingState() async {
+    let engine = MockVistaAutocompleteEngine(modelLoaded: false, initModelHandler: {})
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+
+    XCTAssertTrue(service.isPreparingRecording, "model load happens in the background")
+    XCTAssertFalse(service.isRecording)
+
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertNil(service.lastError)
+  }
+
+  @MainActor
+  func testStartRecordingSurfacesModelInitFailureWithoutEnteringRecording() async {
+    struct ModelInitBoom: Error, LocalizedError {
+      var errorDescription: String? { "model boom" }
+    }
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: { throw ModelInitBoom() })
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where service.lastError == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(service.lastError, "model boom")
+    XCTAssertFalse(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+  }
+
   func testFormatCompositionUsesVistaEngineFormatterWhenAvailable() async {
     let engine = MockVistaAutocompleteEngine(
       formattingAvailable: true,

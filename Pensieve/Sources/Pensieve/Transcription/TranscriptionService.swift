@@ -59,6 +59,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var preview: String
   @Published private(set) var rendered: String
   @Published private(set) var isRecording: Bool
+  @Published private(set) var isPreparingRecording: Bool = false
   @Published private(set) var isFormatting: Bool
   @Published private(set) var lastLanguage: String?
   @Published private(set) var lastStatus: VistaStatusSignal?
@@ -69,6 +70,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   private let cadenceCommitNanoseconds: UInt64
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
+  private var startRecordingTask: Task<Void, Never>?
   private var lastRawPreview: String = ""
   private var promotedPreviewPrefix: String?
 
@@ -89,18 +91,36 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   deinit {
     cadenceCommitTask?.cancel()
+    startRecordingTask?.cancel()
   }
 
-  func startRecording(language: String? = nil) throws {
+  func startRecording(language: String? = nil) {
+    guard !isRecording, !isPreparingRecording else { return }
     let engine = activeEngine()
     engine.setEventListener(listener: self)
-    if !engine.isModelLoaded() {
-      try engine.initModel()
-    }
-    try engine.startRecording(language: language)
-    isRecording = true
+    isPreparingRecording = true
     lastError = nil
-    startCadenceCommitLoop()
+    startRecordingTask = Task { [weak self] in
+      do {
+        // Model init (whisper weights dequantization — seconds of CPU) and
+        // capture start run OFF the main actor; doing this inline froze the
+        // whole UI for the model load (1.77s+ hang reports from the field).
+        try await Task.detached(priority: .userInitiated) {
+          if !engine.isModelLoaded() {
+            try engine.initModel()
+          }
+          try engine.startRecording(language: language)
+        }.value
+        guard let self else { return }
+        self.isPreparingRecording = false
+        self.isRecording = true
+        self.startCadenceCommitLoop()
+      } catch {
+        guard let self else { return }
+        self.isPreparingRecording = false
+        self.lastError = error.localizedDescription
+      }
+    }
   }
 
   @discardableResult

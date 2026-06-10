@@ -186,11 +186,16 @@ private struct TranscriptionTaflaPanelView: View {
       Spacer()
 
       Button(action: start) {
-        Image(systemName: "mic.fill")
+        if service.isPreparingRecording {
+          ProgressView()
+            .controlSize(.small)
+        } else {
+          Image(systemName: "mic.fill")
+        }
       }
       .buttonStyle(.borderedProminent)
-      .disabled(service.isRecording)
-      .help("Start Recording")
+      .disabled(service.isRecording || service.isPreparingRecording)
+      .help(service.isPreparingRecording ? "Loading speech model…" : "Start Recording")
       .accessibilityIdentifier("pensieve.tafla.start")
 
       Button(action: stop) {
@@ -296,7 +301,8 @@ private struct TranscriptionTaflaPanelView: View {
     if let dispatchStatus = service.dispatchStatus {
       return dispatchStatus
     }
-    let recordingState = service.isRecording ? "Recording" : "Idle"
+    let recordingState =
+      service.isPreparingRecording ? "Preparing" : (service.isRecording ? "Recording" : "Idle")
     guard let lastStatus = service.lastStatus else { return recordingState }
     return "\(recordingState) - \(lastStatus.label)"
   }
@@ -310,12 +316,10 @@ private struct TranscriptionTaflaPanelView: View {
   }
 
   private func start() {
-    do {
-      try service.startRecording()
-      controlError = nil
-    } catch {
-      controlError = error.localizedDescription
-    }
+    // Model init + capture start run in the background; failures surface
+    // through service.lastError (already part of errorText).
+    service.startRecording()
+    controlError = nil
   }
 
   private func stop() {
