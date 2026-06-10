@@ -142,6 +142,9 @@ private struct PensieveWindowRoot: View {
   private func revealStartupWindow() {
     DispatchQueue.main.async {
       startupPresentationReady = true
+      if let currentWindow {
+        DocumentWindowRegistry.shared.noteWindowContentReady(currentWindow)
+      }
       applyStartupPresentation(to: currentWindow)
     }
   }
@@ -156,6 +159,10 @@ private struct PensieveWindowRoot: View {
       window.alphaValue = 0
       return
     }
+    // Only force visibility once the scene content actually renders; touching
+    // alpha earlier would re-reveal a suppressed window into a black tab
+    // (never-suppressed windows are visible by default anyway).
+    guard startupPresentationReady else { return }
     window.alphaValue = 1
   }
 }

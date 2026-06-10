@@ -91,6 +91,10 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// External/explicit file opens (⌘O, Finder, recents) load into the current
+  /// window for the same reason as `openDocumentWindow`: a per-document scene
+  /// spawn flashes during its cold start. New windows stay an explicit
+  /// gesture.
   func openFile(url: URL) {
     guard let ref = folderManager.registerOpenFile(url: url, into: appState) else {
       return
@@ -100,16 +104,7 @@ final class AppController: ObservableObject {
       return
     }
 
-    guard appState.documentSession.hasEditableBuffer else {
-      documentStore.load(ref: ref, into: appState)
-      return
-    }
-
-    if let requestOpenDocumentWindow {
-      requestOpenDocumentWindow(ref)
-    } else {
-      documentStore.load(ref: ref, into: appState)
-    }
+    documentStore.load(ref: ref, into: appState)
   }
 
   func openFileInCurrentWindow(url: URL) {
@@ -289,6 +284,11 @@ final class AppController: ObservableObject {
     _ = documentStore.select(ref: ref, into: appState)
   }
 
+  /// A plain list/search click opens the document in the CURRENT window.
+  /// Spawning a per-document SwiftUI scene here flashed a half-built window
+  /// for the scene's cold-start beat; native multi-window stays available as
+  /// an explicit gesture (`openDocumentInNewWindow`), system tabbing, and
+  /// Window menu merges.
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
       return
@@ -298,16 +298,28 @@ final class AppController: ObservableObject {
       return
     }
 
-    guard appState.documentSession.hasEditableBuffer else {
+    selectDocument(id: ref.id)
+  }
+
+  /// Explicit "Open in New Window" gesture: routes through the window registry
+  /// (in-flight coalescing, merge-target bookkeeping, presentation
+  /// suppression) and falls back to in-window selection when no routing is
+  /// wired (tests, headless).
+  func openDocumentInNewWindow(id: DocumentRef.ID?) {
+    guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
+      return
+    }
+
+    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+      return
+    }
+
+    guard appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow else {
       selectDocument(id: ref.id)
       return
     }
 
-    if let requestOpenDocumentWindow {
-      requestOpenDocumentWindow(ref)
-    } else {
-      selectDocument(id: ref.id)
-    }
+    requestOpenDocumentWindow(ref)
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {

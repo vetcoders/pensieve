@@ -578,6 +578,10 @@ struct SidebarView: View {
       controller.openDocumentWindow(id: doc.id)
     }
 
+    Button("Open in New Window") {
+      controller.openDocumentInNewWindow(id: doc.id)
+    }
+
     Button("Open in Default App") {
       openExternally(doc.url)
     }
