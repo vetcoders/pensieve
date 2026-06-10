@@ -125,6 +125,83 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertFalse(surface.textView.hasAutocompleteGhost)
   }
 
+  func testDefaultControllerWithoutEngineSurfacesUnavailableError() {
+    let controller = AutocompleteController(debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+
+    XCTAssertNil(controller.suggestion)
+    XCTAssertEqual(controller.lastError, AutocompleteController.engineUnavailableMessage)
+  }
+
+  func testInitModelFailureLatchesAcrossKeystrokes() async {
+    let attempts = AttemptCounter()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        attempts.increment()
+        throw InitModelTestFailure()
+      })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(controller.lastError, InitModelTestFailure().errorDescription)
+    XCTAssertEqual(attempts.value, 1)
+
+    controller.textDidChange(prefix: "hello a")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(attempts.value, 1, "failed init must not be retried per keystroke")
+    XCTAssertEqual(controller.lastError, InitModelTestFailure().errorDescription)
+  }
+
+  func testInitModelFailureLatchEngagesEvenWhenRequestSuperseded() async {
+    let attempts = AttemptCounter()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        attempts.increment()
+        usleep(100_000)  // keep init in flight while a newer keystroke supersedes it
+        throw InitModelTestFailure()
+      })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 40_000_000)
+    controller.textDidChange(prefix: "hello a")
+    try? await Task.sleep(nanoseconds: 250_000_000)
+
+    controller.textDidChange(prefix: "hello ab")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(
+      attempts.value, 1,
+      "latch is engine-global; a superseded request must still arm it")
+  }
+
+  func testCancelResetsInitFailureLatch() async {
+    let attempts = AttemptCounter()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        attempts.increment()
+        throw InitModelTestFailure()
+      })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+    XCTAssertEqual(attempts.value, 1)
+
+    controller.cancel()
+    controller.textDidChange(prefix: "hello again")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
+  }
+
   func testAIAutocompleteSettingDefaultsOffAndPersists() {
     let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -136,6 +213,27 @@ final class AutocompleteControllerTests: XCTestCase {
     model.aiAutocompleteEnabled = true
     let reloaded = DocumentWindowModel(defaults: defaults)
     XCTAssertTrue(reloaded.aiAutocompleteEnabled)
+  }
+}
+
+private struct InitModelTestFailure: Error, LocalizedError {
+  var errorDescription: String? { "init model boom" }
+}
+
+private final class AttemptCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+
+  func increment() {
+    lock.lock()
+    count += 1
+    lock.unlock()
+  }
+
+  var value: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return count
   }
 }
 

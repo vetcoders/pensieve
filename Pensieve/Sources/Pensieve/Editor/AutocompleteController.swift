@@ -6,19 +6,35 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
   static let defaultDebounceNanoseconds: UInt64 = 400_000_000
 
+  /// Surfaced when no completion engine exists. The vendored qube-ffi bridge has no
+  /// `uniffi_qube_ffi_fn_method_vistaengine_complete` symbol — `VistaEngine.complete`
+  /// is a hand-added stub returning "" — so defaulting to the real engine would pay
+  /// the full model-load cost only to render nothing. Until vista-kernel ships the
+  /// completion method, the default controller has no engine and says so.
+  static let engineUnavailableMessage =
+    "AI autocomplete is not available yet: the bundled vista-kernel build has no completion support."
+
   @Published private(set) var suggestion: String?
   @Published private(set) var lastError: String?
 
-  private let engineFactory: EngineFactory
+  private let engineFactory: EngineFactory?
   private let debounceNanoseconds: UInt64
   private let maxTokens: UInt32
   private var engine: VistaEngineProtocol?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
+  // initModel is expensive; the latch is engine-global state, deliberately NOT
+  // request-scoped: once init fails we stop retrying on every keystroke, and a
+  // single-flight guard keeps overlapping debounced requests from stacking
+  // concurrent blocking initModel calls on the cooperative pool. cancel()
+  // clears the latch so the user has a deliberate retry path.
+  private var modelInitFailed = false
+  private var modelInitErrorMessage: String?
+  private var modelInitInFlight = false
 
   init(
     engine: VistaEngineProtocol? = nil,
-    engineFactory: @escaping EngineFactory = { MockVistaAutocompleteEngine() },
+    engineFactory: EngineFactory? = nil,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
     maxTokens: UInt32 = 32
   ) {
@@ -43,12 +59,47 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
       return
     }
 
-    let engine = activeEngine()
+    guard let engine = activeEngine() else {
+      lastError = Self.engineUnavailableMessage
+      return
+    }
+
+    if modelInitFailed {
+      lastError = modelInitErrorMessage
+      return
+    }
+
     let debounceNanoseconds = debounceNanoseconds
     let maxTokens = maxTokens
     completionTask = Task(priority: .userInitiated) { [weak self] in
       do {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
+        try Task.checkCancellation()
+        if !engine.isModelLoaded() {
+          guard let self, await self.beginModelInit(currentRequestID: currentRequestID) else {
+            // Another request is already loading the model (or init already
+            // failed); this request bails and a later keystroke picks up.
+            return
+          }
+          do {
+            try engine.initModel()
+            await MainActor.run { self.modelInitInFlight = false }
+          } catch {
+            await MainActor.run {
+              // The latch is engine-global: record the failure even when this
+              // request was superseded, otherwise continuous typing would keep
+              // re-running the expensive init. Only the UI fields stay gated
+              // on the request still being current.
+              self.modelInitInFlight = false
+              self.modelInitFailed = true
+              self.modelInitErrorMessage = error.localizedDescription
+              guard self.requestID == currentRequestID else { return }
+              self.suggestion = nil
+              self.lastError = error.localizedDescription
+            }
+            return
+          }
+        }
         try Task.checkCancellation()
         let completion = try await engine.complete(prefix: prefix, maxTokens: maxTokens)
         try Task.checkCancellation()
@@ -78,96 +129,33 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     completionTask = nil
     suggestion = nil
     lastError = nil
+    modelInitFailed = false
+    modelInitErrorMessage = nil
   }
 
-  private func activeEngine() -> VistaEngineProtocol {
+  /// Claims the single-flight init slot on the main actor. Returns false when
+  /// init is already running or has already failed (latch engaged meanwhile).
+  @MainActor
+  private func beginModelInit(currentRequestID: UInt64) -> Bool {
+    if modelInitFailed {
+      if requestID == currentRequestID {
+        suggestion = nil
+        lastError = modelInitErrorMessage
+      }
+      return false
+    }
+    guard !modelInitInFlight else { return false }
+    modelInitInFlight = true
+    return true
+  }
+
+  private func activeEngine() -> VistaEngineProtocol? {
     if let engine {
       return engine
     }
+    guard let engineFactory else { return nil }
     let engine = engineFactory()
     self.engine = engine
     return engine
   }
-}
-
-final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendable {
-  typealias CompletionHandler = @Sendable (String, UInt32) async throws -> String
-  typealias FormattingHandler = @Sendable (String, Bool) async throws -> String
-
-  private let completionHandler: CompletionHandler
-  private let formattingAvailable: Bool
-  private let formattingHandler: FormattingHandler
-
-  init(
-    completionHandler: @escaping CompletionHandler =
-      MockVistaAutocompleteEngine.defaultCompletionHandler,
-    formattingAvailable: Bool = false,
-    formattingHandler: @escaping FormattingHandler = { text, _ in text }
-  ) {
-    self.completionHandler = completionHandler
-    self.formattingAvailable = formattingAvailable
-    self.formattingHandler = formattingHandler
-  }
-
-  func complete(prefix: String, maxTokens: UInt32) async throws -> String {
-    try await completionHandler(prefix, maxTokens)
-  }
-
-  private static let defaultCompletionHandler: CompletionHandler = { prefix, maxTokens in
-    guard maxTokens > 0 else { return "" }
-    guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
-    return " continuation"
-  }
-
-  func configDir() -> String { "" }
-
-  func formatText(text: String, assistive: Bool) async throws -> String {
-    try await formattingHandler(text, assistive)
-  }
-
-  func getAssistivePrompt() -> String { "" }
-
-  func getFormattingPrompt() -> String { "" }
-
-  func hasActiveConversation() -> Bool { false }
-
-  func initModel() throws {}
-
-  func isFormattingAvailable() -> Bool { formattingAvailable }
-
-  func isModelLoaded() -> Bool { true }
-
-  func isRecording() -> Bool { false }
-
-  func latestHistoryPath() throws -> String { "" }
-
-  func loadConfig() -> VistaConfig {
-    fatalError("MockVistaAutocompleteEngine.loadConfig is outside autocomplete scope")
-  }
-
-  func removeEventListener() {}
-
-  func resetConversation() {}
-
-  func resetConversationForMode(mode: VistaAiMode) {}
-
-  func saveHistory(text: String) -> String { "" }
-
-  func setEventListener(listener: VistaEventListener) {}
-
-  func shouldShowOnboarding() -> Bool { false }
-
-  func startPipeline(language: String?) throws {}
-
-  func startRecording(language: String?) throws {}
-
-  func stopPipeline() throws -> String { "" }
-
-  func stopRecording() throws -> String { "" }
-
-  func transcribeFile(audioPath: String) async throws -> TranscriptionResult {
-    fatalError("MockVistaAutocompleteEngine.transcribeFile is outside autocomplete scope")
-  }
-
-  func updateConfig(key: String, value: String) throws {}
 }
