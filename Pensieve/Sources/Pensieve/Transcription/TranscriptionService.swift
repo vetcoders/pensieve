@@ -105,16 +105,19 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   @discardableResult
   func stopRecording() throws -> String {
-    guard let engine else {
+    // Always clear recording state, even when engine.stopRecording() throws;
+    // otherwise the UI stays in "Recording" and the cadence loop never stops.
+    defer {
       isRecording = false
       stopCadenceCommitLoop()
+    }
+
+    guard let engine else {
       return rendered
     }
 
     let finalText = try engine.stopRecording()
     commitActivePreviewForCadence()
-    isRecording = false
-    stopCadenceCommitLoop()
     return finalText
   }
 
