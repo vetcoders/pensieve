@@ -3786,6 +3786,119 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenWindowExpectsMergeUntilAttachCompletesAndRevealsAfterMerge() throws {
+    var openedRefs: [DocumentRef] = []
+    var events: [String] = []
+    let targetWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [targetWindow, documentWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      targetWindow.close()
+      documentWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      mergeWindowIntoTabs: { _, _ in events.append("merge") },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { targetWindow },
+      revealWindow: { window in
+        events.append("reveal")
+        window.alphaValue = 1
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-merge-reveal.md").standardizedFileURL
+
+    XCTAssertFalse(registry.expectsMerge(for: documentID))
+
+    registry.open(DocumentRef(id: documentID)) { openedRefs.append($0) }
+
+    XCTAssertEqual(openedRefs.map(\.id), [documentID])
+    XCTAssertTrue(
+      registry.expectsMerge(for: documentID),
+      "between open() and attach() the upcoming window is destined to merge — presentation can suppress it"
+    )
+
+    // Simulates the born-to-merge window: presentation suppressed it before attach.
+    documentWindow.alphaValue = 0
+    registry.attach(documentWindow, documentID: documentID)
+
+    XCTAssertFalse(registry.expectsMerge(for: documentID))
+    XCTAssertEqual(
+      events, ["merge", "reveal"],
+      "the window must merge into the native tab group before it becomes visible")
+    XCTAssertEqual(documentWindow.alphaValue, 1)
+  }
+
+  @MainActor
+  func testAttachRevealsWindowEvenWithoutPendingMerge() throws {
+    var revealedWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      mergeWindowIntoTabs: { _, _ in XCTFail("no pending target, nothing to merge") },
+      orderAndActivateWindow: { _ in },
+      revealWindow: { revealedWindows.append($0) }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-plain-reveal.md").standardizedFileURL
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer {
+      window.close()
+    }
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(revealedWindows, [window])
+  }
+
+  @MainActor
+  func testModalDeferredAttachRevealsWindowImmediately() throws {
+    var scheduledWork: [@MainActor () -> Void] = []
+    var revealCount = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { false },
+      scheduleDeferredMainWork: { scheduledWork.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      revealWindow: { _ in revealCount += 1 }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-modal-reveal.md").standardizedFileURL
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer {
+      window.close()
+    }
+
+    registry.attach(window, documentID: documentID)
+
+    XCTAssertEqual(scheduledWork.count, 1)
+    XCTAssertEqual(
+      revealCount, 1,
+      "a modal-deferred attach must not leave a suppressed window invisible for the modal's lifetime"
+    )
+  }
+
+  @MainActor
   func testDocumentWindowAttachAssignsTabbedIdentifierOnlyWhenMerging() throws {
     var openedRefs: [DocumentRef] = []
     var mergeCount = 0

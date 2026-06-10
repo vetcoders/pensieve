@@ -80,7 +80,11 @@ private struct PensieveWindowRoot: View {
     .focusedSceneObject(controller)
     .background(
       DocumentWindowAccessor(
-        documentID: appState.selectedDocumentID,
+        // Fall back to the scene's initialDocument so the FIRST attach already
+        // carries the document identity: the registry can merge the window
+        // into the native tab group before the (async) document load finishes,
+        // instead of briefly registering a document window as a launcher.
+        documentID: appState.selectedDocumentID ?? initialDocument?.id,
         title: appState.documentSession.displayTitle,
         representedURL: appState.documentSession.url,
         hasEditableBuffer: appState.documentSession.hasEditableBuffer
@@ -143,7 +147,16 @@ private struct PensieveWindowRoot: View {
   }
 
   private func applyStartupPresentation(to window: NSWindow?) {
-    window?.alphaValue = 1
+    guard let window else { return }
+    // A window born to merge into another window's native tab group stays
+    // invisible until DocumentWindowRegistry.completeAttach reveals it as a
+    // tab; otherwise it flashes standalone for the document-load beat before
+    // addTabbedWindow pulls it in.
+    if let initialDocument, DocumentWindowRegistry.shared.expectsMerge(for: initialDocument.id) {
+      window.alphaValue = 0
+      return
+    }
+    window.alphaValue = 1
   }
 }
 

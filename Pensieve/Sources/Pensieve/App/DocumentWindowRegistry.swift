@@ -23,6 +23,7 @@ final class DocumentWindowRegistry {
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
   private let currentMergeTarget: @MainActor () -> NSWindow?
+  private let revealWindow: @MainActor (NSWindow) -> Void
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
 
@@ -48,6 +49,9 @@ final class DocumentWindowRegistry {
     currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
       NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow ?? NSApp.windows.first
     },
+    revealWindow: @escaping @MainActor (NSWindow) -> Void = { window in
+      window.alphaValue = 1
+    },
     applicationWindows: @escaping @MainActor () -> [NSWindow] = { NSApp.windows },
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
@@ -59,8 +63,19 @@ final class DocumentWindowRegistry {
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.orderAndActivateWindow = orderAndActivateWindow
     self.currentMergeTarget = currentMergeTarget
+    self.revealWindow = revealWindow
     self.applicationWindows = applicationWindows
     self.closeWindow = closeWindow
+  }
+
+  /// True between `open()` and the matching `attach()` for a document whose
+  /// upcoming window will be merged into an existing window's native tab
+  /// group. Presentation uses this to keep the freshly created window
+  /// invisible so the user never sees it flash standalone before the merge;
+  /// `completeAttach` reveals it once it is already a tab.
+  func expectsMerge(for documentID: URL?) -> Bool {
+    guard let documentID = documentID?.standardizedFileURL else { return false }
+    return pendingMergeTargets[documentID]?.window != nil
   }
 
   func open(_ ref: DocumentRef, openDocument: @escaping DocumentOpener) {
@@ -117,6 +132,10 @@ final class DocumentWindowRegistry {
     windowsByDocumentID[documentID] = WeakWindow(window)
 
     guard canMutateWindowTabs() else {
+      // A modal can outlive any reasonable suppression window — reveal now and
+      // accept the legacy standalone-then-merge visual rather than an
+      // invisible window for the modal's lifetime.
+      revealWindow(window)
       deferAttach(window, documentID: documentID)
       return
     }
@@ -144,6 +163,9 @@ final class DocumentWindowRegistry {
     if orderedDocumentIDs.insert(documentID).inserted {
       orderAndActivateWindow(window)
     }
+    // Reveal strictly after the merge so a presentation-suppressed window
+    // first becomes visible as a tab, never as a standalone window.
+    revealWindow(window)
     closeEmptyLauncherWindows(except: window)
   }
 
