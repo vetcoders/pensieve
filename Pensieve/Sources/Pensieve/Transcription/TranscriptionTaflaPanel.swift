@@ -48,6 +48,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    removeSendEventMonitor()
     onVisibilityChanged?()
   }
 
@@ -103,6 +104,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       guard event.keyCode == 36 else { return event }
       let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
       guard flags.contains(.shift) else { return event }
+      // Agent dispatch is click-only by design; the hotkey sends only to the editor.
+      guard self.routingState.sendTarget == .editor else { return event }
       return self.sendComposition(target: self.routingState.sendTarget) ? nil : event
     }
   }
