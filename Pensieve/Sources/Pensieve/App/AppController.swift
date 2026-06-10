@@ -10,7 +10,7 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let agentPromptLauncher: AgentPromptLaunching
-  private let agentWorkspaceRoot: URL
+  private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   let transcriptionService: TranscriptionService
@@ -25,6 +25,7 @@ final class AppController: ObservableObject {
     return panel
   }()
   private var didStart = false
+  private var isAgentDispatchInFlight = false
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
@@ -47,8 +48,7 @@ final class AppController: ObservableObject {
     indexDatabase: IndexDatabase? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
-    agentWorkspaceRoot: URL = URL(
-      fileURLWithPath: "/Users/maciejgad/vc-workspace/vetcoders/pensieve"),
+    agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
   ) {
@@ -423,15 +423,20 @@ final class AppController: ObservableObject {
 
   @discardableResult
   private func dispatchTranscriptionToAgent() -> Bool {
+    guard !isAgentDispatchInFlight else { return false }
     let prompt = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !prompt.isEmpty else { return false }
 
+    isAgentDispatchInFlight = true
     transcriptionService.updateDispatchStatus("Dispatching to agent...")
     let launcher = agentPromptLauncher
-    let workingDirectoryURL = agentWorkspaceRoot
+    let workingDirectoryURL =
+      agentWorkspaceRoot
+      ?? appState.folderURL
+      ?? FileManager.default.homeDirectoryForCurrentUser
     let transcriptionService = transcriptionService
 
-    Task.detached(priority: .utility) {
+    Task.detached(priority: .utility) { [weak self] in
       do {
         let metadata = try launcher.dispatch(
           prompt: prompt,
@@ -442,11 +447,13 @@ final class AppController: ObservableObject {
             transcriptionService.resetTranscript()
           }
           transcriptionService.updateDispatchStatus(metadata.statusLine)
+          self?.isAgentDispatchInFlight = false
         }
       } catch {
         await MainActor.run {
           transcriptionService.updateDispatchStatus(
             "Dispatch failed: \(error.localizedDescription)")
+          self?.isAgentDispatchInFlight = false
         }
       }
     }
