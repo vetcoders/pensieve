@@ -202,8 +202,10 @@ private struct TranscriptionTaflaPanelView: View {
         Image(systemName: "stop.fill")
       }
       .buttonStyle(.bordered)
-      .disabled(!service.isRecording)
-      .help("Stop Recording")
+      // Enabled during Preparing too: a slow/hung model load must stay
+      // cancellable, otherwise the panel has no control to leave that state.
+      .disabled(!service.isRecording && !service.isPreparingRecording)
+      .help(service.isPreparingRecording ? "Cancel Preparation" : "Stop Recording")
       .accessibilityIdentifier("pensieve.tafla.stop")
 
       Button(action: reset) {
@@ -323,6 +325,11 @@ private struct TranscriptionTaflaPanelView: View {
   }
 
   private func stop() {
+    if service.isPreparingRecording {
+      service.cancelPreparation()
+      controlError = nil
+      return
+    }
     do {
       _ = try service.stopRecording()
       controlError = nil

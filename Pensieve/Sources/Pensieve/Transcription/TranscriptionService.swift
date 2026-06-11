@@ -139,6 +139,17 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     }
   }
 
+  /// Cancels an in-flight preparation (model load / capture start) so the
+  /// panel never strands the user in Preparing with no enabled control. The
+  /// bridged cancellation reaches the detached prepare task; if capture
+  /// already began, the prepare task's rollback stops the engine.
+  func cancelPreparation() {
+    guard isPreparingRecording else { return }
+    startRecordingTask?.cancel()
+    startRecordingTask = nil
+    isPreparingRecording = false
+  }
+
   @discardableResult
   func stopRecording() throws -> String {
     // Always clear recording state, even when engine.stopRecording() throws;

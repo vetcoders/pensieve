@@ -141,6 +141,38 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testCancelPreparationLeavesPreparingAndNeverStartsRecording() async {
+    let modelLoadStarted = expectation(description: "model load entered")
+    let releaseModelLoad = DispatchSemaphore(value: 0)
+    let recordingStarted = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        modelLoadStarted.fulfill()
+        releaseModelLoad.wait()
+      },
+      startRecordingHandler: { _ in recordingStarted.set() }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    await fulfillment(of: [modelLoadStarted], timeout: 2)
+
+    service.cancelPreparation()
+    XCTAssertFalse(
+      service.isPreparingRecording,
+      "cancel must leave the Preparing state immediately")
+    releaseModelLoad.signal()
+
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      recordingStarted.isSet,
+      "a cancelled preparation must never start the microphone")
+    XCTAssertFalse(service.isRecording)
+    XCTAssertNil(service.lastError, "user-initiated cancel is not an error")
+  }
+
+  @MainActor
   func testStartRecordingSurfacesModelInitFailureWithoutEnteringRecording() async {
     struct ModelInitBoom: Error, LocalizedError {
       var errorDescription: String? { "model boom" }
