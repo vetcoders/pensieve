@@ -17,6 +17,13 @@
 
 set -euo pipefail
 
+# The shell that launches this build may carry a finite `ulimit -f` (file-size
+# cap) inherited from its environment. The vendored qube-ffi dylib is ~68 MiB,
+# so a 31 MiB cap makes the `cp` into the .app's Frameworks dir die on SIGXFSZ
+# (exit 153, "Filesize limit exceeded") after the whole build otherwise
+# succeeded. Lift it for the build's process tree.
+ulimit -f unlimited 2>/dev/null || true
+
 # ─── Resolve paths ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
