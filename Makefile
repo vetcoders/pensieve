@@ -132,6 +132,10 @@ release-local: gates  ## Signed .app + .dmg, skip notarization (gated, local-onl
 release-clean: clean gates  ## Clean + full release (gated, most reproducible)
 	@$(SCRIPTS)/build-release.sh --clean
 
+.PHONY: notarize
+notarize:  ## DMG-only: package + notarize + staple from the existing signed .app (no rebuild, no gates)
+	@$(SCRIPTS)/build-release.sh --dmg-only
+
 # =========================================================================
 # INSPECTION
 # =========================================================================
