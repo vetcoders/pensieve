@@ -3640,6 +3640,46 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenFileRejectsUnsupportedTypeBeforeRoutingToRegistry() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileUnsupportedTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let imageURL = folder.appendingPathComponent("picture.png")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try Data().write(to: imageURL)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: alphaURL)
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+
+    controller.openFile(url: imageURL)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "an unsupported file must be rejected before it routes to a new window/tab")
+    XCTAssertEqual(appState.lastError, WorkspaceScanner.unsupportedOpenMessage)
+  }
+
+  @MainActor
   func testOpenFileFallsBackToInWindowLoadWithoutRouting() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(

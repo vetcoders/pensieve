@@ -102,6 +102,15 @@ final class AppController: ObservableObject {
       return
     }
 
+    // The registry route below bypasses registerOpenFile (the destination
+    // window registers the file during its own load), so unsupported types
+    // must be rejected HERE — otherwise they would open an empty tab whose
+    // load is refused only afterwards.
+    guard WorkspaceScanner.isMarkdownFile(standardizedURL) else {
+      appState.lastError = WorkspaceScanner.unsupportedOpenMessage
+      return
+    }
+
     // When the file routes to its own window/tab, do NOT register it into
     // THIS window's working set first — the destination window registers it
     // during its own load, and a premature registration leaves the
