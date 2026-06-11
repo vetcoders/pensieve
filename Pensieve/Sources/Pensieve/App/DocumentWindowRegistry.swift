@@ -404,6 +404,10 @@ final class DocumentWindowRegistry {
     launcherWindows = launcherWindows.filter { $0.value.window != nil }
     contentWindows = contentWindows.filter { $0.value.window != nil }
     untitledTabWindows = untitledTabWindows.filter { $0.value.window != nil }
+    // Closed-window identities only matter while the window object is alive
+    // (attach() compares against the live instance); once it deallocates the
+    // entry is dead weight, so drop it instead of accumulating stale keys.
+    closedWindows = closedWindows.filter { $0.value.window != nil }
     if let preferredLauncherID, launcherWindows[preferredLauncherID]?.window == nil {
       self.preferredLauncherID = nil
     }
