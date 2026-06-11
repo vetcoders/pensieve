@@ -4344,7 +4344,9 @@ final class PensieveSmokeTests: XCTestCase {
     let ref = DocumentRef(id: documentID)
 
     registry.attach(launcherWindow, documentID: nil)
-    scheduledSweeps.removeAll()
+    // Run (not just drop) collected sweeps: execution releases the coalescing
+    // latch so the next interaction can schedule a fresh sweep.
+    while let sweep = scheduledSweeps.popLast() { sweep() }
 
     registry.attach(
       documentWindow,
@@ -4352,7 +4354,7 @@ final class PensieveSmokeTests: XCTestCase {
       title: "existing",
       representedURL: documentID,
       hasEditableBuffer: true)
-    scheduledSweeps.removeAll()
+    while let sweep = scheduledSweeps.popLast() { sweep() }
     closedWindows.removeAll()
 
     registry.open(ref)
@@ -4522,7 +4524,9 @@ final class PensieveSmokeTests: XCTestCase {
     registry.attach(documentWindow, documentID: documentID)
 
     XCTAssertEqual(untitledWindow.title, "Draft note")
-    XCTAssertEqual(scheduledSweeps.count, 3)
+    // Sweeps coalesce: the attach churn shares ONE pending close-sweep; the
+    // second entry is the launcher-registration reconcile pass.
+    XCTAssertEqual(scheduledSweeps.count, 2)
     while let sweep = scheduledSweeps.popLast() {
       sweep()
     }

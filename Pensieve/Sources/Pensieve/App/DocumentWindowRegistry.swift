@@ -27,6 +27,8 @@ final class DocumentWindowRegistry {
   /// feed them to the reaping sweeps.
   private var untitledTabWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
+  private var launcherSweepPending = false
+  private var launcherSweepSparedWindow: WeakWindow?
   var makeDocumentWindow: DocumentWindowFactoryClosure?
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
@@ -314,8 +316,15 @@ final class DocumentWindowRegistry {
   }
 
   private func closeEmptyLauncherWindows(except activeWindow: NSWindow?) {
-    scheduleLauncherWindowSweep { [weak self, activeWindow] in
+    // Attach churn used to queue a separate sweep timer per call; one pending
+    // sweep is enough — it reads the LATEST spared window at fire time.
+    launcherSweepSparedWindow = activeWindow.map(WeakWindow.init)
+    guard !launcherSweepPending else { return }
+    launcherSweepPending = true
+    scheduleLauncherWindowSweep { [weak self] in
       guard let self else { return }
+      launcherSweepPending = false
+      let activeWindow = launcherSweepSparedWindow?.window
       purgeClosedLauncherWindows()
       for window in applicationWindows()
       where window !== activeWindow && isEmptyLauncherWindow(window, includingUntracked: true) {
@@ -434,33 +443,59 @@ struct DocumentWindowAccessor: NSViewRepresentable {
   let hasEditableBuffer: Bool
   var onWindow: ((NSWindow) -> Void)?
 
+  /// SwiftUI re-evaluates this representable on EVERY render pass of the
+  /// window root — focus changes, keystrokes, published-object churn. Without
+  /// coalescing each pass dispatched a registry attach (plus its launcher
+  /// sweep) for every window, which showed up as 10-15 redundant attach calls
+  /// per interaction in field traces. The coordinator remembers what was last
+  /// attached and only goes to the registry when something it cares about
+  /// actually changed.
+  final class Coordinator {
+    var lastWindowID: ObjectIdentifier?
+    var lastDocumentID: URL?
+    var lastTitle: String?
+    var lastRepresentedURL: URL?
+    var lastHasEditableBuffer: Bool?
+  }
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
   func makeNSView(context: Context) -> NSView {
     let view = NSView(frame: .zero)
-    DispatchQueue.main.async {
-      if let window = view.window {
-        onWindow?(window)
-        DocumentWindowRegistry.shared.attach(
-          window,
-          documentID: documentID,
-          title: title,
-          representedURL: representedURL,
-          hasEditableBuffer: hasEditableBuffer)
-      }
-    }
+    attachIfNeeded(from: view, coordinator: context.coordinator)
     return view
   }
 
   func updateNSView(_ nsView: NSView, context: Context) {
+    attachIfNeeded(from: nsView, coordinator: context.coordinator)
+  }
+
+  private func attachIfNeeded(from view: NSView, coordinator: Coordinator) {
     DispatchQueue.main.async {
-      if let window = nsView.window {
-        onWindow?(window)
-        DocumentWindowRegistry.shared.attach(
-          window,
-          documentID: documentID,
-          title: title,
-          representedURL: representedURL,
-          hasEditableBuffer: hasEditableBuffer)
-      }
+      guard let window = view.window else { return }
+      let windowID = ObjectIdentifier(window)
+      let unchanged =
+        coordinator.lastWindowID == windowID
+        && coordinator.lastDocumentID == documentID
+        && coordinator.lastTitle == title
+        && coordinator.lastRepresentedURL == representedURL
+        && coordinator.lastHasEditableBuffer == hasEditableBuffer
+      if unchanged { return }
+      coordinator.lastWindowID = windowID
+      coordinator.lastDocumentID = documentID
+      coordinator.lastTitle = title
+      coordinator.lastRepresentedURL = representedURL
+      coordinator.lastHasEditableBuffer = hasEditableBuffer
+
+      onWindow?(window)
+      DocumentWindowRegistry.shared.attach(
+        window,
+        documentID: documentID,
+        title: title,
+        representedURL: representedURL,
+        hasEditableBuffer: hasEditableBuffer)
     }
   }
 }
