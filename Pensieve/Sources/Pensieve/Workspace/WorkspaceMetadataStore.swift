@@ -58,6 +58,10 @@ final class WorkspaceMetadataStore {
         )
         .appendingPathComponent("Pensieve", isDirectory: true)
     } catch {
+      NSLog(
+        "%@",
+        "WorkspaceMetadataStore: Application Support unavailable, "
+          + "falling back to temporary directory: \(error)")
       return FileManager.default.temporaryDirectory
         .appendingPathComponent("Pensieve", isDirectory: true)
     }
@@ -67,11 +71,11 @@ final class WorkspaceMetadataStore {
     do {
       try data.write(to: url, options: protectedWriteOptions)
     } catch {
-      do {
-        try data.write(to: url, options: fallbackWriteOptions)
-      } catch {
-        throw error
-      }
+      NSLog(
+        "%@",
+        "WorkspaceMetadataStore: protected write failed for \(url.lastPathComponent), "
+          + "falling back to unprotected atomic write: \(error)")
+      try data.write(to: url, options: fallbackWriteOptions)
     }
   }
 }

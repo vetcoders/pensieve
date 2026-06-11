@@ -15,8 +15,13 @@ struct PensieveApp: App {
   }
 
   var body: some Scene {
+    // The WindowGroup scene serves the launcher window and any state-restored
+    // legacy document scenes (`initialDocument`). Document opens do NOT go
+    // through `openWindow(value:)` anymore: DocumentWindowRegistry builds
+    // document windows directly in AppKit (DocumentWindowFactory) and attaches
+    // them as native tabs before first presentation.
     WindowGroup("Pensieve", for: DocumentRef.self) { document in
-      PensieveWindowRoot(
+      DocumentWindowRootView(
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
@@ -33,9 +38,8 @@ struct PensieveApp: App {
   }
 }
 
-private struct PensieveWindowRoot: View {
-  @Environment(\.openWindow) private var openWindow
-
+struct DocumentWindowRootView: View {
+  let workspaceStore: WorkspaceStore
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
@@ -43,6 +47,7 @@ private struct PensieveWindowRoot: View {
   @StateObject private var appState: AppState
   @StateObject private var controller: AppController
   @State private var loadedInitialDocumentID: DocumentRef.ID?
+  @State private var initialDocumentLoadResolved = false
   @State private var currentWindow: NSWindow?
   @State private var startupPresentationReady = false
 
@@ -52,6 +57,7 @@ private struct PensieveWindowRoot: View {
     themeManager: ThemeManager,
     initialDocument: DocumentRef?
   ) {
+    self.workspaceStore = workspaceStore
     self.launchIntentCoordinator = launchIntentCoordinator
     self.themeManager = themeManager
     self.initialDocument = initialDocument
@@ -80,13 +86,22 @@ private struct PensieveWindowRoot: View {
     .focusedSceneObject(controller)
     .background(
       DocumentWindowAccessor(
-        documentID: appState.selectedDocumentID,
+        // Fall back to the scene's initialDocument so the FIRST attach already
+        // carries the document identity: the registry can track the window as
+        // a document window before the (async) document load finishes,
+        // instead of briefly registering a document window as a launcher.
+        // The fallback ends once the load resolves — a FAILED load must stop
+        // advertising the document so the registry releases its mapping
+        // instead of pinning this empty window to the URL forever.
+        documentID: DocumentWindowRootView.accessorDocumentID(
+          selected: appState.selectedDocumentID,
+          initialDocument: initialDocument,
+          loadResolved: initialDocumentLoadResolved),
         title: appState.documentSession.displayTitle,
         representedURL: appState.documentSession.url,
         hasEditableBuffer: appState.documentSession.hasEditableBuffer
       ) { window in
         currentWindow = window
-        applyStartupPresentation(to: window)
       }
     )
     .frame(minWidth: 720, minHeight: 480)
@@ -104,7 +119,7 @@ private struct PensieveWindowRoot: View {
     .onChange(of: initialDocument?.id) { _ in
       if let initialDocument {
         startupPresentationReady = false
-        applyStartupPresentation(to: currentWindow)
+        initialDocumentLoadResolved = false
         openInitialDocument(initialDocument)
         revealStartupWindow()
       }
@@ -115,15 +130,35 @@ private struct PensieveWindowRoot: View {
   }
 
   private func configureDocumentRouting() {
+    let factory = DocumentWindowFactory(
+      workspaceStore: workspaceStore,
+      launchIntentCoordinator: launchIntentCoordinator,
+      themeManager: themeManager
+    )
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
+      factory.makeWindow(for: ref)
+    }
     controller.requestOpenDocumentWindow = { ref in
-      DocumentWindowRegistry.shared.open(ref) { ref in
-        openWindow(value: ref)
-      }
+      DocumentWindowRegistry.shared.open(ref)
     }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
     }
+  }
+
+  /// Document identity reported to the window registry. Before the initial
+  /// load resolves, the scene's `initialDocument` stands in for the not-yet
+  /// selected document so the first attaches already carry the identity.
+  /// After the load resolved, only the real session state counts: a failed
+  /// load (deleted/unreadable recent) leaves `selected` nil and the window
+  /// must register as a launcher, releasing the pre-open document mapping.
+  static func accessorDocumentID(
+    selected: URL?,
+    initialDocument: DocumentRef?,
+    loadResolved: Bool
+  ) -> URL? {
+    selected ?? (loadResolved ? nil : initialDocument?.id)
   }
 
   private func openInitialDocument(_ ref: DocumentRef) {
@@ -133,21 +168,20 @@ private struct PensieveWindowRoot: View {
     loadedInitialDocumentID = ref.id.standardizedFileURL
     controller.start(restoringWorkspace: false)
     controller.openFileInCurrentWindow(url: ref.url)
+    // openFileInCurrentWindow loads synchronously: on success
+    // selectedDocumentID is set, on failure it stays nil. Either way the
+    // pre-load fallback has done its job and must stop.
+    initialDocumentLoadResolved = true
   }
 
   private func revealStartupWindow() {
     DispatchQueue.main.async {
       startupPresentationReady = true
-      applyStartupPresentation(to: currentWindow)
     }
-  }
-
-  private func applyStartupPresentation(to window: NSWindow?) {
-    window?.alphaValue = 1
   }
 }
 
-private struct StartupPresentationView: View {
+struct StartupPresentationView: View {
   var body: some View {
     VStack(spacing: 10) {
       ProgressView()

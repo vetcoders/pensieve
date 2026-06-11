@@ -59,6 +59,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var preview: String
   @Published private(set) var rendered: String
   @Published private(set) var isRecording: Bool
+  @Published private(set) var isPreparingRecording: Bool = false
   @Published private(set) var isFormatting: Bool
   @Published private(set) var lastLanguage: String?
   @Published private(set) var lastStatus: VistaStatusSignal?
@@ -69,6 +70,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   private let cadenceCommitNanoseconds: UInt64
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
+  private var startRecordingTask: Task<Void, Never>?
   private var lastRawPreview: String = ""
   private var promotedPreviewPrefix: String?
 
@@ -89,32 +91,80 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   deinit {
     cadenceCommitTask?.cancel()
+    startRecordingTask?.cancel()
   }
 
-  func startRecording(language: String? = nil) throws {
+  func startRecording(language: String? = nil) {
+    guard !isRecording, !isPreparingRecording else { return }
     let engine = activeEngine()
     engine.setEventListener(listener: self)
-    if !engine.isModelLoaded() {
-      try engine.initModel()
-    }
-    try engine.startRecording(language: language)
-    isRecording = true
+    isPreparingRecording = true
     lastError = nil
-    startCadenceCommitLoop()
+    startRecordingTask = Task { [weak self] in
+      // Model init (whisper weights dequantization — seconds of CPU) and
+      // capture start run OFF the main actor; doing this inline froze the
+      // whole UI for the model load (1.77s+ hang reports from the field).
+      // Task.detached does NOT inherit cancellation from this task, so a
+      // teardown-time cancel (deinit) must be bridged explicitly — otherwise
+      // the detached work could still start the microphone after the owning
+      // service/window is gone, with no visible control left to stop it.
+      let prepareTask = Task.detached(priority: .userInitiated) {
+        if !engine.isModelLoaded() {
+          try engine.initModel()
+        }
+        // Owner torn down while the model was loading: never start capture.
+        try Task.checkCancellation()
+        try engine.startRecording(language: language)
+      }
+      do {
+        try await withTaskCancellationHandler {
+          try await prepareTask.value
+        } onCancel: {
+          prepareTask.cancel()
+        }
+        guard let self, !Task.isCancelled else {
+          // Capture already started but the owner went away mid-await: stop
+          // the engine so the microphone is not left running unowned.
+          Task.detached { _ = try? engine.stopRecording() }
+          return
+        }
+        self.isPreparingRecording = false
+        self.isRecording = true
+        self.startCadenceCommitLoop()
+      } catch {
+        guard let self, !(error is CancellationError) else { return }
+        self.isPreparingRecording = false
+        self.lastError = error.localizedDescription
+      }
+    }
+  }
+
+  /// Cancels an in-flight preparation (model load / capture start) so the
+  /// panel never strands the user in Preparing with no enabled control. The
+  /// bridged cancellation reaches the detached prepare task; if capture
+  /// already began, the prepare task's rollback stops the engine.
+  func cancelPreparation() {
+    guard isPreparingRecording else { return }
+    startRecordingTask?.cancel()
+    startRecordingTask = nil
+    isPreparingRecording = false
   }
 
   @discardableResult
   func stopRecording() throws -> String {
-    guard let engine else {
+    // Always clear recording state, even when engine.stopRecording() throws;
+    // otherwise the UI stays in "Recording" and the cadence loop never stops.
+    defer {
       isRecording = false
       stopCadenceCommitLoop()
+    }
+
+    guard let engine else {
       return rendered
     }
 
     let finalText = try engine.stopRecording()
     commitActivePreviewForCadence()
-    isRecording = false
-    stopCadenceCommitLoop()
     return finalText
   }
 

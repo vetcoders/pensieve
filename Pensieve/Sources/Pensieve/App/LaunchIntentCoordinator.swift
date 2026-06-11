@@ -100,8 +100,11 @@ final class LaunchIntentCoordinator: ObservableObject {
 }
 
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
+  private var traceObservers: [NSObjectProtocol] = []
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
+    traceObservers = DebugTrace.installWindowLifecycleObservers()
 
     // A bare `swift run` executable (no `.app` bundle, e.g. `make run`) launches as a
     // background process: no Dock icon, window stuck behind other apps, can't be brought

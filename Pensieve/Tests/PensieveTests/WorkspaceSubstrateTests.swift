@@ -679,7 +679,9 @@ final class WorkspaceSubstrateTests: XCTestCase {
     let identity = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark".utf8))
     let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
     _ = try store.ensureCacheRoot(for: identity)
-    try Data("{ not json".utf8).write(to: store.manifestURL(for: identity), options: [.atomic])
+    // Mirrors WorkspaceCacheStore.protectedWriteOptions used for production manifest writes.
+    try Data("{ not json".utf8).write(
+      to: store.manifestURL(for: identity), options: [.atomic, .completeFileProtection])
     let substrate = WorkspaceSubstrate(store: store)
 
     let verdict = try substrate.validate(

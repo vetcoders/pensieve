@@ -10,7 +10,7 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let agentPromptLauncher: AgentPromptLaunching
-  private let agentWorkspaceRoot: URL
+  private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   let transcriptionService: TranscriptionService
@@ -25,6 +25,7 @@ final class AppController: ObservableObject {
     return panel
   }()
   private var didStart = false
+  private var isAgentDispatchInFlight = false
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
@@ -47,8 +48,7 @@ final class AppController: ObservableObject {
     indexDatabase: IndexDatabase? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
-    agentWorkspaceRoot: URL = URL(
-      fileURLWithPath: "/Users/maciejgad/vc-workspace/vetcoders/pensieve"),
+    agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
   ) {
@@ -91,25 +91,41 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// External/explicit file opens (⌘O, Finder, recents): tab per document.
+  /// An empty window (no editable buffer) is reused in place; once this
+  /// window shows a document, further opens route through the window registry
+  /// and appear as native tabs. Falls back to in-window load when no routing
+  /// is wired (tests, headless).
   func openFile(url: URL) {
+    let standardizedURL = url.standardizedFileURL
+    if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
+      return
+    }
+
+    // The registry route below bypasses registerOpenFile (the destination
+    // window registers the file during its own load), so unsupported types
+    // must be rejected HERE — otherwise they would open an empty tab whose
+    // load is refused only afterwards.
+    guard WorkspaceScanner.isMarkdownFile(standardizedURL) else {
+      appState.lastError = WorkspaceScanner.unsupportedOpenMessage
+      return
+    }
+
+    // When the file routes to its own window/tab, do NOT register it into
+    // THIS window's working set first — the destination window registers it
+    // during its own load, and a premature registration leaves the
+    // originating sidebar permanently listing a file it never displays.
+    if appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow {
+      DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
+      requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
+      return
+    }
+
     guard let ref = folderManager.registerOpenFile(url: url, into: appState) else {
       return
     }
-
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
-      return
-    }
-
-    guard appState.documentSession.hasEditableBuffer else {
-      documentStore.load(ref: ref, into: appState)
-      return
-    }
-
-    if let requestOpenDocumentWindow {
-      requestOpenDocumentWindow(ref)
-    } else {
-      documentStore.load(ref: ref, into: appState)
-    }
+    DebugTrace.log("openFile -> load in current window: \(ref.id.lastPathComponent)")
+    documentStore.load(ref: ref, into: appState)
   }
 
   func openFileInCurrentWindow(url: URL) {
@@ -289,6 +305,12 @@ final class AppController: ObservableObject {
     _ = documentStore.select(ref: ref, into: appState)
   }
 
+  /// Tab per document: the default list/search click. An empty window (no
+  /// editable buffer) is reused in place; once this window shows a document,
+  /// further clicks route through the window registry and open native tabs
+  /// (or activate the window already showing the document). Clicking the
+  /// currently displayed document is a no-op. Falls back to in-window
+  /// selection when no routing is wired (tests, headless).
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
       return
@@ -298,16 +320,20 @@ final class AppController: ObservableObject {
       return
     }
 
-    guard appState.documentSession.hasEditableBuffer else {
+    guard appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow else {
+      DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
       selectDocument(id: ref.id)
       return
     }
 
-    if let requestOpenDocumentWindow {
-      requestOpenDocumentWindow(ref)
-    } else {
-      selectDocument(id: ref.id)
-    }
+    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
+    requestOpenDocumentWindow(ref)
+  }
+
+  /// Explicit "Open in New Window" context-menu gesture. With tab-per-document
+  /// routing this is the same path as the default click.
+  func openDocumentInNewWindow(id: DocumentRef.ID?) {
+    openDocumentWindow(id: id)
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {
@@ -423,15 +449,20 @@ final class AppController: ObservableObject {
 
   @discardableResult
   private func dispatchTranscriptionToAgent() -> Bool {
+    guard !isAgentDispatchInFlight else { return false }
     let prompt = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !prompt.isEmpty else { return false }
 
+    isAgentDispatchInFlight = true
     transcriptionService.updateDispatchStatus("Dispatching to agent...")
     let launcher = agentPromptLauncher
-    let workingDirectoryURL = agentWorkspaceRoot
+    let workingDirectoryURL =
+      agentWorkspaceRoot
+      ?? appState.folderURL
+      ?? FileManager.default.homeDirectoryForCurrentUser
     let transcriptionService = transcriptionService
 
-    Task.detached(priority: .utility) {
+    Task.detached(priority: .utility) { [weak self] in
       do {
         let metadata = try launcher.dispatch(
           prompt: prompt,
@@ -442,11 +473,13 @@ final class AppController: ObservableObject {
             transcriptionService.resetTranscript()
           }
           transcriptionService.updateDispatchStatus(metadata.statusLine)
+          self?.isAgentDispatchInFlight = false
         }
       } catch {
         await MainActor.run {
           transcriptionService.updateDispatchStatus(
             "Dispatch failed: \(error.localizedDescription)")
+          self?.isAgentDispatchInFlight = false
         }
       }
     }

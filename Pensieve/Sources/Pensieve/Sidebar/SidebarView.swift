@@ -578,6 +578,14 @@ struct SidebarView: View {
       controller.openDocumentWindow(id: doc.id)
     }
 
+    // One window per document by design: the gesture only makes sense for a
+    // document this window is not currently showing.
+    if appState.selectedDocumentID?.standardizedFileURL != doc.id.standardizedFileURL {
+      Button("Open in New Window") {
+        controller.openDocumentInNewWindow(id: doc.id)
+      }
+    }
+
     Button("Open in Default App") {
       openExternally(doc.url)
     }

@@ -147,8 +147,10 @@ private final class PDFExportJob: NSObject, WKNavigationDelegate {
     guard !didFinish else { return }
     didFinish = true
 
+    // Leave WKPDFConfiguration.rect nil so createPDF captures the full
+    // content bounds; assigning webView.bounds cropped long documents
+    // to the first viewport.
     let configuration = WKPDFConfiguration()
-    configuration.rect = webView.bounds
     webView.createPDF(configuration: configuration) { [weak self] result in
       guard let self else { return }
       switch result {

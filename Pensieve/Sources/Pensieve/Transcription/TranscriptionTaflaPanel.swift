@@ -48,6 +48,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    removeSendEventMonitor()
     onVisibilityChanged?()
   }
 
@@ -103,6 +104,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       guard event.keyCode == 36 else { return event }
       let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
       guard flags.contains(.shift) else { return event }
+      // Agent dispatch is click-only by design; the hotkey sends only to the editor.
+      guard self.routingState.sendTarget == .editor else { return event }
       return self.sendComposition(target: self.routingState.sendTarget) ? nil : event
     }
   }
@@ -183,19 +186,26 @@ private struct TranscriptionTaflaPanelView: View {
       Spacer()
 
       Button(action: start) {
-        Image(systemName: "mic.fill")
+        if service.isPreparingRecording {
+          ProgressView()
+            .controlSize(.small)
+        } else {
+          Image(systemName: "mic.fill")
+        }
       }
       .buttonStyle(.borderedProminent)
-      .disabled(service.isRecording)
-      .help("Start Recording")
+      .disabled(service.isRecording || service.isPreparingRecording)
+      .help(service.isPreparingRecording ? "Loading speech model…" : "Start Recording")
       .accessibilityIdentifier("pensieve.tafla.start")
 
       Button(action: stop) {
         Image(systemName: "stop.fill")
       }
       .buttonStyle(.bordered)
-      .disabled(!service.isRecording)
-      .help("Stop Recording")
+      // Enabled during Preparing too: a slow/hung model load must stay
+      // cancellable, otherwise the panel has no control to leave that state.
+      .disabled(!service.isRecording && !service.isPreparingRecording)
+      .help(service.isPreparingRecording ? "Cancel Preparation" : "Stop Recording")
       .accessibilityIdentifier("pensieve.tafla.stop")
 
       Button(action: reset) {
@@ -293,7 +303,8 @@ private struct TranscriptionTaflaPanelView: View {
     if let dispatchStatus = service.dispatchStatus {
       return dispatchStatus
     }
-    let recordingState = service.isRecording ? "Recording" : "Idle"
+    let recordingState =
+      service.isPreparingRecording ? "Preparing" : (service.isRecording ? "Recording" : "Idle")
     guard let lastStatus = service.lastStatus else { return recordingState }
     return "\(recordingState) - \(lastStatus.label)"
   }
@@ -307,15 +318,18 @@ private struct TranscriptionTaflaPanelView: View {
   }
 
   private func start() {
-    do {
-      try service.startRecording()
-      controlError = nil
-    } catch {
-      controlError = error.localizedDescription
-    }
+    // Model init + capture start run in the background; failures surface
+    // through service.lastError (already part of errorText).
+    service.startRecording()
+    controlError = nil
   }
 
   private func stop() {
+    if service.isPreparingRecording {
+      service.cancelPreparation()
+      controlError = nil
+      return
+    }
     do {
       _ = try service.stopRecording()
       controlError = nil

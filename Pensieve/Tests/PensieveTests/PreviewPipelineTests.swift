@@ -99,6 +99,60 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(withMath.html.contains("data-vc-tex=\"x+y\""))
   }
 
+  func testMakeDocumentIncludesKatexRuntimeOnlyWhenProvided() {
+    let mathBody =
+      "<p data-vc-block=\"0\">A <span class=\"vc-math vc-math-inline\" data-vc-math=\"inline\" data-vc-tex=\"x+y\">x+y</span></p>"
+
+    let withoutRuntime = PreviewDocument.make(
+      body: mathBody,
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertNil(withoutRuntime.katexJavaScript)
+    XCTAssertNil(withoutRuntime.katexCSS)
+    XCTAssertFalse(withoutRuntime.html.contains("vc-katex-style"))
+
+    let withRuntime = PreviewDocument.make(
+      body: mathBody,
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      katexJavaScript: "window.katex = { render() {} };",
+      katexCSS: ".katex { color: inherit; }"
+    )
+    XCTAssertEqual(withRuntime.katexJavaScript, "window.katex = { render() {} };")
+    XCTAssertEqual(withRuntime.katexCSS, ".katex { color: inherit; }")
+    XCTAssertTrue(withRuntime.html.contains("window.katex = { render() {} };"))
+    XCTAssertTrue(withRuntime.html.contains("<style id=\"vc-katex-style\">"))
+    XCTAssertTrue(withRuntime.html.contains(".katex { color: inherit; }"))
+
+    // Runtime must precede the bootstrap so `window.katex` exists when the
+    // bootstrap walks the math nodes.
+    let runtimeRange = withRuntime.html.range(of: "window.katex = { render() {} };")
+    let bootstrapRange = withRuntime.html.range(of: "KaTeX runtime unavailable")
+    XCTAssertNotNil(runtimeRange)
+    XCTAssertNotNil(bootstrapRange)
+    if let runtimeRange, let bootstrapRange {
+      XCTAssertTrue(runtimeRange.lowerBound < bootstrapRange.lowerBound)
+    }
+  }
+
+  func testMakeDocumentEscapesEmbeddedClosersInKatexAssets() {
+    let document = PreviewDocument.make(
+      body: "<p data-vc-math=\"inline\" data-vc-tex=\"x\">x</p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      katexJavaScript: "window.example = '</script>';",
+      katexCSS: ".katex::after { content: '</style>'; }"
+    )
+    XCTAssertFalse(document.html.contains("'</script>'"))
+    XCTAssertTrue(document.html.contains("'<\\/script>'"))
+    XCTAssertFalse(document.html.contains("'</style>'"))
+    XCTAssertTrue(document.html.contains("'<\\/style>'"))
+  }
+
   func testMakeDocumentEscapesEmbeddedStyleClose() {
     // A hostile theme CSS string trying to break out of the <style> block
     // must be neutralized.
@@ -235,6 +289,34 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("class=\"vc-math vc-math-inline\""), document.html)
     XCTAssertTrue(document.html.contains("data-vc-tex=\"a^2+b^2=c^2\""), document.html)
     XCTAssertTrue(document.html.contains("window.katex"))
+
+    // The bundled KaTeX runtime + stylesheet must ship with math documents so
+    // `window.katex.render` actually exists at bootstrap time.
+    XCTAssertNotNil(document.katexJavaScript, "bundled KaTeX runtime missing")
+    XCTAssertNotNil(document.katexCSS, "bundled KaTeX stylesheet missing")
+    XCTAssertTrue(document.html.contains("e.katex=t()"), "KaTeX runtime not embedded")
+    XCTAssertTrue(document.html.contains("font-family:KaTeX_AMS"), "KaTeX CSS not embedded")
+    XCTAssertFalse(document.html.contains("cdn.jsdelivr"))
+    XCTAssertFalse(document.html.contains("unpkg.com"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentOmitsKatexForPlainDocument() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let request = PreviewRenderRequest(
+      markdown: "# Heading\n\nNo math here.",
+      fontSize: 16,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    let document = pipeline.makeDocument(for: request)
+
+    XCTAssertNil(document.katexJavaScript, "plain document must not carry the ~270KB runtime")
+    XCTAssertNil(document.katexCSS, "plain document must not carry the ~370KB stylesheet")
+    XCTAssertFalse(document.html.contains("e.katex=t()"))
+    XCTAssertFalse(document.html.contains("font-family:KaTeX_AMS"))
+    XCTAssertFalse(document.html.contains("vc-katex-style"))
   }
 
   @MainActor

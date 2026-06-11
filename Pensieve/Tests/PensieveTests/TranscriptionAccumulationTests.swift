@@ -90,6 +90,108 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.rendered, "alpha\nbeta\ngamma")
   }
 
+  @MainActor
+  func testStartRecordingLoadsModelOffMainAndEntersRecordingState() async {
+    let engine = MockVistaAutocompleteEngine(modelLoaded: false, initModelHandler: {})
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+
+    XCTAssertTrue(service.isPreparingRecording, "model load happens in the background")
+    XCTAssertFalse(service.isRecording)
+
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertNil(service.lastError)
+  }
+
+  @MainActor
+  func testTeardownDuringPreparationNeverStartsRecording() async {
+    let modelLoadStarted = expectation(description: "model load entered")
+    let releaseModelLoad = DispatchSemaphore(value: 0)
+    let recordingStarted = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        modelLoadStarted.fulfill()
+        releaseModelLoad.wait()
+      },
+      startRecordingHandler: { _ in recordingStarted.set() }
+    )
+
+    var service: TranscriptionService? = TranscriptionService(
+      engine: engine, cadenceCommitNanoseconds: 0)
+    service?.startRecording()
+    await fulfillment(of: [modelLoadStarted], timeout: 2)
+
+    // Tear the owner down while the detached model load is still running;
+    // deinit cancels the preparation, which must reach the detached task.
+    service = nil
+    releaseModelLoad.signal()
+
+    // Give the detached task time to run past the cancellation check.
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      recordingStarted.isSet,
+      "teardown during preparation must never start the microphone")
+  }
+
+  @MainActor
+  func testCancelPreparationLeavesPreparingAndNeverStartsRecording() async {
+    let modelLoadStarted = expectation(description: "model load entered")
+    let releaseModelLoad = DispatchSemaphore(value: 0)
+    let recordingStarted = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        modelLoadStarted.fulfill()
+        releaseModelLoad.wait()
+      },
+      startRecordingHandler: { _ in recordingStarted.set() }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    await fulfillment(of: [modelLoadStarted], timeout: 2)
+
+    service.cancelPreparation()
+    XCTAssertFalse(
+      service.isPreparingRecording,
+      "cancel must leave the Preparing state immediately")
+    releaseModelLoad.signal()
+
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      recordingStarted.isSet,
+      "a cancelled preparation must never start the microphone")
+    XCTAssertFalse(service.isRecording)
+    XCTAssertNil(service.lastError, "user-initiated cancel is not an error")
+  }
+
+  @MainActor
+  func testStartRecordingSurfacesModelInitFailureWithoutEnteringRecording() async {
+    struct ModelInitBoom: Error, LocalizedError {
+      var errorDescription: String? { "model boom" }
+    }
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: { throw ModelInitBoom() })
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where service.lastError == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(service.lastError, "model boom")
+    XCTAssertFalse(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+  }
+
   func testFormatCompositionUsesVistaEngineFormatterWhenAvailable() async {
     let engine = MockVistaAutocompleteEngine(
       formattingAvailable: true,
@@ -345,6 +447,23 @@ final class TranscriptionAccumulationTests: XCTestCase {
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value = false
+
+  func set() {
+    lock.lock()
+    value = true
+    lock.unlock()
+  }
+
+  var isSet: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
   }
 }
 

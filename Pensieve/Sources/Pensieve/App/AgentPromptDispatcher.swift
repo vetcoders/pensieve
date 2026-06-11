@@ -36,7 +36,9 @@ struct AgentDispatchMetadata: Equatable, Sendable {
         patterns: [
           #"(?m)^\s*Report path:\s*(\S+)\s*$"#,
           #"(?m)^\s*report_path:\s*(\S+)\s*$"#,
-          #"(/Users/[^\s]+/reports/[^\s]+\.md)"#,
+          // Last-resort fallback: an absolute local path; the lookbehind keeps it from
+          // matching inside URLs ("https://host/reports/x.md") or protocol-relative refs.
+          #"(?<![/:])(/[^/\s][^\s]*/reports/[^\s]+\.md)"#,
         ]),
       exitCode: exitCode,
       output: output
@@ -62,13 +64,48 @@ protocol AgentPromptLaunching: Sendable {
   func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata
 }
 
+enum AgentPromptLauncherError: LocalizedError {
+  case executableNotFound(searchedPaths: [String])
+
+  var errorDescription: String? {
+    switch self {
+    case .executableNotFound(let searchedPaths):
+      let searched = searchedPaths.joined(separator: ", ")
+      return
+        "vibecrafted executable not found (searched: \(searched)). "
+        + "Set the PENSIEVE_VIBECRAFTED_PATH environment variable to the full path "
+        + "of the vibecrafted script, or install vibecrafted under "
+        + "~/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted."
+    }
+  }
+}
+
 final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
-  static let executablePath =
-    "/Users/maciejgad/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
+  static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
+  static let defaultExecutableRelativePath =
+    ".local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
+
+  static func resolveExecutablePath() throws -> String {
+    var candidates: [String] = []
+    if let override = ProcessInfo.processInfo.environment[executablePathEnvironmentKey],
+      !override.isEmpty
+    {
+      candidates.append(override)
+    }
+    candidates.append(
+      FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(defaultExecutableRelativePath).path)
+
+    for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+      return candidate
+    }
+    throw AgentPromptLauncherError.executableNotFound(searchedPaths: candidates)
+  }
 
   func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+    let executablePath = try Self.resolveExecutablePath()
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: Self.executablePath)
+    process.executableURL = URL(fileURLWithPath: executablePath)
     process.arguments = ["implement", "codex", "--prompt", prompt]
     process.currentDirectoryURL = workingDirectoryURL
 

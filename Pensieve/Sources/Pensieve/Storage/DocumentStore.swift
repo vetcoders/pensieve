@@ -83,8 +83,7 @@ final class FolderManager {
 
   func registerOpenFile(url: URL, into appState: AppState) -> DocumentRef? {
     guard WorkspaceScanner.isMarkdownFile(url) else {
-      appState.lastError =
-        "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
+      appState.lastError = WorkspaceScanner.unsupportedOpenMessage
       return nil
     }
 
@@ -661,6 +660,7 @@ final class FolderManager {
       appState.lastError = nil
       return true
     } catch {
+      NSLog("%@", "Cold-start valid-skip check failed, falling back to cold open: \(error)")
       return false
     }
   }
@@ -860,6 +860,7 @@ final class FolderManager {
         return false
       }
     } catch {
+      NSLog("%@", "Hot-reopen cache validation failed, falling back to cold open: \(error)")
       appState.workspaceActivity = .cacheMiss(label)
       return false
     }
@@ -1436,6 +1437,9 @@ enum WorkspaceScanner {
   static func build(rootURLs: [URL], exclusions: Set<String>) -> [WorkspaceScan] {
     rootURLs.map { scan(folder: $0, exclusions: exclusions) }
   }
+
+  static let unsupportedOpenMessage =
+    "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
 
   static func isMarkdownFile(_ url: URL) -> Bool {
     ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())

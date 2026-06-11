@@ -3596,7 +3596,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testOpenFileReusesEmptyLauncherWindowBeforeCreatingDocumentWindow() throws {
+  func testOpenFileReusesEmptyWindowBeforeRoutingToDocumentTab() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveOpenFileReuseTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3625,18 +3625,119 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.openFile(url: alphaURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty)
+    XCTAssertTrue(requestedRefs.isEmpty, "an empty window is reused in place")
     XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "alpha")
 
     controller.openFile(url: betaURL)
 
-    XCTAssertEqual(requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL])
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      "once the window shows a document, further opens become document tabs")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "the originating window keeps its document while the tab materializes")
   }
 
   @MainActor
-  func testOpenDocumentWindowReusesEmptyLauncherWindowBeforeCreatingTab() throws {
+  func testAccessorDocumentIDDropsInitialDocumentOnceLoadResolved() {
+    let initial = DocumentRef(id: URL(fileURLWithPath: "/tmp/initial.md"), isAdHoc: true)
+    let selected = URL(fileURLWithPath: "/tmp/selected.md")
+
+    XCTAssertEqual(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: nil, initialDocument: initial, loadResolved: false),
+      initial.id,
+      "before the load resolves the scene's initialDocument stands in")
+    XCTAssertEqual(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: selected, initialDocument: initial, loadResolved: true),
+      selected,
+      "a successful load reports the real selection")
+    XCTAssertNil(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: nil, initialDocument: initial, loadResolved: true),
+      "a failed load must stop advertising the document so the registry releases the mapping")
+  }
+
+  @MainActor
+  func testOpenFileRejectsUnsupportedTypeBeforeRoutingToRegistry() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileUnsupportedTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let imageURL = folder.appendingPathComponent("picture.png")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try Data().write(to: imageURL)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: alphaURL)
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+
+    controller.openFile(url: imageURL)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "an unsupported file must be rejected before it routes to a new window/tab")
+    XCTAssertEqual(appState.lastError, WorkspaceScanner.unsupportedOpenMessage)
+  }
+
+  @MainActor
+  func testOpenFileFallsBackToInWindowLoadWithoutRouting() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileFallbackTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    controller.openFile(url: alphaURL)
+    controller.openFile(url: betaURL)
+
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "headless/no-routing opens load into the current window")
+    XCTAssertEqual(appState.activeDocumentText, "beta")
+  }
+
+  @MainActor
+  func testOpenDocumentWindowReusesEmptyWindowBeforeCreatingTab() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
@@ -3665,47 +3766,114 @@ final class PensieveSmokeTests: XCTestCase {
     controller.openFolder(url: folder)
     controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty)
+    XCTAssertTrue(requestedRefs.isEmpty, "an empty window is reused in place")
     XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "alpha")
 
     controller.openDocumentWindow(id: betaURL.standardizedFileURL)
 
-    XCTAssertEqual(requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL])
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      "tab per document: a list click on another document routes to the registry")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "the originating window keeps its document while the tab materializes")
+
+    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      "clicking the currently displayed document is a no-op")
+
+    // The explicit context-menu gesture rides the same path.
+    controller.openDocumentInNewWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, betaURL.standardizedFileURL])
+  }
+
+  @MainActor
+  func testOpenDocumentWindowFallsBackToInWindowSelectWithoutRouting() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenFallbackTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+
+    controller.openFolder(url: folder)
+    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "headless/no-routing clicks select in the current window")
+    XCTAssertEqual(appState.activeDocumentText, "beta")
   }
 
   @MainActor
   func testDocumentWindowOpenDefersWindowCreationDuringModalRunLoop() throws {
     var canMutateWindowTabs = false
     var scheduledWork: [@MainActor () -> Void] = []
-    var openedRefs: [DocumentRef] = []
+    var factoryRefs: [DocumentRef?] = []
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
 
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { canMutateWindowTabs },
       scheduleDeferredMainWork: { scheduledWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
-      orderAndActivateWindow: { _ in }
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return documentWindow
+      }
     )
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-modal-open-safe.md").standardizedFileURL
     let ref = DocumentRef(id: documentID)
 
-    registry.open(ref) { openedRefs.append($0) }
+    registry.open(ref)
 
     XCTAssertEqual(scheduledWork.count, 1)
-    XCTAssertTrue(openedRefs.isEmpty)
+    XCTAssertTrue(factoryRefs.isEmpty)
 
-    registry.open(ref) { openedRefs.append($0) }
+    registry.open(ref)
 
     XCTAssertEqual(scheduledWork.count, 1, "modal-time open retries coalesce per document")
-    XCTAssertTrue(openedRefs.isEmpty)
+    XCTAssertTrue(factoryRefs.isEmpty)
 
     canMutateWindowTabs = true
     let deferredOpen = try XCTUnwrap(scheduledWork.popLast())
     deferredOpen()
 
     XCTAssertEqual(scheduledWork.count, 0)
-    XCTAssertEqual(openedRefs.map(\.id), [documentID])
+    XCTAssertEqual(factoryRefs.compactMap { $0?.id }, [documentID])
   }
 
   @MainActor
@@ -3786,8 +3954,289 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testDocumentWindowAttachAssignsTabbedIdentifierOnlyWhenMerging() throws {
-    var openedRefs: [DocumentRef] = []
+  func testClosedDocumentWindowIsUnregisteredAndReopensFresh() throws {
+    var createdWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        let window = DocumentWindow(
+          contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+          styleMask: [.titled, .closable],
+          backing: .buffered,
+          defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: .zero)
+        createdWindows.append(window)
+        return window
+      }
+    )
+    // Wire the close handler to THIS registry (production wires it to .shared).
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-close-reopen.md").standardizedFileURL
+
+    registry.open(DocumentRef(id: documentID))
+    XCTAssertEqual(createdWindows.count, 1)
+    let firstWindow = try XCTUnwrap(createdWindows.first as? DocumentWindow)
+    firstWindow.onClose = { registry.handleDocumentWindowClosed($0) }
+
+    firstWindow.close()
+    // The hosting-view teardown is deferred one runloop turn so AppKit can
+    // finish its tab-group reshuffle first.
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+
+    XCTAssertNil(
+      firstWindow.contentView,
+      "close() must dismantle the hosting view to break the SwiftUI retain cycle")
+
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(
+      createdWindows.count, 2,
+      "a closed document must re-open in a fresh window, never resurrect the closed one")
+  }
+
+  @MainActor
+  func testLateAccessorAttachOnClosedWindowIsRejected() throws {
+    var createdWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        let window = DocumentWindow(
+          contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+          styleMask: [.titled, .closable],
+          backing: .buffered,
+          defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: .zero)
+        createdWindows.append(window)
+        return window
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-late-attach.md").standardizedFileURL
+
+    registry.open(DocumentRef(id: documentID))
+    let window = try XCTUnwrap(createdWindows.first as? DocumentWindow)
+    window.onClose = { registry.handleDocumentWindowClosed($0) }
+    window.close()
+
+    // Simulates the closed window's SwiftUI accessor firing one last
+    // main-queue pass after the close.
+    registry.attach(window, documentID: documentID)
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(
+      createdWindows.count, 2,
+      "a late accessor pass must not re-register the closed window; the document re-opens fresh")
+  }
+
+  @MainActor
+  func testDeadMappingWithoutCloseHandlerStillReopensFresh() throws {
+    // Defense-in-depth: even if a mapping survives (close handler bypassed),
+    // a window whose content was torn down must not be activated.
+    var createdCount = 0
+    let zombie = DocumentWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    zombie.isReleasedWhenClosed = false
+    zombie.contentView = NSView(frame: .zero)
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { window in
+        XCTAssertFalse(window.contentView == nil, "a torn-down window must never be activated")
+      },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        createdCount += 1
+        let window = NSWindow(
+          contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+          styleMask: [.titled],
+          backing: .buffered,
+          defer: false)
+        window.isReleasedWhenClosed = false
+        return window
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-zombie-guard.md").standardizedFileURL
+
+    registry.attach(zombie, documentID: documentID)
+    zombie.close()  // no onClose handler wired -> mapping survives, content torn down
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(createdCount, 1, "the dead mapping must be dropped and a fresh window created")
+  }
+
+  @MainActor
+  func testOpenMergesFactoryWindowIntoTabsBeforeOrderingOnScreen() throws {
+    var events: [String] = []
+    var factoryRefs: [DocumentRef?] = []
+    let targetWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [targetWindow, documentWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      targetWindow.close()
+      documentWindow.close()
+    }
+
+    var mergeTarget: NSWindow? = targetWindow
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { target, window in
+        events.append("merge")
+        XCTAssertTrue(target === targetWindow)
+        XCTAssertTrue(window === documentWindow)
+      },
+      orderAndActivateWindow: { window in
+        events.append("activate")
+        XCTAssertTrue(window === documentWindow)
+      },
+      currentMergeTarget: { mergeTarget },
+      makeDocumentWindow: { ref in
+        events.append("create")
+        factoryRefs.append(ref)
+        return documentWindow
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-merge-before-show.md")
+      .standardizedFileURL
+
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(
+      events, ["create", "merge", "activate"],
+      "the window must join the tab group BEFORE it is ever ordered on screen")
+    XCTAssertEqual(factoryRefs.compactMap { $0?.id }, [documentID])
+
+    // The window registered synchronously: a second open for the same document
+    // activates it instead of creating another window. By then the document
+    // window is the key window itself.
+    events.removeAll()
+    mergeTarget = documentWindow
+    registry.open(DocumentRef(id: documentID))
+
+    XCTAssertEqual(
+      events, ["activate"],
+      "an already-open document activates its window, never re-creates it")
+    XCTAssertEqual(factoryRefs.count, 1)
+  }
+
+  @MainActor
+  func testOpenRegistersWindowSynchronouslySoDoubleClickCreatesOneWindow() throws {
+    var createCount = 0
+    var activations: [NSWindow] = []
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { activations.append($0) },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        createCount += 1
+        return documentWindow
+      }
+    )
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-doubleclick-open.md")
+      .standardizedFileURL
+    let ref = DocumentRef(id: documentID)
+
+    registry.open(ref)
+    registry.open(ref)
+
+    XCTAssertEqual(createCount, 1, "a double-click must hit the existing-window path")
+    XCTAssertEqual(activations.count, 2)
+    XCTAssertTrue(activations.allSatisfy { $0 === documentWindow })
+  }
+
+  @MainActor
+  func testWindowSwitchingDocumentsReleasesStaleDocumentMapping() throws {
+    var factoryRefs: [DocumentRef?] = []
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let spawnedWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for tracked in [window, spawnedWindow] {
+      tracked.isReleasedWhenClosed = false
+    }
+    defer {
+      window.close()
+      spawnedWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { window },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return spawnedWindow
+      }
+    )
+    let alphaID = URL(fileURLWithPath: "/tmp/pensieve-stale-alpha.md").standardizedFileURL
+    let betaID = URL(fileURLWithPath: "/tmp/pensieve-stale-beta.md").standardizedFileURL
+
+    // The window displays alpha, then switches to beta in place (the default
+    // in-window click routing does this constantly).
+    registry.attach(window, documentID: alphaID)
+    registry.attach(window, documentID: betaID)
+
+    registry.open(DocumentRef(id: alphaID))
+
+    XCTAssertEqual(
+      factoryRefs.compactMap { $0?.id }, [alphaID],
+      "alpha no longer lives in this window; opening it must spawn a window, not activate the stale mapping"
+    )
+  }
+
+  @MainActor
+  func testOpenAssignsTabbedIdentifierToBothMergeParticipants() throws {
     var mergeCount = 0
     let expectedIdentifier = "Pensieve.DocumentWindow"
     let targetWindow = NSWindow(
@@ -3810,7 +4259,8 @@ final class PensieveSmokeTests: XCTestCase {
 
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { target, window in
         mergeCount += 1
         XCTAssertEqual(target.tabbingIdentifier, expectedIdentifier)
@@ -3818,23 +4268,95 @@ final class PensieveSmokeTests: XCTestCase {
       },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { targetWindow },
-      applicationWindows: { [targetWindow, documentWindow] }
+      applicationWindows: { [targetWindow, documentWindow] },
+      makeDocumentWindow: { _ in documentWindow }
     )
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-merged-tab.md").standardizedFileURL
-    let ref = DocumentRef(id: documentID)
 
-    registry.open(ref) { openedRefs.append($0) }
+    registry.open(DocumentRef(id: documentID))
     registry.attach(documentWindow, documentID: documentID)
 
-    XCTAssertEqual(openedRefs.map(\.id), [documentID])
     XCTAssertEqual(mergeCount, 1)
     XCTAssertEqual(targetWindow.tabbingIdentifier, expectedIdentifier)
-    XCTAssertEqual(documentWindow.tabbingIdentifier, expectedIdentifier)
+    XCTAssertEqual(
+      documentWindow.tabbingIdentifier, expectedIdentifier,
+      "the scene's later attach must not strip the document tab grouping")
+  }
+
+  @MainActor
+  func testNewUntitledTabMergesIntoSourceWindowAndSurvivesLauncherSweeps() throws {
+    var events: [String] = []
+    var factoryRefs: [DocumentRef?] = []
+    var scheduledSweeps: [@MainActor () -> Void] = []
+    var closedWindows: [NSWindow] = []
+    let sourceWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [sourceWindow, untitledWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("plus-button tab should not defer") },
+      scheduleLauncherWindowSweep: { scheduledSweeps.append($0) },
+      mergeWindowIntoTabs: { target, window in
+        events.append("merge")
+        XCTAssertTrue(target === sourceWindow)
+        XCTAssertTrue(window === untitledWindow)
+      },
+      orderAndActivateWindow: { window in
+        events.append(window === untitledWindow ? "activate" : "activate-other")
+      },
+      currentMergeTarget: { sourceWindow },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      closeWindow: { closedWindows.append($0) },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return untitledWindow
+      }
+    )
+
+    // The source window is a real document window.
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-plus-source.md").standardizedFileURL
+    registry.attach(sourceWindow, documentID: documentID)
+    scheduledSweeps.removeAll()
+    events.removeAll()
+
+    registry.newUntitledTab(from: sourceWindow)
+
+    XCTAssertEqual(
+      events, ["merge", "activate"], "the untitled tab joins the group before showing")
+    XCTAssertEqual(factoryRefs.count, 1)
+    XCTAssertNil(factoryRefs[0], "the plus button asks the factory for an untitled window")
+
+    // The new tab's scene attaches in launcher mode (no document, no editable
+    // buffer yet) — that must NOT classify it as an empty launcher to reap.
+    untitledWindow.title = "Pensieve"
+    registry.attach(untitledWindow, documentID: nil, hasEditableBuffer: false)
+
+    while let sweep = scheduledSweeps.popLast() {
+      sweep()
+    }
+    XCTAssertTrue(
+      closedWindows.isEmpty,
+      "a plus-button tab in its launcher-mode state must survive launcher sweeps")
   }
 
   @MainActor
   func testDocumentWindowOpenMergesExistingDocumentWindowIntoCurrentTabs() throws {
-    var openedRefs: [DocumentRef] = []
+    var factoryCallCount = 0
     var mergeCount = 0
     var orderedWindows: [NSWindow] = []
     var scheduledSweeps: [@MainActor () -> Void] = []
@@ -3873,13 +4395,19 @@ final class PensieveSmokeTests: XCTestCase {
       orderAndActivateWindow: { orderedWindows.append($0) },
       currentMergeTarget: { launcherWindow },
       applicationWindows: { [launcherWindow, documentWindow] },
-      closeWindow: { closedWindows.append($0) }
+      closeWindow: { closedWindows.append($0) },
+      makeDocumentWindow: { _ in
+        factoryCallCount += 1
+        return nil
+      }
     )
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-existing-document.md").standardizedFileURL
     let ref = DocumentRef(id: documentID)
 
     registry.attach(launcherWindow, documentID: nil)
-    scheduledSweeps.removeAll()
+    // Run (not just drop) collected sweeps: execution releases the coalescing
+    // latch so the next interaction can schedule a fresh sweep.
+    while let sweep = scheduledSweeps.popLast() { sweep() }
 
     registry.attach(
       documentWindow,
@@ -3887,12 +4415,12 @@ final class PensieveSmokeTests: XCTestCase {
       title: "existing",
       representedURL: documentID,
       hasEditableBuffer: true)
-    scheduledSweeps.removeAll()
+    while let sweep = scheduledSweeps.popLast() { sweep() }
     closedWindows.removeAll()
 
-    registry.open(ref) { openedRefs.append($0) }
+    registry.open(ref)
 
-    XCTAssertTrue(openedRefs.isEmpty)
+    XCTAssertEqual(factoryCallCount, 0, "an already-open document never re-creates a window")
     XCTAssertEqual(mergeCount, 1)
     XCTAssertEqual(orderedWindows.last, documentWindow)
     XCTAssertEqual(scheduledSweeps.count, 1)
@@ -4057,7 +4585,9 @@ final class PensieveSmokeTests: XCTestCase {
     registry.attach(documentWindow, documentID: documentID)
 
     XCTAssertEqual(untitledWindow.title, "Draft note")
-    XCTAssertEqual(scheduledSweeps.count, 3)
+    // Sweeps coalesce: the attach churn shares ONE pending close-sweep; the
+    // second entry is the launcher-registration reconcile pass.
+    XCTAssertEqual(scheduledSweeps.count, 2)
     while let sweep = scheduledSweeps.popLast() {
       sweep()
     }
