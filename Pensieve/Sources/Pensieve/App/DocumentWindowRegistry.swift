@@ -466,14 +466,40 @@ struct DocumentWindowAccessor: NSViewRepresentable {
     Coordinator()
   }
 
+  /// Plain `NSView` plus a one-runloop-turn dispatch is a timing heuristic:
+  /// if the window arrives later than that single turn (and no further
+  /// SwiftUI update fires), the attach never happens. `viewDidMoveToWindow()`
+  /// is AppKit's guaranteed signal that the window slot changed, so use it as
+  /// an additional attach trigger.
+  final class WindowObservingView: NSView {
+    var onWindowChanged: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      onWindowChanged?()
+    }
+  }
+
   func makeNSView(context: Context) -> NSView {
-    let view = NSView(frame: .zero)
-    attachIfNeeded(from: view, coordinator: context.coordinator)
+    let view = WindowObservingView(frame: .zero)
+    configure(view, coordinator: context.coordinator)
     return view
   }
 
   func updateNSView(_ nsView: NSView, context: Context) {
-    attachIfNeeded(from: nsView, coordinator: context.coordinator)
+    guard let view = nsView as? WindowObservingView else { return }
+    configure(view, coordinator: context.coordinator)
+  }
+
+  private func configure(_ view: WindowObservingView, coordinator: Coordinator) {
+    // Reinstalled on every pass so the callback captures the latest property
+    // values of this representable (it is a value type; stale copies would
+    // attach outdated titles/documents).
+    view.onWindowChanged = { [weak view] in
+      guard let view else { return }
+      attachIfNeeded(from: view, coordinator: coordinator)
+    }
+    attachIfNeeded(from: view, coordinator: coordinator)
   }
 
   private func attachIfNeeded(from view: NSView, coordinator: Coordinator) {
