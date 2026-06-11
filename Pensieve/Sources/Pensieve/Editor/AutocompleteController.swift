@@ -24,13 +24,15 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
   // initModel is expensive; the latch is engine-global state, deliberately NOT
-  // request-scoped: once init fails we stop retrying on every keystroke, and a
-  // single-flight guard keeps overlapping debounced requests from stacking
-  // concurrent blocking initModel calls on the cooperative pool. cancel()
-  // clears the latch so the user has a deliberate retry path.
+  // request-scoped: once init fails we stop retrying on every keystroke.
+  // cancel() clears the latch so the user has a deliberate retry path.
   private var modelInitFailed = false
   private var modelInitErrorMessage: String?
-  private var modelInitInFlight = false
+  // Single-flight init as a SHARED task: overlapping debounced requests all
+  // await the same init instead of bailing, so the newest request gets its
+  // completion the moment the model is ready rather than silently dying and
+  // waiting for another keystroke.
+  private var modelInitTask: Task<Void, Error>?
 
   init(
     engine: VistaEngineProtocol? = nil,
@@ -76,29 +78,21 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
         try Task.checkCancellation()
         if !engine.isModelLoaded() {
-          guard let self, await self.beginModelInit(currentRequestID: currentRequestID) else {
-            // Another request is already loading the model (or init already
-            // failed); this request bails and a later keystroke picks up.
+          guard let self,
+            let initTask = await self.sharedModelInitTask(
+              engine: engine, currentRequestID: currentRequestID)
+          else {
+            // Init already failed (latch engaged); sharedModelInitTask
+            // surfaced the latched error if this request is still current.
             return
           }
-          do {
-            try engine.initModel()
-            await MainActor.run { self.modelInitInFlight = false }
-          } catch {
-            await MainActor.run {
-              // The latch is engine-global: record the failure even when this
-              // request was superseded, otherwise continuous typing would keep
-              // re-running the expensive init. Only the UI fields stay gated
-              // on the request still being current.
-              self.modelInitInFlight = false
-              self.modelInitFailed = true
-              self.modelInitErrorMessage = error.localizedDescription
-              guard self.requestID == currentRequestID else { return }
-              self.suggestion = nil
-              self.lastError = error.localizedDescription
-            }
-            return
-          }
+          // Awaiting the shared init keeps THIS request alive through the
+          // model load: a request that arrives while another one is already
+          // initializing must not bail, or the current prefix would never
+          // get a suggestion until the next keystroke. An init failure
+          // rethrows here and lands in the catch below (UI gated on the
+          // request still being current).
+          try await initTask.value
         }
         try Task.checkCancellation()
         let completion = try await engine.complete(prefix: prefix, maxTokens: maxTokens)
@@ -133,20 +127,44 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     modelInitErrorMessage = nil
   }
 
-  /// Claims the single-flight init slot on the main actor. Returns false when
-  /// init is already running or has already failed (latch engaged meanwhile).
+  /// Claims or joins the single-flight model init on the main actor. Returns
+  /// nil when init has already failed (latch engaged) and surfaces the latched
+  /// error if the request is still current. The latch is engine-global,
+  /// deliberately NOT request-scoped: the init task arms it even when every
+  /// awaiting request was superseded, otherwise continuous typing would keep
+  /// re-running the expensive init.
   @MainActor
-  private func beginModelInit(currentRequestID: UInt64) -> Bool {
+  private func sharedModelInitTask(
+    engine: VistaEngineProtocol, currentRequestID: UInt64
+  ) -> Task<Void, Error>? {
     if modelInitFailed {
       if requestID == currentRequestID {
         suggestion = nil
         lastError = modelInitErrorMessage
       }
-      return false
+      return nil
     }
-    guard !modelInitInFlight else { return false }
-    modelInitInFlight = true
-    return true
+    if let modelInitTask {
+      return modelInitTask
+    }
+    let task = Task.detached(priority: .userInitiated) { [weak self] in
+      do {
+        try engine.initModel()
+        await MainActor.run { [weak self] in
+          self?.modelInitTask = nil
+        }
+      } catch {
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.modelInitTask = nil
+          self.modelInitFailed = true
+          self.modelInitErrorMessage = error.localizedDescription
+        }
+        throw error
+      }
+    }
+    modelInitTask = task
+    return task
   }
 
   private func activeEngine() -> VistaEngineProtocol? {

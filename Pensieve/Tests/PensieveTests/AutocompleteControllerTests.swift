@@ -134,6 +134,42 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(controller.lastError, AutocompleteController.engineUnavailableMessage)
   }
 
+  func testRequestArrivingDuringModelInitCompletesAfterInit() async {
+    let attempts = AttemptCounter()
+    let initEntered = expectation(description: "model init entered")
+    let releaseInit = DispatchSemaphore(value: 0)
+    let engine = MockVistaAutocompleteEngine(
+      completionHandler: { prefix, _ in
+        XCTAssertEqual(prefix, "hello a", "only the newest request may complete")
+        return " suggestion"
+      },
+      modelLoaded: false,
+      initModelHandler: {
+        attempts.increment()
+        initEntered.fulfill()
+        releaseInit.wait()
+      })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await fulfillment(of: [initEntered], timeout: 2)
+
+    // A newer keystroke lands while the first request is still loading the
+    // model; it must join the shared init instead of bailing.
+    controller.textDidChange(prefix: "hello a")
+    try? await Task.sleep(nanoseconds: 40_000_000)
+    releaseInit.signal()
+
+    for _ in 0..<200 where controller.suggestion == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertEqual(
+      controller.suggestion, " suggestion",
+      "the request that arrived during init must complete once init lands")
+    XCTAssertNil(controller.lastError)
+    XCTAssertEqual(attempts.value, 1, "init stays single-flight")
+  }
+
   func testInitModelFailureLatchesAcrossKeystrokes() async {
     let attempts = AttemptCounter()
     let engine = MockVistaAutocompleteEngine(
