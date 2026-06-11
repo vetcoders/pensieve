@@ -14,6 +14,7 @@
 #   ./scripts/build-release.sh            # full pipeline
 #   ./scripts/build-release.sh --no-notarize   # local-only signed build
 #   ./scripts/build-release.sh --clean    # nuke dist/ first
+#   ./scripts/build-release.sh --dmg-only # only (re)build DMG from existing stapled .app
 
 set -euo pipefail
 
@@ -45,10 +46,12 @@ SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
 # ─── Args ─────────────────────────────────────────────────────────────────
 DO_NOTARIZE=1
 DO_CLEAN=0
+DMG_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --no-notarize) DO_NOTARIZE=0 ;;
         --clean)       DO_CLEAN=1 ;;
+        --dmg-only)    DMG_ONLY=1 ;;
         -h|--help)
             head -32 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
@@ -110,6 +113,20 @@ COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
+
+if (( DMG_ONLY )); then
+    # Reuse an already-built, signed, notarized + stapled .app and only
+    # (re)build/sign/notarize/staple the DMG around it. Lets a disk-full or
+    # transient DMG failure be retried without re-running swift build and a
+    # second Apple notarization of the .app.
+    [[ -d "$APP_BUNDLE" ]] || die "--dmg-only: $APP_BUNDLE not found — run a full build first."
+    if ! codesign --verify --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+        die "--dmg-only: $APP_BUNDLE signature is invalid — rebuild it before packaging a DMG."
+    fi
+    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (skipping build/sign/notarize-app)"
+fi
+
+if (( ! DMG_ONLY )); then
 
 # ─── Clean ────────────────────────────────────────────────────────────────
 if (( DO_CLEAN )); then
@@ -246,6 +263,8 @@ if (( DO_NOTARIZE )); then
 else
     warn "Skipping notarization (--no-notarize); .app signed but not notarized"
 fi
+
+fi  # end: skip build/sign/notarize-app in --dmg-only mode
 
 # ─── DMG ──────────────────────────────────────────────────────────────────
 log "Building DMG"
