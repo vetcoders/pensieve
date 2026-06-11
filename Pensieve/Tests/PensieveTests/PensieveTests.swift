@@ -3640,6 +3640,27 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testAccessorDocumentIDDropsInitialDocumentOnceLoadResolved() {
+    let initial = DocumentRef(id: URL(fileURLWithPath: "/tmp/initial.md"), isAdHoc: true)
+    let selected = URL(fileURLWithPath: "/tmp/selected.md")
+
+    XCTAssertEqual(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: nil, initialDocument: initial, loadResolved: false),
+      initial.id,
+      "before the load resolves the scene's initialDocument stands in")
+    XCTAssertEqual(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: selected, initialDocument: initial, loadResolved: true),
+      selected,
+      "a successful load reports the real selection")
+    XCTAssertNil(
+      DocumentWindowRootView.accessorDocumentID(
+        selected: nil, initialDocument: initial, loadResolved: true),
+      "a failed load must stop advertising the document so the registry releases the mapping")
+  }
+
+  @MainActor
   func testOpenFileRejectsUnsupportedTypeBeforeRoutingToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(

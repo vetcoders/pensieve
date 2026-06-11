@@ -47,6 +47,7 @@ struct DocumentWindowRootView: View {
   @StateObject private var appState: AppState
   @StateObject private var controller: AppController
   @State private var loadedInitialDocumentID: DocumentRef.ID?
+  @State private var initialDocumentLoadResolved = false
   @State private var currentWindow: NSWindow?
   @State private var startupPresentationReady = false
 
@@ -89,7 +90,13 @@ struct DocumentWindowRootView: View {
         // carries the document identity: the registry can track the window as
         // a document window before the (async) document load finishes,
         // instead of briefly registering a document window as a launcher.
-        documentID: appState.selectedDocumentID ?? initialDocument?.id,
+        // The fallback ends once the load resolves — a FAILED load must stop
+        // advertising the document so the registry releases its mapping
+        // instead of pinning this empty window to the URL forever.
+        documentID: DocumentWindowRootView.accessorDocumentID(
+          selected: appState.selectedDocumentID,
+          initialDocument: initialDocument,
+          loadResolved: initialDocumentLoadResolved),
         title: appState.documentSession.displayTitle,
         representedURL: appState.documentSession.url,
         hasEditableBuffer: appState.documentSession.hasEditableBuffer
@@ -112,6 +119,7 @@ struct DocumentWindowRootView: View {
     .onChange(of: initialDocument?.id) { _ in
       if let initialDocument {
         startupPresentationReady = false
+        initialDocumentLoadResolved = false
         openInitialDocument(initialDocument)
         revealStartupWindow()
       }
@@ -139,6 +147,20 @@ struct DocumentWindowRootView: View {
     }
   }
 
+  /// Document identity reported to the window registry. Before the initial
+  /// load resolves, the scene's `initialDocument` stands in for the not-yet
+  /// selected document so the first attaches already carry the identity.
+  /// After the load resolved, only the real session state counts: a failed
+  /// load (deleted/unreadable recent) leaves `selected` nil and the window
+  /// must register as a launcher, releasing the pre-open document mapping.
+  static func accessorDocumentID(
+    selected: URL?,
+    initialDocument: DocumentRef?,
+    loadResolved: Bool
+  ) -> URL? {
+    selected ?? (loadResolved ? nil : initialDocument?.id)
+  }
+
   private func openInitialDocument(_ ref: DocumentRef) {
     guard loadedInitialDocumentID?.standardizedFileURL != ref.id.standardizedFileURL else {
       return
@@ -146,6 +168,10 @@ struct DocumentWindowRootView: View {
     loadedInitialDocumentID = ref.id.standardizedFileURL
     controller.start(restoringWorkspace: false)
     controller.openFileInCurrentWindow(url: ref.url)
+    // openFileInCurrentWindow loads synchronously: on success
+    // selectedDocumentID is set, on failure it stays nil. Either way the
+    // pre-load fallback has done its job and must stop.
+    initialDocumentLoadResolved = true
   }
 
   private func revealStartupWindow() {
