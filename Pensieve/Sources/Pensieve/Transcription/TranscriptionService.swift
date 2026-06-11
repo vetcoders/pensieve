@@ -101,22 +101,38 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     isPreparingRecording = true
     lastError = nil
     startRecordingTask = Task { [weak self] in
+      // Model init (whisper weights dequantization — seconds of CPU) and
+      // capture start run OFF the main actor; doing this inline froze the
+      // whole UI for the model load (1.77s+ hang reports from the field).
+      // Task.detached does NOT inherit cancellation from this task, so a
+      // teardown-time cancel (deinit) must be bridged explicitly — otherwise
+      // the detached work could still start the microphone after the owning
+      // service/window is gone, with no visible control left to stop it.
+      let prepareTask = Task.detached(priority: .userInitiated) {
+        if !engine.isModelLoaded() {
+          try engine.initModel()
+        }
+        // Owner torn down while the model was loading: never start capture.
+        try Task.checkCancellation()
+        try engine.startRecording(language: language)
+      }
       do {
-        // Model init (whisper weights dequantization — seconds of CPU) and
-        // capture start run OFF the main actor; doing this inline froze the
-        // whole UI for the model load (1.77s+ hang reports from the field).
-        try await Task.detached(priority: .userInitiated) {
-          if !engine.isModelLoaded() {
-            try engine.initModel()
-          }
-          try engine.startRecording(language: language)
-        }.value
-        guard let self else { return }
+        try await withTaskCancellationHandler {
+          try await prepareTask.value
+        } onCancel: {
+          prepareTask.cancel()
+        }
+        guard let self, !Task.isCancelled else {
+          // Capture already started but the owner went away mid-await: stop
+          // the engine so the microphone is not left running unowned.
+          Task.detached { _ = try? engine.stopRecording() }
+          return
+        }
         self.isPreparingRecording = false
         self.isRecording = true
         self.startCadenceCommitLoop()
       } catch {
-        guard let self else { return }
+        guard let self, !(error is CancellationError) else { return }
         self.isPreparingRecording = false
         self.lastError = error.localizedDescription
       }

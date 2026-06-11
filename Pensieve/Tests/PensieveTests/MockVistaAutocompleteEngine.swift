@@ -16,12 +16,14 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
   typealias CompletionHandler = @Sendable (String, UInt32) async throws -> String
   typealias FormattingHandler = @Sendable (String, Bool) async throws -> String
   typealias InitModelHandler = @Sendable () throws -> Void
+  typealias StartRecordingHandler = @Sendable (String?) throws -> Void
 
   private let completionHandler: CompletionHandler
   private let formattingAvailable: Bool
   private let formattingHandler: FormattingHandler
   private let initModelHandler: InitModelHandler
   private let modelLoaded: Bool
+  private let startRecordingHandler: StartRecordingHandler
 
   init(
     completionHandler: @escaping CompletionHandler =
@@ -29,13 +31,15 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
     formattingAvailable: Bool = false,
     formattingHandler: @escaping FormattingHandler = { text, _ in text },
     modelLoaded: Bool = true,
-    initModelHandler: @escaping InitModelHandler = {}
+    initModelHandler: @escaping InitModelHandler = {},
+    startRecordingHandler: @escaping StartRecordingHandler = { _ in }
   ) {
     self.completionHandler = completionHandler
     self.formattingAvailable = formattingAvailable
     self.formattingHandler = formattingHandler
     self.modelLoaded = modelLoaded
     self.initModelHandler = initModelHandler
+    self.startRecordingHandler = startRecordingHandler
   }
 
   func complete(prefix: String, maxTokens: UInt32) async throws -> String {
@@ -97,7 +101,7 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
 
   func startPipeline(language: String?) throws {}
 
-  func startRecording(language: String?) throws {}
+  func startRecording(language: String?) throws { try startRecordingHandler(language) }
 
   func stopPipeline() throws -> String { "" }
 

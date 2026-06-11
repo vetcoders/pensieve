@@ -110,6 +110,37 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testTeardownDuringPreparationNeverStartsRecording() async {
+    let modelLoadStarted = expectation(description: "model load entered")
+    let releaseModelLoad = DispatchSemaphore(value: 0)
+    let recordingStarted = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      modelLoaded: false,
+      initModelHandler: {
+        modelLoadStarted.fulfill()
+        releaseModelLoad.wait()
+      },
+      startRecordingHandler: { _ in recordingStarted.set() }
+    )
+
+    var service: TranscriptionService? = TranscriptionService(
+      engine: engine, cadenceCommitNanoseconds: 0)
+    service?.startRecording()
+    await fulfillment(of: [modelLoadStarted], timeout: 2)
+
+    // Tear the owner down while the detached model load is still running;
+    // deinit cancels the preparation, which must reach the detached task.
+    service = nil
+    releaseModelLoad.signal()
+
+    // Give the detached task time to run past the cancellation check.
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      recordingStarted.isSet,
+      "teardown during preparation must never start the microphone")
+  }
+
+  @MainActor
   func testStartRecordingSurfacesModelInitFailureWithoutEnteringRecording() async {
     struct ModelInitBoom: Error, LocalizedError {
       var errorDescription: String? { "model boom" }
@@ -384,6 +415,23 @@ final class TranscriptionAccumulationTests: XCTestCase {
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value = false
+
+  func set() {
+    lock.lock()
+    value = true
+    lock.unlock()
+  }
+
+  var isSet: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
   }
 }
 
