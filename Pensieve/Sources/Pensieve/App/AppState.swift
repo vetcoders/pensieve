@@ -211,6 +211,16 @@ final class AppState: ObservableObject {
     set { windowModel.pendingFindCommand = newValue }
   }
 
+  var findMatchCount: Int {
+    get { windowModel.findMatchCount }
+    set { windowModel.findMatchCount = newValue }
+  }
+
+  var findActiveMatchIndex: Int? {
+    get { windowModel.findActiveMatchIndex }
+    set { windowModel.findActiveMatchIndex = newValue }
+  }
+
   var tableTidyOnPaste: Bool {
     get { windowModel.tableTidyOnPaste }
     set { windowModel.tableTidyOnPaste = newValue }
