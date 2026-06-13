@@ -61,7 +61,24 @@ struct AgentDispatchMetadata: Equatable, Sendable {
 }
 
 protocol AgentPromptLaunching: Sendable {
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata
+}
+
+enum AgentDispatchPayload: Equatable, Sendable {
+  case prompt(String)
+  case file(String)
+
+  var isEmpty: Bool {
+    switch self {
+    case .prompt(let value), .file(let value):
+      return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+  }
 }
 
 enum AgentPromptLauncherError: LocalizedError {
@@ -102,11 +119,29 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     throw AgentPromptLauncherError.executableNotFound(searchedPaths: candidates)
   }
 
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+  static func arguments(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload
+  ) -> [String] {
+    switch payload {
+    case .prompt(let prompt):
+      return [workflow, agent, "--prompt", prompt]
+    case .file(let path):
+      return [workflow, agent, "--file", path]
+    }
+  }
+
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata {
     let executablePath = try Self.resolveExecutablePath()
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = ["implement", "codex", "--prompt", prompt]
+    process.arguments = Self.arguments(workflow: workflow, agent: agent, payload: payload)
     process.currentDirectoryURL = workingDirectoryURL
 
     let stdout = Pipe()

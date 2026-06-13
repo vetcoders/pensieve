@@ -20,6 +20,20 @@ struct ContentView: View {
     .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
     .toolbar {
       EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
+      ToolbarItem {
+        Menu {
+          ForEach(controller.agentWorkflows, id: \.self) { workflow in
+            Button(workflow) {
+              controller.dispatchCurrentDocumentToAgent(workflow: workflow)
+            }
+          }
+        } label: {
+          Label("Dispatch to Agent", systemImage: "paperplane")
+        }
+        .disabled(!appState.documentSession.hasEditableBuffer)
+        .help("Dispatch to Agent")
+        .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
+      }
     }
   }
 }

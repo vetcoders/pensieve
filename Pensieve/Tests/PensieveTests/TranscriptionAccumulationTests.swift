@@ -484,9 +484,16 @@ private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Se
     self.result = result
   }
 
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata {
     lock.lock()
-    prompts.append(prompt)
+    if case .prompt(let prompt) = payload {
+      prompts.append(prompt)
+    }
     directories.append(workingDirectoryURL)
     lock.unlock()
     return result
