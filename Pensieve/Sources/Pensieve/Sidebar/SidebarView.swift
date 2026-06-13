@@ -590,6 +590,8 @@ struct SidebarView: View {
       openExternally(doc.url)
     }
 
+    dispatchMenu(for: doc.url)
+
     if doc.isAdHoc {
       Button("Close from Open Files") {
         controller.closeOpenFile(id: doc.id)
@@ -656,6 +658,8 @@ struct SidebarView: View {
         Button("Open in Default App") {
           openExternally(url)
         }
+
+        dispatchMenu(for: url)
 
         Button("Reveal in Finder") {
           revealInFinder(url)
@@ -728,6 +732,16 @@ struct SidebarView: View {
 
       Button("Copy Path") {
         copyPath(url.path)
+      }
+    }
+  }
+
+  private func dispatchMenu(for url: URL) -> some View {
+    Menu("Dispatch to Agent") {
+      ForEach(controller.agentWorkflows, id: \.self) { workflow in
+        Button(workflow) {
+          controller.dispatchFileToAgent(workflow: workflow, url: url)
+        }
       }
     }
   }

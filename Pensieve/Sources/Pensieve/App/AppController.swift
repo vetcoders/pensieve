@@ -13,6 +13,12 @@ final class AppController: ObservableObject {
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
+  let agentWorkflows: [String] = [
+    "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
+    "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
+    "review", "scaffold", "workflow",
+  ]
+  let defaultAgent = "codex"
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
@@ -449,42 +455,120 @@ final class AppController: ObservableObject {
 
   @discardableResult
   private func dispatchTranscriptionToAgent() -> Bool {
-    guard !isAgentDispatchInFlight else { return false }
     let prompt = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !prompt.isEmpty else { return false }
 
+    return dispatchToAgent(
+      workflow: "implement",
+      payload: .prompt(prompt),
+      label: "transcription",
+      startStatus: "Dispatching to agent...",
+      onSuccess: { [transcriptionService] in
+        transcriptionService.resetTranscript()
+      }
+    )
+  }
+
+  @discardableResult
+  func dispatchCurrentDocumentToAgent(workflow: String) -> Bool {
+    guard appState.documentSession.hasEditableBuffer else {
+      appState.lastError = "Open an editable document before dispatching to an agent."
+      return false
+    }
+
+    if let url = appState.documentSession.url {
+      return dispatchFileToAgent(workflow: workflow, url: url)
+    }
+
+    return dispatchToAgent(
+      workflow: workflow,
+      payload: .prompt(appState.activeDocumentText),
+      label: appState.documentSession.displayTitle
+    )
+  }
+
+  @discardableResult
+  func dispatchFileToAgent(workflow: String, url: URL) -> Bool {
+    dispatchToAgent(
+      workflow: workflow,
+      payload: .file(url.path),
+      label: url.lastPathComponent
+    )
+  }
+
+  @discardableResult
+  func dispatchToAgent(
+    workflow: String,
+    payload: AgentDispatchPayload,
+    label: String,
+    startStatus: String? = nil,
+    onSuccess: (@MainActor @Sendable () -> Void)? = nil
+  ) -> Bool {
+    guard !isAgentDispatchInFlight else { return false }
+    guard !payload.isEmpty else { return false }
+
     isAgentDispatchInFlight = true
-    transcriptionService.updateDispatchStatus("Dispatching to agent...")
+    transcriptionService.updateDispatchStatus(startStatus ?? "Dispatching \(label) to \(workflow)...")
     let launcher = agentPromptLauncher
+    let agent = defaultAgent
     let workingDirectoryURL =
       agentWorkspaceRoot
       ?? appState.folderURL
       ?? FileManager.default.homeDirectoryForCurrentUser
+    let appState = appState
     let transcriptionService = transcriptionService
 
     Task.detached(priority: .utility) { [weak self] in
       do {
         let metadata = try launcher.dispatch(
-          prompt: prompt,
+          workflow: workflow,
+          agent: agent,
+          payload: payload,
           workingDirectoryURL: workingDirectoryURL
         )
-        await MainActor.run {
-          if metadata.exitCode == 0 {
-            transcriptionService.resetTranscript()
-          }
-          transcriptionService.updateDispatchStatus(metadata.statusLine)
-          self?.isAgentDispatchInFlight = false
-        }
+        await self?.completeAgentDispatch(
+          metadata: metadata,
+          appState: appState,
+          transcriptionService: transcriptionService,
+          onSuccess: onSuccess
+        )
       } catch {
-        await MainActor.run {
-          transcriptionService.updateDispatchStatus(
-            "Dispatch failed: \(error.localizedDescription)")
-          self?.isAgentDispatchInFlight = false
-        }
+        let message = "Dispatch failed: \(error.localizedDescription)"
+        await self?.failAgentDispatch(
+          message: message,
+          appState: appState,
+          transcriptionService: transcriptionService
+        )
       }
     }
 
     return true
+  }
+
+  private func completeAgentDispatch(
+    metadata: AgentDispatchMetadata,
+    appState: AppState,
+    transcriptionService: TranscriptionService,
+    onSuccess: (@MainActor @Sendable () -> Void)?
+  ) {
+    if metadata.exitCode == 0 {
+      onSuccess?()
+      appState.lastError = nil
+    } else {
+      appState.lastError = metadata.statusLine
+    }
+    transcriptionService.updateDispatchStatus(metadata.statusLine)
+    isAgentDispatchInFlight = false
+  }
+
+  private func failAgentDispatch(
+    message: String,
+    appState: AppState,
+    transcriptionService: TranscriptionService
+  ) {
+    transcriptionService.updateDispatchStatus(message)
+    appState.lastError = message
+    isAgentDispatchInFlight = false
   }
 
   func bumpFontSize(by delta: CGFloat) {
