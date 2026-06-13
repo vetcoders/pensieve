@@ -27,7 +27,11 @@ struct EditorView: View {
         aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
         isDirty: documentDirty,
         onDocumentChanged: controller.documentDidChange,
-        onCloseFindBar: closeFindBar
+        onCloseFindBar: closeFindBar,
+        onFindStateChanged: { total, active in
+          appState.findMatchCount = total
+          appState.findActiveMatchIndex = active
+        }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -72,6 +76,9 @@ struct EditorRepresentable: NSViewRepresentable {
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
   let onCloseFindBar: @MainActor () -> Void
+  // Defaults to a no-op so find-navigation tests that build the representable
+  // directly need not wire the count callback they do not exercise.
+  var onFindStateChanged: @MainActor (Int, Int?) -> Void = { _, _ in }
 
   func makeNSView(context: Context) -> NSScrollView {
     let surface = MarkdownEditorSurface(
@@ -89,6 +96,11 @@ struct EditorRepresentable: NSViewRepresentable {
     }
     surface.onCloseFindBar = {
       self.onCloseFindBar()
+    }
+    surface.onFindStateChanged = { total, active in
+      DispatchQueue.main.async {
+        self.onFindStateChanged(total, active)
+      }
     }
     surface.typewriterScrollEnabled = editorMode == .focus
     context.coordinator.surface = surface
@@ -196,6 +208,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   var onTextChanged: ((String) -> Void)?
   var onCloseFindBar: (() -> Void)?
+  var onFindStateChanged: ((Int, Int?) -> Void)?
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -206,6 +219,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
+  private var hasNotifiedFindState = false
+  private var lastNotifiedFindCount = -1
+  private var lastNotifiedFindActiveIndex: Int?
   private var lastPostedEditorBlock: Int?
   private var lastPreviewAppliedBlock: Int?
 
@@ -669,6 +685,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     removeFindHighlights()
     findMatches = []
     activeFindMatchIndex = nil
+    notifyFindStateChanged()
   }
 
   func selectFindMatch(direction: FindDirection) {
@@ -704,6 +721,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.setSelectedRange(range)
     textView.scrollRangeToVisible(range)
     applyFindHighlights()
+    notifyFindStateChanged()
   }
 
   func replaceCurrentFindMatch(query: String, replacement: String) {
@@ -784,12 +802,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self.activeFindMatchIndex = nil
     }
     applyFindHighlights()
+    notifyFindStateChanged()
   }
 
   private func applyFindHighlights() {
     removeFindHighlights()
-    let passiveColor = NSColor.controlAccentColor.withAlphaComponent(0.18)
-    let activeColor = NSColor.controlAccentColor.withAlphaComponent(0.34)
+    // Clear, high-contrast find shading: every match gets a yellow wash so it is
+    // obvious in the document, and the active match an orange one so it stands
+    // out from the rest of the hits.
+    let passiveColor = NSColor.systemYellow.withAlphaComponent(0.50)
+    let activeColor = NSColor.systemOrange.withAlphaComponent(0.80)
     for (index, range) in findMatches.enumerated() {
       textStorage.addAttribute(
         .backgroundColor,
@@ -802,5 +824,19 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private func removeFindHighlights() {
     let fullRange = NSRange(location: 0, length: textStorage.length)
     textStorage.removeAttribute(.backgroundColor, range: fullRange)
+  }
+
+  /// Push the current match total + active index up to the UI (FindBar count),
+  /// deduped so a re-render with unchanged find state never loops the binding.
+  private func notifyFindStateChanged() {
+    if hasNotifiedFindState,
+      lastNotifiedFindCount == findMatches.count,
+      lastNotifiedFindActiveIndex == activeFindMatchIndex {
+      return
+    }
+    hasNotifiedFindState = true
+    lastNotifiedFindCount = findMatches.count
+    lastNotifiedFindActiveIndex = activeFindMatchIndex
+    onFindStateChanged?(findMatches.count, activeFindMatchIndex)
   }
 }

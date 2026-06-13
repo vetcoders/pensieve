@@ -5,6 +5,7 @@ struct NativeSearchField: NSViewRepresentable {
   @Binding var text: String
   var placeholder: String
   var focusToken: Int = 0
+  var focusOnAppear: Bool = false
   var accessibilityIdentifier: String
   var onSubmit: (() -> Void)?
 
@@ -19,6 +20,14 @@ struct NativeSearchField: NSViewRepresentable {
     field.bezelStyle = .squareBezel
     field.controlSize = .small
     field.setAccessibilityIdentifier(accessibilityIdentifier)
+    // The find bar is mounted on demand (⌘F), so a fresh field must claim first
+    // responder when it appears — the focusToken alone is swallowed by the
+    // coordinator on first mount. Deferred so the field is already in a window.
+    if focusOnAppear {
+      DispatchQueue.main.async { [weak field] in
+        field?.window?.makeFirstResponder(field)
+      }
+    }
     return field
   }
 

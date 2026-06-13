@@ -21,6 +21,8 @@ final class DocumentWindowModel: ObservableObject {
   @Published var findReplaceQuery: String = ""
   @Published var findFocusToken: Int = 0
   @Published var pendingFindCommand: FindBarCommand?
+  @Published var findMatchCount: Int = 0
+  @Published var findActiveMatchIndex: Int?
   @Published var tableTidyOnPaste: Bool {
     didSet {
       defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)

@@ -4,6 +4,17 @@ import SwiftUI
 struct FindBar: View {
   @EnvironmentObject private var appState: AppState
 
+  // "3 of 12" while navigating, "12 found" before the first jump, "No results"
+  // when the query matches nothing — shown inline in the bar's search area.
+  private var findCountLabel: String {
+    let total = appState.findMatchCount
+    if total == 0 { return "No results" }
+    if let active = appState.findActiveMatchIndex {
+      return "\(active + 1) of \(total)"
+    }
+    return "\(total) found"
+  }
+
   var body: some View {
     HStack(spacing: 6) {
       // Disclosure toggle next to the search field: reveals/hides the Replace
@@ -24,6 +35,7 @@ struct FindBar: View {
         text: $appState.findQuery,
         placeholder: "Find",
         focusToken: appState.findFocusToken,
+        focusOnAppear: true,
         accessibilityIdentifier: "pensieve.find.query"
       ) {
         appState.pendingFindCommand = FindBarCommand(action: .next)
@@ -51,6 +63,14 @@ struct FindBar: View {
         .buttonStyle(.borderless)
         .disabled(appState.findQuery.isEmpty)
         .accessibilityIdentifier("pensieve.find.replaceAll")
+      }
+
+      if !appState.findQuery.isEmpty {
+        Text(findCountLabel)
+          .font(.system(size: 11).monospacedDigit())
+          .foregroundStyle(.secondary)
+          .frame(minWidth: 64, alignment: .trailing)
+          .accessibilityIdentifier("pensieve.find.count")
       }
 
       Button {
