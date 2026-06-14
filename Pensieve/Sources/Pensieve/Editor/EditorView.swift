@@ -590,6 +590,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       visibleHeight: visible.height,
       documentHeight: documentHeight
     )
+    // IfNeeded (the name was a lie): skip redundant re-centering when the caret line
+    // is already at the typewriter target. Without this guard, every keystroke re-issues
+    // a ~0px scroll + reflectScrolledClipView, and the document visibly JUMPS on each
+    // typed character in Focus mode. Same-line typing keeps caretMidY (→ targetY) stable,
+    // so this no-ops; a real vertical caret move (new line, wrap) still re-centers.
+    guard abs(targetY - visible.origin.y) > 0.5 else { return }
     scrollView.contentView.scroll(to: NSPoint(x: visible.origin.x, y: targetY))
     scrollView.reflectScrolledClipView(scrollView.contentView)
   }
