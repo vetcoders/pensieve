@@ -34,6 +34,13 @@ struct EditorView: View {
         }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
+      // Let the editor scroll view extend UNDER the unified toolbar so the text
+      // (not just the line-number ruler) slides under it, blurred — the native
+      // Finder look. The scroll view already reaches under the titlebar (the ruler
+      // proves it); SwiftUI's top safe-area inset was the only thing holding the
+      // text below. automaticallyAdjustsContentInsets (default) keeps the caret
+      // line starting below the toolbar while letting scrolled content pass under.
+      .ignoresSafeArea(.container, edges: .top)
     }
     .background(Color(NSColor.textBackgroundColor))
   }
