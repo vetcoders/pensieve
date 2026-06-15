@@ -19,6 +19,9 @@ final class AppController: ObservableObject {
     "review", "scaffold", "workflow",
   ]
   let defaultAgent = "codex"
+  /// Agents discovered at runtime from `vibecrafted doctor` (agent-stream:<name>).
+  /// Seeded with the default so the picker is never empty before discovery returns.
+  @Published var availableAgents: [String] = ["codex"]
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
@@ -569,6 +572,92 @@ final class AppController: ObservableObject {
     transcriptionService.updateDispatchStatus(message)
     appState.lastError = message
     isAgentDispatchInFlight = false
+  }
+
+  // MARK: - Agent discovery + Terminal dispatch
+
+  /// Refresh `availableAgents` from `vibecrafted doctor` (dynamic, not hardcoded).
+  /// Safe to call repeatedly (e.g. from the dispatch popover's onAppear).
+  func discoverAgents() {
+    Task.detached(priority: .utility) {
+      let discovered = Self.probeAgents()
+      guard !discovered.isEmpty else { return }
+      await MainActor.run { [weak self] in self?.availableAgents = discovered }
+    }
+  }
+
+  nonisolated private static func probeAgents() -> [String] {
+    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return [] }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: exe)
+    process.arguments = ["doctor"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    guard (try? process.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    // Lines look like: "ok: agent-stream:codex - codex-cli 0.137.0"
+    var names: [String] = []
+    for line in output.split(separator: "\n") {
+      guard let marker = line.range(of: "agent-stream:") else { continue }
+      let tail = line[marker.upperBound...]
+      let name = String(tail.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        .trimmingCharacters(in: .whitespaces)
+      if !name.isEmpty, !names.contains(name) { names.append(name) }
+    }
+    return names
+  }
+
+  /// Launch the currently-open document into a visible Terminal so the run is
+  /// observable: `vibecrafted <workflow> <agent> --file <doc> --root <where>`.
+  /// Terminal takes focus briefly, then focus returns to Pensieve.
+  /// The PLAN is always the open document; `rootURL` is only WHERE the agent runs.
+  @discardableResult
+  func dispatchOpenDocumentViaTerminal(workflow: String, agent: String, rootURL: URL) -> Bool {
+    guard let docURL = appState.documentSession.url else {
+      appState.lastError = "Save the document before dispatching it to an agent."
+      return false
+    }
+    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else {
+      appState.lastError = AgentPromptLauncherError.executableNotFound(searchedPaths: []).localizedDescription
+      return false
+    }
+
+    func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let command = [
+      "cd", shellQuote(rootURL.path), "&&",
+      shellQuote(exe), workflow, agent,
+      "--file", shellQuote(docURL.path),
+      "--root", shellQuote(rootURL.path),
+    ].joined(separator: " ")
+
+    // AppleScript string-literal escaping for the `do script` payload.
+    let asEscaped = command
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+    let script = """
+      tell application "Terminal"
+        activate
+        do script "\(asEscaped)"
+      end tell
+      """
+    let osa = Process()
+    osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    osa.arguments = ["-e", script]
+    guard (try? osa.run()) != nil else {
+      appState.lastError = "Could not open Terminal to dispatch."
+      return false
+    }
+    transcriptionService.updateDispatchStatus(
+      "Dispatched \(appState.documentSession.displayTitle) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)")
+
+    // Terminal owns focus while the run starts; hand focus back to Pensieve after ~10s.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+      NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+    }
+    return true
   }
 
   func bumpFontSize(by delta: CGFloat) {
