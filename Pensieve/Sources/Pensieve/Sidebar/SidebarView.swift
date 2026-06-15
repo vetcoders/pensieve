@@ -5,6 +5,9 @@ import UniformTypeIdentifiers
 struct SidebarView: View {
   @EnvironmentObject private var appState: AppState
   @EnvironmentObject private var controller: AppController
+  // Live open-tab group (the actual tabs), published by the window registry so
+  // "Open Files" mirrors the tab chain instead of a per-window working set.
+  @ObservedObject private var windowRegistry = DocumentWindowRegistry.shared
   @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var knownRootNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var hoveredDocumentID: DocumentRef.ID?
@@ -133,7 +136,7 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
-        if sidebarTab == .openFiles, !appState.openFiles.isEmpty {
+        if sidebarTab == .openFiles, !openTabDocuments.isEmpty {
           Button {
             controller.clearOpenFiles()
           } label: {
@@ -197,16 +200,26 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.tab.\(tab.rawValue)")
   }
 
+  /// The live open-tab documents (registry order) resolved to refs via the shared
+  /// store. Never drops a live tab: a URL absent from the workspace scan / working
+  /// set (e.g. an ad-hoc file evicted past the open-files cap) is synthesized as an
+  /// ad-hoc ref so the row always mirrors the open tab.
+  private var openTabDocuments: [DocumentRef] {
+    windowRegistry.openTabDocumentIDs.map {
+      appState.document(id: $0) ?? DocumentRef(id: $0, isAdHoc: true)
+    }
+  }
+
   private var openFilesList: some View {
     Group {
-      if appState.openFiles.isEmpty {
+      if openTabDocuments.isEmpty {
         sidebarEmptyTab(
           icon: "doc.text",
           message: "No open files",
           hint: "⌘O opens a file · ⌘N new file")
       } else {
         List {
-          ForEach(appState.sortedOpenFiles) { doc in
+          ForEach(openTabDocuments) { doc in
             Button {
               appState.sidebarFocusedURL = doc.url.standardizedFileURL
               controller.openDocumentWindow(id: doc.id)
@@ -229,9 +242,6 @@ struct SidebarView: View {
             .onDrag {
               NSItemProvider(object: doc.url as NSURL)
             }
-          }
-          .onMove { source, destination in
-            controller.reorderOpenFiles(fromOffsets: source, toOffset: destination)
           }
         }
         .listStyle(.sidebar)
@@ -592,10 +602,8 @@ struct SidebarView: View {
 
     dispatchMenu(for: doc.url)
 
-    if doc.isAdHoc {
-      Button("Close from Open Files") {
-        controller.closeOpenFile(id: doc.id)
-      }
+    Button("Close from Open Files") {
+      controller.closeOpenFile(id: doc.id)
     }
 
     Button("Reveal in Finder") {

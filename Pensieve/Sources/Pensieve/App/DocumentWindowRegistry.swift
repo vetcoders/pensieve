@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class DocumentWindowRegistry {
+final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
   private let documentTabbingIdentifier = "Pensieve.DocumentWindow"
 
@@ -21,6 +21,11 @@ final class DocumentWindowRegistry {
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
+  /// The live tab-group documents in open order — the actual open tabs, NOT the
+  /// WorkspaceStore historical/capped working set. The ONLY observed member;
+  /// maintained in lockstep with windowsByDocumentID (one window per document)
+  /// at the exact same mutation sites, so the sidebar "Open Files" == the tabs.
+  @Published private(set) var openTabDocumentIDs: [URL] = []
   /// Windows born from the tab bar's "+" button: launcher-mode content living
   /// as a document tab. They report no document and no editable buffer on
   /// first attach, which would otherwise classify them as empty launchers and
@@ -106,6 +111,7 @@ final class DocumentWindowRegistry {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
       windowsByDocumentID.removeValue(forKey: documentID)
       orderedDocumentIDs.remove(documentID)
+      forgetOpenDocument(documentID)
     }
 
     guard let makeDocumentWindow else {
@@ -124,6 +130,7 @@ final class DocumentWindowRegistry {
     markContentWindow(window)
     windowsByDocumentID[documentID] = WeakWindow(window)
     orderedDocumentIDs.insert(documentID)
+    recordOpenDocument(documentID)
 
     if let target = currentMergeTarget(), target !== window {
       prepareTabbedWindow(target)
@@ -139,17 +146,28 @@ final class DocumentWindowRegistry {
   /// down: drops every registry mapping so the document can re-open in a
   /// fresh window instead of resurrecting the closed (retained) one.
   func handleDocumentWindowClosed(_ window: NSWindow) {
+    reconcileClosedWindow(window)
+    // Tombstone ONLY on this path (DocumentWindow.onClose): factory windows are
+    // never reused, so rejecting a late re-attach of this exact instance is safe.
+    // The window's SwiftUI accessor may still have an in-flight main-queue pass
+    // that would re-register the closed window (and resurrect it as a phantom
+    // tab); remember the identity while the object is alive so attach() rejects
+    // those late passes. Reusable windows (scenes) must NOT be tombstoned — they
+    // are reconciled via reconcileClosedWindow from the global willClose observer.
+    closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  }
+
+  /// Cleanup WITHOUT tombstoning: forget the window's documents and drop its
+  /// bookkeeping maps. Safe for ANY closing window (the process-wide willClose
+  /// observer routes here), so it never poisons a reusable window instance via a
+  /// closedWindows entry. Idempotent for windows the registry never tracked.
+  func reconcileClosedWindow(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
-    DebugTrace.log("registry.windowClosed '\(window.title)'")
+    DebugTrace.log("registry.reconcileClosed '\(window.title)'")
     releaseStaleDocumentMappings(for: window, keeping: nil)
     contentWindows.removeValue(forKey: windowID)
     launcherWindows.removeValue(forKey: windowID)
     untitledTabWindows.removeValue(forKey: windowID)
-    // The window's SwiftUI accessor may still have an in-flight main-queue
-    // pass that would re-register the closed window (and resurrect it as a
-    // phantom tab). Remember the closed identity for as long as the window
-    // object is alive so attach() can reject those late passes.
-    closedWindows[windowID] = WeakWindow(window)
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
@@ -236,6 +254,7 @@ final class DocumentWindowRegistry {
       orderedDocumentIDs.remove(documentID)
     }
     windowsByDocumentID[documentID] = WeakWindow(window)
+    recordOpenDocument(documentID)
 
     guard canMutateWindowTabs() else {
       deferAttach(window, documentID: documentID)
@@ -268,7 +287,39 @@ final class DocumentWindowRegistry {
       DebugTrace.log("release stale mapping \(staleID.lastPathComponent) from '\(window.title)'")
       windowsByDocumentID.removeValue(forKey: staleID)
       orderedDocumentIDs.remove(staleID)
+      forgetOpenDocument(staleID)
     }
+  }
+
+  /// Publish a document into the observed open-tab list. Idempotent: open() and a
+  /// later attach() both fire for the same doc, and re-attaches on window moves
+  /// must not duplicate or reorder an already-tracked document.
+  private func recordOpenDocument(_ documentID: URL) {
+    guard !openTabDocumentIDs.contains(documentID) else { return }
+    openTabDocumentIDs.append(documentID)
+  }
+
+  /// Drop a document from the observed open-tab list when its last window goes
+  /// away (close) or it is swapped out of a window (in-place document switch).
+  /// Guarded so a forget for an untracked doc emits no spurious objectWillChange.
+  private func forgetOpenDocument(_ documentID: URL) {
+    guard openTabDocumentIDs.contains(documentID) else { return }
+    openTabDocumentIDs.removeAll { $0 == documentID }
+  }
+
+  /// Close the window/tab currently showing `documentID` (sidebar "Close from
+  /// Open Files"). The close drives the normal teardown → forgetOpenDocument, so
+  /// the published list updates itself; no direct list mutation here.
+  func closeDocumentWindow(_ documentID: URL) {
+    guard let window = windowsByDocumentID[documentID.standardizedFileURL]?.window else { return }
+    closeWindow(window)
+  }
+
+  /// Close every open document tab (sidebar "Clear Open Files"). Snapshot first:
+  /// closeWindow mutates the maps the list is derived from.
+  func closeAllDocumentWindows() {
+    let windows = openTabDocumentIDs.compactMap { windowsByDocumentID[$0]?.window }
+    for window in windows { closeWindow(window) }
   }
 
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
