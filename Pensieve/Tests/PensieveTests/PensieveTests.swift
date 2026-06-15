@@ -695,6 +695,113 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
   }
 
+  /// Save-on-close guard: closing a window/tab within the autosave debounce
+  /// window (≤1.5s of the last edit) must NOT drop the unsaved change. The
+  /// debounce here is set to a minute so the scheduled autosave cannot have
+  /// fired — the only path that reaches disk is the synchronous close-flush.
+  @MainActor
+  func testSavePendingChangesOnCloseFlushesTitledDocumentBeforeDebounce() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseFlushTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("close.md")
+    try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "initial")
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder)
+    )
+
+    appState.activeDocumentText = "edited within the debounce window"
+    store.documentDidChange(appState: appState)
+    XCTAssertTrue(appState.activeDocumentDirty)
+    // The debounced write has NOT fired yet — disk still holds the old text.
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "initial")
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "edited within the debounce window")
+    XCTAssertFalse(appState.activeDocumentDirty)
+  }
+
+  /// An untitled buffer closed inside the debounce window keeps its content as a
+  /// recovery draft — exactly what the pending autosave would have written.
+  @MainActor
+  func testSavePendingChangesOnCloseWritesRecoveryDraftForUntitled() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveCloseFlushUntitledTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
+    let appState = AppState()
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+
+    appState.documentSession.createUntitled(title: "Untitled.md")
+    appState.activeDocumentText = "unsaved draft in a fast-closed window"
+    store.documentDidChange(appState: appState)
+    // Debounced recovery write has NOT fired yet.
+    XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().first?.text, "unsaved draft in a fast-closed window")
+  }
+
+  /// A clean (non-dirty) buffer must not be re-written on close — the guard is a
+  /// no-op so closing pristine windows never churns disk or the index.
+  @MainActor
+  func testSavePendingChangesOnCloseIsNoOpWhenClean() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveCloseFlushCleanTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("clean.md")
+    try "pristine".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "pristine")
+
+    var writeCount = 0
+    let store = DocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      writeDocument: { text, url in
+        writeCount += 1
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    )
+
+    XCTAssertFalse(store.savePendingChangesOnClose(appState: appState))
+    XCTAssertEqual(writeCount, 0)
+  }
+
   @MainActor
   func testFolderOpenImportsMarkdownRecursivelyAndSkipsDefaultNoise() throws {
     let folder = FileManager.default.temporaryDirectory

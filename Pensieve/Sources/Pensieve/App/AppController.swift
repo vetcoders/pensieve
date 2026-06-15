@@ -287,6 +287,16 @@ final class AppController: ObservableObject {
     documentStore.prepareForDocumentSwitch(appState: appState)
   }
 
+  /// Save-on-close guard for THIS window's session. Routed from the shared
+  /// document-window root on `NSWindow.willCloseNotification`, it flushes a
+  /// pending (debounced) edit synchronously before the window/tab tears down,
+  /// closing the ≤1.5s data-loss window on every close trigger (red button,
+  /// tab "×", sidebar close, ⌘W). No-op for a clean buffer.
+  @discardableResult
+  func savePendingChangesOnClose() -> Bool {
+    documentStore.savePendingChangesOnClose(appState: appState)
+  }
+
   /// Closes the active document session without exiting Pensieve.
   /// Dirty sessions are routed through the existing save semantics in
   /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -126,6 +127,23 @@ struct DocumentWindowRootView: View {
     }
     .onOpenURL { url in
       controller.openFile(url: url)
+    }
+    // App-wide save-on-close guard. Every window (factory-built document tab AND
+    // state-restored WindowGroup scene) shares this root, and every close
+    // trigger — red close button, the tab's "×", the sidebar "Close from Open
+    // Files", or ⌘W falling through to a native window close — posts
+    // `willCloseNotification` for the closing window. Filtering to THIS window's
+    // `currentWindow` flushes only its own session, synchronously, before the
+    // window/`AppState` tears down — closing the ≤1.5s autosave-debounce data
+    // loss without touching the window delegate SwiftUI owns.
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
+      notification in
+      guard let closingWindow = notification.object as? NSWindow,
+        closingWindow === currentWindow
+      else {
+        return
+      }
+      controller.savePendingChangesOnClose()
     }
   }
 

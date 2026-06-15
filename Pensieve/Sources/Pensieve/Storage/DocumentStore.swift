@@ -1914,6 +1914,34 @@ final class DocumentStore {
     scheduleIndexUpdate(appState: appState)
   }
 
+  /// Save-on-close guard (app-wide). The autosave write is debounced 1.5s after
+  /// the last edit; closing a window/tab inside that window — red close button,
+  /// the tab's "×", the sidebar "Close from Open Files", or ⌘W falling through
+  /// to a native window close — used to tear the window (and its `AppState`)
+  /// down before the scheduled save fired, silently dropping the edit. This
+  /// flushes the pending change SYNCHRONOUSLY so the close never races the
+  /// debounce. It mirrors the autosave closure exactly — titled buffers write
+  /// to disk, untitled buffers persist a recovery draft — but runs NOW and
+  /// cancels the still-pending timer. No blocking prompt: the window is already
+  /// committed to closing, so there is nothing to cancel. A clean (non-dirty)
+  /// buffer is a no-op. Returns whether anything was persisted.
+  @discardableResult
+  func savePendingChangesOnClose(appState: AppState) -> Bool {
+    self.appState = appState
+    guard appState.documentSession.hasEditableBuffer,
+      appState.documentSession.isDirty
+    else {
+      return false
+    }
+
+    autosaver.cancel()
+    if appState.documentSession.isUntitled {
+      saveRecoveryDraft(appState: appState)
+      return true
+    }
+    return saveExisting(appState: appState, indexNow: true)
+  }
+
   @discardableResult
   func prepareForDocumentSwitch(appState: AppState) -> Bool {
     self.appState = appState
