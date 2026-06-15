@@ -102,7 +102,11 @@ struct FindBar: View {
     }
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
-    .background(Color(NSColor.controlBackgroundColor))
+    // Native find-bar material (Safari / TextEdit style): an opaque, blurred bar
+    // instead of a flat fill. `controlBackgroundColor` was letting the document
+    // text bleed through behind the search field; `.bar` blurs whatever is under
+    // it so the bar reads as a real macOS find bar, not a translucent overlay.
+    .background(.bar)
     .overlay(alignment: .bottom) {
       Divider()
     }
