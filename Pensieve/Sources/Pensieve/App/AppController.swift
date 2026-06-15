@@ -219,29 +219,24 @@ final class AppController: ObservableObject {
     folderManager.move(url: url, toFolder: folderURL, into: appState)
   }
 
-  func reorderOpenFiles(fromOffsets source: IndexSet, toOffset destination: Int) {
-    var visibleFiles = appState.sortedOpenFiles
-    let moving = source.sorted().map { visibleFiles[$0] }
-    visibleFiles.removeAll { ref in
-      moving.contains { $0.id.standardizedFileURL == ref.id.standardizedFileURL }
-    }
-    let lowerRemovedCount = source.filter { $0 < destination }.count
-    let insertionIndex = max(0, min(destination - lowerRemovedCount, visibleFiles.count))
-    visibleFiles.insert(contentsOf: moving, at: insertionIndex)
-    appState.sidebarSortOrder = .manual
-    appState.openFiles = visibleFiles
-  }
-
   func closeOpenFile(id: DocumentRef.ID) {
+    // Open Files mirrors the live tab group, so closing from the list closes the
+    // tab/window. If it is THIS window's active doc, run the dirty-session guard
+    // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
+    // force-save) so the sidebar close never silently drops unsaved edits.
     let standardizedID = id.standardizedFileURL
     if appState.selectedDocumentID?.standardizedFileURL == standardizedID {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
-    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedID }
+    DocumentWindowRegistry.shared.closeDocumentWindow(standardizedID)
   }
 
   func clearOpenFiles() {
-    appState.openFiles = []
+    // Guard this window's active doc before tearing every tab down.
+    if appState.selectedDocumentID != nil {
+      guard documentStore.select(ref: nil, into: appState) else { return }
+    }
+    DocumentWindowRegistry.shared.closeAllDocumentWindows()
   }
 
   @discardableResult
@@ -321,9 +316,15 @@ final class AppController: ObservableObject {
   /// currently displayed document is a no-op. Falls back to in-window
   /// selection when no routing is wired (tests, headless).
   func openDocumentWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
-      return
-    }
+    guard let id else { return }
+    // Resolve via the workspace/working-set scan, but fall back to a synthesized
+    // ref for a live registry tab whose ref was evicted past the open-files cap —
+    // otherwise the registry-sourced sidebar row exists but its click is dead.
+    let ref =
+      appState.allDocuments.first(where: { $0.id == id })
+      ?? (DocumentWindowRegistry.shared.openTabDocumentIDs.contains(id.standardizedFileURL)
+        ? appState.makeDocumentRef(for: id) : nil)
+    guard let ref else { return }
 
     if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
       return
@@ -511,7 +512,8 @@ final class AppController: ObservableObject {
     guard !payload.isEmpty else { return false }
 
     isAgentDispatchInFlight = true
-    transcriptionService.updateDispatchStatus(startStatus ?? "Dispatching \(label) to \(workflow)...")
+    transcriptionService.updateDispatchStatus(
+      startStatus ?? "Dispatching \(label) to \(workflow)...")
     let launcher = agentPromptLauncher
     let agent = defaultAgent
     let workingDirectoryURL =
@@ -627,11 +629,14 @@ final class AppController: ObservableObject {
       return false
     }
     guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else {
-      appState.lastError = AgentPromptLauncherError.executableNotFound(searchedPaths: []).localizedDescription
+      appState.lastError =
+        AgentPromptLauncherError.executableNotFound(searchedPaths: []).localizedDescription
       return false
     }
 
-    func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    func shellQuote(_ s: String) -> String {
+      "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
     let command = [
       "cd", shellQuote(rootURL.path), "&&",
       shellQuote(exe), workflow, agent,
@@ -640,7 +645,8 @@ final class AppController: ObservableObject {
     ].joined(separator: " ")
 
     // AppleScript string-literal escaping for the `do script` payload.
-    let asEscaped = command
+    let asEscaped =
+      command
       .replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "\"", with: "\\\"")
     let script = """
@@ -657,7 +663,8 @@ final class AppController: ObservableObject {
       return false
     }
     transcriptionService.updateDispatchStatus(
-      "Dispatched \(appState.documentSession.displayTitle) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)")
+      "Dispatched \(appState.documentSession.displayTitle) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
+    )
 
     // Terminal owns focus while the run starts; hand focus back to Pensieve after ~10s.
     DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
