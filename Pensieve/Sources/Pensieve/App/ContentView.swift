@@ -36,7 +36,7 @@ struct ContentView: View {
         .disabled(!appState.documentSession.hasEditableBuffer)
         .help("Dispatch to Agent")
         .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
-        .popover(isPresented: $showDispatch, arrowEdge: .bottom) {
+        .sheet(isPresented: $showDispatch) {
           DispatchPopover(
             controller: controller,
             isPresented: $showDispatch,
