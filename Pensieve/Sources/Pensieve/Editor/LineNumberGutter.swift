@@ -18,6 +18,14 @@ class LineNumberGutter: NSRulerView {
     fatalError("init(coder:) has not been implemented")
   }
 
+  // Real anti-ghosting fix: by default AppKit clips a view's drawing to the
+  // minimal dirty rect, so during a scroll only the newly exposed strip is
+  // repainted and the stale line numbers at the old offset survive (the doubled
+  // gutter). Opting out of default clipping means `drawHashMarksAndLabels`
+  // always fills + repaints the FULL ruler bounds, so no stale numbers remain.
+  // (NSClipView.copiesOnScroll is a no-op since macOS 11, so it cannot help here.)
+  override var wantsDefaultClipping: Bool { false }
+
   override func drawHashMarksAndLabels(in rect: NSRect) {
     guard let textView = clientView as? NSTextView,
       let layoutManager = textLayoutManager,

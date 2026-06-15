@@ -42,6 +42,7 @@ ICON_RESOURCE="$APP_NAME.icns"
 KEYS_DIR="${HOME}/.keys"
 NOTARY_ENV="$KEYS_DIR/.notary.env"
 SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
+FFI_PROFILE="${FFI_PROFILE:-debug}"
 
 # ─── Args ─────────────────────────────────────────────────────────────────
 DO_NOTARIZE=1
@@ -65,6 +66,11 @@ log()  { printf "\033[36m[build]\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
+
+case "$FFI_PROFILE" in
+    debug|release) ;;
+    *) die "FFI_PROFILE must be debug or release, got: $FFI_PROFILE" ;;
+esac
 
 plist_set_string() {
     local plist="$1"
@@ -113,6 +119,7 @@ COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
+log "FFI profile: $FFI_PROFILE"
 
 if (( DMG_ONLY )); then
     # Reuse an already-built, signed, notarized + stapled .app and only
@@ -186,7 +193,7 @@ find "$APP_BUNDLE" -maxdepth 3 -print | head -20 | sed 's|'"$APP_BUNDLE"'|  ./|'
 # the dev path is gone and the Team IDs differ — so dyld aborts at launch (build 133
 # crashed exactly here). Embed it in Contents/Frameworks, repoint to @rpath, and
 # re-sign with our identity so it loads from inside the bundle.
-QUBE_DYLIB_SRC="$PKG_DIR/Vendor/qube-ffi/debug/libqube_ffi.dylib"
+QUBE_DYLIB_SRC="$PKG_DIR/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib"
 if [[ -f "$QUBE_DYLIB_SRC" ]]; then
     log "Embedding qube-ffi dylib (repoint to @rpath + re-sign)"
     FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
