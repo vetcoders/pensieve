@@ -138,7 +138,11 @@ struct EditorRepresentable: NSViewRepresentable {
     if textUnchanged {
       if surface.typewriterScrollEnabled {
         surface.centerCaretLineIfNeeded()
-      } else {
+      } else if scroll.contentView.bounds.origin != savedOrigin {
+        // Only re-pin when surface.update() actually drifted the viewport. Firing
+        // scroll(to:)+reflectScrolledClipView on EVERY keystroke posts a redundant
+        // bounds-change → gutter redraw → the per-letter flicker the operator saw in
+        // normal/split mode. No drift ⇒ nothing to restore.
         scroll.contentView.scroll(to: savedOrigin)
         scroll.reflectScrolledClipView(scroll.contentView)
       }
@@ -261,6 +265,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.borderType = .noBorder
     scrollView.drawsBackground = true
     scrollView.backgroundColor = .textBackgroundColor
+    // Kill the line-number gutter ghosting (doubled/stale numbers) AND the per-keystroke
+    // flicker: with copy-on-scroll the clip view scrolls by blitting old pixels and only
+    // redraws the newly exposed strip, so the NSRulerView keeps a stale copy of the numbers
+    // at the previous offset while drawing the new ones on top. A full redraw on every
+    // scroll is cheap for an editor viewport and makes the ruler + text repaint clean.
+    scrollView.contentView.copiesOnScroll = false
 
     textView = MarkdownTextView(
       frame: NSRect(x: 0, y: 0, width: 640, height: scrollView.contentSize.height),
