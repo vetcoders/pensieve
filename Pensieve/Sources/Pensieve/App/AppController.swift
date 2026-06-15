@@ -618,33 +618,59 @@ final class AppController: ObservableObject {
     return names
   }
 
-  /// Launch the currently-open document into a visible Terminal so the run is
-  /// observable: `vibecrafted <workflow> <agent> --file <doc> --root <where>`.
-  /// Terminal takes focus briefly, then focus returns to Pensieve.
-  /// The PLAN is always the open document; `rootURL` is only WHERE the agent runs.
-  @discardableResult
-  func dispatchOpenDocumentViaTerminal(workflow: String, agent: String, rootURL: URL) -> Bool {
+  /// Outcome of a document dispatch surfaced to the dispatch sheet for an
+  /// explicit, unmissable in-app confirmation (the user must know it fired).
+  enum DocumentDispatchOutcome: Sendable {
+    case success(runID: String?, reportPath: String?, statusLine: String)
+    case failure(message: String)
+  }
+
+  /// Headless dispatch of the OPEN document via the canonical uv-core entry,
+  /// which prints a parseable launch receipt (run_id / report path) and detaches.
+  /// Returns the outcome so the sheet can show "Dispatched ✓ run: …". The plan is
+  /// always the open document (--file); `rootURL` is only WHERE the agent runs
+  /// (--root). Terminal observability is a separate, user-triggered affordance
+  /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
+  func dispatchOpenDocument(workflow: String, agent: String, rootURL: URL) async
+    -> DocumentDispatchOutcome
+  {
     guard let docURL = appState.documentSession.url else {
-      appState.lastError = "Save the document before dispatching it to an agent."
-      return false
+      return .failure(message: "Save the document before dispatching it to an agent.")
     }
-    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else {
-      appState.lastError =
-        AgentPromptLauncherError.executableNotFound(searchedPaths: []).localizedDescription
-      return false
+    let launcher = agentPromptLauncher
+    let title = appState.documentSession.displayTitle
+    do {
+      let metadata = try await Task.detached(priority: .userInitiated) {
+        try launcher.dispatch(
+          workflow: workflow, agent: agent,
+          payload: .file(docURL.path), workingDirectoryURL: rootURL)
+      }.value
+      guard metadata.exitCode == 0 else {
+        appState.lastError = metadata.statusLine
+        transcriptionService.updateDispatchStatus(metadata.statusLine)
+        return .failure(message: metadata.statusLine)
+      }
+      appState.lastError = nil
+      let line = "Dispatched \(title) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
+      transcriptionService.updateDispatchStatus(
+        metadata.runID.map { "\(line) · run: \($0)" } ?? line)
+      return .success(
+        runID: metadata.runID, reportPath: metadata.reportPath, statusLine: line)
+    } catch {
+      let message = "Dispatch failed: \(error.localizedDescription)"
+      appState.lastError = message
+      transcriptionService.updateDispatchStatus(message)
+      return .failure(message: message)
     }
+  }
 
-    func shellQuote(_ s: String) -> String {
-      "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-    let command = [
-      "cd", shellQuote(rootURL.path), "&&",
-      shellQuote(exe), workflow, agent,
-      "--file", shellQuote(docURL.path),
-      "--root", shellQuote(rootURL.path),
-    ].joined(separator: " ")
-
-    // AppleScript string-literal escaping for the `do script` payload.
+  /// Best-effort: open Terminal tailing a launched run via the receipt's
+  /// `vibecrafted <agent> observe --run-id <id>`. User-triggered from the sheet;
+  /// failure is swallowed because the in-app confirmation is the source of truth.
+  nonisolated func observeRunInTerminal(agent: String, runID: String) {
+    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return }
+    func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let command = "\(quote(exe)) \(quote(agent)) observe --run-id \(quote(runID))"
     let asEscaped =
       command
       .replacingOccurrences(of: "\\", with: "\\\\")
@@ -658,19 +684,7 @@ final class AppController: ObservableObject {
     let osa = Process()
     osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     osa.arguments = ["-e", script]
-    guard (try? osa.run()) != nil else {
-      appState.lastError = "Could not open Terminal to dispatch."
-      return false
-    }
-    transcriptionService.updateDispatchStatus(
-      "Dispatched \(appState.documentSession.displayTitle) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
-    )
-
-    // Terminal owns focus while the run starts; hand focus back to Pensieve after ~10s.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-      NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-    }
-    return true
+    try? osa.run()
   }
 
   func bumpFontSize(by delta: CGFloat) {
