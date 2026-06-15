@@ -265,12 +265,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.borderType = .noBorder
     scrollView.drawsBackground = true
     scrollView.backgroundColor = .textBackgroundColor
-    // Kill the line-number gutter ghosting (doubled/stale numbers) AND the per-keystroke
-    // flicker: with copy-on-scroll the clip view scrolls by blitting old pixels and only
-    // redraws the newly exposed strip, so the NSRulerView keeps a stale copy of the numbers
-    // at the previous offset while drawing the new ones on top. A full redraw on every
-    // scroll is cheap for an editor viewport and makes the ruler + text repaint clean.
-    scrollView.contentView.copiesOnScroll = false
 
     textView = MarkdownTextView(
       frame: NSRect(x: 0, y: 0, width: 640, height: scrollView.contentSize.height),
@@ -854,7 +848,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private func notifyFindStateChanged() {
     if hasNotifiedFindState,
       lastNotifiedFindCount == findMatches.count,
-      lastNotifiedFindActiveIndex == activeFindMatchIndex {
+      lastNotifiedFindActiveIndex == activeFindMatchIndex
+    {
       return
     }
     hasNotifiedFindState = true

@@ -5,7 +5,9 @@ import Foundation
 import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-let qubeFFILibraryPath = "\(packageRoot)/Vendor/qube-ffi/debug"
+let qubeFFIProfile =
+    ProcessInfo.processInfo.environment["FFI_PROFILE"] == "release" ? "release" : "debug"
+let qubeFFILibraryPath = "\(packageRoot)/Vendor/qube-ffi/\(qubeFFIProfile)"
 
 let package = Package(
     name: "Pensieve",

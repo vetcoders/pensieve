@@ -36,10 +36,12 @@ C_RESET  := \033[0m
 
 .PHONY: build
 build:  ## Debug build (SwiftPM)
+build: ffi-check
 	@cd $(PKG_DIR) && swift build
 
 .PHONY: build-release
 build-release:  ## Release build (unsigned, fast smoke)
+build-release: ffi-check
 	@cd $(PKG_DIR) && swift build -c release --arch arm64
 
 .PHONY: run
@@ -116,20 +118,31 @@ format:  ## Apply swift-format in-place when installed (best-effort helper)
 gates: test lint  ## Run all quality gates (test + lint)
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) all gates passed\n"
 
+.PHONY: ffi
+ffi:  ## Rebuild and vendor qube-ffi bridge/dylib (FFI_PROFILE=debug|release)
+	@$(PKG_DIR)/scripts/build-ffi.sh
+
+.PHONY: ffi-check
+ffi-check:  ## Warn if vendored qube-ffi provenance is stale
+	@$(PKG_DIR)/scripts/check-ffi-freshness.sh
+
 # =========================================================================
 # RELEASE PIPELINE
 # =========================================================================
 
 .PHONY: release
 release: gates  ## Full signed + notarized .app + .dmg (gated by test+lint)
+release: ffi-check
 	@$(SCRIPTS)/build-release.sh
 
 .PHONY: release-local
 release-local: gates  ## Signed .app + .dmg, skip notarization (gated, local-only)
+release-local: ffi-check
 	@$(SCRIPTS)/build-release.sh --no-notarize
 
 .PHONY: release-clean
 release-clean: clean gates  ## Clean + full release (gated, most reproducible)
+release-clean: ffi-check
 	@$(SCRIPTS)/build-release.sh --clean
 
 .PHONY: notarize
@@ -178,6 +191,7 @@ info-certs:  ## Show signing identities in keychain
 
 .PHONY: ci
 ci: clean gates build-release  ## CI suite: clean + test + lint + release build
+ci: ffi-check
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) CI complete\n"
 
 # =========================================================================

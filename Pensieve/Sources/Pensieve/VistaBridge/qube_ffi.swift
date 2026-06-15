@@ -508,8 +508,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol VistaEngineProtocol: AnyObject, Sendable {
 
-    func complete(prefix: String, maxTokens: UInt32) async throws  -> String
-
+    func complete(prefix: String, maxTokens: UInt32) async throws -> String
+    
     func configDir()  -> String
     
     func formatText(text: String, assistive: Bool) async throws  -> String
@@ -619,13 +619,7 @@ open func configDir() -> String  {
     )
 })
 }
-
-open func complete(prefix: String, maxTokens: UInt32)async throws  -> String  {
-    _ = prefix
-    _ = maxTokens
-    return ""
-}
-
+    
 open func formatText(text: String, assistive: Bool)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(

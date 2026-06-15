@@ -598,6 +598,12 @@ final class AppController: ObservableObject {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     let output = String(data: data, encoding: .utf8) ?? ""
+    return agentStreamNames(in: output)
+  }
+
+  /// Parse `vibecrafted doctor` output for `agent-stream:<name>` agent names,
+  /// in first-seen order, deduplicated. Pure + testable.
+  nonisolated static func agentStreamNames(in output: String) -> [String] {
     // Lines look like: "ok: agent-stream:codex - codex-cli 0.137.0"
     var names: [String] = []
     for line in output.split(separator: "\n") {
