@@ -5,6 +5,13 @@ struct ContentView: View {
   @EnvironmentObject private var appState: AppState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
+  @State private var showDispatch = false
+
+  private var dispatchRoot: URL {
+    appState.folderURL
+      ?? appState.documentSession.url?.deletingLastPathComponent()
+      ?? FileManager.default.homeDirectoryForCurrentUser
+  }
 
   var body: some View {
     NavigationSplitView {
@@ -21,18 +28,22 @@ struct ContentView: View {
     .toolbar {
       EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
       ToolbarItem {
-        Menu {
-          ForEach(controller.agentWorkflows, id: \.self) { workflow in
-            Button(workflow) {
-              controller.dispatchCurrentDocumentToAgent(workflow: workflow)
-            }
-          }
+        Button {
+          showDispatch = true
         } label: {
           Label("Dispatch to Agent", systemImage: "paperplane")
         }
         .disabled(!appState.documentSession.hasEditableBuffer)
         .help("Dispatch to Agent")
         .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
+        .popover(isPresented: $showDispatch, arrowEdge: .bottom) {
+          DispatchPopover(
+            controller: controller,
+            isPresented: $showDispatch,
+            documentTitle: appState.documentSession.displayTitle,
+            defaultRoot: dispatchRoot
+          )
+        }
       }
     }
   }
