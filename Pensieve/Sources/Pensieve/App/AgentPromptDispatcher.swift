@@ -109,9 +109,15 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     {
       candidates.append(override)
     }
-    candidates.append(
-      FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(defaultExecutableRelativePath).path)
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    // Canonical CLI entry: the `vibecrafted` symlink in ~/.local/bin → the uv-core
+    // command surface. This is the headless-friendly entry that prints a parseable
+    // launch receipt (`run_id:` / report path) and detaches the run. The legacy bash
+    // "command deck" below targets an interactive terminal/zellij session; launched
+    // from this GUI Process (no TTY) it produces no usable run — the "dispatch does
+    // nothing" the operator hit. Prefer uv-core; keep the deck as a fallback.
+    candidates.append(home.appendingPathComponent(".local/bin/vibecrafted").path)
+    candidates.append(home.appendingPathComponent(defaultExecutableRelativePath).path)
 
     for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
       return candidate
