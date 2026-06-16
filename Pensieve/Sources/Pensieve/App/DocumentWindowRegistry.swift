@@ -36,7 +36,7 @@ final class DocumentWindowRegistry: ObservableObject {
   private var launcherSweepSparedWindow: WeakWindow?
   /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure?
-  
+
   /// Opens a new empty launcher window. Used when the app is reactivated from
   /// the Dock with no visible windows, or during cold start if SwiftUI does not
   /// provide one automatically.
