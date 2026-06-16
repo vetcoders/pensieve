@@ -59,6 +59,10 @@
     <true/>
     <key>NSSupportsSuddenTermination</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Pensieve needs access to your microphone to transcribe your speech into text.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Pensieve needs access to speech recognition to transcribe your voice notes.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>CFBundleDocumentTypes</key>

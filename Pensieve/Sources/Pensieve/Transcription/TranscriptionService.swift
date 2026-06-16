@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 
@@ -94,6 +95,42 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     startRecordingTask?.cancel()
   }
 
+  private enum MicrophonePermissionError: LocalizedError {
+    case denied
+    case restricted
+
+    var errorDescription: String? {
+      switch self {
+      case .denied:
+        return "Microphone permission is required for transcription. Enable it in System Settings → Privacy & Security → Microphone."
+      case .restricted:
+        return "Microphone access is restricted on this system."
+      }
+    }
+  }
+
+  private static func ensureMicrophonePermission() async throws {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+      return
+    case .notDetermined:
+      let granted = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+          continuation.resume(returning: granted)
+        }
+      }
+      if !granted {
+        throw MicrophonePermissionError.denied
+      }
+    case .denied:
+      throw MicrophonePermissionError.denied
+    case .restricted:
+      throw MicrophonePermissionError.restricted
+    @unknown default:
+      throw MicrophonePermissionError.denied
+    }
+  }
+
   func startRecording(language: String? = nil) {
     guard !isRecording, !isPreparingRecording else { return }
     let engine = activeEngine()
@@ -101,6 +138,17 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     isPreparingRecording = true
     lastError = nil
     startRecordingTask = Task { [weak self] in
+      do {
+        if engine is VistaEngine {
+          try await Self.ensureMicrophonePermission()
+        }
+        try Task.checkCancellation()
+      } catch {
+        guard let self, !(error is CancellationError) else { return }
+        self.isPreparingRecording = false
+        self.lastError = error.localizedDescription
+        return
+      }
       // Model init (whisper weights dequantization — seconds of CPU) and
       // capture start run OFF the main actor; doing this inline froze the
       // whole UI for the model load (1.77s+ hang reports from the field).
