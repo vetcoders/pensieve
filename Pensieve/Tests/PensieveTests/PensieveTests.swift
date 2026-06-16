@@ -2813,8 +2813,15 @@ final class PensieveSmokeTests: XCTestCase {
     try bookmarkStore.persistRoot(url: removedFolder, into: AppState())
     try FileManager.default.removeItem(at: removedFolder)
 
+    let indexFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveBareLaunchIndex-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: indexFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: indexFolder)
+    }
+
     let appState = AppState()
-    let indexDatabase = temporaryIndexDatabase(in: FileManager.default.temporaryDirectory)
+    let indexDatabase = temporaryIndexDatabase(in: indexFolder)
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
