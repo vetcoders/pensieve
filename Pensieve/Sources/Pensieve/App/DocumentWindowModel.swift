@@ -1,51 +1,79 @@
-import Combine
+import Foundation
+import Observation
 import SwiftUI
 
+@Observable
 @MainActor
-final class DocumentWindowModel: ObservableObject {
+final class DocumentWindowModel {
   private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
   private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private let defaults: UserDefaults
 
-  @Published var selectedDocumentID: DocumentRef.ID?
-  @Published var documentSession: DocumentSession = .empty
-  @Published var mode: EditorMode = .split
-  @Published var fontSize: CGFloat = 14
-  @Published var richMarkdownEnabled: Bool = true
-  @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
-  @Published var findBarVisible: Bool = false
-  @Published var findReplaceMode: Bool = false
-  @Published var findQuery: String = ""
-  @Published var findReplaceQuery: String = ""
-  @Published var findFocusToken: Int = 0
-  @Published var pendingFindCommand: FindBarCommand?
-  @Published var findMatchCount: Int = 0
-  @Published var findActiveMatchIndex: Int?
-  @Published var tableTidyOnPaste: Bool {
+  var selectedDocumentID: DocumentRef.ID?
+
+  /// The single source of truth for the open document (kind + text + dirty).
+  /// Typing reassigns this struct on every keystroke, so any view that reads
+  /// `documentSession` directly re-renders per keystroke. The editor and the
+  /// preview WANT that (they read `.text`). The window chrome (title bar, split
+  /// gating, sidebar) must NOT — it reads the discrete mirrors below instead,
+  /// which only change when the metadata actually changes (guarded didSet).
+  var documentSession: DocumentSession = .empty {
+    didSet {
+      let title = documentSession.displayTitle
+      if documentTitle != title { documentTitle = title }
+      let editable = documentSession.hasEditableBuffer
+      if documentHasEditableBuffer != editable { documentHasEditableBuffer = editable }
+      let url = documentSession.url
+      if documentURL != url { documentURL = url }
+      if documentIsDirty != documentSession.isDirty { documentIsDirty = documentSession.isDirty }
+    }
+  }
+
+  /// Discrete, low-frequency mirrors of `documentSession` metadata. Chrome views
+  /// read THESE (not `documentSession`) so a text-only edit never invalidates
+  /// them — that is what stops the whole window re-rendering on every keystroke.
+  private(set) var documentTitle: String = ""
+  private(set) var documentHasEditableBuffer: Bool = false
+  private(set) var documentURL: URL?
+  private(set) var documentIsDirty: Bool = false
+
+  var mode: EditorMode = .split
+  var fontSize: CGFloat = 14
+  var richMarkdownEnabled: Bool = true
+  var pendingMarkdownFormatCommand: MarkdownFormatCommand?
+  var findBarVisible: Bool = false
+  var findReplaceMode: Bool = false
+  var findQuery: String = ""
+  var findReplaceQuery: String = ""
+  var findFocusToken: Int = 0
+  var pendingFindCommand: FindBarCommand?
+  var findMatchCount: Int = 0
+  var findActiveMatchIndex: Int?
+  var tableTidyOnPaste: Bool {
     didSet {
       defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)
     }
   }
-  @Published var asciiSafeTables: Bool {
+  var asciiSafeTables: Bool {
     didSet {
       defaults.set(asciiSafeTables, forKey: Self.asciiSafeTablesKey)
     }
   }
-  @Published var aiAutocompleteEnabled: Bool {
+  var aiAutocompleteEnabled: Bool {
     didSet {
       defaults.set(aiAutocompleteEnabled, forKey: Self.aiAutocompleteEnabledKey)
     }
   }
-  @Published var previewAutoReload: Bool {
+  var previewAutoReload: Bool {
     didSet {
       defaults.set(previewAutoReload, forKey: Self.previewAutoReloadKey)
     }
   }
-  @Published var previewRefreshToken: Int = 0
-  @Published var sidebarVisible: Bool = true
-  @Published var lastError: String?
+  var previewRefreshToken: Int = 0
+  var sidebarVisible: Bool = true
+  var lastError: String?
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -69,6 +97,12 @@ final class DocumentWindowModel: ObservableObject {
     } else {
       self.aiAutocompleteEnabled = defaults.bool(forKey: Self.aiAutocompleteEnabledKey)
     }
+    // Seed the metadata mirrors from the initial (empty) session. didSet does
+    // not fire during init, so prime them explicitly to stay consistent.
+    self.documentTitle = documentSession.displayTitle
+    self.documentHasEditableBuffer = documentSession.hasEditableBuffer
+    self.documentURL = documentSession.url
+    self.documentIsDirty = documentSession.isDirty
   }
 
   func bumpFontSize(by delta: CGFloat) {

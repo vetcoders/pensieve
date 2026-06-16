@@ -1,5 +1,5 @@
-import Combine
 import GRDB
+import Observation
 import XCTest
 
 @testable import Pensieve
@@ -511,18 +511,36 @@ private final class BuilderCallCounter: @unchecked Sendable {
   }
 }
 
-/// Records every non-nil `WorkspaceActivity.detail` published by an `AppState` so a test can
-/// prove the misleading "Indexing N files" phase NEVER appeared on a valid-skip open. Subscribes
-/// on the main actor (the only place `workspaceActivity` is mutated).
+/// Records every non-nil `WorkspaceActivity.detail` an `AppState` passes through so a test can
+/// prove the misleading "Indexing N files" phase NEVER appeared on a valid-skip open. `AppState`
+/// is now `@Observable` (no Combine `$` publisher), so this re-arms an Observation tracking loop:
+/// each change schedules a main-actor read of the new value and re-arms. `workspaceActivity` is
+/// mutated only on the main actor and the test awaits between phases, so each phase is captured.
 @MainActor
 private final class ActivityRecorder {
   private(set) var observedDetails: [String] = []
-  private var cancellable: AnyCancellable?
+  private let appState: AppState
 
   init(observing appState: AppState) {
-    cancellable = appState.$workspaceActivity.sink { [weak self] activity in
-      if let detail = activity?.detail {
-        self?.observedDetails.append(detail)
+    self.appState = appState
+    record(appState.workspaceActivity)
+    arm()
+  }
+
+  private func record(_ activity: WorkspaceActivity?) {
+    if let detail = activity?.detail {
+      observedDetails.append(detail)
+    }
+  }
+
+  private func arm() {
+    withObservationTracking {
+      _ = appState.workspaceActivity
+    } onChange: { [weak self] in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.record(self.appState.workspaceActivity)
+        self.arm()
       }
     }
   }

@@ -2,14 +2,14 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @State private var showDispatch = false
 
   private var dispatchRoot: URL {
     appState.folderURL
-      ?? appState.documentSession.url?.deletingLastPathComponent()
+      ?? appState.documentURL?.deletingLastPathComponent()
       ?? FileManager.default.homeDirectoryForCurrentUser
   }
 
@@ -21,10 +21,10 @@ struct ContentView: View {
       EditorPreviewSplit()
     }
     .navigationTitle(
-      appState.documentSession.hasEditableBuffer
-        ? appState.documentSession.displayTitle : "Pensieve"
+      appState.documentHasEditableBuffer
+        ? appState.documentTitle : "Pensieve"
     )
-    .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
+    .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
     .toolbar {
       EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
       ToolbarItem {
@@ -33,14 +33,14 @@ struct ContentView: View {
         } label: {
           Label("Dispatch to Agent", systemImage: "paperplane")
         }
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
         .help("Dispatch to Agent")
         .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
         .sheet(isPresented: $showDispatch) {
           DispatchPopover(
             controller: controller,
             isPresented: $showDispatch,
-            documentTitle: appState.documentSession.displayTitle,
+            documentTitle: appState.documentTitle,
             defaultRoot: dispatchRoot
           )
         }
@@ -50,7 +50,7 @@ struct ContentView: View {
 }
 
 struct EditorPreviewSplit: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
 
   /// Minimum pane width below which `.split` collapses to a single pane.
   /// Two panes × 260 + ~40 chrome = 560; below that, side-by-side stops
@@ -69,7 +69,7 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    if !appState.documentSession.hasEditableBuffer {
+    if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView(
         hasWorkspace: appState.hasWorkspaceContent,
         activity: appState.workspaceActivity

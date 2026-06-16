@@ -3,11 +3,12 @@ import Combine
 import SwiftUI
 
 struct EditorView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
 
   var body: some View {
-    VStack(spacing: 0) {
+    @Bindable var appState = appState
+    return VStack(spacing: 0) {
       if appState.findBarVisible {
         FindBar()
       }
@@ -226,6 +227,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var autocompleteCancellable: AnyCancellable?
   private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
+  /// Logical line index (newline count before the caret) at the last typewriter
+  /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
+  private var lastCenteredLine: Int?
   private var findQuery = ""
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
@@ -360,6 +364,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textStorage.string != text {
       isApplyingExternalText = true
+      lastCenteredLine = nil  // document changed under us; allow the next center
       invalidateAutocomplete()
       // A model→view text re-sync must NOT yank the viewport to the caret. Preserve the
       // caret + scroll across the full re-apply so a re-render never resets selection to 0
@@ -613,6 +618,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     let textLength = (textStorage.string as NSString).length
     let selection = textView.selectedRange()
     let location = min(max(selection.location, 0), textLength)
+
+    // Typewriter holds steady WHILE typing on a line and re-centers only when
+    // the caret's logical line changes. The old guard assumed the caret-glyph
+    // midY is stable for same-line typing — it is NOT (firstRect wobbles a
+    // fraction of a line on each character), so the document jumped on every
+    // keystroke in Focus mode. Anchoring on the newline-count line makes a
+    // same-line edit physically unable to re-center.
+    let caretLine = lineIndex(forUTF16Offset: location)
+    if caretLine == lastCenteredLine { return }
+    lastCenteredLine = caretLine
+
     let range = NSRange(location: location, length: 0)
     var actualRange = NSRange(location: NSNotFound, length: 0)
     let screenRect = textView.firstRect(forCharacterRange: range, actualRange: &actualRange)
@@ -635,14 +651,28 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       visibleHeight: visible.height,
       documentHeight: documentHeight
     )
-    // IfNeeded (the name was a lie): skip redundant re-centering when the caret line
-    // is already at the typewriter target. Without this guard, every keystroke re-issues
-    // a ~0px scroll + reflectScrolledClipView, and the document visibly JUMPS on each
-    // typed character in Focus mode. Same-line typing keeps caretMidY (→ targetY) stable,
-    // so this no-ops; a real vertical caret move (new line, wrap) still re-centers.
+    // Secondary no-op: on a genuine line change, still skip a sub-pixel scroll.
+    // The PRIMARY same-line guard is the logical-line check at the top —
+    // caretMidY from firstRect is NOT stable across same-line edits, so this
+    // tolerance alone let the document JUMP on every keystroke in Focus mode.
     guard abs(targetY - visible.origin.y) > 0.5 else { return }
     scrollView.contentView.scroll(to: NSPoint(x: visible.origin.x, y: targetY))
     scrollView.reflectScrolledClipView(scrollView.contentView)
+  }
+
+  /// Logical line index = number of newlines before `offset`. Layout-free and
+  /// stable across same-line horizontal edits — the property the typewriter
+  /// re-center guard needs and the caret-glyph rect does not have.
+  private func lineIndex(forUTF16Offset offset: Int) -> Int {
+    let ns = textStorage.string as NSString
+    let clamped = min(max(offset, 0), ns.length)
+    var line = 0
+    var i = 0
+    while i < clamped {
+      if ns.character(at: i) == 0x0A { line += 1 }
+      i += 1
+    }
+    return line
   }
 
   static func centeredScrollY(

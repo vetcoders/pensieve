@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct FindBar: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
 
   // "3 of 12" while navigating, "12 found" before the first jump, "No results"
   // when the query matches nothing — shown inline in the bar's search area.
@@ -16,7 +16,8 @@ struct FindBar: View {
   }
 
   var body: some View {
-    HStack(spacing: 6) {
+    @Bindable var appState = appState
+    return HStack(spacing: 6) {
       // Disclosure toggle next to the search field: reveals/hides the Replace
       // row inline so Replace is discoverable from the bar itself, not only via
       // the ⌘⌥F menu shortcut.
