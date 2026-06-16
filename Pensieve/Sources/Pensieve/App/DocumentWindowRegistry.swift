@@ -34,7 +34,20 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure?
+  
+  /// Opens a new empty launcher window. Used when the app is reactivated from
+  /// the Dock with no visible windows, or during cold start if SwiftUI does not
+  /// provide one automatically.
+  func openLauncherWindow() {
+    guard let factory = makeDocumentWindow else { return }
+    if let launcher = factory(nil) {
+      registerLauncher(launcher)
+      orderAndActivateWindow(launcher)
+    }
+  }
+
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void

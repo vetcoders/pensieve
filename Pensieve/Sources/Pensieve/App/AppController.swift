@@ -20,8 +20,14 @@ final class AppController: ObservableObject {
   ]
   let defaultAgent = "codex"
   /// Agents discovered at runtime from `vibecrafted doctor` (agent-stream:<name>).
-  /// Seeded with the default so the picker is never empty before discovery returns.
-  @Published var availableAgents: [String] = ["codex"]
+  /// `discoverAgents()` refines this, but it only overwrites on a NON-empty probe,
+  /// and current `vibecrafted doctor` output no longer emits `agent-stream:<name>`
+  /// markers — so this seed is what the picker actually shows. Seed the full
+  /// canonical fleet (matches the `vibecrafted` command deck) instead of a single
+  /// agent, so the operator can pick any of them without waiting on broken probing.
+  @Published var availableAgents: [String] = [
+    "claude", "codex", "gemini", "agy", "junie", "grok",
+  ]
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(

@@ -135,6 +135,30 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       NSApp.setActivationPolicy(.regular)
       NSApp.activate(ignoringOtherApps: true)
     }
+
+    // Force application to show its main window if none was restored
+    Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 150_000_000)
+      if NSApp.windows.isEmpty {
+        if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
+          DocumentWindowRegistry.shared.openLauncherWindow()
+        } else {
+          NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+        }
+      }
+    }
+  }
+
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    guard !flag else { return true }
+    Task { @MainActor in
+      if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
+        DocumentWindowRegistry.shared.openLauncherWindow()
+      } else {
+        NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+      }
+    }
+    return true
   }
 
   func application(_ application: NSApplication, open urls: [URL]) {
