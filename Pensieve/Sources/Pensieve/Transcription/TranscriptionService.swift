@@ -55,6 +55,8 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 final class TranscriptionService: ObservableObject, VistaEventListener, @unchecked Sendable {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
+  typealias MicrophonePermissionPolicy = @Sendable (VistaEngineProtocol) -> Bool
+  typealias MicrophonePermissionRequester = @Sendable () async throws -> Void
 
   @Published private(set) var committed: String
   @Published private(set) var preview: String
@@ -68,6 +70,8 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var dispatchStatus: String?
 
   private let engineFactory: EngineFactory
+  private let requiresMicrophonePermission: MicrophonePermissionPolicy
+  private let microphonePermissionRequester: MicrophonePermissionRequester
   private let cadenceCommitNanoseconds: UInt64
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
@@ -78,10 +82,16 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   init(
     engine: VistaEngineProtocol? = nil,
     engineFactory: @escaping EngineFactory = { VistaEngine() },
+    requiresMicrophonePermission: @escaping MicrophonePermissionPolicy = { $0 is VistaEngine },
+    microphonePermissionRequester: @escaping MicrophonePermissionRequester = {
+      try await TranscriptionService.ensureMicrophonePermission()
+    },
     cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
     self.engine = engine
     self.engineFactory = engineFactory
+    self.requiresMicrophonePermission = requiresMicrophonePermission
+    self.microphonePermissionRequester = microphonePermissionRequester
     self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""
@@ -102,7 +112,8 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     var errorDescription: String? {
       switch self {
       case .denied:
-        return "Microphone permission is required for transcription. Enable it in System Settings → Privacy & Security → Microphone."
+        return "Microphone permission is required for transcription. "
+          + "Enable it in System Settings → Privacy & Security → Microphone."
       case .restricted:
         return "Microphone access is restricted on this system."
       }
@@ -114,7 +125,8 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     case .authorized:
       return
     case .notDetermined:
-      let granted = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+      let granted = await withCheckedContinuation {
+        (continuation: CheckedContinuation<Bool, Never>) in
         AVCaptureDevice.requestAccess(for: .audio) { granted in
           continuation.resume(returning: granted)
         }
@@ -137,10 +149,13 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     engine.setEventListener(listener: self)
     isPreparingRecording = true
     lastError = nil
-    startRecordingTask = Task { [weak self] in
+    let requiresMicrophonePermission = self.requiresMicrophonePermission
+    let microphonePermissionRequester = self.microphonePermissionRequester
+    startRecordingTask = Task {
+      [weak self, requiresMicrophonePermission, microphonePermissionRequester] in
       do {
-        if engine is VistaEngine {
-          try await Self.ensureMicrophonePermission()
+        if requiresMicrophonePermission(engine) {
+          try await microphonePermissionRequester()
         }
         try Task.checkCancellation()
       } catch {
