@@ -97,7 +97,7 @@ final class WorkspaceCacheStore {
     .completeFileProtection,
   ]
   private static let fallbackWriteOptions: Data.WritingOptions = [
-    .atomic,
+    .atomic
   ]
 
   private let baseDirectory: URL

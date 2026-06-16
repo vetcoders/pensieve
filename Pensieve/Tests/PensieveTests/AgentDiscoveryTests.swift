@@ -31,6 +31,7 @@ final class AgentDiscoveryTests: XCTestCase {
 
   func testEmptyOrUnrelatedOutputYieldsNoAgents() {
     XCTAssertTrue(AppController.agentStreamNames(in: "").isEmpty)
-    XCTAssertTrue(AppController.agentStreamNames(in: "fail: something broke\nok: snapshot fresh").isEmpty)
+    XCTAssertTrue(
+      AppController.agentStreamNames(in: "fail: something broke\nok: snapshot fresh").isEmpty)
   }
 }
