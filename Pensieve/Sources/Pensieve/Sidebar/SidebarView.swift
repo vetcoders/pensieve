@@ -3,7 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SidebarView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   // Live open-tab group (the actual tabs), published by the window registry so
   // "Open Files" mirrors the tab chain instead of a per-window working set.
@@ -314,7 +314,13 @@ struct SidebarView: View {
 
   private var sortMenu: some View {
     Menu {
-      Picker("Sort", selection: $appState.sidebarSortOrder) {
+      Picker(
+        "Sort",
+        selection: Binding(
+          get: { appState.sidebarSortOrder },
+          set: { appState.sidebarSortOrder = $0 }
+        )
+      ) {
         ForEach(SidebarSortOrder.allCases) { order in
           Text(order.label).tag(order)
         }

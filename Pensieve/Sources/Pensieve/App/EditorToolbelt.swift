@@ -12,7 +12,9 @@ import SwiftUI
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
 /// toolbar's theme picker and `PreviewView` see the same selection.
 struct EditorToolbelt: ToolbarContent {
-  @ObservedObject var appState: AppState
+  // AppState is @Observable: a plain `var` is observed when its properties are
+  // read in this toolbar body. controller/themeManager stay ObservableObject.
+  var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
 
@@ -23,8 +25,10 @@ struct EditorToolbelt: ToolbarContent {
   /// The format strip and editor-facing controls light up for ANY editable buffer —
   /// untitled scratch notes included — not only file-backed documents. Gating them on
   /// `document != nil` made the whole edit toolbar vanish while editing an untitled note.
+  /// Reads the discrete `documentHasEditableBuffer` mirror, not `documentSession`,
+  /// so typing (a text-only change) never re-evaluates the toolbar.
   private var hasEditableBuffer: Bool {
-    appState.documentSession.hasEditableBuffer
+    appState.documentHasEditableBuffer
   }
 
   private var transcriptionTaflaSystemImage: String {
@@ -71,7 +75,12 @@ struct EditorToolbelt: ToolbarContent {
       .disabled(!hasEditableBuffer)
       .accessibilityIdentifier("pensieve.toolbar.reload")
 
-      Toggle(isOn: $appState.previewAutoReload) {
+      Toggle(
+        isOn: Binding(
+          get: { appState.previewAutoReload },
+          set: { appState.previewAutoReload = $0 }
+        )
+      ) {
         Image(systemName: "arrow.triangle.2.circlepath")
       }
       .toggleStyle(.button)

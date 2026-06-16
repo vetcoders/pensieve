@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 // Pensieve — native macOS markdown editor (file-first, source-first)
 
 import Foundation
@@ -12,7 +12,7 @@ let qubeFFILibraryPath = "\(packageRoot)/Vendor/qube-ffi/\(qubeFFIProfile)"
 let package = Package(
     name: "Pensieve",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "Pensieve", targets: ["Pensieve"])
@@ -58,5 +58,9 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift")
             ]
         )
-    ]
+    ],
+    // Tools bumped to 6.0 for the macOS 15 target (Observation needs >= 14).
+    // Pin Swift 5 language mode: this is NOT a Swift 6 strict-concurrency
+    // migration — that would be a separate, much larger change.
+    swiftLanguageModes: [.v5]
 )

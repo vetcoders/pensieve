@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import SwiftUI
 
 enum EditorMode: Int, CaseIterable, Identifiable {
@@ -53,18 +53,11 @@ struct FindBarCommand: Equatable, Identifiable {
   let action: Action
 }
 
+@Observable
 @MainActor
-final class AppState: ObservableObject {
+final class AppState {
   let workspaceStore: WorkspaceStore
   let windowModel: DocumentWindowModel
-  private var cancellables: Set<AnyCancellable> = []
-  @Published var workspaceActivity: WorkspaceActivity? {
-    didSet {
-      if workspaceStore.workspaceActivity != workspaceActivity {
-        workspaceStore.workspaceActivity = workspaceActivity
-      }
-    }
-  }
 
   init(
     workspaceStore: WorkspaceStore? = nil,
@@ -73,22 +66,14 @@ final class AppState: ObservableObject {
   ) {
     self.workspaceStore = workspaceStore ?? WorkspaceStore(defaults: defaults)
     self.windowModel = windowModel ?? DocumentWindowModel(defaults: defaults)
-    self.workspaceActivity = self.workspaceStore.workspaceActivity
+  }
 
-    self.workspaceStore.objectWillChange
-      .sink { [weak self] _ in
-        self?.objectWillChange.send()
-      }
-      .store(in: &cancellables)
-    self.workspaceStore.$workspaceActivity
-      .sink { [weak self] activity in
-        guard let self, self.workspaceActivity != activity else { return }
-        self.workspaceActivity = activity
-      }
-      .store(in: &cancellables)
-    self.windowModel.objectWillChange
-      .sink { [weak self] _ in self?.objectWillChange.send() }
-      .store(in: &cancellables)
+  // Forwarded straight to the workspace store; with `@Observable`, reading this
+  // in a view tracks `workspaceStore.workspaceActivity` directly — no manual
+  // objectWillChange fan-in needed (that was the per-keystroke storm source).
+  var workspaceActivity: WorkspaceActivity? {
+    get { workspaceStore.workspaceActivity }
+    set { workspaceStore.workspaceActivity = newValue }
   }
 
   var folderURL: URL? {
@@ -160,6 +145,13 @@ final class AppState: ObservableObject {
     get { windowModel.documentSession }
     set { windowModel.documentSession = newValue }
   }
+
+  // Discrete metadata mirrors (see DocumentWindowModel). Window chrome reads
+  // these so a text-only edit never invalidates it.
+  var documentTitle: String { windowModel.documentTitle }
+  var documentHasEditableBuffer: Bool { windowModel.documentHasEditableBuffer }
+  var documentURL: URL? { windowModel.documentURL }
+  var documentIsDirty: Bool { windowModel.documentIsDirty }
 
   var mode: EditorMode {
     get { windowModel.mode }

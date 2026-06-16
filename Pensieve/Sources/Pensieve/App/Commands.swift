@@ -2,8 +2,23 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+// AppState is @Observable, so it cannot ride @FocusedObject (Combine-only).
+// Expose it as a typed FocusedValue instead; PensieveApp publishes it via
+// `.focusedSceneValue(\.appState, appState)`. AppController stays
+// ObservableObject and keeps @FocusedObject / .focusedSceneObject.
+private struct AppStateFocusedValueKey: FocusedValueKey {
+  typealias Value = AppState
+}
+
+extension FocusedValues {
+  var appState: AppState? {
+    get { self[AppStateFocusedValueKey.self] }
+    set { self[AppStateFocusedValueKey.self] = newValue }
+  }
+}
+
 struct PensieveCommands: Commands {
-  @FocusedObject private var appState: AppState?
+  @FocusedValue(\.appState) private var appState: AppState?
   @FocusedObject private var controller: AppController?
   @ObservedObject var themeManager: ThemeManager
 
@@ -19,7 +34,8 @@ struct PensieveCommands: Commands {
 }
 
 private struct ActivePensieveCommands: Commands {
-  @ObservedObject var appState: AppState
+  // @Observable AppState observed via a plain stored property.
+  var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
 
@@ -79,19 +95,19 @@ private struct ActivePensieveCommands: Commands {
         saveActiveDocument()
       }
       .keyboardShortcut("s", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Save As…") {
         saveActiveDocumentAs()
       }
       .keyboardShortcut("s", modifiers: [.command, .shift])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Share…") {
         DocumentSharing.share(session: appState.documentSession)
       }
       .keyboardShortcut("s", modifiers: [.command, .control])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Export HTML…") {
         DocumentExport.exportHTML(
@@ -101,7 +117,7 @@ private struct ActivePensieveCommands: Commands {
           themeManager: themeManager
         )
       }
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Export PDF…") {
         DocumentExport.exportPDF(
@@ -111,7 +127,7 @@ private struct ActivePensieveCommands: Commands {
           themeManager: themeManager
         )
       }
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Divider()
 
@@ -151,7 +167,7 @@ private struct ActivePensieveCommands: Commands {
         controller.closeActiveDocument()
       }
       .keyboardShortcut("w", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
     }
 
     CommandGroup(after: .toolbar) {
@@ -231,7 +247,7 @@ private struct ActivePensieveCommands: Commands {
         appState.requestPreviewRefresh()
       }
       .keyboardShortcut("r", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button(appState.previewAutoReload ? "Pause Auto Reload" : "Resume Auto Reload") {
         appState.previewAutoReload.toggle()
@@ -273,55 +289,55 @@ private struct ActivePensieveCommands: Commands {
           controller.applyMarkdownFormat(.bold)
         }
         .keyboardShortcut("b", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Italic") {
           controller.applyMarkdownFormat(.italic)
         }
         .keyboardShortcut("i", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Strikethrough") {
           controller.applyMarkdownFormat(.strike)
         }
         .keyboardShortcut("x", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Quote") {
           controller.applyMarkdownFormat(.quote)
         }
         .keyboardShortcut("'", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Code") {
           controller.applyMarkdownFormat(.code)
         }
         .keyboardShortcut("`", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Link") {
           controller.applyMarkdownFormat(.link)
         }
         .keyboardShortcut("k", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Bulleted List") {
           controller.applyMarkdownFormat(.bulletedList)
         }
         .keyboardShortcut("8", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Numbered List") {
           controller.applyMarkdownFormat(.numberedList)
         }
         .keyboardShortcut("7", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Tidy Table") {
           controller.tidyTable()
         }
         .keyboardShortcut("t", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
       }
 
       Divider()
@@ -448,7 +464,7 @@ private struct ActivePensieveCommands: Commands {
 
   private var sidebarActionTargetURL: URL? {
     appState.sidebarFocusedURL
-      ?? appState.documentSession.url
+      ?? appState.documentURL
       ?? appState.selectedDocumentID
   }
 

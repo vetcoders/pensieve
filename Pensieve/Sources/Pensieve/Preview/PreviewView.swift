@@ -18,7 +18,7 @@ import WebKit
 /// `EnvironmentObject` so the toolbar theme picker, the preview pane, and
 /// any future side surfaces all see the same selection.
 struct PreviewView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var themeManager: ThemeManager
 
   var body: some View {

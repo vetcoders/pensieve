@@ -1,37 +1,38 @@
-import Combine
 import Foundation
+import Observation
 import SwiftUI
 
+@Observable
 @MainActor
-final class WorkspaceStore: ObservableObject {
+final class WorkspaceStore {
   static let maxOpenFiles = 12
   private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
   private let defaults: UserDefaults
 
-  @Published var folderURL: URL?
-  @Published var workspaceRoots: [WorkspaceRoot] = []
-  @Published var workspaceTree: [WorkspaceNode] = []
-  @Published var documents: [DocumentRef] = [] {
+  var folderURL: URL?
+  var workspaceRoots: [WorkspaceRoot] = []
+  var workspaceTree: [WorkspaceNode] = []
+  var documents: [DocumentRef] = [] {
     didSet { rebuildAllDocumentsCache() }
   }
-  @Published var openFiles: [DocumentRef] = [] {
+  var openFiles: [DocumentRef] = [] {
     didSet { rebuildAllDocumentsCache() }
   }
-  @Published var excludedWorkspacePaths: Set<String> = []
-  @Published var workspaceSearchQuery: String = ""
-  @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
-  @Published var sidebarFocusedURL: URL?
-  @Published var pendingSidebarRenameURL: URL?
-  @Published var bookmarkData: Data?
-  @Published var workspaceActivity: WorkspaceActivity?
-  @Published var sidebarSortOrder: SidebarSortOrder {
+  var excludedWorkspacePaths: Set<String> = []
+  var workspaceSearchQuery: String = ""
+  var workspaceSearchResults: [WorkspaceSearchResult] = []
+  var sidebarFocusedURL: URL?
+  var pendingSidebarRenameURL: URL?
+  var bookmarkData: Data?
+  var workspaceActivity: WorkspaceActivity?
+  var sidebarSortOrder: SidebarSortOrder {
     didSet {
       defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
     }
   }
 
-  private(set) var allDocuments: [DocumentRef] = []
-  private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
+  @ObservationIgnored private(set) var allDocuments: [DocumentRef] = []
+  @ObservationIgnored private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults

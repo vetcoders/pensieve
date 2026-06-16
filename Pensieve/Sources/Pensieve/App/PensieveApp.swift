@@ -5,12 +5,13 @@ import SwiftUI
 @main
 struct PensieveApp: App {
   @NSApplicationDelegateAdaptor(PensieveAppDelegate.self) private var appDelegate
-  @StateObject private var workspaceStore: WorkspaceStore
+  // WorkspaceStore is @Observable now → @State, not @StateObject.
+  @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
 
   init() {
-    _workspaceStore = StateObject(wrappedValue: WorkspaceStore())
+    _workspaceStore = State(wrappedValue: WorkspaceStore())
     _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
     _themeManager = StateObject(wrappedValue: ThemeManager())
   }
@@ -45,7 +46,8 @@ struct DocumentWindowRootView: View {
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
 
-  @StateObject private var appState: AppState
+  // AppState is @Observable now → @State, not @StateObject.
+  @State private var appState: AppState
   @StateObject private var controller: AppController
   @State private var loadedInitialDocumentID: DocumentRef.ID?
   @State private var initialDocumentLoadResolved = false
@@ -64,7 +66,7 @@ struct DocumentWindowRootView: View {
     self.initialDocument = initialDocument
 
     let appState = AppState(workspaceStore: workspaceStore)
-    _appState = StateObject(wrappedValue: appState)
+    _appState = State(wrappedValue: appState)
     _controller = StateObject(
       wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
   }
@@ -79,11 +81,11 @@ struct DocumentWindowRootView: View {
         StartupPresentationView()
       }
     }
-    .environmentObject(appState)
+    .environment(appState)
     .environmentObject(controller)
     .environmentObject(controller.transcriptionService)
     .environmentObject(themeManager)
-    .focusedSceneObject(appState)
+    .focusedSceneValue(\.appState, appState)
     .focusedSceneObject(controller)
     .background(
       DocumentWindowAccessor(
@@ -98,9 +100,9 @@ struct DocumentWindowRootView: View {
           selected: appState.selectedDocumentID,
           initialDocument: initialDocument,
           loadResolved: initialDocumentLoadResolved),
-        title: appState.documentSession.displayTitle,
-        representedURL: appState.documentSession.url,
-        hasEditableBuffer: appState.documentSession.hasEditableBuffer
+        title: appState.documentTitle,
+        representedURL: appState.documentURL,
+        hasEditableBuffer: appState.documentHasEditableBuffer
       ) { window in
         currentWindow = window
       }
