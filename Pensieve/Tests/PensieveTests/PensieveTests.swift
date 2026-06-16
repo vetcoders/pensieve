@@ -2795,6 +2795,54 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testBareLaunchSettlesAndShowsLauncherWhenSavedWorkspaceIsGone() async throws {
+    let suiteName = "PensieveBareLaunchTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let removedFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRemovedWorkspace-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: removedFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: removedFolder)
+    }
+
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    try bookmarkStore.persistRoot(url: removedFolder, into: AppState())
+    try FileManager.default.removeItem(at: removedFolder)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: FileManager.default.temporaryDirectory)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: manager,
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    var startupDecisionCount = 0
+
+    coordinator.startWhenLaunchIntentsSettle(controller: controller) {
+      startupDecisionCount += 1
+    }
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(startupDecisionCount, 1)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty)
+    XCTAssertTrue(appState.openFiles.isEmpty)
+    XCTAssertNil(appState.documentSession.url)
+    XCTAssertNil(appState.lastError)
+  }
+
+  @MainActor
   func testLaunchFileIntentInterruptingSettleSignalsStartupDecisionOnce() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(

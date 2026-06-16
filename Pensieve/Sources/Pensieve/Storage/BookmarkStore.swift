@@ -201,7 +201,9 @@ final class BookmarkStore {
 
         return url
       } catch {
-        appState.lastError = "Could not restore saved workspace item: \(error.localizedDescription)"
+        // Missing/stale saved workspace entries are startup state, not a user action failure.
+        // Bare launch must still present the empty launcher instead of surfacing an old bookmark
+        // error when the only saved folder was removed outside Pensieve.
         return nil
       }
     }
