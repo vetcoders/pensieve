@@ -233,8 +233,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var hasNotifiedFindState = false
   private var lastNotifiedFindCount = -1
   private var lastNotifiedFindActiveIndex: Int?
-  private var lastPostedEditorBlock: Int?
-  private var lastPreviewAppliedBlock: Int?
+  private(set) var lastPostedEditorBlock: Int?
+  private(set) var lastPreviewAppliedBlock: Int?
+  private var pendingEditorViewportPost = false
+  private var pendingPreviewViewportBlock: Int?
+  private var previewViewportApplyScheduled = false
 
   init(
     text: String,
@@ -542,22 +545,53 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   @objc private func handlePreviewViewportChanged(_ note: Notification) {
-    // DISABLED (P0 crash, builds 146/148): driving the editor's scroll from the preview re-enters
-    // TextKit2 layout (scrollRangeToVisible → bounds-change → editorBoundsDidChange →
-    // currentTopVisibleBlockIndex → characterIndexForInsertion) and crashes with EXC_BAD_ACCESS in
-    // objc_msgSend. Two targeted guards (bbdb719 first-responder, d4aa124 re-entrancy flag) did NOT
-    // hold — the crashing layout query also fires from textDidChange / selection paths. Until two-way
-    // scroll-sync is re-implemented OFF the layout pass (async/coalesced, never querying layout inside
-    // a notification), the preview must NOT move the editor. Panes scroll independently.
-    _ = note
+    guard let block = note.userInfo?["block"] as? Int else { return }
+    pendingPreviewViewportBlock = block
+    guard !previewViewportApplyScheduled else { return }
+    previewViewportApplyScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      self?.applyPendingPreviewViewportScroll()
+    }
   }
 
-  private func postEditorViewportIfNeeded() {
-    // DISABLED (P0 crash, builds 146/148): currentTopVisibleBlockIndex() → characterIndexForInsertion
-    // triggers TextKit2 viewport layout (a nested scroll) when invoked from a bounds-change / text /
-    // selection notification → EXC_BAD_ACCESS. The editor no longer pushes its viewport to the
-    // preview; both panes scroll independently. Re-enable only with an async/coalesced, layout-safe
-    // top-block computation that never runs characterIndexForInsertion inside a notification.
+  private func applyPendingPreviewViewportScroll() {
+    previewViewportApplyScheduled = false
+    guard let block = pendingPreviewViewportBlock else { return }
+    pendingPreviewViewportBlock = nil
+    guard block != lastPreviewAppliedBlock else { return }
+    guard
+      let location = MarkdownBlockMapper.utf16Location(
+        forBlockIndex: block,
+        in: textStorage.string)
+    else {
+      return
+    }
+    lastPreviewAppliedBlock = block
+    lastPostedEditorBlock = block
+    isApplyingPreviewScroll = true
+    textView.scrollRangeToVisible(NSRange(location: location, length: 0))
+    isApplyingPreviewScroll = false
+  }
+
+  func postEditorViewportIfNeeded() {
+    guard !isApplyingPreviewScroll, !pendingEditorViewportPost else { return }
+    pendingEditorViewportPost = true
+    DispatchQueue.main.async { [weak self] in
+      self?.publishEditorViewportIfNeeded()
+    }
+  }
+
+  private func publishEditorViewportIfNeeded() {
+    pendingEditorViewportPost = false
+    guard !isApplyingPreviewScroll else { return }
+    guard let block = currentTopVisibleBlockIndex() else { return }
+    guard block != lastPostedEditorBlock else { return }
+    lastPostedEditorBlock = block
+    NotificationCenter.default.post(
+      name: .vcEditorViewportChanged,
+      object: nil,
+      userInfo: ["block": block]
+    )
   }
 
   private func currentTopVisibleBlockIndex() -> Int? {
