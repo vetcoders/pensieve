@@ -141,6 +141,40 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
   }
 
   @MainActor
+  func test_typing_does_not_drive_editor_viewport_sync() throws {
+    // The per-keystroke "blocks vanish + vertical reflow without viewport
+    // mutation" symptom: textDidChange posted the editor viewport on every
+    // edit, and publishing queries currentTopVisibleBlockIndex ->
+    // characterIndexForInsertion, which forces a TextKit2 layout pass mid-edit
+    // (fragments invalidate -> vanish/reflow). Typing does not scroll, so it
+    // must NOT drive viewport sync — that belongs to editorBoundsDidChange.
+    let (surface, window) = makeHostedSurface(text: longDocument())
+    defer { window.contentView = nil }
+    surface.typewriterScrollEnabled = false
+
+    // Pin the viewport so the caret is IN VIEW — then typing causes no scroll.
+    let docHeight = surface.textView.bounds.height
+    surface.scrollView.contentView.scroll(to: NSPoint(x: 0, y: (docHeight - 400) / 2))
+    surface.scrollView.reflectScrolledClipView(surface.scrollView.contentView)
+    let caret = (surface.textStorage.string as NSString).length / 2
+    surface.textView.setSelectedRange(NSRange(location: caret, length: 0))
+    drainMainQueue()  // let any setup-scroll viewport query settle first
+
+    // Count forced-layout viewport queries directly (dedup-proof: the query
+    // runs BEFORE the notification dedup, so counting it — not the post — is
+    // the sound guard).
+    let queriesBefore = surface.editorViewportLayoutQueryCount
+    surface.textView.insertText("x", replacementRange: NSRange(location: caret, length: 0))
+    drainMainQueue()
+
+    XCTAssertEqual(
+      surface.editorViewportLayoutQueryCount, queriesBefore,
+      "In-view typing forced a TextKit2 viewport layout query "
+        + "(characterIndexForInsertion) — the per-keystroke block-vanish/reflow."
+    )
+  }
+
+  @MainActor
   func test_typing_at_offscreen_caret_scrolls_it_into_view_expected() throws {
     // Boundary: caret OFF-SCREEN (at the end, viewport parked in the middle).
     // Scrolling an off-screen caret into view on edit is EXPECTED behavior, not
