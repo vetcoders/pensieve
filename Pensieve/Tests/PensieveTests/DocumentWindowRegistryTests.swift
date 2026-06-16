@@ -140,6 +140,37 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenLauncherWindowCreatesAndActivatesUntitledLauncher() throws {
+    let launcherWindow = Self.makeWindow()
+    var factoryRefs: [DocumentRef?] = []
+    var activatedWindows: [NSWindow] = []
+    defer { launcherWindow.close() }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("launcher open should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { activatedWindows.append($0) },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return launcherWindow
+      }
+    )
+
+    registry.openLauncherWindow()
+
+    XCTAssertEqual(factoryRefs.count, 1)
+    XCTAssertNil(factoryRefs[0], "cold start must request an untitled launcher window")
+    XCTAssertEqual(
+      activatedWindows.map { ObjectIdentifier($0) },
+      [ObjectIdentifier(launcherWindow)])
+    XCTAssertEqual(launcherWindow.title, "Pensieve")
+    XCTAssertNil(launcherWindow.representedURL)
+    XCTAssertEqual(registry.openTabDocumentIDs, [])
+  }
+
+  @MainActor
   private static func makeWindow() -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),

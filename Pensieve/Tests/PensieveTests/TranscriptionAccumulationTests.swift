@@ -110,6 +110,31 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testStartRecordingRequestsMicrophoneBeforeRealEngineCapture() async {
+    let events = LockedStringLog()
+    let engine = MockVistaAutocompleteEngine(
+      startRecordingHandler: { _ in events.append("startRecording") })
+    let service = TranscriptionService(
+      engine: engine,
+      requiresMicrophonePermission: { _ in true },
+      microphonePermissionRequester: {
+        events.append("permission")
+      },
+      cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(events.values, ["permission", "startRecording"])
+    XCTAssertTrue(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertNil(service.lastError)
+  }
+
+  @MainActor
   func testTeardownDuringPreparationNeverStartsRecording() async {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
@@ -447,6 +472,23 @@ final class TranscriptionAccumulationTests: XCTestCase {
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
+}
+
+private final class LockedStringLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [String] = []
+
+  func append(_ value: String) {
+    lock.lock()
+    storage.append(value)
+    lock.unlock()
+  }
+
+  var values: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
   }
 }
 
