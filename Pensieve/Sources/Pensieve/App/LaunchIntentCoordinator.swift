@@ -149,7 +149,10 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+  func applicationShouldHandleReopen(
+    _ sender: NSApplication,
+    hasVisibleWindows flag: Bool
+  ) -> Bool {
     guard !flag else { return true }
     Task { @MainActor in
       if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
