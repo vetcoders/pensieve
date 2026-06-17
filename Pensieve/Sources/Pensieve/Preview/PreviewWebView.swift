@@ -111,6 +111,7 @@ final class PreviewWebView: NSView {
           document.head.appendChild(script);
         }
 
+        \(Self.viewportBridgeScript)
         \(document.containsMath ? Self.mathBootstrapScript : "")
         \(document.mermaidJavaScript == nil ? "" : Self.mermaidBootstrapScript)
 
@@ -412,6 +413,23 @@ final class PreviewWebView: NSView {
           node.setAttribute('title', error && error.message ? error.message : String(error));
         }
       });
+    })();
+    """
+
+  static let viewportBridgeScript: String = """
+    (function() {
+      window.__vcScrollToBlock = function(blockIndex) {
+        const requestedIndex = String(blockIndex);
+        const blocks = Array.from(document.querySelectorAll('[data-vc-block]'));
+        const target = blocks.find(function(element) {
+          return element.getAttribute('data-vc-block') === requestedIndex;
+        });
+        if (!target) {
+          return false;
+        }
+        target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+        return true;
+      };
     })();
     """
 

@@ -5,6 +5,7 @@
 #   make            # = make help
 #   make run        # build + launch app
 #   make test       # unit + integration tests
+#   make install-app # local app install + repo git hooks
 #   make release    # full signed + notarized .app + .dmg
 #
 # Conventions:
@@ -53,7 +54,7 @@ run-release: release-local  ## Build + launch signed .app (no notarize)
 	@open "$(APP_BUNDLE)"
 
 .PHONY: install-app
-install-app: release-local  ## Build signed .app + swap the production bundle in /Applications
+install-app: init-hooks release-local  ## Build signed .app + swap the production bundle in /Applications
 	@printf "$(C_CYAN)[install]$(C_RESET) quitting running Pensieve — a live process + bundle swap = SIGKILL (code signature invalid)\n"
 	@osascript -e 'tell application id "io.vetcoders.pensieve" to quit' >/dev/null 2>&1 || true
 	@pkill -x Pensieve >/dev/null 2>&1 || true
@@ -91,7 +92,11 @@ clean-deep: clean  ## Clean + nuke SwiftPM resolved deps cache
 
 .PHONY: test
 test:  ## Run unit + integration tests
-	@cd $(PKG_DIR) && swift test 2>&1 | tail -25
+	@log="$$(mktemp -t pensieve-swift-test.XXXXXX)"; \
+	if cd $(PKG_DIR) && swift test > "$$log" 2>&1; then rc=0; else rc=$$?; fi; \
+	tail -25 "$$log"; \
+	rm -f "$$log"; \
+	exit $$rc
 
 .PHONY: ui-smoke
 ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
@@ -117,6 +122,18 @@ format:  ## Apply swift-format in-place when installed (best-effort helper)
 .PHONY: gates
 gates: test lint  ## Run all quality gates (test + lint)
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) all gates passed\n"
+
+.PHONY: init-hooks
+init-hooks:  ## Install repo-local pre-commit + pre-push hooks
+	@if [ "$$CI" = "true" ]; then \
+		printf "$(C_YELLOW)[skip]$(C_RESET) CI detected; not installing local git hooks\n"; \
+	elif git rev-parse --git-dir >/dev/null 2>&1; then \
+		git config core.hooksPath scripts/hooks >/dev/null; \
+		chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push; \
+		printf "$(C_GREEN)[ ok ]$(C_RESET) git hooks installed via core.hooksPath=scripts/hooks\n"; \
+	else \
+		true; \
+	fi
 
 .PHONY: ffi
 ffi:  ## Rebuild and vendor qube-ffi bridge/dylib (FFI_PROFILE=debug|release)

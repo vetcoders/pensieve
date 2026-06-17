@@ -103,6 +103,7 @@ extension PreviewDocument {
       <article class="markdown-body">
       \(body)
       </article>
+      <script>\(PreviewWebView.viewportBridgeScript)</script>
       \(mermaidScripts)
       \(mathScript)
       </body></html>
