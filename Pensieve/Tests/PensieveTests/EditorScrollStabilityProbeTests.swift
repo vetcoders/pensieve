@@ -168,4 +168,34 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
         + "(\(originBefore.y) -> \(originAfter.y))."
     )
   }
+
+  /// Regression for the live per-keystroke jump (operator-confirmed). With no
+  /// active find, the find-highlight cleanup must NOT mutate document attributes:
+  /// `removeFindHighlights()` used to run a whole-document
+  /// `removeAttribute(.backgroundColor)` on EVERY keystroke (textDidChange ->
+  /// refreshFindMatches) and EVERY re-render (updateNSView -> updateFind ->
+  /// clearFindHighlights), which forced a TextKit2 relayout of the viewport — the
+  /// content "jump" at a fixed scroll origin, independent of syntax highlighting.
+  /// A planted background attribute must survive cleanup when there are no matches.
+  @MainActor
+  func test_find_cleanup_is_noop_without_active_matches() throws {
+    let (surface, window) = makeHostedSurface(text: "alpha beta gamma")
+    defer { window.contentView = nil }
+
+    let sentinel = NSColor.systemBlue
+    surface.textStorage.addAttribute(
+      .backgroundColor, value: sentinel, range: NSRange(location: 0, length: 5))
+
+    // The cleanup path that fires on every keystroke / re-render with no find.
+    surface.updateFind(query: "", visible: false)
+
+    var effective = NSRange()
+    let attr = surface.textStorage.attribute(
+      .backgroundColor, at: 0, effectiveRange: &effective)
+    XCTAssertEqual(
+      attr as? NSColor, sentinel,
+      "find cleanup wiped document attributes with no active find — the "
+        + "whole-document removeAttribute that forced a per-keystroke relayout"
+    )
+  }
 }
