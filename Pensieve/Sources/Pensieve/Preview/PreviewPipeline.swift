@@ -105,7 +105,6 @@ extension PreviewDocument {
       </article>
       \(mermaidScripts)
       \(mathScript)
-      <script>\(PreviewWebView.bridgeScript)</script>
       </body></html>
       """
     return PreviewDocument(
