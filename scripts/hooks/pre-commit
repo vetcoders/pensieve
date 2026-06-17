@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACM)"
+if [ -z "$staged_files" ]; then
+    exit 0
+fi
+
+if ! printf '%s\n' "$staged_files" | grep -qE '^Pensieve/(Sources|Tests)/.*[.]swift$|^Makefile$|^scripts/hooks/'; then
+    echo "[pre-commit] No Swift/build hook files staged; skipping."
+    exit 0
+fi
+
+echo "[pre-commit] Pensieve lint gate"
+make lint

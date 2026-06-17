@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+remote="${1:-unknown}"
+url="${2:-unknown}"
+
+echo "[pre-push] Pensieve gates"
+echo "Pushing to: ${remote} (${url})"
+
+make gates
+make ffi-check
+
+echo "[pre-push] Pensieve gates passed"
