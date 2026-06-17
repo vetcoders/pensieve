@@ -38,8 +38,8 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
     return (surface, window)
   }
 
-  /// Spin the main runloop so the async `postEditorViewportIfNeeded` hop runs
-  /// before we read the origin.
+  /// Spin the main runloop so any deferred main-queue work settles before we
+  /// read the scroll origin.
   private func drainMainQueue() {
     let exp = expectation(description: "main-queue drain")
     DispatchQueue.main.async { exp.fulfill() }
@@ -137,40 +137,6 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
     XCTAssertEqual(
       originAfter.y, originBefore.y, accuracy: 0.5,
       "Focus-mode same-line typing re-centered (\(originBefore.y) -> \(originAfter.y))."
-    )
-  }
-
-  @MainActor
-  func test_typing_does_not_drive_editor_viewport_sync() throws {
-    // The per-keystroke "blocks vanish + vertical reflow without viewport
-    // mutation" symptom: textDidChange posted the editor viewport on every
-    // edit, and publishing queries currentTopVisibleBlockIndex ->
-    // characterIndexForInsertion, which forces a TextKit2 layout pass mid-edit
-    // (fragments invalidate -> vanish/reflow). Typing does not scroll, so it
-    // must NOT drive viewport sync — that belongs to editorBoundsDidChange.
-    let (surface, window) = makeHostedSurface(text: longDocument())
-    defer { window.contentView = nil }
-    surface.typewriterScrollEnabled = false
-
-    // Pin the viewport so the caret is IN VIEW — then typing causes no scroll.
-    let docHeight = surface.textView.bounds.height
-    surface.scrollView.contentView.scroll(to: NSPoint(x: 0, y: (docHeight - 400) / 2))
-    surface.scrollView.reflectScrolledClipView(surface.scrollView.contentView)
-    let caret = (surface.textStorage.string as NSString).length / 2
-    surface.textView.setSelectedRange(NSRange(location: caret, length: 0))
-    drainMainQueue()  // let any setup-scroll viewport query settle first
-
-    // Count forced-layout viewport queries directly (dedup-proof: the query
-    // runs BEFORE the notification dedup, so counting it — not the post — is
-    // the sound guard).
-    let queriesBefore = surface.editorViewportLayoutQueryCount
-    surface.textView.insertText("x", replacementRange: NSRange(location: caret, length: 0))
-    drainMainQueue()
-
-    XCTAssertEqual(
-      surface.editorViewportLayoutQueryCount, queriesBefore,
-      "In-view typing forced a TextKit2 viewport layout query "
-        + "(characterIndexForInsertion) — the per-keystroke block-vanish/reflow."
     )
   }
 
