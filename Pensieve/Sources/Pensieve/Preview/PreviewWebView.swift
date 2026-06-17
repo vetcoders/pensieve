@@ -14,36 +14,16 @@ import WebKit
 ///   • Loads a `PreviewDocument` into the underlying WKWebView.
 ///   • Routes activated `http(s)` / `mailto` links to `NSWorkspace` instead of
 ///     navigating the WebView itself.
-///   • Bridges body scroll → posts `.vcPreviewViewportChanged` so the editor
-///     can follow once an editor-side listener exists.
-///   • Exposes `scroll(toBlock:)` and listens for `.vcEditorViewportChanged`
-///     so the editor can drive preview position once an editor-side poster
-///     exists.
-///
-/// What is *not* live yet: there is no poster of `.vcEditorViewportChanged`
-/// anywhere in the app, so the editor → preview half of the two-way bridge is
-/// inert. The surface is wired so an editor agent can switch it on without
-/// touching this file.
 final class PreviewWebView: NSView {
   private let webView: WKWebView
-  private let scrollMessageName = "vcScroll"
-
-  private var lastReportedBlock: Int = -1
-  private var lastAppliedBlock: Int = -1
   private var loadedIdentity: PreviewLoadIdentity?
-
-  var onViewportChanged: ((Int) -> Void)?
 
   override init(frame frameRect: NSRect) {
     let config = WKWebViewConfiguration()
-    let userContent = WKUserContentController()
-    config.userContentController = userContent
     webView = WKWebView(frame: .zero, configuration: config)
     webView.setValue(false, forKey: "drawsBackground")
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
-
-    userContent.add(MessageProxy(target: self), name: scrollMessageName)
 
     addSubview(webView)
     webView.translatesAutoresizingMaskIntoConstraints = false
@@ -55,13 +35,6 @@ final class PreviewWebView: NSView {
     ])
 
     webView.navigationDelegate = NavigationProxy.shared
-
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(handleEditorViewportChanged(_:)),
-      name: .vcEditorViewportChanged,
-      object: nil
-    )
   }
 
   required init?(coder: NSCoder) {
@@ -69,8 +42,6 @@ final class PreviewWebView: NSView {
   }
 
   deinit {
-    webView.configuration.userContentController.removeScriptMessageHandler(
-      forName: scrollMessageName)
     NotificationCenter.default.removeObserver(self)
   }
 
@@ -92,8 +63,6 @@ final class PreviewWebView: NSView {
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
-    lastReportedBlock = -1
-    lastAppliedBlock = -1
   }
 
   private func updateLoadedPage(_ document: PreviewDocument) {
@@ -417,77 +386,6 @@ final class PreviewWebView: NSView {
     """
   }
 
-  func scroll(toBlock index: Int) {
-    guard index >= 0, index != lastAppliedBlock else { return }
-    lastAppliedBlock = index
-    let js = "window.__vcScrollToBlock && window.__vcScrollToBlock(\(index));"
-    webView.evaluateJavaScript(js, completionHandler: nil)
-  }
-
-  // MARK: - Bridge plumbing
-
-  fileprivate func receivedScrollMessage(_ body: Any) {
-    guard let dict = body as? [String: Any],
-      let block = dict["block"] as? Int,
-      block != lastReportedBlock
-    else { return }
-    lastReportedBlock = block
-    onViewportChanged?(block)
-    NotificationCenter.default.post(
-      name: .vcPreviewViewportChanged,
-      object: nil,
-      userInfo: ["block": block]
-    )
-  }
-
-  @objc private func handleEditorViewportChanged(_ note: Notification) {
-    guard let block = note.userInfo?["block"] as? Int else { return }
-    scroll(toBlock: block)
-  }
-
-  // MARK: - JS bridge
-
-  /// Viewport bridge installed in every preview document. Block elements
-  /// emitted by `HTMLEmitter` carry `data-vc-block="<index>"`; this script
-  /// (a) exposes `window.__vcScrollToBlock(idx)` so Swift can drive scroll
-  /// position, and (b) posts `vcScroll` messages with the top-visible block
-  /// index whenever the body scrolls.
-  static let bridgeScript: String = """
-    (function() {
-      function blocks() {
-        return Array.from(document.querySelectorAll('[data-vc-block]'));
-      }
-      window.__vcScrollToBlock = function(idx) {
-        const el = document.querySelector('[data-vc-block="' + idx + '"]');
-        if (el) {
-          el.scrollIntoView({behavior: 'auto', block: 'start'});
-        }
-      };
-      let pending = false;
-      function report() {
-        const els = blocks();
-        for (const el of els) {
-          const r = el.getBoundingClientRect();
-          if (r.bottom > 0) {
-            const idx = parseInt(el.getAttribute('data-vc-block'), 10);
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vcScroll) {
-              window.webkit.messageHandlers.vcScroll.postMessage({block: idx});
-            }
-            return;
-          }
-        }
-      }
-      window.addEventListener('scroll', function() {
-        if (pending) return;
-        pending = true;
-        requestAnimationFrame(function() {
-          pending = false;
-          report();
-        });
-      }, {passive: true});
-    })();
-    """
-
   static let mathBootstrapScript: String = """
     (function() {
       const nodes = Array.from(document.querySelectorAll('[data-vc-math]'));
@@ -628,37 +526,6 @@ private struct PreviewLoadIdentity: Equatable {
 // MARK: - PreviewSink conformance
 
 extension PreviewWebView: PreviewSink {}
-
-// MARK: - Notifications
-
-extension Notification.Name {
-  /// Posted by the editor when its visible viewport top changes. UserInfo
-  /// must include `["block": Int]` with the topmost visible block index.
-  static let vcEditorViewportChanged = Notification.Name("Pensieve.editorViewportChanged")
-
-  /// Posted by the preview when its visible viewport top changes. UserInfo
-  /// includes `["block": Int]`. Editor consumes for two-way sync.
-  static let vcPreviewViewportChanged = Notification.Name("Pensieve.previewViewportChanged")
-}
-
-// MARK: - WKScriptMessageHandler proxy
-// Avoids retain cycle: WKWebView ↣ userContentController ↣ handler ↣ NSView.
-// The proxy holds weak ref to the host view.
-
-private final class MessageProxy: NSObject, WKScriptMessageHandler {
-  weak var target: PreviewWebView?
-
-  init(target: PreviewWebView) {
-    self.target = target
-  }
-
-  func userContentController(
-    _ userContentController: WKUserContentController,
-    didReceive message: WKScriptMessage
-  ) {
-    target?.receivedScrollMessage(message.body)
-  }
-}
 
 // MARK: - WKNavigationDelegate proxy
 // Singleton: opens activated http(s)/mailto links in the default browser,
