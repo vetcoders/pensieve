@@ -15,6 +15,7 @@
 #   ./scripts/build-release.sh --no-notarize   # local-only signed build
 #   ./scripts/build-release.sh --clean    # nuke dist/ first
 #   ./scripts/build-release.sh --dmg-only # only (re)build DMG from existing stapled .app
+#   ./scripts/build-release.sh --no-dmg   # build + sign the .app only, skip the DMG step
 
 set -euo pipefail
 
@@ -48,11 +49,13 @@ FFI_PROFILE="${FFI_PROFILE:-debug}"
 DO_NOTARIZE=1
 DO_CLEAN=0
 DMG_ONLY=0
+DO_DMG=1
 for arg in "$@"; do
     case "$arg" in
         --no-notarize) DO_NOTARIZE=0 ;;
         --clean)       DO_CLEAN=1 ;;
         --dmg-only)    DMG_ONLY=1 ;;
+        --no-dmg)      DO_DMG=0 ;;
         -h|--help)
             head -32 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
@@ -60,6 +63,9 @@ for arg in "$@"; do
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+if (( DMG_ONLY )) && (( ! DO_DMG )); then
+    echo "Args --dmg-only and --no-dmg are contradictory" >&2; exit 2
+fi
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 log()  { printf "\033[36m[build]\033[0m %s\n" "$*"; }
@@ -274,6 +280,9 @@ fi
 fi  # end: skip build/sign/notarize-app in --dmg-only mode
 
 # ─── DMG ──────────────────────────────────────────────────────────────────
+if (( ! DO_DMG )); then
+    ok "Skipping DMG (--no-dmg): signed .app is ready at $APP_BUNDLE"
+else
 log "Building DMG"
 rm -f "$DMG_PATH"
 hdiutil create \
@@ -316,17 +325,22 @@ if (( DO_NOTARIZE )); then
         die "DMG notarization failed"
     fi
 fi
+fi  # end: skip DMG build/sign/notarize in --no-dmg mode
 
 # ─── Final Gatekeeper check ───────────────────────────────────────────────
 log "Gatekeeper assessment"
 spctl --assess --type execute --verbose "$APP_BUNDLE" 2>&1 | tail -3 || warn "spctl assessment failed (may be OK before stapler)"
-spctl --assess --type open --context context:primary-signature "$DMG_PATH" 2>&1 | tail -3 || warn "DMG spctl check failed (may be OK)"
+if (( DO_DMG )); then
+    spctl --assess --type open --context context:primary-signature "$DMG_PATH" 2>&1 | tail -3 || warn "DMG spctl check failed (may be OK)"
+fi
 
 ok "Release pipeline complete"
 echo ""
 echo "  App: $APP_BUNDLE"
-echo "  DMG: $DMG_PATH"
+(( DO_DMG )) && echo "  DMG: $DMG_PATH"
 echo ""
 echo "  Open: open '$APP_BUNDLE'"
-echo "  Verify staple: xcrun stapler validate '$APP_BUNDLE'"
-echo "  Open DMG: open '$DMG_PATH'"
+if (( DO_DMG )); then
+    echo "  Verify staple: xcrun stapler validate '$APP_BUNDLE'"
+    echo "  Open DMG: open '$DMG_PATH'"
+fi
