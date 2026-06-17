@@ -808,6 +808,15 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   private func removeFindHighlights() {
+    // Find highlights only exist when there are matches. Skip the whole-document
+    // attribute mutation when there is nothing to remove: this ran on EVERY
+    // keystroke (textDidChange -> refreshFindMatches) AND every SwiftUI re-render
+    // (updateNSView -> updateFind -> clearFindHighlights), and a full-range
+    // removeAttribute forces a TextKit2 relayout of the visible viewport — the
+    // per-keystroke "text reflows/jumps at a fixed scroll origin" bug, which is
+    // independent of syntax highlighting (hence disabling rich markdown never
+    // helped).
+    guard !findMatches.isEmpty else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
     textStorage.removeAttribute(.backgroundColor, range: fullRange)
   }
