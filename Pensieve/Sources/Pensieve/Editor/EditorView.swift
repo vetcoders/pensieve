@@ -230,16 +230,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Logical line index (newline count before the caret) at the last typewriter
   /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
   private var lastCenteredLine: Int?
-  /// Test-observable count of forced-layout viewport queries. Incremented in
-  /// currentTopVisibleBlockIndex (which calls characterIndexForInsertion and
-  /// thus forces a TextKit2 layout pass). A probe asserts a plain text edit
-  /// does not bump this — i.e. typing never forces viewport layout (the
-  /// per-keystroke block-vanish/reflow).
-  private(set) var editorViewportLayoutQueryCount = 0
-  /// Last clip-view origin the viewport sync ran for. Sentinel forces the first
-  /// real scroll to post; edits that reflow content without scrolling keep the
-  /// origin and are skipped (no forced layout query mid-edit).
-  private var lastSyncedViewportOrigin = NSPoint(x: -1, y: -1)
   private var findQuery = ""
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
@@ -247,11 +237,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var hasNotifiedFindState = false
   private var lastNotifiedFindCount = -1
   private var lastNotifiedFindActiveIndex: Int?
-  private(set) var lastPostedEditorBlock: Int?
-  private(set) var lastPreviewAppliedBlock: Int?
-  private var pendingEditorViewportPost = false
-  private var pendingPreviewViewportBlock: Int?
-  private var previewViewportApplyScheduled = false
 
   init(
     text: String,
@@ -322,18 +307,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self?.acceptAutocompleteSuggestion() ?? false
     }
     bindAutocomplete()
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(editorBoundsDidChange),
-      name: NSView.boundsDidChangeNotification,
-      object: scrollView.contentView
-    )
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(handlePreviewViewportChanged(_:)),
-      name: .vcPreviewViewportChanged,
-      object: nil
-    )
     update(
       text: text,
       fontSize: fontSize,
@@ -398,7 +371,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
-    postEditorViewportIfNeeded()
   }
 
   deinit {
@@ -418,13 +390,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     refreshFindMatches()
     centerCaretLineIfNeeded()
-    // Do NOT post the editor viewport on a text edit. Publishing queries
-    // currentTopVisibleBlockIndex -> characterIndexForInsertion, which forces a
-    // TextKit2 layout pass mid-edit: blocks visibly vanish and the document
-    // reflows vertically on every keystroke (no scroll occurs, so the origin
-    // never moves — exactly the reported symptom). Typing never scrolls, so
-    // there is no top-visible-block change to sync; editorBoundsDidChange (a
-    // real scroll) stays the sync trigger.
   }
 
   private func autocompletePrefix(from text: String) -> String {
@@ -550,94 +515,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     lastTextChangeSelection = nil
     centerCaretLineIfNeeded()
-    // No viewport post on selection change: a caret move does not scroll, so
-    // syncing the top-visible block here only forces a TextKit2 layout query
-    // (currentTopVisibleBlockIndex → characterIndexForInsertion) on every
-    // keystroke — the per-keystroke block-vanish/reflow. Real scrolls are
-    // handled by editorBoundsDidChange.
-  }
-
-  private var isApplyingPreviewScroll = false
-
-  @objc private func editorBoundsDidChange() {
-    // Re-entrancy guard (crash fix): handlePreviewViewportChanged scrolls the editor, whose clip-view
-    // bounds change fires this SYNCHRONOUSLY; re-posting the editor viewport here recurses back into
-    // NSTextView layout (postEditorViewportIfNeeded → currentTopVisibleBlockIndex →
-    // characterIndexForInsertion) mid-scroll and crashed with EXC_BAD_ACCESS in objc_msgSend
-    // (build 146). Suppress the echo while a preview-driven scroll is applying.
-    guard !isApplyingPreviewScroll else { return }
-    // Sync only on a REAL scroll (origin moved). An edit can reflow content and
-    // fire a bounds-change with an UNCHANGED origin; querying the viewport then
-    // forces a mid-edit TextKit2 layout pass (blocks vanish + vertical reflow,
-    // no scroll). Skip those.
-    let origin = scrollView.contentView.bounds.origin
-    guard origin != lastSyncedViewportOrigin else { return }
-    lastSyncedViewportOrigin = origin
-    postEditorViewportIfNeeded()
-  }
-
-  @objc private func handlePreviewViewportChanged(_ note: Notification) {
-    guard let block = note.userInfo?["block"] as? Int else { return }
-    pendingPreviewViewportBlock = block
-    guard !previewViewportApplyScheduled else { return }
-    previewViewportApplyScheduled = true
-    DispatchQueue.main.async { [weak self] in
-      self?.applyPendingPreviewViewportScroll()
-    }
-  }
-
-  private func applyPendingPreviewViewportScroll() {
-    previewViewportApplyScheduled = false
-    guard let block = pendingPreviewViewportBlock else { return }
-    pendingPreviewViewportBlock = nil
-    guard block != lastPreviewAppliedBlock else { return }
-    guard
-      let location = MarkdownBlockMapper.utf16Location(
-        forBlockIndex: block,
-        in: textStorage.string)
-    else {
-      return
-    }
-    lastPreviewAppliedBlock = block
-    lastPostedEditorBlock = block
-    isApplyingPreviewScroll = true
-    textView.scrollRangeToVisible(NSRange(location: location, length: 0))
-    isApplyingPreviewScroll = false
-  }
-
-  func postEditorViewportIfNeeded() {
-    guard !isApplyingPreviewScroll, !pendingEditorViewportPost else { return }
-    pendingEditorViewportPost = true
-    DispatchQueue.main.async { [weak self] in
-      self?.publishEditorViewportIfNeeded()
-    }
-  }
-
-  private func publishEditorViewportIfNeeded() {
-    pendingEditorViewportPost = false
-    guard !isApplyingPreviewScroll else { return }
-    guard let block = currentTopVisibleBlockIndex() else { return }
-    guard block != lastPostedEditorBlock else { return }
-    lastPostedEditorBlock = block
-    NotificationCenter.default.post(
-      name: .vcEditorViewportChanged,
-      object: nil,
-      userInfo: ["block": block]
-    )
-  }
-
-  private func currentTopVisibleBlockIndex() -> Int? {
-    editorViewportLayoutQueryCount += 1
-    let point = NSPoint(
-      x: textView.textContainerInset.width + 1,
-      y: scrollView.contentView.bounds.minY + textView.textContainerInset.height + 1
-    )
-    let rawLocation = textView.characterIndexForInsertion(at: point)
-    let maxLocation = (textStorage.string as NSString).length
-    return MarkdownBlockMapper.blockIndex(
-      atUTF16Location: min(max(rawLocation, 0), maxLocation),
-      in: textStorage.string
-    )
   }
 
   func centerCaretLineIfNeeded() {
