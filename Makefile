@@ -136,9 +136,9 @@ release: ffi-check
 	@$(SCRIPTS)/build-release.sh
 
 .PHONY: release-local
-release-local: gates  ## Signed .app + .dmg, skip notarization (gated, local-only)
+release-local: gates  ## Signed .app only (no dmg, no notarize) — local install/run
 release-local: ffi-check
-	@$(SCRIPTS)/build-release.sh --no-notarize
+	@$(SCRIPTS)/build-release.sh --no-notarize --no-dmg
 
 .PHONY: release-clean
 release-clean: clean gates  ## Clean + full release (gated, most reproducible)
