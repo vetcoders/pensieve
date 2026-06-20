@@ -47,8 +47,9 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("--vc-font-size: 17px"))
     XCTAssertTrue(document.html.contains("@media (prefers-color-scheme: dark)"))
 
-    // Viewport bridge script is embedded so block-level scroll sync stays wired.
-    XCTAssertTrue(document.html.contains("window.__vcScrollToBlock"))
+    // The old editor-preview scroll bridge was removed; preview documents
+    // should not ship the dead bridge script.
+    XCTAssertFalse(document.html.contains("window.__vcScrollToBlock"))
     XCTAssertFalse(document.html.contains("window.mermaid"))
 
     XCTAssertEqual(document.baseURL?.path, URL(fileURLWithPath: "/tmp").path)

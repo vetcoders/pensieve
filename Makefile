@@ -91,7 +91,7 @@ clean-deep: clean  ## Clean + nuke SwiftPM resolved deps cache
 
 .PHONY: test
 test:  ## Run unit + integration tests
-	@cd $(PKG_DIR) && swift test 2>&1 | tail -25
+	@cd $(PKG_DIR) && { set -o pipefail; swift test 2>&1 | tail -25; }
 
 .PHONY: ui-smoke
 ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app

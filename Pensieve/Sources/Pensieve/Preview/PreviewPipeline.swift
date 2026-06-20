@@ -42,9 +42,8 @@ struct PreviewDocument: Equatable {
 extension PreviewDocument {
   /// Compose the preview HTML around a rendered markdown body. Theme CSS is
   /// sanitized so an embedded `</style>` fragment cannot escape the style
-  /// block; appearance CSS and the viewport bridge script come from
-  /// `PreviewWebView` so the renderer-side and webview-side surfaces share
-  /// one source of truth.
+  /// block; appearance CSS comes from `PreviewWebView` so the renderer-side and
+  /// webview-side surfaces share one source of truth.
   static func make(
     body: String,
     css: String,
