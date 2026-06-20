@@ -225,12 +225,13 @@ final class DocumentWindowRegistry: ObservableObject {
       DebugTrace.log("registry.attach rejected: window already closed")
       return
     }
-    // Factory-built document windows keep their tabbing identifier so the
-    // system keeps grouping them (and keeps showing "+"); only windows from
-    // other origins (launcher scene, restored scenes) are normalized back to
-    // standalone tabbing.
+    // Every document window — factory-built, restored, or launcher-promoted —
+    // shares the document tabbing identifier so the system keeps grouping them
+    // (the "+" button) AND keeps "Window > Merge All Windows" enabled. That menu
+    // greys out when windows don't share an identifier, so non-factory windows
+    // are normalized ONTO the shared identifier, never nilled into mergeless islands.
     if window.tabbingIdentifier != documentTabbingIdentifier {
-      prepareStandaloneTabbing(for: window)
+      prepareTabbedWindow(window)
     }
 
     guard let documentID = documentID?.standardizedFileURL else {
@@ -433,13 +434,6 @@ final class DocumentWindowRegistry: ObservableObject {
     let windowID = ObjectIdentifier(window)
     launcherWindows.removeValue(forKey: windowID)
     contentWindows[windowID] = WeakWindow(window)
-  }
-
-  private func prepareStandaloneTabbing(for window: NSWindow) {
-    window.tabbingMode = .automatic
-    if (window.tabbedWindows?.count ?? 1) <= 1 {
-      window.setValue(nil, forKey: "tabbingIdentifier")
-    }
   }
 
   private func prepareTabbedWindow(_ window: NSWindow) {

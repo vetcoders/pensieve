@@ -4091,7 +4091,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testDocumentWindowAttachDoesNotForceTabbedIdentifierForStandaloneDocument() throws {
+  func testDocumentWindowAttachSharesMergeableTabbingIdentifierForStandaloneDocument() throws {
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
@@ -4112,7 +4112,10 @@ final class PensieveSmokeTests: XCTestCase {
     registry.attach(window, documentID: documentID)
 
     XCTAssertEqual(window.tabbingMode, .automatic)
-    XCTAssertNotEqual(window.tabbingIdentifier, "Pensieve.DocumentWindow")
+    XCTAssertEqual(
+      window.tabbingIdentifier, "Pensieve.DocumentWindow",
+      "non-factory document windows must share the document tabbing identifier so "
+        + "Window > Merge All Windows stays enabled (it greys out without a shared id)")
   }
 
   @MainActor
