@@ -11,7 +11,9 @@ final class WorkspaceStore {
 
   var folderURL: URL?
   var workspaceRoots: [WorkspaceRoot] = []
-  var workspaceTree: [WorkspaceNode] = []
+  var workspaceTree: [WorkspaceNode] = [] {
+    didSet { sortedWorkspaceTree = sortNodes(workspaceTree) }
+  }
   var documents: [DocumentRef] = [] {
     didSet { rebuildAllDocumentsCache() }
   }
@@ -28,6 +30,7 @@ final class WorkspaceStore {
   var sidebarSortOrder: SidebarSortOrder {
     didSet {
       defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
+      sortedWorkspaceTree = sortNodes(workspaceTree)
     }
   }
 
@@ -53,9 +56,13 @@ final class WorkspaceStore {
     sortDocuments(openFiles)
   }
 
-  var sortedWorkspaceTree: [WorkspaceNode] {
-    sortNodes(workspaceTree)
-  }
+  /// Recomputed only when `workspaceTree` or `sidebarSortOrder` changes (via
+  /// didSet), never per read. The previous computed form re-sorted the whole
+  /// tree on EVERY access — and `SidebarView.body` reads it inside its row
+  /// flatten, so every hover/selection/render triggered a full O(n log n)
+  /// recursive re-sort on the main thread (the sidebar "slow as hell" jank).
+  /// Stored + eager-on-mutation keeps reads O(1) and stays @Observable-tracked.
+  private(set) var sortedWorkspaceTree: [WorkspaceNode] = []
 
   var hasWorkspaceContent: Bool {
     !workspaceRoots.isEmpty || !openFiles.isEmpty
