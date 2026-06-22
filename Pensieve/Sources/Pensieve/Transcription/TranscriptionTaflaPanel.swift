@@ -36,6 +36,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   func show() {
     let panel = panel ?? makePanel()
     self.panel = panel
+    AppPermissionService.preflightTaflaPermissions()
     panel.orderFront(nil)
     installSendEventMonitor()
     onVisibilityChanged?()
