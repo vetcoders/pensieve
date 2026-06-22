@@ -105,42 +105,8 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     startRecordingTask?.cancel()
   }
 
-  private enum MicrophonePermissionError: LocalizedError {
-    case denied
-    case restricted
-
-    var errorDescription: String? {
-      switch self {
-      case .denied:
-        return "Microphone permission is required for transcription. "
-          + "Enable it in System Settings → Privacy & Security → Microphone."
-      case .restricted:
-        return "Microphone access is restricted on this system."
-      }
-    }
-  }
-
   private static func ensureMicrophonePermission() async throws {
-    switch AVCaptureDevice.authorizationStatus(for: .audio) {
-    case .authorized:
-      return
-    case .notDetermined:
-      let granted = await withCheckedContinuation {
-        (continuation: CheckedContinuation<Bool, Never>) in
-        AVCaptureDevice.requestAccess(for: .audio) { granted in
-          continuation.resume(returning: granted)
-        }
-      }
-      if !granted {
-        throw MicrophonePermissionError.denied
-      }
-    case .denied:
-      throw MicrophonePermissionError.denied
-    case .restricted:
-      throw MicrophonePermissionError.restricted
-    @unknown default:
-      throw MicrophonePermissionError.denied
-    }
+    try await AppPermissionService.ensureMicrophonePermission(openSettingsOnFailure: true)
   }
 
   func startRecording(language: String? = nil) {
