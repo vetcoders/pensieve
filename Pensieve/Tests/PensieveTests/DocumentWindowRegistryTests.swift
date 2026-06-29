@@ -280,6 +280,40 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testReapKeepsTheOnlyWindowButReapsRedundantLaunchersBesideASurvivor() throws {
+    let launcherA = Self.makeWindow()
+    let launcherB = Self.makeWindow()
+    let survivor = Self.makeWindow()
+    defer {
+      launcherA.close()
+      launcherB.close()
+      survivor.close()
+    }
+
+    var closedIDs: [ObjectIdentifier] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      closeWindow: { closedIDs.append(ObjectIdentifier($0)) }
+    )
+
+    // Every window is reapable → keep one so the app is never windowless.
+    registry.reapLaunchersKeepingLastWindow([launcherA], among: [launcherA])
+    XCTAssertTrue(
+      closedIDs.isEmpty,
+      "reaping the only window would leave the app windowless — it must be kept")
+
+    // A non-reapable window survives → reap the redundant launcher beside it.
+    registry.reapLaunchersKeepingLastWindow([launcherB], among: [launcherB, survivor])
+    XCTAssertEqual(
+      closedIDs, [ObjectIdentifier(launcherB)],
+      "a redundant launcher must still be reaped when another window survives")
+  }
+
+  @MainActor
   private static func makeWindow() -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),

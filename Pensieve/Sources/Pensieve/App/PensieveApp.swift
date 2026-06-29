@@ -117,6 +117,17 @@ struct DocumentWindowRootView: View {
         launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
           revealStartupWindow()
         }
+        // Belt: the launch coordinator is a shared singleton whose startup
+        // decision fires reliably only for the FIRST window. A re-opened or
+        // second launcher window (Dock click with no windows, or the launcher
+        // re-spawned after the last document closed) may never get that
+        // callback and would otherwise stay stuck on the startup spinner. Reveal
+        // this window's empty state regardless after a short grace period — the
+        // coordinator still runs its workspace restore in the background.
+        Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 400_000_000)
+          revealStartupWindow()
+        }
       }
     }
     .onChange(of: initialDocument?.id) { _ in
