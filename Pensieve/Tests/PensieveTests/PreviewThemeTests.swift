@@ -62,6 +62,27 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("#b1a3cc"))
   }
 
+  func testVercelSkinIsBlueLinkOnNearBlackInk() {
+    let css = PreviewWebView.skinCSS(for: .vercel)
+    XCTAssertTrue(css.contains("vc-skin:vercel"))
+    XCTAssertTrue(css.contains("#171717"))
+    XCTAssertTrue(css.contains("Geist"))
+  }
+
+  func testThemeableSkinIsInterOnSlate() {
+    let css = PreviewWebView.skinCSS(for: .themeable)
+    XCTAssertTrue(css.contains("vc-skin:themeable"))
+    XCTAssertTrue(css.contains("Inter"))
+    XCTAssertTrue(css.contains("#1e293b"))
+  }
+
+  func testGlassSkinIsBackdropBlurred() {
+    let css = PreviewWebView.skinCSS(for: .glass)
+    XCTAssertTrue(css.contains("vc-skin:glass"))
+    XCTAssertTrue(css.contains("backdrop-filter: blur"))
+    XCTAssertTrue(css.contains("linear-gradient"))
+  }
+
   func testEverySkinIsExhaustivelyCovered() {
     // Guards against an enum case being added without a skinCSS branch + marker.
     for skin in ThemeManager.PreviewTheme.allCases {

@@ -508,7 +508,8 @@ final class PreviewWebView: NSView {
 
     case .notion:
       // Notion-like: warm neutral ink on white, comfortable measure, red inline
-      // code accent.
+      // code accent. Palette derived from the Apache-2.0 Typora Notion theme
+      // (cayxc, modified s1m4ne); dark tokens are the upstream values.
       return """
         /* vc-skin:notion */
         :root {
@@ -523,14 +524,14 @@ final class PreviewWebView: NSView {
         }
         @media (prefers-color-scheme: dark) {
           :root {
-            --vc-preview-text: #e9e9e7;
-            --vc-preview-muted: #9b9b9b;
-            --vc-preview-border: #373737;
-            --vc-preview-code-bg: #2b2b2b;
-            --vc-preview-link: #5a9bd8;
-            --vc-preview-row-alt: #242424;
+            --vc-preview-text: #d4d4d4;
+            --vc-preview-muted: #9c9c9c;
+            --vc-preview-border: #3d3d3d;
+            --vc-preview-code-bg: #292927;
+            --vc-preview-link: #9c9c9c;
+            --vc-preview-row-alt: #202020;
             --vc-preview-notion-bg: #191919;
-            --vc-preview-notion-code: #ff7b72;
+            --vc-preview-notion-code: #eb5757;
           }
         }
         html, body {
@@ -704,6 +705,154 @@ final class PreviewWebView: NSView {
         }
         .markdown-body blockquote {
           border-left: 0.3rem solid var(--vc-preview-jam-accent) !important;
+        }
+        """
+
+    case .vercel:
+      // Vercel: Geist-style sans, near-black ink on white, blue links, purple
+      // callout accent. Derived from the MIT Typora Vercel theme (tecladochen);
+      // Geist falls back to the system sans (font fallback policy).
+      return """
+        /* vc-skin:vercel */
+        :root {
+          --vc-preview-text: #171717;
+          --vc-preview-muted: #666666;
+          --vc-preview-border: #eaeaea;
+          --vc-preview-code-bg: #fafafa;
+          --vc-preview-link: #0072f5;
+          --vc-preview-row-alt: #fafafa;
+          --vc-preview-vercel-bg: #ffffff;
+          --vc-preview-vercel-accent: #8e4ec6;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #ededed;
+            --vc-preview-muted: #a1a1a1;
+            --vc-preview-border: #333333;
+            --vc-preview-code-bg: #1a1a1a;
+            --vc-preview-link: #52aeff;
+            --vc-preview-row-alt: #141414;
+            --vc-preview-vercel-bg: #0a0a0a;
+            --vc-preview-vercel-accent: #bf7af0;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-vercel-bg) !important;
+        }
+        .markdown-body {
+          max-width: 880px;
+          font-family: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+          line-height: 1.65;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 600;
+          letter-spacing: -0.02em;
+        }
+        .markdown-body a {
+          text-decoration: none;
+          border-bottom: 1px solid var(--vc-preview-link);
+        }
+        .markdown-body blockquote {
+          border-left: 3px solid var(--vc-preview-vercel-accent) !important;
+        }
+        .markdown-body pre,
+        .markdown-body code,
+        .markdown-body tt {
+          font-family: "GeistMono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        """
+
+    case .themeable:
+      // Themeable: Inter sans on slate, clean Tailwind-ish palette. Derived from
+      // the MIT Typora Themeable theme (jhildenbiddle); Inter falls back to the
+      // system sans.
+      return """
+        /* vc-skin:themeable */
+        :root {
+          --vc-preview-text: #1e293b;
+          --vc-preview-muted: #64748b;
+          --vc-preview-border: #e2e8f0;
+          --vc-preview-code-bg: #f1f5f9;
+          --vc-preview-link: #2563eb;
+          --vc-preview-row-alt: #f8fafc;
+          --vc-preview-themeable-bg: #ffffff;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e2e8f0;
+            --vc-preview-muted: #94a3b8;
+            --vc-preview-border: #334155;
+            --vc-preview-code-bg: #1e293b;
+            --vc-preview-link: #60a5fa;
+            --vc-preview-row-alt: #1e293b;
+            --vc-preview-themeable-bg: #0f172a;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-themeable-bg) !important;
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          line-height: 1.7;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 700;
+          letter-spacing: -0.015em;
+        }
+        """
+
+    case .glass:
+      // Glass: translucent, backdrop-blurred panels over a soft gradient, with
+      // pastel accents. Derived from the MIT Typora Foresee theme (passwordgloo).
+      return """
+        /* vc-skin:glass */
+        :root {
+          --vc-preview-text: #333333;
+          --vc-preview-muted: #666666;
+          --vc-preview-border: rgba(0, 0, 0, 0.08);
+          --vc-preview-code-bg: rgba(255, 255, 255, 0.45);
+          --vc-preview-link: #2f6fb3;
+          --vc-preview-row-alt: rgba(255, 255, 255, 0.35);
+          --vc-preview-glass-panel: rgba(255, 255, 255, 0.40);
+          --vc-preview-glass-grad-a: #e8f0ff;
+          --vc-preview-glass-grad-b: #f6e8ff;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e0e0e0;
+            --vc-preview-muted: #a8a8a8;
+            --vc-preview-border: rgba(255, 255, 255, 0.10);
+            --vc-preview-code-bg: rgba(255, 255, 255, 0.06);
+            --vc-preview-link: #b3daff;
+            --vc-preview-row-alt: rgba(255, 255, 255, 0.05);
+            --vc-preview-glass-panel: rgba(40, 40, 50, 0.45);
+            --vc-preview-glass-grad-a: #1b2236;
+            --vc-preview-glass-grad-b: #2a1b36;
+          }
+        }
+        html, body {
+          background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b)) !important;
+          background-attachment: fixed !important;
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+          line-height: 1.7;
+        }
+        .markdown-body pre,
+        .markdown-body blockquote,
+        .markdown-body table {
+          background: var(--vc-preview-glass-panel) !important;
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          border: 1px solid var(--vc-preview-border) !important;
+          border-radius: 12px;
+        }
+        .markdown-body blockquote {
+          padding: 0.6em 1em;
         }
         """
     }
