@@ -32,6 +32,46 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("max-width: none"))
   }
 
+  func testNotionSkinUsesNotionTokens() {
+    let css = PreviewWebView.skinCSS(for: .notion)
+    XCTAssertTrue(css.contains("vc-skin:notion"))
+    // Notion ink + red inline-code accent are the signature tokens.
+    XCTAssertTrue(css.contains("#37352f"))
+    XCTAssertTrue(css.contains("--vc-preview-notion-code"))
+  }
+
+  func testVistaSkinBandsTables() {
+    let css = PreviewWebView.skinCSS(for: .vista)
+    XCTAssertTrue(css.contains("vc-skin:vista"))
+    XCTAssertTrue(css.contains("Helvetica"))
+    // Banded rows are the VISTA table signature.
+    XCTAssertTrue(css.contains("tbody tr:nth-child(even)"))
+  }
+
+  func testMLASkinIsSerifAndDoubleSpaced() {
+    let css = PreviewWebView.skinCSS(for: .mla)
+    XCTAssertTrue(css.contains("vc-skin:mla"))
+    XCTAssertTrue(css.contains("serif"))
+    XCTAssertTrue(css.contains("line-height: 2.0"))
+  }
+
+  func testJamstaticSkinIsPoppinsWithLilacAccent() {
+    let css = PreviewWebView.skinCSS(for: .jamstatic)
+    XCTAssertTrue(css.contains("vc-skin:jamstatic"))
+    XCTAssertTrue(css.contains("Poppins"))
+    XCTAssertTrue(css.contains("#b1a3cc"))
+  }
+
+  func testEverySkinIsExhaustivelyCovered() {
+    // Guards against an enum case being added without a skinCSS branch + marker.
+    for skin in ThemeManager.PreviewTheme.allCases {
+      let css = PreviewWebView.skinCSS(for: skin)
+      XCTAssertTrue(
+        css.contains("vc-skin:\(skin.rawValue)"),
+        "skin \(skin.rawValue) is missing its overlay marker")
+    }
+  }
+
   // MARK: - appearanceCSS threads the skin through
 
   func testAppearanceCSSAppendsSkinOverlay() {

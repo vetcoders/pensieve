@@ -143,9 +143,10 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityIdentifier("pensieve.toolbar.themePicker")
   }
 
-  /// Reading-surface skin picker (Default / Document / Code / Raw). Orthogonal
-  /// to the flavor: it re-skins the rendered surface — paper-like, code-like, or
-  /// stripped — without changing the markdown dialect.
+  /// Reading-surface skin picker (Default / Document / Code / Raw / Notion /
+  /// Vista / MLA / Jamstatic). Orthogonal to the flavor: it re-skins the
+  /// rendered surface — paper-like, code-like, stripped, or a ported document
+  /// theme — without changing the markdown dialect.
   private var previewSkinPicker: some View {
     Picker("Theme", selection: $themeManager.skin) {
       ForEach(ThemeManager.PreviewTheme.allCases) { skin in
@@ -153,7 +154,7 @@ struct EditorToolbelt: ToolbarContent {
       }
     }
     .pickerStyle(.menu)
-    .help("Preview theme — reading surface (Document, Code, Raw)")
+    .help("Preview theme — reading surface (Document, Code, Raw, Notion, Vista, MLA, Jamstatic)")
     .frame(minWidth: 120)
     .accessibilityIdentifier("pensieve.toolbar.skinPicker")
   }
