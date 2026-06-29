@@ -426,10 +426,33 @@ final class DocumentWindowRegistry: ObservableObject {
       launcherSweepPending = false
       let activeWindow = launcherSweepSparedWindow?.window
       purgeClosedLauncherWindows()
-      for window in applicationWindows()
-      where window !== activeWindow && isEmptyLauncherWindow(window, includingUntracked: true) {
-        closeWindow(window)
+      let allWindows = applicationWindows()
+      let reapable = allWindows.filter {
+        $0 !== activeWindow && self.isEmptyLauncherWindow($0, includingUntracked: true)
       }
+      self.reapLaunchersKeepingLastWindow(reapable, among: allWindows)
+    }
+  }
+
+  /// Close the reapable empty launchers — but NEVER if it would leave the app
+  /// with zero windows. Reaping the only window leaves the app alive yet
+  /// windowless (the empty state simply vanishes), and paired with
+  /// reopen-on-empty it degenerates into a reopen→reap→flash loop. As long as
+  /// some other window survives the sweep (a real document window, tracked or
+  /// not), reap every redundant launcher; only when ALL windows would be reaped
+  /// do we keep one so the user still lands on the empty-state surface.
+  func reapLaunchersKeepingLastWindow(
+    _ reapable: [NSWindow],
+    among allWindows: [NSWindow]
+  ) {
+    let reapableIDs = Set(reapable.map(ObjectIdentifier.init))
+    let aSurvivorRemains = allWindows.contains { !reapableIDs.contains(ObjectIdentifier($0)) }
+    var toClose = reapable
+    if !aSurvivorRemains, !toClose.isEmpty {
+      toClose.removeLast()
+    }
+    for window in toClose {
+      closeWindow(window)
     }
   }
 
@@ -483,13 +506,12 @@ final class DocumentWindowRegistry: ObservableObject {
       let preferredLauncher = preferredLauncherID.flatMap { self.launcherWindows[$0]?.window }
       let shouldCloseAllLaunchers =
         hasContentWindow || hasVisibleContentWindow(except: preferredLauncher)
-      for window in applicationWindows()
-      where isEmptyLauncherWindow(window, includingUntracked: shouldCloseAllLaunchers)
-        && (shouldCloseAllLaunchers
-          || window !== preferredLauncher)
-      {
-        closeWindow(window)
+      let allWindows = applicationWindows()
+      let reapable = allWindows.filter { window in
+        self.isEmptyLauncherWindow(window, includingUntracked: shouldCloseAllLaunchers)
+          && (shouldCloseAllLaunchers || window !== preferredLauncher)
       }
+      self.reapLaunchersKeepingLastWindow(reapable, among: allWindows)
     }
   }
 
