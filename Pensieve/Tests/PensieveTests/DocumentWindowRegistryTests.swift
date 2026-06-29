@@ -203,7 +203,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     // Closing the LAST document window must not leave the app windowless: it
     // reopens an empty launcher so the user can start a new document (⌘N).
     registry.handleDocumentWindowClosed(docWindow)
-    deferredWork.forEach { $0() }
+    for work in deferredWork { work() }
 
     XCTAssertTrue(
       factoryRefs.contains { $0 == nil },
@@ -240,7 +240,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: alphaID))
     registry.open(DocumentRef(id: betaID))
     registry.handleDocumentWindowClosed(alphaWindow)
-    deferredWork.forEach { $0() }
+    for work in deferredWork { work() }
 
     XCTAssertFalse(
       factoryRefs.contains { $0 == nil },
@@ -272,7 +272,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: docID))
     registry.beginTermination()
     registry.handleDocumentWindowClosed(docWindow)
-    deferredWork.forEach { $0() }
+    for work in deferredWork { work() }
 
     XCTAssertFalse(
       factoryRefs.contains { $0 == nil },
