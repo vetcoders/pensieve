@@ -155,7 +155,7 @@ struct EditorToolbelt: ToolbarContent {
       }
     }
     .pickerStyle(.menu)
-    .help("Preview theme — reading surface (Document, Code, Raw, Notion, Vista, MLA, Jamstatic, Vercel, Themeable, Glass)")
+    .help("Preview theme — the reading surface for the rendered markdown")
     .frame(minWidth: 120)
     .accessibilityIdentifier("pensieve.toolbar.skinPicker")
   }
