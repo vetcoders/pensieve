@@ -75,8 +75,8 @@ final class WorkspaceSubstrate {
     currentExclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint?
   ) throws -> WorkspaceCacheVerdict {
-    guard currentRoots.count == 1 else {
-      return .accessDenied(reason: "multi-root not supported in B-1b")
+    guard !currentRoots.isEmpty else {
+      return .accessDenied(reason: "workspace requires at least one root")
     }
 
     let manifest: WorkspaceManifest
@@ -100,14 +100,17 @@ final class WorkspaceSubstrate {
       )
     }
 
-    let root = currentRoots[0].standardizedFileURL
-    guard Self.isReachableDirectory(root) else {
+    // Reachability: EVERY root must be a reachable directory. Iterating in the
+    // caller's order and naming the first unreachable root keeps the single-root
+    // diagnostic message byte-identical to the pre-multi-root behavior.
+    let standardizedRoots = currentRoots.map(\.standardizedFileURL)
+    for root in standardizedRoots where !Self.isReachableDirectory(root) {
       return .accessDenied(reason: "workspace root is not reachable: \(root.path)")
     }
 
     let currentFingerprint =
       try precomputedFingerprint
-      ?? TreeFingerprint.compute(rootURL: root, exclusions: currentExclusions)
+      ?? TreeFingerprint.compute(roots: currentRoots, exclusions: currentExclusions)
 
     // Diagnostic order is pinned by tests: schema, scanner, exclusions, roots,
     // bookmark, file evidence, then valid.
@@ -121,7 +124,12 @@ final class WorkspaceSubstrate {
         .exclusionsChanged, storedManifest: nil, currentFingerprint: currentFingerprint)
     }
 
-    if manifest.roots.map(\.standardizedFileURL) != [root] {
+    // Root-SET comparison over standardized paths, canonicalized by path order:
+    // adding / removing / moving a root is `.rootMoved`; a pure reorder is NOT.
+    // Matches TreeFingerprint.canonicalRootOrder so the two never disagree.
+    let storedRoots = manifest.roots.map(\.standardizedFileURL).sorted { $0.path < $1.path }
+    let comparedRoots = standardizedRoots.sorted { $0.path < $1.path }
+    if storedRoots != comparedRoots {
       return .stale(.rootMoved, storedManifest: nil, currentFingerprint: currentFingerprint)
     }
 
@@ -198,7 +206,9 @@ final class WorkspaceSubstrate {
       (try? store.readManifest(for: identity))
       ?? WorkspaceManifest(
         workspaceID: identity.workspaceID,
-        roots: [identity.canonicalRootURL.standardizedFileURL],
+        roots: identity.canonicalRootURLs.isEmpty
+          ? [identity.canonicalRootURL.standardizedFileURL]
+          : identity.canonicalRootURLs.map(\.standardizedFileURL),
         exclusions: [],
         scannerVersion: scannerVersion,
         cacheSchemaVersion: cacheSchemaVersion,
