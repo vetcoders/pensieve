@@ -559,10 +559,9 @@ final class FolderManager {
 
     coldRebuildWorkspace(scans: scans, into: appState)
     // Hand the manifest commit the fingerprint derived from THIS walk so it does not re-walk.
-    let coldFingerprint =
-      rootURLs.count == 1
-      ? try? TreeFingerprint.compute(from: scans, root: rootURLs[0].standardizedFileURL)
-      : nil
+    // Multi-root delegates to the single-root v1 fingerprint byte-for-byte when count == 1, so
+    // single-root manifests are unchanged; N>1 gets the root-qualified v2 fingerprint.
+    let coldFingerprint = try? TreeFingerprint.compute(from: scans, roots: rootURLs)
     _ = commitWorkspaceManifest(
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
@@ -600,7 +599,9 @@ final class FolderManager {
   ///
   /// Returns `true` ONLY when ALL of the following hold (else `false` → caller does the full
   /// cold path unchanged, preserving every existing behavior):
-  /// - single-root (multi-root cache is not keyed; mirrors `attemptHotReopen`/`cacheIdentity`);
+  /// - the workspace identity + fingerprint key on the FULL root set (N≥1; single-root reduces to
+  ///   the byte-identical legacy key, so single-root caches stay warm — multi-root is now keyed
+  ///   too, in lockstep with `attemptHotReopen`/`cacheIdentity`/`commitWorkspaceManifest`);
   /// - the substrate verdict is genuinely `.valid` (tree-fingerprint match + schema/scanner/
   ///   exclusions/roots/bookmark checks) — NOT a new validity notion;
   /// - the FTS index already has rows for this workspace (empty-index guard, invariant 2): a
@@ -618,19 +619,19 @@ final class FolderManager {
     precomputedIndexedDocumentCount: Int? = nil,
     into appState: AppState
   ) -> Bool {
-    guard rootURLs.count == 1 else { return false }
-    let root = rootURLs[0].standardizedFileURL
+    guard !rootURLs.isEmpty else { return false }
 
     let identity = WorkspaceIdentity.make(
-      rootURL: rootURLs[0],
+      roots: rootURLs,
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
 
     do {
       // Fingerprint from the SINGLE cold-open walk — no second tree walk. The background path
       // pre-computes it off the main actor and passes it in; the sync path computes it here.
+      // Keyed on the full root set: N==1 reduces to the legacy v1 hash; N>1 is root-qualified v2.
       let fingerprint =
-        try precomputedFingerprint ?? TreeFingerprint.compute(from: scans, root: root)
+        try precomputedFingerprint ?? TreeFingerprint.compute(from: scans, roots: rootURLs)
       let verdict = try workspaceSubstrate.open(
         identity: identity,
         currentRoots: rootURLs,
@@ -718,18 +719,16 @@ final class FolderManager {
       // the single walk we already have (no second walk), then the main-actor gate decides.
       let liveRoots = appState.workspaceRoots.map(\.url)
       let coldStartFingerprint: TreeFingerprint? =
-        liveRoots.count == 1
-        ? await Task.detached(priority: .utility) {
-          try? TreeFingerprint.compute(from: scans, root: liveRoots[0].standardizedFileURL)
+        await Task.detached(priority: .utility) {
+          // Keyed on the FULL root set: N==1 reduces to the legacy v1 hash, N>1 is root-qualified v2.
+          try? TreeFingerprint.compute(from: scans, roots: liveRoots)
         }.value
-        : nil
       guard !Task.isCancelled else { return }
       // The empty-index guard reads a COUNT — also off the main thread — before the skip decision.
+      // Counts rows across EVERY root so a multi-root workspace passes the invariant-2 guard.
       let coldStartIndexedCount =
-        liveRoots.count == 1
-        ? await self.indexDatabase.indexedDocumentCountInBackground(
+        await self.indexDatabase.indexedDocumentCountInBackground(
           forRootPaths: liveRoots.map { $0.standardizedFileURL.path }, appState: appState)
-        : 0
       guard !Task.isCancelled else { return }
       if let coldStartFingerprint,
         self.attemptColdStartValidSkip(
@@ -792,10 +791,12 @@ final class FolderManager {
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
     appState.workspaceActivity = .checkingCache(label)
 
-    // Cache fast-path is single-root only. Multi-root workspaces fall back to
-    // the cold scan path (WorkspaceScanner.build handles multiple roots);
-    // returning true here would skip the scan and silently drop the added folder.
-    guard rootURLs.count == 1 else {
+    // Cache fast-path keys on the FULL root set (N≥1). The real guard against silently dropping
+    // an ADDED folder is `matchesCurrentWorkspace` below: when `open` merged a new root the
+    // in-memory roots no longer equal the requested set, so the match fails and we fall to the
+    // cold scan path (WorkspaceScanner.build owns the multi-root walk). A `.valid` fast-return
+    // only happens when the in-memory workspace already holds EXACTLY these roots.
+    guard !rootURLs.isEmpty else {
       appState.workspaceActivity = .cacheMiss(label)
       return false
     }
@@ -821,7 +822,7 @@ final class FolderManager {
     }
 
     let identity = WorkspaceIdentity.make(
-      rootURL: rootURLs[0],
+      roots: rootURLs,
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
 
@@ -1035,13 +1036,16 @@ final class FolderManager {
     return WorkspaceSignature(entries: entries)
   }
 
-  /// Workspace identity for cache keying (signature, fingerprint, manifest). SINGLE-ROOT only —
-  /// the persisted-signature fast-path mirrors `attemptHotReopen`'s single-root scope. Multi-root
-  /// returns nil (caller full-reindexes, persists nothing) since the cache is not keyed for it.
+  /// Workspace identity for cache keying (signature, fingerprint, manifest), keyed on the FULL
+  /// root set (N≥1). Single-root reduces to the byte-identical legacy key so existing single-root
+  /// signature caches stay warm; multi-root is keyed in lockstep with `attemptHotReopen` /
+  /// `attemptColdStartValidSkip` / `commitWorkspaceManifest`, so the persisted `.md` signature
+  /// survives across launches for a multi-root workspace too. Returns nil only for an empty root
+  /// set (caller full-reindexes, persists nothing — there is nothing to key on).
   private func cacheIdentity(rootURLs: [URL], appState: AppState) -> WorkspaceIdentity? {
-    guard rootURLs.count == 1 else { return nil }
+    guard !rootURLs.isEmpty else { return nil }
     return WorkspaceIdentity.make(
-      rootURL: rootURLs[0],
+      roots: rootURLs,
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
   }
@@ -1160,21 +1164,22 @@ final class FolderManager {
     precomputedFingerprint: TreeFingerprint? = nil,
     into appState: AppState
   ) -> Task<Void, Never>? {
-    guard rootURLs.count == 1 else { return nil }
+    guard !rootURLs.isEmpty else { return nil }
     let startedAt = Date()
     let identity = WorkspaceIdentity.make(
-      rootURL: rootURLs[0],
+      roots: rootURLs,
       bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
     )
     do {
       // Reuse the fingerprint the single cold-open walk already produced instead of walking the
-      // tree a SECOND time. `compute(from:scans:root:)` is byte-for-byte identical to
-      // `compute(rootURL:exclusions:)` for the same tree, so the persisted manifest/fingerprint
-      // are unchanged (no STAB-R01 regression — the scanner still owns the only walk). Falls back
-      // to a fresh walk only when no precomputed fingerprint is supplied (defensive).
+      // tree a SECOND time. `compute(from:scans:roots:)` is byte-for-byte identical to
+      // `compute(roots:exclusions:)` for the same tree (and to the legacy single-root path when
+      // count == 1), so the persisted manifest/fingerprint are unchanged for single-root and
+      // root-qualified for multi-root (no STAB-R01 regression — the scanner still owns the only
+      // walk). Falls back to a fresh walk only when no precomputed fingerprint is supplied.
       let fingerprint =
         try precomputedFingerprint
-        ?? TreeFingerprint.compute(rootURL: rootURLs[0], exclusions: exclusions)
+        ?? TreeFingerprint.compute(roots: rootURLs, exclusions: exclusions)
       let manifest = try workspaceSubstrate.commit(
         identity: identity,
         roots: rootURLs,
