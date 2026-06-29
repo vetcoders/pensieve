@@ -18,7 +18,7 @@ dyscyplina dowodu. Trio jest kanonem.
   (`cuts/loctree-haki.md` per-repo albo operator-managed global).
 - "Doubt" w wyborze tool = anti-pattern. Albo loctree to znajdzie,
   albo nie umie i wtedy hak + fallback.
-- Sfabrykowane doctriny ("CodeScribe grep-first", "szybciej grepem",
+- Sfabrykowane doctriny ("codescribe grep-first", "szybciej grepem",
   "loctree pewnie nie ma") = halucynacja klasy `cutoffflu`. Zakaz.
 - `loctree-mcp` niedostępne? Użyj `loct` cli, ale napisz 'haka'
    sygnalizującego ten problem.

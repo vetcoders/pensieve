@@ -2,7 +2,7 @@
 
 Welcome to the 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. forge. 
 
-We build software differently here at VetCoders. We value *product truth* over local elegance, and *runtime truth* over theoretical correctness. If you want to contribute, please understand our core stance.
+We build software differently here at vetcoders. We value *product truth* over local elegance, and *runtime truth* over theoretical correctness. If you want to contribute, please understand our core stance.
 
 ## Our Core Stance
 

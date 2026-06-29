@@ -112,8 +112,8 @@ final class HTMLEmitterTests: XCTestCase {
   }
 
   func testLink() {
-    let html = render("[VetCoders](https://vetcoders.io)")
-    XCTAssertTrue(html.contains("<a href=\"https://vetcoders.io\">VetCoders</a>"), html)
+    let html = render("[Vetcoders](https://vetcoders.io)")
+    XCTAssertTrue(html.contains("<a href=\"https://vetcoders.io\">Vetcoders</a>"), html)
   }
 
   func testHtmlEscapingInText() {
