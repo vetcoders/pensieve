@@ -505,6 +505,207 @@ final class PreviewWebView: NSView {
           border-left-width: 2px;
         }
         """
+
+    case .notion:
+      // Notion-like: warm neutral ink on white, comfortable measure, red inline
+      // code accent.
+      return """
+        /* vc-skin:notion */
+        :root {
+          --vc-preview-text: #37352f;
+          --vc-preview-muted: #73716d;
+          --vc-preview-border: #e1e7e8;
+          --vc-preview-code-bg: #ededeb;
+          --vc-preview-link: #2383e2;
+          --vc-preview-row-alt: #f7f6f3;
+          --vc-preview-notion-bg: #ffffff;
+          --vc-preview-notion-code: #eb5757;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e9e9e7;
+            --vc-preview-muted: #9b9b9b;
+            --vc-preview-border: #373737;
+            --vc-preview-code-bg: #2b2b2b;
+            --vc-preview-link: #5a9bd8;
+            --vc-preview-row-alt: #242424;
+            --vc-preview-notion-bg: #191919;
+            --vc-preview-notion-code: #ff7b72;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-notion-bg) !important;
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+          line-height: 1.55;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 700;
+          letter-spacing: -0.01em;
+        }
+        .markdown-body :not(pre) > code,
+        .markdown-body tt {
+          color: var(--vc-preview-notion-code) !important;
+        }
+        """
+
+    case .vista:
+      // Vista: Helvetica technical-doc look with framed, banded, hover-lit
+      // tables.
+      return """
+        /* vc-skin:vista */
+        :root {
+          --vc-preview-text: #1a1a1a;
+          --vc-preview-muted: #555555;
+          --vc-preview-border: #e0e0e0;
+          --vc-preview-code-bg: #f6f8fa;
+          --vc-preview-link: #1f6feb;
+          --vc-preview-row-alt: #fafafa;
+          --vc-preview-vista-bg: #f9f9f9;
+          --vc-preview-vista-thead: #f1f1f1;
+          --vc-preview-vista-hover: #f5f8ff;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #dedede;
+            --vc-preview-muted: #aaaaaa;
+            --vc-preview-border: #333333;
+            --vc-preview-code-bg: rgba(245, 245, 245, 0.06);
+            --vc-preview-link: #8ab4f8;
+            --vc-preview-row-alt: #181818;
+            --vc-preview-vista-bg: #101010;
+            --vc-preview-vista-thead: #1f1f1f;
+            --vc-preview-vista-hover: #1a2030;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-vista-bg) !important;
+        }
+        .markdown-body {
+          max-width: 900px;
+          font-family: "Helvetica Neue", Helvetica, Arial, -apple-system, BlinkMacSystemFont, sans-serif;
+          line-height: 1.6;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 600;
+        }
+        .markdown-body table {
+          border: 1px solid var(--vc-preview-border) !important;
+          border-radius: 6px;
+          border-collapse: separate;
+          border-spacing: 0;
+          overflow: hidden;
+        }
+        .markdown-body thead th {
+          background: var(--vc-preview-vista-thead) !important;
+          font-weight: 600;
+        }
+        .markdown-body tbody tr:nth-child(even) {
+          background: var(--vc-preview-row-alt) !important;
+        }
+        .markdown-body tbody tr:hover {
+          background: var(--vc-preview-vista-hover) !important;
+        }
+        """
+
+    case .mla:
+      // MLA: Times serif, double-spaced, narrow academic measure with indented
+      // paragraphs and a centred title.
+      return """
+        /* vc-skin:mla */
+        :root {
+          --vc-preview-text: #1a1a1a;
+          --vc-preview-muted: #555555;
+          --vc-preview-border: #d8d2c4;
+          --vc-preview-code-bg: #f2efe6;
+          --vc-preview-link: #7a4a1f;
+          --vc-preview-row-alt: #f2efe6;
+          --vc-preview-mla-bg: #fbfaf5;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e8e4d8;
+            --vc-preview-muted: #b0a890;
+            --vc-preview-border: #463f31;
+            --vc-preview-code-bg: #262219;
+            --vc-preview-link: #d2a16a;
+            --vc-preview-row-alt: #211d15;
+            --vc-preview-mla-bg: #17140d;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-mla-bg) !important;
+        }
+        .markdown-body {
+          max-width: 680px;
+          font-family: "Times New Roman", Times, Georgia, serif;
+          line-height: 2.0;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "Times New Roman", Times, Georgia, serif;
+          font-weight: 700;
+        }
+        .markdown-body h1 {
+          text-align: center;
+          font-size: 1.3em;
+        }
+        .markdown-body p {
+          text-indent: 2em;
+          margin: 0;
+        }
+        """
+
+    case .jamstatic:
+      // Jamstatic: Poppins sans, slate body, lilac accents, deep-violet links.
+      return """
+        /* vc-skin:jamstatic */
+        :root {
+          --vc-preview-text: #52525b;
+          --vc-preview-muted: #71717a;
+          --vc-preview-border: #b1a3cc;
+          --vc-preview-code-bg: #f2f7ff;
+          --vc-preview-link: #300a66;
+          --vc-preview-row-alt: #f2f7ff;
+          --vc-preview-jam-bg: #ffffff;
+          --vc-preview-jam-accent: #b1a3cc;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #cdd0d6;
+            --vc-preview-muted: #9b9ba6;
+            --vc-preview-border: #4a4060;
+            --vc-preview-code-bg: #262234;
+            --vc-preview-link: #c4b5fd;
+            --vc-preview-row-alt: #242031;
+            --vc-preview-jam-bg: #1b1b22;
+            --vc-preview-jam-accent: #b1a3cc;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-jam-bg) !important;
+        }
+        .markdown-body {
+          max-width: 860px;
+          font-family: "Poppins", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+          line-height: 1.6;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "Poppins", system-ui, sans-serif;
+          font-weight: 700;
+        }
+        .markdown-body a {
+          font-weight: 700;
+        }
+        .markdown-body blockquote {
+          border-left: 0.3rem solid var(--vc-preview-jam-accent) !important;
+        }
+        """
     }
   }
 

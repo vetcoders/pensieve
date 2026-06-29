@@ -49,6 +49,17 @@ final class ThemeManager: ObservableObject {
     /// Raw surface: stripped chrome, monospace, full-width, minimal styling —
     /// closest to "view source" while still rendered.
     case raw
+    /// Notion-like surface: warm neutral ink on white, comfortable measure,
+    /// soft block tokens with a red inline-code accent.
+    case notion
+    /// Vista surface: Helvetica technical-doc look with framed, banded tables.
+    case vista
+    /// MLA surface: Times serif, double-spaced, narrow academic measure with
+    /// indented paragraphs and a centred title.
+    case mla
+    /// Jamstatic surface: Poppins sans, slate body, lilac accents and
+    /// deep-violet links.
+    case jamstatic
 
     var id: String { rawValue }
 
@@ -58,6 +69,10 @@ final class ThemeManager: ObservableObject {
       case .paper: return "Document"
       case .code: return "Code"
       case .raw: return "Raw"
+      case .notion: return "Notion"
+      case .vista: return "Vista"
+      case .mla: return "MLA"
+      case .jamstatic: return "Jamstatic"
       }
     }
 
@@ -68,6 +83,10 @@ final class ThemeManager: ObservableObject {
       case .paper: return "book"
       case .code: return "chevron.left.forwardslash.chevron.right"
       case .raw: return "text.alignleft"
+      case .notion: return "square.grid.2x2"
+      case .vista: return "tablecells"
+      case .mla: return "graduationcap"
+      case .jamstatic: return "paintpalette"
       }
     }
   }
