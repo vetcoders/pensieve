@@ -315,10 +315,27 @@ final class DocumentWindowRegistry: ObservableObject {
 
   func closeWindowIfEmptyLauncher(_ window: NSWindow?) {
     guard let window else { return }
+    // Reaping never closes the window the user is looking at (see
+    // `isReapSafe`): an empty launcher the user is focused on is the empty
+    // state, not garbage.
+    guard isReapSafe(window) else { return }
     let windowID = ObjectIdentifier(window)
     guard contentWindows[windowID]?.window == nil else { return }
     launcherWindows.removeValue(forKey: windowID)
     closeWindow(window)
+  }
+
+  /// Architectural invariant for the empty/no-document state: reaping is
+  /// cleanup of REDUNDANT or PHANTOM empty launchers (notably the invisible
+  /// `<untitled>` WindowGroup scenes SwiftUI leaks) — it must NEVER close the
+  /// window the user is actually looking at. A visible, focused window IS the
+  /// user's surface (an open document OR the empty-state placeholder); it may
+  /// only be closed by an explicit user action (red button, Close menu →
+  /// `closeDocumentWindow`/`closeAllDocumentWindows`), never as a reap side
+  /// effect. This is what keeps the empty state durable instead of flashing
+  /// and dying.
+  private func isReapSafe(_ window: NSWindow) -> Bool {
+    !(window.isVisible && (window.isKeyWindow || window.isMainWindow))
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
@@ -445,9 +462,15 @@ final class DocumentWindowRegistry: ObservableObject {
     _ reapable: [NSWindow],
     among allWindows: [NSWindow]
   ) {
-    let reapableIDs = Set(reapable.map(ObjectIdentifier.init))
-    let aSurvivorRemains = allWindows.contains { !reapableIDs.contains(ObjectIdentifier($0)) }
-    var toClose = reapable
+    // Architectural invariant (see `isReapSafe`): the reaping sweep never
+    // closes the window the user is currently looking at. The earlier
+    // "windowless" failure was exactly this — the sweep counted a phantom
+    // invisible `<untitled>` WindowGroup scene as a survivor and then reaped
+    // the visible empty-state window beside it. Drop visible/focused windows
+    // from the kill list entirely; they survive on their own merit.
+    var toClose = reapable.filter(isReapSafe)
+    let toCloseIDs = Set(toClose.map(ObjectIdentifier.init))
+    let aSurvivorRemains = allWindows.contains { !toCloseIDs.contains(ObjectIdentifier($0)) }
     if !aSurvivorRemains, !toClose.isEmpty {
       toClose.removeLast()
     }
