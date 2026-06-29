@@ -8,7 +8,7 @@ final class DocumentExportTests: XCTestCase {
     let sourceURL = URL(fileURLWithPath: "/tmp/pensieve-export/Daily.md")
     let session = DocumentSession(
       document: DocumentRef(id: sourceURL),
-      text: "# Daily\n\nSee [[Monika]] and $x+y$.",
+      text: "# Daily\n\nSee [[Index]] and $x+y$.",
       isDirty: false
     )
 

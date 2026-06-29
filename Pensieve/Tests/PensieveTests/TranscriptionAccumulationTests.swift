@@ -306,7 +306,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let appState = AppState()
     let service = TranscriptionService(cadenceCommitNanoseconds: 0)
     let reportPath =
-      "/Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
+      "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
     let launcher = MockAgentPromptLauncher(
       result: AgentDispatchMetadata.parse(
         output: """

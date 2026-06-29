@@ -2499,7 +2499,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     // Multi-root falls back to the cold scan path (cache fast-path is single-root
     // only), so adding a second folder must keep BOTH roots and import both files —
-    // not block with a multi-root error (that was the B-1b regression Maciej hit).
+    // not block with a multi-root error (that was the B-1b regression we hit).
     XCTAssertNil(appState.lastError)
     XCTAssertEqual(
       Set(appState.workspaceRoots.map(\.url)),

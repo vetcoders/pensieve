@@ -7,7 +7,7 @@ forked here as the starting reference for our rewrite into
 
 ## Why kept
 
-- **Daily driver heritage:** Maciej used this editor daily for over a year.
+- **Daily driver heritage:** used daily for over a year.
 - **Architectural reference:** split-source-preview pattern, converter strategy.
 - **Resources still in use:** `markdown.css`, `gfm.css`, `sample.md` were
   promoted into `../VCNotes/Resources/` as the starting CSS theme.
