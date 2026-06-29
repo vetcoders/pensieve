@@ -60,6 +60,18 @@ final class ThemeManager: ObservableObject {
     /// Jamstatic surface: Poppins sans, slate body, lilac accents and
     /// deep-violet links.
     case jamstatic
+    /// Vercel surface: Geist-style sans, near-black ink on white, blue links and
+    /// a purple callout accent. Ported from the MIT-licensed Typora Vercel theme
+    /// (tecladochen). See THIRD_PARTY_THEMES.md.
+    case vercel
+    /// Themeable surface: Inter sans on slate, clean Tailwind-ish palette.
+    /// Ported from the MIT-licensed Typora Themeable theme (jhildenbiddle).
+    /// See THIRD_PARTY_THEMES.md.
+    case themeable
+    /// Glass surface: translucent, backdrop-blurred panels with soft pastel
+    /// accents. Ported from the MIT-licensed Typora Foresee theme (passwordgloo).
+    /// See THIRD_PARTY_THEMES.md.
+    case glass
 
     var id: String { rawValue }
 
@@ -73,6 +85,9 @@ final class ThemeManager: ObservableObject {
       case .vista: return "Vista"
       case .mla: return "MLA"
       case .jamstatic: return "Jamstatic"
+      case .vercel: return "Vercel"
+      case .themeable: return "Themeable"
+      case .glass: return "Glass"
       }
     }
 
@@ -87,6 +102,9 @@ final class ThemeManager: ObservableObject {
       case .vista: return "tablecells"
       case .mla: return "graduationcap"
       case .jamstatic: return "paintpalette"
+      case .vercel: return "triangle.fill"
+      case .themeable: return "slider.horizontal.3"
+      case .glass: return "square.on.square"
       }
     }
   }
