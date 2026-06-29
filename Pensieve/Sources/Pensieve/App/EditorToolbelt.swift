@@ -68,6 +68,7 @@ struct EditorToolbelt: ToolbarContent {
       .accessibilityIdentifier("pensieve.toolbar.share")
 
       previewThemePicker
+      previewSkinPicker
       Button(action: { appState.requestPreviewRefresh() }) {
         Image(systemName: "arrow.clockwise")
       }
@@ -131,15 +132,30 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   private var previewThemePicker: some View {
-    Picker("Preview Style", selection: $themeManager.current) {
+    Picker("Flavor", selection: $themeManager.current) {
       ForEach(ThemeManager.Theme.allCases) { theme in
         Text(theme.displayName).tag(theme)
       }
     }
     .pickerStyle(.menu)
-    .help("Preview stylesheet")
+    .help("Markdown flavor — plain Markdown or GitHub Flavored")
     .frame(minWidth: 140)
     .accessibilityIdentifier("pensieve.toolbar.themePicker")
+  }
+
+  /// Reading-surface skin picker (Default / Document / Code / Raw). Orthogonal
+  /// to the flavor: it re-skins the rendered surface — paper-like, code-like, or
+  /// stripped — without changing the markdown dialect.
+  private var previewSkinPicker: some View {
+    Picker("Theme", selection: $themeManager.skin) {
+      ForEach(ThemeManager.PreviewTheme.allCases) { skin in
+        Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
+      }
+    }
+    .pickerStyle(.menu)
+    .help("Preview theme — reading surface (Document, Code, Raw)")
+    .frame(minWidth: 120)
+    .accessibilityIdentifier("pensieve.toolbar.skinPicker")
   }
 
   @ViewBuilder

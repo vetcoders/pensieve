@@ -51,6 +51,10 @@ final class DocumentWindowModel {
   var pendingFindCommand: FindBarCommand?
   var findMatchCount: Int = 0
   var findActiveMatchIndex: Int?
+  /// Caret/selection state surfaced by the editor for the status bar. UTF-16
+  /// units, as AppKit reports them; the status bar resolves line/column lazily.
+  var caretUTF16Offset: Int = 0
+  var selectionUTF16Length: Int = 0
   var tableTidyOnPaste: Bool {
     didSet {
       defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)
