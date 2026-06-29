@@ -169,4 +169,13 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       LaunchIntentCoordinator.shared.handle(urls: urls)
     }
   }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    // The last document window closing during Quit must not resurrect a
+    // launcher; tell the registry the app is going away before its windows tear
+    // down.
+    MainActor.assumeIsolated {
+      DocumentWindowRegistry.shared.beginTermination()
+    }
+  }
 }
