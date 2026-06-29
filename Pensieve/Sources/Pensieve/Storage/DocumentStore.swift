@@ -557,6 +557,7 @@ final class FolderManager {
       return
     }
 
+    DebugTrace.log("cold reindex roots=\(rootURLs.count)")
     coldRebuildWorkspace(scans: scans, into: appState)
     // Hand the manifest commit the fingerprint derived from THIS walk so it does not re-walk.
     // Multi-root delegates to the single-root v1 fingerprint byte-for-byte when count == 1, so
@@ -659,6 +660,7 @@ final class FolderManager {
         cacheStore.readSearchSignature(for: identity)
         ?? FolderManager.signature(from: scans)
       appState.lastError = nil
+      DebugTrace.log("coldStartValidSkip taken roots=\(rootURLs.count)")
       return true
     } catch {
       NSLog("%@", "Cold-start valid-skip check failed, falling back to cold open: \(error)")
@@ -748,6 +750,7 @@ final class FolderManager {
         return
       }
 
+      DebugTrace.log("cold reindex roots=\(liveRoots.count)")
       let workspaceIndexWriteTask = self.commitWorkspaceManifest(
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
