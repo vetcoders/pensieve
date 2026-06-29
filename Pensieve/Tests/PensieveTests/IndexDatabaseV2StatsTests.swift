@@ -467,6 +467,268 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       "all docs searchable after the guarded full reindex")
   }
 
+  /// MULTI-ROOT valid-skip (Cut 3-1, F4 proof). A 2-root workspace cold-opens ONCE; an unchanged
+  /// relaunch (a fresh manager + AppState that RESTORES the persisted multi-root workspace) takes
+  /// the substrate `.valid` skip: no second tree walk, no new cold_scan session (no manifest
+  /// re-commit), no FTS reindex churn. This is the cut that flips multi-root user-visible behavior —
+  /// before lifting the `count == 1` cache gates a 2-root workspace cold-reindexed on EVERY open.
+  func testMultiRootRelaunchTakesValidSkipWithoutReindex() async throws {
+    let rootA = try makeTemporaryFolder()
+    let rootB = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: rootA) }
+    defer { try? FileManager.default.removeItem(at: rootB) }
+
+    for index in 0..<6 {
+      try "alpha-token body \(index) needle-a-\(index)".write(
+        to: rootA.appendingPathComponent("a-\(index).md"), atomically: true, encoding: .utf8)
+    }
+    for index in 0..<4 {
+      try "beta-token body \(index) needle-b-\(index)".write(
+        to: rootB.appendingPathComponent("b-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    // Cache + index DB live OUTSIDE either root so they are never themselves indexed.
+    let support = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: support) }
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: support))
+    let databaseURL = support.appendingPathComponent("index.db", isDirectory: false)
+    // ONE IndexDatabase (one pool) across both launches — a real relaunch reopens the same file.
+    let indexDatabase = IndexDatabase(databaseURL: databaseURL)
+
+    // ONE shared bookmark store across both launches: the relaunch RESTORES the persisted multi-root
+    // workspace in a SINGLE open, exactly like a real app restart. (We deliberately do NOT call
+    // `closeWorkspace` — it clears the bookmark store; a relaunch is a fresh process, not a folder
+    // close. Fresh manager + fresh AppState already gives the empty in-memory tree / nil baseline.)
+    let suiteName = "PensieveMultiRootSkipTests-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(
+      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
+    defaults.removePersistentDomain(forName: suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+
+    let rootPaths = [rootA, rootB].map { $0.standardizedFileURL.path }
+
+    // Seed BOTH roots into the shared bookmark store, then open the 2-root workspace in ONE call
+    // via the restore seam. (Opening A then ADDING B would index A's docs under a spurious [A]-only
+    // workspace as well, inflating the cross-workspace count; a single multi-root open is the clean
+    // analogue of a workspace the operator already assembled in a prior session.)
+    let seedState = AppState()
+    try bookmarkStore.persistRoot(url: rootA, into: seedState)
+    try bookmarkStore.persistRoot(url: rootB, into: seedState)
+
+    // ---- First launch: restore the 2-root workspace → full cold index of all 10 docs.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceSubstrate: substrate)
+    firstManager.restoreLastFolderInBackground(into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      Set(firstState.workspaceRoots.map { $0.url.standardizedFileURL }),
+      Set([rootA.standardizedFileURL, rootB.standardizedFileURL]),
+      "first launch holds BOTH roots in memory")
+
+    // Multi-root identity keys on the FULL root set (order-independent); used to query sessions.
+    let identity = WorkspaceIdentity.make(
+      roots: [rootA, rootB], bookmarkData: firstState.bookmarkData)
+    // The in-memory sidebar tree (rebuilt from the single scan, not the index) is exact: 10 docs.
+    XCTAssertEqual(
+      firstState.documents.count, 10, "first launch loads all 10 docs across BOTH roots into the tree")
+    // FTS rows after the cold open. NOTE: the document-write layer keys workspace docs PER ROOT
+    // (`IndexDatabase.documentWriteRecord` → `make(rootURL:)`), while `commitWorkspaceManifest` now
+    // ALSO writes them under the COMBINED multi-root identity — so a 2-root cold open currently
+    // double-writes (combined copy + per-root copy). That index-layer regression is OUT OF SCOPE
+    // for Cut 3-1 (cache fast-path gates) and reported separately; this test pins the cache-SKIP
+    // behavior via INVARIANCE across the relaunch, not an absolute row count.
+    let ftsRowsAfterFirst =
+      indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: firstState)
+    XCTAssertGreaterThan(ftsRowsAfterFirst, 0, "first launch indexes the multi-root workspace")
+
+    let dbQueue = try DatabaseQueue(path: databaseURL.path)
+    let sessionsAfterFirst = try await dbQueue.read { db in
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected first-launch scan_session count for multi-root \(identity.workspaceID)")
+    }
+    XCTAssertEqual(
+      sessionsAfterFirst, 1,
+      "first launch writes exactly one cold_scan session for the 2-root identity")
+    XCTAssertNotNil(
+      substrate.store.readSearchSignature(for: identity),
+      "multi-root search signature persisted after first launch")
+
+    // ---- Second launch: fresh manager + AppState (empty tree, nil baseline → relaunch), SAME
+    // bookmark store → restore the 2-root workspace in ONE multi-root open. Unchanged files.
+    let secondCalls = BuilderCallCounter()
+    let secondBuilder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      secondCalls.increment()
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
+    let secondState = AppState()
+    let activity = ActivityRecorder(observing: secondState)
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceBuilder: secondBuilder,
+      workspaceSubstrate: substrate)
+    secondManager.restoreLastFolderInBackground(into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      Set(secondState.workspaceRoots.map { $0.url.standardizedFileURL }),
+      Set([rootA.standardizedFileURL, rootB.standardizedFileURL]),
+      "relaunch restores BOTH roots")
+
+    // (1) NO double walk: the multi-root relaunch walks the tree EXACTLY ONCE.
+    XCTAssertEqual(
+      secondCalls.value, 1,
+      "multi-root valid-skip relaunch walks the tree exactly once (no validate-walk + cold-scan double walk)"
+    )
+
+    // (2) NO new cold_scan session — the skip does NOT re-commit the multi-root manifest.
+    let sessionsAfterSecond = try await dbQueue.read { db in
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected second-launch scan_session count for multi-root \(identity.workspaceID)")
+    }
+    XCTAssertEqual(
+      sessionsAfterSecond, 1,
+      "unchanged 2-root relaunch writes NO new scan_session (substrate .valid skip, no manifest re-commit)"
+    )
+
+    // (3) The FTS index is reused untouched — same row count, no reindex churn on the skip.
+    XCTAssertEqual(
+      indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: secondState),
+      ftsRowsAfterFirst,
+      "multi-root valid-skip relaunch reuses the existing FTS index (no reindex churn)")
+
+    // (4) The misleading "Indexing N" phase NEVER appeared on the multi-root valid-skip open.
+    let sawIndexing = activity.observedDetails.contains { $0.hasPrefix("Indexing ") }
+    XCTAssertFalse(
+      sawIndexing,
+      "no 'Indexing N files' phase on a multi-root valid-skip relaunch (observed: \(activity.observedDetails))"
+    )
+    XCTAssertNil(
+      secondState.workspaceActivity, "activity cleared after the multi-root valid-skip open")
+
+    // (5) Tree + documents restored from the single walk, across BOTH roots.
+    XCTAssertEqual(
+      secondState.documents.count, 10, "all 10 docs across both roots restored into the tree")
+    XCTAssertFalse(secondState.workspaceTree.isEmpty, "the multi-root workspace tree is restored")
+
+    // (6) Search answers against the reused index for a file from EACH root (≥1; the index-layer
+    // double-write noted above can return duplicate hits — orthogonal to the cache skip).
+    XCTAssertGreaterThanOrEqual(
+      indexDatabase.search(query: "needle-a-3", documents: secondState.allDocuments).count, 1,
+      "the reused index answers search for a root-A file after the multi-root skip")
+    XCTAssertGreaterThanOrEqual(
+      indexDatabase.search(query: "needle-b-2", documents: secondState.allDocuments).count, 1,
+      "the reused index answers search for a root-B file after the multi-root skip")
+  }
+
+  /// MULTI-ROOT freshness (Cut 3-1). A change in the SECOND root must invalidate the multi-root
+  /// fingerprint so the next relaunch does NOT skip — it cold-scans (a new session) and the changed
+  /// content becomes searchable. Proves the lifted fingerprint covers every root, not just the first.
+  func testMultiRootRelaunchAfterChangeInSecondRootReindexes() async throws {
+    let rootA = try makeTemporaryFolder()
+    let rootB = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: rootA) }
+    defer { try? FileManager.default.removeItem(at: rootB) }
+
+    for index in 0..<3 {
+      try "alpha-token body \(index)".write(
+        to: rootA.appendingPathComponent("a-\(index).md"), atomically: true, encoding: .utf8)
+    }
+    for index in 0..<3 {
+      try "orig-token body \(index)".write(
+        to: rootB.appendingPathComponent("b-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let support = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: support) }
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: support))
+    let databaseURL = support.appendingPathComponent("index.db", isDirectory: false)
+    let indexDatabase = IndexDatabase(databaseURL: databaseURL)
+
+    let suiteName = "PensieveMultiRootChangeTests-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(
+      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
+    defaults.removePersistentDomain(forName: suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+
+    // Seed both roots, then open the 2-root workspace in ONE call via restore (see the sibling
+    // skip test for why a single multi-root open is used instead of open-A-then-add-B).
+    let seedState = AppState()
+    try bookmarkStore.persistRoot(url: rootA, into: seedState)
+    try bookmarkStore.persistRoot(url: rootB, into: seedState)
+
+    // First launch: restore the 2-root workspace, full cold index.
+    let firstState = AppState()
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceSubstrate: substrate)
+    firstManager.restoreLastFolderInBackground(into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    let identity = WorkspaceIdentity.make(
+      roots: [rootA, rootB], bookmarkData: firstState.bookmarkData)
+
+    // Operator changes a file in the SECOND root between launches.
+    try "changed-token modified content noticeably longer than the original line".write(
+      to: rootB.appendingPathComponent("b-1.md"), atomically: true, encoding: .utf8)
+
+    // Second launch: restore → fingerprint over [A,B] now differs → NO skip.
+    let secondState = AppState()
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceSubstrate: substrate)
+    secondManager.restoreLastFolderInBackground(into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    let dbQueue = try DatabaseQueue(path: databaseURL.path)
+    let sessions = try await dbQueue.read { db in
+      try XCTUnwrap(
+        Int.fetchOne(
+          db, sql: "SELECT COUNT(*) FROM scan_sessions WHERE workspace_id = ?",
+          arguments: [identity.workspaceID]),
+        "Expected changed multi-root scan_session count for \(identity.workspaceID)")
+    }
+    XCTAssertEqual(
+      sessions, 2,
+      "a change in the SECOND root does NOT skip — a second cold_scan session is written")
+
+    // The changed root-B file's new content is searchable (the fingerprint over BOTH roots caught
+    // the change → no skip → reindex). The result maps to b-1.md regardless of any index-layer
+    // duplicate rows (the per-file `lastPathComponent` is what matters here).
+    let refs = secondState.allDocuments
+    let changedHits = indexDatabase.search(query: "changed-token", documents: refs)
+      .map(\.document.url.lastPathComponent)
+    XCTAssertTrue(
+      changedHits.contains("b-1.md") && Set(changedHits) == ["b-1.md"],
+      "only the changed root-B file matches the new content after the non-skip relaunch (got \(changedHits))"
+    )
+  }
+
   private func makeTemporaryFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveIndexV2StatsTests-\(UUID().uuidString)", isDirectory: true)
