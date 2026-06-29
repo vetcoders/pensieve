@@ -129,7 +129,9 @@ final class PreviewWebView: NSView {
     }
   }
 
-  static func appearanceCSS(fontSize: CGFloat) -> String {
+  static func appearanceCSS(fontSize: CGFloat, skin: ThemeManager.PreviewTheme = .default)
+    -> String
+  {
     """
     :root {
       color-scheme: light dark;
@@ -383,7 +385,127 @@ final class PreviewWebView: NSView {
       text-align: left;
       white-space: pre-wrap;
     }
+
+    /* Reading-surface skin overlay — re-tunes the base appearance tokens and
+       body typography. Comes last so it wins over the base block above without
+       re-implementing any flavor (markdown.css / gfm.css) rules. */
+    \(skinCSS(for: skin))
     """
+  }
+
+  /// CSS overlay for a reading-surface skin. Each skin overrides design tokens
+  /// (`--vc-preview-*`) and `.markdown-body` typography only; structural rules
+  /// stay owned by the base appearance block and the flavor bundle. `.default`
+  /// emits nothing so the established GitHub surface is byte-for-byte unchanged.
+  static func skinCSS(for skin: ThemeManager.PreviewTheme) -> String {
+    switch skin {
+    case .default:
+      return "/* vc-skin:default — base appearance, no overlay */"
+
+    case .paper:
+      // Warm paper: serif body, narrow measure, generous line height, ink-on-cream.
+      return """
+        /* vc-skin:paper */
+        :root {
+          --vc-preview-text: #2b2620;
+          --vc-preview-muted: #6b6358;
+          --vc-preview-border: #e3d9c6;
+          --vc-preview-code-bg: #f3ecda;
+          --vc-preview-link: #8a5a2b;
+          --vc-preview-row-alt: #f3ecda;
+          --vc-preview-paper-bg: #faf4e6;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e8e0d0;
+            --vc-preview-muted: #b3a892;
+            --vc-preview-border: #4a4234;
+            --vc-preview-code-bg: #2b2820;
+            --vc-preview-link: #d9a566;
+            --vc-preview-row-alt: #26231c;
+            --vc-preview-paper-bg: #1d1a14;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-paper-bg) !important;
+        }
+        .markdown-body {
+          max-width: 720px;
+          font-family: "New York", Georgia, "Iowan Old Style", "Times New Roman", serif;
+          line-height: 1.78;
+          letter-spacing: 0.1px;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "New York", Georgia, "Iowan Old Style", serif;
+          letter-spacing: 0.2px;
+        }
+        """
+
+    case .code:
+      // Code surface: monospace everything, terminal-ish slate tokens, tight rhythm.
+      return """
+        /* vc-skin:code */
+        :root {
+          --vc-preview-text: #d6deeb;
+          --vc-preview-muted: #8694a8;
+          --vc-preview-border: #20293a;
+          --vc-preview-code-bg: #0d1623;
+          --vc-preview-link: #7fb3ff;
+          --vc-preview-row-alt: #131d2c;
+          --vc-preview-code-surface: #0a121d;
+        }
+        @media (prefers-color-scheme: light) {
+          :root {
+            --vc-preview-text: #1b2330;
+            --vc-preview-muted: #5a6675;
+            --vc-preview-border: #d2dae6;
+            --vc-preview-code-bg: #eef2f7;
+            --vc-preview-link: #1f6feb;
+            --vc-preview-row-alt: #f1f5fa;
+            --vc-preview-code-surface: #f6f9fc;
+          }
+        }
+        html, body {
+          background: var(--vc-preview-code-surface) !important;
+        }
+        .markdown-body {
+          max-width: 900px;
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+          line-height: 1.55;
+          font-size: 0.95em;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+          letter-spacing: -0.2px;
+        }
+        """
+
+    case .raw:
+      // Raw: stripped chrome, full width, monospace, near "view source".
+      return """
+        /* vc-skin:raw */
+        .markdown-body {
+          max-width: none;
+          margin: 0;
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+          line-height: 1.5;
+          font-size: 0.92em;
+        }
+        .markdown-body pre,
+        .markdown-body code,
+        .markdown-body tt {
+          border: 0 !important;
+          border-radius: 0 !important;
+          background: transparent !important;
+          padding: 0 !important;
+        }
+        .markdown-body blockquote {
+          border-left-width: 2px;
+        }
+        """
+    }
   }
 
   static let mathBootstrapScript: String = """

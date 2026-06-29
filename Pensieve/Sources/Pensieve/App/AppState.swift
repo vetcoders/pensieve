@@ -213,6 +213,16 @@ final class AppState {
     set { windowModel.findActiveMatchIndex = newValue }
   }
 
+  var caretUTF16Offset: Int {
+    get { windowModel.caretUTF16Offset }
+    set { windowModel.caretUTF16Offset = newValue }
+  }
+
+  var selectionUTF16Length: Int {
+    get { windowModel.selectionUTF16Length }
+    set { windowModel.selectionUTF16Length = newValue }
+  }
+
   var tableTidyOnPaste: Bool {
     get { windowModel.tableTidyOnPaste }
     set { windowModel.tableTidyOnPaste = newValue }

@@ -26,6 +26,7 @@ struct PreviewView: View {
       markdown: appState.activeDocumentText,
       fontSize: appState.fontSize,
       theme: themeManager.current,
+      skin: themeManager.skin,
       themeManager: themeManager,
       documentURL: appState.activeDocumentURL,
       autoReload: appState.previewAutoReload,
@@ -42,6 +43,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
+  let skin: ThemeManager.PreviewTheme
   let themeManager: ThemeManager
   let documentURL: URL?
   let autoReload: Bool
@@ -83,6 +85,7 @@ struct PreviewRepresentable: NSViewRepresentable {
       markdown: markdown,
       fontSize: fontSize,
       theme: theme,
+      skin: skin,
       documentURL: documentURL,
       refreshToken: refreshToken
     )
@@ -122,13 +125,14 @@ struct PreviewRepresentable: NSViewRepresentable {
 
     /// True when the only difference between `previous` and `next` is the
     /// markdown payload or font size — the parts that live-stream as the
-    /// operator types or scrubs the slider. Theme, documentURL, and
+    /// operator types or scrubs the slider. Theme, skin, documentURL, and
     /// refreshToken are operator-triggered control changes; those always
     /// pass through even when auto-reload is off.
     private func shouldGateUpdate(
       from previous: PreviewRenderRequest, to next: PreviewRenderRequest
     ) -> Bool {
       previous.theme == next.theme
+        && previous.skin == next.skin
         && previous.documentURL == next.documentURL
         && previous.refreshToken == next.refreshToken
     }

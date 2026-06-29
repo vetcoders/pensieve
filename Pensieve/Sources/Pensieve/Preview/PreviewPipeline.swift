@@ -16,6 +16,10 @@ struct PreviewRenderRequest: Equatable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
+  /// Reading-surface skin layered on top of the flavor CSS. Defaulted so the
+  /// many constructors that predate the skin axis (export, command palette,
+  /// tests) keep compiling and render the established GitHub surface.
+  var skin: ThemeManager.PreviewTheme = .default
   let documentURL: URL?
   var refreshToken: Int = 0
 }
@@ -48,6 +52,7 @@ extension PreviewDocument {
     body: String,
     css: String,
     fontSize: CGFloat,
+    skin: ThemeManager.PreviewTheme = .default,
     baseURL: URL?,
     mermaidJavaScript: String? = nil,
     katexJavaScript: String? = nil,
@@ -58,7 +63,7 @@ extension PreviewDocument {
     let safeCSS = sanitizedForInlineEmbedding(css)
     let styleHTML = """
       \(safeCSS)
-      \(PreviewWebView.appearanceCSS(fontSize: fontSize))
+      \(PreviewWebView.appearanceCSS(fontSize: fontSize, skin: skin))
       """
     let mermaidScripts =
       mermaidJavaScript.map { javascript in
@@ -246,6 +251,7 @@ final class PreviewPipeline {
       body: output.body,
       css: css,
       fontSize: request.fontSize,
+      skin: request.skin,
       baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL),
       mermaidJavaScript: mermaidJavaScript,
       katexJavaScript: katexJavaScript,

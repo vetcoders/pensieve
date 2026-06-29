@@ -32,6 +32,10 @@ struct EditorView: View {
         onFindStateChanged: { total, active in
           appState.findMatchCount = total
           appState.findActiveMatchIndex = active
+        },
+        onSelectionChanged: { caret, selectionLength in
+          appState.caretUTF16Offset = caret
+          appState.selectionUTF16Length = selectionLength
         }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -87,6 +91,8 @@ struct EditorRepresentable: NSViewRepresentable {
   // Defaults to a no-op so find-navigation tests that build the representable
   // directly need not wire the count callback they do not exercise.
   var onFindStateChanged: @MainActor (Int, Int?) -> Void = { _, _ in }
+  // Caret/selection sink for the status bar; no-op default for the same reason.
+  var onSelectionChanged: @MainActor (Int, Int) -> Void = { _, _ in }
 
   func makeNSView(context: Context) -> NSScrollView {
     let surface = MarkdownEditorSurface(
@@ -108,6 +114,11 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onFindStateChanged = { total, active in
       DispatchQueue.main.async {
         self.onFindStateChanged(total, active)
+      }
+    }
+    surface.onSelectionChanged = { caret, selectionLength in
+      DispatchQueue.main.async {
+        self.onSelectionChanged(caret, selectionLength)
       }
     }
     surface.typewriterScrollEnabled = editorMode == .focus
@@ -221,6 +232,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onTextChanged: ((String) -> Void)?
   var onCloseFindBar: (() -> Void)?
   var onFindStateChanged: ((Int, Int?) -> Void)?
+  /// Reports (caret UTF-16 offset, selection UTF-16 length) for the status bar.
+  var onSelectionChanged: ((Int, Int) -> Void)?
+  private var lastNotifiedCaretOffset = -1
+  private var lastNotifiedSelectionLength = -1
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -390,6 +405,20 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     refreshFindMatches()
     centerCaretLineIfNeeded()
+    notifySelectionChanged()
+  }
+
+  /// Push the caret offset + selection length up to the status bar, deduped so
+  /// a re-render or no-op selection event never loops the SwiftUI binding.
+  private func notifySelectionChanged() {
+    let range = textView.selectedRange()
+    guard
+      range.location != lastNotifiedCaretOffset
+        || range.length != lastNotifiedSelectionLength
+    else { return }
+    lastNotifiedCaretOffset = range.location
+    lastNotifiedSelectionLength = range.length
+    onSelectionChanged?(range.location, range.length)
   }
 
   private func autocompletePrefix(from text: String) -> String {
@@ -515,6 +544,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     lastTextChangeSelection = nil
     centerCaretLineIfNeeded()
+    notifySelectionChanged()
   }
 
   func centerCaretLineIfNeeded() {

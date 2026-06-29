@@ -18,7 +18,12 @@ struct ContentView: View {
       SidebarView()
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
-      EditorPreviewSplit()
+      VStack(spacing: 0) {
+        EditorPreviewSplit()
+        if appState.documentHasEditableBuffer {
+          EditorStatusBar()
+        }
+      }
     }
     .navigationTitle(
       appState.documentHasEditableBuffer
