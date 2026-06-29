@@ -389,6 +389,67 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(before.fileCount, after.fileCount)
   }
 
+  func testTreeFingerprintFromScansRootsSingleRootMatchesLegacyPath() throws {
+    let root = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: root)
+    _ = try writeFile("beta", named: "beta.markdown", in: root)
+    let scans = WorkspaceScanner.build(rootURLs: [root.standardizedFileURL], exclusions: [])
+
+    let legacy = try TreeFingerprint.compute(from: scans, root: root.standardizedFileURL)
+    let generalized = try TreeFingerprint.compute(from: scans, roots: [root])
+    let legacyWalk = try TreeFingerprint.compute(rootURL: root, exclusions: [])
+    let generalizedWalk = try TreeFingerprint.compute(roots: [root], exclusions: [])
+
+    XCTAssertEqual(generalized.treeHash, legacy.treeHash)
+    XCTAssertEqual(generalized.fileCount, legacy.fileCount)
+    XCTAssertEqual(generalized.folderCount, legacy.folderCount)
+    XCTAssertEqual(generalized.algorithmVersion, legacy.algorithmVersion)
+    XCTAssertEqual(generalizedWalk.treeHash, legacyWalk.treeHash)
+    XCTAssertEqual(generalizedWalk.fileCount, legacyWalk.fileCount)
+    XCTAssertEqual(generalizedWalk.folderCount, legacyWalk.folderCount)
+    XCTAssertEqual(generalizedWalk.algorithmVersion, legacyWalk.algorithmVersion)
+  }
+
+  func testTreeFingerprintMultiRootQualifiesSameRelativePaths() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    let firstNotes = firstRoot.appendingPathComponent("notes", isDirectory: true)
+    let secondNotes = secondRoot.appendingPathComponent("notes", isDirectory: true)
+    try FileManager.default.createDirectory(at: firstNotes, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondNotes, withIntermediateDirectories: true)
+    let firstFile = try writeFile("same body", named: "todo.md", in: firstNotes)
+    let secondFile = try writeFile("same body", named: "todo.md", in: secondNotes)
+    let matchingMTime = Date(timeIntervalSince1970: 1_800)
+    try setModificationDate(matchingMTime, for: firstFile)
+    try setModificationDate(matchingMTime, for: secondFile)
+
+    let scans = WorkspaceScanner.build(rootURLs: [firstRoot, secondRoot], exclusions: [])
+    let generalized = try TreeFingerprint.compute(from: scans, roots: [firstRoot, secondRoot])
+    let legacyUnqualified = try TreeFingerprint.compute(
+      from: scans, root: firstRoot.standardizedFileURL)
+    let singleRoot = try TreeFingerprint.compute(rootURL: firstRoot, exclusions: [])
+
+    XCTAssertEqual(generalized.fileCount, 2)
+    XCTAssertEqual(generalized.algorithmVersion, 2)
+    XCTAssertNotEqual(generalized.treeHash, singleRoot.treeHash)
+    XCTAssertNotEqual(generalized.treeHash, legacyUnqualified.treeHash)
+  }
+
+  func testTreeFingerprintMultiRootIsOrderIndependent() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+
+    let firstOrder = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    let reversedOrder = try TreeFingerprint.compute(roots: [secondRoot, firstRoot], exclusions: [])
+
+    XCTAssertEqual(firstOrder.treeHash, reversedOrder.treeHash)
+    XCTAssertEqual(firstOrder.fileCount, reversedOrder.fileCount)
+    XCTAssertEqual(firstOrder.folderCount, reversedOrder.folderCount)
+    XCTAssertEqual(firstOrder.algorithmVersion, reversedOrder.algorithmVersion)
+  }
+
   func testTreeFingerprintRoundtripsCodable() throws {
     let fingerprint = TreeFingerprint(
       treeHash: "abc123",
@@ -791,6 +852,10 @@ final class WorkspaceSubstrateTests: XCTestCase {
     let file = directory.appendingPathComponent(name, isDirectory: false)
     try contents.write(to: file, atomically: true, encoding: .utf8)
     return file
+  }
+
+  private func setModificationDate(_ date: Date, for url: URL) throws {
+    try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
   }
 
   private func sampleManifest(identity: WorkspaceIdentity, root: URL) -> WorkspaceManifest {
