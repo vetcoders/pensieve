@@ -917,8 +917,19 @@ final class IndexDatabase {
     let batchSize = searchIndexBatchSize
 
     do {
+      // Build per-document write records keyed on each doc's OWN root identity
+      // (workspace docs → `WorkspaceIdentity.make(rootURL:)`, ad-hoc → `__adhoc__`),
+      // exactly as the cold reindex (`replaceSearchIndex`) and every reader (search,
+      // `indexedDocumentCount`) key the `documents` table. Keying the document rows
+      // under the MERGED multi-root `identity.workspaceID` instead would write a
+      // SECOND copy of every doc that the reindex can NOT collapse (its records carry
+      // the per-root workspace_id, so the `(workspace_id, path)` skip never matches) —
+      // an N-root cold open double-indexed (20 rows for 10 docs) and leaked duplicate
+      // search hits. For single-root the per-root id IS `identity.workspaceID`
+      // byte-for-byte, so this is a no-op there. The merged identity still anchors the
+      // workspaces REGISTRY row below (manifest / scan_session / stats key on it).
       let records = await Task.detached(priority: .utility) {
-        documents.compactMap(Self.documentRecord)
+        documents.compactMap(Self.documentWriteRecord)
       }.value
       guard
         databaseURL.map({ FileManager.default.fileExists(atPath: $0.path) }) ?? true
@@ -927,27 +938,45 @@ final class IndexDatabase {
       }
       try await Task.detached(priority: .utility) {
         try pool.write { db in
+          // The REGISTRY row for the whole N-root workspace (manifest / scan_session /
+          // stats anchor). Document rows below live under their per-root workspace_ids.
           try Self.upsertWorkspace(identity: identity, roots: roots, lastSeenAt: lastSeenAt, in: db)
-          // `commitWorkspaceManifest` is the cold-scan `documents` writer, and
-          // `documents` is now the single FTS source. Count each row this write
-          // actually (re)indexes — inserted or content-changed — so the
-          // didInsertBatch observability reflects the indexing work on this path
-          // too (the cold-open reindex that follows skips these already-written
-          // rows). Unchanged rows are not counted, so a no-change re-commit
-          // reports 0 (matching the prior contract where reindex skipped them).
-          try Self.upsertDocuments(
-            records: records,
-            workspaceID: identity.workspaceID,
-            indexedAt: lastSeenAt,
-            batchSize: batchSize,
-            didInsertBatch: didInsertBatch,
-            in: db
-          )
-          try Self.tombstoneDocumentsNotIn(
-            paths: records.map(\.path),
-            workspaceID: identity.workspaceID,
-            in: db
-          )
+
+          // Group the documents by their per-root workspace_id, then run the SAME
+          // per-workspace writer the single-root path always used (`indexed_at =
+          // lastSeenAt`, unchanged-row skip, batched `didInsertBatch` observability) —
+          // once per group instead of once under the merged identity. Single-root has
+          // exactly one group whose id IS `identity.workspaceID`, so its write is
+          // byte-identical; multi-root fans out to one group per root.
+          let recordsByWorkspace = Dictionary(grouping: records, by: \.workspaceID)
+          for (workspaceID, group) in recordsByWorkspace {
+            // FK target: the per-root workspaces row, mapped to its real canonical_path
+            // so the search full-path reconstruction (canonical_path || '/' || path)
+            // stays correct for every root.
+            try Self.ensureWorkspaceRow(
+              workspaceID: workspaceID, canonicalPath: group[0].canonicalPath, in: db)
+            try Self.upsertDocuments(
+              records: group.map {
+                IndexDocumentRecord(
+                  path: $0.path, title: $0.title, body: $0.body,
+                  mtime: $0.mtime, size: $0.size, isAdHoc: $0.isAdHoc)
+              },
+              workspaceID: workspaceID,
+              indexedAt: lastSeenAt,
+              batchSize: batchSize,
+              didInsertBatch: didInsertBatch,
+              in: db
+            )
+            try Self.tombstoneDocumentsNotIn(
+              paths: group.map(\.path), workspaceID: workspaceID, in: db)
+          }
+          if recordsByWorkspace.isEmpty {
+            // No documents this commit: preserve the legacy empty-wipe under the
+            // workspace identity (single-root → its own rows; multi-root W_AB owns
+            // no document rows, so this is a harmless no-op).
+            try Self.tombstoneDocumentsNotIn(
+              paths: [], workspaceID: identity.workspaceID, in: db)
+          }
         }
       }.value
     } catch {
@@ -1407,27 +1436,6 @@ final class IndexDatabase {
           AND path NOT IN (\(placeholders))
         """,
       arguments: arguments
-    )
-  }
-
-  private nonisolated static func documentRecord(from document: DocumentRef)
-    -> IndexDocumentRecord?
-  {
-    let url = document.url.standardizedFileURL
-    guard let body = try? String(contentsOf: url, encoding: .utf8) else {
-      return nil
-    }
-    let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-    let modifiedAt =
-      values?.contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
-    let size = values?.fileSize ?? Data(body.utf8).count
-    return IndexDocumentRecord(
-      path: document.relativePath ?? document.displayPath,
-      title: title(fromMarkdown: body, fallback: document.title),
-      body: body,
-      mtime: Int(modifiedAt),
-      size: size,
-      isAdHoc: document.isAdHoc
     )
   }
 
