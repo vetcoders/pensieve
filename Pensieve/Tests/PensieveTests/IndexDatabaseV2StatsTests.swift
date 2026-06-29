@@ -538,7 +538,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       roots: [rootA, rootB], bookmarkData: firstState.bookmarkData)
     // The in-memory sidebar tree (rebuilt from the single scan, not the index) is exact: 10 docs.
     XCTAssertEqual(
-      firstState.documents.count, 10, "first launch loads all 10 docs across BOTH roots into the tree")
+      firstState.documents.count, 10, "first launch loads all 10 docs across BOTH roots")
     // FTS rows after the cold open. NOTE: the document-write layer keys workspace docs PER ROOT
     // (`IndexDatabase.documentWriteRecord` → `make(rootURL:)`), while `commitWorkspaceManifest` now
     // ALSO writes them under the COMBINED multi-root identity — so a 2-root cold open currently
