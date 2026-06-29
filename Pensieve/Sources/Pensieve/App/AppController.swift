@@ -325,41 +325,53 @@ final class AppController: ObservableObject {
     _ = documentStore.select(ref: ref, into: appState)
   }
 
-  /// Tab per document: the default list/search click. An empty window (no
-  /// editable buffer) is reused in place; once this window shows a document,
-  /// further clicks route through the window registry and open native tabs
-  /// (or activate the window already showing the document). Clicking the
-  /// currently displayed document is a no-op. Falls back to in-window
-  /// selection when no routing is wired (tests, headless).
-  func openDocumentWindow(id: DocumentRef.ID?) {
-    guard let id else { return }
-    // Resolve via the workspace/working-set scan, but fall back to a synthesized
-    // ref for a live registry tab whose ref was evicted past the open-files cap —
-    // otherwise the registry-sourced sidebar row exists but its click is dead.
-    let ref =
-      appState.allDocuments.first(where: { $0.id == id })
+  /// Resolves a sidebar/search row ID to a `DocumentRef`. Resolves via the
+  /// workspace/working-set scan, falling back to a synthesized ref for a live
+  /// registry tab whose ref was evicted past the open-files cap — otherwise the
+  /// registry-sourced sidebar row exists but its click is dead.
+  private func resolveDocumentRef(for id: DocumentRef.ID) -> DocumentRef? {
+    appState.allDocuments.first(where: { $0.id == id })
       ?? (DocumentWindowRegistry.shared.openTabDocumentIDs.contains(id.standardizedFileURL)
         ? appState.makeDocumentRef(for: id) : nil)
-    guard let ref else { return }
+  }
+
+  /// Default click (Open Files list, workspace tree, search result, context-menu
+  /// "Open"): load the document in the current window, reusing the active editor
+  /// pane. This is the VS Code / Zed model — a single click never spawns a window
+  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
+  /// gesture. Clicking the currently displayed document is a no-op.
+  func openDocumentWindow(id: DocumentRef.ID?) {
+    guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
     if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
       return
     }
 
-    guard appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow else {
-      DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
+    selectDocument(id: ref.id)
+  }
+
+  /// Explicit "Open in New Window" context-menu gesture: route through the window
+  /// registry to open the document in a native tab (or activate the window
+  /// already showing it). Clicking the currently displayed document is a no-op.
+  /// Falls back to in-window selection when no routing is wired (tests, headless).
+  func openDocumentInNewWindow(id: DocumentRef.ID?) {
+    guard let id, let ref = resolveDocumentRef(for: id) else { return }
+
+    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+      return
+    }
+
+    guard let requestOpenDocumentWindow else {
+      DebugTrace.log(
+        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
+      )
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture. With tab-per-document
-  /// routing this is the same path as the default click.
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
-    openDocumentWindow(id: id)
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {

@@ -3899,7 +3899,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testOpenDocumentWindowReusesEmptyWindowBeforeCreatingTab() throws {
+  func testDefaultClickSelectsInPlaceAndExplicitGestureRoutesToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
@@ -3928,31 +3928,44 @@ final class PensieveSmokeTests: XCTestCase {
     controller.openFolder(url: folder)
     controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty, "an empty window is reused in place")
+    XCTAssertTrue(requestedRefs.isEmpty, "a default click never spawns a window")
     XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "alpha")
+
+    // VS Code / Zed model: a default click on another document loads it in place,
+    // reusing the current window — it does NOT route to the registry.
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "a default click on another document loads in place, never routing to the registry")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "the current window swaps to the clicked document")
+    XCTAssertEqual(appState.activeDocumentText, "beta")
 
     controller.openDocumentWindow(id: betaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
-      "tab per document: a list click on another document routes to the registry")
-    XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
-      "the originating window keeps its document while the tab materializes")
-
-    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
-
-    XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
       "clicking the currently displayed document is a no-op")
 
-    // The explicit context-menu gesture rides the same path.
+    // Only the explicit "Open in New Window" gesture routes to the registry, and
+    // only for a document the window is not already showing.
+    controller.openDocumentInNewWindow(id: alphaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
+      "the explicit gesture opens the document in a new window/tab")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "the originating window keeps its document while the new window materializes")
+
     controller.openDocumentInNewWindow(id: betaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL),
-      [betaURL.standardizedFileURL, betaURL.standardizedFileURL])
+      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
+      "the explicit gesture on the currently displayed document is a no-op")
   }
 
   @MainActor
