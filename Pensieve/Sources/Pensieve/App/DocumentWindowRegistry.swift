@@ -34,8 +34,17 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  /// Set once the app starts quitting so the last document window's close does
+  /// not resurrect a launcher mid-termination.
+  private var isTerminating = false
   /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure?
+
+  /// Mark the app as terminating (called from `applicationWillTerminate`) so the
+  /// last-window-close handler suppresses its launcher reopen.
+  func beginTermination() {
+    isTerminating = true
+  }
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
   /// the Dock with no visible windows, or during cold start if SwiftUI does not
@@ -160,6 +169,7 @@ final class DocumentWindowRegistry: ObservableObject {
   /// fresh window instead of resurrecting the closed (retained) one.
   func handleDocumentWindowClosed(_ window: NSWindow) {
     reconcileClosedWindow(window)
+    reopenLauncherIfAppWouldBeWindowless()
     // Tombstone ONLY on this path (DocumentWindow.onClose): factory windows are
     // never reused, so rejecting a late re-attach of this exact instance is safe.
     // The window's SwiftUI accessor may still have an in-flight main-queue pass
@@ -181,6 +191,31 @@ final class DocumentWindowRegistry: ObservableObject {
     contentWindows.removeValue(forKey: windowID)
     launcherWindows.removeValue(forKey: windowID)
     untitledTabWindows.removeValue(forKey: windowID)
+  }
+
+  /// After the last document window closes the app is left with no window and
+  /// no focused controller — the New command (which targets the focused
+  /// window's `AppState`) then has nothing to act on, so the user can neither
+  /// see the empty-state surface nor start a new document. Re-open a launcher so
+  /// a window stays alive on the empty state, matching the VS Code-style "last
+  /// editor closed, window remains" behaviour. Deferred so it runs after AppKit
+  /// finishes the in-progress close; suppressed during termination so Quit is
+  /// never fought by a resurrected launcher, and a no-op when any other document
+  /// or launcher window is still alive.
+  private func reopenLauncherIfAppWouldBeWindowless() {
+    guard !isTerminating, makeDocumentWindow != nil else { return }
+    scheduleDeferredMainWork { [weak self] in
+      guard let self, !self.isTerminating else { return }
+      self.purgeClosedLauncherWindows()
+      guard !self.hasContentWindow else { return }
+      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
+      guard !hasLauncher else { return }
+      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
+        $0.window?.contentView != nil
+      }
+      guard !hasLiveDocumentWindow else { return }
+      self.openLauncherWindow()
+    }
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
