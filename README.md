@@ -4,7 +4,7 @@ Native macOS markdown writing app. File-first. Source-first.
 Not Notion. Not Obsidian. Not an unwieldy monolith. 
 A beautiful, fast, local markdown *pisak* — crafted for vetcoders, and anyone who appreciates the pure joy of typing.
 
-*𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026*
+*𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI*
 
 ## The Vibe
 
