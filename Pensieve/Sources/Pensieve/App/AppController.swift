@@ -441,14 +441,6 @@ final class AppController: ObservableObject {
     transcriptionTaflaPanel.toggle()
   }
 
-  func showTranscriptionTafla() {
-    transcriptionTaflaPanel.show()
-  }
-
-  func hideTranscriptionTafla() {
-    transcriptionTaflaPanel.hide()
-  }
-
   @discardableResult
   func sendTranscription(
     target: TranscriptionSendTarget,
