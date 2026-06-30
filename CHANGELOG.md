@@ -24,5 +24,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live HTML rendering via `WKWebView` using legacy CSS (`markdown.css`, `gfm.css`).
 - FSEvents-based file watching.
 - SQLite indexing framework setup via `GRDB.swift`.
-- VibeCrafted documentation (README, CONTRIBUTING, CHANGELOG, CODE_OF_CONDUCT).
+- Vibecrafted documentation (README, CONTRIBUTING, CHANGELOG, CODE_OF_CONDUCT).
 - Business Source License (BSL) transition.
