@@ -29,7 +29,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       output: """
         warmup noise
         run_id: work-260615-123456
-        Report path: /Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md
+        Report path: /Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md
         tail noise
         """,
       exitCode: 0
@@ -38,10 +38,10 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(metadata.runID, "work-260615-123456")
     XCTAssertEqual(
       metadata.reportPath,
-      "/Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md")
+      "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md")
     let expectedStatus =
       "Dispatch completed: work-260615-123456"
-      + " | /Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md"
+      + " | /Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md"
     XCTAssertEqual(
       metadata.statusLine,
       expectedStatus)
