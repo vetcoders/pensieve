@@ -688,6 +688,16 @@ final class AppController: ObservableObject {
   /// `vibecrafted <agent> observe --run-id <id>`. User-triggered from the sheet;
   /// failure is swallowed because the in-app confirmation is the source of truth.
   nonisolated func observeRunInTerminal(agent: String, runID: String) {
+    // Defense-in-depth before the values are composed into the Terminal command
+    // below: agent/runID are parsed from the launcher receipt, so fail closed on
+    // anything outside a strict shell-safe charset instead of relying solely on
+    // the quoting/AppleScript-escaping. (The proper fix — dropping AppleScript for
+    // `open -a Terminal` — is tracked separately as it changes terminal-spawn UX.)
+    let allowed = CharacterSet(
+      charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+    guard !agent.isEmpty, agent.unicodeScalars.allSatisfy(allowed.contains),
+      !runID.isEmpty, runID.unicodeScalars.allSatisfy(allowed.contains)
+    else { return }
     guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return }
     func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     let command = "\(quote(exe)) \(quote(agent)) observe --run-id \(quote(runID))"
