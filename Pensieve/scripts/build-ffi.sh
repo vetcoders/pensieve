@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PENSIEVE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_VISTA_ROOT="$HOME/vc-workspace/LibraxisAI/vista-kernel"
+DEFAULT_VISTA_ROOT="$(cd "$PENSIEVE_ROOT/../.." && pwd)/vista-kernel"
 VISTA_KERNEL_ROOT="${VISTA_KERNEL_ROOT:-$DEFAULT_VISTA_ROOT}"
 FFI_PROFILE="${FFI_PROFILE:-debug}"
 
@@ -60,6 +60,11 @@ patch_completion_protocol() {
 echo "Building qube-ffi from $VISTA_KERNEL_ROOT ($FFI_PROFILE)"
 (
   cd "$VISTA_KERNEL_ROOT"
+  # rustc bakes builder-absolute source paths into the dylib via panic-location
+  # / #[track_caller] (file!() literals land in __TEXT), leaking the builder's
+  # $HOME/.cargo username into the shipped binary. `strip` does NOT remove these.
+  # Remap to neutral prefixes at compile time so the vendored dylib stays clean.
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$VISTA_KERNEL_ROOT=/vista-kernel"
   cargo build -p qube-ffi "${CARGO_PROFILE_ARGS[@]}"
   cargo run -p uniffi-bindgen -- generate \
     --library "$LIB_DIR/libqube_ffi.dylib" \

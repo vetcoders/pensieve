@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PENSIEVE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_VISTA_ROOT="$HOME/vc-workspace/LibraxisAI/vista-kernel"
+DEFAULT_VISTA_ROOT="$(cd "$PENSIEVE_ROOT/../.." && pwd)/vista-kernel"
 VISTA_KERNEL_ROOT="${VISTA_KERNEL_ROOT:-$DEFAULT_VISTA_ROOT}"
 PROVENANCE="$PENSIEVE_ROOT/Vendor/qube-ffi/PROVENANCE.txt"
 
