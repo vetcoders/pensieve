@@ -11,7 +11,7 @@ We currently support the latest version of Pensieve. Older versions do not recei
 
 ## Reporting a Vulnerability
 
-Security is a top priority for vetcoders. If you discover a security vulnerability within Pensieve, please report it via private email to `security@vetcoders.io` or use the GitHub Security Advisory feature.
+Security is a top priority for Vetcoders. If you discover a security vulnerability within Pensieve, please report it via private email to `security@vetcoders.io` or use the GitHub Security Advisory feature.
 
 **Please do not disclose the vulnerability publicly until a fix has been released.**
 

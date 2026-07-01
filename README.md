@@ -2,7 +2,7 @@
 
 Native macOS markdown writing app. File-first. Source-first. 
 Not Notion. Not Obsidian. Not an unwieldy monolith. 
-A beautiful, fast, local markdown *pisak* — crafted for vetcoders, and anyone who appreciates the pure joy of typing.
+A beautiful, fast, local markdown *pisak* — crafted for Vetcoders, and anyone who appreciates the pure joy of typing.
 
 *𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI*
 
@@ -26,4 +26,4 @@ A beautiful, fast, local markdown *pisak* — crafted for vetcoders, and anyone 
 Pensieve is the spiritual successor to an older Objective-C markdown editor (by Satoshi Iwaki) that served as our daily driver for over a year. We kept the essence (and the CSS) but rebuilt the engine entirely in modern Swift to drop legacy debt and gain native Apple Silicon performance.
 
 ---
-Created by vetcoders.
+Created by Vetcoders.
