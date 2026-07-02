@@ -528,6 +528,13 @@ final class AppController: ObservableObject {
     startStatus: String? = nil,
     onSuccess: (@MainActor @Sendable () -> Void)? = nil
   ) -> Bool {
+    // Sandboxed (App Store) build: spawning the vibecrafted CLI is denied by
+    // the sandbox. The UI already disables its entry points; this guard keeps
+    // any other path honest instead of dying inside Process.run().
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
     guard !isAgentDispatchInFlight else { return false }
     guard !payload.isEmpty else { return false }
 
@@ -654,6 +661,9 @@ final class AppController: ObservableObject {
   func dispatchOpenDocument(workflow: String, agent: String, rootURL: URL) async
     -> DocumentDispatchOutcome
   {
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+      return .failure(message: SandboxCapabilities.dispatchUnavailableExplanation)
+    }
     guard let docURL = appState.documentSession.url else {
       return .failure(message: "Save the document before dispatching it to an agent.")
     }
@@ -688,6 +698,9 @@ final class AppController: ObservableObject {
   /// `vibecrafted <agent> observe --run-id <id>`. User-triggered from the sheet;
   /// failure is swallowed because the in-app confirmation is the source of truth.
   nonisolated func observeRunInTerminal(agent: String, runID: String) {
+    // Sandboxed build: osascript/Terminal automation is unavailable; only
+    // reachable after a dispatch, which the sandbox guard already blocks.
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else { return }
     // Defense-in-depth before the values are composed into the Terminal command
     // below: agent/runID are parsed from the launcher receipt, so fail closed on
     // anything outside a strict shell-safe charset instead of relying solely on

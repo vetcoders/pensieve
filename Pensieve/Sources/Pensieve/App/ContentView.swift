@@ -39,8 +39,15 @@ struct ContentView: View {
         } label: {
           Label("Dispatch to Agent", systemImage: "paperplane")
         }
-        .disabled(!appState.documentHasEditableBuffer)
-        .help("Dispatch to Agent")
+        .disabled(
+          !appState.documentHasEditableBuffer
+            || !SandboxCapabilities.allowsExternalAgentDispatch()
+        )
+        .help(
+          SandboxCapabilities.allowsExternalAgentDispatch()
+            ? "Dispatch to Agent"
+            : SandboxCapabilities.dispatchUnavailableExplanation
+        )
         .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
         .sheet(isPresented: $showDispatch) {
           DispatchPopover(
@@ -57,6 +64,7 @@ struct ContentView: View {
 
 struct EditorPreviewSplit: View {
   @Environment(AppState.self) private var appState
+  @State private var scrollSyncCoordinator = ScrollSyncCoordinator()
 
   /// Minimum pane width below which `.split` collapses to a single pane.
   /// Two panes × 260 + ~40 chrome = 560; below that, side-by-side stops
@@ -96,9 +104,9 @@ struct EditorPreviewSplit: View {
           EditorView()
         } else {
           HSplitView {
-            EditorView()
+            EditorView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
-            PreviewView()
+            PreviewView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
           }
         }

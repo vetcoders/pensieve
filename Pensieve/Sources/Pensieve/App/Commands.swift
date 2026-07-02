@@ -258,6 +258,16 @@ private struct ActivePensieveCommands: Commands {
         appState.previewAutoReload.toggle()
       }
       .keyboardShortcut("r", modifiers: [.command, .shift])
+
+      Toggle(
+        "Scroll Sync",
+        isOn: Binding(
+          get: { appState.scrollSyncEnabled },
+          set: { appState.scrollSyncEnabled = $0 }
+        )
+      )
+      .disabled(!appState.documentHasEditableBuffer)
+      .accessibilityIdentifier("pensieve.scrollSync.menuToggle")
     }
 
     // Tab navigation (Quick Win)
@@ -283,12 +293,17 @@ private struct ActivePensieveCommands: Commands {
     // Agents menu — fast dispatch path for the ACTIVE document: default agent,
     // workspace root, workflow from the curated deck. The toolbar ✈ sheet stays
     // the configurable path (agent/root pickers, in-sheet confirmation).
+    // Sandboxed (App Store) build: items stay visible but disabled — dispatch
+    // spawns external processes the sandbox forbids (SandboxCapabilities).
     CommandMenu("Agents") {
       Button("Dispatch Document to Agent") {
         controller.dispatchCurrentDocumentToAgent(workflow: "implement")
       }
       .keyboardShortcut("d", modifiers: [.command, .shift])
-      .disabled(!appState.documentHasEditableBuffer)
+      .disabled(
+        !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch()
+      )
       .accessibilityIdentifier("pensieve.agents.menu.dispatchDocument")
 
       Menu("Dispatch Document with Workflow") {
@@ -298,8 +313,17 @@ private struct ActivePensieveCommands: Commands {
           }
         }
       }
-      .disabled(!appState.documentHasEditableBuffer)
+      .disabled(
+        !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch()
+      )
       .accessibilityIdentifier("pensieve.agents.menu.dispatchDocumentWorkflow")
+
+      if !SandboxCapabilities.allowsExternalAgentDispatch() {
+        Section {
+          Text(SandboxCapabilities.dispatchUnavailableExplanation)
+        }
+      }
     }
 
     // Format menu — Markdown formatting and font sizing. Menu items route
