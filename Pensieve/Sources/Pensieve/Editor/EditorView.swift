@@ -260,7 +260,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
     aiAutocompleteEnabled: Bool = false,
-    autocompleteController: AutocompleteController = AutocompleteController()
+    // Production autocomplete engine. The factory is lazy: `VistaEngine()` is
+    // a thin FFI handle resolved post-debounce inside the controller, and the
+    // completion path never loads the whisper model (see AutocompleteController
+    // `resolveEngine`), so surface init and typing stay FFI-free.
+    autocompleteController: AutocompleteController = AutocompleteController(
+      engineFactory: { VistaEngine() })
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()

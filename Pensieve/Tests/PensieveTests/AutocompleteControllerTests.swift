@@ -134,97 +134,109 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(controller.lastError, AutocompleteController.engineUnavailableMessage)
   }
 
-  func testRequestArrivingDuringModelInitCompletesAfterInit() async {
-    let attempts = AttemptCounter()
-    let initEntered = expectation(description: "model init entered")
-    let releaseInit = DispatchSemaphore(value: 0)
+  func testCompletionPathNeverTouchesSttModelInit() async {
+    // complete() is an HTTP call to the LLM endpoint; initModel() loads the
+    // whisper STT model. The completion path must not couple to STT: with the
+    // model "not loaded", a suggestion must still arrive and init must never run.
     let engine = MockVistaAutocompleteEngine(
-      completionHandler: { prefix, _ in
-        XCTAssertEqual(prefix, "hello a", "only the newest request may complete")
-        return " suggestion"
-      },
+      completionHandler: { _, _ in " suggestion" },
       modelLoaded: false,
       initModelHandler: {
-        attempts.increment()
-        initEntered.fulfill()
-        releaseInit.wait()
+        XCTFail("completion path must not init the STT model")
       })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
 
     controller.textDidChange(prefix: "hello")
-    await fulfillment(of: [initEntered], timeout: 2)
-
-    // A newer keystroke lands while the first request is still loading the
-    // model; it must join the shared init instead of bailing.
-    controller.textDidChange(prefix: "hello a")
-    try? await Task.sleep(nanoseconds: 40_000_000)
-    releaseInit.signal()
-
     for _ in 0..<200 where controller.suggestion == nil {
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
-    XCTAssertEqual(
-      controller.suggestion, " suggestion",
-      "the request that arrived during init must complete once init lands")
+
+    XCTAssertEqual(controller.suggestion, " suggestion")
     XCTAssertNil(controller.lastError)
-    XCTAssertEqual(attempts.value, 1, "init stays single-flight")
   }
 
-  func testInitModelFailureLatchesAcrossKeystrokes() async {
+  func testEngineFactoryIsInvokedLazilyAndOnce() async {
+    let factoryCalls = AttemptCounter()
+    let controller = AutocompleteController(
+      engineFactory: {
+        factoryCalls.increment()
+        return MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" })
+      },
+      debounceNanoseconds: 10_000_000)
+
+    XCTAssertEqual(factoryCalls.value, 0, "the factory must not run at construction time")
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+    XCTAssertEqual(controller.suggestion, " world")
+
+    controller.textDidChange(prefix: "hello w")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(factoryCalls.value, 1, "the resolved engine must be cached across requests")
+  }
+
+  func testProductionDefaultSurfaceHasEngineSource() {
+    // Guards the EditorView wiring: the default MarkdownEditorSurface (the
+    // production path through EditorRepresentable.makeNSView) must own a
+    // controller with a real engine source. The factory is lazy, so this
+    // never constructs a VistaEngine.
+    let surface = MarkdownEditorSurface(text: "hello", fontSize: 14)
+    XCTAssertTrue(surface.autocompleteController.hasEngineSource)
+  }
+
+  func testTypedUnavailableLatchesAcrossKeystrokes() async {
     let attempts = AttemptCounter()
-    let engine = MockVistaAutocompleteEngine(
-      modelLoaded: false,
-      initModelHandler: {
-        attempts.increment()
-        throw InitModelTestFailure()
-      })
+    let unavailable = VistaError.ModelError(
+      msg: "completion LLM unavailable: set LLM_ENDPOINT, LLM_ASSISTIVE_ENDPOINT, "
+        + "or LLM_FORMATTING_ENDPOINT")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      throw unavailable
+    })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
     controller.textDidChange(prefix: "hello")
     try? await Task.sleep(nanoseconds: 80_000_000)
 
-    XCTAssertEqual(controller.lastError, InitModelTestFailure().errorDescription)
     XCTAssertEqual(attempts.value, 1)
+    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
 
     controller.textDidChange(prefix: "hello a")
-    try? await Task.sleep(nanoseconds: 80_000_000)
-
-    XCTAssertEqual(attempts.value, 1, "failed init must not be retried per keystroke")
-    XCTAssertEqual(controller.lastError, InitModelTestFailure().errorDescription)
-  }
-
-  func testInitModelFailureLatchEngagesEvenWhenRequestSuperseded() async {
-    let attempts = AttemptCounter()
-    let engine = MockVistaAutocompleteEngine(
-      modelLoaded: false,
-      initModelHandler: {
-        attempts.increment()
-        usleep(100_000)  // keep init in flight while a newer keystroke supersedes it
-        throw InitModelTestFailure()
-      })
-    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
-
-    controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 40_000_000)
-    controller.textDidChange(prefix: "hello a")
-    try? await Task.sleep(nanoseconds: 250_000_000)
-
-    controller.textDidChange(prefix: "hello ab")
     try? await Task.sleep(nanoseconds: 80_000_000)
 
     XCTAssertEqual(
-      attempts.value, 1,
-      "latch is engine-global; a superseded request must still arm it")
+      attempts.value, 1, "typed unavailable must not be retried per keystroke")
+    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
+    XCTAssertNil(controller.suggestion)
   }
 
-  func testCancelResetsInitFailureLatch() async {
+  func testTransientCompletionErrorDoesNotLatch() async {
     let attempts = AttemptCounter()
-    let engine = MockVistaAutocompleteEngine(
-      modelLoaded: false,
-      initModelHandler: {
-        attempts.increment()
-        throw InitModelTestFailure()
-      })
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      throw VistaError.ModelError(msg: "completion request failed: connection reset")
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+    XCTAssertEqual(controller.lastError, "completion request failed: connection reset")
+
+    controller.textDidChange(prefix: "hello a")
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    XCTAssertEqual(
+      attempts.value, 2,
+      "a transient failure must not kill autocomplete; the debounce is the storm guard")
+  }
+
+  func testCancelResetsUnavailableLatch() async {
+    let attempts = AttemptCounter()
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      throw VistaError.ModelError(msg: "completion LLM unavailable: set LLM_ENDPOINT")
+    })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
     controller.textDidChange(prefix: "hello")
@@ -250,10 +262,6 @@ final class AutocompleteControllerTests: XCTestCase {
     let reloaded = DocumentWindowModel(defaults: defaults)
     XCTAssertTrue(reloaded.aiAutocompleteEnabled)
   }
-}
-
-private struct InitModelTestFailure: Error, LocalizedError {
-  var errorDescription: String? { "init model boom" }
 }
 
 private final class AttemptCounter: @unchecked Sendable {
