@@ -16,6 +16,22 @@
 #   ./scripts/build-release.sh --clean    # nuke dist/ first
 #   ./scripts/build-release.sh --dmg-only # only (re)build DMG from existing stapled .app
 #   ./scripts/build-release.sh --no-dmg   # build + sign the .app only, skip the DMG step
+#   ./scripts/build-release.sh --appstore # Mac App Store lane: sandbox-signed .app + .pkg
+#
+# App Store lane (--appstore):
+#   Signs with Pensieve.mas.entitlements (App Sandbox) and packages a .pkg via
+#   productbuild. No notarization (App Review replaces it) and no DMG. Outputs
+#   land in dist/mas/. Identities come from the environment:
+#     PENSIEVE_MAS_APP_IDENTITY        (required) app signing identity, e.g.
+#                                      "Apple Distribution: <Team> (<TEAMID>)"
+#                                      or "3rd Party Mac Developer Application: …"
+#     PENSIEVE_MAS_INSTALLER_IDENTITY  (optional) pkg signing identity, e.g.
+#                                      "3rd Party Mac Developer Installer: …";
+#                                      unset → unsigned pkg (local inspection only)
+#     PENSIEVE_MAS_PROVISIONING_PROFILE (optional) path to the Mac App Store
+#                                      .provisionprofile; embedded when present.
+#                                      App Review REQUIRES it — without it the
+#                                      .pkg is a dry-run artifact, not a submission.
 
 set -euo pipefail
 
@@ -50,14 +66,16 @@ DO_NOTARIZE=1
 DO_CLEAN=0
 DMG_ONLY=0
 DO_DMG=1
+APPSTORE=0
 for arg in "$@"; do
     case "$arg" in
         --no-notarize) DO_NOTARIZE=0 ;;
         --clean)       DO_CLEAN=1 ;;
         --dmg-only)    DMG_ONLY=1 ;;
         --no-dmg)      DO_DMG=0 ;;
+        --appstore)    APPSTORE=1 ;;
         -h|--help)
-            head -32 "$0" | grep -E "^#" | sed 's/^# \?//'
+            head -48 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
@@ -65,6 +83,18 @@ for arg in "$@"; do
 done
 if (( DMG_ONLY )) && (( ! DO_DMG )); then
     echo "Args --dmg-only and --no-dmg are contradictory" >&2; exit 2
+fi
+if (( APPSTORE )) && (( DMG_ONLY )); then
+    echo "Args --appstore and --dmg-only are contradictory (MAS lane has no DMG)" >&2; exit 2
+fi
+if (( APPSTORE )); then
+    # MAS lane: App Review replaces notarization; the product is a .pkg, not a DMG.
+    DO_NOTARIZE=0
+    DO_DMG=0
+    DIST_DIR="$REPO_ROOT/dist/mas"
+    APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
+    PKG_PATH="$DIST_DIR/$APP_NAME.pkg"
+    ENTITLEMENTS="$PKG_DIR/Resources/Pensieve.mas.entitlements"
 fi
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -86,18 +116,47 @@ plist_set_string() {
         || /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist" >/dev/null
 }
 
+# Hardened Runtime belongs to the Developer ID/notarization lane; the MAS lane
+# relies on the App Sandbox instead (adding `--options runtime` there is at best
+# a no-op and at worst an App Review flag). One funnel keeps the two lanes from
+# drifting apart at each of the three signing sites (dylib, executable, bundle).
+sign_code() {
+    if (( APPSTORE )); then
+        codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$@"
+    else
+        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$@"
+    fi
+}
+
 # ─── Pre-flight ───────────────────────────────────────────────────────────
 log "Pre-flight checks"
 [[ -d "$PKG_DIR" ]] || die "Pensieve/ not found at $PKG_DIR"
 [[ -f "$PKG_DIR/Package.swift" ]] || die "Package.swift missing"
 [[ -f "$VERSION_FILE" ]] || die "VERSION file missing at $VERSION_FILE"
 [[ -f "$INFO_PLIST_SRC" ]] || die "Info.plist template missing at $INFO_PLIST_SRC"
-[[ -f "$ENTITLEMENTS" ]] || die "Pensieve.entitlements missing"
+[[ -f "$ENTITLEMENTS" ]] || die "Entitlements missing at $ENTITLEMENTS"
 [[ -f "$ICON_SRC" ]] || die "App icon missing at $ICON_SRC"
-[[ -f "$SIGNING_IDENTITY_FILE" ]] || die "Signing identity file missing at $SIGNING_IDENTITY_FILE"
 
-SIGNING_IDENTITY="$(head -n1 "$SIGNING_IDENTITY_FILE" | sed -e 's/[[:space:]]*$//')"
-[[ -n "$SIGNING_IDENTITY" ]] || die "Signing identity is empty"
+if (( APPSTORE )); then
+    SIGNING_IDENTITY="${PENSIEVE_MAS_APP_IDENTITY:-}"
+    [[ -n "$SIGNING_IDENTITY" ]] || die "App Store lane needs PENSIEVE_MAS_APP_IDENTITY.
+       Export the Mac App Store app signing identity, e.g.:
+         export PENSIEVE_MAS_APP_IDENTITY='Apple Distribution: <Team Name> (<TEAMID>)'
+       (or '3rd Party Mac Developer Application: …' for the legacy cert type).
+       Certificates come from App Store Connect ▸ Certificates, IDs & Profiles.
+       For a local dry-run a Developer ID Application identity also works as a
+       stand-in — the resulting .pkg is NOT submittable, only inspectable."
+    MAS_INSTALLER_IDENTITY="${PENSIEVE_MAS_INSTALLER_IDENTITY:-}"
+    MAS_PROFILE="${PENSIEVE_MAS_PROVISIONING_PROFILE:-}"
+    if [[ -n "$MAS_PROFILE" && ! -f "$MAS_PROFILE" ]]; then
+        die "PENSIEVE_MAS_PROVISIONING_PROFILE points to a missing file: $MAS_PROFILE"
+    fi
+    log "App Store lane: sandbox entitlements $ENTITLEMENTS"
+else
+    [[ -f "$SIGNING_IDENTITY_FILE" ]] || die "Signing identity file missing at $SIGNING_IDENTITY_FILE"
+    SIGNING_IDENTITY="$(head -n1 "$SIGNING_IDENTITY_FILE" | sed -e 's/[[:space:]]*$//')"
+    [[ -n "$SIGNING_IDENTITY" ]] || die "Signing identity is empty"
+fi
 log "Signing identity: $SIGNING_IDENTITY"
 
 if (( DO_NOTARIZE )); then
@@ -212,28 +271,33 @@ if [[ -f "$QUBE_DYLIB_SRC" ]]; then
         install_name_tool -change "$QUBE_OLD_REF" "@rpath/libqube_ffi.dylib" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
     fi
     install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
-    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    # Same identity (= same Team ID) as the main executable: the sandbox's
+    # library validation refuses dylibs signed by another team.
+    sign_code "$FRAMEWORKS_DIR/libqube_ffi.dylib"
     ok "qube-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
 else
     die "qube-ffi dylib not found at $QUBE_DYLIB_SRC — the app binary links libqube_ffi.dylib unconditionally, so a bundle without it aborts in dyld at launch. Run Pensieve/scripts/build-ffi.sh to produce it, then re-run this script."
 fi
 
 # ─── Sign ─────────────────────────────────────────────────────────────────
-log "Signing with Hardened Runtime"
+if (( APPSTORE )); then
+    log "Signing for Mac App Store (App Sandbox entitlements)"
+    # The provisioning profile must sit inside the bundle BEFORE the seal is
+    # computed, or the signature won't cover it and App Review rejects the pkg.
+    if [[ -n "$MAS_PROFILE" ]]; then
+        cp "$MAS_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+        ok "Embedded provisioning profile: $MAS_PROFILE"
+    else
+        warn "No PENSIEVE_MAS_PROVISIONING_PROFILE — App Review requires an embedded"
+        warn "provisioning profile; this build is a local dry-run, not a submission."
+    fi
+else
+    log "Signing with Hardened Runtime"
+fi
 # Sign nested first if any (none yet, but template safe)
-codesign --force \
-    --options runtime \
-    --entitlements "$ENTITLEMENTS" \
-    --sign "$SIGNING_IDENTITY" \
-    --timestamp \
-    "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+sign_code --entitlements "$ENTITLEMENTS" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-codesign --force \
-    --options runtime \
-    --entitlements "$ENTITLEMENTS" \
-    --sign "$SIGNING_IDENTITY" \
-    --timestamp \
-    "$APP_BUNDLE"
+sign_code --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 
 log "Verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE" 2>&1 | tail -5
@@ -278,6 +342,40 @@ else
 fi
 
 fi  # end: skip build/sign/notarize-app in --dmg-only mode
+
+# ─── Mac App Store pkg ────────────────────────────────────────────────────
+if (( APPSTORE )); then
+    log "Building installer pkg (productbuild)"
+    rm -f "$PKG_PATH"
+    if [[ -n "$MAS_INSTALLER_IDENTITY" ]]; then
+        productbuild \
+            --component "$APP_BUNDLE" /Applications \
+            --sign "$MAS_INSTALLER_IDENTITY" \
+            "$PKG_PATH"
+        ok "Signed pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
+    else
+        productbuild \
+            --component "$APP_BUNDLE" /Applications \
+            "$PKG_PATH"
+        warn "pkg is UNSIGNED (no PENSIEVE_MAS_INSTALLER_IDENTITY) — fine for local"
+        warn "inspection; App Store submission needs a '3rd Party Mac Developer"
+        warn "Installer' / 'Mac Installer Distribution' signed pkg."
+        ok "Unsigned pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
+    fi
+
+    log "Entitlements on signed app (verify sandbox):"
+    codesign -d --entitlements - "$APP_BUNDLE" 2>/dev/null | head -30
+
+    ok "App Store lane complete"
+    echo ""
+    echo "  App: $APP_BUNDLE"
+    echo "  Pkg: $PKG_PATH"
+    echo ""
+    echo "  Verify entitlements: codesign -d --entitlements - '$APP_BUNDLE'"
+    echo "  Submit (operator):   upload the signed pkg with Transporter.app;"
+    echo "                       see docs/appstore-lane.md for the ASC checklist."
+    exit 0
+fi
 
 # ─── DMG ──────────────────────────────────────────────────────────────────
 if (( ! DO_DMG )); then

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Mac App Store lane: App Sandbox is mandatory for MAS distribution.
+         The Developer ID lane keeps Pensieve.entitlements (non-sandboxed);
+         this file is selected only by scripts/build-release.sh --appstore. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- File access: Pensieve is a file-first editor. The user grants folders
+         and documents via NSOpenPanel; access persists across launches through
+         app-scoped security bookmarks (BookmarkStore). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+
+    <!-- Microphone: transcription tafla (TranscriptionService). The usage
+         string lives in Info.plist (NSMicrophoneUsageDescription). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

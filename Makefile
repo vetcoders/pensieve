@@ -163,6 +163,11 @@ release-clean: ffi-check
 notarize:  ## DMG-only: package + notarize + staple from the existing signed .app (no rebuild, no gates)
 	@$(SCRIPTS)/build-release.sh --dmg-only
 
+.PHONY: release-appstore
+release-appstore: gates  ## Mac App Store lane: sandbox-signed .app + .pkg in dist/mas (needs PENSIEVE_MAS_APP_IDENTITY)
+release-appstore: ffi-check
+	@$(SCRIPTS)/build-release.sh --appstore
+
 # =========================================================================
 # INSPECTION
 # =========================================================================
@@ -198,6 +203,23 @@ info-artifacts:  ## Inspect dist/ artifacts (sizes + sigs)
 .PHONY: info-certs
 info-certs:  ## Show signing identities in keychain
 	@security find-identity -v -p codesigning | grep -E "Developer ID|Apple Development" || true
+
+.PHONY: info-appstore
+info-appstore:  ## Inspect dist/mas artifacts: entitlements on the .app + pkg signature (read-only)
+	@if [[ -d "$(DIST)/mas/Pensieve.app" ]]; then \
+		printf "$(C_CYAN)[entitlements]$(C_RESET) dist/mas/Pensieve.app\n"; \
+		codesign -d --entitlements - "$(DIST)/mas/Pensieve.app" 2>/dev/null; \
+		printf "\n$(C_CYAN)[signature]$(C_RESET)\n"; \
+		codesign -dv "$(DIST)/mas/Pensieve.app" 2>&1 | grep -E "Authority|TeamIdentifier|flags" || true; \
+	else \
+		printf "$(C_YELLOW)[empty]$(C_RESET) dist/mas/Pensieve.app missing — run \`make release-appstore\` first\n"; \
+	fi
+	@if [[ -f "$(DIST)/mas/Pensieve.pkg" ]]; then \
+		printf "\n$(C_CYAN)[pkg]$(C_RESET)\n"; \
+		pkgutil --check-signature "$(DIST)/mas/Pensieve.pkg" | head -6 || true; \
+	fi
+	@printf "\n$(C_CYAN)[mas certs]$(C_RESET)\n"
+	@security find-identity -v -p codesigning | grep -E "Apple Distribution|3rd Party Mac Developer" || printf "  (none — see docs/appstore-lane.md)\n"
 
 # =========================================================================
 # CI
