@@ -238,6 +238,11 @@ final class AppState {
     set { windowModel.aiAutocompleteEnabled = newValue }
   }
 
+  var scrollSyncEnabled: Bool {
+    get { windowModel.scrollSyncEnabled }
+    set { windowModel.scrollSyncEnabled = newValue }
+  }
+
   var previewAutoReload: Bool {
     get { windowModel.previewAutoReload }
     set { windowModel.previewAutoReload = newValue }

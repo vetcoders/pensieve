@@ -9,6 +9,7 @@ final class DocumentWindowModel {
   private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
+  private static let scrollSyncEnabledKey = "Pensieve.scrollSyncEnabled"
   private let defaults: UserDefaults
 
   var selectedDocumentID: DocumentRef.ID?
@@ -70,6 +71,11 @@ final class DocumentWindowModel {
       defaults.set(aiAutocompleteEnabled, forKey: Self.aiAutocompleteEnabledKey)
     }
   }
+  var scrollSyncEnabled: Bool {
+    didSet {
+      defaults.set(scrollSyncEnabled, forKey: Self.scrollSyncEnabledKey)
+    }
+  }
   var previewAutoReload: Bool {
     didSet {
       defaults.set(previewAutoReload, forKey: Self.previewAutoReloadKey)
@@ -100,6 +106,11 @@ final class DocumentWindowModel {
       self.aiAutocompleteEnabled = false
     } else {
       self.aiAutocompleteEnabled = defaults.bool(forKey: Self.aiAutocompleteEnabledKey)
+    }
+    if defaults.object(forKey: Self.scrollSyncEnabledKey) == nil {
+      self.scrollSyncEnabled = false
+    } else {
+      self.scrollSyncEnabled = defaults.bool(forKey: Self.scrollSyncEnabledKey)
     }
     // Seed the metadata mirrors from the initial (empty) session. didSet does
     // not fire during init, so prime them explicitly to stay consistent.

@@ -5,6 +5,11 @@ import SwiftUI
 struct EditorView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  private let scrollSyncCoordinator: ScrollSyncCoordinator?
+
+  init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+  }
 
   var body: some View {
     @Bindable var appState = appState
@@ -26,6 +31,8 @@ struct EditorView: View {
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
         aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
+        scrollSyncCoordinator: scrollSyncCoordinator,
+        scrollSyncEnabled: appState.scrollSyncEnabled && appState.mode == .split,
         isDirty: documentDirty,
         onDocumentChanged: controller.documentDidChange,
         onCloseFindBar: closeFindBar,
@@ -85,6 +92,8 @@ struct EditorRepresentable: NSViewRepresentable {
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
   let aiAutocompleteEnabled: Bool
+  let scrollSyncCoordinator: ScrollSyncCoordinator?
+  let scrollSyncEnabled: Bool
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
   let onCloseFindBar: @MainActor () -> Void
@@ -93,6 +102,48 @@ struct EditorRepresentable: NSViewRepresentable {
   var onFindStateChanged: @MainActor (Int, Int?) -> Void = { _, _ in }
   // Caret/selection sink for the status bar; no-op default for the same reason.
   var onSelectionChanged: @MainActor (Int, Int) -> Void = { _, _ in }
+
+  init(
+    text: Binding<String>,
+    editorMode: EditorMode,
+    fontSize: CGFloat,
+    syntaxHighlightingEnabled: Bool,
+    formattingCommand: MarkdownFormatCommand?,
+    findQuery: Binding<String>,
+    findReplacement: Binding<String>,
+    findBarVisible: Bool,
+    findCommand: FindBarCommand?,
+    tableTidyOnPaste: Bool,
+    asciiSafeTables: Bool,
+    aiAutocompleteEnabled: Bool,
+    scrollSyncCoordinator: ScrollSyncCoordinator? = nil,
+    scrollSyncEnabled: Bool = false,
+    isDirty: Binding<Bool>,
+    onDocumentChanged: @escaping @MainActor () -> Void,
+    onCloseFindBar: @escaping @MainActor () -> Void,
+    onFindStateChanged: @escaping @MainActor (Int, Int?) -> Void = { _, _ in },
+    onSelectionChanged: @escaping @MainActor (Int, Int) -> Void = { _, _ in }
+  ) {
+    self._text = text
+    self.editorMode = editorMode
+    self.fontSize = fontSize
+    self.syntaxHighlightingEnabled = syntaxHighlightingEnabled
+    self.formattingCommand = formattingCommand
+    self._findQuery = findQuery
+    self._findReplacement = findReplacement
+    self.findBarVisible = findBarVisible
+    self.findCommand = findCommand
+    self.tableTidyOnPaste = tableTidyOnPaste
+    self.asciiSafeTables = asciiSafeTables
+    self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+    self.scrollSyncEnabled = scrollSyncEnabled
+    self._isDirty = isDirty
+    self.onDocumentChanged = onDocumentChanged
+    self.onCloseFindBar = onCloseFindBar
+    self.onFindStateChanged = onFindStateChanged
+    self.onSelectionChanged = onSelectionChanged
+  }
 
   func makeNSView(context: Context) -> NSScrollView {
     let surface = MarkdownEditorSurface(
@@ -121,6 +172,10 @@ struct EditorRepresentable: NSViewRepresentable {
         self.onSelectionChanged(caret, selectionLength)
       }
     }
+    surface.configureScrollSync(
+      coordinator: scrollSyncCoordinator,
+      enabled: scrollSyncEnabled
+    )
     surface.typewriterScrollEnabled = editorMode == .focus
     context.coordinator.surface = surface
     return surface.scrollView
@@ -137,6 +192,10 @@ struct EditorRepresentable: NSViewRepresentable {
     let textUnchanged = surface.textStorage.string == text
     let savedOrigin = scroll.contentView.bounds.origin
     surface.typewriterScrollEnabled = editorMode == .focus
+    surface.configureScrollSync(
+      coordinator: scrollSyncCoordinator,
+      enabled: scrollSyncEnabled
+    )
     surface.update(
       text: text,
       fontSize: fontSize,
@@ -242,6 +301,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var autocompleteCancellable: AnyCancellable?
   private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
+  private weak var scrollSyncCoordinator: ScrollSyncCoordinator?
+  private var scrollSyncEnabled = false
+  private var pendingScrollSyncSample: DispatchWorkItem?
+  private let scrollSyncDebounce: TimeInterval
   /// Logical line index (newline count before the caret) at the last typewriter
   /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
   private var lastCenteredLine: Int?
@@ -260,6 +323,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
     aiAutocompleteEnabled: Bool = false,
+    scrollSyncDebounce: TimeInterval = 0.04,
     // Production autocomplete engine. The factory is lazy: `VistaEngine()` is
     // a thin FFI handle resolved post-debounce inside the controller, and the
     // completion path never loads the whisper model (see AutocompleteController
@@ -272,6 +336,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textStorage = NSTextStorage()
     self.autocompleteController = autocompleteController
     self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.scrollSyncDebounce = scrollSyncDebounce
     textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
 
     textContentStorage.textStorage = textStorage
@@ -311,6 +376,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     super.init()
 
     textView.delegate = self
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(editorBoundsDidChange(_:)),
+      name: NSView.boundsDidChangeNotification,
+      object: scrollView.contentView
+    )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
     }
@@ -394,7 +465,52 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   deinit {
+    pendingScrollSyncSample?.cancel()
     NotificationCenter.default.removeObserver(self)
+  }
+
+  func configureScrollSync(coordinator: ScrollSyncCoordinator?, enabled: Bool) {
+    let wasEnabled = scrollSyncEnabled
+    scrollSyncCoordinator = coordinator
+    scrollSyncEnabled = enabled
+    coordinator?.isEnabled = enabled
+    if wasEnabled, !enabled {
+      pendingScrollSyncSample?.cancel()
+      pendingScrollSyncSample = nil
+    }
+  }
+
+  @objc private func editorBoundsDidChange(_ notification: Notification) {
+    guard notification.object as? NSClipView === scrollView.contentView else { return }
+    scheduleScrollSyncSample()
+  }
+
+  func scheduleScrollSyncSample() {
+    guard scrollSyncEnabled, scrollSyncCoordinator?.isEnabled == true else { return }
+
+    pendingScrollSyncSample?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.emitScrollSyncFromCurrentViewport()
+    }
+    pendingScrollSyncSample = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + scrollSyncDebounce, execute: workItem)
+  }
+
+  private func emitScrollSyncFromCurrentViewport() {
+    pendingScrollSyncSample = nil
+    guard scrollSyncEnabled, let scrollSyncCoordinator else { return }
+    let visible = scrollView.contentView.bounds
+    let documentHeight = scrollView.documentView?.bounds.height ?? textView.bounds.height
+    let position = Self.scrollSyncPosition(visibleRect: visible, documentHeight: documentHeight)
+    scrollSyncCoordinator.editorDidScroll(to: position)
+  }
+
+  static func scrollSyncPosition(visibleRect: NSRect, documentHeight: CGFloat) -> ScrollSyncPosition {
+    let scrollableHeight = max(0, documentHeight - visibleRect.height)
+    guard scrollableHeight > 0 else {
+      return ScrollSyncPosition(progress: 0)
+    }
+    return ScrollSyncPosition(progress: Double(visibleRect.origin.y / scrollableHeight))
   }
 
   func textDidChange(_ notification: Notification) {

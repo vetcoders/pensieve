@@ -20,6 +20,11 @@ import WebKit
 struct PreviewView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var themeManager: ThemeManager
+  private let scrollSyncCoordinator: ScrollSyncCoordinator?
+
+  init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+  }
 
   var body: some View {
     PreviewRepresentable(
@@ -30,7 +35,8 @@ struct PreviewView: View {
       themeManager: themeManager,
       documentURL: appState.activeDocumentURL,
       autoReload: appState.previewAutoReload,
-      refreshToken: appState.previewRefreshToken
+      refreshToken: appState.previewRefreshToken,
+      scrollSyncCoordinator: scrollSyncCoordinator
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Color(NSColor.textBackgroundColor).ignoresSafeArea(.container, edges: .top))
@@ -49,6 +55,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   let documentURL: URL?
   let autoReload: Bool
   let refreshToken: Int
+  let scrollSyncCoordinator: ScrollSyncCoordinator?
 
   /// Base URL for relative resource resolution inside the preview WebView.
   /// File-first markdown: relative images/links belong to the note's folder.
@@ -63,7 +70,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(themeManager: themeManager)
+    Coordinator(themeManager: themeManager, scrollSyncCoordinator: scrollSyncCoordinator)
   }
 
   func makeNSView(context: Context) -> PreviewWebView {
@@ -74,6 +81,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func updateNSView(_ nsView: PreviewWebView, context: Context) {
+    context.coordinator.update(scrollSyncCoordinator: scrollSyncCoordinator)
     context.coordinator.submit(request: currentRequest, autoReload: autoReload, initial: false)
   }
 
@@ -102,18 +110,41 @@ struct PreviewRepresentable: NSViewRepresentable {
   /// pass through.
   final class Coordinator {
     let pipeline: PreviewPipeline
+    private weak var previewView: PreviewWebView?
+    private var scrollSyncCoordinator: ScrollSyncCoordinator?
     private var lastAccepted: PreviewRenderRequest?
 
-    init(themeManager: ThemeManager) {
+    init(
+      themeManager: ThemeManager,
+      scrollSyncCoordinator: ScrollSyncCoordinator? = nil
+    ) {
       self.pipeline = PreviewPipeline(themeManager: themeManager)
+      self.scrollSyncCoordinator = scrollSyncCoordinator
     }
 
     func attach(view: PreviewWebView) {
+      previewView = view
       pipeline.attach(sink: view)
+      scrollSyncCoordinator?.attachPreviewTarget(view)
     }
 
     func detach() {
+      if let previewView {
+        scrollSyncCoordinator?.detachPreviewTarget(previewView)
+      }
+      previewView = nil
       pipeline.detach()
+    }
+
+    func update(scrollSyncCoordinator nextCoordinator: ScrollSyncCoordinator?) {
+      guard !sameCoordinator(as: nextCoordinator) else { return }
+      if let previewView {
+        scrollSyncCoordinator?.detachPreviewTarget(previewView)
+      }
+      scrollSyncCoordinator = nextCoordinator
+      if let previewView {
+        scrollSyncCoordinator?.attachPreviewTarget(previewView)
+      }
     }
 
     func submit(request: PreviewRenderRequest, autoReload: Bool, initial: Bool) {
@@ -136,6 +167,16 @@ struct PreviewRepresentable: NSViewRepresentable {
         && previous.skin == next.skin
         && previous.documentURL == next.documentURL
         && previous.refreshToken == next.refreshToken
+    }
+
+    private func sameCoordinator(as other: ScrollSyncCoordinator?) -> Bool {
+      guard let scrollSyncCoordinator else {
+        return other == nil
+      }
+      guard let other else {
+        return false
+      }
+      return scrollSyncCoordinator === other
     }
   }
 }

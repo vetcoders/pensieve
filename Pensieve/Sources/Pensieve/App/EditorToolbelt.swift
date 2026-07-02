@@ -78,6 +78,23 @@ struct EditorToolbelt: ToolbarContent {
 
       Toggle(
         isOn: Binding(
+          get: { appState.scrollSyncEnabled },
+          set: { appState.scrollSyncEnabled = $0 }
+        )
+      ) {
+        Image(systemName: "arrow.up.and.down")
+      }
+      .toggleStyle(.button)
+      .help(
+        appState.scrollSyncEnabled
+          ? "Scroll sync on — editor drives preview in Split mode"
+          : "Scroll sync off"
+      )
+      .disabled(!hasEditableBuffer)
+      .accessibilityIdentifier("pensieve.toolbar.scrollSync")
+
+      Toggle(
+        isOn: Binding(
           get: { appState.previewAutoReload },
           set: { appState.previewAutoReload = $0 }
         )

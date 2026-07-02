@@ -60,6 +60,44 @@ final class PreviewWebView: NSView {
     updateLoadedPage(document)
   }
 
+  func readScrollSyncPosition(completion: @escaping (ScrollSyncPosition?) -> Void) {
+    guard loadedIdentity != nil else {
+      completion(nil)
+      return
+    }
+
+    let script = """
+      (function() {
+        const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        if (maxY <= 0) {
+          return 0;
+        }
+        return Math.min(Math.max((window.scrollY || 0) / maxY, 0), 1);
+      })();
+      """
+    webView.evaluateJavaScript(script) { result, error in
+      guard error == nil, let progress = result as? Double else {
+        completion(nil)
+        return
+      }
+      completion(ScrollSyncPosition(progress: progress))
+    }
+  }
+
+  private func scrollToScrollSyncPosition(_ position: ScrollSyncPosition) {
+    guard loadedIdentity != nil else { return }
+    let progress = position.progress
+    let script = """
+      (function() {
+        const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        const nextY = maxY * \(progress);
+        window.scrollTo({ left: window.scrollX || 0, top: nextY, behavior: 'auto' });
+        return true;
+      })();
+      """
+    webView.evaluateJavaScript(script, completionHandler: nil)
+  }
+
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
@@ -998,6 +1036,12 @@ private struct PreviewLoadIdentity: Equatable {
 // MARK: - PreviewSink conformance
 
 extension PreviewWebView: PreviewSink {}
+
+extension PreviewWebView: ScrollSyncPreviewTarget {
+  func applyScrollSyncPosition(_ position: ScrollSyncPosition) {
+    scrollToScrollSyncPosition(position)
+  }
+}
 
 // MARK: - WKNavigationDelegate proxy
 // Singleton: opens activated http(s)/mailto links in the default browser,
