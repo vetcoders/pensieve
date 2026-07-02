@@ -32,31 +32,6 @@ VENDOR_DIR="$PENSIEVE_ROOT/Vendor/qube-ffi/$FFI_PROFILE"
 GENERATED_SWIFT="$PENSIEVE_ROOT/Sources/Pensieve/VistaBridge/qube_ffi.swift"
 PROVENANCE="$PENSIEVE_ROOT/Vendor/qube-ffi/PROVENANCE.txt"
 
-patch_completion_protocol() {
-  local swift_file="$1"
-
-  if awk '
-    /public protocol VistaEngineProtocol: AnyObject, Sendable \{/ { in_protocol = 1 }
-    in_protocol && /func complete\(prefix: String, maxTokens: UInt32\)/ { found = 1 }
-    in_protocol && /^}/ { in_protocol = 0 }
-    END { exit found ? 0 : 1 }
-  ' "$swift_file"; then
-    return
-  fi
-
-  perl -0pi -e 's/(public protocol VistaEngineProtocol: AnyObject, Sendable \{\n)/$1\n    func complete(prefix: String, maxTokens: UInt32) async throws -> String\n/' "$swift_file"
-
-  if ! awk '
-    /public protocol VistaEngineProtocol: AnyObject, Sendable \{/ { in_protocol = 1 }
-    in_protocol && /func complete\(prefix: String, maxTokens: UInt32\)/ { found = 1 }
-    in_protocol && /^}/ { in_protocol = 0 }
-    END { exit found ? 0 : 1 }
-  ' "$swift_file"; then
-    echo "error: failed to patch VistaEngineProtocol.complete into $swift_file" >&2
-    exit 1
-  fi
-}
-
 echo "Building qube-ffi from $VISTA_KERNEL_ROOT ($FFI_PROFILE)"
 (
   cd "$VISTA_KERNEL_ROOT"
@@ -79,7 +54,6 @@ mkdir -p \
 
 cp "$BRIDGE_DIR/qube_ffi.swift" \
   "$GENERATED_SWIFT"
-patch_completion_protocol "$GENERATED_SWIFT"
 cp "$BRIDGE_DIR/qube_ffiFFI.h" \
   "$PENSIEVE_ROOT/Sources/qube_ffiFFI/qube_ffiFFI.h"
 cp "$LIB_DIR/libqube_ffi.dylib" \

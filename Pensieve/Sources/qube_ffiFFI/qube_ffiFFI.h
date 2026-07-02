@@ -299,6 +299,11 @@ uint64_t uniffi_qube_ffi_fn_constructor_vistaengine_new(RustCallStatus *_Nonnull
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_FN_METHOD_VISTAENGINE_COMPLETE
+#define UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_FN_METHOD_VISTAENGINE_COMPLETE
+uint64_t uniffi_qube_ffi_fn_method_vistaengine_complete(uint64_t ptr, RustBuffer prefix, uint32_t max_tokens
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_FN_METHOD_VISTAENGINE_CONFIG_DIR
 #define UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_FN_METHOD_VISTAENGINE_CONFIG_DIR
 RustBuffer uniffi_qube_ffi_fn_method_vistaengine_config_dir(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -709,6 +714,12 @@ void ffi_qube_ffi_rust_future_free_void(uint64_t handle
 void ffi_qube_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_CHECKSUM_METHOD_VISTAENGINE_COMPLETE
+#define UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_CHECKSUM_METHOD_VISTAENGINE_COMPLETE
+uint16_t uniffi_qube_ffi_checksum_method_vistaengine_complete(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_CHECKSUM_METHOD_VISTAENGINE_CONFIG_DIR
 #define UNIFFI_FFIDEF_UNIFFI_QUBE_FFI_CHECKSUM_METHOD_VISTAENGINE_CONFIG_DIR
 uint16_t uniffi_qube_ffi_checksum_method_vistaengine_config_dir(void
@@ -883,4 +894,3 @@ uint32_t ffi_qube_ffi_uniffi_contract_version(void
     
 );
 #endif
-

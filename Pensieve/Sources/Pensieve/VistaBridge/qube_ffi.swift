@@ -425,6 +425,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
     typealias FfiType = Float
     typealias SwiftType = Float
@@ -508,7 +524,7 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol VistaEngineProtocol: AnyObject, Sendable {
 
-    func complete(prefix: String, maxTokens: UInt32) async throws -> String
+    func complete(prefix: String, maxTokens: UInt32) async throws  -> String
     
     func configDir()  -> String
     
@@ -611,6 +627,23 @@ public convenience init() {
 
     
 
+
+open func complete(prefix: String, maxTokens: UInt32)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_qube_ffi_fn_method_vistaengine_complete(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(prefix),FfiConverterUInt32.lower(maxTokens)
+                )
+            },
+            pollFunc: ffi_qube_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_qube_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_qube_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeVistaError_lift
+        )
+}
     
 open func configDir() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1653,6 +1686,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_qube_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_qube_ffi_checksum_method_vistaengine_complete() != 58715) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_qube_ffi_checksum_method_vistaengine_config_dir() != 53480) {
         return InitializationResult.apiChecksumMismatch
