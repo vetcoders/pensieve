@@ -22,6 +22,7 @@ struct ContentView: View {
         EditorPreviewSplit()
         if appState.documentHasEditableBuffer {
           EditorStatusBar()
+            .opacity(appState.mode == .focus ? 0.45 : 1)
         }
       }
     }
@@ -81,9 +82,10 @@ struct EditorPreviewSplit: View {
       )
     } else {
       switch appState.mode {
-      case .source, .focus:
-        // Focus mode shares source layout (Wave 2 dimming TBD).
+      case .source:
         EditorView()
+      case .focus:
+        FocusedEditorView()
       case .preview:
         PreviewView()
       case .split:
@@ -102,6 +104,40 @@ struct EditorPreviewSplit: View {
         }
       }
     }
+  }
+}
+
+private struct FocusedEditorView: View {
+  var body: some View {
+    EditorView()
+      .overlay {
+        FocusModeDimmingOverlay()
+          .allowsHitTesting(false)
+      }
+      .accessibilityIdentifier("pensieve.focus.editor")
+  }
+}
+
+private struct FocusModeDimmingOverlay: View {
+  var body: some View {
+    VStack(spacing: 0) {
+      LinearGradient(
+        colors: [Color.black.opacity(0.10), Color.black.opacity(0)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 88)
+
+      Spacer(minLength: 0)
+
+      LinearGradient(
+        colors: [Color.black.opacity(0), Color.black.opacity(0.08)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 96)
+    }
+    .accessibilityIdentifier("pensieve.focus.dimming")
   }
 }
 
@@ -144,7 +180,8 @@ struct DocumentEmptyStateView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor))
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.emptyState")
   }
 

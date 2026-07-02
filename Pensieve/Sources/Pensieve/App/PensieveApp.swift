@@ -30,10 +30,7 @@ struct PensieveApp: App {
         initialDocument: document.wrappedValue
       )
     }
-    .windowStyle(.titleBar)
-    .windowToolbarStyle(.unified(showsTitle: true))
-    .defaultSize(width: 1180, height: 760)
-    .windowResizability(.contentMinSize)
+    .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
     }
@@ -107,7 +104,10 @@ struct DocumentWindowRootView: View {
         currentWindow = window
       }
     )
-    .frame(minWidth: 720, minHeight: 480)
+    .frame(
+      minWidth: WindowChromeRecipe.minimumContentSize.width,
+      minHeight: WindowChromeRecipe.minimumContentSize.height
+    )
     .task {
       configureDocumentRouting()
       if let initialDocument {
@@ -227,7 +227,8 @@ struct StartupPresentationView: View {
         .foregroundStyle(.tertiary)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor))
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.startupPresentation")
   }
 }

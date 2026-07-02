@@ -33,7 +33,8 @@ struct PreviewView: View {
       refreshToken: appState.previewRefreshToken
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.textBackgroundColor))
+    .background(Color(NSColor.textBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
   }
 }
 
