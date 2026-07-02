@@ -120,13 +120,14 @@ gates: test lint  ## Run all quality gates (test + lint)
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) all gates passed\n"
 
 .PHONY: init-hooks
-init-hooks:  ## Install repo-local pre-commit + pre-push hooks
+init-hooks:  ## Install git hooks via lefthook (Vibecrafted standard)
 	@if [ "$$CI" = "true" ]; then \
 		printf "$(C_YELLOW)[skip]$(C_RESET) CI detected; not installing local git hooks\n"; \
+	elif ! command -v lefthook >/dev/null 2>&1; then \
+		printf "$(C_YELLOW)[skip]$(C_RESET) lefthook not installed — run 'brew install lefthook' then 'make init-hooks'\n"; \
 	elif git rev-parse --git-dir >/dev/null 2>&1; then \
-		git config core.hooksPath scripts/hooks >/dev/null; \
-		chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push; \
-		printf "$(C_GREEN)[ ok ]$(C_RESET) git hooks installed via core.hooksPath=scripts/hooks\n"; \
+		lefthook install >/dev/null; \
+		printf "$(C_GREEN)[ ok ]$(C_RESET) git hooks installed via lefthook (lefthook.yml -> .husky)\n"; \
 	else \
 		true; \
 	fi

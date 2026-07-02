@@ -108,3 +108,6 @@ dist/
 *.backup
 /docs/workforce
 /.claude
+
+# vibecrafted-hooks-template warns retention
+.husky/warns/
