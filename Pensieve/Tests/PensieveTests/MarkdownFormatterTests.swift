@@ -192,6 +192,54 @@ final class MarkdownFormatterTests: XCTestCase {
   }
 
   @MainActor
+  func testFormatSelectionMapsWrapperStringsToFormatCommands() {
+    // Every wrapper string the Format menu passes must land as the matching
+    // typed command in pendingMarkdownFormatCommand (the editor pickup point).
+    let expectations: [(wrapper: String, format: MarkdownFormat)] = [
+      ("**", .bold), ("*", .italic), ("~~", .strike), (">", .quote),
+      ("`", .code), ("[]()", .link), ("-", .bulletedList), ("1.", .numberedList),
+    ]
+
+    for expectation in expectations {
+      let appState = AppState()
+      let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+      appState.documentSession = DocumentSession(document: ref, text: "alpha")
+      let controller = AppController(appState: appState)
+
+      controller.formatSelection(with: expectation.wrapper)
+
+      XCTAssertEqual(
+        appState.pendingMarkdownFormatCommand?.action,
+        .format(expectation.format),
+        "wrapper \(expectation.wrapper) should map to \(expectation.format)")
+    }
+  }
+
+  @MainActor
+  func testFormatSelectionIgnoresUnknownWrapper() {
+    let appState = AppState()
+    let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+    appState.documentSession = DocumentSession(document: ref, text: "alpha")
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "%%")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
+  func testFormatSelectionRequiresEditableBuffer() {
+    // Mirrors the Format menu's disabled predicate: with no editable buffer
+    // the command must not enqueue a formatting request.
+    let appState = AppState()
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "**")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
   func testEmptySelectionFormattingIsLegacyNoOp() {
     var didRouteDocumentChange = false
     let surface = MarkdownEditorSurface(text: "plain", fontSize: 14)

@@ -181,6 +181,127 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(service.dispatchStatus, "Dispatch failed (exit 2)")
     XCTAssertEqual(launcher.requests().map(\.payload), [.file(documentURL.path)])
   }
+
+  // MARK: - Current-document dispatch (Agents menu route)
+
+  @MainActor
+  func testDispatchCurrentDocumentRefusesWithoutEditableBuffer() {
+    let appState = AppState()
+    let launcher = RecordingAgentPromptLauncher()
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: TranscriptionService(cadenceCommitNanoseconds: 0),
+      agentPromptLauncher: launcher
+    )
+
+    // The Agents menu items disable on this exact predicate; the method must
+    // refuse on the same state so a stale menu can never fire a blind dispatch.
+    XCTAssertFalse(appState.documentHasEditableBuffer)
+    XCTAssertFalse(controller.dispatchCurrentDocumentToAgent(workflow: "review"))
+    XCTAssertEqual(
+      appState.lastError, "Open an editable document before dispatching to an agent.")
+    XCTAssertTrue(launcher.requests().isEmpty)
+  }
+
+  @MainActor
+  func testDispatchCurrentDocumentRoutesActiveFileAsFilePayload() async {
+    let documentURL = URL(fileURLWithPath: "/tmp/pensieve-current-doc.md").standardizedFileURL
+    let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
+      .standardizedFileURL
+    let appState = AppState()
+    appState.documentSession = DocumentSession(
+      document: DocumentRef(id: documentURL),
+      text: "# Plan",
+      isDirty: false)
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let launcher = RecordingAgentPromptLauncher(
+      result: AgentDispatchMetadata(
+        runID: "work-current-doc",
+        reportPath: nil,
+        exitCode: 0,
+        output: "receipt"
+      )
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: workspaceRoot
+    )
+
+    XCTAssertTrue(appState.documentHasEditableBuffer)
+    XCTAssertTrue(controller.dispatchCurrentDocumentToAgent(workflow: "review"))
+    await waitForDispatchStatus(service, containing: "work-current-doc")
+
+    XCTAssertEqual(
+      launcher.requests(),
+      [
+        RecordingAgentPromptLauncher.Request(
+          workflow: "review",
+          agent: controller.defaultAgent,
+          payload: .file(documentURL.path),
+          workingDirectoryURL: workspaceRoot)
+      ])
+  }
+
+  @MainActor
+  func testDispatchCurrentDocumentRoutesUntitledBufferAsPromptPayload() async {
+    let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
+      .standardizedFileURL
+    let appState = AppState()
+    appState.documentSession.createUntitled(title: "Scratch.md")
+    appState.documentSession.text = "ship the plan"
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let launcher = RecordingAgentPromptLauncher(
+      result: AgentDispatchMetadata(
+        runID: "work-untitled-doc",
+        reportPath: nil,
+        exitCode: 0,
+        output: "receipt"
+      )
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: workspaceRoot
+    )
+
+    XCTAssertTrue(appState.documentHasEditableBuffer)
+    XCTAssertTrue(controller.dispatchCurrentDocumentToAgent(workflow: "workflow"))
+    await waitForDispatchStatus(service, containing: "work-untitled-doc")
+
+    XCTAssertEqual(
+      launcher.requests(),
+      [
+        RecordingAgentPromptLauncher.Request(
+          workflow: "workflow",
+          agent: controller.defaultAgent,
+          payload: .prompt("ship the plan"),
+          workingDirectoryURL: workspaceRoot)
+      ])
+  }
+
+  private func waitForDispatchStatus(
+    _ service: TranscriptionService,
+    containing needle: String,
+    timeout: TimeInterval = 1.0
+  ) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if await MainActor.run(body: { service.dispatchStatus?.contains(needle) == true }) {
+        return
+      }
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
 }
 
 private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {

@@ -291,11 +291,6 @@ final class AppState {
     }
   }
 
-  var selectedDocument: DocumentRef? {
-    guard let id = selectedDocumentID else { return nil }
-    return allDocuments.first(where: { $0.id == id })
-  }
-
   var allDocuments: [DocumentRef] {
     workspaceStore.allDocuments
   }

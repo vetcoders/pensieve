@@ -185,6 +185,11 @@ private struct ActivePensieveCommands: Commands {
         )
       )
       .accessibilityIdentifier("pensieve.autocomplete.menuToggle")
+
+      Button("Show/Hide Tab Bar") {
+        NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
+      }
+      .disabled(NSApp.keyWindow == nil && NSApp.mainWindow == nil)
     }
 
     // Edit menu — Find & Replace routes into Pensieve's own squared find bar.
@@ -255,13 +260,6 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("r", modifiers: [.command, .shift])
     }
 
-    CommandGroup(after: .toolbar) {
-      Button("Show/Hide Tab Bar") {
-        NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
-      }
-      .disabled(NSApp.keyWindow == nil && NSApp.mainWindow == nil)
-    }
-
     // Tab navigation (Quick Win)
     CommandGroup(after: .windowArrangement) {
       Button(transcriptionTaflaMenuTitle) {
@@ -282,53 +280,78 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("[", modifiers: [.command, .shift])
     }
 
-    // Format menu — Markdown formatting and font sizing
+    // Agents menu — fast dispatch path for the ACTIVE document: default agent,
+    // workspace root, workflow from the curated deck. The toolbar ✈ sheet stays
+    // the configurable path (agent/root pickers, in-sheet confirmation).
+    CommandMenu("Agents") {
+      Button("Dispatch Document to Agent") {
+        controller.dispatchCurrentDocumentToAgent(workflow: "implement")
+      }
+      .keyboardShortcut("d", modifiers: [.command, .shift])
+      .disabled(!appState.documentHasEditableBuffer)
+      .accessibilityIdentifier("pensieve.agents.menu.dispatchDocument")
+
+      Menu("Dispatch Document with Workflow") {
+        ForEach(controller.agentWorkflows, id: \.self) { workflow in
+          Button(workflow) {
+            controller.dispatchCurrentDocumentToAgent(workflow: workflow)
+          }
+        }
+      }
+      .disabled(!appState.documentHasEditableBuffer)
+      .accessibilityIdentifier("pensieve.agents.menu.dispatchDocumentWorkflow")
+    }
+
+    // Format menu — Markdown formatting and font sizing. Menu items route
+    // through the wrapper-string surface `formatSelection(with:)` (the legacy
+    // MarkdownEditor contract); it resolves into the same
+    // `applyMarkdownFormat` funnel the toolbar strip calls with typed cases.
     CommandMenu("Format") {
       Section {
         Button("Bold") {
-          controller.applyMarkdownFormat(.bold)
+          controller.formatSelection(with: "**")
         }
         .keyboardShortcut("b", modifiers: [.command])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Italic") {
-          controller.applyMarkdownFormat(.italic)
+          controller.formatSelection(with: "*")
         }
         .keyboardShortcut("i", modifiers: [.command])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Strikethrough") {
-          controller.applyMarkdownFormat(.strike)
+          controller.formatSelection(with: "~~")
         }
         .keyboardShortcut("x", modifiers: [.command, .shift])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Quote") {
-          controller.applyMarkdownFormat(.quote)
+          controller.formatSelection(with: ">")
         }
         .keyboardShortcut("'", modifiers: [.command])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Code") {
-          controller.applyMarkdownFormat(.code)
+          controller.formatSelection(with: "`")
         }
         .keyboardShortcut("`", modifiers: [.command])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Link") {
-          controller.applyMarkdownFormat(.link)
+          controller.formatSelection(with: "[]()")
         }
         .keyboardShortcut("k", modifiers: [.command])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Bulleted List") {
-          controller.applyMarkdownFormat(.bulletedList)
+          controller.formatSelection(with: "-")
         }
         .keyboardShortcut("8", modifiers: [.command, .shift])
         .disabled(!appState.documentHasEditableBuffer)
 
         Button("Numbered List") {
-          controller.applyMarkdownFormat(.numberedList)
+          controller.formatSelection(with: "1.")
         }
         .keyboardShortcut("7", modifiers: [.command, .shift])
         .disabled(!appState.documentHasEditableBuffer)
