@@ -338,7 +338,11 @@ if (( DO_NOTARIZE )); then
         die "App notarization failed"
     fi
 else
-    warn "Skipping notarization (--no-notarize); .app signed but not notarized"
+    if (( APPSTORE )); then
+        log "No notarization in the App Store lane — App Review replaces it"
+    else
+        warn "Skipping notarization (--no-notarize); .app signed but not notarized"
+    fi
 fi
 
 fi  # end: skip build/sign/notarize-app in --dmg-only mode

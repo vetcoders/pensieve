@@ -4,7 +4,9 @@
 <dict>
     <!-- Mac App Store lane: App Sandbox is mandatory for MAS distribution.
          The Developer ID lane keeps Pensieve.entitlements (non-sandboxed);
-         this file is selected only by scripts/build-release.sh --appstore. -->
+         this file is selected only by the appstore flag of
+         scripts/build-release.sh. (XML comments cannot contain double
+         hyphens; AMFI rejects them even when plutil lints clean.) -->
     <key>com.apple.security.app-sandbox</key>
     <true/>
 
