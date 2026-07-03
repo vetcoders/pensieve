@@ -228,7 +228,6 @@ private struct AppearancePopoverContent: View {
     }
     .padding(14)
     .frame(width: 280)
-    .accessibilityIdentifier("pensieve.toolbar.appearancePopover")
   }
 }
 
