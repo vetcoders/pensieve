@@ -35,9 +35,11 @@ final class ScrollSyncCoordinator {
   private var lockGeneration: UInt64 = 0
   private let unlockScheduler: (@escaping () -> Void) -> Void
 
-  init(unlockScheduler: @escaping (@escaping () -> Void) -> Void = { action in
-    RunLoop.main.perform(action)
-  }) {
+  init(
+    unlockScheduler: @escaping (@escaping () -> Void) -> Void = { action in
+      RunLoop.main.perform(action)
+    }
+  ) {
     self.unlockScheduler = unlockScheduler
   }
 

@@ -505,7 +505,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollSyncCoordinator.editorDidScroll(to: position)
   }
 
-  static func scrollSyncPosition(visibleRect: NSRect, documentHeight: CGFloat) -> ScrollSyncPosition {
+  static func scrollSyncPosition(visibleRect: NSRect, documentHeight: CGFloat) -> ScrollSyncPosition
+  {
     let scrollableHeight = max(0, documentHeight - visibleRect.height)
     guard scrollableHeight > 0 else {
       return ScrollSyncPosition(progress: 0)
