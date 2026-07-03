@@ -67,8 +67,9 @@ struct EditorToolbelt: ToolbarContent {
       .disabled(!hasEditableBuffer)
       .accessibilityIdentifier("pensieve.toolbar.share")
 
-      previewThemePicker
-      previewSkinPicker
+      if Self.showsAppearanceControls(for: appState.mode) {
+        AppearanceToolbarButton(themeManager: themeManager)
+      }
       Button(action: { appState.requestPreviewRefresh() }) {
         Image(systemName: "arrow.clockwise")
       }
@@ -111,6 +112,14 @@ struct EditorToolbelt: ToolbarContent {
     }
   }
 
+  /// Appearance controls describe only the rendered preview surface, so they
+  /// earn toolbar space only while a preview pane is actually on screen.
+  /// `.split` counts even when a narrow window collapses it to one pane —
+  /// the mode, not the momentary geometry, is the source of truth.
+  static func showsAppearanceControls(for mode: EditorMode) -> Bool {
+    mode == .preview || mode == .split
+  }
+
   // MARK: - Subgroups
 
   private var modePicker: some View {
@@ -148,35 +157,6 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
   }
 
-  private var previewThemePicker: some View {
-    Picker("Flavor", selection: $themeManager.current) {
-      ForEach(ThemeManager.Theme.allCases) { theme in
-        Text(theme.displayName).tag(theme)
-      }
-    }
-    .pickerStyle(.menu)
-    .help("Markdown flavor — plain Markdown or GitHub Flavored")
-    .frame(minWidth: 140)
-    .accessibilityIdentifier("pensieve.toolbar.themePicker")
-  }
-
-  /// Reading-surface skin picker. Orthogonal to the flavor: it re-skins the
-  /// rendered surface — paper-like, code-like, stripped, or a document theme —
-  /// without changing the markdown dialect. Authorial skins (Default, Document,
-  /// Code, Raw, Vista, MLA, Jamstatic) plus open-licensed ports (Notion, Vercel,
-  /// Themeable, Glass — see THIRD_PARTY_THEMES.md).
-  private var previewSkinPicker: some View {
-    Picker("Theme", selection: $themeManager.skin) {
-      ForEach(ThemeManager.PreviewTheme.allCases) { skin in
-        Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
-      }
-    }
-    .pickerStyle(.menu)
-    .help("Preview theme — the reading surface for the rendered markdown")
-    .frame(minWidth: 120)
-    .accessibilityIdentifier("pensieve.toolbar.skinPicker")
-  }
-
   @ViewBuilder
   private var formatStrip: some View {
     ForEach(MarkdownFormat.allCases) { format in
@@ -190,6 +170,65 @@ struct EditorToolbelt: ToolbarContent {
         Divider()
       }
     }
+  }
+}
+
+/// Compact replacement for the two wide preview pickers that used to dominate
+/// the titlebar: one monochrome toolbar button opening a popover that hosts
+/// both appearance axes. A plain `View` (not `ToolbarContent`) so it can own
+/// the `@State` driving the popover presentation.
+private struct AppearanceToolbarButton: View {
+  @ObservedObject var themeManager: ThemeManager
+  @State private var isPopoverPresented = false
+
+  var body: some View {
+    Button(action: { isPopoverPresented.toggle() }) {
+      Image(systemName: "paintpalette")
+    }
+    .help("Preview appearance — markdown flavor and reading theme")
+    .accessibilityIdentifier("pensieve.toolbar.appearance")
+    .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
+      AppearancePopoverContent(themeManager: themeManager)
+    }
+  }
+}
+
+/// Popover body hosting the flavor and skin pickers. Same `Picker` views as the
+/// old toolbar items — both auto-populate from `CaseIterable` and keep their
+/// accessibility identifiers, so switching either axis drives `ThemeManager`
+/// (and the live preview) exactly as before.
+private struct AppearancePopoverContent: View {
+  @ObservedObject var themeManager: ThemeManager
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Picker("Flavor", selection: $themeManager.current) {
+        ForEach(ThemeManager.Theme.allCases) { theme in
+          Text(theme.displayName).tag(theme)
+        }
+      }
+      .pickerStyle(.menu)
+      .help("Markdown flavor — plain Markdown or GitHub Flavored")
+      .accessibilityIdentifier("pensieve.toolbar.themePicker")
+
+      // Reading-surface skin, orthogonal to the flavor: it re-skins the
+      // rendered surface — paper-like, code-like, stripped, or a document
+      // theme — without changing the markdown dialect. Authorial skins
+      // (Default, Document, Code, Raw, Vista, MLA, Jamstatic) plus
+      // open-licensed ports (Notion, Vercel, Themeable, Glass — see
+      // THIRD_PARTY_THEMES.md).
+      Picker("Theme", selection: $themeManager.skin) {
+        ForEach(ThemeManager.PreviewTheme.allCases) { skin in
+          Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
+        }
+      }
+      .pickerStyle(.menu)
+      .help("Preview theme — the reading surface for the rendered markdown")
+      .accessibilityIdentifier("pensieve.toolbar.skinPicker")
+    }
+    .padding(14)
+    .frame(width: 280)
+    .accessibilityIdentifier("pensieve.toolbar.appearancePopover")
   }
 }
 
