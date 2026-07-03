@@ -186,6 +186,8 @@ final class PreviewWebView: NSView {
       --vc-preview-diagram-error-bg: #fff1f1;
       --vc-preview-diagram-error-text: #8c1d18;
       --vc-preview-math-bg: #f6f8fa;
+      --vc-preview-page-background: transparent;
+      --vc-preview-titlebar-glass-height: 64px;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -220,8 +222,20 @@ final class PreviewWebView: NSView {
       margin: 0 !important;
       padding: clamp(12px, 3vw, 28px) !important;
       box-sizing: border-box;
+      min-height: 100vh;
       overflow-wrap: anywhere;
       word-wrap: break-word;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      top: var(--vc-preview-titlebar-glass-height);
+      right: 0;
+      bottom: 0;
+      left: 0;
+      background: var(--vc-preview-page-background);
+      pointer-events: none;
     }
 
     .markdown-body {
@@ -230,6 +244,7 @@ final class PreviewWebView: NSView {
       color: var(--vc-preview-text) !important;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
       line-height: 1.65;
+      position: relative;
       overflow-wrap: anywhere;
       word-wrap: break-word;
     }
@@ -452,6 +467,7 @@ final class PreviewWebView: NSView {
           --vc-preview-link: #8a5a2b;
           --vc-preview-row-alt: #f3ecda;
           --vc-preview-paper-bg: #faf4e6;
+          --vc-preview-page-background: var(--vc-preview-paper-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -462,10 +478,8 @@ final class PreviewWebView: NSView {
             --vc-preview-link: #d9a566;
             --vc-preview-row-alt: #26231c;
             --vc-preview-paper-bg: #1d1a14;
+            --vc-preview-page-background: var(--vc-preview-paper-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-paper-bg) !important;
         }
         .markdown-body {
           max-width: 720px;
@@ -492,6 +506,7 @@ final class PreviewWebView: NSView {
           --vc-preview-link: #7fb3ff;
           --vc-preview-row-alt: #131d2c;
           --vc-preview-code-surface: #0a121d;
+          --vc-preview-page-background: var(--vc-preview-code-surface);
         }
         @media (prefers-color-scheme: light) {
           :root {
@@ -502,10 +517,8 @@ final class PreviewWebView: NSView {
             --vc-preview-link: #1f6feb;
             --vc-preview-row-alt: #f1f5fa;
             --vc-preview-code-surface: #f6f9fc;
+            --vc-preview-page-background: var(--vc-preview-code-surface);
           }
-        }
-        html, body {
-          background: var(--vc-preview-code-surface) !important;
         }
         .markdown-body {
           max-width: 900px;
@@ -559,6 +572,7 @@ final class PreviewWebView: NSView {
           --vc-preview-row-alt: #f7f6f3;
           --vc-preview-notion-bg: #ffffff;
           --vc-preview-notion-code: #eb5757;
+          --vc-preview-page-background: var(--vc-preview-notion-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -570,10 +584,8 @@ final class PreviewWebView: NSView {
             --vc-preview-row-alt: #202020;
             --vc-preview-notion-bg: #191919;
             --vc-preview-notion-code: #eb5757;
+            --vc-preview-page-background: var(--vc-preview-notion-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-notion-bg) !important;
         }
         .markdown-body {
           max-width: 820px;
@@ -606,6 +618,7 @@ final class PreviewWebView: NSView {
           --vc-preview-vista-bg: #f9f9f9;
           --vc-preview-vista-thead: #f1f1f1;
           --vc-preview-vista-hover: #f5f8ff;
+          --vc-preview-page-background: var(--vc-preview-vista-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -618,10 +631,8 @@ final class PreviewWebView: NSView {
             --vc-preview-vista-bg: #101010;
             --vc-preview-vista-thead: #1f1f1f;
             --vc-preview-vista-hover: #1a2030;
+            --vc-preview-page-background: var(--vc-preview-vista-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-vista-bg) !important;
         }
         .markdown-body {
           max-width: 900px;
@@ -664,6 +675,7 @@ final class PreviewWebView: NSView {
           --vc-preview-link: #7a4a1f;
           --vc-preview-row-alt: #f2efe6;
           --vc-preview-mla-bg: #fbfaf5;
+          --vc-preview-page-background: var(--vc-preview-mla-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -674,10 +686,8 @@ final class PreviewWebView: NSView {
             --vc-preview-link: #d2a16a;
             --vc-preview-row-alt: #211d15;
             --vc-preview-mla-bg: #17140d;
+            --vc-preview-page-background: var(--vc-preview-mla-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-mla-bg) !important;
         }
         .markdown-body {
           max-width: 680px;
@@ -712,6 +722,7 @@ final class PreviewWebView: NSView {
           --vc-preview-row-alt: #f2f7ff;
           --vc-preview-jam-bg: #ffffff;
           --vc-preview-jam-accent: #b1a3cc;
+          --vc-preview-page-background: var(--vc-preview-jam-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -723,10 +734,8 @@ final class PreviewWebView: NSView {
             --vc-preview-row-alt: #242031;
             --vc-preview-jam-bg: #1b1b22;
             --vc-preview-jam-accent: #b1a3cc;
+            --vc-preview-page-background: var(--vc-preview-jam-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-jam-bg) !important;
         }
         .markdown-body {
           max-width: 860px;
@@ -761,6 +770,7 @@ final class PreviewWebView: NSView {
           --vc-preview-row-alt: #fafafa;
           --vc-preview-vercel-bg: #ffffff;
           --vc-preview-vercel-accent: #8e4ec6;
+          --vc-preview-page-background: var(--vc-preview-vercel-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -772,10 +782,8 @@ final class PreviewWebView: NSView {
             --vc-preview-row-alt: #141414;
             --vc-preview-vercel-bg: #0a0a0a;
             --vc-preview-vercel-accent: #bf7af0;
+            --vc-preview-page-background: var(--vc-preview-vercel-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-vercel-bg) !important;
         }
         .markdown-body {
           max-width: 880px;
@@ -815,6 +823,7 @@ final class PreviewWebView: NSView {
           --vc-preview-link: #2563eb;
           --vc-preview-row-alt: #f8fafc;
           --vc-preview-themeable-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-themeable-bg);
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -825,10 +834,8 @@ final class PreviewWebView: NSView {
             --vc-preview-link: #60a5fa;
             --vc-preview-row-alt: #1e293b;
             --vc-preview-themeable-bg: #0f172a;
+            --vc-preview-page-background: var(--vc-preview-themeable-bg);
           }
-        }
-        html, body {
-          background: var(--vc-preview-themeable-bg) !important;
         }
         .markdown-body {
           max-width: 820px;
@@ -857,6 +864,7 @@ final class PreviewWebView: NSView {
           --vc-preview-glass-panel: rgba(255, 255, 255, 0.40);
           --vc-preview-glass-grad-a: #e8f0ff;
           --vc-preview-glass-grad-b: #f6e8ff;
+          --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
         }
         @media (prefers-color-scheme: dark) {
           :root {
@@ -869,11 +877,8 @@ final class PreviewWebView: NSView {
             --vc-preview-glass-panel: rgba(40, 40, 50, 0.45);
             --vc-preview-glass-grad-a: #1b2236;
             --vc-preview-glass-grad-b: #2a1b36;
+            --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
           }
-        }
-        html, body {
-          background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b)) !important;
-          background-attachment: fixed !important;
         }
         .markdown-body {
           max-width: 820px;

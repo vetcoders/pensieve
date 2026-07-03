@@ -114,6 +114,40 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("vc-skin:default"))
   }
 
+  func testAppearanceCSSKeepsTitlebarOverlapTransparent() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
+
+    XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-height: 64px"))
+    XCTAssertTrue(css.contains("body::before"))
+    XCTAssertTrue(css.contains("top: var(--vc-preview-titlebar-glass-height)"))
+    XCTAssertTrue(css.contains("background: var(--vc-preview-page-background)"))
+    XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-paper-bg)"))
+    XCTAssertFalse(css.contains("background: var(--vc-preview-paper-bg) !important"))
+  }
+
+  func testOpaqueSkinsRouteBackgroundThroughPageBackdropToken() {
+    let skins: [ThemeManager.PreviewTheme] = [
+      .paper,
+      .code,
+      .notion,
+      .vista,
+      .mla,
+      .jamstatic,
+      .vercel,
+      .themeable,
+      .glass,
+    ]
+
+    for skin in skins {
+      XCTAssertTrue(
+        PreviewWebView.skinCSS(for: skin).contains("--vc-preview-page-background"),
+        "skin \(skin.rawValue) should keep its pane background below the glass strip")
+    }
+
+    XCTAssertFalse(PreviewWebView.skinCSS(for: .default).contains("--vc-preview-page-background"))
+    XCTAssertFalse(PreviewWebView.skinCSS(for: .raw).contains("--vc-preview-page-background"))
+  }
+
   // MARK: - request carries the skin axis
 
   func testRenderRequestCarriesSkinAndDefaultsToDefault() {
