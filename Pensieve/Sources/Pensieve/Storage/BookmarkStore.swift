@@ -95,6 +95,9 @@ final class BookmarkStore {
       ? defaults.data(forKey: legacyFolderBookmarkKey).map { [$0] } ?? []
       : rootBookmarkData
     let files = fileBookmarkData
+    // Persisted-blob counts BEFORE resolution — distinguishes "no saved workspace"
+    // from "saved bookmarks failed to resolve" when tracing startup restores.
+    DebugTrace.log("open bookmarks persisted roots=\(roots.count) files=\(files.count)")
 
     appState.bookmarkData = roots.first
 

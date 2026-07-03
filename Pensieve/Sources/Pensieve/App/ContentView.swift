@@ -159,7 +159,10 @@ struct DocumentEmptyStateView: View {
 
   var body: some View {
     VStack(spacing: 18) {
-      if let activity {
+      // Only import-class work (real index writes ahead) takes over the center pane.
+      // Subtle open/validate states stay in the sidebar — a cached, unchanged reopen
+      // must never present itself as "Importing Workspace".
+      if let activity, activity.isProminent {
         WorkspaceActivityView(activity: activity)
           .frame(maxWidth: 340)
           .accessibilityIdentifier("pensieve.emptyState.activity")

@@ -1095,7 +1095,9 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(scanStarted.wait(timeout: .now() + 1), .success)
     XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
-    XCTAssertEqual(appState.workspaceActivity?.title, "Importing Workspace")
+    // Cut 4-1: DURING the walk the open flow does not yet know whether an import is
+    // coming, so it presents the honest `.opening` state — never "Importing Workspace".
+    XCTAssertEqual(appState.workspaceActivity?.title, "Opening Workspace")
     XCTAssertTrue(appState.workspaceActivity?.detail.contains(folder.lastPathComponent) == true)
     XCTAssertNotNil(appState.workspaceActivity?.progress)
 

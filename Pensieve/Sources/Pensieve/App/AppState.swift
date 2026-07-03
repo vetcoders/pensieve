@@ -378,20 +378,45 @@ struct WorkspaceNode: Identifiable, Hashable, Sendable {
 }
 
 struct WorkspaceActivity: Equatable, Sendable {
+  /// Stable case tag: drives the `open activity=<case>` trace breadcrumb and the
+  /// prominent-vs-subtle presentation split. The open flow may not KNOW yet whether
+  /// an import is coming — `.opening` is the honest "walking the tree to find out"
+  /// state; only import-class kinds may claim "Importing Workspace".
+  enum Kind: String, Equatable, Sendable {
+    case opening
+    case indexing
+    case checkingCache
+    case cacheHit
+    case cacheMiss
+  }
+
+  var kind: Kind
   var title: String
   var detail: String
   var progress: Double?
 
-  static func scanning(_ label: String) -> WorkspaceActivity {
+  /// Import-class work (index writes genuinely ahead) earns the center takeover in the
+  /// empty document pane; open/validate states stay subtle — sidebar progress only. This
+  /// is what keeps a cached, unchanged reopen free of the "Importing Workspace" takeover.
+  var isProminent: Bool {
+    switch kind {
+    case .indexing, .cacheMiss: return true
+    case .opening, .checkingCache, .cacheHit: return false
+    }
+  }
+
+  static func opening(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
-      title: "Importing Workspace",
-      detail: "Scanning \(label)",
+      kind: .opening,
+      title: "Opening Workspace",
+      detail: "Reading \(label)",
       progress: 0.15
     )
   }
 
   static func indexing(documentCount: Int) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .indexing,
       title: "Importing Workspace",
       detail: "Indexing \(documentCount) Markdown file\(documentCount == 1 ? "" : "s")",
       progress: 0.68
@@ -400,6 +425,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func checkingCache(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .checkingCache,
       title: "Checking Workspace Cache",
       detail: "Validating \(label)",
       progress: 0.05
@@ -408,6 +434,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheHit(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheHit,
       title: "Opening Cached Workspace",
       detail: "Using cached state for \(label)",
       progress: 0.92
@@ -416,6 +443,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheMiss(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheMiss,
       title: "Importing Workspace",
       detail: "Cache miss for \(label)",
       progress: 0.1

@@ -930,8 +930,18 @@ final class WorkspaceSubstrateTests: XCTestCase {
 
   func testWorkspaceActivityFactoriesProduceConsistentTitleDetail() {
     XCTAssertEqual(
+      WorkspaceActivity.opening("Notes"),
+      WorkspaceActivity(
+        kind: .opening,
+        title: "Opening Workspace",
+        detail: "Reading Notes",
+        progress: 0.15
+      )
+    )
+    XCTAssertEqual(
       WorkspaceActivity.checkingCache("Notes"),
       WorkspaceActivity(
+        kind: .checkingCache,
         title: "Checking Workspace Cache",
         detail: "Validating Notes",
         progress: 0.05
@@ -940,6 +950,7 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(
       WorkspaceActivity.cacheHit("Notes"),
       WorkspaceActivity(
+        kind: .cacheHit,
         title: "Opening Cached Workspace",
         detail: "Using cached state for Notes",
         progress: 0.92
@@ -948,11 +959,42 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(
       WorkspaceActivity.cacheMiss("Notes"),
       WorkspaceActivity(
+        kind: .cacheMiss,
         title: "Importing Workspace",
         detail: "Cache miss for Notes",
         progress: 0.1
       )
     )
+  }
+
+  /// Only import-class kinds (real index writes ahead) may take over the center pane;
+  /// open/validate kinds stay subtle. Guards the "no takeover on a cached open" contract.
+  func testWorkspaceActivityProminenceSplitsImportFromOpenStates() {
+    XCTAssertTrue(WorkspaceActivity.indexing(documentCount: 3).isProminent)
+    XCTAssertTrue(WorkspaceActivity.cacheMiss("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.opening("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.checkingCache("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.cacheHit("Notes").isProminent)
+  }
+
+  /// Acceptance 2 (Cut 4-1): the sidebar's empty placeholders and ANY in-flight workspace
+  /// activity are mutually exclusive — "Empty workspace" must never render mid-open.
+  @MainActor
+  func testSidebarEmptyPlaceholderIsMutuallyExclusiveWithActivity() {
+    let activities: [WorkspaceActivity] = [
+      .opening("Notes"),
+      .indexing(documentCount: 29),
+      .checkingCache("Notes"),
+      .cacheHit("Notes"),
+      .cacheMiss("Notes"),
+    ]
+    for activity in activities {
+      XCTAssertFalse(
+        SidebarView.showsEmptyPlaceholder(isEmpty: true, activity: activity),
+        "empty placeholder must be suppressed while \(activity.kind) is in flight")
+    }
+    XCTAssertTrue(SidebarView.showsEmptyPlaceholder(isEmpty: true, activity: nil))
+    XCTAssertFalse(SidebarView.showsEmptyPlaceholder(isEmpty: false, activity: nil))
   }
 
   private func makeIdentity() throws -> WorkspaceIdentity {

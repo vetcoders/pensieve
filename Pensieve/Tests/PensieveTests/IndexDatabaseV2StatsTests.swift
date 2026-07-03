@@ -245,6 +245,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
     // ---- First launch: full cold path → 1 cold_scan, full index, persisted manifest+signature.
     let firstState = AppState()
+    let firstActivity = ActivityRecorder(observing: firstState)
     let firstManager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
@@ -255,6 +256,13 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     await firstManager.waitForPendingWorkspaceBuild()
     await firstManager.waitForPendingIndexUpdate()
     await indexDatabase.waitForPendingReindex()
+
+    // Cut 4-1 honest-import guard: a REAL first import still presents the import activity
+    // (the honesty cut must not mute genuine imports — only cached opens).
+    XCTAssertTrue(
+      firstActivity.observedTitles.contains("Importing Workspace"),
+      "a real first import still shows 'Importing Workspace' (observed: \(firstActivity.observedTitles))"
+    )
 
     let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: firstState.bookmarkData)
     let rootPath = folder.standardizedFileURL.path
@@ -319,6 +327,12 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let observed = activity.observedDetails
     XCTAssertFalse(
       sawIndexing, "no 'Indexing N files' phase on a valid-skip relaunch (observed: \(observed))")
+    // (4b) Cut 4-1 workspace-open honesty: NO activity on the skip path may present itself
+    // as an import — the takeover title must never appear, at ANY point of the open.
+    XCTAssertFalse(
+      activity.observedTitles.contains("Importing Workspace"),
+      "no 'Importing Workspace' presentation on a valid-skip relaunch (observed: \(activity.observedTitles))"
+    )
     XCTAssertNil(secondState.workspaceActivity, "activity cleared after the valid-skip open")
 
     // (5) The tree + documents are correctly restored from the single walk.
@@ -620,6 +634,12 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
       sawIndexing,
       "no 'Indexing N files' phase on a multi-root valid-skip relaunch (observed: \(activity.observedDetails))"
     )
+    // (4b) Cut 4-1 workspace-open honesty: the multi-root skip path must never present
+    // itself as an import either — no "Importing Workspace" title at ANY point.
+    XCTAssertFalse(
+      activity.observedTitles.contains("Importing Workspace"),
+      "no 'Importing Workspace' presentation on a multi-root valid-skip relaunch (observed: \(activity.observedTitles))"
+    )
     XCTAssertNil(
       secondState.workspaceActivity, "activity cleared after the multi-root valid-skip open")
 
@@ -781,6 +801,7 @@ private final class BuilderCallCounter: @unchecked Sendable {
 @MainActor
 private final class ActivityRecorder {
   private(set) var observedDetails: [String] = []
+  private(set) var observedTitles: [String] = []
   private let appState: AppState
 
   init(observing appState: AppState) {
@@ -790,8 +811,9 @@ private final class ActivityRecorder {
   }
 
   private func record(_ activity: WorkspaceActivity?) {
-    if let detail = activity?.detail {
-      observedDetails.append(detail)
+    if let activity {
+      observedDetails.append(activity.detail)
+      observedTitles.append(activity.title)
     }
   }
 

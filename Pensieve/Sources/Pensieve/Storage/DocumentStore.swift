@@ -50,6 +50,15 @@ final class FolderManager {
     self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
   }
 
+  /// Single choke-point for open-flow activity transitions so `PENSIEVE_TRACE=1`
+  /// exposes the honest presentation sequence (`open activity=<case>`), and so the
+  /// choreography stays auditable in one place. Presentation only — every set-point
+  /// keeps its position relative to the skip/fingerprint/identity decisions.
+  private func setOpenActivity(_ activity: WorkspaceActivity?, into appState: AppState) {
+    DebugTrace.log("open activity=\(activity?.kind.rawValue ?? "nil")")
+    appState.workspaceActivity = activity
+  }
+
   func open(url: URL, into appState: AppState) {
     do {
       try bookmarkStore.persistRoot(url: url, into: appState)
@@ -68,7 +77,7 @@ final class FolderManager {
       openResolvedWorkspaceInBackground(
         rootURLs: roots, fileURLs: appState.openFiles.map(\.url), into: appState)
     } catch {
-      appState.workspaceActivity = nil
+      setOpenActivity(nil, into: appState)
       appState.lastError = "Could not open folder: \(error.localizedDescription)"
     }
   }
@@ -332,6 +341,8 @@ final class FolderManager {
 
   func restoreLastFolderInBackground(into appState: AppState) {
     let restored = bookmarkStore.restoreWorkspace(into: appState)
+    DebugTrace.log(
+      "open restore roots=\(restored.rootURLs.count) files=\(restored.fileURLs.count)")
     guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
       return
     }
@@ -537,7 +548,9 @@ final class FolderManager {
       return
     }
 
-    appState.workspaceActivity = .scanning(label)
+    // Honest open state: at this point we do NOT know whether an import is coming —
+    // the walk below is what decides. `.opening` (subtle) instead of an import claim.
+    setOpenActivity(.opening(label), into: appState)
     indexDatabase.open(into: appState)
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
@@ -553,11 +566,13 @@ final class FolderManager {
     {
       selectRestoredDocument(previousSelection: previousSelection, into: appState)
       startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-      appState.workspaceActivity = nil
+      setOpenActivity(nil, into: appState)
       return
     }
 
     DebugTrace.log("cold reindex roots=\(rootURLs.count)")
+    // The skip-gate said no: index writes are genuinely ahead — NOW the import claim is honest.
+    setOpenActivity(.indexing(documentCount: appState.allDocuments.count), into: appState)
     coldRebuildWorkspace(scans: scans, into: appState)
     // Hand the manifest commit the fingerprint derived from THIS walk so it does not re-walk.
     // Multi-root delegates to the single-root v1 fingerprint byte-for-byte when count == 1, so
@@ -571,7 +586,7 @@ final class FolderManager {
     )
     selectRestoredDocument(previousSelection: previousSelection, into: appState)
     startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-    appState.workspaceActivity = nil
+    setOpenActivity(nil, into: appState)
   }
 
   /// Persisted-signature-aware index decision for the cold-open path, given the tree the SINGLE
@@ -684,7 +699,12 @@ final class FolderManager {
     // path). Opening + migrating here on main was a source of the "Scanning…" hang.
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
-    appState.workspaceActivity = .scanning(label)
+    // Honest open state for the WHOLE walk: the skip decision lands only after the walk +
+    // fingerprint + DB count below, so claiming "Importing Workspace" here would present
+    // every cached open as a full import (the operator's "indeksuje non stop" perception).
+    // `.opening` is subtle (sidebar progress, no center takeover); the import claim is
+    // made only after the skip-gate genuinely fails.
+    setOpenActivity(.opening(label), into: appState)
 
     let expectedRootPaths = appState.workspaceRoots.map { $0.url.standardizedFileURL.path }
     let expectedOpenFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
@@ -746,11 +766,15 @@ final class FolderManager {
         // no reindex, no "Indexing N". Just select + watch.
         self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-        appState.workspaceActivity = nil
+        self.setOpenActivity(nil, into: appState)
         return
       }
 
       DebugTrace.log("cold reindex roots=\(liveRoots.count)")
+      // The skip-gate said no: manifest commit + index writes are genuinely ahead — the
+      // "Importing Workspace" claim becomes honest exactly here, never during the walk.
+      self.setOpenActivity(
+        .indexing(documentCount: appState.allDocuments.count), into: appState)
       let workspaceIndexWriteTask = self.commitWorkspaceManifest(
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
@@ -759,7 +783,6 @@ final class FolderManager {
       )
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-      appState.workspaceActivity = .indexing(documentCount: appState.allDocuments.count)
       await workspaceIndexWriteTask?.value
       // Cold open: instead of an UNCONDITIONAL full reindex, consult the PERSISTED `.md`
       // signature + the index-content guard. Compute the current `.md` signature off the main
@@ -784,7 +807,7 @@ final class FolderManager {
       self.indexUpdateTask = indexTask
       await indexTask?.value
       guard !Task.isCancelled else { return }
-      appState.workspaceActivity = nil
+      self.setOpenActivity(nil, into: appState)
     }
   }
 
@@ -792,15 +815,17 @@ final class FolderManager {
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
   ) -> Bool {
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
-    appState.workspaceActivity = .checkingCache(label)
+    setOpenActivity(.checkingCache(label), into: appState)
 
     // Cache fast-path keys on the FULL root set (N≥1). The real guard against silently dropping
     // an ADDED folder is `matchesCurrentWorkspace` below: when `open` merged a new root the
     // in-memory roots no longer equal the requested set, so the match fails and we fall to the
     // cold scan path (WorkspaceScanner.build owns the multi-root walk). A `.valid` fast-return
     // only happens when the in-memory workspace already holds EXACTLY these roots.
+    // No `.cacheMiss` here: nothing was validated yet, so a miss claim (titled as an
+    // import) would be dishonest. The caller immediately sets `.opening` on the false
+    // return; `.cacheMiss` is reserved for a REAL substrate verdict below.
     guard !rootURLs.isEmpty else {
-      appState.workspaceActivity = .cacheMiss(label)
       return false
     }
 
@@ -820,7 +845,9 @@ final class FolderManager {
       ),
       !appState.workspaceTree.isEmpty
     else {
-      appState.workspaceActivity = .cacheMiss(label)
+      // Cold-start short-circuit: the substrate was never consulted, so this is NOT a
+      // cache miss — the cold path's skip-gate may still validate the cache. Keep the
+      // subtle `.checkingCache`; the caller sets `.opening` right after.
       return false
     }
 
@@ -837,7 +864,7 @@ final class FolderManager {
       )
       switch verdict {
       case .valid:
-        appState.workspaceActivity = .cacheHit(label)
+        setOpenActivity(.cacheHit(label), into: appState)
         // In-session hot-reopen: the pool is already open from the initial cold open, so this is a
         // no-op fast return; the rare first-open runs OFF the main thread rather than blocking it.
         let indexDatabase = indexDatabase
@@ -853,19 +880,19 @@ final class FolderManager {
           ?? FolderManager.currentWorkspaceSignature(
             roots: rootURLs, exclusions: exclusions)
         appState.lastError = nil
-        appState.workspaceActivity = nil
+        setOpenActivity(nil, into: appState)
         return true
       case .accessDenied(let reason):
         appState.lastError = "Could not open cached workspace: \(reason)"
-        appState.workspaceActivity = nil
+        setOpenActivity(nil, into: appState)
         return true
       case .missing, .stale, .incompatibleSchema, .corrupted:
-        appState.workspaceActivity = .cacheMiss(label)
+        setOpenActivity(.cacheMiss(label), into: appState)
         return false
       }
     } catch {
       NSLog("%@", "Hot-reopen cache validation failed, falling back to cold open: \(error)")
-      appState.workspaceActivity = .cacheMiss(label)
+      setOpenActivity(.cacheMiss(label), into: appState)
       return false
     }
   }

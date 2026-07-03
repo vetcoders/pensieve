@@ -32,12 +32,24 @@ struct SidebarView: View {
     }
   }
 
+  /// Empty-state placeholders and open-flow activity are mutually exclusive: while ANY
+  /// workspace activity is in flight the tree area shows progress, never an emptiness
+  /// claim the walk has not verified yet (the "Importing Workspace" + "Empty workspace"
+  /// contradiction from the operator's screenshots).
+  static func showsEmptyPlaceholder(isEmpty: Bool, activity: WorkspaceActivity?) -> Bool {
+    isEmpty && activity == nil
+  }
+
   var body: some View {
     VStack(spacing: 0) {
       header
 
       if !appState.hasWorkspaceContent {
-        emptyState
+        if Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
+          emptyState
+        } else {
+          openingPlaceholder
+        }
       } else if appState.isSearchingWorkspace {
         searchResults
       } else {
@@ -253,7 +265,9 @@ struct SidebarView: View {
   private var workspaceList: some View {
     Group {
       if appState.workspaceTree.isEmpty {
-        if appState.workspaceRoots.isEmpty {
+        if !Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
+          openingPlaceholder
+        } else if appState.workspaceRoots.isEmpty {
           sidebarEmptyTab(
             icon: "folder",
             message: "No workspace folder",
@@ -288,6 +302,22 @@ struct SidebarView: View {
       Spacer()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  /// Shown in place of any empty-state copy while an open-flow activity is in flight —
+  /// the tree is not "empty", it is being restored/verified.
+  private var openingPlaceholder: some View {
+    VStack(spacing: 10) {
+      Spacer()
+      ProgressView()
+        .controlSize(.small)
+      Text(appState.workspaceActivity?.title ?? "Opening Workspace")
+        .font(.subheadline)
+        .foregroundColor(.secondary)
+      Spacer()
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .accessibilityIdentifier("pensieve.sidebar.openingPlaceholder")
   }
 
   private var emptyWorkspaceRoot: some View {
