@@ -17,6 +17,11 @@ import WebKit
 final class PreviewWebView: NSView {
   private let webView: WKWebView
   private var loadedIdentity: PreviewLoadIdentity?
+  private let titlebarGlassController = PreviewTitlebarGlassController()
+
+  // Test seam: lets unit tests verify the native-window -> CSS-var choreography
+  // without depending on a live WKWebView process.
+  var titlebarGlassScriptEvaluator: ((String) -> Void)?
 
   override init(frame frameRect: NSRect) {
     let config = WKWebViewConfiguration()
@@ -34,7 +39,10 @@ final class PreviewWebView: NSView {
       webView.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
 
-    webView.navigationDelegate = NavigationProxy.shared
+    webView.navigationDelegate = self
+    titlebarGlassController.scriptEvaluator = { [weak self] script in
+      self?.evaluateTitlebarGlassScript(script)
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -42,7 +50,17 @@ final class PreviewWebView: NSView {
   }
 
   deinit {
-    NotificationCenter.default.removeObserver(self)
+    titlebarGlassController.invalidate()
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    titlebarGlassController.attach(to: window)
+  }
+
+  override func layout() {
+    super.layout()
+    titlebarGlassController.layoutDidChange()
   }
 
   // MARK: - Public
@@ -101,6 +119,7 @@ final class PreviewWebView: NSView {
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
+    titlebarGlassController.fullPageLoadDidStart()
   }
 
   private func updateLoadedPage(_ document: PreviewDocument) {
@@ -187,7 +206,7 @@ final class PreviewWebView: NSView {
       --vc-preview-diagram-error-text: #8c1d18;
       --vc-preview-math-bg: #f6f8fa;
       --vc-preview-page-background: transparent;
-      --vc-preview-titlebar-glass-height: 64px;
+      --vc-preview-titlebar-glass-height: 0px;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -1024,6 +1043,163 @@ final class PreviewWebView: NSView {
     }
     return literal
   }
+
+  private func evaluateTitlebarGlassScript(_ script: String) {
+    if let titlebarGlassScriptEvaluator {
+      titlebarGlassScriptEvaluator(script)
+    } else {
+      webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+  }
+}
+
+extension PreviewWebView {
+  static let titlebarGlassHeightCSSVariable =
+    PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable
+
+  static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
+    PreviewTitlebarGlassController.titlebarGlassHeight(
+      frameHeight: frameHeight,
+      contentLayoutHeight: contentLayoutHeight)
+  }
+
+  static func titlebarGlassHeight(for window: NSWindow?) -> CGFloat {
+    PreviewTitlebarGlassController.titlebarGlassHeight(for: window)
+  }
+
+  static func titlebarGlassHeightScript(height: CGFloat) -> String {
+    PreviewTitlebarGlassController.titlebarGlassHeightScript(height: height)
+  }
+}
+
+final class PreviewTitlebarGlassController: NSObject {
+  static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
+
+  static let windowChromeNotifications: [Notification.Name] = [
+    NSWindow.didResizeNotification,
+    NSWindow.didEndLiveResizeNotification,
+    NSWindow.willEnterFullScreenNotification,
+    NSWindow.didEnterFullScreenNotification,
+    NSWindow.willExitFullScreenNotification,
+    NSWindow.didExitFullScreenNotification,
+    NSWindow.didChangeScreenNotification,
+    NSWindow.didChangeBackingPropertiesNotification,
+  ]
+
+  var scriptEvaluator: ((String) -> Void)?
+  var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
+  private weak var observedWindow: NSWindow?
+  private var pendingUpdate: DispatchWorkItem?
+  private var pendingUpdateNeedsForce = false
+  private var lastAppliedHeight: CGFloat?
+
+  deinit {
+    invalidate()
+  }
+
+  static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
+    ceil(max(0, frameHeight - contentLayoutHeight))
+  }
+
+  static func titlebarGlassHeight(for window: NSWindow?) -> CGFloat {
+    guard let window else { return 0 }
+    return titlebarGlassHeight(
+      frameHeight: window.frame.height,
+      contentLayoutHeight: window.contentLayoutRect.height)
+  }
+
+  static func titlebarGlassHeightScript(height: CGFloat) -> String {
+    let pixelHeight = Int(titlebarGlassHeight(frameHeight: height, contentLayoutHeight: 0))
+    return """
+      document.documentElement.style.setProperty('\(titlebarGlassHeightCSSVariable)', '\(pixelHeight)px');
+      """
+  }
+
+  func invalidate() {
+    pendingUpdate?.cancel()
+    pendingUpdate = nil
+    pendingUpdateNeedsForce = false
+    if let observedWindow {
+      for name in Self.windowChromeNotifications {
+        NotificationCenter.default.removeObserver(self, name: name, object: observedWindow)
+      }
+    }
+    observedWindow = nil
+  }
+
+  @discardableResult
+  func attach(to nextWindow: NSWindow?) -> CGFloat {
+    observeWindowIfNeeded(nextWindow)
+    return apply(force: true)
+  }
+
+  func layoutDidChange() {
+    scheduleUpdate()
+  }
+
+  func fullPageLoadDidStart() {
+    lastAppliedHeight = nil
+    scheduleUpdate(force: true)
+  }
+
+  @discardableResult
+  func navigationDidFinish() -> CGFloat {
+    apply(force: true)
+  }
+
+  @discardableResult
+  func apply(force: Bool = false) -> CGFloat {
+    let height =
+      titlebarGlassHeightProvider?(observedWindow)
+      ?? Self.titlebarGlassHeight(for: observedWindow)
+    guard force || lastAppliedHeight != height else {
+      return height
+    }
+
+    lastAppliedHeight = height
+    scriptEvaluator?(Self.titlebarGlassHeightScript(height: height))
+    return height
+  }
+
+  private func observeWindowIfNeeded(_ nextWindow: NSWindow?) {
+    guard observedWindow !== nextWindow else { return }
+
+    if let observedWindow {
+      for name in Self.windowChromeNotifications {
+        NotificationCenter.default.removeObserver(self, name: name, object: observedWindow)
+      }
+    }
+    observedWindow = nextWindow
+
+    guard let nextWindow else { return }
+
+    for name in Self.windowChromeNotifications {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(windowChromeGeometryDidChange(_:)),
+        name: name,
+        object: nextWindow)
+    }
+  }
+
+  private func scheduleUpdate(force: Bool = false) {
+    pendingUpdateNeedsForce = pendingUpdateNeedsForce || force
+    pendingUpdate?.cancel()
+
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      let force = pendingUpdateNeedsForce
+      pendingUpdateNeedsForce = false
+      pendingUpdate = nil
+      apply(force: force)
+    }
+    pendingUpdate = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
+  }
+
+  @objc private func windowChromeGeometryDidChange(_ notification: Notification) {
+    scheduleUpdate(force: true)
+  }
 }
 
 private struct PreviewLoadIdentity: Equatable {
@@ -1048,13 +1224,12 @@ extension PreviewWebView: ScrollSyncPreviewTarget {
   }
 }
 
-// MARK: - WKNavigationDelegate proxy
-// Singleton: opens activated http(s)/mailto links in the default browser,
-// allows everything else (initial HTML load, JS-driven scrollIntoView, …).
+// MARK: - WKNavigationDelegate
+// Opens activated http(s)/mailto links in the default browser, allows everything
+// else (initial HTML load, JS-driven scrollIntoView, …), and reapplies native
+// chrome measurements after full-page navigations replace the document root.
 
-private final class NavigationProxy: NSObject, WKNavigationDelegate {
-  static let shared = NavigationProxy()
-
+extension PreviewWebView: WKNavigationDelegate {
   func webView(
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction,
@@ -1072,5 +1247,9 @@ private final class NavigationProxy: NSObject, WKNavigationDelegate {
       }
     }
     decisionHandler(.allow)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    titlebarGlassController.navigationDidFinish()
   }
 }

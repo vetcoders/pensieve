@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 @testable import Pensieve
@@ -114,15 +115,72 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("vc-skin:default"))
   }
 
-  func testAppearanceCSSKeepsTitlebarOverlapTransparent() {
+  func testAppearanceCSSDefaultsTitlebarOverlapToOpaqueUntilNativeMeasurement() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
 
-    XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-height: 64px"))
+    XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-height: 0px"))
     XCTAssertTrue(css.contains("body::before"))
     XCTAssertTrue(css.contains("top: var(--vc-preview-titlebar-glass-height)"))
     XCTAssertTrue(css.contains("background: var(--vc-preview-page-background)"))
     XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-paper-bg)"))
     XCTAssertFalse(css.contains("background: var(--vc-preview-paper-bg) !important"))
+  }
+
+  func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {
+    XCTAssertEqual(
+      PreviewWebView.titlebarGlassHeight(frameHeight: 800, contentLayoutHeight: 736),
+      64)
+    XCTAssertEqual(
+      PreviewWebView.titlebarGlassHeight(frameHeight: 800, contentLayoutHeight: 800),
+      0)
+    XCTAssertEqual(
+      PreviewWebView.titlebarGlassHeight(frameHeight: 799.5, contentLayoutHeight: 735.25),
+      65)
+    XCTAssertEqual(
+      PreviewWebView.titlebarGlassHeight(frameHeight: 700, contentLayoutHeight: 724),
+      0)
+  }
+
+  func testTitlebarGlassHeightScriptTargetsDocumentRootCSSVariable() {
+    let script = PreviewWebView.titlebarGlassHeightScript(height: 47.2)
+
+    XCTAssertTrue(script.contains("document.documentElement.style.setProperty"))
+    XCTAssertTrue(script.contains("'--vc-preview-titlebar-glass-height'"))
+    XCTAssertTrue(script.contains("'48px'"))
+  }
+
+  @MainActor
+  func testPreviewTitlebarGlassControllerAppliesAttachAndNavigationUpdates() {
+    let controller = PreviewTitlebarGlassController()
+
+    var scripts: [String] = []
+    controller.scriptEvaluator = { scripts.append($0) }
+    controller.titlebarGlassHeightProvider = { _ in 41 }
+    controller.attach(to: nil)
+
+    XCTAssertFalse(scripts.isEmpty)
+    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-height'") == true)
+    XCTAssertTrue(scripts.last?.contains("'41px'") == true)
+
+    let afterAttachCount = scripts.count
+    controller.titlebarGlassHeightProvider = { _ in 0 }
+    controller.navigationDidFinish()
+
+    XCTAssertGreaterThan(scripts.count, afterAttachCount)
+    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-height'") == true)
+    XCTAssertTrue(scripts.last?.contains("'0px'") == true)
+  }
+
+  func testPreviewTitlebarGlassControllerTracksChromeChangeNotifications() {
+    XCTAssertTrue(
+      PreviewTitlebarGlassController.windowChromeNotifications.contains(
+        NSWindow.didResizeNotification))
+    XCTAssertTrue(
+      PreviewTitlebarGlassController.windowChromeNotifications.contains(
+        NSWindow.didEnterFullScreenNotification))
+    XCTAssertTrue(
+      PreviewTitlebarGlassController.windowChromeNotifications.contains(
+        NSWindow.didExitFullScreenNotification))
   }
 
   func testOpaqueSkinsRouteBackgroundThroughPageBackdropToken() {
