@@ -17,11 +17,17 @@ import WebKit
 final class PreviewWebView: NSView {
   private let webView: WKWebView
   private var loadedIdentity: PreviewLoadIdentity?
+  // Newest document handed to `load(document:)` — the recovery source when the
+  // WebContent process dies or an in-place update fails under the same identity.
+  private var lastDocument: PreviewDocument?
   private let titlebarGlassController = PreviewTitlebarGlassController()
 
   // Test seam: lets unit tests verify the native-window -> CSS-var choreography
   // without depending on a live WKWebView process.
   var titlebarGlassScriptEvaluator: ((String) -> Void)?
+
+  // Test seam: observes full-page (re)loads without a live WKWebView process.
+  var fullPageLoadObserver: ((PreviewDocument) -> Void)?
 
   override init(frame frameRect: NSRect) {
     let config = WKWebViewConfiguration()
@@ -70,12 +76,24 @@ final class PreviewWebView: NSView {
   /// update the already-loaded article/style in place so scroll position and the
   /// WKWebView process stay stable while typing.
   func load(document: PreviewDocument) {
+    lastDocument = document
     let identity = PreviewLoadIdentity(document: document)
     guard loadedIdentity == identity else {
       loadFullPage(document, identity: identity)
       return
     }
     updateLoadedPage(document)
+  }
+
+  /// WKWebView leaves a blank page behind when its WebContent process dies
+  /// (memory pressure, GPU reset). Without this recovery the preview stays
+  /// blank until the next edit happens to fail the in-place update path —
+  /// a reader who never types would stare at a white panel forever.
+  func handleWebContentProcessTermination() {
+    DebugTrace.log("preview web content process terminated — reloading last document")
+    loadedIdentity = nil
+    guard let document = lastDocument else { return }
+    loadFullPage(document, identity: PreviewLoadIdentity(document: document))
   }
 
   func readScrollSyncPosition(completion: @escaping (ScrollSyncPosition?) -> Void) {
@@ -120,6 +138,7 @@ final class PreviewWebView: NSView {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
     titlebarGlassController.fullPageLoadDidStart()
+    fullPageLoadObserver?(document)
   }
 
   private func updateLoadedPage(_ document: PreviewDocument) {
@@ -179,11 +198,23 @@ final class PreviewWebView: NSView {
       })();
       """
     webView.evaluateJavaScript(script) { [weak self, document] result, error in
-      guard error == nil, (result as? Bool) == true else {
-        self?.loadFullPage(document, identity: PreviewLoadIdentity(document: document))
-        return
-      }
+      self?.handleUpdateScriptResult(result, error: error, for: document)
     }
+  }
+
+  /// Completion for the in-place update script. A `false`/error result means
+  /// the loaded page can no longer host the article (crashed process, stripped
+  /// DOM), so fall back to a full load — but only while the failed document's
+  /// identity is still the one on screen: the completion arrives async, and an
+  /// unconditional reload here would overwrite a newer page with stale content.
+  /// `lastDocument` (not the failed snapshot) is reloaded so same-identity
+  /// edits that raced past the failure are not rolled back.
+  func handleUpdateScriptResult(_ result: Any?, error: Error?, for document: PreviewDocument) {
+    guard error != nil || (result as? Bool) != true else { return }
+    guard loadedIdentity == PreviewLoadIdentity(document: document), let current = lastDocument
+    else { return }
+    DebugTrace.log("preview in-place update failed — falling back to full page load")
+    loadFullPage(current, identity: PreviewLoadIdentity(document: current))
   }
 
   static func appearanceCSS(fontSize: CGFloat, skin: ThemeManager.PreviewTheme = .default)
@@ -1251,5 +1282,9 @@ extension PreviewWebView: WKNavigationDelegate {
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     titlebarGlassController.navigationDidFinish()
+  }
+
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    handleWebContentProcessTermination()
   }
 }
