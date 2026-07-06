@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class FolderManager {
+  typealias RecycleItems = ([URL], @escaping @Sendable ([URL: URL], Error?) -> Void) -> Void
+
   static let shared = FolderManager()
   private let watcher = FileWatcher()
   private let metadataStore: WorkspaceMetadataStore
@@ -11,6 +13,7 @@ final class FolderManager {
   private let bookmarkStore: BookmarkStore
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
+  private let recycleItems: RecycleItems
   /// Shares the substrate's cache store so the persisted `.md` signature lands in the SAME
   /// identity-keyed cache directory (`Workspaces/<workspaceID>/`) as the manifest/fingerprint.
   /// Keeping a single store keeps the signature, manifest, and fingerprint co-located and keyed
@@ -45,7 +48,10 @@ final class FolderManager {
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
     selfWriteSuppressionInterval: TimeInterval = 1.2,
-    watcherDebounceMilliseconds: UInt64 = 300
+    watcherDebounceMilliseconds: UInt64 = 300,
+    recycleItems: @escaping RecycleItems = { urls, completion in
+      NSWorkspace.shared.recycle(urls, completionHandler: completion)
+    }
   ) {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
@@ -54,6 +60,7 @@ final class FolderManager {
     self.workspaceSubstrate = workspaceSubstrate
     self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
     self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
+    self.recycleItems = recycleItems
   }
 
   /// Single choke-point for open-flow activity transitions so `PENSIEVE_TRACE=1`
@@ -242,7 +249,7 @@ final class FolderManager {
   func moveToTrash(url: URL, into appState: AppState) -> Bool {
     let source = url.standardizedFileURL
     appState.lastError = nil
-    NSWorkspace.shared.recycle([source]) { [weak self, weak appState] _, error in
+    recycleItems([source]) { [weak self, weak appState] _, error in
       Task { @MainActor in
         guard let self, let appState else { return }
         if let error {

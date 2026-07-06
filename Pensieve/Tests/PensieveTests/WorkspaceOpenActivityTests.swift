@@ -7,7 +7,7 @@ import XCTest
 /// Before the generation-guarded terminal clear, two real routes left the sidebar
 /// stuck on "Opening Workspace" forever:
 ///   1. an ad-hoc file opened mid-walk fails `matchesCurrentWorkspace` → bare return;
-///   2. `refresh(force:)` (file create, exclusion edit) cancels the build task via
+///   2. `refresh(force:)` (file create, exclusion edit, trash/delete) cancels the build task via
 ///      `applyRefresh` without ever owning the activity display.
 @MainActor
 final class WorkspaceOpenActivityTests: XCTestCase {
@@ -78,7 +78,9 @@ final class WorkspaceOpenActivityTests: XCTestCase {
     manager.openInBackground(url: folder, into: appState)
     XCTAssertEqual(appState.workspaceActivity?.kind, .opening)
 
-    // A forced refresh (file create / exclusion edit) cancels the in-flight build via
+    try FileManager.default.removeItem(at: folder.appendingPathComponent("alpha.md"))
+
+    // A forced refresh (file create / exclusion edit / trash-delete) cancels the in-flight build via
     // applyRefresh without taking over the activity presentation.
     manager.refresh(into: appState, force: true)
     gate.signal()

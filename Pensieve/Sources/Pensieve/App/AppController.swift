@@ -9,6 +9,7 @@ final class AppController: ObservableObject {
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let documentWindowRegistry: DocumentWindowRegistry
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
@@ -61,6 +62,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    documentWindowRegistry: DocumentWindowRegistry? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
     agentWorkspaceRoot: URL? = nil,
@@ -71,6 +73,7 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
     self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
@@ -217,7 +220,33 @@ final class AppController: ObservableObject {
 
   @discardableResult
   func moveItemToTrash(url: URL) -> Bool {
-    folderManager.moveToTrash(url: url, into: appState)
+    let source = url.standardizedFileURL
+    guard closeDocumentsAffectedByTrash(at: source) else { return false }
+    return folderManager.moveToTrash(url: source, into: appState)
+  }
+
+  @discardableResult
+  private func closeDocumentsAffectedByTrash(at source: URL) -> Bool {
+    if let selected = appState.selectedDocumentID,
+      isAffectedByTrash(documentID: selected, source: source)
+    {
+      guard documentStore.select(ref: nil, into: appState) else { return false }
+    }
+
+    let affectedDocumentIDs = documentWindowRegistry.openTabDocumentIDs.filter {
+      isAffectedByTrash(documentID: $0, source: source)
+    }
+    for documentID in affectedDocumentIDs {
+      documentWindowRegistry.closeDocumentWindow(documentID)
+    }
+    return true
+  }
+
+  private func isAffectedByTrash(documentID: URL, source: URL) -> Bool {
+    let standardizedDocumentID = documentID.standardizedFileURL
+    let standardizedSource = source.standardizedFileURL
+    return standardizedDocumentID == standardizedSource
+      || WorkspaceScanner.contains(standardizedDocumentID, in: standardizedSource)
   }
 
   @discardableResult
@@ -234,7 +263,7 @@ final class AppController: ObservableObject {
     if appState.selectedDocumentID?.standardizedFileURL == standardizedID {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
-    DocumentWindowRegistry.shared.closeDocumentWindow(standardizedID)
+    documentWindowRegistry.closeDocumentWindow(standardizedID)
   }
 
   func clearOpenFiles() {
@@ -242,7 +271,7 @@ final class AppController: ObservableObject {
     if appState.selectedDocumentID != nil {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
-    DocumentWindowRegistry.shared.closeAllDocumentWindows()
+    documentWindowRegistry.closeAllDocumentWindows()
   }
 
   @discardableResult
@@ -331,7 +360,7 @@ final class AppController: ObservableObject {
   /// registry-sourced sidebar row exists but its click is dead.
   private func resolveDocumentRef(for id: DocumentRef.ID) -> DocumentRef? {
     appState.allDocuments.first(where: { $0.id == id })
-      ?? (DocumentWindowRegistry.shared.openTabDocumentIDs.contains(id.standardizedFileURL)
+      ?? (documentWindowRegistry.openTabDocumentIDs.contains(id.standardizedFileURL)
         ? appState.makeDocumentRef(for: id) : nil)
   }
 
