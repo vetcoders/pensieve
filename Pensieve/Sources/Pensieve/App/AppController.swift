@@ -116,6 +116,21 @@ final class AppController: ObservableObject {
   /// is wired (tests, headless).
   func openFile(url: URL) {
     let standardizedURL = url.standardizedFileURL
+
+    // OS-level opens (Finder, Dock drop, `open -a`, launch URLs) funnel every
+    // URL kind here. A directory is a workspace, not a document: it must route
+    // to the folder-open path BEFORE the registry/markdown handling below, or
+    // a first-class workspace open is refused with a misleading
+    // "unsupported file type" error (and could even route to a document tab).
+    var isDirectory: ObjCBool = false
+    if FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+      isDirectory.boolValue
+    {
+      DebugTrace.log("openFile -> openFolder (directory): \(standardizedURL.lastPathComponent)")
+      openFolder(url: standardizedURL)
+      return
+    }
+
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
       return
     }

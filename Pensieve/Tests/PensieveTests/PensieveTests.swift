@@ -3883,6 +3883,88 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenFileRoutesDirectoryToWorkspaceOpen() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileDirectoryTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("alpha.md")
+    try "alpha".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: folder)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "a directory must open as a workspace, never route to a document window/tab")
+    XCTAssertEqual(
+      appState.workspaceRoots.map { $0.url.resolvingSymlinksInPath() },
+      [folder.resolvingSymlinksInPath()],
+      "a directory handed to the file-open funnel must become a workspace root")
+    XCTAssertEqual(
+      appState.documents.map { $0.url.resolvingSymlinksInPath() },
+      [noteURL.resolvingSymlinksInPath()]
+    )
+    XCTAssertNil(
+      appState.lastError,
+      "a directory open must not surface the unsupported-file error")
+  }
+
+  @MainActor
+  func testLaunchFolderIntentOpensWorkspaceInsteadOfRejectingIt() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveLaunchFolderIntentTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("alpha.md")
+    try "alpha".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [folder])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(
+      appState.workspaceRoots.map { $0.url.resolvingSymlinksInPath() },
+      [folder.resolvingSymlinksInPath()],
+      "launching with a folder URL must open it as a workspace")
+    XCTAssertNil(appState.lastError)
+  }
+
+  @MainActor
   func testOpenFileFallsBackToInWindowLoadWithoutRouting() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
