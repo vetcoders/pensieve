@@ -200,6 +200,13 @@ final class MarkdownFormatterTests: XCTestCase {
       ("`", .code), ("[]()", .link), ("-", .bulletedList), ("1.", .numberedList),
     ]
 
+    // Completeness latch: the Format app menu hand-rolls these wrapper strings
+    // (Commands.swift), while every other edit surface iterates
+    // `MarkdownFormat.allCases`. A new enum case must show up here — and force
+    // a conscious Format-menu decision — instead of silently missing coverage.
+    XCTAssertEqual(expectations.count, MarkdownFormat.allCases.count)
+    XCTAssertEqual(Set(expectations.map(\.format)), Set(MarkdownFormat.allCases))
+
     for expectation in expectations {
       let appState = AppState()
       let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
