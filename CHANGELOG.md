@@ -7,15 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-05
+
 ### Added
+
 - Release identity surface: app version, build number, 8-character commit slug, build date, and component version map are embedded into packaged builds and visible from the app.
 - IndexDatabase v2 schema: seven-table model (`workspaces`, `documents`, `document_revisions`, `document_chunks`, `scan_sessions`, `workspace_stats`, plus the FTS5 search index) extending the single-table index. Active writers populate `workspaces` + `documents` on every workspace scan; `document_revisions` and `document_chunks` are forward-looking scaffolding for version history and vector chunking.
 - FTS5 search index now syncs from the `documents` table via triggers (collapsing the previous double-write) while preserving the existing search behavior, ranking, and ad-hoc (out-of-workspace) document search.
 - Per-scan operational telemetry: a `scan_sessions` append-only log plus a `workspace_stats` aggregate (file/folder counts, last scan/index timestamps, index health) — the data source for an upcoming workspace dashboard.
+- App Store lane: sandbox entitlements, MAS packaging target, sandbox dispatch gating, microphone usage metadata, and bookmark coverage for security-scoped workspace access.
+- Real AI autocomplete path: the vendored qube-ffi bridge now exposes `complete()`, and the editor constructs autocomplete with a production Vista engine factory instead of a mock-only path.
+- Current-document agent dispatch, format-selection menu routing, scroll-sync toggle, and compact Appearance/Edit toolbar menus.
+
+### Changed
+
+- Preview chrome now uses runtime titlebar overlap from the window instead of a hardcoded glass strip height.
+- Workspace open activity is honest about cached reopen versus first import, reducing false "Importing Workspace" takeovers.
+- Move-to-Trash handling closes affected open documents before recycling so the UI does not keep phantom files alive.
+- Release gates now surface failing Swift test names and run Swift gate coverage through the local pre-push lane.
+
+### Fixed
+
+- Autocomplete no longer silently succeeds with an empty-string stub.
+- Scroll sync is rebuilt as off-by-default with a re-entrancy guard.
+- WebContent recovery, workspace activity teardown, ghost-text acceptance, and toolbar placement received regression guards.
 
 ## [0.1.0] - 2026-05-24
 
 ### Added
+
 - **MVP 0.1 Release:** Minimum Viable Demonstrator.
 - Native macOS `NSTextView` implementation with TextKit 2.
 - Markdown parsing utilizing `swift-markdown`.
