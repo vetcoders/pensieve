@@ -417,6 +417,71 @@ final class AutocompleteControllerTests: XCTestCase {
       "the live typing path must cap the prompt payload at the prefix window")
   }
 
+  func testOnlyPlainTabAcceptsAutocomplete() {
+    // Shift-Tab is backtab (outdent / focus navigation); Ctrl/Option/Command
+    // chords carry their own meanings. None of them may swallow a visible
+    // ghost and insert text the user asked nothing about.
+    XCTAssertTrue(
+      MarkdownTextView.isAutocompleteAcceptKeyEvent(keyCode: 48, modifierFlags: []))
+    // Caps Lock / device-state bits do not change what Tab means.
+    XCTAssertTrue(
+      MarkdownTextView.isAutocompleteAcceptKeyEvent(keyCode: 48, modifierFlags: [.capsLock]))
+    for chord: NSEvent.ModifierFlags in [.shift, .control, .option, .command, [.shift, .option]] {
+      XCTAssertFalse(
+        MarkdownTextView.isAutocompleteAcceptKeyEvent(keyCode: 48, modifierFlags: chord),
+        "Tab + \(chord) must not accept the ghost")
+    }
+    // Any other key is never the accept chord, ghost or not.
+    XCTAssertFalse(MarkdownTextView.isAutocompleteAcceptKeyEvent(keyCode: 36, modifierFlags: []))
+  }
+
+  func testShiftTabKeyDownDoesNotInsertGhost() {
+    let surface = makeSurface(text: "hello")
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    surface.textView.setAutocompleteGhost(" world", at: 5)
+
+    guard
+      let backtab = NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0,
+        windowNumber: 0, context: nil, characters: "\u{19}",
+        charactersIgnoringModifiers: "\u{9}", isARepeat: false, keyCode: 48)
+    else {
+      XCTFail("could not synthesize a Shift-Tab key event")
+      return
+    }
+    surface.textView.keyDown(with: backtab)
+
+    // The chord falls through to AppKit (which may handle it natively); the
+    // contract under test is that the ghost suggestion is NOT inserted.
+    XCTAssertFalse(surface.textStorage.string.contains("world"))
+  }
+
+  func testMultilineCompletionIsCappedAtFirstLine() {
+    // The ghost renderer is a single-line field at the caret: what it shows
+    // must be exactly what accept inserts, so the published suggestion stops
+    // at the first non-empty line.
+    XCTAssertEqual(
+      AutocompleteController.singleLineSuggestion(from: " world\nand more\nlines"), " world")
+    XCTAssertEqual(
+      AutocompleteController.singleLineSuggestion(from: "\n\nlate start\ntail"), "late start")
+    XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: " world"), " world")
+    XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: "hello\n"), "hello")
+    XCTAssertNil(AutocompleteController.singleLineSuggestion(from: "\n\n"))
+    XCTAssertNil(AutocompleteController.singleLineSuggestion(from: ""))
+  }
+
+  func testMultilineCompletionPublishesOnlyFirstLine() async {
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      " world\nnever shown by the single-line ghost"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
+
+    controller.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertEqual(controller.suggestion, " world")
+  }
+
   func testAIAutocompleteSettingDefaultsOffAndPersists() {
     let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!

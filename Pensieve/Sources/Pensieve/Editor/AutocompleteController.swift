@@ -99,8 +99,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         await MainActor.run { [weak self] in
           guard let self else { return }
           guard self.requestID == currentRequestID else { return }
-          let cleaned = completion.trimmingCharacters(in: .newlines)
-          self.suggestion = cleaned.isEmpty ? nil : cleaned
+          self.suggestion = Self.singleLineSuggestion(from: completion)
         }
       } catch is CancellationError {
         return
@@ -134,6 +133,18 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     lastError = nil
     engineUnavailable = false
     engineUnavailableDetail = nil
+  }
+
+  /// The ghost renderer is a single-line floating field at the caret
+  /// (MarkdownTextView, `lineBreakMode = .byClipping`); publishing a
+  /// multi-line completion would paint its tail squeezed to the right of the
+  /// caret while Tab inserts the whole block — text the user never saw. Cap
+  /// the suggestion at the first non-empty line so what the ghost shows is
+  /// exactly what accept inserts.
+  static func singleLineSuggestion(from completion: String) -> String? {
+    let cleaned = completion.trimmingCharacters(in: .newlines)
+    let firstLine = cleaned.components(separatedBy: .newlines).first ?? ""
+    return firstLine.isEmpty ? nil : firstLine
   }
 
   /// Resolves (and caches) the engine. Runs inside the completion task, after

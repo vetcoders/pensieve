@@ -88,7 +88,10 @@ class MarkdownTextView: NSTextView {
   }
 
   override func keyDown(with event: NSEvent) {
-    if event.keyCode == 48, onAcceptAutocomplete?() == true {
+    if Self.isAutocompleteAcceptKeyEvent(
+      keyCode: event.keyCode, modifierFlags: event.modifierFlags),
+      onAcceptAutocomplete?() == true
+    {
       return
     }
     if event.keyCode == 53 {
@@ -100,6 +103,18 @@ class MarkdownTextView: NSTextView {
       }
     }
     super.keyDown(with: event)
+  }
+
+  /// Only a PLAIN Tab accepts the ghost. Shift-Tab is backtab (outdent /
+  /// focus navigation), and Ctrl/Option/Command chords carry their own
+  /// meanings — swallowing any of them while a ghost happens to be visible
+  /// would insert text the user asked nothing about. Caps Lock and
+  /// device-state bits do not change what Tab means, so they pass through.
+  static func isAutocompleteAcceptKeyEvent(
+    keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags
+  ) -> Bool {
+    keyCode == 48
+      && modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty
   }
 
   var hasAutocompleteGhost: Bool {
