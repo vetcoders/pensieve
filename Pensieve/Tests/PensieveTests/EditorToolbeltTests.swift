@@ -127,3 +127,81 @@ final class EditorToolbeltFloatingClampTests: XCTestCase {
     XCTAssertEqual(origin, NSPoint(x: 4, y: 52))
   }
 }
+
+/// Chrome-truth companion to the pure clamp suite above: the pieces the
+/// geometry tests cannot see — the unflipped `accessoryOrigin` branch, the
+/// full origin→clamp pin path, and `accessoryAllowedRect` reading a REAL
+/// `window.contentLayoutRect` under a full-size content view (the same
+/// boundary rule as the preview glass strip).
+@MainActor
+final class FormattingAccessoryChromeTruthTests: XCTestCase {
+  private let barSize = NSSize(width: 200, height: 28)
+
+  func testUnflippedPlacementPrefersBelowSelection() {
+    let allowed = NSRect(x: 0, y: 0, width: 800, height: 600)
+    let selection = NSRect(x: 100, y: 100, width: 120, height: 17)
+    let origin = MarkdownTextView.accessoryOrigin(
+      for: selection, size: barSize, allowed: allowed, isFlipped: false)
+    // Unflipped space: "below" = larger y; maxY(117) + gap(6) = 123.
+    XCTAssertEqual(origin, NSPoint(x: 100, y: 123))
+  }
+
+  func testUnflippedPlacementFlipsAboveAtTopEdge() {
+    let allowed = NSRect(x: 0, y: 0, width: 800, height: 600)
+    let selection = NSRect(x: 100, y: 560, width: 120, height: 17)
+    let origin = MarkdownTextView.accessoryOrigin(
+      for: selection, size: barSize, allowed: allowed, isFlipped: false)
+    // Below would end at 583+28 = 611 > 600 → above: 560 - 28 - 6 = 526.
+    XCTAssertEqual(origin, NSPoint(x: 100, y: 526))
+  }
+
+  func testAccessoryOriginPinsIntoAllowedWhenSelectionSitsUnderChrome() {
+    // Through the FULL path (origin choice + clamp), not the clamp alone: a
+    // selection whose above AND below candidates both land in chrome must
+    // still come back pinned at the chrome edge.
+    let allowed = NSRect(x: 0, y: 52, width: 800, height: 548)
+    let selection = NSRect(x: 100, y: 0, width: 120, height: 17)
+    let origin = MarkdownTextView.accessoryOrigin(
+      for: selection, size: barSize, allowed: allowed, isFlipped: true)
+    XCTAssertEqual(origin.y, allowed.minY)
+  }
+
+  func testAllowedRectWithoutWindowFallsBackToVisibleRect() {
+    let surface = MarkdownEditorSurface(text: "hello chrome", fontSize: 14)
+    surface.scrollView.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+    surface.scrollView.layoutSubtreeIfNeeded()
+
+    XCTAssertEqual(
+      surface.textView.accessoryAllowedRect(), surface.textView.visibleRect)
+  }
+
+  func testAllowedRectExcludesTitlebarChromeInFullSizeContentWindow() {
+    let surface = MarkdownEditorSurface(text: "hello chrome", fontSize: 14)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: [.titled, .fullSizeContentView],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    window.contentView = surface.scrollView
+    surface.scrollView.frame = window.contentView?.bounds ?? .zero
+    surface.scrollView.layoutSubtreeIfNeeded()
+
+    let textView = surface.textView
+    let visible = textView.visibleRect
+    let allowed = textView.accessoryAllowedRect()
+
+    // Under .fullSizeContentView the text view underlaps the titlebar, so the
+    // allowed region must start BELOW the chrome edge (flipped coords: larger
+    // minY) — and that edge must be exactly the window's contentLayoutRect.
+    XCTAssertGreaterThan(
+      allowed.minY, visible.minY,
+      "allowed rect must exclude the titlebar band the visible rect underlaps")
+    XCTAssertEqual(allowed.maxY, visible.maxY, accuracy: 0.5)
+    XCTAssertFalse(allowed.isEmpty)
+
+    let contentTop = textView.convert(window.contentLayoutRect, from: nil).minY
+    XCTAssertEqual(allowed.minY, contentTop, accuracy: 0.5)
+  }
+}
