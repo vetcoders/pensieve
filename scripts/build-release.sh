@@ -152,6 +152,22 @@ if (( APPSTORE )); then
         die "PENSIEVE_MAS_PROVISIONING_PROFILE points to a missing file: $MAS_PROFILE"
     fi
     log "App Store lane: sandbox entitlements $ENTITLEMENTS"
+    # The pkg embeds Vendor/qube-ffi/$FFI_PROFILE/ verbatim. ffi-check only
+    # compares vista-kernel HEADs — it is blind to the build profile and to a
+    # dirty source tree, so a MAS artifact could silently ship a debug or
+    # untraceable dylib. Warn (not die): local dry-runs must keep working.
+    if [[ "$FFI_PROFILE" != "release" ]]; then
+        warn "FFI_PROFILE=$FFI_PROFILE — the pkg will embed the $FFI_PROFILE-profile qube-ffi dylib."
+        warn "A submittable MAS build needs FFI_PROFILE=release (Pensieve/scripts/build-ffi.sh)."
+    fi
+    FFI_PROVENANCE="$PKG_DIR/Vendor/qube-ffi/PROVENANCE.txt"
+    if [[ -f "$FFI_PROVENANCE" ]]; then
+        FFI_DESCRIBE="$(awk -F= '$1 == "vista-kernel-describe" { print $2 }' "$FFI_PROVENANCE" 2>/dev/null || true)"
+        if [[ "$FFI_DESCRIBE" == *-dirty ]]; then
+            warn "Vendored qube-ffi was built from a DIRTY vista-kernel tree ($FFI_DESCRIBE) —"
+            warn "its source is untraceable; rebuild from a clean vista-kernel before submitting."
+        fi
+    fi
 else
     [[ -f "$SIGNING_IDENTITY_FILE" ]] || die "Signing identity file missing at $SIGNING_IDENTITY_FILE"
     SIGNING_IDENTITY="$(head -n1 "$SIGNING_IDENTITY_FILE" | sed -e 's/[[:space:]]*$//')"
