@@ -19,6 +19,12 @@ final class FolderManager {
   private let selfWriteSuppressionInterval: TimeInterval
   private let watcherDebounceNanoseconds: UInt64
   private var workspaceBuildTask: Task<Void, Never>?
+  /// Ownership token for the open-flow activity presentation. Each open flow (and
+  /// `closeWorkspace`) bumps it; an in-flight background build that exits on ANY path —
+  /// cancellation, workspace mismatch, or normal completion — clears `workspaceActivity`
+  /// only while its own generation is still current. Without this, a build cancelled by
+  /// `applyRefresh` or superseded by an ad-hoc file open left `.opening` on screen forever.
+  private var openFlowGeneration: UInt64 = 0
   private var watcherRefreshTask: Task<Void, Never>?
   /// Tracks the off-main FTS index write launched by `rebuildWorkspace` (incremental delta OR
   /// full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so callers
@@ -57,6 +63,16 @@ final class FolderManager {
   private func setOpenActivity(_ activity: WorkspaceActivity?, into appState: AppState) {
     DebugTrace.log("open activity=\(activity?.kind.rawValue ?? "nil")")
     appState.workspaceActivity = activity
+  }
+
+  /// Terminal clear for a background open flow. No-op when a NEWER open flow has taken
+  /// ownership of the activity display (it bumped the generation before cancelling this
+  /// task), and when there is nothing to clear. This is the ONLY clear point for the
+  /// background path, so every early `return` in the build task tears the spinner down.
+  private func finishOpenFlow(generation: UInt64, into appState: AppState) {
+    guard generation == openFlowGeneration else { return }
+    guard appState.workspaceActivity != nil else { return }
+    setOpenActivity(nil, into: appState)
   }
 
   func open(url: URL, into appState: AppState) {
@@ -513,6 +529,9 @@ final class FolderManager {
   /// editor; otherwise the editor is cleared too.
   func closeWorkspace(into appState: AppState) {
     workspaceBuildTask?.cancel()
+    // Take ownership of the activity display so the cancelled build's terminal clear
+    // cannot race the direct `workspaceActivity = nil` below.
+    openFlowGeneration &+= 1
     watcherRefreshTask?.cancel()
     // Cancel any still-awaiting off-main index update. The underlying single-transaction
     // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
@@ -541,6 +560,7 @@ final class FolderManager {
 
   private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
     workspaceBuildTask?.cancel()
+    openFlowGeneration &+= 1
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
     let exclusions = Set(metadata.excludedPaths)
@@ -687,6 +707,8 @@ final class FolderManager {
     rootURLs: [URL], fileURLs: [URL], into appState: AppState
   ) {
     workspaceBuildTask?.cancel()
+    openFlowGeneration &+= 1
+    let generation = openFlowGeneration
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
     let exclusions = Set(metadata.excludedPaths)
@@ -717,8 +739,14 @@ final class FolderManager {
 
     workspaceBuildTask = Task { [weak self, weak appState] in
       let scans = await scanTask.value
-      guard !Task.isCancelled, let self, let appState else { return }
-      guard
+      guard let self, let appState else { return }
+      // EVERY exit from this task — cancellation guard, workspace mismatch, or the
+      // normal tail — must tear the `.opening`/`.indexing` presentation down, unless a
+      // newer open flow already owns the display. A bare `return` here used to leave
+      // the "Opening Workspace" spinner on screen forever (e.g. an ad-hoc file opened
+      // mid-walk fails the workspace match; `applyRefresh` cancels the build outright).
+      defer { self.finishOpenFlow(generation: generation, into: appState) }
+      guard !Task.isCancelled,
         self.matchesCurrentWorkspace(
           rootPaths: expectedRootPaths,
           openFilePaths: expectedOpenFilePaths,
@@ -763,10 +791,9 @@ final class FolderManager {
         )
       {
         // Unchanged workspace: tree already restored from the single walk; no manifest re-commit,
-        // no reindex, no "Indexing N". Just select + watch.
+        // no reindex, no "Indexing N". Just select + watch; the defer clears the activity.
         self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
-        self.setOpenActivity(nil, into: appState)
         return
       }
 
@@ -806,8 +833,8 @@ final class FolderManager {
       )
       self.indexUpdateTask = indexTask
       await indexTask?.value
-      guard !Task.isCancelled else { return }
-      self.setOpenActivity(nil, into: appState)
+      // The defer clears the `.indexing` activity (generation-guarded, so a superseding
+      // open that cancelled this await keeps its own presentation).
     }
   }
 
