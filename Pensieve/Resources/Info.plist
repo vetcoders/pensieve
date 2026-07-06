@@ -11,9 +11,9 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleGetInfoString</key>
-    <string>Pensieve 0.1.0 (dev)</string>
+    <string>Pensieve 0.0.0 (dev)</string>
     <key>PensieveBuildCommit</key>
     <string>unknown</string>
     <key>PensieveBuildCommitSlug</key>
@@ -23,19 +23,19 @@
     <key>PensieveComponentVersions</key>
     <dict>
         <key>Editor</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>MarkdownRenderer</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Mermaid</key>
         <string>11.15.0</string>
         <key>Preview</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Search</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Storage</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Workspace</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
     </dict>
     <key>CFBundleExecutable</key>
     <string>Pensieve</string>
