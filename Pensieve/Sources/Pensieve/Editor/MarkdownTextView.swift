@@ -72,12 +72,14 @@ class MarkdownTextView: NSTextView {
   @objc private func boundsDidChange() {
     gutter?.needsDisplay = true
     scheduleAutocompleteGhostReposition()
+    clampFormattingAccessoryIntoChrome()
   }
 
   override func layout() {
     super.layout()
     gutter?.needsDisplay = true
     scheduleAutocompleteGhostReposition()
+    clampFormattingAccessoryIntoChrome()
   }
 
   override func paste(_ sender: Any?) {
@@ -252,26 +254,68 @@ class MarkdownTextView: NSTextView {
 
     let size = accessory.fittingBarSize
     accessory.setFrameSize(size)
-    accessory.setFrameOrigin(accessoryOrigin(for: localRect, size: size))
+    accessory.setFrameOrigin(
+      Self.accessoryOrigin(
+        for: localRect, size: size, allowed: accessoryAllowedRect(), isFlipped: isFlipped))
   }
 
-  /// Default position near the current selection, clamped into the visible rect. The bar prefers to
-  /// sit just above the selection's first line; if there is no room above, it drops below. The user
-  /// can drag it from here via the grip.
-  private func accessoryOrigin(for selectionRect: NSRect, size: NSSize) -> NSPoint {
-    let gap: CGFloat = 6
+  /// The region the floating accessories may occupy: the visible rect minus any window
+  /// chrome overlapping it. With a full-size content view the text view's `visibleRect`
+  /// extends UNDER the translucent titlebar/toolbar, so a bar clamped only to it ghosts
+  /// through the toolbar material. `window.contentLayoutRect` is the boundary truth for
+  /// where the chrome ends (same rule as the preview glass strip).
+  func accessoryAllowedRect() -> NSRect {
     let visible = visibleRect
+    guard let window else { return visible }
+    let content = convert(window.contentLayoutRect, from: nil)
+    let clipped = visible.intersection(content)
+    return clipped.isEmpty ? visible : clipped
+  }
+
+  /// Default position near the current selection, clamped into `allowed`. The bar prefers
+  /// to sit just above the selection's first line; if there is no room above (the anchor
+  /// sits at — or under — the toolbar edge), it drops below; the final origin is pinned
+  /// inside `allowed` either way. The user can still drag it from there via the grip.
+  static func accessoryOrigin(
+    for selectionRect: NSRect, size: NSSize, allowed: NSRect, isFlipped: Bool
+  ) -> NSPoint {
+    let gap: CGFloat = 6
     var y: CGFloat
     if isFlipped {
       y = selectionRect.minY - size.height - gap
-      if y < visible.minY { y = selectionRect.maxY + gap }
+      if y < allowed.minY { y = selectionRect.maxY + gap }
     } else {
       y = selectionRect.maxY + gap
-      if y + size.height > visible.maxY { y = selectionRect.minY - size.height - gap }
+      if y + size.height > allowed.maxY { y = selectionRect.minY - size.height - gap }
     }
-    var x = selectionRect.minX
-    x = min(max(x, visible.minX + 4), max(visible.minX + 4, visible.maxX - size.width - 4))
-    return NSPoint(x: x, y: y)
+    return clampedAccessoryOrigin(
+      NSPoint(x: selectionRect.minX, y: y), size: size, allowed: allowed)
+  }
+
+  /// Pin an accessory origin inside `allowed`. Pure so the positioning seam is testable;
+  /// used at presentation time, on every scroll tick, and while dragging, so a bar whose
+  /// text anchor slides under the toolbar is pinned just below the chrome edge instead
+  /// of following the selection through it.
+  static func clampedAccessoryOrigin(
+    _ origin: NSPoint, size: NSSize, allowed: NSRect
+  ) -> NSPoint {
+    var clamped = origin
+    clamped.x = min(
+      max(clamped.x, allowed.minX + 4), max(allowed.minX + 4, allowed.maxX - size.width - 4))
+    clamped.y = min(max(clamped.y, allowed.minY), max(allowed.minY, allowed.maxY - size.height))
+    return clamped
+  }
+
+  /// The bar is a subview of this text view, so it scrolls in lockstep with the text —
+  /// which also means a scroll can carry it under the titlebar. Re-pin it after every
+  /// bounds/layout change.
+  private func clampFormattingAccessoryIntoChrome() {
+    guard let bar = formattingAccessory, bar.superview === self else { return }
+    let clamped = Self.clampedAccessoryOrigin(
+      bar.frame.origin, size: bar.frame.size, allowed: accessoryAllowedRect())
+    if clamped != bar.frame.origin {
+      bar.setFrameOrigin(clamped)
+    }
   }
 
   func hideFormattingPopover() {
@@ -466,7 +510,9 @@ private final class FormatBarGrip: NSView {
     // Window y grows upward; a flipped canvas (NSTextView) grows downward, so invert there.
     origin.y += canvas.isFlipped ? -dy : dy
 
-    let visible = canvas.visibleRect
+    // Drag clamps to the same chrome-aware rect as automatic placement, so the user
+    // cannot park the bar under the translucent toolbar either.
+    let visible = (canvas as? MarkdownTextView)?.accessoryAllowedRect() ?? canvas.visibleRect
     origin.x = min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - bar.frame.width))
     origin.y = min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - bar.frame.height))
     bar.setFrameOrigin(origin)

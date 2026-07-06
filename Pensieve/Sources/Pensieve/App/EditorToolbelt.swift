@@ -2,11 +2,13 @@ import SwiftUI
 
 /// Window toolbar contents for the main editor scene.
 ///
-/// Re-creates the chrome density of the legacy MarkdownEditor: a mode/syntax
-/// picker on the leading side, a Markdown format strip in the middle, and the
-/// preview style/refresh/auto-reload controls trailing. Built as
-/// `ToolbarContent` so `ContentView` can mount it via `.toolbar { … }` and
-/// SwiftUI lays the items into the native unified window toolbar.
+/// Declutter contract (Cut 5-1R): the titlebar carries the navigation cluster
+/// (mode picker), one summary `Aa` Edit menu in the principal slot, and a
+/// reduced trailing side of daily drivers — share, preview appearance, reload
+/// (plus the dispatch item mounted by `ContentView`). Everything else
+/// (transcription tafla, scroll sync, auto reload) lives in a single overflow
+/// menu. No raw format buttons sit in the bar; the edit actions surface via
+/// the `Aa` menu, the floating selection bar, and the Format app menu.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -22,7 +24,7 @@ struct EditorToolbelt: ToolbarContent {
     appState.documentSession.document != nil
   }
 
-  /// The format strip and editor-facing controls light up for ANY editable buffer —
+  /// The edit menu and editor-facing controls light up for ANY editable buffer —
   /// untitled scratch notes included — not only file-backed documents. Gating them on
   /// `document != nil` made the whole edit toolbar vanish while editing an untitled note.
   /// Reads the discrete `documentHasEditableBuffer` mirror, not `documentSession`,
@@ -31,39 +33,18 @@ struct EditorToolbelt: ToolbarContent {
     appState.documentHasEditableBuffer
   }
 
-  private var transcriptionTaflaSystemImage: String {
-    controller.isTranscriptionTaflaVisible ? "waveform.circle.fill" : "waveform.circle"
-  }
-
-  private var transcriptionTaflaHelp: String {
-    controller.isTranscriptionTaflaVisible
-      ? "Hide Transcription Tafla"
-      : "Show Transcription Tafla"
-  }
-
   var body: some ToolbarContent {
     ToolbarItemGroup(placement: .navigation) {
       modePicker
-      // Visible in every mode on purpose (unlike the appearance popover,
-      // which is preview appearance and gated to .preview/.split):
-      // rich-markdown is an editor-buffer property, so it stays reachable
-      // even while the editor pane itself is hidden.
-      richMarkdownToggle
     }
 
     ToolbarItemGroup(placement: .principal) {
       if hasEditableBuffer {
-        formatStrip
+        editMenu
       }
     }
 
     ToolbarItemGroup(placement: .primaryAction) {
-      Button(action: { controller.toggleTranscriptionTafla() }) {
-        Image(systemName: transcriptionTaflaSystemImage)
-      }
-      .help(transcriptionTaflaHelp)
-      .accessibilityIdentifier("pensieve.toolbar.taflaToggle")
-
       Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
         Image(systemName: "square.and.arrow.up")
       }
@@ -74,6 +55,7 @@ struct EditorToolbelt: ToolbarContent {
       if Self.showsAppearanceControls(for: appState.mode) {
         AppearanceToolbarButton(themeManager: themeManager)
       }
+
       Button(action: { appState.requestPreviewRefresh() }) {
         Image(systemName: "arrow.clockwise")
       }
@@ -81,38 +63,7 @@ struct EditorToolbelt: ToolbarContent {
       .disabled(!hasEditableBuffer)
       .accessibilityIdentifier("pensieve.toolbar.reload")
 
-      Toggle(
-        isOn: Binding(
-          get: { appState.scrollSyncEnabled },
-          set: { appState.scrollSyncEnabled = $0 }
-        )
-      ) {
-        Image(systemName: "arrow.up.and.down")
-      }
-      .toggleStyle(.button)
-      .help(
-        appState.scrollSyncEnabled
-          ? "Scroll sync on — editor drives preview in Split mode"
-          : "Scroll sync off"
-      )
-      .disabled(!hasEditableBuffer)
-      .accessibilityIdentifier("pensieve.toolbar.scrollSync")
-
-      Toggle(
-        isOn: Binding(
-          get: { appState.previewAutoReload },
-          set: { appState.previewAutoReload = $0 }
-        )
-      ) {
-        Image(systemName: "arrow.triangle.2.circlepath")
-      }
-      .toggleStyle(.button)
-      .help(
-        appState.previewAutoReload
-          ? "Auto reload on — preview re-renders as you type"
-          : "Auto reload off — use the reload button to refresh"
-      )
-      .accessibilityIdentifier("pensieve.toolbar.autoReload")
+      overflowMenu
     }
   }
 
@@ -146,34 +97,82 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityIdentifier("pensieve.toolbar.modePicker")
   }
 
-  private var richMarkdownToggle: some View {
-    Button(action: { controller.toggleRichMarkdown() }) {
-      Image(
-        systemName: appState.richMarkdownEnabled
-          ? "textformat.alt"
-          : "textformat")
+  /// The ONE summary Edit menu behind the `Aa` glyph. Its action list is not a
+  /// second source of truth: it iterates `MarkdownFormat.allCases` in
+  /// declaration order — exactly the list the floating selection bar and the
+  /// editor context menu render — so the surfaces can never drift apart.
+  /// The rich-markdown toggle rides along at the bottom: it is an
+  /// editor-buffer property, formerly the misleading bare `Aa` button.
+  private var editMenu: some View {
+    Menu {
+      ForEach(MarkdownFormat.allCases) { format in
+        Button(action: { controller.applyMarkdownFormat(format) }) {
+          Label(format.label, systemImage: format.systemImageName)
+        }
+        .accessibilityIdentifier(format.toolbarAccessibilityIdentifier)
+      }
+
+      Divider()
+
+      Toggle(
+        isOn: Binding(
+          get: { appState.richMarkdownEnabled },
+          set: { _ in controller.toggleRichMarkdown() }
+        )
+      ) {
+        Label("Rich Markdown (⌘/)", systemImage: "textformat.alt")
+      }
+      .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
+    } label: {
+      Image(systemName: "textformat")
     }
-    .help(
-      appState.richMarkdownEnabled
-        ? "Rich Markdown on (⌘/)"
-        : "Plain syntax (⌘/)"
-    )
-    .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
+    .help("Edit — Markdown formatting for the selection, plus Rich Markdown")
+    .accessibilityIdentifier("pensieve.toolbar.editMenu")
   }
 
-  @ViewBuilder
-  private var formatStrip: some View {
-    ForEach(MarkdownFormat.allCases) { format in
-      Button(action: { controller.applyMarkdownFormat(format) }) {
-        Image(systemName: format.systemImageName)
+  /// Single overflow for the non-daily controls the trailing side used to
+  /// carry raw: transcription tafla, scroll sync, auto reload. They are
+  /// set-and-forget toggles, so one `ellipsis.circle` menu holds them all;
+  /// share/appearance/reload/dispatch stay visible as the daily drivers.
+  private var overflowMenu: some View {
+    Menu {
+      Toggle(
+        isOn: Binding(
+          get: { controller.isTranscriptionTaflaVisible },
+          set: { _ in controller.toggleTranscriptionTafla() }
+        )
+      ) {
+        Label("Transcription Tafla", systemImage: "waveform.circle")
       }
-      .help(format.label)
-      .accessibilityIdentifier(format.toolbarAccessibilityIdentifier)
+      .accessibilityIdentifier("pensieve.toolbar.taflaToggle")
 
-      if format == .strike || format == .quote || format == .numberedList {
-        Divider()
+      Divider()
+
+      Toggle(
+        isOn: Binding(
+          get: { appState.scrollSyncEnabled },
+          set: { appState.scrollSyncEnabled = $0 }
+        )
+      ) {
+        Label("Scroll Sync", systemImage: "arrow.up.and.down")
       }
+      .disabled(!hasEditableBuffer)
+      .accessibilityIdentifier("pensieve.toolbar.scrollSync")
+
+      Toggle(
+        isOn: Binding(
+          get: { appState.previewAutoReload },
+          set: { appState.previewAutoReload = $0 }
+        )
+      ) {
+        Label("Auto Reload Preview", systemImage: "arrow.triangle.2.circlepath")
+      }
+      .accessibilityIdentifier("pensieve.toolbar.autoReload")
+    } label: {
+      Image(systemName: "ellipsis.circle")
     }
+    .help("More — transcription tafla, scroll sync, auto reload")
+    .accessibilityIdentifier("pensieve.toolbar.overflow")
   }
 }
 
