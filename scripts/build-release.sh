@@ -267,7 +267,12 @@ plist_set_string "$APP_BUNDLE/Contents/Info.plist" "PensieveBuildDate" "$BUILD_D
 for component in Editor MarkdownRenderer Preview Search Storage Workspace; do
     /usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:$component string $BUILD_LABEL" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 done
-/usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:Mermaid string 11.15.0" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+# The vendored runtime's banner (line 1) is the ONLY producer of the Mermaid
+# version claim — a hand-copied literal here silently outlives upgrades.
+MERMAID_JS="$PKG_DIR/Sources/Pensieve/Resources/mermaid.min.js"
+MERMAID_VERSION="$(sed -n '1s/.*Mermaid v\([0-9][0-9.]*[0-9]\).*/\1/p' "$MERMAID_JS")"
+[[ -n "$MERMAID_VERSION" ]] || die "Cannot extract Mermaid version from banner of $MERMAID_JS"
+/usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:Mermaid string $MERMAID_VERSION" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 cp -R "$SPM_BUNDLE_DIR" "$APP_BUNDLE/Contents/Resources/"
 ok ".app bundle laid out at $APP_BUNDLE"
 

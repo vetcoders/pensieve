@@ -59,9 +59,28 @@ final class BuildIdentityTests: XCTestCase {
 
     let components = try XCTUnwrap(
       info[BuildIdentity.componentVersionsKey] as? [String: String])
-    for (name, version) in components where name != "Mermaid" {
+    for (name, version) in components {
       XCTAssertEqual(
         version, "0.0.0", "component \(name) must stay a placeholder until stamped")
     }
+  }
+
+  /// scripts/build-release.sh stamps the Mermaid component version by
+  /// extracting it from the vendored runtime's banner (line 1) — the file
+  /// itself is the only producer of that claim. Guard the extraction
+  /// contract: the banner must keep carrying `Mermaid v<x.y.z>`.
+  func testVendoredMermaidBannerCarriesExtractableVersion() throws {
+    let mermaidURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // PensieveTests/
+      .deletingLastPathComponent()  // Tests/
+      .deletingLastPathComponent()  // package root
+      .appendingPathComponent("Sources/Pensieve/Resources/mermaid.min.js")
+    let handle = try FileHandle(forReadingFrom: mermaidURL)
+    defer { try? handle.close() }
+    let banner = String(decoding: handle.readData(ofLength: 256), as: UTF8.self)
+
+    XCTAssertNotNil(
+      banner.range(of: #"Mermaid v\d+\.\d+\.\d+"#, options: .regularExpression),
+      "vendored mermaid.min.js banner lost its extractable version marker")
   }
 }
