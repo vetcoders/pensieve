@@ -250,6 +250,173 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
   }
 
+  func testInitEnabledFlagSurvivesToTypingPath() async {
+    // The trailing update() inside init defaults aiAutocompleteEnabled to
+    // false; before the pass-through fix it silently disabled autocomplete on
+    // every surface built with init(aiAutocompleteEnabled: true).
+    let attempts = AttemptCounter()
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: AutocompleteController(
+        engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in
+          attempts.increment()
+          return " world"
+        }),
+        debounceNanoseconds: 1
+      )
+    )
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    surface.textDidChange(
+      Notification(name: NSText.didChangeNotification, object: surface.textView))
+
+    for _ in 0..<200 where attempts.value == 0 {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(
+      attempts.value, 1,
+      "init(aiAutocompleteEnabled: true) must survive the trailing update() defaults")
+  }
+
+  func testMarkedTextSuppressesCompletionRequest() async {
+    // IME composition must not fire LLM requests: textDidChange fires per
+    // candidate update, and half-composed characters are not a prompt.
+    let attempts = AttemptCounter()
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: AutocompleteController(
+        engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in
+          attempts.increment()
+          return " world"
+        }),
+        debounceNanoseconds: 1
+      )
+    )
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    surface.textView.setMarkedText(
+      "に", selectedRange: NSRange(location: 0, length: 1),
+      replacementRange: NSRange(location: 5, length: 0))
+    XCTAssertTrue(surface.textView.hasMarkedText())
+
+    surface.textDidChange(
+      Notification(name: NSText.didChangeNotification, object: surface.textView))
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertEqual(attempts.value, 0, "composition keystrokes must not reach the engine")
+    XCTAssertFalse(surface.textView.hasAutocompleteGhost)
+  }
+
+  func testSuggestionArrivingMidCompositionDoesNotRenderGhost() async {
+    // Models a completion that slips past the request-side marked-text skip
+    // (fired straight at the controller): when it publishes while composition
+    // is active and the selection has been stable since the capture, the
+    // render path itself must refuse to paint a ghost into the marked range.
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: AutocompleteController(
+        engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" }),
+        debounceNanoseconds: 1
+      )
+    )
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    // Caret AFTER the composed character (zero-length selection): the render
+    // path's selection-length guard must not be what saves us here.
+    surface.textView.setMarkedText(
+      "に", selectedRange: NSRange(location: 1, length: 0),
+      replacementRange: NSRange(location: 5, length: 0))
+    XCTAssertTrue(surface.textView.hasMarkedText())
+    XCTAssertEqual(surface.textView.selectedRange().length, 0)
+
+    surface.autocompleteController.textDidChange(prefix: "hello")
+    try? await Task.sleep(nanoseconds: 250_000_000)
+
+    XCTAssertEqual(surface.autocompleteController.suggestion, " world")
+    XCTAssertFalse(
+      surface.textView.hasAutocompleteGhost,
+      "a ghost must never render inside an active IME composition")
+  }
+
+  func testAcceptRefusedDuringComposition() {
+    let surface = makeSurface(text: "hello")
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    surface.textView.setAutocompleteGhost(" world", at: 5)
+    surface.textView.setMarkedText(
+      "に", selectedRange: NSRange(location: 0, length: 1),
+      replacementRange: NSRange(location: 5, length: 0))
+    XCTAssertTrue(surface.textView.hasMarkedText())
+
+    XCTAssertFalse(surface.acceptAutocompleteSuggestion())
+
+    XCTAssertFalse(surface.textStorage.string.contains("world"))
+    XCTAssertFalse(surface.textView.hasAutocompleteGhost)
+  }
+
+  func testBoundedAutocompletePrefixCapsTail() {
+    let cap = MarkdownEditorSurface.autocompletePrefixMaxUTF16
+    let text = String(repeating: "a", count: cap + 1000) as NSString
+
+    let bounded = MarkdownEditorSurface.boundedAutocompletePrefix(text, caret: text.length)
+    XCTAssertEqual(bounded.utf16.count, cap)
+    XCTAssertTrue(bounded.allSatisfy { $0 == "a" })
+
+    // Short documents pass through untouched.
+    let short = "hello" as NSString
+    XCTAssertEqual(MarkdownEditorSurface.boundedAutocompletePrefix(short, caret: 5), "hello")
+    // Caret clamped into bounds.
+    XCTAssertEqual(MarkdownEditorSurface.boundedAutocompletePrefix(short, caret: 99), "hello")
+  }
+
+  func testBoundedAutocompletePrefixNeverSplitsSurrogatePair() {
+    let cap = MarkdownEditorSurface.autocompletePrefixMaxUTF16
+    // Layout: cap UTF-16 units of emoji, one 'x', then 10 more emoji.
+    // caret-at-end puts the raw window start at an ODD offset inside the
+    // leading emoji run — mid-surrogate-pair without the boundary snap.
+    let text =
+      (String(repeating: "😀", count: cap / 2) + "x"
+      + String(repeating: "😀", count: 10)) as NSString
+    let caret = text.length
+
+    let bounded = MarkdownEditorSurface.boundedAutocompletePrefix(text, caret: caret)
+
+    XCTAssertLessThanOrEqual(bounded.utf16.count, cap + 1)
+    XCTAssertTrue(bounded.hasPrefix("😀"), "window start must snap to a composed boundary")
+    XCTAssertTrue(bounded.hasSuffix("😀"))
+  }
+
+  func testTypingPathSendsBoundedPrefix() async {
+    let cap = MarkdownEditorSurface.autocompletePrefixMaxUTF16
+    let capturedLength = AttemptCounter()
+    let surface = MarkdownEditorSurface(
+      text: String(repeating: "a", count: cap + 2000),
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: AutocompleteController(
+        engine: MockVistaAutocompleteEngine(completionHandler: { prefix, _ in
+          capturedLength.record(prefix.utf16.count)
+          return " world"
+        }),
+        debounceNanoseconds: 1
+      )
+    )
+    surface.textView.setSelectedRange(NSRange(location: cap + 2000, length: 0))
+    surface.textDidChange(
+      Notification(name: NSText.didChangeNotification, object: surface.textView))
+
+    for _ in 0..<200 where capturedLength.value == 0 {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(
+      capturedLength.value, cap,
+      "the live typing path must cap the prompt payload at the prefix window")
+  }
+
   func testAIAutocompleteSettingDefaultsOffAndPersists() {
     let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -271,6 +438,12 @@ private final class AttemptCounter: @unchecked Sendable {
   func increment() {
     lock.lock()
     count += 1
+    lock.unlock()
+  }
+
+  func record(_ newValue: Int) {
+    lock.lock()
+    count = newValue
     lock.unlock()
   }
 

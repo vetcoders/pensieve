@@ -29,6 +29,7 @@ DMG_PATH   := $(DIST)/Pensieve.dmg
 C_CYAN   := \033[36m
 C_GREEN  := \033[32m
 C_YELLOW := \033[33m
+C_RED    := \033[31m
 C_RESET  := \033[0m
 
 # =========================================================================
@@ -92,7 +93,13 @@ clean-deep: clean  ## Clean + nuke SwiftPM resolved deps cache
 
 .PHONY: test
 test:  ## Run unit + integration tests
-	@cd $(PKG_DIR) && { set -o pipefail; swift test 2>&1 | tail -25; }
+	@cd $(PKG_DIR) && mkdir -p .build && \
+	{ set -o pipefail; swift test 2>&1 | tee .build/test-output.log | tail -25; } || { \
+		status=$$?; \
+		printf "\n$(C_RED)[fail]$(C_RESET) failing tests (full log: $(PKG_DIR)/.build/test-output.log):\n"; \
+		grep -E "Test Case .* failed|error:|✘" .build/test-output.log | head -40 || true; \
+		exit $$status; \
+	}
 
 .PHONY: ui-smoke
 ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app

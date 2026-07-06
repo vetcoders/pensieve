@@ -398,12 +398,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self?.acceptAutocompleteSuggestion() ?? false
     }
     bindAutocomplete()
+    // Forward the init flag: update() defaults aiAutocompleteEnabled to false,
+    // so omitting it here silently disabled autocomplete on every surface
+    // built through this initializer (the init argument was a dead letter).
     update(
       text: text,
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
-      asciiSafeTables: asciiSafeTables
+      asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled
     )
   }
 
@@ -523,7 +527,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     onTextChanged?(latestText)
     if aiAutocompleteEnabled {
       lastTextChangeSelection = textView.selectedRange()
-      autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
+      // IME composition (marked text) fires textDidChange per candidate
+      // update; requesting a completion against half-composed characters
+      // wastes the LLM round-trip and risks rendering a ghost inside the
+      // composition. The render path re-checks hasMarkedText for requests
+      // already in flight.
+      if !textView.hasMarkedText() {
+        autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
+      }
     }
     refreshFindMatches()
     centerCaretLineIfNeeded()
@@ -543,10 +554,30 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     onSelectionChanged?(range.location, range.length)
   }
 
+  /// UTF-16 cap on the completion prompt tail. Without it every debounce
+  /// ships the ENTIRE document up to the caret through UniFFI + HTTP — a
+  /// multi-hundred-KB payload per typing pause in a large note. ~4k units
+  /// (≈1–2k tokens) keeps the nearest context, which is all the completion
+  /// endpoint conditions on anyway.
+  static let autocompletePrefixMaxUTF16 = 4096
+
   private func autocompletePrefix(from text: String) -> String {
-    let nsText = text as NSString
-    let caret = min(max(textView.selectedRange().location, 0), nsText.length)
-    return nsText.substring(to: caret)
+    let caret = textView.selectedRange().location
+    return Self.boundedAutocompletePrefix(text as NSString, caret: caret)
+  }
+
+  static func boundedAutocompletePrefix(
+    _ text: NSString,
+    caret: Int,
+    maxUTF16: Int = MarkdownEditorSurface.autocompletePrefixMaxUTF16
+  ) -> String {
+    let caret = min(max(caret, 0), text.length)
+    guard caret > maxUTF16 else { return text.substring(to: caret) }
+    // Snap the window start down to a composed-character boundary so a
+    // surrogate pair (emoji, rare CJK) is never split; the window may grow
+    // by at most one composed sequence.
+    let start = text.rangeOfComposedCharacterSequence(at: caret - maxUTF16).location
+    return text.substring(with: NSRange(location: start, length: caret - start))
   }
 
   private func bindAutocomplete() {
@@ -569,7 +600,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private func scheduleAutocompleteRender(_ suggestion: String?) {
     let selection = textView.selectedRange()
     let renderGeneration = autocompleteRenderGeneration
-    guard aiAutocompleteEnabled, selection.length == 0, let suggestion, !suggestion.isEmpty else {
+    guard aiAutocompleteEnabled, selection.length == 0, !textView.hasMarkedText(),
+      let suggestion, !suggestion.isEmpty
+    else {
       textView.dismissAutocompleteGhost()
       return
     }
@@ -578,7 +611,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       guard let self else { return }
       guard self.aiAutocompleteEnabled,
         self.autocompleteRenderGeneration == renderGeneration,
-        self.textView.selectedRange() == selection
+        self.textView.selectedRange() == selection,
+        !self.textView.hasMarkedText()
       else { return }
       self.textView.setAutocompleteGhost(suggestion, at: caret)
     }
@@ -587,6 +621,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   @discardableResult
   func acceptAutocompleteSuggestion() -> Bool {
     guard let suggestion = textView.autocompleteGhostText, !suggestion.isEmpty else { return false }
+    // Accepting during IME composition would splice the suggestion through
+    // the marked range and corrupt the composition; refuse so Tab reaches
+    // the input method instead.
+    guard !textView.hasMarkedText() else {
+      invalidateAutocomplete()
+      return false
+    }
     let range = textView.selectedRange()
     guard range.length == 0 else {
       invalidateAutocomplete()
