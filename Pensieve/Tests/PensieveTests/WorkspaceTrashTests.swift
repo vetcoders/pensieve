@@ -72,6 +72,59 @@ final class WorkspaceTrashTests: XCTestCase {
     XCTAssertEqual(harness.recycleRequests, [[folderURL]])
   }
 
+  func testRecycleSuccessCompletionRemovesOpenFileReference() async throws {
+    let fixture = try makeFixture()
+    defer { fixture.cleanup() }
+
+    let fileURL = fixture.root.appendingPathComponent("alpha.md").standardizedFileURL
+    try "# Alpha".write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let harness = try makeHarness(root: fixture.root)
+    harness.appState.openFiles = [DocumentRef(id: fileURL, isAdHoc: true)]
+
+    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
+    XCTAssertEqual(harness.appState.openFiles.map(\.id), [fileURL])
+
+    let completion = try XCTUnwrap(harness.recycleCompletion)
+    completion([:], nil)
+    await Self.drainMainActor(until: { harness.appState.openFiles.isEmpty })
+
+    XCTAssertTrue(harness.appState.openFiles.isEmpty)
+    XCTAssertNil(harness.appState.lastError)
+  }
+
+  func testRecycleFailureCompletionSurfacesErrorAndKeepsOpenFileReference() async throws {
+    let fixture = try makeFixture()
+    defer { fixture.cleanup() }
+
+    let fileURL = fixture.root.appendingPathComponent("alpha.md").standardizedFileURL
+    try "# Alpha".write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let harness = try makeHarness(root: fixture.root)
+    harness.appState.openFiles = [DocumentRef(id: fileURL, isAdHoc: true)]
+
+    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
+
+    let completion = try XCTUnwrap(harness.recycleCompletion)
+    completion([:], CocoaError(.fileWriteNoPermission))
+    await Self.drainMainActor(until: { harness.appState.lastError != nil })
+
+    let lastError = try XCTUnwrap(harness.appState.lastError)
+    XCTAssertTrue(lastError.contains("alpha.md"), "error names the file: \(lastError)")
+    XCTAssertTrue(lastError.contains("Trash"), "error names the operation: \(lastError)")
+    // The file is still on disk after a failed recycle, so its sidebar reference must survive.
+    XCTAssertEqual(harness.appState.openFiles.map(\.id), [fileURL])
+  }
+
+  /// The recycle completion hops through `Task { @MainActor in ... }`; yield the main
+  /// actor until the hop lands (bounded so a regression fails fast instead of hanging).
+  private static func drainMainActor(until condition: @MainActor () -> Bool) async {
+    for _ in 0..<500 {
+      if condition() { return }
+      await Task.yield()
+    }
+  }
+
   private func makeHarness(root: URL) throws -> TrashHarness {
     let appState = AppState()
     let indexDatabase = IndexDatabase(databaseURL: root.appendingPathComponent("index.db"))
