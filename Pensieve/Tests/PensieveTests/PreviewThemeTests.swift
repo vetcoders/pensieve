@@ -128,21 +128,25 @@ final class PreviewThemeTests: XCTestCase {
 
   func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {
     XCTAssertEqual(
-      PreviewWebView.titlebarGlassHeight(frameHeight: 800, contentLayoutHeight: 736),
+      PreviewTitlebarGlassController.titlebarGlassHeight(
+        frameHeight: 800, contentLayoutHeight: 736),
       64)
     XCTAssertEqual(
-      PreviewWebView.titlebarGlassHeight(frameHeight: 800, contentLayoutHeight: 800),
+      PreviewTitlebarGlassController.titlebarGlassHeight(
+        frameHeight: 800, contentLayoutHeight: 800),
       0)
     XCTAssertEqual(
-      PreviewWebView.titlebarGlassHeight(frameHeight: 799.5, contentLayoutHeight: 735.25),
+      PreviewTitlebarGlassController.titlebarGlassHeight(
+        frameHeight: 799.5, contentLayoutHeight: 735.25),
       65)
     XCTAssertEqual(
-      PreviewWebView.titlebarGlassHeight(frameHeight: 700, contentLayoutHeight: 724),
+      PreviewTitlebarGlassController.titlebarGlassHeight(
+        frameHeight: 700, contentLayoutHeight: 724),
       0)
   }
 
   func testTitlebarGlassHeightScriptTargetsDocumentRootCSSVariable() {
-    let script = PreviewWebView.titlebarGlassHeightScript(height: 47.2)
+    let script = PreviewTitlebarGlassController.titlebarGlassHeightScript(height: 47.2)
 
     XCTAssertTrue(script.contains("document.documentElement.style.setProperty"))
     XCTAssertTrue(script.contains("'--vc-preview-titlebar-glass-height'"))

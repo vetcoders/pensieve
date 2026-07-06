@@ -22,10 +22,6 @@ final class PreviewWebView: NSView {
   private var lastDocument: PreviewDocument?
   private let titlebarGlassController = PreviewTitlebarGlassController()
 
-  // Test seam: lets unit tests verify the native-window -> CSS-var choreography
-  // without depending on a live WKWebView process.
-  var titlebarGlassScriptEvaluator: ((String) -> Void)?
-
   // Test seam: observes full-page (re)loads without a live WKWebView process.
   var fullPageLoadObserver: ((PreviewDocument) -> Void)?
 
@@ -46,8 +42,11 @@ final class PreviewWebView: NSView {
     ])
 
     webView.navigationDelegate = self
+    // The controller's own `scriptEvaluator` is the single injectable seam for
+    // glass-script choreography (see PreviewThemeTests); here it always targets
+    // the live WKWebView.
     titlebarGlassController.scriptEvaluator = { [weak self] script in
-      self?.evaluateTitlebarGlassScript(script)
+      self?.webView.evaluateJavaScript(script, completionHandler: nil)
     }
   }
 
@@ -218,7 +217,7 @@ final class PreviewWebView: NSView {
       --vc-preview-diagram-error-text: #8c1d18;
       --vc-preview-math-bg: #f6f8fa;
       --vc-preview-page-background: transparent;
-      --vc-preview-titlebar-glass-height: 0px;
+      \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -261,7 +260,7 @@ final class PreviewWebView: NSView {
     body::before {
       content: "";
       position: fixed;
-      top: var(--vc-preview-titlebar-glass-height);
+      top: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
       right: 0;
       bottom: 0;
       left: 0;
@@ -1056,32 +1055,6 @@ final class PreviewWebView: NSView {
     return literal
   }
 
-  private func evaluateTitlebarGlassScript(_ script: String) {
-    if let titlebarGlassScriptEvaluator {
-      titlebarGlassScriptEvaluator(script)
-    } else {
-      webView.evaluateJavaScript(script, completionHandler: nil)
-    }
-  }
-}
-
-extension PreviewWebView {
-  static let titlebarGlassHeightCSSVariable =
-    PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable
-
-  static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
-    PreviewTitlebarGlassController.titlebarGlassHeight(
-      frameHeight: frameHeight,
-      contentLayoutHeight: contentLayoutHeight)
-  }
-
-  static func titlebarGlassHeight(for window: NSWindow?) -> CGFloat {
-    PreviewTitlebarGlassController.titlebarGlassHeight(for: window)
-  }
-
-  static func titlebarGlassHeightScript(height: CGFloat) -> String {
-    PreviewTitlebarGlassController.titlebarGlassHeightScript(height: height)
-  }
 }
 
 final class PreviewTitlebarGlassController: NSObject {
