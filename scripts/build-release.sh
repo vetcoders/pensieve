@@ -210,7 +210,15 @@ mkdir -p "$DIST_DIR"
 # ─── Build ────────────────────────────────────────────────────────────────
 log "swift build -c release (arm64)"
 cd "$PKG_DIR"
-swift build -c release --arch arm64 2>&1 | tail -8
+# Same failure class as the `make test | tail` fix: a `| tail -8` on a red
+# parallel build routinely shows 8 progress lines from OTHER modules while the
+# actual `error:` lines scrolled away — the release/MAS lane died with no names.
+BUILD_LOG="$DIST_DIR/swift-build.log"
+if ! swift build -c release --arch arm64 >"$BUILD_LOG" 2>&1; then
+    grep -E "error:" "$BUILD_LOG" | head -40 || tail -25 "$BUILD_LOG"
+    die "swift build failed — full log: $BUILD_LOG"
+fi
+tail -8 "$BUILD_LOG"
 EXECUTABLE="$PKG_DIR/.build/arm64-apple-macosx/release/$APP_NAME"
 [[ -x "$EXECUTABLE" ]] || die "Executable not built at $EXECUTABLE"
 ok "Executable: $EXECUTABLE ($(du -h "$EXECUTABLE" | cut -f1))"

@@ -96,30 +96,11 @@ final class PreviewWebView: NSView {
     loadFullPage(document, identity: PreviewLoadIdentity(document: document))
   }
 
-  func readScrollSyncPosition(completion: @escaping (ScrollSyncPosition?) -> Void) {
-    guard loadedIdentity != nil else {
-      completion(nil)
-      return
-    }
-
-    let script = """
-      (function() {
-        const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-        if (maxY <= 0) {
-          return 0;
-        }
-        return Math.min(Math.max((window.scrollY || 0) / maxY, 0), 1);
-      })();
-      """
-    webView.evaluateJavaScript(script) { result, error in
-      guard error == nil, let progress = result as? Double else {
-        completion(nil)
-        return
-      }
-      completion(ScrollSyncPosition(progress: progress))
-    }
-  }
-
+  // Scroll sync is deliberately ONE-WAY (editor → preview). The preview-side
+  // readback that would close the loop was the re-entrancy direction that
+  // crashed the original two-way design; ScrollSyncTests pins the one-way
+  // contract. Do not add a preview scroll observer without going through the
+  // coordinator's latch semantics.
   private func scrollToScrollSyncPosition(_ position: ScrollSyncPosition) {
     guard loadedIdentity != nil else { return }
     let progress = position.progress
