@@ -68,6 +68,7 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("vc-skin:vercel"))
     XCTAssertTrue(css.contains("#171717"))
     XCTAssertTrue(css.contains("Geist"))
+    XCTAssertTrue(css.contains("font-weight: 700"))
   }
 
   func testThemeableSkinIsInterOnSlate() {
@@ -113,6 +114,40 @@ final class PreviewThemeTests: XCTestCase {
     // render the established surface.
     let css = PreviewWebView.appearanceCSS(fontSize: 14)
     XCTAssertTrue(css.contains("vc-skin:default"))
+  }
+
+  func testAppearanceCSSDefinesRelativeHeadingScaleIndependentOfFlavor() {
+    for skin in [ThemeManager.PreviewTheme.default, .vercel, .paper] {
+      let css = PreviewWebView.appearanceCSS(fontSize: 16, skin: skin)
+
+      XCTAssertTrue(css.contains("line-height: 1.25"), "skin \(skin.rawValue)")
+      XCTAssertTrue(css.contains("margin-top: 1.4em"), "skin \(skin.rawValue)")
+      XCTAssertTrue(css.contains("font-weight: 700"), "skin \(skin.rawValue)")
+
+      for (selector, size) in headingScaleExpectations {
+        let rule = cssRule(selector: selector, containing: "font-size:", in: css)
+        XCTAssertTrue(rule?.contains("font-size: \(size);") == true, "skin \(skin.rawValue)")
+      }
+    }
+  }
+
+  func testAppearanceCSSKeepsHeadingScaleRelativeAcrossFontSizes() {
+    let small = PreviewWebView.appearanceCSS(fontSize: 16)
+    let large = PreviewWebView.appearanceCSS(fontSize: 24)
+
+    XCTAssertTrue(small.contains("--vc-font-size: 16px"))
+    XCTAssertTrue(large.contains("--vc-font-size: 24px"))
+
+    for css in [small, large] {
+      for (selector, size) in headingScaleExpectations {
+        guard let rule = cssRule(selector: selector, containing: "font-size:", in: css) else {
+          XCTFail("missing heading rule for \(selector)")
+          continue
+        }
+        XCTAssertTrue(rule.contains("font-size: \(size);"), rule)
+        XCTAssertFalse(rule.contains("px"), rule)
+      }
+    }
   }
 
   func testAppearanceCSSDefaultsTitlebarOverlapToOpaqueUntilNativeMeasurement() {
@@ -240,4 +275,28 @@ final class PreviewThemeTests: XCTestCase {
 
     defaults.removePersistentDomain(forName: suiteName)
   }
+}
+
+private let headingScaleExpectations = [
+  (".markdown-body h1", "2em"),
+  (".markdown-body h2", "1.5em"),
+  (".markdown-body h3", "1.25em"),
+  (".markdown-body h4", "1em"),
+  (".markdown-body h5", "0.875em"),
+  (".markdown-body h6", "0.85em"),
+]
+
+private func cssRule(selector: String, containing declaration: String, in css: String) -> String? {
+  var searchRange = css.startIndex..<css.endIndex
+  while let selectorRange = css.range(of: "\(selector) {", range: searchRange) {
+    guard let closeBrace = css[selectorRange.upperBound...].firstIndex(of: "}") else {
+      return nil
+    }
+    let rule = String(css[selectorRange.lowerBound...closeBrace])
+    if rule.contains(declaration) {
+      return rule
+    }
+    searchRange = closeBrace..<css.endIndex
+  }
+  return nil
 }

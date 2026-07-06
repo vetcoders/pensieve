@@ -288,6 +288,40 @@ final class PreviewWebView: NSView {
       overflow-wrap: anywhere;
       word-wrap: break-word;
       hyphens: auto;
+      line-height: 1.25;
+      margin-top: 1.4em;
+      margin-bottom: 0.55em;
+    }
+
+    .markdown-body h1,
+    .markdown-body h2,
+    .markdown-body h3,
+    .markdown-body h4 {
+      font-weight: 700;
+    }
+
+    .markdown-body h1 {
+      font-size: 2em;
+    }
+
+    .markdown-body h2 {
+      font-size: 1.5em;
+    }
+
+    .markdown-body h3 {
+      font-size: 1.25em;
+    }
+
+    .markdown-body h4 {
+      font-size: 1em;
+    }
+
+    .markdown-body h5 {
+      font-size: 0.875em;
+    }
+
+    .markdown-body h6 {
+      font-size: 0.85em;
     }
 
     .markdown-body h1,
@@ -822,7 +856,7 @@ final class PreviewWebView: NSView {
         }
         .markdown-body h1, .markdown-body h2, .markdown-body h3,
         .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-weight: 600;
+          font-weight: 700;
           letter-spacing: -0.02em;
         }
         .markdown-body a {
