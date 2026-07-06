@@ -97,7 +97,12 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
     surface.update(
       text: surface.textStorage.string,
       fontSize: 14,
-      syntaxHighlightingEnabled: true
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      findQuery: "",
+      findBarVisible: false
     )
     drainMainQueue()
 

@@ -32,7 +32,16 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertNotNil(surface.textStorage.attribute(.font, at: 0, effectiveRange: nil))
 
     let updatedText = "## Updated\n\nBinding changes must reach AppKit."
-    surface.update(text: updatedText, fontSize: 18, syntaxHighlightingEnabled: true)
+    surface.update(
+      text: updatedText,
+      fontSize: 18,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      findQuery: "",
+      findBarVisible: false
+    )
 
     XCTAssertEqual(surface.textView.string, updatedText)
     XCTAssertEqual(surface.textView.gutter?.fontSize, 18)
@@ -334,7 +343,16 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
       NSColor.textColor)
 
-    surface.update(text: storage.string, fontSize: 14, syntaxHighlightingEnabled: true)
+    surface.update(
+      text: storage.string,
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      findQuery: "",
+      findBarVisible: false
+    )
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,

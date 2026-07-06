@@ -44,6 +44,10 @@ struct EditorToolbelt: ToolbarContent {
   var body: some ToolbarContent {
     ToolbarItemGroup(placement: .navigation) {
       modePicker
+      // Visible in every mode on purpose (unlike the appearance popover,
+      // which is preview appearance and gated to .preview/.split):
+      // rich-markdown is an editor-buffer property, so it stays reachable
+      // even while the editor pane itself is hidden.
       richMarkdownToggle
     }
 

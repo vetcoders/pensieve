@@ -16,6 +16,13 @@ protocol ScrollSyncPreviewTarget: AnyObject {
   func applyScrollSyncPosition(_ position: ScrollSyncPosition)
 }
 
+/// One-way scroll sync: the editor is the ONLY producer, the preview a pure
+/// target (the preview->editor readback was deliberately removed after the
+/// two-way design crashed on scroll feedback). `Side.preview` and the
+/// programmatic-scroll lock below are kept as re-entrancy insurance, pinned
+/// by ScrollSyncTests: while a programmatic preview scroll is in flight, an
+/// observed preview scroll must be rejected. Do not wire a preview-side
+/// producer without revisiting that contract.
 final class ScrollSyncCoordinator {
   enum Side: Equatable {
     case editor

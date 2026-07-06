@@ -398,28 +398,31 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self?.acceptAutocompleteSuggestion() ?? false
     }
     bindAutocomplete()
-    // Forward the init flag: update() defaults aiAutocompleteEnabled to false,
-    // so omitting it here silently disabled autocomplete on every surface
-    // built through this initializer (the init argument was a dead letter).
     update(
       text: text,
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
-      aiAutocompleteEnabled: aiAutocompleteEnabled
+      aiAutocompleteEnabled: aiAutocompleteEnabled,
+      findQuery: "",
+      findBarVisible: false
     )
   }
 
+  // No default parameter values on purpose: a defaulted behavior flag already
+  // shipped one silent kill (init passed aiAutocompleteEnabled, the trailing
+  // update() omitted it, and the =false default disabled autocomplete on every
+  // surface). Every call site states every flag; the compiler enforces it.
   func update(
     text: String,
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool,
-    tableTidyOnPaste: Bool = true,
-    asciiSafeTables: Bool = false,
-    aiAutocompleteEnabled: Bool = false,
-    findQuery: String = "",
-    findBarVisible: Bool = false
+    tableTidyOnPaste: Bool,
+    asciiSafeTables: Bool,
+    aiAutocompleteEnabled: Bool,
+    findQuery: String,
+    findBarVisible: Bool
   ) {
     textView.tableTidyOnPaste = tableTidyOnPaste
     textView.asciiSafeTables = asciiSafeTables

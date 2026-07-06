@@ -45,8 +45,6 @@ final class DocumentWindow: NSWindow {
 /// `openWindow(value:)` path is impossible by construction.
 @MainActor
 struct DocumentWindowFactory {
-  static let documentTabbingIdentifier = WindowChromeRecipe.documentTabbingIdentifier
-
   let workspaceStore: WorkspaceStore
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager

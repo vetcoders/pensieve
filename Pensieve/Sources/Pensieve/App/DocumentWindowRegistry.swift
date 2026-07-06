@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
-  private let documentTabbingIdentifier = "Pensieve.DocumentWindow"
+  private let documentTabbingIdentifier = WindowChromeRecipe.documentTabbingIdentifier
 
   typealias DeferredMainWork = @MainActor () -> Void
   /// Builds a fully configured document window WITHOUT ordering it on screen.

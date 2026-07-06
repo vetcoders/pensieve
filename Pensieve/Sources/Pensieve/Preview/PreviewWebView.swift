@@ -1121,7 +1121,10 @@ final class PreviewTitlebarGlassController: NSObject {
   }
 
   static func titlebarGlassHeightScript(height: CGFloat) -> String {
-    let pixelHeight = Int(titlebarGlassHeight(frameHeight: height, contentLayoutHeight: 0))
+    // `height` is an already-measured glass height; measurement happens once,
+    // in titlebarGlassHeight(frameHeight:contentLayoutHeight:). Here we only
+    // clamp to a whole non-negative CSS pixel.
+    let pixelHeight = Int(ceil(max(0, height)))
     return """
       document.documentElement.style.setProperty('\(titlebarGlassHeightCSSVariable)', '\(pixelHeight)px');
       """
