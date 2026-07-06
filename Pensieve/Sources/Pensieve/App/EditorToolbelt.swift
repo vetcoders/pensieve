@@ -50,6 +50,7 @@ struct EditorToolbelt: ToolbarContent {
       }
       .help("Share")
       .disabled(!hasEditableBuffer)
+      .accessibilityLabel("Share Document")
       .accessibilityIdentifier("pensieve.toolbar.share")
 
       if Self.showsAppearanceControls(for: appState.mode) {
@@ -61,6 +62,7 @@ struct EditorToolbelt: ToolbarContent {
       }
       .help("Reload Preview")
       .disabled(!hasEditableBuffer)
+      .accessibilityLabel("Reload Preview")
       .accessibilityIdentifier("pensieve.toolbar.reload")
 
       overflowMenu
@@ -127,6 +129,7 @@ struct EditorToolbelt: ToolbarContent {
       Image(systemName: "textformat")
     }
     .help("Edit — Markdown formatting for the selection, plus Rich Markdown")
+    .accessibilityLabel("Markdown Formatting")
     .accessibilityIdentifier("pensieve.toolbar.editMenu")
   }
 
@@ -172,6 +175,7 @@ struct EditorToolbelt: ToolbarContent {
       Image(systemName: "ellipsis.circle")
     }
     .help("More — transcription tafla, scroll sync, auto reload")
+    .accessibilityLabel("More Controls")
     .accessibilityIdentifier("pensieve.toolbar.overflow")
   }
 }
@@ -189,6 +193,7 @@ private struct AppearanceToolbarButton: View {
       Image(systemName: "paintpalette")
     }
     .help("Preview appearance — markdown flavor and reading theme")
+    .accessibilityLabel("Preview Appearance")
     .accessibilityIdentifier("pensieve.toolbar.appearance")
     .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
       AppearancePopoverContent(themeManager: themeManager)
