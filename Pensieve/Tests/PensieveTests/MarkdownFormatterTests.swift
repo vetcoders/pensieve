@@ -263,6 +263,64 @@ final class MarkdownFormatterTests: XCTestCase {
   }
 
   @MainActor
+  func testWrappingFormatToggleUnwrapsSelectionInsideExistingSpan() {
+    let cases: [(format: MarkdownFormat, marked: String, selected: String)] = [
+      (.bold, "**Lorem ipsum**", "Lorem"),
+      (.italic, "*Lorem ipsum*", "Lorem"),
+      (.strike, "~~Lorem ipsum~~", "Lorem"),
+      (.code, "```\nLorem ipsum\n```", "Lorem"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange((sample.marked as NSString).range(of: sample.selected))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an inner selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem ipsum", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleUnwrapsExactSpanSelection() {
+    let cases: [(format: MarkdownFormat, marked: String)] = [
+      (.bold, "**Lorem**"),
+      (.italic, "*Lorem*"),
+      (.strike, "~~Lorem~~"),
+      (.code, "```\nLorem\n```"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange(
+        NSRange(location: 0, length: (sample.marked as NSString).length))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an exact span selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleNoOpsPartiallyOverlappingSpan() {
+    var didRouteDocumentChange = false
+    let text = "pre **Lorem ipsum** post"
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    surface.onTextChanged = { _ in
+      didRouteDocumentChange = true
+    }
+    surface.textView.setSelectedRange((text as NSString).range(of: "pre **Lorem"))
+
+    let didApply = surface.applyMarkdownFormat(.bold)
+
+    XCTAssertFalse(didApply)
+    XCTAssertEqual(surface.textStorage.string, text)
+    XCTAssertFalse(didRouteDocumentChange)
+  }
+
+  @MainActor
   func testCustomFindReplaceAllUsesEditorUndoPath() {
     var changedText = ""
     let surface = MarkdownEditorSurface(text: "Alpha beta alpha", fontSize: 14)

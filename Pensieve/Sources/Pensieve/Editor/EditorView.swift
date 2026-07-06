@@ -793,14 +793,19 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard range.length > 0 else { return false }
     guard NSMaxRange(range) <= (textStorage.string as NSString).length else { return false }
 
-    let selectedText = (textStorage.string as NSString).substring(with: range)
-    let replacement = MarkdownFormatter.format(selectedText, as: format)
-    guard textView.shouldChangeText(in: range, replacementString: replacement) else { return false }
+    guard
+      let edit = MarkdownFormatter.formatSelection(
+        in: textStorage.string,
+        range: range,
+        as: format)
+    else { return false }
+    guard textView.shouldChangeText(in: edit.range, replacementString: edit.replacement) else {
+      return false
+    }
 
-    textStorage.replaceCharacters(in: range, with: replacement)
+    textStorage.replaceCharacters(in: edit.range, with: edit.replacement)
     textContentStorage.refreshHighlighting()
-    textView.setSelectedRange(
-      NSRange(location: range.location, length: (replacement as NSString).length))
+    textView.setSelectedRange(edit.selectedRange)
     textView.didChangeText()
     textView.hideFormattingPopover()
     return true

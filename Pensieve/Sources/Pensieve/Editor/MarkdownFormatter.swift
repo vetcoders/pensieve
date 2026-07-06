@@ -65,7 +65,24 @@ struct MarkdownAutoconversion: Equatable {
   let selectedRange: NSRange
 }
 
+struct MarkdownFormatEdit: Equatable {
+  let range: NSRange
+  let replacement: String
+  let selectedRange: NSRange
+}
+
 enum MarkdownFormatter {
+  private struct WrappingDelimiters {
+    let opening: String
+    let closing: String
+    let usesStandaloneAsterisk: Bool
+  }
+
+  private struct WrappingSpan {
+    let fullRange: NSRange
+    let contentRange: NSRange
+  }
+
   private enum AutoconversionPatterns {
     static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX]\]\s*(.*)$"#)
     static let unorderedList = compile(#"^(\s*)([-*+])\s+(.*)$"#)
@@ -96,6 +113,36 @@ enum MarkdownFormatter {
     case .numberedList:
       return prefixLines(in: text, with: "1. ")
     }
+  }
+
+  static func formatSelection(
+    in text: String,
+    range: NSRange,
+    as format: MarkdownFormat
+  ) -> MarkdownFormatEdit? {
+    let nsText = text as NSString
+    guard range.length > 0, range.location >= 0, NSMaxRange(range) <= nsText.length else {
+      return nil
+    }
+
+    if let delimiters = wrappingDelimiters(for: format) {
+      let spans = wrappingSpans(in: nsText, delimiters: delimiters)
+      if let edit = unwrappingEdit(in: nsText, range: range, spans: spans) {
+        return edit
+      }
+
+      if spans.contains(where: { rangesIntersect(range, $0.fullRange) }) {
+        return nil
+      }
+    }
+
+    let selectedText = nsText.substring(with: range)
+    let replacement = Self.format(selectedText, as: format)
+    return MarkdownFormatEdit(
+      range: range,
+      replacement: replacement,
+      selectedRange: NSRange(location: range.location, length: (replacement as NSString).length)
+    )
   }
 
   static func autoconversion(
@@ -264,5 +311,115 @@ enum MarkdownFormatter {
       replacement: replacement,
       selectedRange: NSRange(location: selectedLocation, length: 0)
     )
+  }
+
+  private static func wrappingDelimiters(for format: MarkdownFormat) -> WrappingDelimiters? {
+    switch format {
+    case .bold:
+      return WrappingDelimiters(opening: "**", closing: "**", usesStandaloneAsterisk: false)
+    case .italic:
+      return WrappingDelimiters(opening: "*", closing: "*", usesStandaloneAsterisk: true)
+    case .strike:
+      return WrappingDelimiters(opening: "~~", closing: "~~", usesStandaloneAsterisk: false)
+    case .code:
+      return WrappingDelimiters(opening: "```\n", closing: "\n```", usesStandaloneAsterisk: false)
+    case .link, .quote, .bulletedList, .numberedList:
+      return nil
+    }
+  }
+
+  private static func wrappingSpans(
+    in text: NSString,
+    delimiters: WrappingDelimiters
+  ) -> [WrappingSpan] {
+    var spans: [WrappingSpan] = []
+    var searchLocation = 0
+
+    while searchLocation < text.length {
+      let openSearchRange = NSRange(location: searchLocation, length: text.length - searchLocation)
+      let openRange = text.range(of: delimiters.opening, options: [], range: openSearchRange)
+      guard openRange.location != NSNotFound else { break }
+
+      guard delimiterIsValid(openRange, in: text, delimiters: delimiters) else {
+        searchLocation = openRange.location + 1
+        continue
+      }
+
+      var closeSearchLocation = NSMaxRange(openRange)
+      var closeRange: NSRange?
+      while closeSearchLocation < text.length {
+        let closeSearchRange = NSRange(
+          location: closeSearchLocation,
+          length: text.length - closeSearchLocation)
+        let candidate = text.range(of: delimiters.closing, options: [], range: closeSearchRange)
+        guard candidate.location != NSNotFound else { break }
+
+        if delimiterIsValid(candidate, in: text, delimiters: delimiters) {
+          closeRange = candidate
+          break
+        }
+        closeSearchLocation = candidate.location + 1
+      }
+
+      guard let closeRange else { break }
+
+      let contentRange = NSRange(
+        location: NSMaxRange(openRange),
+        length: closeRange.location - NSMaxRange(openRange))
+      let fullRange = NSRange(
+        location: openRange.location,
+        length: NSMaxRange(closeRange) - openRange.location)
+      spans.append(WrappingSpan(fullRange: fullRange, contentRange: contentRange))
+      searchLocation = NSMaxRange(closeRange)
+    }
+
+    return spans
+  }
+
+  private static func delimiterIsValid(
+    _ range: NSRange,
+    in text: NSString,
+    delimiters: WrappingDelimiters
+  ) -> Bool {
+    guard delimiters.usesStandaloneAsterisk else { return true }
+
+    let before =
+      range.location > 0
+      ? text.substring(with: NSRange(location: range.location - 1, length: 1))
+      : ""
+    let afterLocation = NSMaxRange(range)
+    let after =
+      afterLocation < text.length
+      ? text.substring(with: NSRange(location: afterLocation, length: 1))
+      : ""
+    return before != "*" && after != "*"
+  }
+
+  private static func unwrappingEdit(
+    in text: NSString,
+    range: NSRange,
+    spans: [WrappingSpan]
+  ) -> MarkdownFormatEdit? {
+    guard
+      let span = spans.first(where: { span in
+        range == span.fullRange
+          || (range.location >= span.contentRange.location
+            && NSMaxRange(range) <= NSMaxRange(span.contentRange))
+      })
+    else {
+      return nil
+    }
+
+    let replacement = text.substring(with: span.contentRange)
+    return MarkdownFormatEdit(
+      range: span.fullRange,
+      replacement: replacement,
+      selectedRange: NSRange(
+        location: span.fullRange.location, length: (replacement as NSString).length)
+    )
+  }
+
+  private static func rangesIntersect(_ lhs: NSRange, _ rhs: NSRange) -> Bool {
+    NSIntersectionRange(lhs, rhs).length > 0
   }
 }
