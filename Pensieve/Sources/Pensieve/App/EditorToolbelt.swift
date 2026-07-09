@@ -3,11 +3,16 @@ import SwiftUI
 
 /// Window toolbar contents for the main editor scene.
 ///
-/// Titlebar contract (Cut 7-8): keep SwiftUI's native sidebar toggle first,
-/// leave `.navigation` empty so the document title leads, then mount share and
-/// dispatch as their own native island before the principal edit row.
-/// Modes, preview appearance, reload, and overflow live on the
-/// trailing side.
+/// Titlebar contract: keep SwiftUI's native sidebar toggle first, leave
+/// `.navigation` empty so the document title leads, then TITLE →
+/// SHARE/DISPATCH → EDIT → MODES/THEMES. Declaration order is the ONLY
+/// layout truth: every group uses the default placement, so the system
+/// renders them left-to-right exactly as declared. `.principal` (a centre
+/// anchor) and per-group `.automatic` heuristics are deliberately absent —
+/// mixing them let the system reorder islands per window width (cut 7-14
+/// regression on the operator's window). Island separation comes from native
+/// `ToolbarSpacer`s on macOS 26; a flexible spacer pushes the trailing
+/// cluster to the window edge.
 /// Everything else (transcription tafla, scroll sync, auto reload) lives in a
 /// single overflow menu. Raw format buttons stay inline whenever the buffer is
 /// editable, matching the floating selection bar and the Format app menu without
@@ -54,16 +59,24 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   var body: some ToolbarContent {
-    ToolbarItemGroup(placement: .automatic) {
+    ToolbarItemGroup {
       shareButton
       dispatchButton
     }
 
     if showsEditToolbelt {
-      ToolbarItemGroup(placement: .principal) {
+      if #available(macOS 26.0, *) {
+        ToolbarSpacer(.fixed)
+      }
+
+      ToolbarItemGroup {
         richMarkdownToggle
         formatButtons
       }
+    }
+
+    if #available(macOS 26.0, *) {
+      ToolbarSpacer(.flexible)
     }
 
     ToolbarItemGroup {
