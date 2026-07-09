@@ -4,9 +4,9 @@ import SwiftUI
 /// Window toolbar contents for the main editor scene.
 ///
 /// Titlebar contract (Cut 7-8): keep SwiftUI's native sidebar toggle first,
-/// leave `.navigation` empty so the document title leads, then start the
-/// principal strip with share and dispatch as their own native group before the
-/// edit row. Modes, preview appearance, reload, and overflow live on the
+/// leave `.navigation` empty so the document title leads, then mount share and
+/// dispatch as their own native island before the principal edit row.
+/// Modes, preview appearance, reload, and overflow live on the
 /// trailing side.
 /// Everything else (transcription tafla, scroll sync, auto reload) lives in a
 /// single overflow menu. Raw format buttons stay inline whenever the buffer is
@@ -33,7 +33,12 @@ struct EditorToolbelt: ToolbarContent {
   static let reloadIdentifier = "pensieve.toolbar.reload"
   static let overflowIdentifier = "pensieve.toolbar.overflow"
   static let richMarkdownToggleIdentifier = "pensieve.toolbar.richMarkdownToggle"
-  static let shareEditIslandGap: CGFloat = 68
+
+  enum ToolbarIslandIdentifier: String, Equatable {
+    case shareDispatch
+    case edit
+    case trailing
+  }
 
   /// The edit menu and editor-facing controls light up for ANY editable buffer —
   /// untitled scratch notes included — not only file-backed documents. Gating them on
@@ -49,18 +54,12 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   var body: some ToolbarContent {
-    ToolbarItemGroup(placement: .principal) {
+    ToolbarItemGroup(placement: .automatic) {
       shareButton
       dispatchButton
     }
 
     if showsEditToolbelt {
-      ToolbarItem(placement: .principal) {
-        Color.clear
-          .frame(width: Self.shareEditIslandGap)
-          .accessibilityHidden(true)
-      }
-
       ToolbarItemGroup(placement: .principal) {
         richMarkdownToggle
         formatButtons
@@ -121,6 +120,20 @@ struct EditorToolbelt: ToolbarContent {
     identifiers.append(reloadIdentifier)
     identifiers.append(overflowIdentifier)
     return identifiers
+  }
+
+  static func visibleToolbarIslandOrder(
+    for mode: EditorMode,
+    hasEditableBuffer: Bool
+  ) -> [ToolbarIslandIdentifier] {
+    var islands: [ToolbarIslandIdentifier] = [.shareDispatch]
+
+    if showsEditToolbelt(for: mode, hasEditableBuffer: hasEditableBuffer) {
+      islands.append(.edit)
+    }
+
+    islands.append(.trailing)
+    return islands
   }
 
   // MARK: - Subgroups

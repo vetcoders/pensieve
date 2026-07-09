@@ -121,8 +121,14 @@ final class EditorToolbeltTests: XCTestCase {
       expectedOrder)
   }
 
-  func testShareDispatchIslandGapStaysVisiblySeparateFromEditRow() {
-    XCTAssertEqual(EditorToolbelt.shareEditIslandGap, 68)
+  func testTitlebarIslandsKeepShareDispatchSeparateFromPrincipalEditRow() {
+    XCTAssertEqual(
+      EditorToolbelt.visibleToolbarIslandOrder(for: .split, hasEditableBuffer: true),
+      [.shareDispatch, .edit, .trailing])
+
+    XCTAssertEqual(
+      EditorToolbelt.visibleToolbarIslandOrder(for: .source, hasEditableBuffer: false),
+      [.shareDispatch, .trailing])
   }
 
   func testTitlebarOrderKeepsModesTrailingWhenEditRowIsUnavailable() {
