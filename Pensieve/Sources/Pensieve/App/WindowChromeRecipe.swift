@@ -59,6 +59,29 @@ enum WindowChromeRecipe {
     return cssColor
   }
 
+  /// Measured transmission profile of the editor's native scroll-edge effect
+  /// (cut 7-12b row probe: ~9% ghost transmission at the window edge, ~15%
+  /// mid-band, ~38% at 80%, ~55% just above the chrome seam). The preview's
+  /// veil band must mask to `alpha = 1 − transmission` at each row, and no
+  /// stop may be fully opaque — an opaque segment reads as a solid plate under
+  /// the toolbar buttons with the dissolve compressed into a stripe below.
+  /// This is the ONLY home of the profile: the veil CSS and its regression
+  /// pins both consume `titlebarGlassVeilMaskCSSGradient`.
+  static let titlebarGlassVeilMaskStops: [(alpha: Double, percent: Int)] = [
+    (alpha: 0.92, percent: 0),
+    (alpha: 0.86, percent: 45),
+    (alpha: 0.62, percent: 80),
+    (alpha: 0.42, percent: 100),
+  ]
+
+  static var titlebarGlassVeilMaskCSSGradient: String {
+    let stops =
+      titlebarGlassVeilMaskStops
+      .map { "rgba(0, 0, 0, \(String(format: "%.2f", $0.alpha))) \($0.percent)%" }
+      .joined(separator: ", ")
+    return "linear-gradient(to bottom, \(stops))"
+  }
+
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
     ceil(max(0, frameHeight - contentLayoutHeight))
   }

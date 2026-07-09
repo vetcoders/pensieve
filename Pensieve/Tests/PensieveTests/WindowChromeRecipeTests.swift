@@ -79,6 +79,40 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(WindowChromeRecipe.titlebarGlassBackingColor, .textBackgroundColor)
   }
 
+  // MARK: - Veil mask profile (single source of truth)
+
+  func testVeilMaskProfilePinsMeasuredTransmissionCurve() {
+    // The 7-12b row-probe values. Editing the profile is a conscious
+    // re-measurement, not a drive-by CSS tweak — this pin makes that explicit.
+    let stops = WindowChromeRecipe.titlebarGlassVeilMaskStops
+    XCTAssertEqual(stops.map(\.alpha), [0.92, 0.86, 0.62, 0.42])
+    XCTAssertEqual(stops.map(\.percent), [0, 45, 80, 100])
+  }
+
+  func testVeilMaskProfileNeverCarriesAnOpaqueStopAndOnlyDissolvesDownward() {
+    let stops = WindowChromeRecipe.titlebarGlassVeilMaskStops
+    XCTAssertFalse(stops.isEmpty)
+    for stop in stops {
+      XCTAssertLessThan(
+        stop.alpha, 1.0,
+        "an opaque stop reads as a solid plate under the toolbar (cut 7-12b)")
+      XCTAssertGreaterThan(stop.alpha, 0.0)
+    }
+    // The editor's scroll-edge dissolve only ever increases transmission
+    // toward the chrome seam; the veil must never re-thicken mid-band.
+    XCTAssertEqual(stops.map(\.alpha), stops.map(\.alpha).sorted(by: >))
+    XCTAssertEqual(stops.map(\.percent), stops.map(\.percent).sorted())
+    XCTAssertEqual(stops.first?.percent, 0)
+    XCTAssertEqual(stops.last?.percent, 100)
+  }
+
+  func testVeilMaskCSSGradientRendersTheProfileVerbatim() {
+    XCTAssertEqual(
+      WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient,
+      "linear-gradient(to bottom, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.86) 45%, "
+        + "rgba(0, 0, 0, 0.62) 80%, rgba(0, 0, 0, 0.42) 100%)")
+  }
+
   @MainActor
   func testPreviewWebViewFeedsChromeTheRecipeBackingColor() {
     let view = PreviewWebView(frame: .zero)

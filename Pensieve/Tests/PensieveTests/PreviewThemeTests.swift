@@ -276,14 +276,15 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("height: var(--vc-preview-titlebar-glass-height)"))
     XCTAssertTrue(
       css.contains("background: var(--vc-preview-titlebar-glass-backing, transparent)"))
-    // The veil's mask must never carry a fully-opaque stop (`black`): the
-    // editor's scroll-edge effect transmits ghosts across the whole band, so
-    // an opaque segment reads as a solid plate under the toolbar buttons with
-    // the dissolve compressed into a stripe below them (cut 7-12b).
+    // The mask profile has exactly one owner — WindowChromeRecipe. The CSS
+    // must consume it verbatim (both prefixed and standard property), and it
+    // must never carry a fully-opaque stop: the editor's scroll-edge effect
+    // transmits ghosts across the whole band, so an opaque segment reads as a
+    // solid plate under the toolbar buttons (cut 7-12b).
     XCTAssertTrue(
-      css.contains(
-        "mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.92) 0%, "
-          + "rgba(0, 0, 0, 0.86) 45%, rgba(0, 0, 0, 0.62) 80%, rgba(0, 0, 0, 0.42) 100%)"))
+      css.contains("-webkit-mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient)"))
+    XCTAssertTrue(
+      css.contains("mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient)"))
     XCTAssertFalse(css.contains("mask-image: linear-gradient(to bottom, black"))
     // Core Animation refuses nested backdrop capture under the native titlebar
     // glass (measured in cut 7-12): a backdrop-filter here passes @supports,
