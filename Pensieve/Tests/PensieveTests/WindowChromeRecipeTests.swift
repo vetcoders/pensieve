@@ -163,6 +163,66 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(webView.obscuredContentInsets.right, 0)
   }
 
+  /// The regression path polarize L2 measured on the operator's window:
+  /// WebKit re-adopts the safe area as obscured insets on chrome geometry
+  /// changes that give the container NO layout pass (SwiftUI attaches the
+  /// toolbar after the preview joins the window, shrinking
+  /// `contentLayoutRect` silently). Enforcement must therefore ride the
+  /// glass controller's geometry channel, not just layout()/window moves —
+  /// otherwise the pocket doubles the page-start offset and hard-clips
+  /// scrolled content with WebKit's own fade instead of the veil's.
+  @MainActor
+  func testPreviewWebViewReZeroesViewportOnChromeGeometryEventsWithoutLayout() throws {
+    guard #available(macOS 26.0, *) else {
+      throw XCTSkip("obscured content insets exist from macOS 26")
+    }
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false
+    )
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Viewport Re-Adoption Probe")
+
+    let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+    window.contentView = view
+    view.layoutSubtreeIfNeeded()
+
+    let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+    // Simulate WebKit's silent re-adoption after attach — no container layout.
+    webView.obscuredContentInsets = NSEdgeInsets(top: 52, left: 0, bottom: 0, right: 0)
+    XCTAssertEqual(webView.obscuredContentInsets.top, 52)
+
+    // A chrome geometry event with no layout pass: the controller's window
+    // notification path (didResize) schedules apply() after ~30ms.
+    NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
+    let deadline = Date().addingTimeInterval(2)
+    while webView.obscuredContentInsets.top != 0, Date() < deadline {
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+    }
+    XCTAssertEqual(webView.obscuredContentInsets.top, 0)
+  }
+
+  /// The enforcer must run on EVERY apply — including unforced ones whose
+  /// script guard short-circuits (unchanged height/backing): the pocket can
+  /// re-adopt while the measured glass height stays identical.
+  @MainActor
+  func testGlassControllerRunsViewportEnforcerOnEveryGeometryApply() {
+    let controller = PreviewTitlebarGlassController()
+    var enforcements = 0
+    controller.viewportEnforcer = { enforcements += 1 }
+    controller.scriptEvaluator = { _ in }
+
+    controller.attach(to: nil)
+    XCTAssertEqual(enforcements, 1)
+    controller.navigationDidFinish()
+    XCTAssertEqual(enforcements, 2)
+    // Unchanged values: script application is skipped, enforcement is not.
+    controller.apply()
+    XCTAssertEqual(enforcements, 3)
+  }
+
   @MainActor
   func testGutterDrawingRectStopsAtChromeBoundary() {
     let window = NSWindow(

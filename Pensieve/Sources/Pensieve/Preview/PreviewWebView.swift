@@ -50,6 +50,11 @@ final class PreviewWebView: NSView {
     titlebarGlassController.scriptEvaluator = { [weak self] script in
       self?.webView.evaluateJavaScript(script, completionHandler: nil)
     }
+    // Viewport enforcement rides the controller's geometry channel: layout
+    // passes alone miss the re-adoption moments (see `viewportEnforcer`).
+    titlebarGlassController.viewportEnforcer = { [weak self] in
+      self?.enforceFullBleedViewport()
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -88,7 +93,10 @@ final class PreviewWebView: NSView {
   /// full chrome height below the editor's. WebKit re-applies the automatic
   /// value whenever the view lands in a window, so a single set at init is
   /// not enough; re-assert (guarded, so unchanged values never re-trigger
-  /// layout) on window moves and layout passes. The measured titlebar glass
+  /// layout) on window moves, layout passes, AND every chrome geometry event
+  /// the glass controller sees (`viewportEnforcer`) — the toolbar attaching
+  /// after window join shrinks `contentLayoutRect` with no layout pass here,
+  /// which is exactly when WebKit re-adopts. The measured titlebar glass
   /// height (CSS var in `appearanceCSS`) is then the only owner of the
   /// chrome offset.
   private func enforceFullBleedViewport() {
@@ -1177,6 +1185,17 @@ final class PreviewTitlebarGlassController: NSObject {
   var scriptEvaluator: ((String) -> Void)?
   var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
   var titlebarGlassBackingProvider: ((NSWindow?) -> String)?
+  /// Re-asserts the host view's full-bleed viewport (zeroed
+  /// `obscuredContentInsets`). WebKit re-adopts the safe area on chrome
+  /// geometry changes that never give the container a layout pass — the
+  /// toolbar attaching after the preview joins the window shrinks
+  /// `contentLayoutRect` silently — so viewport enforcement must ride the
+  /// same channel as the CSS variables: every geometry event that funnels
+  /// into `apply()` re-zeroes the pocket first. With the pocket alive the
+  /// page start doubles up (WebKit inset + CSS glass offset) and scrolled
+  /// content hard-clips at the pocket with WebKit's own fade instead of
+  /// ghosting through the veil (measured, polarize L2).
+  var viewportEnforcer: (() -> Void)?
   private weak var observedWindow: NSWindow?
   private var contentLayoutObservation: NSKeyValueObservation?
   private var pendingUpdate: DispatchWorkItem?
@@ -1255,6 +1274,7 @@ final class PreviewTitlebarGlassController: NSObject {
 
   @discardableResult
   func apply(force: Bool = false) -> CGFloat {
+    viewportEnforcer?()
     let height =
       titlebarGlassHeightProvider?(observedWindow)
       ?? Self.titlebarGlassHeight(for: observedWindow)
