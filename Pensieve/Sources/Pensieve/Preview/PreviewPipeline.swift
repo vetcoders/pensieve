@@ -4,6 +4,11 @@ import Foundation
 
 // MARK: - Pipeline value types
 
+enum PreviewRenderMode: Equatable {
+  case markdown
+  case plainText
+}
+
 /// One render request to the preview pipeline. Equatable on every input the
 /// pipeline observes so the scheduler can drop duplicates without re-rendering
 /// the markdown AST.
@@ -22,6 +27,32 @@ struct PreviewRenderRequest: Equatable {
   var skin: ThemeManager.PreviewTheme = .default
   let documentURL: URL?
   var refreshToken: Int = 0
+
+  var renderMode: PreviewRenderMode {
+    if Self.hasShebang(markdown) {
+      return .plainText
+    }
+    guard let documentURL else {
+      return .markdown
+    }
+    let ext = documentURL.pathExtension.lowercased()
+    guard !ext.isEmpty else {
+      return .plainText
+    }
+    return Self.markdownExtensions.contains(ext) ? .markdown : .plainText
+  }
+
+  private static let markdownExtensions: Set<String> = [
+    "md", "markdown", "mdown", "mdwn", "mkd", "mkdn",
+  ]
+
+  private static func hasShebang(_ text: String) -> Bool {
+    let start =
+      text.hasPrefix("\u{feff}")
+      ? text.dropFirst()
+      : text[...]
+    return start.hasPrefix("#!")
+  }
 }
 
 /// A fully composed HTML payload plus its base URL, ready to be loaded into a
@@ -237,18 +268,24 @@ final class PreviewPipeline {
   private static let cachedKatexCSS = PreviewResourceLocator.css(named: "katex.inline.min")
 
   func makeDocument(for request: PreviewRenderRequest) -> PreviewDocument {
-    let output = renderer.render(request.markdown)
+    let body: String
+    switch request.renderMode {
+    case .markdown:
+      body = renderer.render(request.markdown).body
+    case .plainText:
+      body = Self.plainTextBody(for: request.markdown)
+    }
     let css = themeManager.css(for: request.theme)
     let mermaidJavaScript =
-      output.body.contains("class=\"mermaid\"")
+      body.contains("class=\"mermaid\"")
       ? Self.cachedMermaidJavaScript
       : nil
     // Embed the KaTeX payload only when the rendered body actually contains math.
-    let containsMath = output.body.contains("data-vc-math=")
+    let containsMath = body.contains("data-vc-math=")
     let katexJavaScript = containsMath ? Self.cachedKatexJavaScript : nil
     let katexCSS = containsMath ? Self.cachedKatexCSS : nil
     return PreviewDocument.make(
-      body: output.body,
+      body: body,
       css: css,
       fontSize: request.fontSize,
       skin: request.skin,
@@ -259,6 +296,13 @@ final class PreviewPipeline {
       sourceURL: request.documentURL,
       refreshToken: request.refreshToken
     )
+  }
+
+  private static func plainTextBody(for text: String) -> String {
+    let escaped = HTMLEmitter.escapeText(text)
+    return """
+      <pre class="vc-plain-text" data-vc-block="0" style="font-size: var(--vc-font-size);"><code>\(escaped)</code></pre>
+      """
   }
 
   private func apply(_ request: PreviewRenderRequest) {
