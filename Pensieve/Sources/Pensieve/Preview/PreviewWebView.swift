@@ -313,8 +313,13 @@ final class PreviewWebView: NSView {
        veil instead: a fixed band owned by the measured glass-height variable,
        painted in the native glass backing colour (plumbed by the glass
        controller from WindowChromeRecipe so both sides of the split stay
-       pixel-identical), fading to transparent toward the band's bottom edge
-       so gliding content dissolves the way the editor's does. */
+       pixel-identical). The mask must not contain a fully-opaque stop: the
+       editor's scroll-edge effect transmits ghosts across the WHOLE band
+       (cut 7-12b row-probe: ~9% at the window edge, ~15% mid-band, ~38% at
+       80%, ~55% just above the chrome seam), so an opaque segment reads as a
+       solid plate under the toolbar buttons and compresses the dissolve into
+       a ghost stripe hanging below them. The stops below track that measured
+       transmission profile (alpha = 1 − transmission). */
     body::after {
       content: "";
       position: fixed;
@@ -325,8 +330,8 @@ final class PreviewWebView: NSView {
       pointer-events: none;
       z-index: 10;
       background: var(\(PreviewTitlebarGlassController.titlebarGlassBackingCSSVariable), transparent);
-      -webkit-mask-image: linear-gradient(to bottom, black 50%, rgba(0, 0, 0, 0.35) 100%);
-      mask-image: linear-gradient(to bottom, black 50%, rgba(0, 0, 0, 0.35) 100%);
+      -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.86) 45%, rgba(0, 0, 0, 0.62) 80%, rgba(0, 0, 0, 0.42) 100%);
+      mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.86) 45%, rgba(0, 0, 0, 0.62) 80%, rgba(0, 0, 0, 0.42) 100%);
     }
 
     .markdown-body {
