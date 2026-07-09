@@ -26,6 +26,15 @@ class LineNumberGutter: NSRulerView {
   // (NSClipView.copiesOnScroll is a no-op since macOS 11, so it cannot help here.)
   override var wantsDefaultClipping: Bool { false }
 
+  /// Where the gutter is allowed to paint: its bounds minus any window chrome
+  /// overlapping them. With a full-size content view the ruler's bounds run
+  /// under the translucent titlebar/toolbelt, so an unclipped background fill
+  /// and separator stroke show through the glass and cut across the window
+  /// title. Same boundary truth as the editor's floating accessories.
+  func chromeClippedDrawingRect() -> NSRect {
+    WindowChromeRecipe.chromeClippedVisibleRect(for: self, fallback: bounds)
+  }
+
   override func drawHashMarksAndLabels(in rect: NSRect) {
     guard let textView = clientView as? NSTextView,
       let layoutManager = textLayoutManager,
@@ -33,6 +42,16 @@ class LineNumberGutter: NSRulerView {
     else { return }
 
     let bounds = self.bounds
+
+    // Clip ≠ skipped repaint: the anti-ghosting contract above (full-bounds
+    // repaint on every pass) still holds inside this region; the chrome strip
+    // itself simply never receives gutter pixels.
+    let allowed = chromeClippedDrawingRect()
+    guard !allowed.isEmpty else { return }
+    NSGraphicsContext.current?.saveGraphicsState()
+    defer { NSGraphicsContext.current?.restoreGraphicsState() }
+    NSBezierPath(rect: allowed).setClip()
+
     NSColor.windowBackgroundColor.setFill()
     bounds.fill()
 

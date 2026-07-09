@@ -164,9 +164,13 @@ final class PreviewThemeTests: XCTestCase {
   func testAppearanceCSSPinsPreviewTopContentInsetToWindowChromeRecipe() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
 
+    // The top inset rides on the measured glass height: the viewport is
+    // full-bleed (obscured content insets zeroed), so the CSS var is the only
+    // owner of the chrome offset — a bare pixel inset would park the first
+    // line under the toolbelt.
     XCTAssertTrue(
       css.contains(
-        "padding: \(Int(WindowChromeRecipe.previewContentTopInset))px clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important"
+        "padding: calc(var(--vc-preview-titlebar-glass-height) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important"
       ))
     XCTAssertTrue(css.contains(".markdown-body > :first-child"))
     XCTAssertTrue(css.contains("margin-top: 0 !important"))
@@ -219,6 +223,49 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertGreaterThan(scripts.count, afterAttachCount)
     XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-height'") == true)
     XCTAssertTrue(scripts.last?.contains("'0px'") == true)
+  }
+
+  @MainActor
+  func testPreviewTitlebarGlassControllerFollowsContentLayoutChanges() throws {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false
+    )
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Glass KVO Probe")
+
+    let controller = PreviewTitlebarGlassController()
+    var scripts: [String] = []
+    controller.scriptEvaluator = { scripts.append($0) }
+    controller.attach(to: window)
+    let scriptsAfterAttach = scripts.count
+    let heightBefore = WindowChromeRecipe.titlebarGlassHeight(for: window)
+
+    // SwiftUI attaches the toolbar AFTER the preview joins the window. That
+    // shrinks contentLayoutRect without firing any resize notification and
+    // without resizing the full-bleed web view (no layout pass either), so
+    // the controller must re-measure on its own or it keeps the glass height
+    // it saw mid-construction.
+    window.toolbar = NSToolbar(identifier: "pensieve.tests.glassKVOProbe")
+    let heightAfter = WindowChromeRecipe.titlebarGlassHeight(for: window)
+    guard heightAfter != heightBefore else {
+      throw XCTSkip("headless window did not change contentLayoutRect on toolbar attach")
+    }
+
+    // The controller coalesces updates (~0.03 s); pump the run loop until the
+    // re-measured script lands.
+    let deadline = Date().addingTimeInterval(2.0)
+    while scripts.count == scriptsAfterAttach && Date() < deadline {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+
+    XCTAssertGreaterThan(scripts.count, scriptsAfterAttach)
+    XCTAssertTrue(
+      scripts.last?.contains("'\(Int(heightAfter))px'") == true,
+      "controller should re-apply the freshly measured glass height, got: \(scripts.last ?? "none")"
+    )
   }
 
   func testPreviewTitlebarGlassControllerTracksChromeChangeNotifications() {

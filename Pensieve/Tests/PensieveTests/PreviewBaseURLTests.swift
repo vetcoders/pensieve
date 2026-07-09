@@ -43,7 +43,10 @@ final class PreviewBaseURLTests: XCTestCase {
 
     // Top padding is chrome-recipe pinned; horizontal/bottom padding stays
     // fluid so narrow windows do not bleed content under the side gutters.
-    XCTAssertTrue(css.contains("padding: \(Int(WindowChromeRecipe.previewContentTopInset))px"))
+    XCTAssertTrue(
+      css.contains(
+        "padding: calc(var(--vc-preview-titlebar-glass-height) + \(Int(WindowChromeRecipe.previewContentTopInset))px)"
+      ))
     XCTAssertTrue(css.contains("clamp(12px, 3vw, 28px)"))
     XCTAssertTrue(css.contains("margin: 0 !important"))
 

@@ -33,6 +33,7 @@ final class PreviewWebView: NSView {
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
 
+    enforceFullBleedViewport()
     addSubview(webView)
     webView.translatesAutoresizingMaskIntoConstraints = false
     NSLayoutConstraint.activate([
@@ -61,12 +62,34 @@ final class PreviewWebView: NSView {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    enforceFullBleedViewport()
     titlebarGlassController.attach(to: window)
   }
 
   override func layout() {
     super.layout()
+    enforceFullBleedViewport()
     titlebarGlassController.layoutDidChange()
+  }
+
+  /// macOS 26 auto-adopts the view's safe area as obscured content insets:
+  /// the layout viewport starts at the chrome's bottom edge, so scrolled
+  /// content hard-clips mid-glyph at the toolbelt instead of gliding under
+  /// the glass the way the editor's text view does — and the CSS glass-height
+  /// offset would double up on the WebKit pocket, parking the page start a
+  /// full chrome height below the editor's. WebKit re-applies the automatic
+  /// value whenever the view lands in a window, so a single set at init is
+  /// not enough; re-assert (guarded, so unchanged values never re-trigger
+  /// layout) on window moves and layout passes. The measured titlebar glass
+  /// height (CSS var in `appearanceCSS`) is then the only owner of the
+  /// chrome offset.
+  private func enforceFullBleedViewport() {
+    if #available(macOS 26.0, *) {
+      let insets = webView.obscuredContentInsets
+      if insets.top != 0 || insets.left != 0 || insets.bottom != 0 || insets.right != 0 {
+        webView.obscuredContentInsets = NSEdgeInsets()
+      }
+    }
   }
 
   // MARK: - Public
@@ -251,7 +274,7 @@ final class PreviewWebView: NSView {
     body {
       font-size: var(--vc-font-size);
       margin: 0 !important;
-      padding: \(Int(WindowChromeRecipe.previewContentTopInset))px clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
+      padding: calc(var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable)) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
       box-sizing: border-box;
       min-height: 100vh;
       overflow-wrap: anywhere;
@@ -1113,6 +1136,7 @@ final class PreviewTitlebarGlassController: NSObject {
   var scriptEvaluator: ((String) -> Void)?
   var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
   private weak var observedWindow: NSWindow?
+  private var contentLayoutObservation: NSKeyValueObservation?
   private var pendingUpdate: DispatchWorkItem?
   private var pendingUpdateNeedsForce = false
   private var lastAppliedHeight: CGFloat?
@@ -1145,6 +1169,8 @@ final class PreviewTitlebarGlassController: NSObject {
     pendingUpdate?.cancel()
     pendingUpdate = nil
     pendingUpdateNeedsForce = false
+    contentLayoutObservation?.invalidate()
+    contentLayoutObservation = nil
     if let observedWindow {
       for name in Self.windowChromeNotifications {
         NotificationCenter.default.removeObserver(self, name: name, object: observedWindow)
@@ -1205,6 +1231,18 @@ final class PreviewTitlebarGlassController: NSObject {
         selector: #selector(windowChromeGeometryDidChange(_:)),
         name: name,
         object: nextWindow)
+    }
+
+    // The resize/fullscreen notifications above never fire for the one chrome
+    // change every document window goes through: SwiftUI attaches the toolbar
+    // AFTER the preview joins the window, which shrinks `contentLayoutRect`
+    // without resizing the full-bleed web view (so no layout pass either).
+    // Without this observation the controller keeps the glass height it
+    // measured mid-construction — the stale value that both parked the page
+    // start a band below the editor's and painted the 7-9 underlay stripe.
+    contentLayoutObservation?.invalidate()
+    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) { [weak self] _, _ in
+      self?.scheduleUpdate()
     }
   }
 

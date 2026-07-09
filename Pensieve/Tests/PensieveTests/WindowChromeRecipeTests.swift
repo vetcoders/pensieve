@@ -97,4 +97,78 @@ final class WindowChromeRecipeTests: XCTestCase {
       XCTAssertEqual(applied.alphaComponent, expected.alphaComponent, accuracy: 0.001)
     }
   }
+
+  @MainActor
+  func testPreviewWebViewKeepsFullBleedViewportUnderChrome() throws {
+    guard #available(macOS 26.0, *) else {
+      throw XCTSkip("obscured content insets exist from macOS 26")
+    }
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false
+    )
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Viewport Probe")
+
+    let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+    window.contentView = view
+    view.layoutSubtreeIfNeeded()
+
+    let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+    // macOS 26 otherwise auto-adopts the safe area as obscured insets — and
+    // RE-applies them when the view lands in a window — which hard-clips
+    // scrolled preview content at the chrome edge while the editor pane
+    // glides under the glass, and doubles the CSS glass-height offset. The
+    // window attach above is the part that regressed silently with an
+    // init-only reset.
+    XCTAssertEqual(webView.obscuredContentInsets.top, 0)
+    XCTAssertEqual(webView.obscuredContentInsets.left, 0)
+    XCTAssertEqual(webView.obscuredContentInsets.bottom, 0)
+    XCTAssertEqual(webView.obscuredContentInsets.right, 0)
+  }
+
+  @MainActor
+  func testGutterDrawingRectStopsAtChromeBoundary() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false
+    )
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Gutter Chrome Probe")
+
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+    let textView = NSTextView(frame: scrollView.bounds)
+    scrollView.documentView = textView
+    window.contentView = scrollView
+
+    let layoutManager = NSTextLayoutManager()
+    let gutter = LineNumberGutter(scrollView: scrollView, textLayoutManager: layoutManager)
+    scrollView.verticalRulerView = gutter
+    scrollView.hasVerticalRuler = true
+    scrollView.rulersVisible = true
+    scrollView.tile()
+
+    // The ruler spans the full-size content view, i.e. it runs under the
+    // titlebar; its allowed drawing region must not.
+    XCTAssertFalse(gutter.bounds.isEmpty)
+    let allowed = gutter.chromeClippedDrawingRect()
+    XCTAssertFalse(allowed.isEmpty)
+    let allowedInWindow = gutter.convert(allowed, to: nil)
+    XCTAssertLessThanOrEqual(
+      allowedInWindow.maxY, window.contentLayoutRect.maxY + 0.5,
+      "gutter drawing must stop at the chrome boundary instead of crossing the title")
+
+    let glassHeight = WindowChromeRecipe.titlebarGlassHeight(for: window)
+    if glassHeight > 0 {
+      let boundsInWindow = gutter.convert(gutter.bounds, to: nil)
+      XCTAssertGreaterThan(
+        boundsInWindow.maxY, window.contentLayoutRect.maxY,
+        "probe premise: the ruler itself extends under the chrome")
+      XCTAssertLessThan(allowedInWindow.height, boundsInWindow.height)
+    }
+  }
 }
