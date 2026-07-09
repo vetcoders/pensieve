@@ -35,32 +35,25 @@ struct ContentView: View {
       EditorToolbelt(
         appState: appState,
         controller: controller,
-        themeManager: themeManager)
-      ToolbarItem {
-        Button {
+        themeManager: themeManager,
+        onDispatchToAgent: {
           showDispatch = true
-        } label: {
-          Label("Dispatch to Agent", systemImage: "paperplane")
-        }
-        .disabled(
+        },
+        isDispatchDisabled:
           !appState.documentHasEditableBuffer
-            || !SandboxCapabilities.allowsExternalAgentDispatch()
-        )
-        .help(
+          || !SandboxCapabilities.allowsExternalAgentDispatch(),
+        dispatchHelp:
           SandboxCapabilities.allowsExternalAgentDispatch()
-            ? "Dispatch to Agent"
-            : SandboxCapabilities.dispatchUnavailableExplanation
-        )
-        .accessibilityIdentifier("pensieve.toolbar.dispatchToAgent")
-        .sheet(isPresented: $showDispatch) {
-          DispatchPopover(
-            controller: controller,
-            isPresented: $showDispatch,
-            documentTitle: appState.documentTitle,
-            defaultRoot: dispatchRoot
-          )
-        }
-      }
+          ? "Dispatch to Agent"
+          : SandboxCapabilities.dispatchUnavailableExplanation)
+    }
+    .sheet(isPresented: $showDispatch) {
+      DispatchPopover(
+        controller: controller,
+        isPresented: $showDispatch,
+        documentTitle: appState.documentTitle,
+        defaultRoot: dispatchRoot
+      )
     }
   }
 }

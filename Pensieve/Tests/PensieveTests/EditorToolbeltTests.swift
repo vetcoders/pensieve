@@ -98,6 +98,51 @@ final class EditorToolbeltTests: XCTestCase {
       MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier),
       expectedToolbarIdentifiers)
   }
+
+  // MARK: - Titlebar order contract
+
+  func testTitlebarOrderKeepsShareDispatchBeforeEditThenModesAndThemes() {
+    let expectedOrder =
+      [
+        EditorToolbelt.shareIdentifier,
+        EditorToolbelt.dispatchIdentifier,
+      ]
+      + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
+      + [
+        EditorToolbelt.richMarkdownToggleIdentifier,
+        EditorToolbelt.modePickerIdentifier,
+        EditorToolbelt.appearanceIdentifier,
+        EditorToolbelt.reloadIdentifier,
+        EditorToolbelt.overflowIdentifier,
+      ]
+
+    XCTAssertEqual(
+      EditorToolbelt.visibleToolbarIdentifierOrder(for: .split, hasEditableBuffer: true),
+      expectedOrder)
+  }
+
+  func testTitlebarOrderKeepsModesTrailingWhenEditRowIsUnavailable() {
+    XCTAssertEqual(
+      EditorToolbelt.visibleToolbarIdentifierOrder(for: .preview, hasEditableBuffer: true),
+      [
+        EditorToolbelt.shareIdentifier,
+        EditorToolbelt.dispatchIdentifier,
+        EditorToolbelt.modePickerIdentifier,
+        EditorToolbelt.appearanceIdentifier,
+        EditorToolbelt.reloadIdentifier,
+        EditorToolbelt.overflowIdentifier,
+      ])
+
+    XCTAssertEqual(
+      EditorToolbelt.visibleToolbarIdentifierOrder(for: .source, hasEditableBuffer: false),
+      [
+        EditorToolbelt.shareIdentifier,
+        EditorToolbelt.dispatchIdentifier,
+        EditorToolbelt.modePickerIdentifier,
+        EditorToolbelt.reloadIdentifier,
+        EditorToolbelt.overflowIdentifier,
+      ])
+  }
 }
 
 /// Regression at the floating-format-bar positioning seam (operator evidence

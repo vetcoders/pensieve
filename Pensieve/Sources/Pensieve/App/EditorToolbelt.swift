@@ -3,14 +3,14 @@ import SwiftUI
 
 /// Window toolbar contents for the main editor scene.
 ///
-/// Declutter contract (Cut 5-1R): the titlebar carries the navigation cluster
-/// (mode picker), one always-visible edit toolbelt in the principal slot, and a
-/// reduced trailing side of daily drivers - share, preview appearance, reload
-/// (plus the dispatch item mounted by `ContentView`). Everything else
-/// (transcription tafla, scroll sync, auto reload) lives in a single overflow
-/// menu. Raw format buttons stay inline whenever the buffer is editable,
-/// matching the floating selection bar and the Format app menu without adding
-/// formatter logic.
+/// Titlebar contract (Cut 7-8): keep SwiftUI's native sidebar toggle first,
+/// leave `.navigation` empty so the document title leads, then start the
+/// principal strip with share and dispatch before the edit row. Modes, preview
+/// appearance, reload, and overflow live on the trailing side.
+/// Everything else (transcription tafla, scroll sync, auto reload) lives in a
+/// single overflow menu. Raw format buttons stay inline whenever the buffer is
+/// editable, matching the floating selection bar and the Format app menu without
+/// adding formatter logic.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -21,6 +21,17 @@ struct EditorToolbelt: ToolbarContent {
   var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
+  let onDispatchToAgent: () -> Void
+  let isDispatchDisabled: Bool
+  let dispatchHelp: String
+
+  static let shareIdentifier = "pensieve.toolbar.share"
+  static let dispatchIdentifier = "pensieve.toolbar.dispatchToAgent"
+  static let modePickerIdentifier = "pensieve.toolbar.modePicker"
+  static let appearanceIdentifier = "pensieve.toolbar.appearance"
+  static let reloadIdentifier = "pensieve.toolbar.reload"
+  static let overflowIdentifier = "pensieve.toolbar.overflow"
+  static let richMarkdownToggleIdentifier = "pensieve.toolbar.richMarkdownToggle"
 
   /// The edit menu and editor-facing controls light up for ANY editable buffer —
   /// untitled scratch notes included — not only file-backed documents. Gating them on
@@ -36,25 +47,18 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   var body: some ToolbarContent {
-    ToolbarItemGroup(placement: .navigation) {
-      modePicker
-    }
-
     ToolbarItemGroup(placement: .principal) {
+      shareButton
+      dispatchButton
+
       if showsEditToolbelt {
         formatButtons
         richMarkdownToggle
       }
     }
 
-    ToolbarItemGroup(placement: .primaryAction) {
-      Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
-        Image(systemName: "square.and.arrow.up")
-      }
-      .help("Share")
-      .disabled(!hasEditableBuffer)
-      .accessibilityLabel("Share Document")
-      .accessibilityIdentifier("pensieve.toolbar.share")
+    ToolbarItemGroup {
+      modePicker
 
       if Self.showsAppearanceControls(for: appState.mode) {
         AppearanceToolbarButton(themeManager: themeManager)
@@ -66,7 +70,7 @@ struct EditorToolbelt: ToolbarContent {
       .help("Reload Preview")
       .disabled(!hasEditableBuffer)
       .accessibilityLabel("Reload Preview")
-      .accessibilityIdentifier("pensieve.toolbar.reload")
+      .accessibilityIdentifier(Self.reloadIdentifier)
 
       overflowMenu
     }
@@ -84,7 +88,51 @@ struct EditorToolbelt: ToolbarContent {
     hasEditableBuffer && mode != .preview
   }
 
+  static func visibleToolbarIdentifierOrder(
+    for mode: EditorMode,
+    hasEditableBuffer: Bool
+  ) -> [String] {
+    var identifiers = [
+      shareIdentifier,
+      dispatchIdentifier,
+    ]
+
+    if showsEditToolbelt(for: mode, hasEditableBuffer: hasEditableBuffer) {
+      identifiers.append(contentsOf: MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier))
+      identifiers.append(richMarkdownToggleIdentifier)
+    }
+
+    identifiers.append(modePickerIdentifier)
+
+    if showsAppearanceControls(for: mode) {
+      identifiers.append(appearanceIdentifier)
+    }
+
+    identifiers.append(reloadIdentifier)
+    identifiers.append(overflowIdentifier)
+    return identifiers
+  }
+
   // MARK: - Subgroups
+
+  private var shareButton: some View {
+    Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
+      Image(systemName: "square.and.arrow.up")
+    }
+    .help("Share")
+    .disabled(!hasEditableBuffer)
+    .accessibilityLabel("Share Document")
+    .accessibilityIdentifier(Self.shareIdentifier)
+  }
+
+  private var dispatchButton: some View {
+    Button(action: onDispatchToAgent) {
+      Label("Dispatch to Agent", systemImage: "paperplane")
+    }
+    .disabled(isDispatchDisabled)
+    .help(dispatchHelp)
+    .accessibilityIdentifier(Self.dispatchIdentifier)
+  }
 
   private var modePicker: some View {
     Picker(
@@ -103,7 +151,7 @@ struct EditorToolbelt: ToolbarContent {
     .pickerStyle(.segmented)
     .help("Editor layout")
     .frame(minWidth: 140)
-    .accessibilityIdentifier("pensieve.toolbar.modePicker")
+    .accessibilityIdentifier(Self.modePickerIdentifier)
   }
 
   /// The format action row is not a second source of truth: it iterates
@@ -139,7 +187,7 @@ struct EditorToolbelt: ToolbarContent {
     .help("Rich Markdown (⌘/)")
     .accessibilityLabel("Rich Markdown")
     .accessibilityValue(appState.richMarkdownEnabled ? "On" : "Off")
-    .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
+    .accessibilityIdentifier(Self.richMarkdownToggleIdentifier)
   }
 
   /// Single overflow for the non-daily controls the trailing side used to
@@ -185,7 +233,7 @@ struct EditorToolbelt: ToolbarContent {
     }
     .help("More — transcription tafla, scroll sync, auto reload")
     .accessibilityLabel("More Controls")
-    .accessibilityIdentifier("pensieve.toolbar.overflow")
+    .accessibilityIdentifier(Self.overflowIdentifier)
   }
 }
 
@@ -203,7 +251,7 @@ private struct AppearanceToolbarButton: View {
     }
     .help("Preview appearance — markdown flavor and reading theme")
     .accessibilityLabel("Preview Appearance")
-    .accessibilityIdentifier("pensieve.toolbar.appearance")
+    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
     .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
       AppearancePopoverContent(themeManager: themeManager)
     }
