@@ -49,24 +49,38 @@ final class EditorToolbeltTests: XCTestCase {
     }
   }
 
-  // MARK: - Aa Edit menu ↔ floating bar shared contract
+  // MARK: - Aa inline toolbelt ↔ floating bar shared contract
 
   func testEditActionListIsTheSharedAllCasesOrder() {
-    // The Aa toolbar menu, the floating selection bar, and the editor context
-    // menu ALL iterate `MarkdownFormat.allCases` — this pins the shared order
-    // so a reorder (or a fork into a second array) shows up as a test edit.
+    // The Aa inline toolbar, floating selection bar, and editor context menu
+    // ALL iterate `MarkdownFormat.allCases` — this pins the shared order so a
+    // reorder (or a fork into a second array) shows up as a test edit.
     XCTAssertEqual(
       MarkdownFormat.allCases,
       [.bold, .strike, .italic, .quote, .code, .link, .bulletedList, .numberedList])
   }
 
-  func testEveryEditActionRendersInMenus() {
-    // Menu rows need a title and a symbol; empty metadata would render a
-    // blank row in the Aa menu without failing the build.
+  func testEveryEditActionRendersInInlineToolbelt() {
+    let expectedToolbarIdentifiers = [
+      "pensieve.toolbar.format.bold",
+      "pensieve.toolbar.format.strike",
+      "pensieve.toolbar.format.italic",
+      "pensieve.toolbar.format.quote",
+      "pensieve.toolbar.format.code",
+      "pensieve.toolbar.format.link",
+      "pensieve.toolbar.format.bulletedList",
+      "pensieve.toolbar.format.numberedList",
+    ]
+
+    // Inline buttons need a label, a symbol, and stable accessibility ids;
+    // empty metadata would render a blank Aa row without failing the build.
     for format in MarkdownFormat.allCases {
       XCTAssertFalse(format.label.isEmpty)
       XCTAssertFalse(format.systemImageName.isEmpty)
     }
+    XCTAssertEqual(
+      MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier),
+      expectedToolbarIdentifiers)
   }
 }
 

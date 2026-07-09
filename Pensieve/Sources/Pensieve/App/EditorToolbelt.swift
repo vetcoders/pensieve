@@ -1,14 +1,15 @@
+import AppKit
 import SwiftUI
 
 /// Window toolbar contents for the main editor scene.
 ///
 /// Declutter contract (Cut 5-1R): the titlebar carries the navigation cluster
-/// (mode picker), one summary `Aa` Edit menu in the principal slot, and a
+/// (mode picker), one expandable `Aa` edit toolbelt in the principal slot, and a
 /// reduced trailing side of daily drivers — share, preview appearance, reload
 /// (plus the dispatch item mounted by `ContentView`). Everything else
 /// (transcription tafla, scroll sync, auto reload) lives in a single overflow
-/// menu. No raw format buttons sit in the bar; the edit actions surface via
-/// the `Aa` menu, the floating selection bar, and the Format app menu.
+/// menu. Raw format buttons stay behind the inline `Aa` expansion, matching the
+/// floating selection bar and the Format app menu without adding formatter logic.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -19,6 +20,7 @@ struct EditorToolbelt: ToolbarContent {
   var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
+  @Binding var isEditToolbeltExpanded: Bool
 
   private var hasDocument: Bool {
     appState.documentSession.document != nil
@@ -40,7 +42,7 @@ struct EditorToolbelt: ToolbarContent {
 
     ToolbarItemGroup(placement: .principal) {
       if hasEditableBuffer {
-        editMenu
+        editToolbelt
       }
     }
 
@@ -99,38 +101,105 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityIdentifier("pensieve.toolbar.modePicker")
   }
 
-  /// The ONE summary Edit menu behind the `Aa` glyph. Its action list is not a
-  /// second source of truth: it iterates `MarkdownFormat.allCases` in
-  /// declaration order — exactly the list the floating selection bar and the
-  /// editor context menu render — so the surfaces can never drift apart.
-  /// The rich-markdown toggle rides along at the bottom: it is an
-  /// editor-buffer property, formerly the misleading bare `Aa` button.
-  private var editMenu: some View {
-    Menu {
-      ForEach(MarkdownFormat.allCases) { format in
-        Button(action: { controller.applyMarkdownFormat(format) }) {
-          Label(format.label, systemImage: format.systemImageName)
+  /// The expandable `Aa` toolbelt. Its action list is not a second source of
+  /// truth: it iterates `MarkdownFormat.allCases` in declaration order, exactly
+  /// like the floating selection bar and editor context menu.
+  private var editToolbelt: some View {
+    HStack(spacing: 4) {
+      Button {
+        isEditToolbeltExpanded.toggle()
+      } label: {
+        Image(systemName: "textformat")
+          .frame(width: 24, height: 24)
+      }
+      .buttonStyle(.plain)
+      .background(toolbarButtonBackground(isSelected: isEditToolbeltExpanded))
+      .help("Edit actions")
+      .accessibilityLabel("Edit actions")
+      .accessibilityIdentifier("pensieve.toolbar.editMenu")
+
+      if isEditToolbeltExpanded {
+        Divider()
+          .frame(height: 22)
+
+        formatButtons
+
+        richMarkdownToggle
+      }
+    }
+    .padding(.horizontal, isEditToolbeltExpanded ? 6 : 0)
+    .padding(.vertical, 3)
+    .fixedSize(horizontal: true, vertical: false)
+    .id(isEditToolbeltExpanded ? "edit-toolbelt-expanded" : "edit-toolbelt-collapsed")
+    .background(
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(
+          isEditToolbeltExpanded
+            ? Color(NSColor.windowBackgroundColor).opacity(0.96)
+            : Color.clear
+        )
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .stroke(
+          isEditToolbeltExpanded ? Color.primary.opacity(0.08) : Color.clear,
+          lineWidth: 1
+        )
+    )
+    .background {
+      GeometryReader { _ in
+        ToolbeltDismissMonitor(isActive: isEditToolbeltExpanded) {
+          isEditToolbeltExpanded = false
         }
+      }
+    }
+    .accessibilityElement(children: .contain)
+  }
+
+  private var formatButtons: some View {
+    HStack(spacing: 2) {
+      ForEach(MarkdownFormat.allCases) { format in
+        Button {
+          controller.applyMarkdownFormat(format)
+        } label: {
+          Image(systemName: format.systemImageName)
+            .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.plain)
+        .background(toolbarButtonBackground(isSelected: false))
+        .help(format.label)
+        .accessibilityLabel(format.label)
         .accessibilityIdentifier(format.toolbarAccessibilityIdentifier)
       }
-
-      Divider()
-
-      Toggle(
-        isOn: Binding(
-          get: { appState.richMarkdownEnabled },
-          set: { _ in controller.toggleRichMarkdown() }
-        )
-      ) {
-        Label("Rich Markdown (⌘/)", systemImage: "textformat.alt")
-      }
-      .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
-    } label: {
-      Image(systemName: "textformat")
     }
-    .help("Edit — Markdown formatting for the selection, plus Rich Markdown")
-    .accessibilityLabel("Markdown Formatting")
-    .accessibilityIdentifier("pensieve.toolbar.editMenu")
+  }
+
+  private var richMarkdownToggle: some View {
+    Button {
+      controller.toggleRichMarkdown()
+    } label: {
+      Image(systemName: "textformat.alt")
+        .frame(width: 24, height: 24)
+    }
+    .buttonStyle(.plain)
+    .background(toolbarButtonBackground(isSelected: appState.richMarkdownEnabled))
+    .help("Rich Markdown (⌘/)")
+    .accessibilityLabel("Rich Markdown")
+    .accessibilityValue(appState.richMarkdownEnabled ? "On" : "Off")
+    .accessibilityIdentifier("pensieve.toolbar.richMarkdownToggle")
+  }
+
+  private func toolbarButtonBackground(isSelected: Bool) -> some View {
+    RoundedRectangle(cornerRadius: 6, style: .continuous)
+      .fill(
+        isSelected
+          ? Color.accentColor.opacity(0.18)
+          : Color(NSColor.controlBackgroundColor)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+          .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+      )
   }
 
   /// Single overflow for the non-daily controls the trailing side used to
@@ -177,6 +246,76 @@ struct EditorToolbelt: ToolbarContent {
     .help("More — transcription tafla, scroll sync, auto reload")
     .accessibilityLabel("More Controls")
     .accessibilityIdentifier("pensieve.toolbar.overflow")
+  }
+}
+
+private struct ToolbeltDismissMonitor: NSViewRepresentable {
+  let isActive: Bool
+  let onDismiss: () -> Void
+
+  func makeNSView(context: Context) -> NSView {
+    let view = NSView(frame: .zero)
+    context.coordinator.hostView = view
+    context.coordinator.onDismiss = onDismiss
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    context.coordinator.hostView = nsView
+    context.coordinator.onDismiss = onDismiss
+    context.coordinator.setActive(isActive)
+  }
+
+  static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+    coordinator.setActive(false)
+  }
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
+  final class Coordinator {
+    weak var hostView: NSView?
+    var onDismiss: () -> Void = {}
+    private var monitor: Any?
+
+    deinit {
+      setActive(false)
+    }
+
+    func setActive(_ isActive: Bool) {
+      if isActive {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(
+          matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+        ) { [weak self] event in
+          self?.handle(event) ?? event
+        }
+      } else if let monitor {
+        NSEvent.removeMonitor(monitor)
+        self.monitor = nil
+      }
+    }
+
+    private func handle(_ event: NSEvent) -> NSEvent? {
+      guard let hostView, hostView.window === event.window else {
+        return event
+      }
+
+      if event.type == .keyDown, event.keyCode == 53 {
+        onDismiss()
+        return nil
+      }
+
+      if event.type == .leftMouseDown || event.type == .rightMouseDown {
+        let point = hostView.convert(event.locationInWindow, from: nil)
+        if !hostView.bounds.contains(point) {
+          onDismiss()
+        }
+      }
+
+      return event
+    }
   }
 }
 
@@ -240,7 +379,7 @@ private struct AppearancePopoverContent: View {
 }
 
 extension MarkdownFormat {
-  fileprivate var toolbarAccessibilityIdentifier: String {
+  var toolbarAccessibilityIdentifier: String {
     switch self {
     case .bold: return "pensieve.toolbar.format.bold"
     case .italic: return "pensieve.toolbar.format.italic"

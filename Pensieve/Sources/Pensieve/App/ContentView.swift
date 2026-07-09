@@ -6,11 +6,20 @@ struct ContentView: View {
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @State private var showDispatch = false
+  @State private var isEditToolbeltExpanded = false
 
   private var dispatchRoot: URL {
     appState.folderURL
       ?? appState.documentURL?.deletingLastPathComponent()
       ?? FileManager.default.homeDirectoryForCurrentUser
+  }
+
+  private var editToolbeltBufferIdentity: String {
+    guard appState.documentHasEditableBuffer else { return "empty" }
+    if let url = appState.documentURL {
+      return url.standardizedFileURL.path
+    }
+    return "untitled:\(appState.documentTitle)"
   }
 
   var body: some View {
@@ -32,7 +41,11 @@ struct ContentView: View {
     )
     .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
     .toolbar {
-      EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
+      EditorToolbelt(
+        appState: appState,
+        controller: controller,
+        themeManager: themeManager,
+        isEditToolbeltExpanded: $isEditToolbeltExpanded)
       ToolbarItem {
         Button {
           showDispatch = true
@@ -58,6 +71,13 @@ struct ContentView: View {
           )
         }
       }
+    }
+    .onAppear {
+      isEditToolbeltExpanded = false
+    }
+    .onChange(of: editToolbeltBufferIdentity) { _, _ in
+      // Per-window chrome state: never force the expanded toolbar across documents.
+      isEditToolbeltExpanded = false
     }
   }
 }
