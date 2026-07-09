@@ -101,15 +101,15 @@ final class EditorToolbeltTests: XCTestCase {
 
   // MARK: - Titlebar order contract
 
-  func testTitlebarOrderKeepsShareDispatchBeforeEditThenModesAndThemes() {
+  func testTitlebarOrderSeparatesShareDispatchAndStartsEditRowWithRichMarkdownToggle() {
     let expectedOrder =
       [
         EditorToolbelt.shareIdentifier,
         EditorToolbelt.dispatchIdentifier,
+        EditorToolbelt.richMarkdownToggleIdentifier,
       ]
       + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
       + [
-        EditorToolbelt.richMarkdownToggleIdentifier,
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,

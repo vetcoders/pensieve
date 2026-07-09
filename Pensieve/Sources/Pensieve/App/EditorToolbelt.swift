@@ -5,8 +5,9 @@ import SwiftUI
 ///
 /// Titlebar contract (Cut 7-8): keep SwiftUI's native sidebar toggle first,
 /// leave `.navigation` empty so the document title leads, then start the
-/// principal strip with share and dispatch before the edit row. Modes, preview
-/// appearance, reload, and overflow live on the trailing side.
+/// principal strip with share and dispatch as their own native group before the
+/// edit row. Modes, preview appearance, reload, and overflow live on the
+/// trailing side.
 /// Everything else (transcription tafla, scroll sync, auto reload) lives in a
 /// single overflow menu. Raw format buttons stay inline whenever the buffer is
 /// editable, matching the floating selection bar and the Format app menu without
@@ -50,10 +51,18 @@ struct EditorToolbelt: ToolbarContent {
     ToolbarItemGroup(placement: .principal) {
       shareButton
       dispatchButton
+    }
 
-      if showsEditToolbelt {
-        formatButtons
+    if showsEditToolbelt {
+      ToolbarItem(placement: .principal) {
+        Color.clear
+          .frame(width: 10)
+          .accessibilityHidden(true)
+      }
+
+      ToolbarItemGroup(placement: .principal) {
         richMarkdownToggle
+        formatButtons
       }
     }
 
@@ -98,8 +107,8 @@ struct EditorToolbelt: ToolbarContent {
     ]
 
     if showsEditToolbelt(for: mode, hasEditableBuffer: hasEditableBuffer) {
-      identifiers.append(contentsOf: MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier))
       identifiers.append(richMarkdownToggleIdentifier)
+      identifiers.append(contentsOf: MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier))
     }
 
     identifiers.append(modePickerIdentifier)
