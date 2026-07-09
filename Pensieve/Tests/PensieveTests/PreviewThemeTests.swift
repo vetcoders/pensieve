@@ -268,6 +268,59 @@ final class PreviewThemeTests: XCTestCase {
     )
   }
 
+  func testAppearanceCSSPaintsGlassBandVeilOwnedByMeasuredVariables() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
+
+    XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-backing: transparent"))
+    XCTAssertTrue(css.contains("body::after"))
+    XCTAssertTrue(css.contains("height: var(--vc-preview-titlebar-glass-height)"))
+    XCTAssertTrue(
+      css.contains("background: var(--vc-preview-titlebar-glass-backing, transparent)"))
+    XCTAssertTrue(
+      css.contains("mask-image: linear-gradient(to bottom, black 50%, rgba(0, 0, 0, 0.35) 100%)"))
+    // Core Animation refuses nested backdrop capture under the native titlebar
+    // glass (measured in cut 7-12): a backdrop-filter here passes @supports,
+    // renders fine in a plain window, and silently drops the whole veil —
+    // mask included — in the real chrome. The veil must stay filter-free.
+    XCTAssertFalse(css.contains("backdrop-filter:"))
+  }
+
+  func testTitlebarGlassBackingScriptTargetsDocumentRootCSSVariable() {
+    let script = PreviewTitlebarGlassController.titlebarGlassBackingScript(
+      cssColor: "rgb(30, 30, 30)")
+
+    XCTAssertTrue(script.contains("document.documentElement.style.setProperty"))
+    XCTAssertTrue(script.contains("'--vc-preview-titlebar-glass-backing'"))
+    XCTAssertTrue(script.contains("'rgb(30, 30, 30)'"))
+  }
+
+  @MainActor
+  func testPreviewTitlebarGlassControllerPlumbsBackingColourWithHeight() {
+    let controller = PreviewTitlebarGlassController()
+
+    var scripts: [String] = []
+    controller.scriptEvaluator = { scripts.append($0) }
+    controller.titlebarGlassHeightProvider = { _ in 41 }
+    controller.titlebarGlassBackingProvider = { _ in "rgb(1, 2, 3)" }
+    controller.attach(to: nil)
+
+    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-height'") == true)
+    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-backing'") == true)
+    XCTAssertTrue(scripts.last?.contains("'rgb(1, 2, 3)'") == true)
+
+    // A dark/light flip changes only the backing colour — same glass height.
+    // The guard must not swallow that update.
+    let beforeFlip = scripts.count
+    controller.titlebarGlassBackingProvider = { _ in "rgb(4, 5, 6)" }
+    controller.appearanceDidChange()
+    let deadline = Date().addingTimeInterval(2.0)
+    while scripts.count == beforeFlip && Date() < deadline {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    XCTAssertGreaterThan(scripts.count, beforeFlip)
+    XCTAssertTrue(scripts.last?.contains("'rgb(4, 5, 6)'") == true)
+  }
+
   func testPreviewTitlebarGlassControllerTracksChromeChangeNotifications() {
     XCTAssertTrue(
       PreviewTitlebarGlassController.windowChromeNotifications.contains(

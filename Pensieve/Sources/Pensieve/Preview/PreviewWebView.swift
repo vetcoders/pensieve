@@ -66,6 +66,14 @@ final class PreviewWebView: NSView {
     titlebarGlassController.attach(to: window)
   }
 
+  // The veil band's backing colour resolves through the window's effective
+  // appearance; a dark/light flip changes the colour without any geometry
+  // notification, so re-plumb the CSS variables on appearance changes.
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    titlebarGlassController.appearanceDidChange()
+  }
+
   override func layout() {
     super.layout()
     enforceFullBleedViewport()
@@ -242,6 +250,7 @@ final class PreviewWebView: NSView {
       --vc-preview-math-bg: #f6f8fa;
       --vc-preview-page-background: transparent;
       \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
+      \(PreviewTitlebarGlassController.titlebarGlassBackingCSSVariable): transparent;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -290,6 +299,34 @@ final class PreviewWebView: NSView {
       left: 0;
       background: var(--vc-preview-page-background);
       pointer-events: none;
+    }
+
+    /* The editor pane gets AppKit's scroll-edge effect for free: content
+       scrolling under the titlebar glass progressively dissolves toward the
+       window edge. WebKit's equivalent only engages with a non-zero
+       obscuredContentInsets, which reintroduces the hard-clip scroll pocket
+       (measured in cut 7-10), and CSS backdrop-filter is dead in exactly this
+       strip: Core Animation refuses nested backdrop capture under the native
+       titlebar glass (measured in cut 7-12 — the same rule blurs fine in a
+       plain window and below the glass line, and silently drops both the
+       filter AND its mask under the glass). So the parity fade is a masked
+       veil instead: a fixed band owned by the measured glass-height variable,
+       painted in the native glass backing colour (plumbed by the glass
+       controller from WindowChromeRecipe so both sides of the split stay
+       pixel-identical), fading to transparent toward the band's bottom edge
+       so gliding content dissolves the way the editor's does. */
+    body::after {
+      content: "";
+      position: fixed;
+      top: 0;
+      right: 0;
+      left: 0;
+      height: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
+      pointer-events: none;
+      z-index: 10;
+      background: var(\(PreviewTitlebarGlassController.titlebarGlassBackingCSSVariable), transparent);
+      -webkit-mask-image: linear-gradient(to bottom, black 50%, rgba(0, 0, 0, 0.35) 100%);
+      mask-image: linear-gradient(to bottom, black 50%, rgba(0, 0, 0, 0.35) 100%);
     }
 
     .markdown-body {
@@ -1121,6 +1158,7 @@ final class PreviewWebView: NSView {
 
 final class PreviewTitlebarGlassController: NSObject {
   static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
+  static let titlebarGlassBackingCSSVariable = "--vc-preview-titlebar-glass-backing"
 
   static let windowChromeNotifications: [Notification.Name] = [
     NSWindow.didResizeNotification,
@@ -1135,11 +1173,13 @@ final class PreviewTitlebarGlassController: NSObject {
 
   var scriptEvaluator: ((String) -> Void)?
   var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
+  var titlebarGlassBackingProvider: ((NSWindow?) -> String)?
   private weak var observedWindow: NSWindow?
   private var contentLayoutObservation: NSKeyValueObservation?
   private var pendingUpdate: DispatchWorkItem?
   private var pendingUpdateNeedsForce = false
   private var lastAppliedHeight: CGFloat?
+  private var lastAppliedBacking: String?
 
   deinit {
     invalidate()
@@ -1163,6 +1203,12 @@ final class PreviewTitlebarGlassController: NSObject {
     return """
       document.documentElement.style.setProperty('\(titlebarGlassHeightCSSVariable)', '\(pixelHeight)px');
       """
+  }
+
+  static func titlebarGlassBackingScript(cssColor: String) -> String {
+    """
+    document.documentElement.style.setProperty('\(titlebarGlassBackingCSSVariable)', '\(cssColor)');
+    """
   }
 
   func invalidate() {
@@ -1189,8 +1235,13 @@ final class PreviewTitlebarGlassController: NSObject {
     scheduleUpdate()
   }
 
+  func appearanceDidChange() {
+    scheduleUpdate(force: true)
+  }
+
   func fullPageLoadDidStart() {
     lastAppliedHeight = nil
+    lastAppliedBacking = nil
     scheduleUpdate(force: true)
   }
 
@@ -1204,12 +1255,18 @@ final class PreviewTitlebarGlassController: NSObject {
     let height =
       titlebarGlassHeightProvider?(observedWindow)
       ?? Self.titlebarGlassHeight(for: observedWindow)
-    guard force || lastAppliedHeight != height else {
+    let backing =
+      titlebarGlassBackingProvider?(observedWindow)
+      ?? WindowChromeRecipe.titlebarGlassBackingCSSColor(for: observedWindow)
+    guard force || lastAppliedHeight != height || lastAppliedBacking != backing else {
       return height
     }
 
     lastAppliedHeight = height
-    scriptEvaluator?(Self.titlebarGlassHeightScript(height: height))
+    lastAppliedBacking = backing
+    scriptEvaluator?(
+      Self.titlebarGlassHeightScript(height: height)
+        + Self.titlebarGlassBackingScript(cssColor: backing))
     return height
   }
 

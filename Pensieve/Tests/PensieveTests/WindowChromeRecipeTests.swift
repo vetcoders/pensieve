@@ -171,4 +171,35 @@ final class WindowChromeRecipeTests: XCTestCase {
       XCTAssertLessThan(allowedInWindow.height, boundsInWindow.height)
     }
   }
+
+  // The preview veil (cut 7-12) paints web-side pixels that must equal the
+  // native glass backing on the editor side of the split — one colour truth,
+  // resolved per appearance, emitted as a concrete sRGB value (a CSS keyword
+  // guess is exactly how the 7-9 tinted-stripe class comes back).
+  @MainActor
+  func testTitlebarGlassBackingCSSColorResolvesPerAppearance() throws {
+    func cssColor(_ appearanceName: NSAppearance.Name) throws -> String {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false
+      )
+      window.isReleasedWhenClosed = false
+      defer { window.close() }
+      window.appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+      return WindowChromeRecipe.titlebarGlassBackingCSSColor(for: window)
+    }
+
+    let dark = try cssColor(.darkAqua)
+    let light = try cssColor(.aqua)
+
+    for value in [dark, light] {
+      XCTAssertTrue(
+        value.range(of: #"^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$"#, options: .regularExpression)
+          != nil,
+        "backing colour must resolve to a concrete rgb() value, got: \(value)")
+    }
+    XCTAssertNotEqual(dark, light, "backing colour must follow the effective appearance")
+  }
 }

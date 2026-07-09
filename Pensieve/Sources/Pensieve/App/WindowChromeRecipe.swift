@@ -42,6 +42,23 @@ enum WindowChromeRecipe {
   /// glows through dark chrome as a lighter, sepia-tinted patch.
   static var titlebarGlassBackingColor: NSColor { .textBackgroundColor }
 
+  /// The same backing truth as a CSS colour, resolved through the window's
+  /// effective appearance. The preview's veil band (cut 7-12) must paint the
+  /// exact pixels the native glass composites on the editor side of the
+  /// split, or the band reads as a tinted stripe — the 7-9 failure class.
+  static func titlebarGlassBackingCSSColor(for window: NSWindow?) -> String {
+    let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+    var cssColor = "transparent"
+    appearance.performAsCurrentDrawingAppearance {
+      guard let srgb = titlebarGlassBackingColor.usingColorSpace(.sRGB) else { return }
+      let red = Int(round(srgb.redComponent * 255))
+      let green = Int(round(srgb.greenComponent * 255))
+      let blue = Int(round(srgb.blueComponent * 255))
+      cssColor = "rgb(\(red), \(green), \(blue))"
+    }
+    return cssColor
+  }
+
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
     ceil(max(0, frameHeight - contentLayoutHeight))
   }
