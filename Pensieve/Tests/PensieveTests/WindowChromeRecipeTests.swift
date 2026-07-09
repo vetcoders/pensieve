@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 import XCTest
 
 @testable import Pensieve
@@ -72,5 +73,28 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentLayoutHeight: window.contentLayoutRect.height)
     XCTAssertEqual(WindowChromeRecipe.titlebarGlassHeight(for: window), expected)
     XCTAssertGreaterThanOrEqual(expected, 0)
+  }
+
+  func testTitlebarGlassBackingColorMatchesEditorSurface() {
+    XCTAssertEqual(WindowChromeRecipe.titlebarGlassBackingColor, .textBackgroundColor)
+  }
+
+  @MainActor
+  func testPreviewWebViewFeedsChromeTheRecipeBackingColor() {
+    let view = PreviewWebView(frame: .zero)
+    let webView = view.subviews.compactMap { $0 as? WKWebView }.first
+    XCTAssertNotNil(webView)
+    // WKWebView resolves the dynamic catalog colour to concrete sRGB on set;
+    // compare resolved components, not colour identity.
+    let applied = webView?.underPageBackgroundColor.usingColorSpace(.sRGB)
+    let expected = WindowChromeRecipe.titlebarGlassBackingColor.usingColorSpace(.sRGB)
+    XCTAssertNotNil(applied)
+    XCTAssertNotNil(expected)
+    if let applied, let expected {
+      XCTAssertEqual(applied.redComponent, expected.redComponent, accuracy: 0.001)
+      XCTAssertEqual(applied.greenComponent, expected.greenComponent, accuracy: 0.001)
+      XCTAssertEqual(applied.blueComponent, expected.blueComponent, accuracy: 0.001)
+      XCTAssertEqual(applied.alphaComponent, expected.alphaComponent, accuracy: 0.001)
+    }
   }
 }

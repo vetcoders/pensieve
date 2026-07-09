@@ -34,6 +34,14 @@ enum WindowChromeRecipe {
     window.contentMinSize = minimumContentSize
   }
 
+  /// Backing colour WebKit composites into the titlebar glass above the
+  /// preview page (`WKWebView.underPageBackgroundColor`). Must be the same
+  /// surface the editor pane feeds the chrome — `textBackgroundColor` — or
+  /// the glass strip reads a different tint on each side of the split
+  /// divider: WebKit's default under-page colour is a light warm gray that
+  /// glows through dark chrome as a lighter, sepia-tinted patch.
+  static var titlebarGlassBackingColor: NSColor { .textBackgroundColor }
+
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
     ceil(max(0, frameHeight - contentLayoutHeight))
   }

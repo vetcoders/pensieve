@@ -29,6 +29,7 @@ final class PreviewWebView: NSView {
     let config = WKWebViewConfiguration()
     webView = WKWebView(frame: .zero, configuration: config)
     webView.setValue(false, forKey: "drawsBackground")
+    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
 
