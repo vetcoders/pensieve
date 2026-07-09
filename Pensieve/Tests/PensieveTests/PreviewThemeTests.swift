@@ -176,24 +176,9 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("margin-top: 0 !important"))
   }
 
-  func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {
-    XCTAssertEqual(
-      PreviewTitlebarGlassController.titlebarGlassHeight(
-        frameHeight: 800, contentLayoutHeight: 736),
-      64)
-    XCTAssertEqual(
-      PreviewTitlebarGlassController.titlebarGlassHeight(
-        frameHeight: 800, contentLayoutHeight: 800),
-      0)
-    XCTAssertEqual(
-      PreviewTitlebarGlassController.titlebarGlassHeight(
-        frameHeight: 799.5, contentLayoutHeight: 735.25),
-      65)
-    XCTAssertEqual(
-      PreviewTitlebarGlassController.titlebarGlassHeight(
-        frameHeight: 700, contentLayoutHeight: 724),
-      0)
-  }
+  // The glass-height arithmetic is owned by WindowChromeRecipe and pinned in
+  // WindowChromeRecipeTests.testTitlebarGlassHeightComesFromWindowContentLayoutDelta;
+  // the controller consumes it (polarize L4 removed the forwarding twins here).
 
   func testTitlebarGlassHeightScriptTargetsDocumentRootCSSVariable() {
     let script = PreviewTitlebarGlassController.titlebarGlassHeightScript(height: 47.2)

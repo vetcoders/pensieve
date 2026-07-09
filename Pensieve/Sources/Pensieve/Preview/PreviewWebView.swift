@@ -1161,20 +1161,10 @@ final class PreviewTitlebarGlassController: NSObject {
     invalidate()
   }
 
-  static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
-    WindowChromeRecipe.titlebarGlassHeight(
-      frameHeight: frameHeight,
-      contentLayoutHeight: contentLayoutHeight)
-  }
-
-  static func titlebarGlassHeight(for window: NSWindow?) -> CGFloat {
-    WindowChromeRecipe.titlebarGlassHeight(for: window)
-  }
-
   static func titlebarGlassHeightScript(height: CGFloat) -> String {
     // `height` is an already-measured glass height; measurement happens once,
-    // in titlebarGlassHeight(frameHeight:contentLayoutHeight:). Here we only
-    // clamp to a whole non-negative CSS pixel.
+    // in `WindowChromeRecipe.titlebarGlassHeight` — the only owner of that
+    // number. Here we only clamp to a whole non-negative CSS pixel.
     let pixelHeight = Int(ceil(max(0, height)))
     return """
       document.documentElement.style.setProperty('\(titlebarGlassHeightCSSVariable)', '\(pixelHeight)px');
@@ -1221,7 +1211,7 @@ final class PreviewTitlebarGlassController: NSObject {
     guard isEngaged else { return 0 }
     let height =
       titlebarGlassHeightProvider?(observedWindow)
-      ?? Self.titlebarGlassHeight(for: observedWindow)
+      ?? WindowChromeRecipe.titlebarGlassHeight(for: observedWindow)
     guard force || lastAppliedHeight != height else {
       return height
     }
