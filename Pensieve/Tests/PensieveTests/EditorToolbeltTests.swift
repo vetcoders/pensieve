@@ -49,11 +49,27 @@ final class EditorToolbeltTests: XCTestCase {
     }
   }
 
-  // MARK: - Aa inline toolbelt ↔ floating bar shared contract
+  // MARK: - Inline edit toolbelt policy
+
+  func testEditToolbeltVisibleForEditableSourceSplitAndFocusBuffers() {
+    XCTAssertTrue(EditorToolbelt.showsEditToolbelt(for: .source, hasEditableBuffer: true))
+    XCTAssertTrue(EditorToolbelt.showsEditToolbelt(for: .split, hasEditableBuffer: true))
+    XCTAssertTrue(EditorToolbelt.showsEditToolbelt(for: .focus, hasEditableBuffer: true))
+  }
+
+  func testEditToolbeltHiddenForPreviewOnlyAndEmptyBuffers() {
+    XCTAssertFalse(EditorToolbelt.showsEditToolbelt(for: .preview, hasEditableBuffer: true))
+
+    for mode in EditorMode.allCases {
+      XCTAssertFalse(EditorToolbelt.showsEditToolbelt(for: mode, hasEditableBuffer: false))
+    }
+  }
+
+  // MARK: - Inline toolbelt ↔ floating bar shared contract
 
   func testEditActionListIsTheSharedAllCasesOrder() {
-    // The Aa inline toolbar, floating selection bar, and editor context menu
-    // ALL iterate `MarkdownFormat.allCases` — this pins the shared order so a
+    // The inline toolbar, floating selection bar, and editor context menu
+    // ALL iterate `MarkdownFormat.allCases` - this pins the shared order so a
     // reorder (or a fork into a second array) shows up as a test edit.
     XCTAssertEqual(
       MarkdownFormat.allCases,
@@ -73,7 +89,7 @@ final class EditorToolbeltTests: XCTestCase {
     ]
 
     // Inline buttons need a label, a symbol, and stable accessibility ids;
-    // empty metadata would render a blank Aa row without failing the build.
+    // empty metadata would render a blank row without failing the build.
     for format in MarkdownFormat.allCases {
       XCTAssertFalse(format.label.isEmpty)
       XCTAssertFalse(format.systemImageName.isEmpty)
