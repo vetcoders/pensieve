@@ -366,7 +366,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.autoresizingMask = [.width]
     textView.backgroundColor = .textBackgroundColor
     textView.setAccessibilityIdentifier("pensieve.editor")
-    textView.textContainerInset = NSSize(width: 12, height: 10)
+    textView.textContainerInset = NSSize(
+      width: 12,
+      height: WindowChromeRecipe.documentContentTopInset)
 
     scrollView.documentView = textView
     textView.setupGutter(layoutManager: textLayoutManager)

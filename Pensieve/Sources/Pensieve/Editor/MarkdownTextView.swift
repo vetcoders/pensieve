@@ -266,10 +266,7 @@ class MarkdownTextView: NSTextView {
   /// where the chrome ends (same rule as the preview glass strip).
   func accessoryAllowedRect() -> NSRect {
     let visible = visibleRect
-    guard let window else { return visible }
-    let content = convert(window.contentLayoutRect, from: nil)
-    let clipped = visible.intersection(content)
-    return clipped.isEmpty ? visible : clipped
+    return WindowChromeRecipe.chromeClippedVisibleRect(for: self, fallback: visible)
   }
 
   /// Default position near the current selection, clamped into `allowed`. The bar prefers

@@ -161,6 +161,17 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertFalse(css.contains("background: var(--vc-preview-paper-bg) !important"))
   }
 
+  func testAppearanceCSSPinsPreviewTopContentInsetToWindowChromeRecipe() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
+
+    XCTAssertTrue(
+      css.contains(
+        "padding: \(Int(WindowChromeRecipe.previewContentTopInset))px clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important"
+      ))
+    XCTAssertTrue(css.contains(".markdown-body > :first-child"))
+    XCTAssertTrue(css.contains("margin-top: 0 !important"))
+  }
+
   func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {
     XCTAssertEqual(
       PreviewTitlebarGlassController.titlebarGlassHeight(

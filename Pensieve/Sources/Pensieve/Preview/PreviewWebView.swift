@@ -250,7 +250,7 @@ final class PreviewWebView: NSView {
     body {
       font-size: var(--vc-font-size);
       margin: 0 !important;
-      padding: clamp(12px, 3vw, 28px) !important;
+      padding: \(Int(WindowChromeRecipe.previewContentTopInset))px clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
       box-sizing: border-box;
       min-height: 100vh;
       overflow-wrap: anywhere;
@@ -277,6 +277,10 @@ final class PreviewWebView: NSView {
       position: relative;
       overflow-wrap: anywhere;
       word-wrap: break-word;
+    }
+
+    .markdown-body > :first-child {
+      margin-top: 0 !important;
     }
 
     .markdown-body h1,
@@ -1117,14 +1121,13 @@ final class PreviewTitlebarGlassController: NSObject {
   }
 
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
-    ceil(max(0, frameHeight - contentLayoutHeight))
+    WindowChromeRecipe.titlebarGlassHeight(
+      frameHeight: frameHeight,
+      contentLayoutHeight: contentLayoutHeight)
   }
 
   static func titlebarGlassHeight(for window: NSWindow?) -> CGFloat {
-    guard let window else { return 0 }
-    return titlebarGlassHeight(
-      frameHeight: window.frame.height,
-      contentLayoutHeight: window.contentLayoutRect.height)
+    WindowChromeRecipe.titlebarGlassHeight(for: window)
   }
 
   static func titlebarGlassHeightScript(height: CGFloat) -> String {

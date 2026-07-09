@@ -41,8 +41,10 @@ final class PreviewBaseURLTests: XCTestCase {
   func testPreviewAppearanceCSSIsResponsive() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14)
 
-    // Fluid padding so narrow windows do not bleed content under the chrome.
-    XCTAssertTrue(css.contains("padding: clamp(12px, 3vw, 28px)"))
+    // Top padding is chrome-recipe pinned; horizontal/bottom padding stays
+    // fluid so narrow windows do not bleed content under the side gutters.
+    XCTAssertTrue(css.contains("padding: \(Int(WindowChromeRecipe.previewContentTopInset))px"))
+    XCTAssertTrue(css.contains("clamp(12px, 3vw, 28px)"))
     XCTAssertTrue(css.contains("margin: 0 !important"))
 
     // Long headings, links, and inline tokens must wrap, not clip.
