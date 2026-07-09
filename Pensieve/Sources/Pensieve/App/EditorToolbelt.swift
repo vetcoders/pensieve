@@ -33,6 +33,7 @@ struct EditorToolbelt: ToolbarContent {
   static let reloadIdentifier = "pensieve.toolbar.reload"
   static let overflowIdentifier = "pensieve.toolbar.overflow"
   static let richMarkdownToggleIdentifier = "pensieve.toolbar.richMarkdownToggle"
+  static let shareEditIslandGap: CGFloat = 68
 
   /// The edit menu and editor-facing controls light up for ANY editable buffer —
   /// untitled scratch notes included — not only file-backed documents. Gating them on
@@ -56,7 +57,7 @@ struct EditorToolbelt: ToolbarContent {
     if showsEditToolbelt {
       ToolbarItem(placement: .principal) {
         Color.clear
-          .frame(width: 10)
+          .frame(width: Self.shareEditIslandGap)
           .accessibilityHidden(true)
       }
 
