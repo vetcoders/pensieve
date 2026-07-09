@@ -33,7 +33,6 @@ final class PreviewWebView: NSView {
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
 
-    enforceFullBleedViewport()
     addSubview(webView)
     webView.translatesAutoresizingMaskIntoConstraints = false
     NSLayoutConstraint.activate([
@@ -50,11 +49,6 @@ final class PreviewWebView: NSView {
     titlebarGlassController.scriptEvaluator = { [weak self] script in
       self?.webView.evaluateJavaScript(script, completionHandler: nil)
     }
-    // Viewport enforcement rides the controller's geometry channel: layout
-    // passes alone miss the re-adoption moments (see `viewportEnforcer`).
-    titlebarGlassController.viewportEnforcer = { [weak self] in
-      self?.enforceFullBleedViewport()
-    }
   }
 
   required init?(coder: NSCoder) {
@@ -67,46 +61,26 @@ final class PreviewWebView: NSView {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    enforceFullBleedViewport()
     titlebarGlassController.attach(to: window)
-  }
-
-  // The veil band's backing colour resolves through the window's effective
-  // appearance; a dark/light flip changes the colour without any geometry
-  // notification, so re-plumb the CSS variables on appearance changes.
-  override func viewDidChangeEffectiveAppearance() {
-    super.viewDidChangeEffectiveAppearance()
-    titlebarGlassController.appearanceDidChange()
   }
 
   override func layout() {
     super.layout()
-    enforceFullBleedViewport()
     titlebarGlassController.layoutDidChange()
   }
 
-  /// macOS 26 auto-adopts the view's safe area as obscured content insets:
-  /// the layout viewport starts at the chrome's bottom edge, so scrolled
-  /// content hard-clips mid-glyph at the toolbelt instead of gliding under
-  /// the glass the way the editor's text view does — and the CSS glass-height
-  /// offset would double up on the WebKit pocket, parking the page start a
-  /// full chrome height below the editor's. WebKit re-applies the automatic
-  /// value whenever the view lands in a window, so a single set at init is
-  /// not enough; re-assert (guarded, so unchanged values never re-trigger
-  /// layout) on window moves, layout passes, AND every chrome geometry event
-  /// the glass controller sees (`viewportEnforcer`) — the toolbar attaching
-  /// after window join shrinks `contentLayoutRect` with no layout pass here,
-  /// which is exactly when WebKit re-adopts. The measured titlebar glass
-  /// height (CSS var in `appearanceCSS`) is then the only owner of the
-  /// chrome offset.
-  private func enforceFullBleedViewport() {
-    if #available(macOS 26.0, *) {
-      let insets = webView.obscuredContentInsets
-      if insets.top != 0 || insets.left != 0 || insets.bottom != 0 || insets.right != 0 {
-        webView.obscuredContentInsets = NSEdgeInsets()
-      }
-    }
-  }
+  // The chrome offset and the scrolled dissolve have ONE owner on macOS 26:
+  // WebKit's auto-adopted `obscuredContentInsets` pocket — the WebKit face of
+  // the same OS mechanism that insets the editor's scroll view
+  // (`automaticallyAdjustsContentInsets`). The pocket parks the page start at
+  // the glass line AND renders the native scroll-edge ghosts through the band
+  // (measured on the polarize L3 rig: pocket band p95 2–12/255 vs editor
+  // 3–11/255; zeroing the insets instead painted scrolled text CRISP through
+  // the title at 192/255). Never zero or re-assert these insets: fighting the
+  // adoption is what forced the CSS offset + masked-veil imitation (cuts
+  // 7-10 → 7-12b) that could not reach pixel parity. Before macOS 26 there is
+  // no pocket API; `PreviewTitlebarGlassController` plumbs the measured glass
+  // height as the CSS fallback offset instead.
 
   // MARK: - Public
 
@@ -258,7 +232,6 @@ final class PreviewWebView: NSView {
       --vc-preview-math-bg: #f6f8fa;
       --vc-preview-page-background: transparent;
       \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
-      \(PreviewTitlebarGlassController.titlebarGlassBackingCSSVariable): transparent;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -309,36 +282,17 @@ final class PreviewWebView: NSView {
       pointer-events: none;
     }
 
-    /* The editor pane gets AppKit's scroll-edge effect for free: content
-       scrolling under the titlebar glass progressively dissolves toward the
-       window edge. WebKit's equivalent only engages with a non-zero
-       obscuredContentInsets, which reintroduces the hard-clip scroll pocket
-       (measured in cut 7-10), and CSS backdrop-filter is dead in exactly this
-       strip: Core Animation refuses nested backdrop capture under the native
-       titlebar glass (measured in cut 7-12 — the same rule blurs fine in a
-       plain window and below the glass line, and silently drops both the
-       filter AND its mask under the glass). So the parity fade is a masked
-       veil instead: a fixed band owned by the measured glass-height variable,
-       painted in the native glass backing colour (plumbed by the glass
-       controller from WindowChromeRecipe so both sides of the split stay
-       pixel-identical). Every number here — band height, backing colour, and
-       the mask's transmission profile — is consumed from WindowChromeRecipe;
-       this rule owns no chrome truth of its own (see
-       `titlebarGlassVeilMaskStops` for the measured 7-12b profile and the
-       no-opaque-stop constraint). */
-    body::after {
-      content: "";
-      position: fixed;
-      top: 0;
-      right: 0;
-      left: 0;
-      height: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
-      pointer-events: none;
-      z-index: 10;
-      background: var(\(PreviewTitlebarGlassController.titlebarGlassBackingCSSVariable), transparent);
-      -webkit-mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient);
-      mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient);
-    }
+    /* No page-side chrome band here — deliberately. The dissolve under the
+       titlebar glass is owned by the OS on macOS 26 (WebKit's auto-adopted
+       obscuredContentInsets pocket renders the same scroll-edge ghosts as the
+       editor pane; measured, polarize L3). Two imitations died against
+       measured platform walls and must not come back: (1) backdrop-filter is
+       dead in exactly this strip — Core Animation refuses nested backdrop
+       capture under the native titlebar glass (cut 7-12; the same rule blurs
+       fine in a plain window, and @supports lies because the limit is
+       positional); (2) a masked backing veil (cuts 7-12/7-12b) sits ON TOP of
+       the pocket's own ghosts and can only mute them — it transmitted 0/255
+       on the operator window (polarize L2). */
 
     .markdown-body {
       max-width: 980px;
@@ -1167,9 +1121,22 @@ final class PreviewWebView: NSView {
 
 }
 
+/// Pre-macOS-26 fallback ONLY: plumbs the measured titlebar height into the
+/// CSS offset variable so the page start clears the chrome on systems without
+/// the `obscuredContentInsets` pocket. On macOS 26+ the controller stays
+/// silent — the OS pocket owns both the offset and the scrolled dissolve, and
+/// the CSS variable keeps its 0px default (polarize L3). One offset owner per
+/// OS generation, boundary explicit here.
 final class PreviewTitlebarGlassController: NSObject {
   static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
-  static let titlebarGlassBackingCSSVariable = "--vc-preview-titlebar-glass-backing"
+
+  /// Test seam: choreography tests force-engage the pre-26 path on any OS.
+  var engagementOverride: Bool?
+  private var isEngaged: Bool {
+    if let engagementOverride { return engagementOverride }
+    if #available(macOS 26.0, *) { return false }
+    return true
+  }
 
   static let windowChromeNotifications: [Notification.Name] = [
     NSWindow.didResizeNotification,
@@ -1184,24 +1151,11 @@ final class PreviewTitlebarGlassController: NSObject {
 
   var scriptEvaluator: ((String) -> Void)?
   var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
-  var titlebarGlassBackingProvider: ((NSWindow?) -> String)?
-  /// Re-asserts the host view's full-bleed viewport (zeroed
-  /// `obscuredContentInsets`). WebKit re-adopts the safe area on chrome
-  /// geometry changes that never give the container a layout pass — the
-  /// toolbar attaching after the preview joins the window shrinks
-  /// `contentLayoutRect` silently — so viewport enforcement must ride the
-  /// same channel as the CSS variables: every geometry event that funnels
-  /// into `apply()` re-zeroes the pocket first. With the pocket alive the
-  /// page start doubles up (WebKit inset + CSS glass offset) and scrolled
-  /// content hard-clips at the pocket with WebKit's own fade instead of
-  /// ghosting through the veil (measured, polarize L2).
-  var viewportEnforcer: (() -> Void)?
   private weak var observedWindow: NSWindow?
   private var contentLayoutObservation: NSKeyValueObservation?
   private var pendingUpdate: DispatchWorkItem?
   private var pendingUpdateNeedsForce = false
   private var lastAppliedHeight: CGFloat?
-  private var lastAppliedBacking: String?
 
   deinit {
     invalidate()
@@ -1227,12 +1181,6 @@ final class PreviewTitlebarGlassController: NSObject {
       """
   }
 
-  static func titlebarGlassBackingScript(cssColor: String) -> String {
-    """
-    document.documentElement.style.setProperty('\(titlebarGlassBackingCSSVariable)', '\(cssColor)');
-    """
-  }
-
   func invalidate() {
     pendingUpdate?.cancel()
     pendingUpdate = nil
@@ -1249,6 +1197,7 @@ final class PreviewTitlebarGlassController: NSObject {
 
   @discardableResult
   func attach(to nextWindow: NSWindow?) -> CGFloat {
+    guard isEngaged else { return 0 }
     observeWindowIfNeeded(nextWindow)
     return apply(force: true)
   }
@@ -1257,13 +1206,8 @@ final class PreviewTitlebarGlassController: NSObject {
     scheduleUpdate()
   }
 
-  func appearanceDidChange() {
-    scheduleUpdate(force: true)
-  }
-
   func fullPageLoadDidStart() {
     lastAppliedHeight = nil
-    lastAppliedBacking = nil
     scheduleUpdate(force: true)
   }
 
@@ -1274,22 +1218,16 @@ final class PreviewTitlebarGlassController: NSObject {
 
   @discardableResult
   func apply(force: Bool = false) -> CGFloat {
-    viewportEnforcer?()
+    guard isEngaged else { return 0 }
     let height =
       titlebarGlassHeightProvider?(observedWindow)
       ?? Self.titlebarGlassHeight(for: observedWindow)
-    let backing =
-      titlebarGlassBackingProvider?(observedWindow)
-      ?? WindowChromeRecipe.titlebarGlassBackingCSSColor(for: observedWindow)
-    guard force || lastAppliedHeight != height || lastAppliedBacking != backing else {
+    guard force || lastAppliedHeight != height else {
       return height
     }
 
     lastAppliedHeight = height
-    lastAppliedBacking = backing
-    scriptEvaluator?(
-      Self.titlebarGlassHeightScript(height: height)
-        + Self.titlebarGlassBackingScript(cssColor: backing))
+    scriptEvaluator?(Self.titlebarGlassHeightScript(height: height))
     return height
   }
 

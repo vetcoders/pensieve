@@ -164,10 +164,10 @@ final class PreviewThemeTests: XCTestCase {
   func testAppearanceCSSPinsPreviewTopContentInsetToWindowChromeRecipe() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
 
-    // The top inset rides on the measured glass height: the viewport is
-    // full-bleed (obscured content insets zeroed), so the CSS var is the only
-    // owner of the chrome offset — a bare pixel inset would park the first
-    // line under the toolbelt.
+    // On macOS 26 the glass-height var stays at its 0px default (the OS
+    // pocket owns the chrome offset), so the padding reduces to the Recipe's
+    // preview inset; before macOS 26 the glass controller plumbs the measured
+    // height into the var as the fallback offset. Same CSS, one owner per OS.
     XCTAssertTrue(
       css.contains(
         "padding: calc(var(--vc-preview-titlebar-glass-height) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important"
@@ -206,6 +206,7 @@ final class PreviewThemeTests: XCTestCase {
   @MainActor
   func testPreviewTitlebarGlassControllerAppliesAttachAndNavigationUpdates() {
     let controller = PreviewTitlebarGlassController()
+    controller.engagementOverride = true
 
     var scripts: [String] = []
     controller.scriptEvaluator = { scripts.append($0) }
@@ -237,6 +238,7 @@ final class PreviewThemeTests: XCTestCase {
     WindowChromeRecipe.apply(to: window, title: "Glass KVO Probe")
 
     let controller = PreviewTitlebarGlassController()
+    controller.engagementOverride = true
     var scripts: [String] = []
     controller.scriptEvaluator = { scripts.append($0) }
     controller.attach(to: window)
@@ -268,65 +270,21 @@ final class PreviewThemeTests: XCTestCase {
     )
   }
 
-  func testAppearanceCSSPaintsGlassBandVeilOwnedByMeasuredVariables() {
+  func testAppearanceCSSCarriesNoPageSideChromeBand() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
 
-    XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-backing: transparent"))
-    XCTAssertTrue(css.contains("body::after"))
-    XCTAssertTrue(css.contains("height: var(--vc-preview-titlebar-glass-height)"))
-    XCTAssertTrue(
-      css.contains("background: var(--vc-preview-titlebar-glass-backing, transparent)"))
-    // The mask profile has exactly one owner — WindowChromeRecipe. The CSS
-    // must consume it verbatim (both prefixed and standard property), and it
-    // must never carry a fully-opaque stop: the editor's scroll-edge effect
-    // transmits ghosts across the whole band, so an opaque segment reads as a
-    // solid plate under the toolbar buttons (cut 7-12b).
-    XCTAssertTrue(
-      css.contains("-webkit-mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient)"))
-    XCTAssertTrue(
-      css.contains("mask-image: \(WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient)"))
-    XCTAssertFalse(css.contains("mask-image: linear-gradient(to bottom, black"))
-    // Core Animation refuses nested backdrop capture under the native titlebar
-    // glass (measured in cut 7-12): a backdrop-filter here passes @supports,
-    // renders fine in a plain window, and silently drops the whole veil —
-    // mask included — in the real chrome. The veil must stay filter-free.
+    // The scrolled dissolve under the glass is owned by the OS pocket
+    // (obscuredContentInsets auto-adoption, polarize L3) on both panes. Two
+    // page-side imitations died against measured platform walls and must not
+    // come back: a backdrop-filter is silently dropped by Core Animation
+    // under the native titlebar glass (cut 7-12 — @supports lies, the limit
+    // is positional), and a masked backing veil sits ON TOP of the pocket's
+    // own ghosts and can only mute them — it transmitted 0/255 on the
+    // operator window (polarize L2).
+    XCTAssertFalse(css.contains("body::after"))
+    XCTAssertFalse(css.contains("mask-image"))
     XCTAssertFalse(css.contains("backdrop-filter:"))
-  }
-
-  func testTitlebarGlassBackingScriptTargetsDocumentRootCSSVariable() {
-    let script = PreviewTitlebarGlassController.titlebarGlassBackingScript(
-      cssColor: "rgb(30, 30, 30)")
-
-    XCTAssertTrue(script.contains("document.documentElement.style.setProperty"))
-    XCTAssertTrue(script.contains("'--vc-preview-titlebar-glass-backing'"))
-    XCTAssertTrue(script.contains("'rgb(30, 30, 30)'"))
-  }
-
-  @MainActor
-  func testPreviewTitlebarGlassControllerPlumbsBackingColourWithHeight() {
-    let controller = PreviewTitlebarGlassController()
-
-    var scripts: [String] = []
-    controller.scriptEvaluator = { scripts.append($0) }
-    controller.titlebarGlassHeightProvider = { _ in 41 }
-    controller.titlebarGlassBackingProvider = { _ in "rgb(1, 2, 3)" }
-    controller.attach(to: nil)
-
-    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-height'") == true)
-    XCTAssertTrue(scripts.last?.contains("'--vc-preview-titlebar-glass-backing'") == true)
-    XCTAssertTrue(scripts.last?.contains("'rgb(1, 2, 3)'") == true)
-
-    // A dark/light flip changes only the backing colour — same glass height.
-    // The guard must not swallow that update.
-    let beforeFlip = scripts.count
-    controller.titlebarGlassBackingProvider = { _ in "rgb(4, 5, 6)" }
-    controller.appearanceDidChange()
-    let deadline = Date().addingTimeInterval(2.0)
-    while scripts.count == beforeFlip && Date() < deadline {
-      RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-    }
-    XCTAssertGreaterThan(scripts.count, beforeFlip)
-    XCTAssertTrue(scripts.last?.contains("'rgb(4, 5, 6)'") == true)
+    XCTAssertFalse(css.contains("--vc-preview-titlebar-glass-backing"))
   }
 
   func testPreviewTitlebarGlassControllerTracksChromeChangeNotifications() {

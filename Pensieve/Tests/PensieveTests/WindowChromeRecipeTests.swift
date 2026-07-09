@@ -79,40 +79,6 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(WindowChromeRecipe.titlebarGlassBackingColor, .textBackgroundColor)
   }
 
-  // MARK: - Veil mask profile (single source of truth)
-
-  func testVeilMaskProfilePinsMeasuredTransmissionCurve() {
-    // The 7-12b row-probe values. Editing the profile is a conscious
-    // re-measurement, not a drive-by CSS tweak — this pin makes that explicit.
-    let stops = WindowChromeRecipe.titlebarGlassVeilMaskStops
-    XCTAssertEqual(stops.map(\.alpha), [0.92, 0.86, 0.62, 0.42])
-    XCTAssertEqual(stops.map(\.percent), [0, 45, 80, 100])
-  }
-
-  func testVeilMaskProfileNeverCarriesAnOpaqueStopAndOnlyDissolvesDownward() {
-    let stops = WindowChromeRecipe.titlebarGlassVeilMaskStops
-    XCTAssertFalse(stops.isEmpty)
-    for stop in stops {
-      XCTAssertLessThan(
-        stop.alpha, 1.0,
-        "an opaque stop reads as a solid plate under the toolbar (cut 7-12b)")
-      XCTAssertGreaterThan(stop.alpha, 0.0)
-    }
-    // The editor's scroll-edge dissolve only ever increases transmission
-    // toward the chrome seam; the veil must never re-thicken mid-band.
-    XCTAssertEqual(stops.map(\.alpha), stops.map(\.alpha).sorted(by: >))
-    XCTAssertEqual(stops.map(\.percent), stops.map(\.percent).sorted())
-    XCTAssertEqual(stops.first?.percent, 0)
-    XCTAssertEqual(stops.last?.percent, 100)
-  }
-
-  func testVeilMaskCSSGradientRendersTheProfileVerbatim() {
-    XCTAssertEqual(
-      WindowChromeRecipe.titlebarGlassVeilMaskCSSGradient,
-      "linear-gradient(to bottom, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.86) 45%, "
-        + "rgba(0, 0, 0, 0.62) 80%, rgba(0, 0, 0, 0.42) 100%)")
-  }
-
   @MainActor
   func testPreviewWebViewFeedsChromeTheRecipeBackingColor() {
     let view = PreviewWebView(frame: .zero)
@@ -132,8 +98,14 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
   }
 
+  /// The pocket IS the chrome truth on macOS 26 (polarize L3): WebKit's
+  /// auto-adopted obscured insets park the page start at the glass line and
+  /// render the editor's scroll-edge ghosts through the band. Nothing in the
+  /// preview stack may fight the adoption — zeroing it painted scrolled text
+  /// crisp through the window title (measured: 192/255 in-band vs the
+  /// pocket's native 2–12/255 dissolve).
   @MainActor
-  func testPreviewWebViewKeepsFullBleedViewportUnderChrome() throws {
+  func testPreviewWebViewLetsWebKitKeepTheAdoptedChromePocket() throws {
     guard #available(macOS 26.0, *) else {
       throw XCTSkip("obscured content insets exist from macOS 26")
     }
@@ -144,83 +116,47 @@ final class WindowChromeRecipeTests: XCTestCase {
       defer: false
     )
     defer { window.close() }
-    WindowChromeRecipe.apply(to: window, title: "Viewport Probe")
+    WindowChromeRecipe.apply(to: window, title: "Pocket Adoption Probe")
 
     let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
     window.contentView = view
     view.layoutSubtreeIfNeeded()
 
     let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
-    // macOS 26 otherwise auto-adopts the safe area as obscured insets — and
-    // RE-applies them when the view lands in a window — which hard-clips
-    // scrolled preview content at the chrome edge while the editor pane
-    // glides under the glass, and doubles the CSS glass-height offset. The
-    // window attach above is the part that regressed silently with an
-    // init-only reset.
-    XCTAssertEqual(webView.obscuredContentInsets.top, 0)
-    XCTAssertEqual(webView.obscuredContentInsets.left, 0)
-    XCTAssertEqual(webView.obscuredContentInsets.bottom, 0)
-    XCTAssertEqual(webView.obscuredContentInsets.right, 0)
-  }
-
-  /// The regression path polarize L2 measured on the operator's window:
-  /// WebKit re-adopts the safe area as obscured insets on chrome geometry
-  /// changes that give the container NO layout pass (SwiftUI attaches the
-  /// toolbar after the preview joins the window, shrinking
-  /// `contentLayoutRect` silently). Enforcement must therefore ride the
-  /// glass controller's geometry channel, not just layout()/window moves —
-  /// otherwise the pocket doubles the page-start offset and hard-clips
-  /// scrolled content with WebKit's own fade instead of the veil's.
-  @MainActor
-  func testPreviewWebViewReZeroesViewportOnChromeGeometryEventsWithoutLayout() throws {
-    guard #available(macOS 26.0, *) else {
-      throw XCTSkip("obscured content insets exist from macOS 26")
-    }
-    let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-      styleMask: WindowChromeRecipe.documentStyleMask,
-      backing: .buffered,
-      defer: false
-    )
-    defer { window.close() }
-    WindowChromeRecipe.apply(to: window, title: "Viewport Re-Adoption Probe")
-
-    let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-    window.contentView = view
-    view.layoutSubtreeIfNeeded()
-
-    let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
-    // Simulate WebKit's silent re-adoption after attach — no container layout.
+    // Simulate WebKit's adoption after attach; a headless test window never
+    // triggers the real one deterministically, so plant the adopted value.
     webView.obscuredContentInsets = NSEdgeInsets(top: 52, left: 0, bottom: 0, right: 0)
-    XCTAssertEqual(webView.obscuredContentInsets.top, 52)
 
-    // A chrome geometry event with no layout pass: the controller's window
-    // notification path (didResize) schedules apply() after ~30ms.
+    // Chrome geometry events (the L2 enforcement channel) and layout passes
+    // (the 7-10 channel) must both leave the adopted pocket alone now.
     NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
-    let deadline = Date().addingTimeInterval(2)
-    while webView.obscuredContentInsets.top != 0, Date() < deadline {
+    view.needsLayout = true
+    view.layoutSubtreeIfNeeded()
+    let deadline = Date().addingTimeInterval(0.3)
+    while Date() < deadline {
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
     }
-    XCTAssertEqual(webView.obscuredContentInsets.top, 0)
+    XCTAssertEqual(webView.obscuredContentInsets.top, 52)
   }
 
-  /// The enforcer must run on EVERY apply — including unforced ones whose
-  /// script guard short-circuits (unchanged height/backing): the pocket can
-  /// re-adopt while the measured glass height stays identical.
+  /// On macOS 26 the glass controller must stay silent: the CSS offset
+  /// variable keeps its 0px default because the OS pocket owns the offset.
+  /// The controller only plumbs the measured height before macOS 26.
   @MainActor
-  func testGlassControllerRunsViewportEnforcerOnEveryGeometryApply() {
+  func testGlassControllerStaysSilentWhereTheOSPocketOwnsTheOffset() {
     let controller = PreviewTitlebarGlassController()
-    var enforcements = 0
-    controller.viewportEnforcer = { enforcements += 1 }
-    controller.scriptEvaluator = { _ in }
+    var scripts: [String] = []
+    controller.scriptEvaluator = { scripts.append($0) }
+    controller.titlebarGlassHeightProvider = { _ in 52 }
 
+    controller.engagementOverride = false  // the macOS 26 runtime posture
     controller.attach(to: nil)
-    XCTAssertEqual(enforcements, 1)
     controller.navigationDidFinish()
-    XCTAssertEqual(enforcements, 2)
-    // Unchanged values: script application is skipped, enforcement is not.
-    controller.apply()
-    XCTAssertEqual(enforcements, 3)
+    XCTAssertTrue(scripts.isEmpty)
+
+    controller.engagementOverride = true  // the pre-26 fallback posture
+    controller.attach(to: nil)
+    XCTAssertFalse(scripts.isEmpty)
   }
 
   @MainActor
@@ -266,34 +202,4 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
   }
 
-  // The preview veil (cut 7-12) paints web-side pixels that must equal the
-  // native glass backing on the editor side of the split — one colour truth,
-  // resolved per appearance, emitted as a concrete sRGB value (a CSS keyword
-  // guess is exactly how the 7-9 tinted-stripe class comes back).
-  @MainActor
-  func testTitlebarGlassBackingCSSColorResolvesPerAppearance() throws {
-    func cssColor(_ appearanceName: NSAppearance.Name) throws -> String {
-      let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
-        styleMask: WindowChromeRecipe.documentStyleMask,
-        backing: .buffered,
-        defer: false
-      )
-      window.isReleasedWhenClosed = false
-      defer { window.close() }
-      window.appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
-      return WindowChromeRecipe.titlebarGlassBackingCSSColor(for: window)
-    }
-
-    let dark = try cssColor(.darkAqua)
-    let light = try cssColor(.aqua)
-
-    for value in [dark, light] {
-      XCTAssertTrue(
-        value.range(of: #"^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$"#, options: .regularExpression)
-          != nil,
-        "backing colour must resolve to a concrete rgb() value, got: \(value)")
-    }
-    XCTAssertNotEqual(dark, light, "backing colour must follow the effective appearance")
-  }
 }
