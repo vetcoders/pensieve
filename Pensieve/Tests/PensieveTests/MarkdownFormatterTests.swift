@@ -192,6 +192,61 @@ final class MarkdownFormatterTests: XCTestCase {
   }
 
   @MainActor
+  func testFormatSelectionMapsWrapperStringsToFormatCommands() {
+    // Every wrapper string the Format menu passes must land as the matching
+    // typed command in pendingMarkdownFormatCommand (the editor pickup point).
+    let expectations: [(wrapper: String, format: MarkdownFormat)] = [
+      ("**", .bold), ("*", .italic), ("~~", .strike), (">", .quote),
+      ("`", .code), ("[]()", .link), ("-", .bulletedList), ("1.", .numberedList),
+    ]
+
+    // Completeness latch: the Format app menu hand-rolls these wrapper strings
+    // (Commands.swift), while every other edit surface iterates
+    // `MarkdownFormat.allCases`. A new enum case must show up here — and force
+    // a conscious Format-menu decision — instead of silently missing coverage.
+    XCTAssertEqual(expectations.count, MarkdownFormat.allCases.count)
+    XCTAssertEqual(Set(expectations.map(\.format)), Set(MarkdownFormat.allCases))
+
+    for expectation in expectations {
+      let appState = AppState()
+      let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+      appState.documentSession = DocumentSession(document: ref, text: "alpha")
+      let controller = AppController(appState: appState)
+
+      controller.formatSelection(with: expectation.wrapper)
+
+      XCTAssertEqual(
+        appState.pendingMarkdownFormatCommand?.action,
+        .format(expectation.format),
+        "wrapper \(expectation.wrapper) should map to \(expectation.format)")
+    }
+  }
+
+  @MainActor
+  func testFormatSelectionIgnoresUnknownWrapper() {
+    let appState = AppState()
+    let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+    appState.documentSession = DocumentSession(document: ref, text: "alpha")
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "%%")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
+  func testFormatSelectionRequiresEditableBuffer() {
+    // Mirrors the Format menu's disabled predicate: with no editable buffer
+    // the command must not enqueue a formatting request.
+    let appState = AppState()
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "**")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
   func testEmptySelectionFormattingIsLegacyNoOp() {
     var didRouteDocumentChange = false
     let surface = MarkdownEditorSurface(text: "plain", fontSize: 14)
@@ -204,6 +259,64 @@ final class MarkdownFormatterTests: XCTestCase {
 
     XCTAssertFalse(didApply)
     XCTAssertEqual(surface.textStorage.string, "plain")
+    XCTAssertFalse(didRouteDocumentChange)
+  }
+
+  @MainActor
+  func testWrappingFormatToggleUnwrapsSelectionInsideExistingSpan() {
+    let cases: [(format: MarkdownFormat, marked: String, selected: String)] = [
+      (.bold, "**Lorem ipsum**", "Lorem"),
+      (.italic, "*Lorem ipsum*", "Lorem"),
+      (.strike, "~~Lorem ipsum~~", "Lorem"),
+      (.code, "```\nLorem ipsum\n```", "Lorem"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange((sample.marked as NSString).range(of: sample.selected))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an inner selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem ipsum", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleUnwrapsExactSpanSelection() {
+    let cases: [(format: MarkdownFormat, marked: String)] = [
+      (.bold, "**Lorem**"),
+      (.italic, "*Lorem*"),
+      (.strike, "~~Lorem~~"),
+      (.code, "```\nLorem\n```"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange(
+        NSRange(location: 0, length: (sample.marked as NSString).length))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an exact span selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleNoOpsPartiallyOverlappingSpan() {
+    var didRouteDocumentChange = false
+    let text = "pre **Lorem ipsum** post"
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    surface.onTextChanged = { _ in
+      didRouteDocumentChange = true
+    }
+    surface.textView.setSelectedRange((text as NSString).range(of: "pre **Lorem"))
+
+    let didApply = surface.applyMarkdownFormat(.bold)
+
+    XCTAssertFalse(didApply)
+    XCTAssertEqual(surface.textStorage.string, text)
     XCTAssertFalse(didRouteDocumentChange)
   }
 

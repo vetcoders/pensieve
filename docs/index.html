@@ -4,6 +4,17 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pensieve - Native macOS Markdown Editor</title>
+    <meta name="description" content="Pensieve is a fast, local-first macOS Markdown editor with native writing, preview, backlinks, and agent-aware workflows.">
+    <meta name="keywords" content="Pensieve, macOS Markdown editor, local-first notes, SwiftUI editor, markdown preview, Vetcoders">
+    <meta name="author" content="Vetcoders">
+    <meta property="og:title" content="Pensieve - Native macOS Markdown Editor">
+    <meta property="og:description" content="A fast, local-first macOS Markdown editor for source-first writing and agent-aware workflows.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://vetcoders.github.io/pensieve/">
+    <meta property="og:site_name" content="Pensieve">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="Pensieve - Native macOS Markdown Editor">
+    <meta name="twitter:description" content="A fast, local-first macOS Markdown editor for source-first writing and agent-aware workflows.">
     <style>
         :root {
             --bg-color: #f9f9f9;
@@ -111,6 +122,12 @@
             border-top: 1px solid var(--code-bg);
             padding-top: 20px;
         }
+
+        .note {
+            border-left: 3px solid var(--accent-color);
+            padding-left: 16px;
+            opacity: 0.9;
+        }
     </style>
 </head>
 <body>
@@ -132,16 +149,19 @@
                 <li><strong>Native Performance:</strong> Written in Swift, avoiding Electron bloat.</li>
                 <li><strong>Source-First Identity:</strong> Focus on the markdown source, not a heavy WYSIWYG facade.</li>
                 <li><strong>Local First:</strong> Your files stay on your machine. No cloud lock-in.</li>
+                <li><strong>Agent-Aware Workflows:</strong> Current-document dispatch and Vista-powered autocomplete are wired into the editor.</li>
                 <li><strong>Dark Mode Support:</strong> Seamless integration with macOS system themes.</li>
             </ul>
         </section>
         
         <section>
             <h2>Get Started</h2>
-            <p>You can build Pensieve directly from source. Clone the repository and use the standard <code>make</code> commands.</p>
+            <p>You can build Pensieve directly from source while the public distribution lane is being finalized.</p>
             <pre><code>git clone https://github.com/vetcoders/pensieve.git
 cd pensieve
+make build
 make run</code></pre>
+            <p class="note">The local install lane is <code>make install-app</code>. The Mac App Store lane exists, but submission and signing remain operator-gated.</p>
         </section>
 
         <div class="cta">
@@ -150,7 +170,7 @@ make run</code></pre>
     </main>
 
     <footer class="footer">
-        <p>&copy; 2026 VetCoders. Built for thinkers.</p>
+        <p>&copy; 2026 Vetcoders. Built for thinkers.</p>
     </footer>
 
 </body>

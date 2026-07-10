@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 
@@ -54,6 +55,8 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 final class TranscriptionService: ObservableObject, VistaEventListener, @unchecked Sendable {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
+  typealias MicrophonePermissionPolicy = @Sendable (VistaEngineProtocol) -> Bool
+  typealias MicrophonePermissionRequester = @Sendable () async throws -> Void
 
   @Published private(set) var committed: String
   @Published private(set) var preview: String
@@ -67,6 +70,8 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   @Published private(set) var dispatchStatus: String?
 
   private let engineFactory: EngineFactory
+  private let requiresMicrophonePermission: MicrophonePermissionPolicy
+  private let microphonePermissionRequester: MicrophonePermissionRequester
   private let cadenceCommitNanoseconds: UInt64
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
@@ -77,10 +82,16 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   init(
     engine: VistaEngineProtocol? = nil,
     engineFactory: @escaping EngineFactory = { VistaEngine() },
+    requiresMicrophonePermission: @escaping MicrophonePermissionPolicy = { $0 is VistaEngine },
+    microphonePermissionRequester: @escaping MicrophonePermissionRequester = {
+      try await TranscriptionService.ensureMicrophonePermission()
+    },
     cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
     self.engine = engine
     self.engineFactory = engineFactory
+    self.requiresMicrophonePermission = requiresMicrophonePermission
+    self.microphonePermissionRequester = microphonePermissionRequester
     self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""
@@ -94,13 +105,31 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     startRecordingTask?.cancel()
   }
 
+  private static func ensureMicrophonePermission() async throws {
+    try await AppPermissionService.ensureMicrophonePermission(openSettingsOnFailure: true)
+  }
+
   func startRecording(language: String? = nil) {
     guard !isRecording, !isPreparingRecording else { return }
     let engine = activeEngine()
     engine.setEventListener(listener: self)
     isPreparingRecording = true
     lastError = nil
-    startRecordingTask = Task { [weak self] in
+    let requiresMicrophonePermission = self.requiresMicrophonePermission
+    let microphonePermissionRequester = self.microphonePermissionRequester
+    startRecordingTask = Task {
+      [weak self, requiresMicrophonePermission, microphonePermissionRequester] in
+      do {
+        if requiresMicrophonePermission(engine) {
+          try await microphonePermissionRequester()
+        }
+        try Task.checkCancellation()
+      } catch {
+        guard let self, !(error is CancellationError) else { return }
+        self.isPreparingRecording = false
+        self.lastError = error.localizedDescription
+        return
+      }
       // Model init (whisper weights dequantization — seconds of CPU) and
       // capture start run OFF the main actor; doing this inline froze the
       // whole UI for the model load (1.77s+ hang reports from the field).

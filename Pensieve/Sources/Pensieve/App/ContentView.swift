@@ -2,30 +2,65 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
+  @State private var showDispatch = false
+
+  private var dispatchRoot: URL {
+    appState.folderURL
+      ?? appState.documentURL?.deletingLastPathComponent()
+      ?? FileManager.default.homeDirectoryForCurrentUser
+  }
 
   var body: some View {
     NavigationSplitView {
       SidebarView()
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
-      EditorPreviewSplit()
+      VStack(spacing: 0) {
+        EditorPreviewSplit()
+        if appState.documentHasEditableBuffer {
+          EditorStatusBar()
+            .opacity(appState.mode == .focus ? 0.45 : 1)
+        }
+      }
     }
     .navigationTitle(
-      appState.documentSession.hasEditableBuffer
-        ? appState.documentSession.displayTitle : "Pensieve"
+      appState.documentHasEditableBuffer
+        ? appState.documentTitle : "Pensieve"
     )
-    .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
+    .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
     .toolbar {
-      EditorToolbelt(appState: appState, controller: controller, themeManager: themeManager)
+      EditorToolbelt(
+        appState: appState,
+        controller: controller,
+        themeManager: themeManager,
+        onDispatchToAgent: {
+          showDispatch = true
+        },
+        isDispatchDisabled:
+          !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch(),
+        dispatchHelp:
+          SandboxCapabilities.allowsExternalAgentDispatch()
+          ? "Dispatch to Agent"
+          : SandboxCapabilities.dispatchUnavailableExplanation)
+    }
+    .sheet(isPresented: $showDispatch) {
+      DispatchPopover(
+        controller: controller,
+        isPresented: $showDispatch,
+        documentTitle: appState.documentTitle,
+        defaultRoot: dispatchRoot
+      )
     }
   }
 }
 
 struct EditorPreviewSplit: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
+  @State private var scrollSyncCoordinator = ScrollSyncCoordinator()
 
   /// Minimum pane width below which `.split` collapses to a single pane.
   /// Two panes × 260 + ~40 chrome = 560; below that, side-by-side stops
@@ -44,16 +79,17 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    if !appState.documentSession.hasEditableBuffer {
+    if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView(
         hasWorkspace: appState.hasWorkspaceContent,
         activity: appState.workspaceActivity
       )
     } else {
       switch appState.mode {
-      case .source, .focus:
-        // Focus mode shares source layout (Wave 2 dimming TBD).
+      case .source:
         EditorView()
+      case .focus:
+        FocusedEditorView()
       case .preview:
         PreviewView()
       case .split:
@@ -64,14 +100,48 @@ struct EditorPreviewSplit: View {
           EditorView()
         } else {
           HSplitView {
-            EditorView()
+            EditorView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
-            PreviewView()
+            PreviewView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
           }
         }
       }
     }
+  }
+}
+
+private struct FocusedEditorView: View {
+  var body: some View {
+    EditorView()
+      .overlay {
+        FocusModeDimmingOverlay()
+          .allowsHitTesting(false)
+      }
+      .accessibilityIdentifier("pensieve.focus.editor")
+  }
+}
+
+private struct FocusModeDimmingOverlay: View {
+  var body: some View {
+    VStack(spacing: 0) {
+      LinearGradient(
+        colors: [Color.black.opacity(0.10), Color.black.opacity(0)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 88)
+
+      Spacer(minLength: 0)
+
+      LinearGradient(
+        colors: [Color.black.opacity(0), Color.black.opacity(0.08)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 96)
+    }
+    .accessibilityIdentifier("pensieve.focus.dimming")
   }
 }
 
@@ -85,7 +155,10 @@ struct DocumentEmptyStateView: View {
 
   var body: some View {
     VStack(spacing: 18) {
-      if let activity {
+      // Only import-class work (real index writes ahead) takes over the center pane.
+      // Subtle open/validate states stay in the sidebar — a cached, unchanged reopen
+      // must never present itself as "Importing Workspace".
+      if let activity, activity.isProminent {
         WorkspaceActivityView(activity: activity)
           .frame(maxWidth: 340)
           .accessibilityIdentifier("pensieve.emptyState.activity")
@@ -114,7 +187,8 @@ struct DocumentEmptyStateView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor))
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.emptyState")
   }
 

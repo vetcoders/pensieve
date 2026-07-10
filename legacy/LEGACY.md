@@ -7,7 +7,7 @@ forked here as the starting reference for our rewrite into
 
 ## Why kept
 
-- **Daily driver heritage:** Maciej used this editor daily for over a year.
+- **Daily driver heritage:** used daily for over a year.
 - **Architectural reference:** split-source-preview pattern, converter strategy.
 - **Resources still in use:** `markdown.css`, `gfm.css`, `sample.md` were
   promoted into `../VCNotes/Resources/` as the starting CSS theme.
@@ -28,4 +28,4 @@ See `../docs/specs/2026-05-22-vc-notes-design.md` for the new architecture.
 
 ---
 
-*𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI*
+*𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI*

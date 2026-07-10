@@ -14,36 +14,24 @@ import WebKit
 ///   • Loads a `PreviewDocument` into the underlying WKWebView.
 ///   • Routes activated `http(s)` / `mailto` links to `NSWorkspace` instead of
 ///     navigating the WebView itself.
-///   • Bridges body scroll → posts `.vcPreviewViewportChanged` so the editor
-///     can follow once an editor-side listener exists.
-///   • Exposes `scroll(toBlock:)` and listens for `.vcEditorViewportChanged`
-///     so the editor can drive preview position once an editor-side poster
-///     exists.
-///
-/// What is *not* live yet: there is no poster of `.vcEditorViewportChanged`
-/// anywhere in the app, so the editor → preview half of the two-way bridge is
-/// inert. The surface is wired so an editor agent can switch it on without
-/// touching this file.
 final class PreviewWebView: NSView {
   private let webView: WKWebView
-  private let scrollMessageName = "vcScroll"
-
-  private var lastReportedBlock: Int = -1
-  private var lastAppliedBlock: Int = -1
   private var loadedIdentity: PreviewLoadIdentity?
+  // Newest document handed to `load(document:)` — the recovery source when the
+  // WebContent process dies or an in-place update fails under the same identity.
+  private var lastDocument: PreviewDocument?
+  private let titlebarGlassController = PreviewTitlebarGlassController()
 
-  var onViewportChanged: ((Int) -> Void)?
+  // Test seam: observes full-page (re)loads without a live WKWebView process.
+  var fullPageLoadObserver: ((PreviewDocument) -> Void)?
 
   override init(frame frameRect: NSRect) {
     let config = WKWebViewConfiguration()
-    let userContent = WKUserContentController()
-    config.userContentController = userContent
     webView = WKWebView(frame: .zero, configuration: config)
     webView.setValue(false, forKey: "drawsBackground")
+    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
-
-    userContent.add(MessageProxy(target: self), name: scrollMessageName)
 
     addSubview(webView)
     webView.translatesAutoresizingMaskIntoConstraints = false
@@ -54,14 +42,13 @@ final class PreviewWebView: NSView {
       webView.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
 
-    webView.navigationDelegate = NavigationProxy.shared
-
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(handleEditorViewportChanged(_:)),
-      name: .vcEditorViewportChanged,
-      object: nil
-    )
+    webView.navigationDelegate = self
+    // The controller's own `scriptEvaluator` is the single injectable seam for
+    // glass-script choreography (see PreviewThemeTests); here it always targets
+    // the live WKWebView.
+    titlebarGlassController.scriptEvaluator = { [weak self] script in
+      self?.webView.evaluateJavaScript(script, completionHandler: nil)
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -69,10 +56,31 @@ final class PreviewWebView: NSView {
   }
 
   deinit {
-    webView.configuration.userContentController.removeScriptMessageHandler(
-      forName: scrollMessageName)
-    NotificationCenter.default.removeObserver(self)
+    titlebarGlassController.invalidate()
   }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    titlebarGlassController.attach(to: window)
+  }
+
+  override func layout() {
+    super.layout()
+    titlebarGlassController.layoutDidChange()
+  }
+
+  // The chrome offset and the scrolled dissolve have ONE owner on macOS 26:
+  // WebKit's auto-adopted `obscuredContentInsets` pocket — the WebKit face of
+  // the same OS mechanism that insets the editor's scroll view
+  // (`automaticallyAdjustsContentInsets`). The pocket parks the page start at
+  // the glass line AND renders the native scroll-edge ghosts through the band
+  // (measured on the polarize L3 rig: pocket band p95 2–12/255 vs editor
+  // 3–11/255; zeroing the insets instead painted scrolled text CRISP through
+  // the title at 192/255). Never zero or re-assert these insets: fighting the
+  // adoption is what forced the CSS offset + masked-veil imitation (cuts
+  // 7-10 → 7-12b) that could not reach pixel parity. Before macOS 26 there is
+  // no pocket API; `PreviewTitlebarGlassController` plumbs the measured glass
+  // height as the CSS fallback offset instead.
 
   // MARK: - Public
 
@@ -81,6 +89,7 @@ final class PreviewWebView: NSView {
   /// update the already-loaded article/style in place so scroll position and the
   /// WKWebView process stay stable while typing.
   func load(document: PreviewDocument) {
+    lastDocument = document
     let identity = PreviewLoadIdentity(document: document)
     guard loadedIdentity == identity else {
       loadFullPage(document, identity: identity)
@@ -89,11 +98,41 @@ final class PreviewWebView: NSView {
     updateLoadedPage(document)
   }
 
+  /// WKWebView leaves a blank page behind when its WebContent process dies
+  /// (memory pressure, GPU reset). Without this recovery the preview stays
+  /// blank until the next edit happens to fail the in-place update path —
+  /// a reader who never types would stare at a white panel forever.
+  func handleWebContentProcessTermination() {
+    DebugTrace.log("preview web content process terminated — reloading last document")
+    loadedIdentity = nil
+    guard let document = lastDocument else { return }
+    loadFullPage(document, identity: PreviewLoadIdentity(document: document))
+  }
+
+  // Scroll sync is deliberately ONE-WAY (editor → preview). The preview-side
+  // readback that would close the loop was the re-entrancy direction that
+  // crashed the original two-way design; ScrollSyncTests pins the one-way
+  // contract. Do not add a preview scroll observer without going through the
+  // coordinator's latch semantics.
+  private func scrollToScrollSyncPosition(_ position: ScrollSyncPosition) {
+    guard loadedIdentity != nil else { return }
+    let progress = position.progress
+    let script = """
+      (function() {
+        const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        const nextY = maxY * \(progress);
+        window.scrollTo({ left: window.scrollX || 0, top: nextY, behavior: 'auto' });
+        return true;
+      })();
+      """
+    webView.evaluateJavaScript(script, completionHandler: nil)
+  }
+
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
-    lastReportedBlock = -1
-    lastAppliedBlock = -1
+    titlebarGlassController.fullPageLoadDidStart()
+    fullPageLoadObserver?(document)
   }
 
   private func updateLoadedPage(_ document: PreviewDocument) {
@@ -153,14 +192,28 @@ final class PreviewWebView: NSView {
       })();
       """
     webView.evaluateJavaScript(script) { [weak self, document] result, error in
-      guard error == nil, (result as? Bool) == true else {
-        self?.loadFullPage(document, identity: PreviewLoadIdentity(document: document))
-        return
-      }
+      self?.handleUpdateScriptResult(result, error: error, for: document)
     }
   }
 
-  static func appearanceCSS(fontSize: CGFloat) -> String {
+  /// Completion for the in-place update script. A `false`/error result means
+  /// the loaded page can no longer host the article (crashed process, stripped
+  /// DOM), so fall back to a full load — but only while the failed document's
+  /// identity is still the one on screen: the completion arrives async, and an
+  /// unconditional reload here would overwrite a newer page with stale content.
+  /// `lastDocument` (not the failed snapshot) is reloaded so same-identity
+  /// edits that raced past the failure are not rolled back.
+  func handleUpdateScriptResult(_ result: Any?, error: Error?, for document: PreviewDocument) {
+    guard error != nil || (result as? Bool) != true else { return }
+    guard loadedIdentity == PreviewLoadIdentity(document: document), let current = lastDocument
+    else { return }
+    DebugTrace.log("preview in-place update failed — falling back to full page load")
+    loadFullPage(current, identity: PreviewLoadIdentity(document: current))
+  }
+
+  static func appearanceCSS(fontSize: CGFloat, skin: ThemeManager.PreviewTheme = .default)
+    -> String
+  {
     """
     :root {
       color-scheme: light dark;
@@ -177,6 +230,8 @@ final class PreviewWebView: NSView {
       --vc-preview-diagram-error-bg: #fff1f1;
       --vc-preview-diagram-error-text: #8c1d18;
       --vc-preview-math-bg: #f6f8fa;
+      --vc-preview-page-background: transparent;
+      \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -209,11 +264,35 @@ final class PreviewWebView: NSView {
     body {
       font-size: var(--vc-font-size);
       margin: 0 !important;
-      padding: clamp(12px, 3vw, 28px) !important;
+      padding: calc(var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable)) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
       box-sizing: border-box;
+      min-height: 100vh;
       overflow-wrap: anywhere;
       word-wrap: break-word;
     }
+
+    body::before {
+      content: "";
+      position: fixed;
+      top: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
+      right: 0;
+      bottom: 0;
+      left: 0;
+      background: var(--vc-preview-page-background);
+      pointer-events: none;
+    }
+
+    /* No page-side chrome band here — deliberately. The dissolve under the
+       titlebar glass is owned by the OS on macOS 26 (WebKit's auto-adopted
+       obscuredContentInsets pocket renders the same scroll-edge ghosts as the
+       editor pane; measured, polarize L3). Two imitations died against
+       measured platform walls and must not come back: (1) backdrop-filter is
+       dead in exactly this strip — Core Animation refuses nested backdrop
+       capture under the native titlebar glass (cut 7-12; the same rule blurs
+       fine in a plain window, and @supports lies because the limit is
+       positional); (2) a masked backing veil (cuts 7-12/7-12b) sits ON TOP of
+       the pocket's own ghosts and can only mute them — it transmitted 0/255
+       on the operator window (polarize L2). */
 
     .markdown-body {
       max-width: 980px;
@@ -221,8 +300,13 @@ final class PreviewWebView: NSView {
       color: var(--vc-preview-text) !important;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
       line-height: 1.65;
+      position: relative;
       overflow-wrap: anywhere;
       word-wrap: break-word;
+    }
+
+    .markdown-body > :first-child {
+      margin-top: 0 !important;
     }
 
     .markdown-body h1,
@@ -234,6 +318,40 @@ final class PreviewWebView: NSView {
       overflow-wrap: anywhere;
       word-wrap: break-word;
       hyphens: auto;
+      line-height: 1.25;
+      margin-top: 1.4em;
+      margin-bottom: 0.55em;
+    }
+
+    .markdown-body h1,
+    .markdown-body h2,
+    .markdown-body h3,
+    .markdown-body h4 {
+      font-weight: 700;
+    }
+
+    .markdown-body h1 {
+      font-size: 2em;
+    }
+
+    .markdown-body h2 {
+      font-size: 1.5em;
+    }
+
+    .markdown-body h3 {
+      font-size: 1.25em;
+    }
+
+    .markdown-body h4 {
+      font-size: 1em;
+    }
+
+    .markdown-body h5 {
+      font-size: 0.875em;
+    }
+
+    .markdown-body h6 {
+      font-size: 0.85em;
     }
 
     .markdown-body h1,
@@ -414,79 +532,468 @@ final class PreviewWebView: NSView {
       text-align: left;
       white-space: pre-wrap;
     }
+
+    /* Reading-surface skin overlay — re-tunes the base appearance tokens and
+       body typography. Comes last so it wins over the base block above without
+       re-implementing any flavor (markdown.css / gfm.css) rules. */
+    \(skinCSS(for: skin))
     """
   }
 
-  func scroll(toBlock index: Int) {
-    guard index >= 0, index != lastAppliedBlock else { return }
-    lastAppliedBlock = index
-    let js = "window.__vcScrollToBlock && window.__vcScrollToBlock(\(index));"
-    webView.evaluateJavaScript(js, completionHandler: nil)
-  }
+  /// CSS overlay for a reading-surface skin. Each skin overrides design tokens
+  /// (`--vc-preview-*`) and `.markdown-body` typography only; structural rules
+  /// stay owned by the base appearance block and the flavor bundle. `.default`
+  /// emits nothing so the established GitHub surface is byte-for-byte unchanged.
+  static func skinCSS(for skin: ThemeManager.PreviewTheme) -> String {
+    switch skin {
+    case .default:
+      return "/* vc-skin:default — base appearance, no overlay */"
 
-  // MARK: - Bridge plumbing
-
-  fileprivate func receivedScrollMessage(_ body: Any) {
-    guard let dict = body as? [String: Any],
-      let block = dict["block"] as? Int,
-      block != lastReportedBlock
-    else { return }
-    lastReportedBlock = block
-    onViewportChanged?(block)
-    NotificationCenter.default.post(
-      name: .vcPreviewViewportChanged,
-      object: nil,
-      userInfo: ["block": block]
-    )
-  }
-
-  @objc private func handleEditorViewportChanged(_ note: Notification) {
-    guard let block = note.userInfo?["block"] as? Int else { return }
-    scroll(toBlock: block)
-  }
-
-  // MARK: - JS bridge
-
-  /// Viewport bridge installed in every preview document. Block elements
-  /// emitted by `HTMLEmitter` carry `data-vc-block="<index>"`; this script
-  /// (a) exposes `window.__vcScrollToBlock(idx)` so Swift can drive scroll
-  /// position, and (b) posts `vcScroll` messages with the top-visible block
-  /// index whenever the body scrolls.
-  static let bridgeScript: String = """
-    (function() {
-      function blocks() {
-        return Array.from(document.querySelectorAll('[data-vc-block]'));
-      }
-      window.__vcScrollToBlock = function(idx) {
-        const el = document.querySelector('[data-vc-block="' + idx + '"]');
-        if (el) {
-          el.scrollIntoView({behavior: 'auto', block: 'start'});
+    case .paper:
+      // Warm paper: serif body, narrow measure, generous line height, ink-on-cream.
+      return """
+        /* vc-skin:paper */
+        :root {
+          --vc-preview-text: #2b2620;
+          --vc-preview-muted: #6b6358;
+          --vc-preview-border: #e3d9c6;
+          --vc-preview-code-bg: #f3ecda;
+          --vc-preview-link: #8a5a2b;
+          --vc-preview-row-alt: #f3ecda;
+          --vc-preview-paper-bg: #faf4e6;
+          --vc-preview-page-background: var(--vc-preview-paper-bg);
         }
-      };
-      let pending = false;
-      function report() {
-        const els = blocks();
-        for (const el of els) {
-          const r = el.getBoundingClientRect();
-          if (r.bottom > 0) {
-            const idx = parseInt(el.getAttribute('data-vc-block'), 10);
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vcScroll) {
-              window.webkit.messageHandlers.vcScroll.postMessage({block: idx});
-            }
-            return;
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e8e0d0;
+            --vc-preview-muted: #b3a892;
+            --vc-preview-border: #4a4234;
+            --vc-preview-code-bg: #2b2820;
+            --vc-preview-link: #d9a566;
+            --vc-preview-row-alt: #26231c;
+            --vc-preview-paper-bg: #1d1a14;
+            --vc-preview-page-background: var(--vc-preview-paper-bg);
           }
         }
-      }
-      window.addEventListener('scroll', function() {
-        if (pending) return;
-        pending = true;
-        requestAnimationFrame(function() {
-          pending = false;
-          report();
-        });
-      }, {passive: true});
-    })();
-    """
+        .markdown-body {
+          max-width: 720px;
+          font-family: "New York", Georgia, "Iowan Old Style", "Times New Roman", serif;
+          line-height: 1.78;
+          letter-spacing: 0.1px;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "New York", Georgia, "Iowan Old Style", serif;
+          letter-spacing: 0.2px;
+        }
+        """
+
+    case .code:
+      // Code surface: monospace everything, terminal-ish slate tokens, tight rhythm.
+      return """
+        /* vc-skin:code */
+        :root {
+          --vc-preview-text: #d6deeb;
+          --vc-preview-muted: #8694a8;
+          --vc-preview-border: #20293a;
+          --vc-preview-code-bg: #0d1623;
+          --vc-preview-link: #7fb3ff;
+          --vc-preview-row-alt: #131d2c;
+          --vc-preview-code-surface: #0a121d;
+          --vc-preview-page-background: var(--vc-preview-code-surface);
+        }
+        @media (prefers-color-scheme: light) {
+          :root {
+            --vc-preview-text: #1b2330;
+            --vc-preview-muted: #5a6675;
+            --vc-preview-border: #d2dae6;
+            --vc-preview-code-bg: #eef2f7;
+            --vc-preview-link: #1f6feb;
+            --vc-preview-row-alt: #f1f5fa;
+            --vc-preview-code-surface: #f6f9fc;
+            --vc-preview-page-background: var(--vc-preview-code-surface);
+          }
+        }
+        .markdown-body {
+          max-width: 900px;
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+          line-height: 1.55;
+          font-size: 0.95em;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+          letter-spacing: -0.2px;
+        }
+        """
+
+    case .raw:
+      // Raw: stripped chrome, full width, monospace, near "view source".
+      return """
+        /* vc-skin:raw */
+        .markdown-body {
+          max-width: none;
+          margin: 0;
+          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+          line-height: 1.5;
+          font-size: 0.92em;
+        }
+        .markdown-body pre,
+        .markdown-body code,
+        .markdown-body tt {
+          border: 0 !important;
+          border-radius: 0 !important;
+          background: transparent !important;
+          padding: 0 !important;
+        }
+        .markdown-body blockquote {
+          border-left-width: 2px;
+        }
+        """
+
+    case .notion:
+      // Notion-like: warm neutral ink on white, comfortable measure, red inline
+      // code accent. Palette derived from the Apache-2.0 Typora Notion theme
+      // (cayxc, modified s1m4ne); dark tokens are the upstream values.
+      return """
+        /* vc-skin:notion */
+        :root {
+          --vc-preview-text: #37352f;
+          --vc-preview-muted: #73716d;
+          --vc-preview-border: #e1e7e8;
+          --vc-preview-code-bg: #ededeb;
+          --vc-preview-link: #2383e2;
+          --vc-preview-row-alt: #f7f6f3;
+          --vc-preview-notion-bg: #ffffff;
+          --vc-preview-notion-code: #eb5757;
+          --vc-preview-page-background: var(--vc-preview-notion-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #d4d4d4;
+            --vc-preview-muted: #9c9c9c;
+            --vc-preview-border: #3d3d3d;
+            --vc-preview-code-bg: #292927;
+            --vc-preview-link: #9c9c9c;
+            --vc-preview-row-alt: #202020;
+            --vc-preview-notion-bg: #191919;
+            --vc-preview-notion-code: #eb5757;
+            --vc-preview-page-background: var(--vc-preview-notion-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+          line-height: 1.55;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 700;
+          letter-spacing: -0.01em;
+        }
+        .markdown-body :not(pre) > code,
+        .markdown-body tt {
+          color: var(--vc-preview-notion-code) !important;
+        }
+        """
+
+    case .vista:
+      // Vista: Helvetica technical-doc look with framed, banded, hover-lit
+      // tables.
+      return """
+        /* vc-skin:vista */
+        :root {
+          --vc-preview-text: #1a1a1a;
+          --vc-preview-muted: #555555;
+          --vc-preview-border: #e0e0e0;
+          --vc-preview-code-bg: #f6f8fa;
+          --vc-preview-link: #1f6feb;
+          --vc-preview-row-alt: #fafafa;
+          --vc-preview-vista-bg: #f9f9f9;
+          --vc-preview-vista-thead: #f1f1f1;
+          --vc-preview-vista-hover: #f5f8ff;
+          --vc-preview-page-background: var(--vc-preview-vista-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #dedede;
+            --vc-preview-muted: #aaaaaa;
+            --vc-preview-border: #333333;
+            --vc-preview-code-bg: rgba(245, 245, 245, 0.06);
+            --vc-preview-link: #8ab4f8;
+            --vc-preview-row-alt: #181818;
+            --vc-preview-vista-bg: #101010;
+            --vc-preview-vista-thead: #1f1f1f;
+            --vc-preview-vista-hover: #1a2030;
+            --vc-preview-page-background: var(--vc-preview-vista-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 900px;
+          font-family: "Helvetica Neue", Helvetica, Arial, -apple-system, BlinkMacSystemFont, sans-serif;
+          line-height: 1.6;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 600;
+        }
+        .markdown-body table {
+          border: 1px solid var(--vc-preview-border) !important;
+          border-radius: 6px;
+          border-collapse: separate;
+          border-spacing: 0;
+          overflow: hidden;
+        }
+        .markdown-body thead th {
+          background: var(--vc-preview-vista-thead) !important;
+          font-weight: 600;
+        }
+        .markdown-body tbody tr:nth-child(even) {
+          background: var(--vc-preview-row-alt) !important;
+        }
+        .markdown-body tbody tr:hover {
+          background: var(--vc-preview-vista-hover) !important;
+        }
+        """
+
+    case .mla:
+      // MLA: Times serif, double-spaced, narrow academic measure with indented
+      // paragraphs and a centred title.
+      return """
+        /* vc-skin:mla */
+        :root {
+          --vc-preview-text: #1a1a1a;
+          --vc-preview-muted: #555555;
+          --vc-preview-border: #d8d2c4;
+          --vc-preview-code-bg: #f2efe6;
+          --vc-preview-link: #7a4a1f;
+          --vc-preview-row-alt: #f2efe6;
+          --vc-preview-mla-bg: #fbfaf5;
+          --vc-preview-page-background: var(--vc-preview-mla-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e8e4d8;
+            --vc-preview-muted: #b0a890;
+            --vc-preview-border: #463f31;
+            --vc-preview-code-bg: #262219;
+            --vc-preview-link: #d2a16a;
+            --vc-preview-row-alt: #211d15;
+            --vc-preview-mla-bg: #17140d;
+            --vc-preview-page-background: var(--vc-preview-mla-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 680px;
+          font-family: "Times New Roman", Times, Georgia, serif;
+          line-height: 2.0;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "Times New Roman", Times, Georgia, serif;
+          font-weight: 700;
+        }
+        .markdown-body h1 {
+          text-align: center;
+          font-size: 1.3em;
+        }
+        .markdown-body p {
+          text-indent: 2em;
+          margin: 0;
+        }
+        """
+
+    case .jamstatic:
+      // Jamstatic: Poppins sans, slate body, lilac accents, deep-violet links.
+      return """
+        /* vc-skin:jamstatic */
+        :root {
+          --vc-preview-text: #52525b;
+          --vc-preview-muted: #71717a;
+          --vc-preview-border: #b1a3cc;
+          --vc-preview-code-bg: #f2f7ff;
+          --vc-preview-link: #300a66;
+          --vc-preview-row-alt: #f2f7ff;
+          --vc-preview-jam-bg: #ffffff;
+          --vc-preview-jam-accent: #b1a3cc;
+          --vc-preview-page-background: var(--vc-preview-jam-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #cdd0d6;
+            --vc-preview-muted: #9b9ba6;
+            --vc-preview-border: #4a4060;
+            --vc-preview-code-bg: #262234;
+            --vc-preview-link: #c4b5fd;
+            --vc-preview-row-alt: #242031;
+            --vc-preview-jam-bg: #1b1b22;
+            --vc-preview-jam-accent: #b1a3cc;
+            --vc-preview-page-background: var(--vc-preview-jam-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 860px;
+          font-family: "Poppins", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+          line-height: 1.6;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "Poppins", system-ui, sans-serif;
+          font-weight: 700;
+        }
+        .markdown-body a {
+          font-weight: 700;
+        }
+        .markdown-body blockquote {
+          border-left: 0.3rem solid var(--vc-preview-jam-accent) !important;
+        }
+        """
+
+    case .vercel:
+      // Vercel: Geist-style sans, near-black ink on white, blue links, purple
+      // callout accent. Derived from the MIT Typora Vercel theme (tecladochen);
+      // Geist falls back to the system sans (font fallback policy).
+      return """
+        /* vc-skin:vercel */
+        :root {
+          --vc-preview-text: #171717;
+          --vc-preview-muted: #666666;
+          --vc-preview-border: #eaeaea;
+          --vc-preview-code-bg: #fafafa;
+          --vc-preview-link: #0072f5;
+          --vc-preview-row-alt: #fafafa;
+          --vc-preview-vercel-bg: #ffffff;
+          --vc-preview-vercel-accent: #8e4ec6;
+          --vc-preview-page-background: var(--vc-preview-vercel-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #ededed;
+            --vc-preview-muted: #a1a1a1;
+            --vc-preview-border: #333333;
+            --vc-preview-code-bg: #1a1a1a;
+            --vc-preview-link: #52aeff;
+            --vc-preview-row-alt: #141414;
+            --vc-preview-vercel-bg: #0a0a0a;
+            --vc-preview-vercel-accent: #bf7af0;
+            --vc-preview-page-background: var(--vc-preview-vercel-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 880px;
+          font-family: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+          line-height: 1.65;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 700;
+          letter-spacing: -0.02em;
+        }
+        .markdown-body a {
+          text-decoration: none;
+          border-bottom: 1px solid var(--vc-preview-link);
+        }
+        .markdown-body blockquote {
+          border-left: 3px solid var(--vc-preview-vercel-accent) !important;
+        }
+        .markdown-body pre,
+        .markdown-body code,
+        .markdown-body tt {
+          font-family: "GeistMono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        """
+
+    case .themeable:
+      // Themeable: Inter sans on slate, clean Tailwind-ish palette. Derived from
+      // the MIT Typora Themeable theme (jhildenbiddle); Inter falls back to the
+      // system sans.
+      return """
+        /* vc-skin:themeable */
+        :root {
+          --vc-preview-text: #1e293b;
+          --vc-preview-muted: #64748b;
+          --vc-preview-border: #e2e8f0;
+          --vc-preview-code-bg: #f1f5f9;
+          --vc-preview-link: #2563eb;
+          --vc-preview-row-alt: #f8fafc;
+          --vc-preview-themeable-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-themeable-bg);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e2e8f0;
+            --vc-preview-muted: #94a3b8;
+            --vc-preview-border: #334155;
+            --vc-preview-code-bg: #1e293b;
+            --vc-preview-link: #60a5fa;
+            --vc-preview-row-alt: #1e293b;
+            --vc-preview-themeable-bg: #0f172a;
+            --vc-preview-page-background: var(--vc-preview-themeable-bg);
+          }
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          line-height: 1.7;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-weight: 700;
+          letter-spacing: -0.015em;
+        }
+        """
+
+    case .glass:
+      // Glass: translucent, backdrop-blurred panels over a soft gradient, with
+      // pastel accents. Derived from the MIT Typora Foresee theme (passwordgloo).
+      return """
+        /* vc-skin:glass */
+        :root {
+          --vc-preview-text: #333333;
+          --vc-preview-muted: #666666;
+          --vc-preview-border: rgba(0, 0, 0, 0.08);
+          --vc-preview-code-bg: rgba(255, 255, 255, 0.45);
+          --vc-preview-link: #2f6fb3;
+          --vc-preview-row-alt: rgba(255, 255, 255, 0.35);
+          --vc-preview-glass-panel: rgba(255, 255, 255, 0.40);
+          --vc-preview-glass-grad-a: #e8f0ff;
+          --vc-preview-glass-grad-b: #f6e8ff;
+          --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --vc-preview-text: #e0e0e0;
+            --vc-preview-muted: #a8a8a8;
+            --vc-preview-border: rgba(255, 255, 255, 0.10);
+            --vc-preview-code-bg: rgba(255, 255, 255, 0.06);
+            --vc-preview-link: #b3daff;
+            --vc-preview-row-alt: rgba(255, 255, 255, 0.05);
+            --vc-preview-glass-panel: rgba(40, 40, 50, 0.45);
+            --vc-preview-glass-grad-a: #1b2236;
+            --vc-preview-glass-grad-b: #2a1b36;
+            --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
+          }
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+          line-height: 1.7;
+        }
+        .markdown-body pre,
+        .markdown-body blockquote,
+        .markdown-body table {
+          background: var(--vc-preview-glass-panel) !important;
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          border: 1px solid var(--vc-preview-border) !important;
+          border-radius: 12px;
+        }
+        .markdown-body blockquote {
+          padding: 0.6em 1em;
+        }
+        """
+    }
+  }
 
   static let mathBootstrapScript: String = """
     (function() {
@@ -611,6 +1118,160 @@ final class PreviewWebView: NSView {
     }
     return literal
   }
+
+}
+
+/// Pre-macOS-26 fallback ONLY: plumbs the measured titlebar height into the
+/// CSS offset variable so the page start clears the chrome on systems without
+/// the `obscuredContentInsets` pocket. On macOS 26+ the controller stays
+/// silent — the OS pocket owns both the offset and the scrolled dissolve, and
+/// the CSS variable keeps its 0px default (polarize L3). One offset owner per
+/// OS generation, boundary explicit here.
+final class PreviewTitlebarGlassController: NSObject {
+  static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
+
+  /// Test seam: choreography tests force-engage the pre-26 path on any OS.
+  var engagementOverride: Bool?
+  private var isEngaged: Bool {
+    if let engagementOverride { return engagementOverride }
+    if #available(macOS 26.0, *) { return false }
+    return true
+  }
+
+  static let windowChromeNotifications: [Notification.Name] = [
+    NSWindow.didResizeNotification,
+    NSWindow.didEndLiveResizeNotification,
+    NSWindow.willEnterFullScreenNotification,
+    NSWindow.didEnterFullScreenNotification,
+    NSWindow.willExitFullScreenNotification,
+    NSWindow.didExitFullScreenNotification,
+    NSWindow.didChangeScreenNotification,
+    NSWindow.didChangeBackingPropertiesNotification,
+  ]
+
+  var scriptEvaluator: ((String) -> Void)?
+  var titlebarGlassHeightProvider: ((NSWindow?) -> CGFloat)?
+  private weak var observedWindow: NSWindow?
+  private var contentLayoutObservation: NSKeyValueObservation?
+  private var pendingUpdate: DispatchWorkItem?
+  private var pendingUpdateNeedsForce = false
+  private var lastAppliedHeight: CGFloat?
+
+  deinit {
+    invalidate()
+  }
+
+  static func titlebarGlassHeightScript(height: CGFloat) -> String {
+    // `height` is an already-measured glass height; measurement happens once,
+    // in `WindowChromeRecipe.titlebarGlassHeight` — the only owner of that
+    // number. Here we only clamp to a whole non-negative CSS pixel.
+    let pixelHeight = Int(ceil(max(0, height)))
+    return """
+      document.documentElement.style.setProperty('\(titlebarGlassHeightCSSVariable)', '\(pixelHeight)px');
+      """
+  }
+
+  func invalidate() {
+    pendingUpdate?.cancel()
+    pendingUpdate = nil
+    pendingUpdateNeedsForce = false
+    contentLayoutObservation?.invalidate()
+    contentLayoutObservation = nil
+    if let observedWindow {
+      for name in Self.windowChromeNotifications {
+        NotificationCenter.default.removeObserver(self, name: name, object: observedWindow)
+      }
+    }
+    observedWindow = nil
+  }
+
+  @discardableResult
+  func attach(to nextWindow: NSWindow?) -> CGFloat {
+    guard isEngaged else { return 0 }
+    observeWindowIfNeeded(nextWindow)
+    return apply(force: true)
+  }
+
+  func layoutDidChange() {
+    scheduleUpdate()
+  }
+
+  func fullPageLoadDidStart() {
+    lastAppliedHeight = nil
+    scheduleUpdate(force: true)
+  }
+
+  @discardableResult
+  func navigationDidFinish() -> CGFloat {
+    apply(force: true)
+  }
+
+  @discardableResult
+  func apply(force: Bool = false) -> CGFloat {
+    guard isEngaged else { return 0 }
+    let height =
+      titlebarGlassHeightProvider?(observedWindow)
+      ?? WindowChromeRecipe.titlebarGlassHeight(for: observedWindow)
+    guard force || lastAppliedHeight != height else {
+      return height
+    }
+
+    lastAppliedHeight = height
+    scriptEvaluator?(Self.titlebarGlassHeightScript(height: height))
+    return height
+  }
+
+  private func observeWindowIfNeeded(_ nextWindow: NSWindow?) {
+    guard observedWindow !== nextWindow else { return }
+
+    if let observedWindow {
+      for name in Self.windowChromeNotifications {
+        NotificationCenter.default.removeObserver(self, name: name, object: observedWindow)
+      }
+    }
+    observedWindow = nextWindow
+
+    guard let nextWindow else { return }
+
+    for name in Self.windowChromeNotifications {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(windowChromeGeometryDidChange(_:)),
+        name: name,
+        object: nextWindow)
+    }
+
+    // The resize/fullscreen notifications above never fire for the one chrome
+    // change every document window goes through: SwiftUI attaches the toolbar
+    // AFTER the preview joins the window, which shrinks `contentLayoutRect`
+    // without resizing the full-bleed web view (so no layout pass either).
+    // Without this observation the controller keeps the glass height it
+    // measured mid-construction — the stale value that both parked the page
+    // start a band below the editor's and painted the 7-9 underlay stripe.
+    contentLayoutObservation?.invalidate()
+    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) { [weak self] _, _ in
+      self?.scheduleUpdate()
+    }
+  }
+
+  private func scheduleUpdate(force: Bool = false) {
+    pendingUpdateNeedsForce = pendingUpdateNeedsForce || force
+    pendingUpdate?.cancel()
+
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      let force = pendingUpdateNeedsForce
+      pendingUpdateNeedsForce = false
+      pendingUpdate = nil
+      apply(force: force)
+    }
+    pendingUpdate = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
+  }
+
+  @objc private func windowChromeGeometryDidChange(_ notification: Notification) {
+    scheduleUpdate(force: true)
+  }
 }
 
 private struct PreviewLoadIdentity: Equatable {
@@ -629,44 +1290,18 @@ private struct PreviewLoadIdentity: Equatable {
 
 extension PreviewWebView: PreviewSink {}
 
-// MARK: - Notifications
-
-extension Notification.Name {
-  /// Posted by the editor when its visible viewport top changes. UserInfo
-  /// must include `["block": Int]` with the topmost visible block index.
-  static let vcEditorViewportChanged = Notification.Name("Pensieve.editorViewportChanged")
-
-  /// Posted by the preview when its visible viewport top changes. UserInfo
-  /// includes `["block": Int]`. Editor consumes for two-way sync.
-  static let vcPreviewViewportChanged = Notification.Name("Pensieve.previewViewportChanged")
-}
-
-// MARK: - WKScriptMessageHandler proxy
-// Avoids retain cycle: WKWebView ↣ userContentController ↣ handler ↣ NSView.
-// The proxy holds weak ref to the host view.
-
-private final class MessageProxy: NSObject, WKScriptMessageHandler {
-  weak var target: PreviewWebView?
-
-  init(target: PreviewWebView) {
-    self.target = target
-  }
-
-  func userContentController(
-    _ userContentController: WKUserContentController,
-    didReceive message: WKScriptMessage
-  ) {
-    target?.receivedScrollMessage(message.body)
+extension PreviewWebView: ScrollSyncPreviewTarget {
+  func applyScrollSyncPosition(_ position: ScrollSyncPosition) {
+    scrollToScrollSyncPosition(position)
   }
 }
 
-// MARK: - WKNavigationDelegate proxy
-// Singleton: opens activated http(s)/mailto links in the default browser,
-// allows everything else (initial HTML load, JS-driven scrollIntoView, …).
+// MARK: - WKNavigationDelegate
+// Opens activated http(s)/mailto links in the default browser, allows everything
+// else (initial HTML load, JS-driven scrollIntoView, …), and reapplies native
+// chrome measurements after full-page navigations replace the document root.
 
-private final class NavigationProxy: NSObject, WKNavigationDelegate {
-  static let shared = NavigationProxy()
-
+extension PreviewWebView: WKNavigationDelegate {
   func webView(
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction,
@@ -684,5 +1319,13 @@ private final class NavigationProxy: NSObject, WKNavigationDelegate {
       }
     }
     decisionHandler(.allow)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    titlebarGlassController.navigationDidFinish()
+  }
+
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    handleWebContentProcessTermination()
   }
 }

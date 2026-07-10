@@ -2,9 +2,9 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class DocumentWindowRegistry {
+final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
-  private let documentTabbingIdentifier = "Pensieve.DocumentWindow"
+  private let documentTabbingIdentifier = WindowChromeRecipe.documentTabbingIdentifier
 
   typealias DeferredMainWork = @MainActor () -> Void
   /// Builds a fully configured document window WITHOUT ordering it on screen.
@@ -21,6 +21,11 @@ final class DocumentWindowRegistry {
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
+  /// The live tab-group documents in open order — the actual open tabs, NOT the
+  /// WorkspaceStore historical/capped working set. The ONLY observed member;
+  /// maintained in lockstep with windowsByDocumentID (one window per document)
+  /// at the exact same mutation sites, so the sidebar "Open Files" == the tabs.
+  @Published private(set) var openTabDocumentIDs: [URL] = []
   /// Windows born from the tab bar's "+" button: launcher-mode content living
   /// as a document tab. They report no document and no editable buffer on
   /// first attach, which would otherwise classify them as empty launchers and
@@ -29,7 +34,29 @@ final class DocumentWindowRegistry {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  /// Set once the app starts quitting so the last document window's close does
+  /// not resurrect a launcher mid-termination.
+  private var isTerminating = false
+  /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure?
+
+  /// Mark the app as terminating (called from `applicationWillTerminate`) so the
+  /// last-window-close handler suppresses its launcher reopen.
+  func beginTermination() {
+    isTerminating = true
+  }
+
+  /// Opens a new empty launcher window. Used when the app is reactivated from
+  /// the Dock with no visible windows, or during cold start if SwiftUI does not
+  /// provide one automatically.
+  func openLauncherWindow() {
+    guard let factory = makeDocumentWindow else { return }
+    if let launcher = factory(nil) {
+      registerLauncher(launcher)
+      orderAndActivateWindow(launcher)
+    }
+  }
+
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
@@ -106,6 +133,7 @@ final class DocumentWindowRegistry {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
       windowsByDocumentID.removeValue(forKey: documentID)
       orderedDocumentIDs.remove(documentID)
+      forgetOpenDocument(documentID)
     }
 
     guard let makeDocumentWindow else {
@@ -124,6 +152,7 @@ final class DocumentWindowRegistry {
     markContentWindow(window)
     windowsByDocumentID[documentID] = WeakWindow(window)
     orderedDocumentIDs.insert(documentID)
+    recordOpenDocument(documentID)
 
     if let target = currentMergeTarget(), target !== window {
       prepareTabbedWindow(target)
@@ -139,17 +168,54 @@ final class DocumentWindowRegistry {
   /// down: drops every registry mapping so the document can re-open in a
   /// fresh window instead of resurrecting the closed (retained) one.
   func handleDocumentWindowClosed(_ window: NSWindow) {
+    reconcileClosedWindow(window)
+    reopenLauncherIfAppWouldBeWindowless()
+    // Tombstone ONLY on this path (DocumentWindow.onClose): factory windows are
+    // never reused, so rejecting a late re-attach of this exact instance is safe.
+    // The window's SwiftUI accessor may still have an in-flight main-queue pass
+    // that would re-register the closed window (and resurrect it as a phantom
+    // tab); remember the identity while the object is alive so attach() rejects
+    // those late passes. Reusable windows (scenes) must NOT be tombstoned — they
+    // are reconciled via reconcileClosedWindow from the global willClose observer.
+    closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  }
+
+  /// Cleanup WITHOUT tombstoning: forget the window's documents and drop its
+  /// bookkeeping maps. Safe for ANY closing window (the process-wide willClose
+  /// observer routes here), so it never poisons a reusable window instance via a
+  /// closedWindows entry. Idempotent for windows the registry never tracked.
+  func reconcileClosedWindow(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
-    DebugTrace.log("registry.windowClosed '\(window.title)'")
+    DebugTrace.log("registry.reconcileClosed '\(window.title)'")
     releaseStaleDocumentMappings(for: window, keeping: nil)
     contentWindows.removeValue(forKey: windowID)
     launcherWindows.removeValue(forKey: windowID)
     untitledTabWindows.removeValue(forKey: windowID)
-    // The window's SwiftUI accessor may still have an in-flight main-queue
-    // pass that would re-register the closed window (and resurrect it as a
-    // phantom tab). Remember the closed identity for as long as the window
-    // object is alive so attach() can reject those late passes.
-    closedWindows[windowID] = WeakWindow(window)
+  }
+
+  /// After the last document window closes the app is left with no window and
+  /// no focused controller — the New command (which targets the focused
+  /// window's `AppState`) then has nothing to act on, so the user can neither
+  /// see the empty-state surface nor start a new document. Re-open a launcher so
+  /// a window stays alive on the empty state, matching the VS Code-style "last
+  /// editor closed, window remains" behaviour. Deferred so it runs after AppKit
+  /// finishes the in-progress close; suppressed during termination so Quit is
+  /// never fought by a resurrected launcher, and a no-op when any other document
+  /// or launcher window is still alive.
+  private func reopenLauncherIfAppWouldBeWindowless() {
+    guard !isTerminating, makeDocumentWindow != nil else { return }
+    scheduleDeferredMainWork { [weak self] in
+      guard let self, !self.isTerminating else { return }
+      self.purgeClosedLauncherWindows()
+      guard !self.hasContentWindow else { return }
+      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
+      guard !hasLauncher else { return }
+      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
+        $0.window?.contentView != nil
+      }
+      guard !hasLiveDocumentWindow else { return }
+      self.openLauncherWindow()
+    }
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
@@ -194,12 +260,13 @@ final class DocumentWindowRegistry {
       DebugTrace.log("registry.attach rejected: window already closed")
       return
     }
-    // Factory-built document windows keep their tabbing identifier so the
-    // system keeps grouping them (and keeps showing "+"); only windows from
-    // other origins (launcher scene, restored scenes) are normalized back to
-    // standalone tabbing.
+    // Every document window — factory-built, restored, or launcher-promoted —
+    // shares the document tabbing identifier so the system keeps grouping them
+    // (the "+" button) AND keeps "Window > Merge All Windows" enabled. That menu
+    // greys out when windows don't share an identifier, so non-factory windows
+    // are normalized ONTO the shared identifier, never nilled into mergeless islands.
     if window.tabbingIdentifier != documentTabbingIdentifier {
-      prepareStandaloneTabbing(for: window)
+      prepareTabbedWindow(window)
     }
 
     guard let documentID = documentID?.standardizedFileURL else {
@@ -236,6 +303,7 @@ final class DocumentWindowRegistry {
       orderedDocumentIDs.remove(documentID)
     }
     windowsByDocumentID[documentID] = WeakWindow(window)
+    recordOpenDocument(documentID)
 
     guard canMutateWindowTabs() else {
       deferAttach(window, documentID: documentID)
@@ -247,10 +315,27 @@ final class DocumentWindowRegistry {
 
   func closeWindowIfEmptyLauncher(_ window: NSWindow?) {
     guard let window else { return }
+    // Reaping never closes the window the user is looking at (see
+    // `isReapSafe`): an empty launcher the user is focused on is the empty
+    // state, not garbage.
+    guard isReapSafe(window) else { return }
     let windowID = ObjectIdentifier(window)
     guard contentWindows[windowID]?.window == nil else { return }
     launcherWindows.removeValue(forKey: windowID)
     closeWindow(window)
+  }
+
+  /// Architectural invariant for the empty/no-document state: reaping is
+  /// cleanup of REDUNDANT or PHANTOM empty launchers (notably the invisible
+  /// `<untitled>` WindowGroup scenes SwiftUI leaks) — it must NEVER close the
+  /// window the user is actually looking at. A visible, focused window IS the
+  /// user's surface (an open document OR the empty-state placeholder); it may
+  /// only be closed by an explicit user action (red button, Close menu →
+  /// `closeDocumentWindow`/`closeAllDocumentWindows`), never as a reap side
+  /// effect. This is what keeps the empty state durable instead of flashing
+  /// and dying.
+  private func isReapSafe(_ window: NSWindow) -> Bool {
+    !(window.isVisible && (window.isKeyWindow || window.isMainWindow))
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
@@ -268,7 +353,39 @@ final class DocumentWindowRegistry {
       DebugTrace.log("release stale mapping \(staleID.lastPathComponent) from '\(window.title)'")
       windowsByDocumentID.removeValue(forKey: staleID)
       orderedDocumentIDs.remove(staleID)
+      forgetOpenDocument(staleID)
     }
+  }
+
+  /// Publish a document into the observed open-tab list. Idempotent: open() and a
+  /// later attach() both fire for the same doc, and re-attaches on window moves
+  /// must not duplicate or reorder an already-tracked document.
+  private func recordOpenDocument(_ documentID: URL) {
+    guard !openTabDocumentIDs.contains(documentID) else { return }
+    openTabDocumentIDs.append(documentID)
+  }
+
+  /// Drop a document from the observed open-tab list when its last window goes
+  /// away (close) or it is swapped out of a window (in-place document switch).
+  /// Guarded so a forget for an untracked doc emits no spurious objectWillChange.
+  private func forgetOpenDocument(_ documentID: URL) {
+    guard openTabDocumentIDs.contains(documentID) else { return }
+    openTabDocumentIDs.removeAll { $0 == documentID }
+  }
+
+  /// Close the window/tab currently showing `documentID` (sidebar "Close from
+  /// Open Files"). The close drives the normal teardown → forgetOpenDocument, so
+  /// the published list updates itself; no direct list mutation here.
+  func closeDocumentWindow(_ documentID: URL) {
+    guard let window = windowsByDocumentID[documentID.standardizedFileURL]?.window else { return }
+    closeWindow(window)
+  }
+
+  /// Close every open document tab (sidebar "Clear Open Files"). Snapshot first:
+  /// closeWindow mutates the maps the list is derived from.
+  func closeAllDocumentWindows() {
+    let windows = openTabDocumentIDs.compactMap { windowsByDocumentID[$0]?.window }
+    for window in windows { closeWindow(window) }
   }
 
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
@@ -326,10 +443,39 @@ final class DocumentWindowRegistry {
       launcherSweepPending = false
       let activeWindow = launcherSweepSparedWindow?.window
       purgeClosedLauncherWindows()
-      for window in applicationWindows()
-      where window !== activeWindow && isEmptyLauncherWindow(window, includingUntracked: true) {
-        closeWindow(window)
+      let allWindows = applicationWindows()
+      let reapable = allWindows.filter {
+        $0 !== activeWindow && self.isEmptyLauncherWindow($0, includingUntracked: true)
       }
+      self.reapLaunchersKeepingLastWindow(reapable, among: allWindows)
+    }
+  }
+
+  /// Close the reapable empty launchers — but NEVER if it would leave the app
+  /// with zero windows. Reaping the only window leaves the app alive yet
+  /// windowless (the empty state simply vanishes), and paired with
+  /// reopen-on-empty it degenerates into a reopen→reap→flash loop. As long as
+  /// some other window survives the sweep (a real document window, tracked or
+  /// not), reap every redundant launcher; only when ALL windows would be reaped
+  /// do we keep one so the user still lands on the empty-state surface.
+  func reapLaunchersKeepingLastWindow(
+    _ reapable: [NSWindow],
+    among allWindows: [NSWindow]
+  ) {
+    // Architectural invariant (see `isReapSafe`): the reaping sweep never
+    // closes the window the user is currently looking at. The earlier
+    // "windowless" failure was exactly this — the sweep counted a phantom
+    // invisible `<untitled>` WindowGroup scene as a survivor and then reaped
+    // the visible empty-state window beside it. Drop visible/focused windows
+    // from the kill list entirely; they survive on their own merit.
+    var toClose = reapable.filter(isReapSafe)
+    let toCloseIDs = Set(toClose.map(ObjectIdentifier.init))
+    let aSurvivorRemains = allWindows.contains { !toCloseIDs.contains(ObjectIdentifier($0)) }
+    if !aSurvivorRemains, !toClose.isEmpty {
+      toClose.removeLast()
+    }
+    for window in toClose {
+      closeWindow(window)
     }
   }
 
@@ -371,13 +517,6 @@ final class DocumentWindowRegistry {
     contentWindows[windowID] = WeakWindow(window)
   }
 
-  private func prepareStandaloneTabbing(for window: NSWindow) {
-    window.tabbingMode = .automatic
-    if (window.tabbedWindows?.count ?? 1) <= 1 {
-      window.setValue(nil, forKey: "tabbingIdentifier")
-    }
-  }
-
   private func prepareTabbedWindow(_ window: NSWindow) {
     window.tabbingMode = .automatic
     window.tabbingIdentifier = documentTabbingIdentifier
@@ -390,13 +529,12 @@ final class DocumentWindowRegistry {
       let preferredLauncher = preferredLauncherID.flatMap { self.launcherWindows[$0]?.window }
       let shouldCloseAllLaunchers =
         hasContentWindow || hasVisibleContentWindow(except: preferredLauncher)
-      for window in applicationWindows()
-      where isEmptyLauncherWindow(window, includingUntracked: shouldCloseAllLaunchers)
-        && (shouldCloseAllLaunchers
-          || window !== preferredLauncher)
-      {
-        closeWindow(window)
+      let allWindows = applicationWindows()
+      let reapable = allWindows.filter { window in
+        self.isEmptyLauncherWindow(window, includingUntracked: shouldCloseAllLaunchers)
+          && (shouldCloseAllLaunchers || window !== preferredLauncher)
       }
+      self.reapLaunchersKeepingLastWindow(reapable, among: allWindows)
     }
   }
 

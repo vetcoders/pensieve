@@ -61,7 +61,24 @@ struct AgentDispatchMetadata: Equatable, Sendable {
 }
 
 protocol AgentPromptLaunching: Sendable {
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata
+}
+
+enum AgentDispatchPayload: Equatable, Sendable {
+  case prompt(String)
+  case file(String)
+
+  var isEmpty: Bool {
+    switch self {
+    case .prompt(let value), .file(let value):
+      return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+  }
 }
 
 enum AgentPromptLauncherError: LocalizedError {
@@ -92,9 +109,15 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     {
       candidates.append(override)
     }
-    candidates.append(
-      FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(defaultExecutableRelativePath).path)
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    // Canonical CLI entry: the `vibecrafted` symlink in ~/.local/bin → the uv-core
+    // command surface. This is the headless-friendly entry that prints a parseable
+    // launch receipt (`run_id:` / report path) and detaches the run. The legacy bash
+    // "command deck" below targets an interactive terminal/zellij session; launched
+    // from this GUI Process (no TTY) it produces no usable run — the "dispatch does
+    // nothing" the operator hit. Prefer uv-core; keep the deck as a fallback.
+    candidates.append(home.appendingPathComponent(".local/bin/vibecrafted").path)
+    candidates.append(home.appendingPathComponent(defaultExecutableRelativePath).path)
 
     for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
       return candidate
@@ -102,11 +125,29 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     throw AgentPromptLauncherError.executableNotFound(searchedPaths: candidates)
   }
 
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+  static func arguments(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload
+  ) -> [String] {
+    switch payload {
+    case .prompt(let prompt):
+      return [workflow, agent, "--prompt", prompt]
+    case .file(let path):
+      return [workflow, agent, "--file", path]
+    }
+  }
+
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata {
     let executablePath = try Self.resolveExecutablePath()
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = ["implement", "codex", "--prompt", prompt]
+    process.arguments = Self.arguments(workflow: workflow, agent: agent, payload: payload)
     process.currentDirectoryURL = workingDirectoryURL
 
     let stdout = Pipe()

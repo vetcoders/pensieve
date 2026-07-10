@@ -21,6 +21,23 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertNotEqual(a, differentTheme)
   }
 
+  func testRenderRequestClassifiesMarkdownExtensionsAndPlainScripts() {
+    let markdown = PreviewRenderRequest(
+      markdown: "# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/notes/a.mdown"))
+    XCTAssertEqual(markdown.renderMode, .markdown)
+
+    let text = PreviewRenderRequest(
+      markdown: "# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/notes/a.txt"))
+    XCTAssertEqual(text.renderMode, .plainText)
+
+    let extensionlessScript = PreviewRenderRequest(
+      markdown: "#!/bin/zsh\n# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/vibecrafted-rescue"))
+    XCTAssertEqual(extensionlessScript.renderMode, .plainText)
+  }
+
   // MARK: - Document construction
 
   func testMakeDocumentEmbedsBodyThemeCSSAndFontSize() {
@@ -47,8 +64,9 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("--vc-font-size: 17px"))
     XCTAssertTrue(document.html.contains("@media (prefers-color-scheme: dark)"))
 
-    // Viewport bridge script is embedded so block-level scroll sync stays wired.
-    XCTAssertTrue(document.html.contains("window.__vcScrollToBlock"))
+    // The old editor-preview scroll bridge was removed; preview documents
+    // should not ship the dead bridge script.
+    XCTAssertFalse(document.html.contains("window.__vcScrollToBlock"))
     XCTAssertFalse(document.html.contains("window.mermaid"))
 
     XCTAssertEqual(document.baseURL?.path, URL(fileURLWithPath: "/tmp").path)
@@ -244,7 +262,7 @@ final class PreviewPipelineTests: XCTestCase {
       markdown: "# Heading\n\nBody.",
       fontSize: 16,
       theme: .markdown,
-      documentURL: nil
+      documentURL: URL(fileURLWithPath: "/tmp/notes/entry.md")
     )
 
     let document = pipeline.makeDocument(for: request)
@@ -252,6 +270,34 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("<h1 data-vc-block=\"0\">Heading</h1>"))
     XCTAssertTrue(document.html.contains("<p data-vc-block=\"1\">Body.</p>"))
     XCTAssertTrue(document.html.contains("--vc-font-size: 16px"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentRendersScriptsAsPlainTextWithoutHeadings() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let source = "#!/bin/zsh\n# komentarz\n# ────\necho '<done>'"
+    let urls = [
+      URL(fileURLWithPath: "/tmp/vibecrafted-rescue.sh"),
+      URL(fileURLWithPath: "/tmp/vibecrafted-rescue.txt"),
+    ]
+
+    for url in urls {
+      let request = PreviewRenderRequest(
+        markdown: source,
+        fontSize: 16,
+        theme: .markdown,
+        documentURL: url
+      )
+
+      let document = pipeline.makeDocument(for: request)
+
+      XCTAssertTrue(document.html.contains("<pre class=\"vc-plain-text\""))
+      XCTAssertTrue(document.html.contains("# komentarz"))
+      XCTAssertTrue(document.html.contains("# ────"))
+      XCTAssertTrue(document.html.contains("&lt;done&gt;"))
+      XCTAssertTrue(document.html.contains("font-size: var(--vc-font-size)"))
+      XCTAssertFalse(document.html.contains("<h1"), document.html)
+    }
   }
 
   @MainActor

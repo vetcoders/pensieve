@@ -12,7 +12,7 @@ final class WorkspaceMetadataStore {
     .completeFileProtection,
   ]
   private static let fallbackWriteOptions: Data.WritingOptions = [
-    .atomic,
+    .atomic
   ]
 
   private let metadataURL: URL

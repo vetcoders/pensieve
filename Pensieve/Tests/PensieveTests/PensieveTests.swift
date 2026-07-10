@@ -32,7 +32,16 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertNotNil(surface.textStorage.attribute(.font, at: 0, effectiveRange: nil))
 
     let updatedText = "## Updated\n\nBinding changes must reach AppKit."
-    surface.update(text: updatedText, fontSize: 18, syntaxHighlightingEnabled: true)
+    surface.update(
+      text: updatedText,
+      fontSize: 18,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      findQuery: "",
+      findBarVisible: false
+    )
 
     XCTAssertEqual(surface.textView.string, updatedText)
     XCTAssertEqual(surface.textView.gutter?.fontSize, 18)
@@ -334,7 +343,16 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
       NSColor.textColor)
 
-    surface.update(text: storage.string, fontSize: 14, syntaxHighlightingEnabled: true)
+    surface.update(
+      text: storage.string,
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      findQuery: "",
+      findBarVisible: false
+    )
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
@@ -695,6 +713,113 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
   }
 
+  /// Save-on-close guard: closing a window/tab within the autosave debounce
+  /// window (≤1.5s of the last edit) must NOT drop the unsaved change. The
+  /// debounce here is set to a minute so the scheduled autosave cannot have
+  /// fired — the only path that reaches disk is the synchronous close-flush.
+  @MainActor
+  func testSavePendingChangesOnCloseFlushesTitledDocumentBeforeDebounce() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseFlushTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("close.md")
+    try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "initial")
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder)
+    )
+
+    appState.activeDocumentText = "edited within the debounce window"
+    store.documentDidChange(appState: appState)
+    XCTAssertTrue(appState.activeDocumentDirty)
+    // The debounced write has NOT fired yet — disk still holds the old text.
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "initial")
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "edited within the debounce window")
+    XCTAssertFalse(appState.activeDocumentDirty)
+  }
+
+  /// An untitled buffer closed inside the debounce window keeps its content as a
+  /// recovery draft — exactly what the pending autosave would have written.
+  @MainActor
+  func testSavePendingChangesOnCloseWritesRecoveryDraftForUntitled() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveCloseFlushUntitledTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
+    let appState = AppState()
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+
+    appState.documentSession.createUntitled(title: "Untitled.md")
+    appState.activeDocumentText = "unsaved draft in a fast-closed window"
+    store.documentDidChange(appState: appState)
+    // Debounced recovery write has NOT fired yet.
+    XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().first?.text, "unsaved draft in a fast-closed window")
+  }
+
+  /// A clean (non-dirty) buffer must not be re-written on close — the guard is a
+  /// no-op so closing pristine windows never churns disk or the index.
+  @MainActor
+  func testSavePendingChangesOnCloseIsNoOpWhenClean() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveCloseFlushCleanTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("clean.md")
+    try "pristine".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "pristine")
+
+    var writeCount = 0
+    let store = DocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      writeDocument: { text, url in
+        writeCount += 1
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    )
+
+    XCTAssertFalse(store.savePendingChangesOnClose(appState: appState))
+    XCTAssertEqual(writeCount, 0)
+  }
+
   @MainActor
   func testFolderOpenImportsMarkdownRecursivelyAndSkipsDefaultNoise() throws {
     let folder = FileManager.default.temporaryDirectory
@@ -988,7 +1113,9 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(scanStarted.wait(timeout: .now() + 1), .success)
     XCTAssertEqual(appState.workspaceRoots.map(\.url), [folder.standardizedFileURL])
-    XCTAssertEqual(appState.workspaceActivity?.title, "Importing Workspace")
+    // Cut 4-1: DURING the walk the open flow does not yet know whether an import is
+    // coming, so it presents the honest `.opening` state — never "Importing Workspace".
+    XCTAssertEqual(appState.workspaceActivity?.title, "Opening Workspace")
     XCTAssertTrue(appState.workspaceActivity?.detail.contains(folder.lastPathComponent) == true)
     XCTAssertNotNil(appState.workspaceActivity?.progress)
 
@@ -2499,7 +2626,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     // Multi-root falls back to the cold scan path (cache fast-path is single-root
     // only), so adding a second folder must keep BOTH roots and import both files —
-    // not block with a multi-root error (that was the B-1b regression Maciej hit).
+    // not block with a multi-root error (that was the B-1b regression we hit).
     XCTAssertNil(appState.lastError)
     XCTAssertEqual(
       Set(appState.workspaceRoots.map(\.url)),
@@ -2685,6 +2812,61 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.activeDocumentText, "first body")
     XCTAssertTrue(appState.lastError?.contains(".md, .markdown, or .txt") == true)
     XCTAssertTrue(appState.workspaceRoots.isEmpty)
+  }
+
+  @MainActor
+  func testBareLaunchSettlesAndShowsLauncherWhenSavedWorkspaceIsGone() async throws {
+    let suiteName = "PensieveBareLaunchTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let removedFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRemovedWorkspace-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: removedFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: removedFolder)
+    }
+
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    try bookmarkStore.persistRoot(url: removedFolder, into: AppState())
+    try FileManager.default.removeItem(at: removedFolder)
+
+    let indexFolder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveBareLaunchIndex-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: indexFolder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: indexFolder)
+    }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: indexFolder)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore
+    )
+    let controller = AppController(
+      appState: appState,
+      folderManager: manager,
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    var startupDecisionCount = 0
+
+    coordinator.startWhenLaunchIntentsSettle(controller: controller) {
+      startupDecisionCount += 1
+    }
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(startupDecisionCount, 1)
+    XCTAssertTrue(appState.workspaceRoots.isEmpty)
+    XCTAssertTrue(appState.openFiles.isEmpty)
+    XCTAssertNil(appState.documentSession.url)
+    XCTAssertNil(appState.lastError)
   }
 
   @MainActor
@@ -3701,6 +3883,88 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenFileRoutesDirectoryToWorkspaceOpen() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileDirectoryTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("alpha.md")
+    try "alpha".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: folder)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "a directory must open as a workspace, never route to a document window/tab")
+    XCTAssertEqual(
+      appState.workspaceRoots.map { $0.url.resolvingSymlinksInPath() },
+      [folder.resolvingSymlinksInPath()],
+      "a directory handed to the file-open funnel must become a workspace root")
+    XCTAssertEqual(
+      appState.documents.map { $0.url.resolvingSymlinksInPath() },
+      [noteURL.resolvingSymlinksInPath()]
+    )
+    XCTAssertNil(
+      appState.lastError,
+      "a directory open must not surface the unsupported-file error")
+  }
+
+  @MainActor
+  func testLaunchFolderIntentOpensWorkspaceInsteadOfRejectingIt() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveLaunchFolderIntentTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("alpha.md")
+    try "alpha".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [folder])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(
+      appState.workspaceRoots.map { $0.url.resolvingSymlinksInPath() },
+      [folder.resolvingSymlinksInPath()],
+      "launching with a folder URL must open it as a workspace")
+    XCTAssertNil(appState.lastError)
+  }
+
+  @MainActor
   func testOpenFileFallsBackToInWindowLoadWithoutRouting() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
@@ -3737,7 +4001,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testOpenDocumentWindowReusesEmptyWindowBeforeCreatingTab() throws {
+  func testDefaultClickSelectsInPlaceAndExplicitGestureRoutesToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
@@ -3766,31 +4030,44 @@ final class PensieveSmokeTests: XCTestCase {
     controller.openFolder(url: folder)
     controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty, "an empty window is reused in place")
+    XCTAssertTrue(requestedRefs.isEmpty, "a default click never spawns a window")
     XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "alpha")
+
+    // VS Code / Zed model: a default click on another document loads it in place,
+    // reusing the current window — it does NOT route to the registry.
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertTrue(
+      requestedRefs.isEmpty,
+      "a default click on another document loads in place, never routing to the registry")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "the current window swaps to the clicked document")
+    XCTAssertEqual(appState.activeDocumentText, "beta")
 
     controller.openDocumentWindow(id: betaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
-      "tab per document: a list click on another document routes to the registry")
-    XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
-      "the originating window keeps its document while the tab materializes")
-
-    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
-
-    XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
       "clicking the currently displayed document is a no-op")
 
-    // The explicit context-menu gesture rides the same path.
+    // Only the explicit "Open in New Window" gesture routes to the registry, and
+    // only for a document the window is not already showing.
+    controller.openDocumentInNewWindow(id: alphaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
+      "the explicit gesture opens the document in a new window/tab")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "the originating window keeps its document while the new window materializes")
+
     controller.openDocumentInNewWindow(id: betaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL),
-      [betaURL.standardizedFileURL, betaURL.standardizedFileURL])
+      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
+      "the explicit gesture on the currently displayed document is a no-op")
   }
 
   @MainActor
@@ -3929,7 +4206,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testDocumentWindowAttachDoesNotForceTabbedIdentifierForStandaloneDocument() throws {
+  func testDocumentWindowAttachSharesMergeableTabbingIdentifierForStandaloneDocument() throws {
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
@@ -3950,7 +4227,10 @@ final class PensieveSmokeTests: XCTestCase {
     registry.attach(window, documentID: documentID)
 
     XCTAssertEqual(window.tabbingMode, .automatic)
-    XCTAssertNotEqual(window.tabbingIdentifier, "Pensieve.DocumentWindow")
+    XCTAssertEqual(
+      window.tabbingIdentifier, "Pensieve.DocumentWindow",
+      "non-factory document windows must share the document tabbing identifier so "
+        + "Window > Merge All Windows stays enabled (it greys out without a shared id)")
   }
 
   @MainActor

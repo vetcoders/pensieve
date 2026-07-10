@@ -95,6 +95,9 @@ final class BookmarkStore {
       ? defaults.data(forKey: legacyFolderBookmarkKey).map { [$0] } ?? []
       : rootBookmarkData
     let files = fileBookmarkData
+    // Persisted-blob counts BEFORE resolution — distinguishes "no saved workspace"
+    // from "saved bookmarks failed to resolve" when tracing startup restores.
+    DebugTrace.log("open bookmarks persisted roots=\(roots.count) files=\(files.count)")
 
     appState.bookmarkData = roots.first
 
@@ -201,7 +204,9 @@ final class BookmarkStore {
 
         return url
       } catch {
-        appState.lastError = "Could not restore saved workspace item: \(error.localizedDescription)"
+        // Missing/stale saved workspace entries are startup state, not a user action failure.
+        // Bare launch must still present the empty launcher instead of surfacing an old bookmark
+        // error when the only saved folder was removed outside Pensieve.
         return nil
       }
     }

@@ -13,6 +13,17 @@ struct TreeFingerprint: Codable, Equatable {
     return try compute(from: scans, root: root)
   }
 
+  static func compute(roots: [URL], exclusions: Set<String>) throws -> TreeFingerprint {
+    let roots = roots.map(\.standardizedFileURL)
+    guard roots.count != 1 else {
+      return try compute(rootURL: roots[0], exclusions: exclusions)
+    }
+
+    let sortedRoots = canonicalRootOrder(roots)
+    let scans = WorkspaceScanner.build(rootURLs: sortedRoots, exclusions: exclusions)
+    return try compute(from: scans, roots: sortedRoots)
+  }
+
   /// Computes the SAME fingerprint v1 as `compute(rootURL:exclusions:)` but from an
   /// already-walked `[WorkspaceScan]` instead of re-walking the filesystem. The cold-open path
   /// has already built the workspace tree once (`workspaceBuilder`), so feeding that single walk
@@ -52,6 +63,65 @@ struct TreeFingerprint: Codable, Equatable {
     )
   }
 
+  static func compute(from scans: [WorkspaceScan], roots: [URL]) throws -> TreeFingerprint {
+    let roots = roots.map(\.standardizedFileURL)
+    guard roots.count != 1 else {
+      return try compute(from: scans, root: roots[0])
+    }
+
+    let sortedRoots = canonicalRootOrder(roots)
+    let documents = scans.flatMap(\.documents)
+    let entries = try documents.map { document in
+      let rootIndex = try rootIndex(for: document, in: sortedRoots)
+      let root = sortedRoots[rootIndex]
+      let relativePath =
+        document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
+      let values = try document.url.resourceValues(forKeys: [
+        .contentModificationDateKey,
+        .fileSizeKey,
+      ])
+      let mtime = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+      let size = values.fileSize ?? 0
+      return FingerprintEntry(
+        relativePath: "\(rootIndex):\(relativePath)", mtime: mtime, size: size)
+    }
+    .sorted { $0.relativePath < $1.relativePath }
+
+    let payload =
+      entries
+      .map { "\($0.relativePath)|\($0.mtime)|\($0.size)\n" }
+      .joined()
+
+    return TreeFingerprint(
+      treeHash: WorkspaceHash.sha256Hex(payload),
+      fileCount: entries.count,
+      folderCount: scans.reduce(0) { $0 + visibleFolderCount(in: $1.rootNode) },
+      computedAt: Date(),
+      algorithmVersion: 2
+    )
+  }
+
+  private static func canonicalRootOrder(_ roots: [URL]) -> [URL] {
+    roots.sorted { $0.path < $1.path }
+  }
+
+  private static func rootIndex(for document: DocumentRef, in roots: [URL]) throws -> Int {
+    if let documentRoot = document.rootURL?.standardizedFileURL,
+      let exactIndex = roots.firstIndex(where: { $0.path == documentRoot.path })
+    {
+      return exactIndex
+    }
+
+    let documentURL = document.url.standardizedFileURL
+    if let containingIndex = roots.firstIndex(where: {
+      WorkspaceScanner.contains(documentURL, in: $0)
+    }) {
+      return containingIndex
+    }
+
+    throw FingerprintError.documentOutsideRoots(documentURL)
+  }
+
   private static func visibleFolderCount(in node: WorkspaceNode) -> Int {
     guard node.kind == .folder, let children = node.children, !children.isEmpty else {
       return 0
@@ -63,6 +133,10 @@ struct TreeFingerprint: Codable, Equatable {
     var relativePath: String
     var mtime: Int
     var size: Int
+  }
+
+  private enum FingerprintError: Error {
+    case documentOutsideRoots(URL)
   }
 }
 
@@ -97,7 +171,7 @@ final class WorkspaceCacheStore {
     .completeFileProtection,
   ]
   private static let fallbackWriteOptions: Data.WritingOptions = [
-    .atomic,
+    .atomic
   ]
 
   private let baseDirectory: URL

@@ -91,7 +91,7 @@ dist/
 *.txt
 *.log
 # Broad on purpose: internal docs (specs, plans, agent prompts) sync between
-# machines over Tailscale + rsync, NOT through git/GitHub. Keep all markdown out
+# machines via rsync, NOT through git/GitHub. Keep all markdown out
 # except the named governance/root files below.
 *.md
 !README.md
@@ -101,9 +101,13 @@ dist/
 !CONTRIBUTING.md
 !SECURITY.md
 !AGENTS.md
+!THIRD_PARTY_THEMES.md
 /tmp
 /dist
 /docs/superpowers
 *.backup
 /docs/workforce
 /.claude
+
+# vibecrafted-hooks-template warns retention
+.husky/warns/

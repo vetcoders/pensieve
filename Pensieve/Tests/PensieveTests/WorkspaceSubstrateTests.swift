@@ -389,6 +389,67 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(before.fileCount, after.fileCount)
   }
 
+  func testTreeFingerprintFromScansRootsSingleRootMatchesLegacyPath() throws {
+    let root = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: root)
+    _ = try writeFile("beta", named: "beta.markdown", in: root)
+    let scans = WorkspaceScanner.build(rootURLs: [root.standardizedFileURL], exclusions: [])
+
+    let legacy = try TreeFingerprint.compute(from: scans, root: root.standardizedFileURL)
+    let generalized = try TreeFingerprint.compute(from: scans, roots: [root])
+    let legacyWalk = try TreeFingerprint.compute(rootURL: root, exclusions: [])
+    let generalizedWalk = try TreeFingerprint.compute(roots: [root], exclusions: [])
+
+    XCTAssertEqual(generalized.treeHash, legacy.treeHash)
+    XCTAssertEqual(generalized.fileCount, legacy.fileCount)
+    XCTAssertEqual(generalized.folderCount, legacy.folderCount)
+    XCTAssertEqual(generalized.algorithmVersion, legacy.algorithmVersion)
+    XCTAssertEqual(generalizedWalk.treeHash, legacyWalk.treeHash)
+    XCTAssertEqual(generalizedWalk.fileCount, legacyWalk.fileCount)
+    XCTAssertEqual(generalizedWalk.folderCount, legacyWalk.folderCount)
+    XCTAssertEqual(generalizedWalk.algorithmVersion, legacyWalk.algorithmVersion)
+  }
+
+  func testTreeFingerprintMultiRootQualifiesSameRelativePaths() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    let firstNotes = firstRoot.appendingPathComponent("notes", isDirectory: true)
+    let secondNotes = secondRoot.appendingPathComponent("notes", isDirectory: true)
+    try FileManager.default.createDirectory(at: firstNotes, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondNotes, withIntermediateDirectories: true)
+    let firstFile = try writeFile("same body", named: "todo.md", in: firstNotes)
+    let secondFile = try writeFile("same body", named: "todo.md", in: secondNotes)
+    let matchingMTime = Date(timeIntervalSince1970: 1_800)
+    try setModificationDate(matchingMTime, for: firstFile)
+    try setModificationDate(matchingMTime, for: secondFile)
+
+    let scans = WorkspaceScanner.build(rootURLs: [firstRoot, secondRoot], exclusions: [])
+    let generalized = try TreeFingerprint.compute(from: scans, roots: [firstRoot, secondRoot])
+    let legacyUnqualified = try TreeFingerprint.compute(
+      from: scans, root: firstRoot.standardizedFileURL)
+    let singleRoot = try TreeFingerprint.compute(rootURL: firstRoot, exclusions: [])
+
+    XCTAssertEqual(generalized.fileCount, 2)
+    XCTAssertEqual(generalized.algorithmVersion, 2)
+    XCTAssertNotEqual(generalized.treeHash, singleRoot.treeHash)
+    XCTAssertNotEqual(generalized.treeHash, legacyUnqualified.treeHash)
+  }
+
+  func testTreeFingerprintMultiRootIsOrderIndependent() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+
+    let firstOrder = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    let reversedOrder = try TreeFingerprint.compute(roots: [secondRoot, firstRoot], exclusions: [])
+
+    XCTAssertEqual(firstOrder.treeHash, reversedOrder.treeHash)
+    XCTAssertEqual(firstOrder.fileCount, reversedOrder.fileCount)
+    XCTAssertEqual(firstOrder.folderCount, reversedOrder.folderCount)
+    XCTAssertEqual(firstOrder.algorithmVersion, reversedOrder.algorithmVersion)
+  }
+
   func testTreeFingerprintRoundtripsCodable() throws {
     let fingerprint = TreeFingerprint(
       treeHash: "abc123",
@@ -730,10 +791,157 @@ final class WorkspaceSubstrateTests: XCTestCase {
     }
   }
 
+  // MARK: - Multi-root verdicts (Cut 2-1)
+
+  func testSubstrateValidateProducesValidVerdictForTwoRoots() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    let manifest = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    XCTAssertEqual(
+      try substrate.validate(
+        identity: identity, currentRoots: [firstRoot, secondRoot], currentExclusions: []),
+      .valid(manifest)
+    )
+  }
+
+  func testSubstrateValidateTwoRootsReorderStaysValid() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    let manifest = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    // Reordering the roots is NOT a move: the set is identical, so the verdict is still valid.
+    XCTAssertEqual(
+      try substrate.validate(
+        identity: identity, currentRoots: [secondRoot, firstRoot], currentExclusions: []),
+      .valid(manifest)
+    )
+  }
+
+  func testSubstrateValidateProducesRootMovedWhenRootRemoved() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    _ = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    let verdict = try substrate.validate(
+      identity: identity, currentRoots: [firstRoot], currentExclusions: [])
+
+    guard case .stale(.rootMoved, let storedManifest, _) = verdict else {
+      return XCTFail("Expected rootMoved after removing a root, got \(verdict)")
+    }
+    XCTAssertNil(storedManifest)
+  }
+
+  func testSubstrateValidateProducesRootMovedWhenRootAdded() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    let thirdRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+    _ = try writeFile("gamma", named: "gamma.md", in: thirdRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    _ = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    let verdict = try substrate.validate(
+      identity: identity, currentRoots: [firstRoot, secondRoot, thirdRoot], currentExclusions: [])
+
+    guard case .stale(.rootMoved, let storedManifest, _) = verdict else {
+      return XCTFail("Expected rootMoved after adding a root, got \(verdict)")
+    }
+    XCTAssertNil(storedManifest)
+  }
+
+  func testSubstrateValidateDetectsFileEvidenceChangeInSecondRoot() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    let secondFile = try writeFile("beta", named: "beta.md", in: secondRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    _ = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    // Mutate a file in the SECOND root: proves that root participates in the fingerprint.
+    try "beta with more bytes".write(to: secondFile, atomically: true, encoding: .utf8)
+    let verdict = try substrate.validate(
+      identity: identity, currentRoots: [firstRoot, secondRoot], currentExclusions: [])
+
+    guard
+      case .stale(.fileEvidenceChanged, let storedManifest, let currentFingerprint) = verdict
+    else {
+      return XCTFail("Expected fileEvidenceChanged from second-root edit, got \(verdict)")
+    }
+    XCTAssertNotEqual(storedManifest?.treeFingerprint.treeHash, currentFingerprint.treeHash)
+  }
+
+  func testSubstrateValidateProducesExclusionsChangedForTwoRoots() throws {
+    let firstRoot = try makeTemporaryWorkspace()
+    let secondRoot = try makeTemporaryWorkspace()
+    _ = try writeFile("alpha", named: "alpha.md", in: firstRoot)
+    _ = try writeFile("beta", named: "beta.md", in: secondRoot)
+    let identity = WorkspaceIdentity.make(
+      roots: [firstRoot, secondRoot], bookmarkData: Data("bookmark".utf8))
+    let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
+    let substrate = WorkspaceSubstrate(store: store)
+    let fingerprint = try TreeFingerprint.compute(roots: [firstRoot, secondRoot], exclusions: [])
+    _ = try substrate.commit(
+      identity: identity, roots: [firstRoot, secondRoot], exclusions: [], fingerprint: fingerprint)
+
+    let verdict = try substrate.validate(
+      identity: identity, currentRoots: [firstRoot, secondRoot], currentExclusions: ["Drafts"])
+
+    guard case .stale(.exclusionsChanged, let storedManifest, _) = verdict else {
+      return XCTFail("Expected exclusionsChanged for two roots, got \(verdict)")
+    }
+    XCTAssertNil(storedManifest)
+  }
+
   func testWorkspaceActivityFactoriesProduceConsistentTitleDetail() {
+    XCTAssertEqual(
+      WorkspaceActivity.opening("Notes"),
+      WorkspaceActivity(
+        kind: .opening,
+        title: "Opening Workspace",
+        detail: "Reading Notes",
+        progress: 0.15
+      )
+    )
     XCTAssertEqual(
       WorkspaceActivity.checkingCache("Notes"),
       WorkspaceActivity(
+        kind: .checkingCache,
         title: "Checking Workspace Cache",
         detail: "Validating Notes",
         progress: 0.05
@@ -742,6 +950,7 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(
       WorkspaceActivity.cacheHit("Notes"),
       WorkspaceActivity(
+        kind: .cacheHit,
         title: "Opening Cached Workspace",
         detail: "Using cached state for Notes",
         progress: 0.92
@@ -750,11 +959,42 @@ final class WorkspaceSubstrateTests: XCTestCase {
     XCTAssertEqual(
       WorkspaceActivity.cacheMiss("Notes"),
       WorkspaceActivity(
+        kind: .cacheMiss,
         title: "Importing Workspace",
         detail: "Cache miss for Notes",
         progress: 0.1
       )
     )
+  }
+
+  /// Only import-class kinds (real index writes ahead) may take over the center pane;
+  /// open/validate kinds stay subtle. Guards the "no takeover on a cached open" contract.
+  func testWorkspaceActivityProminenceSplitsImportFromOpenStates() {
+    XCTAssertTrue(WorkspaceActivity.indexing(documentCount: 3).isProminent)
+    XCTAssertTrue(WorkspaceActivity.cacheMiss("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.opening("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.checkingCache("Notes").isProminent)
+    XCTAssertFalse(WorkspaceActivity.cacheHit("Notes").isProminent)
+  }
+
+  /// Acceptance 2 (Cut 4-1): the sidebar's empty placeholders and ANY in-flight workspace
+  /// activity are mutually exclusive — "Empty workspace" must never render mid-open.
+  @MainActor
+  func testSidebarEmptyPlaceholderIsMutuallyExclusiveWithActivity() {
+    let activities: [WorkspaceActivity] = [
+      .opening("Notes"),
+      .indexing(documentCount: 29),
+      .checkingCache("Notes"),
+      .cacheHit("Notes"),
+      .cacheMiss("Notes"),
+    ]
+    for activity in activities {
+      XCTAssertFalse(
+        SidebarView.showsEmptyPlaceholder(isEmpty: true, activity: activity),
+        "empty placeholder must be suppressed while \(activity.kind) is in flight")
+    }
+    XCTAssertTrue(SidebarView.showsEmptyPlaceholder(isEmpty: true, activity: nil))
+    XCTAssertFalse(SidebarView.showsEmptyPlaceholder(isEmpty: false, activity: nil))
   }
 
   private func makeIdentity() throws -> WorkspaceIdentity {
@@ -791,6 +1031,10 @@ final class WorkspaceSubstrateTests: XCTestCase {
     let file = directory.appendingPathComponent(name, isDirectory: false)
     try contents.write(to: file, atomically: true, encoding: .utf8)
     return file
+  }
+
+  private func setModificationDate(_ date: Date, for url: URL) throws {
+    try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
   }
 
   private func sampleManifest(identity: WorkspaceIdentity, root: URL) -> WorkspaceManifest {

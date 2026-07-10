@@ -2,8 +2,23 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+// AppState is @Observable, so it cannot ride @FocusedObject (Combine-only).
+// Expose it as a typed FocusedValue instead; PensieveApp publishes it via
+// `.focusedSceneValue(\.appState, appState)`. AppController stays
+// ObservableObject and keeps @FocusedObject / .focusedSceneObject.
+private struct AppStateFocusedValueKey: FocusedValueKey {
+  typealias Value = AppState
+}
+
+extension FocusedValues {
+  var appState: AppState? {
+    get { self[AppStateFocusedValueKey.self] }
+    set { self[AppStateFocusedValueKey.self] = newValue }
+  }
+}
+
 struct PensieveCommands: Commands {
-  @FocusedObject private var appState: AppState?
+  @FocusedValue(\.appState) private var appState: AppState?
   @FocusedObject private var controller: AppController?
   @ObservedObject var themeManager: ThemeManager
 
@@ -19,7 +34,8 @@ struct PensieveCommands: Commands {
 }
 
 private struct ActivePensieveCommands: Commands {
-  @ObservedObject var appState: AppState
+  // @Observable AppState observed via a plain stored property.
+  var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
 
@@ -79,19 +95,19 @@ private struct ActivePensieveCommands: Commands {
         saveActiveDocument()
       }
       .keyboardShortcut("s", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Save As…") {
         saveActiveDocumentAs()
       }
       .keyboardShortcut("s", modifiers: [.command, .shift])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Share…") {
         DocumentSharing.share(session: appState.documentSession)
       }
       .keyboardShortcut("s", modifiers: [.command, .control])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Export HTML…") {
         DocumentExport.exportHTML(
@@ -101,7 +117,7 @@ private struct ActivePensieveCommands: Commands {
           themeManager: themeManager
         )
       }
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button("Export PDF…") {
         DocumentExport.exportPDF(
@@ -111,7 +127,7 @@ private struct ActivePensieveCommands: Commands {
           themeManager: themeManager
         )
       }
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Divider()
 
@@ -151,7 +167,7 @@ private struct ActivePensieveCommands: Commands {
         controller.closeActiveDocument()
       }
       .keyboardShortcut("w", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
     }
 
     CommandGroup(after: .toolbar) {
@@ -169,6 +185,11 @@ private struct ActivePensieveCommands: Commands {
         )
       )
       .accessibilityIdentifier("pensieve.autocomplete.menuToggle")
+
+      Button("Show/Hide Tab Bar") {
+        NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
+      }
+      .disabled(NSApp.keyWindow == nil && NSApp.mainWindow == nil)
     }
 
     // Edit menu — Find & Replace routes into Pensieve's own squared find bar.
@@ -231,19 +252,22 @@ private struct ActivePensieveCommands: Commands {
         appState.requestPreviewRefresh()
       }
       .keyboardShortcut("r", modifiers: [.command])
-      .disabled(!appState.documentSession.hasEditableBuffer)
+      .disabled(!appState.documentHasEditableBuffer)
 
       Button(appState.previewAutoReload ? "Pause Auto Reload" : "Resume Auto Reload") {
         appState.previewAutoReload.toggle()
       }
       .keyboardShortcut("r", modifiers: [.command, .shift])
-    }
 
-    CommandGroup(after: .toolbar) {
-      Button("Show/Hide Tab Bar") {
-        NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
-      }
-      .disabled(NSApp.keyWindow == nil && NSApp.mainWindow == nil)
+      Toggle(
+        "Scroll Sync",
+        isOn: Binding(
+          get: { appState.scrollSyncEnabled },
+          set: { appState.scrollSyncEnabled = $0 }
+        )
+      )
+      .disabled(!appState.documentHasEditableBuffer)
+      .accessibilityIdentifier("pensieve.scrollSync.menuToggle")
     }
 
     // Tab navigation (Quick Win)
@@ -266,62 +290,101 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("[", modifiers: [.command, .shift])
     }
 
-    // Format menu — Markdown formatting and font sizing
+    // Agents menu — fast dispatch path for the ACTIVE document: default agent,
+    // workspace root, workflow from the curated deck. The toolbar ✈ sheet stays
+    // the configurable path (agent/root pickers, in-sheet confirmation).
+    // Sandboxed (App Store) build: items stay visible but disabled — dispatch
+    // spawns external processes the sandbox forbids (SandboxCapabilities).
+    CommandMenu("Agents") {
+      Button("Dispatch Document to Agent") {
+        controller.dispatchCurrentDocumentToAgent(workflow: "implement")
+      }
+      .keyboardShortcut("d", modifiers: [.command, .shift])
+      .disabled(
+        !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch()
+      )
+      .accessibilityIdentifier("pensieve.agents.menu.dispatchDocument")
+
+      Menu("Dispatch Document with Workflow") {
+        ForEach(controller.agentWorkflows, id: \.self) { workflow in
+          Button(workflow) {
+            controller.dispatchCurrentDocumentToAgent(workflow: workflow)
+          }
+        }
+      }
+      .disabled(
+        !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch()
+      )
+      .accessibilityIdentifier("pensieve.agents.menu.dispatchDocumentWorkflow")
+
+      if !SandboxCapabilities.allowsExternalAgentDispatch() {
+        Section {
+          Text(SandboxCapabilities.dispatchUnavailableExplanation)
+        }
+      }
+    }
+
+    // Format menu — Markdown formatting and font sizing. Menu items route
+    // through the wrapper-string surface `formatSelection(with:)` (the legacy
+    // MarkdownEditor contract); it resolves into the same
+    // `applyMarkdownFormat` funnel the toolbar strip calls with typed cases.
     CommandMenu("Format") {
       Section {
         Button("Bold") {
-          controller.applyMarkdownFormat(.bold)
+          controller.formatSelection(with: "**")
         }
         .keyboardShortcut("b", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Italic") {
-          controller.applyMarkdownFormat(.italic)
+          controller.formatSelection(with: "*")
         }
         .keyboardShortcut("i", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Strikethrough") {
-          controller.applyMarkdownFormat(.strike)
+          controller.formatSelection(with: "~~")
         }
         .keyboardShortcut("x", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Quote") {
-          controller.applyMarkdownFormat(.quote)
+          controller.formatSelection(with: ">")
         }
         .keyboardShortcut("'", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Code") {
-          controller.applyMarkdownFormat(.code)
+          controller.formatSelection(with: "`")
         }
         .keyboardShortcut("`", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Link") {
-          controller.applyMarkdownFormat(.link)
+          controller.formatSelection(with: "[]()")
         }
         .keyboardShortcut("k", modifiers: [.command])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Bulleted List") {
-          controller.applyMarkdownFormat(.bulletedList)
+          controller.formatSelection(with: "-")
         }
         .keyboardShortcut("8", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Numbered List") {
-          controller.applyMarkdownFormat(.numberedList)
+          controller.formatSelection(with: "1.")
         }
         .keyboardShortcut("7", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
 
         Button("Tidy Table") {
           controller.tidyTable()
         }
         .keyboardShortcut("t", modifiers: [.command, .shift])
-        .disabled(!appState.documentSession.hasEditableBuffer)
+        .disabled(!appState.documentHasEditableBuffer)
       }
 
       Divider()
@@ -448,7 +511,7 @@ private struct ActivePensieveCommands: Commands {
 
   private var sidebarActionTargetURL: URL? {
     appState.sidebarFocusedURL
-      ?? appState.documentSession.url
+      ?? appState.documentURL
       ?? appState.selectedDocumentID
   }
 

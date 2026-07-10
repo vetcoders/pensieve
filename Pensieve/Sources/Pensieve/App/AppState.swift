@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import SwiftUI
 
 enum EditorMode: Int, CaseIterable, Identifiable {
@@ -53,18 +53,11 @@ struct FindBarCommand: Equatable, Identifiable {
   let action: Action
 }
 
+@Observable
 @MainActor
-final class AppState: ObservableObject {
+final class AppState {
   let workspaceStore: WorkspaceStore
   let windowModel: DocumentWindowModel
-  private var cancellables: Set<AnyCancellable> = []
-  @Published var workspaceActivity: WorkspaceActivity? {
-    didSet {
-      if workspaceStore.workspaceActivity != workspaceActivity {
-        workspaceStore.workspaceActivity = workspaceActivity
-      }
-    }
-  }
 
   init(
     workspaceStore: WorkspaceStore? = nil,
@@ -73,22 +66,14 @@ final class AppState: ObservableObject {
   ) {
     self.workspaceStore = workspaceStore ?? WorkspaceStore(defaults: defaults)
     self.windowModel = windowModel ?? DocumentWindowModel(defaults: defaults)
-    self.workspaceActivity = self.workspaceStore.workspaceActivity
+  }
 
-    self.workspaceStore.objectWillChange
-      .sink { [weak self] _ in
-        self?.objectWillChange.send()
-      }
-      .store(in: &cancellables)
-    self.workspaceStore.$workspaceActivity
-      .sink { [weak self] activity in
-        guard let self, self.workspaceActivity != activity else { return }
-        self.workspaceActivity = activity
-      }
-      .store(in: &cancellables)
-    self.windowModel.objectWillChange
-      .sink { [weak self] _ in self?.objectWillChange.send() }
-      .store(in: &cancellables)
+  // Forwarded straight to the workspace store; with `@Observable`, reading this
+  // in a view tracks `workspaceStore.workspaceActivity` directly — no manual
+  // objectWillChange fan-in needed (that was the per-keystroke storm source).
+  var workspaceActivity: WorkspaceActivity? {
+    get { workspaceStore.workspaceActivity }
+    set { workspaceStore.workspaceActivity = newValue }
   }
 
   var folderURL: URL? {
@@ -161,6 +146,13 @@ final class AppState: ObservableObject {
     set { windowModel.documentSession = newValue }
   }
 
+  // Discrete metadata mirrors (see DocumentWindowModel). Window chrome reads
+  // these so a text-only edit never invalidates it.
+  var documentTitle: String { windowModel.documentTitle }
+  var documentHasEditableBuffer: Bool { windowModel.documentHasEditableBuffer }
+  var documentURL: URL? { windowModel.documentURL }
+  var documentIsDirty: Bool { windowModel.documentIsDirty }
+
   var mode: EditorMode {
     get { windowModel.mode }
     set { windowModel.mode = newValue }
@@ -211,6 +203,26 @@ final class AppState: ObservableObject {
     set { windowModel.pendingFindCommand = newValue }
   }
 
+  var findMatchCount: Int {
+    get { windowModel.findMatchCount }
+    set { windowModel.findMatchCount = newValue }
+  }
+
+  var findActiveMatchIndex: Int? {
+    get { windowModel.findActiveMatchIndex }
+    set { windowModel.findActiveMatchIndex = newValue }
+  }
+
+  var caretUTF16Offset: Int {
+    get { windowModel.caretUTF16Offset }
+    set { windowModel.caretUTF16Offset = newValue }
+  }
+
+  var selectionUTF16Length: Int {
+    get { windowModel.selectionUTF16Length }
+    set { windowModel.selectionUTF16Length = newValue }
+  }
+
   var tableTidyOnPaste: Bool {
     get { windowModel.tableTidyOnPaste }
     set { windowModel.tableTidyOnPaste = newValue }
@@ -224,6 +236,11 @@ final class AppState: ObservableObject {
   var aiAutocompleteEnabled: Bool {
     get { windowModel.aiAutocompleteEnabled }
     set { windowModel.aiAutocompleteEnabled = newValue }
+  }
+
+  var scrollSyncEnabled: Bool {
+    get { windowModel.scrollSyncEnabled }
+    set { windowModel.scrollSyncEnabled = newValue }
   }
 
   var previewAutoReload: Bool {
@@ -277,11 +294,6 @@ final class AppState: ObservableObject {
     set {
       documentSession.isDirty = newValue
     }
-  }
-
-  var selectedDocument: DocumentRef? {
-    guard let id = selectedDocumentID else { return nil }
-    return allDocuments.first(where: { $0.id == id })
   }
 
   var allDocuments: [DocumentRef] {
@@ -366,20 +378,45 @@ struct WorkspaceNode: Identifiable, Hashable, Sendable {
 }
 
 struct WorkspaceActivity: Equatable, Sendable {
+  /// Stable case tag: drives the `open activity=<case>` trace breadcrumb and the
+  /// prominent-vs-subtle presentation split. The open flow may not KNOW yet whether
+  /// an import is coming — `.opening` is the honest "walking the tree to find out"
+  /// state; only import-class kinds may claim "Importing Workspace".
+  enum Kind: String, Equatable, Sendable {
+    case opening
+    case indexing
+    case checkingCache
+    case cacheHit
+    case cacheMiss
+  }
+
+  var kind: Kind
   var title: String
   var detail: String
   var progress: Double?
 
-  static func scanning(_ label: String) -> WorkspaceActivity {
+  /// Import-class work (index writes genuinely ahead) earns the center takeover in the
+  /// empty document pane; open/validate states stay subtle — sidebar progress only. This
+  /// is what keeps a cached, unchanged reopen free of the "Importing Workspace" takeover.
+  var isProminent: Bool {
+    switch kind {
+    case .indexing, .cacheMiss: return true
+    case .opening, .checkingCache, .cacheHit: return false
+    }
+  }
+
+  static func opening(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
-      title: "Importing Workspace",
-      detail: "Scanning \(label)",
+      kind: .opening,
+      title: "Opening Workspace",
+      detail: "Reading \(label)",
       progress: 0.15
     )
   }
 
   static func indexing(documentCount: Int) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .indexing,
       title: "Importing Workspace",
       detail: "Indexing \(documentCount) Markdown file\(documentCount == 1 ? "" : "s")",
       progress: 0.68
@@ -388,6 +425,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func checkingCache(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .checkingCache,
       title: "Checking Workspace Cache",
       detail: "Validating \(label)",
       progress: 0.05
@@ -396,6 +434,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheHit(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheHit,
       title: "Opening Cached Workspace",
       detail: "Using cached state for \(label)",
       progress: 0.92
@@ -404,6 +443,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheMiss(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheMiss,
       title: "Importing Workspace",
       detail: "Cache miss for \(label)",
       progress: 0.1

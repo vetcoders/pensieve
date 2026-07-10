@@ -110,6 +110,31 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testStartRecordingRequestsMicrophoneBeforeRealEngineCapture() async {
+    let events = LockedStringLog()
+    let engine = MockVistaAutocompleteEngine(
+      startRecordingHandler: { _ in events.append("startRecording") })
+    let service = TranscriptionService(
+      engine: engine,
+      requiresMicrophonePermission: { _ in true },
+      microphonePermissionRequester: {
+        events.append("permission")
+      },
+      cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(events.values, ["permission", "startRecording"])
+    XCTAssertTrue(service.isRecording)
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertNil(service.lastError)
+  }
+
+  @MainActor
   func testTeardownDuringPreparationNeverStartsRecording() async {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
@@ -306,7 +331,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let appState = AppState()
     let service = TranscriptionService(cadenceCommitNanoseconds: 0)
     let reportPath =
-      "/Users/maciejgad/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
+      "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
     let launcher = MockAgentPromptLauncher(
       result: AgentDispatchMetadata.parse(
         output: """
@@ -450,6 +475,23 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 }
 
+private final class LockedStringLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [String] = []
+
+  func append(_ value: String) {
+    lock.lock()
+    storage.append(value)
+    lock.unlock()
+  }
+
+  var values: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
+  }
+}
+
 private final class LockedFlag: @unchecked Sendable {
   private let lock = NSLock()
   private var value = false
@@ -484,9 +526,16 @@ private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Se
     self.result = result
   }
 
-  func dispatch(prompt: String, workingDirectoryURL: URL) throws -> AgentDispatchMetadata {
+  func dispatch(
+    workflow: String,
+    agent: String,
+    payload: AgentDispatchPayload,
+    workingDirectoryURL: URL
+  ) throws -> AgentDispatchMetadata {
     lock.lock()
-    prompts.append(prompt)
+    if case .prompt(let prompt) = payload {
+      prompts.append(prompt)
+    }
     directories.append(workingDirectoryURL)
     lock.unlock()
     return result

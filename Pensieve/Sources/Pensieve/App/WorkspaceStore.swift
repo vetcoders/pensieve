@@ -1,37 +1,41 @@
-import Combine
 import Foundation
+import Observation
 import SwiftUI
 
+@Observable
 @MainActor
-final class WorkspaceStore: ObservableObject {
+final class WorkspaceStore {
   static let maxOpenFiles = 12
   private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
   private let defaults: UserDefaults
 
-  @Published var folderURL: URL?
-  @Published var workspaceRoots: [WorkspaceRoot] = []
-  @Published var workspaceTree: [WorkspaceNode] = []
-  @Published var documents: [DocumentRef] = [] {
+  var folderURL: URL?
+  var workspaceRoots: [WorkspaceRoot] = []
+  var workspaceTree: [WorkspaceNode] = [] {
+    didSet { sortedWorkspaceTree = sortNodes(workspaceTree) }
+  }
+  var documents: [DocumentRef] = [] {
     didSet { rebuildAllDocumentsCache() }
   }
-  @Published var openFiles: [DocumentRef] = [] {
+  var openFiles: [DocumentRef] = [] {
     didSet { rebuildAllDocumentsCache() }
   }
-  @Published var excludedWorkspacePaths: Set<String> = []
-  @Published var workspaceSearchQuery: String = ""
-  @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
-  @Published var sidebarFocusedURL: URL?
-  @Published var pendingSidebarRenameURL: URL?
-  @Published var bookmarkData: Data?
-  @Published var workspaceActivity: WorkspaceActivity?
-  @Published var sidebarSortOrder: SidebarSortOrder {
+  var excludedWorkspacePaths: Set<String> = []
+  var workspaceSearchQuery: String = ""
+  var workspaceSearchResults: [WorkspaceSearchResult] = []
+  var sidebarFocusedURL: URL?
+  var pendingSidebarRenameURL: URL?
+  var bookmarkData: Data?
+  var workspaceActivity: WorkspaceActivity?
+  var sidebarSortOrder: SidebarSortOrder {
     didSet {
       defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
+      sortedWorkspaceTree = sortNodes(workspaceTree)
     }
   }
 
-  private(set) var allDocuments: [DocumentRef] = []
-  private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
+  @ObservationIgnored private(set) var allDocuments: [DocumentRef] = []
+  @ObservationIgnored private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -52,9 +56,13 @@ final class WorkspaceStore: ObservableObject {
     sortDocuments(openFiles)
   }
 
-  var sortedWorkspaceTree: [WorkspaceNode] {
-    sortNodes(workspaceTree)
-  }
+  /// Recomputed only when `workspaceTree` or `sidebarSortOrder` changes (via
+  /// didSet), never per read. The previous computed form re-sorted the whole
+  /// tree on EVERY access — and `SidebarView.body` reads it inside its row
+  /// flatten, so every hover/selection/render triggered a full O(n log n)
+  /// recursive re-sort on the main thread (the sidebar "slow as hell" jank).
+  /// Stored + eager-on-mutation keeps reads O(1) and stays @Observable-tracked.
+  private(set) var sortedWorkspaceTree: [WorkspaceNode] = []
 
   var hasWorkspaceContent: Bool {
     !workspaceRoots.isEmpty || !openFiles.isEmpty

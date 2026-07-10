@@ -45,8 +45,6 @@ final class DocumentWindow: NSWindow {
 /// `openWindow(value:)` path is impossible by construction.
 @MainActor
 struct DocumentWindowFactory {
-  static let documentTabbingIdentifier = "Pensieve.DocumentWindow"
-
   let workspaceStore: WorkspaceStore
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager
@@ -55,21 +53,11 @@ struct DocumentWindowFactory {
   /// supports that the same way the WindowGroup scene does.
   func makeWindow(for document: DocumentRef?) -> NSWindow {
     let window = DocumentWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
-      // Matches the SwiftUI WindowGroup windows (.windowStyle(.titleBar) with
-      // a unified toolbar) so a factory window is indistinguishable as a tab.
-      styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
       defer: false)
-    // ARC owns the single reference; AppKit retains the window while it is on
-    // screen / in a tab group. The default (true) would double-release.
-    window.isReleasedWhenClosed = false
-    window.toolbarStyle = .unified
-    window.tabbingMode = .preferred
-    window.tabbingIdentifier = Self.documentTabbingIdentifier
-    // Placeholder until the scene's first registry attach sets the real title.
-    window.title = document?.title ?? "Untitled"
-    window.contentMinSize = NSSize(width: 720, height: 480)
+    WindowChromeRecipe.apply(to: window, title: document?.title ?? "Untitled")
     window.onNewWindowForTab = { sourceWindow in
       DocumentWindowRegistry.shared.newUntitledTab(from: sourceWindow)
     }

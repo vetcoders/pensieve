@@ -9,10 +9,26 @@ final class AppController: ObservableObject {
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let documentWindowRegistry: DocumentWindowRegistry
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
+  let agentWorkflows: [String] = [
+    "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
+    "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
+    "review", "scaffold", "workflow",
+  ]
+  let defaultAgent = "codex"
+  /// Agents discovered at runtime from `vibecrafted doctor` (agent-stream:<name>).
+  /// `discoverAgents()` refines this, but it only overwrites on a NON-empty probe,
+  /// and current `vibecrafted doctor` output no longer emits `agent-stream:<name>`
+  /// markers — so this seed is what the picker actually shows. Seed the full
+  /// canonical fleet (matches the `vibecrafted` command deck) instead of a single
+  /// agent, so the operator can pick any of them without waiting on broken probing.
+  @Published var availableAgents: [String] = [
+    "claude", "codex", "gemini", "agy", "junie", "grok",
+  ]
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
@@ -46,6 +62,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    documentWindowRegistry: DocumentWindowRegistry? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
     agentWorkspaceRoot: URL? = nil,
@@ -56,6 +73,7 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
     self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
@@ -98,6 +116,21 @@ final class AppController: ObservableObject {
   /// is wired (tests, headless).
   func openFile(url: URL) {
     let standardizedURL = url.standardizedFileURL
+
+    // OS-level opens (Finder, Dock drop, `open -a`, launch URLs) funnel every
+    // URL kind here. A directory is a workspace, not a document: it must route
+    // to the folder-open path BEFORE the registry/markdown handling below, or
+    // a first-class workspace open is refused with a misleading
+    // "unsupported file type" error (and could even route to a document tab).
+    var isDirectory: ObjCBool = false
+    if FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+      isDirectory.boolValue
+    {
+      DebugTrace.log("openFile -> openFolder (directory): \(standardizedURL.lastPathComponent)")
+      openFolder(url: standardizedURL)
+      return
+    }
+
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
       return
     }
@@ -202,7 +235,33 @@ final class AppController: ObservableObject {
 
   @discardableResult
   func moveItemToTrash(url: URL) -> Bool {
-    folderManager.moveToTrash(url: url, into: appState)
+    let source = url.standardizedFileURL
+    guard closeDocumentsAffectedByTrash(at: source) else { return false }
+    return folderManager.moveToTrash(url: source, into: appState)
+  }
+
+  @discardableResult
+  private func closeDocumentsAffectedByTrash(at source: URL) -> Bool {
+    if let selected = appState.selectedDocumentID,
+      isAffectedByTrash(documentID: selected, source: source)
+    {
+      guard documentStore.select(ref: nil, into: appState) else { return false }
+    }
+
+    let affectedDocumentIDs = documentWindowRegistry.openTabDocumentIDs.filter {
+      isAffectedByTrash(documentID: $0, source: source)
+    }
+    for documentID in affectedDocumentIDs {
+      documentWindowRegistry.closeDocumentWindow(documentID)
+    }
+    return true
+  }
+
+  private func isAffectedByTrash(documentID: URL, source: URL) -> Bool {
+    let standardizedDocumentID = documentID.standardizedFileURL
+    let standardizedSource = source.standardizedFileURL
+    return standardizedDocumentID == standardizedSource
+      || WorkspaceScanner.contains(standardizedDocumentID, in: standardizedSource)
   }
 
   @discardableResult
@@ -210,29 +269,24 @@ final class AppController: ObservableObject {
     folderManager.move(url: url, toFolder: folderURL, into: appState)
   }
 
-  func reorderOpenFiles(fromOffsets source: IndexSet, toOffset destination: Int) {
-    var visibleFiles = appState.sortedOpenFiles
-    let moving = source.sorted().map { visibleFiles[$0] }
-    visibleFiles.removeAll { ref in
-      moving.contains { $0.id.standardizedFileURL == ref.id.standardizedFileURL }
-    }
-    let lowerRemovedCount = source.filter { $0 < destination }.count
-    let insertionIndex = max(0, min(destination - lowerRemovedCount, visibleFiles.count))
-    visibleFiles.insert(contentsOf: moving, at: insertionIndex)
-    appState.sidebarSortOrder = .manual
-    appState.openFiles = visibleFiles
-  }
-
   func closeOpenFile(id: DocumentRef.ID) {
+    // Open Files mirrors the live tab group, so closing from the list closes the
+    // tab/window. If it is THIS window's active doc, run the dirty-session guard
+    // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
+    // force-save) so the sidebar close never silently drops unsaved edits.
     let standardizedID = id.standardizedFileURL
     if appState.selectedDocumentID?.standardizedFileURL == standardizedID {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
-    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedID }
+    documentWindowRegistry.closeDocumentWindow(standardizedID)
   }
 
   func clearOpenFiles() {
-    appState.openFiles = []
+    // Guard this window's active doc before tearing every tab down.
+    if appState.selectedDocumentID != nil {
+      guard documentStore.select(ref: nil, into: appState) else { return }
+    }
+    documentWindowRegistry.closeAllDocumentWindows()
   }
 
   @discardableResult
@@ -283,6 +337,16 @@ final class AppController: ObservableObject {
     documentStore.prepareForDocumentSwitch(appState: appState)
   }
 
+  /// Save-on-close guard for THIS window's session. Routed from the shared
+  /// document-window root on `NSWindow.willCloseNotification`, it flushes a
+  /// pending (debounced) edit synchronously before the window/tab tears down,
+  /// closing the ≤1.5s data-loss window on every close trigger (red button,
+  /// tab "×", sidebar close, ⌘W). No-op for a clean buffer.
+  @discardableResult
+  func savePendingChangesOnClose() -> Bool {
+    documentStore.savePendingChangesOnClose(appState: appState)
+  }
+
   /// Closes the active document session without exiting Pensieve.
   /// Dirty sessions are routed through the existing save semantics in
   /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
@@ -305,35 +369,53 @@ final class AppController: ObservableObject {
     _ = documentStore.select(ref: ref, into: appState)
   }
 
-  /// Tab per document: the default list/search click. An empty window (no
-  /// editable buffer) is reused in place; once this window shows a document,
-  /// further clicks route through the window registry and open native tabs
-  /// (or activate the window already showing the document). Clicking the
-  /// currently displayed document is a no-op. Falls back to in-window
-  /// selection when no routing is wired (tests, headless).
+  /// Resolves a sidebar/search row ID to a `DocumentRef`. Resolves via the
+  /// workspace/working-set scan, falling back to a synthesized ref for a live
+  /// registry tab whose ref was evicted past the open-files cap — otherwise the
+  /// registry-sourced sidebar row exists but its click is dead.
+  private func resolveDocumentRef(for id: DocumentRef.ID) -> DocumentRef? {
+    appState.allDocuments.first(where: { $0.id == id })
+      ?? (documentWindowRegistry.openTabDocumentIDs.contains(id.standardizedFileURL)
+        ? appState.makeDocumentRef(for: id) : nil)
+  }
+
+  /// Default click (Open Files list, workspace tree, search result, context-menu
+  /// "Open"): load the document in the current window, reusing the active editor
+  /// pane. This is the VS Code / Zed model — a single click never spawns a window
+  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
+  /// gesture. Clicking the currently displayed document is a no-op.
   func openDocumentWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = appState.allDocuments.first(where: { $0.id == id }) else {
-      return
-    }
+    guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
     if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
       return
     }
 
-    guard appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow else {
-      DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
+    selectDocument(id: ref.id)
+  }
+
+  /// Explicit "Open in New Window" context-menu gesture: route through the window
+  /// registry to open the document in a native tab (or activate the window
+  /// already showing it). Clicking the currently displayed document is a no-op.
+  /// Falls back to in-window selection when no routing is wired (tests, headless).
+  func openDocumentInNewWindow(id: DocumentRef.ID?) {
+    guard let id, let ref = resolveDocumentRef(for: id) else { return }
+
+    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+      return
+    }
+
+    guard let requestOpenDocumentWindow else {
+      DebugTrace.log(
+        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
+      )
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture. With tab-per-document
-  /// routing this is the same path as the default click.
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
-    openDocumentWindow(id: id)
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {
@@ -403,14 +485,6 @@ final class AppController: ObservableObject {
     transcriptionTaflaPanel.toggle()
   }
 
-  func showTranscriptionTafla() {
-    transcriptionTaflaPanel.show()
-  }
-
-  func hideTranscriptionTafla() {
-    transcriptionTaflaPanel.hide()
-  }
-
   @discardableResult
   func sendTranscription(
     target: TranscriptionSendTarget,
@@ -449,42 +523,255 @@ final class AppController: ObservableObject {
 
   @discardableResult
   private func dispatchTranscriptionToAgent() -> Bool {
-    guard !isAgentDispatchInFlight else { return false }
     let prompt = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !prompt.isEmpty else { return false }
 
+    return dispatchToAgent(
+      workflow: "implement",
+      payload: .prompt(prompt),
+      label: "transcription",
+      startStatus: "Dispatching to agent...",
+      onSuccess: { [transcriptionService] in
+        transcriptionService.resetTranscript()
+      }
+    )
+  }
+
+  @discardableResult
+  func dispatchCurrentDocumentToAgent(workflow: String) -> Bool {
+    guard appState.documentSession.hasEditableBuffer else {
+      appState.lastError = "Open an editable document before dispatching to an agent."
+      return false
+    }
+
+    if let url = appState.documentSession.url {
+      return dispatchFileToAgent(workflow: workflow, url: url)
+    }
+
+    return dispatchToAgent(
+      workflow: workflow,
+      payload: .prompt(appState.activeDocumentText),
+      label: appState.documentSession.displayTitle
+    )
+  }
+
+  @discardableResult
+  func dispatchFileToAgent(workflow: String, url: URL) -> Bool {
+    dispatchToAgent(
+      workflow: workflow,
+      payload: .file(url.path),
+      label: url.lastPathComponent
+    )
+  }
+
+  @discardableResult
+  func dispatchToAgent(
+    workflow: String,
+    payload: AgentDispatchPayload,
+    label: String,
+    startStatus: String? = nil,
+    onSuccess: (@MainActor @Sendable () -> Void)? = nil
+  ) -> Bool {
+    // Sandboxed (App Store) build: spawning the vibecrafted CLI is denied by
+    // the sandbox. The UI already disables its entry points; this guard keeps
+    // any other path honest instead of dying inside Process.run().
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
+    guard !isAgentDispatchInFlight else { return false }
+    guard !payload.isEmpty else { return false }
+
     isAgentDispatchInFlight = true
-    transcriptionService.updateDispatchStatus("Dispatching to agent...")
+    transcriptionService.updateDispatchStatus(
+      startStatus ?? "Dispatching \(label) to \(workflow)...")
     let launcher = agentPromptLauncher
+    let agent = defaultAgent
     let workingDirectoryURL =
       agentWorkspaceRoot
       ?? appState.folderURL
       ?? FileManager.default.homeDirectoryForCurrentUser
+    let appState = appState
     let transcriptionService = transcriptionService
 
     Task.detached(priority: .utility) { [weak self] in
       do {
         let metadata = try launcher.dispatch(
-          prompt: prompt,
+          workflow: workflow,
+          agent: agent,
+          payload: payload,
           workingDirectoryURL: workingDirectoryURL
         )
-        await MainActor.run {
-          if metadata.exitCode == 0 {
-            transcriptionService.resetTranscript()
-          }
-          transcriptionService.updateDispatchStatus(metadata.statusLine)
-          self?.isAgentDispatchInFlight = false
-        }
+        await self?.completeAgentDispatch(
+          metadata: metadata,
+          appState: appState,
+          transcriptionService: transcriptionService,
+          onSuccess: onSuccess
+        )
       } catch {
-        await MainActor.run {
-          transcriptionService.updateDispatchStatus(
-            "Dispatch failed: \(error.localizedDescription)")
-          self?.isAgentDispatchInFlight = false
-        }
+        let message = "Dispatch failed: \(error.localizedDescription)"
+        await self?.failAgentDispatch(
+          message: message,
+          appState: appState,
+          transcriptionService: transcriptionService
+        )
       }
     }
 
     return true
+  }
+
+  private func completeAgentDispatch(
+    metadata: AgentDispatchMetadata,
+    appState: AppState,
+    transcriptionService: TranscriptionService,
+    onSuccess: (@MainActor @Sendable () -> Void)?
+  ) {
+    if metadata.exitCode == 0 {
+      onSuccess?()
+      appState.lastError = nil
+    } else {
+      appState.lastError = metadata.statusLine
+    }
+    transcriptionService.updateDispatchStatus(metadata.statusLine)
+    isAgentDispatchInFlight = false
+  }
+
+  private func failAgentDispatch(
+    message: String,
+    appState: AppState,
+    transcriptionService: TranscriptionService
+  ) {
+    transcriptionService.updateDispatchStatus(message)
+    appState.lastError = message
+    isAgentDispatchInFlight = false
+  }
+
+  // MARK: - Agent discovery + Terminal dispatch
+
+  /// Refresh `availableAgents` from `vibecrafted doctor` (dynamic, not hardcoded).
+  /// Safe to call repeatedly (e.g. from the dispatch popover's onAppear).
+  func discoverAgents() {
+    Task.detached(priority: .utility) {
+      let discovered = Self.probeAgents()
+      guard !discovered.isEmpty else { return }
+      await MainActor.run { [weak self] in self?.availableAgents = discovered }
+    }
+  }
+
+  nonisolated private static func probeAgents() -> [String] {
+    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return [] }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: exe)
+    process.arguments = ["doctor"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    guard (try? process.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    return agentStreamNames(in: output)
+  }
+
+  /// Parse `vibecrafted doctor` output for `agent-stream:<name>` agent names,
+  /// in first-seen order, deduplicated. Pure + testable.
+  nonisolated static func agentStreamNames(in output: String) -> [String] {
+    // Lines look like: "ok: agent-stream:codex - codex-cli 0.137.0"
+    var names: [String] = []
+    for line in output.split(separator: "\n") {
+      guard let marker = line.range(of: "agent-stream:") else { continue }
+      let tail = line[marker.upperBound...]
+      let name = String(tail.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        .trimmingCharacters(in: .whitespaces)
+      if !name.isEmpty, !names.contains(name) { names.append(name) }
+    }
+    return names
+  }
+
+  /// Outcome of a document dispatch surfaced to the dispatch sheet for an
+  /// explicit, unmissable in-app confirmation (the user must know it fired).
+  enum DocumentDispatchOutcome: Sendable {
+    case success(runID: String?, reportPath: String?, statusLine: String)
+    case failure(message: String)
+  }
+
+  /// Headless dispatch of the OPEN document via the canonical uv-core entry,
+  /// which prints a parseable launch receipt (run_id / report path) and detaches.
+  /// Returns the outcome so the sheet can show "Dispatched ✓ run: …". The plan is
+  /// always the open document (--file); `rootURL` is only WHERE the agent runs
+  /// (--root). Terminal observability is a separate, user-triggered affordance
+  /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
+  func dispatchOpenDocument(workflow: String, agent: String, rootURL: URL) async
+    -> DocumentDispatchOutcome
+  {
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+      return .failure(message: SandboxCapabilities.dispatchUnavailableExplanation)
+    }
+    guard let docURL = appState.documentSession.url else {
+      return .failure(message: "Save the document before dispatching it to an agent.")
+    }
+    let launcher = agentPromptLauncher
+    let title = appState.documentSession.displayTitle
+    do {
+      let metadata = try await Task.detached(priority: .userInitiated) {
+        try launcher.dispatch(
+          workflow: workflow, agent: agent,
+          payload: .file(docURL.path), workingDirectoryURL: rootURL)
+      }.value
+      guard metadata.exitCode == 0 else {
+        appState.lastError = metadata.statusLine
+        transcriptionService.updateDispatchStatus(metadata.statusLine)
+        return .failure(message: metadata.statusLine)
+      }
+      appState.lastError = nil
+      let line = "Dispatched \(title) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
+      transcriptionService.updateDispatchStatus(
+        metadata.runID.map { "\(line) · run: \($0)" } ?? line)
+      return .success(
+        runID: metadata.runID, reportPath: metadata.reportPath, statusLine: line)
+    } catch {
+      let message = "Dispatch failed: \(error.localizedDescription)"
+      appState.lastError = message
+      transcriptionService.updateDispatchStatus(message)
+      return .failure(message: message)
+    }
+  }
+
+  /// Best-effort: open Terminal tailing a launched run via the receipt's
+  /// `vibecrafted <agent> observe --run-id <id>`. User-triggered from the sheet;
+  /// failure is swallowed because the in-app confirmation is the source of truth.
+  nonisolated func observeRunInTerminal(agent: String, runID: String) {
+    // Sandboxed build: osascript/Terminal automation is unavailable; only
+    // reachable after a dispatch, which the sandbox guard already blocks.
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else { return }
+    // Defense-in-depth before the values are composed into the Terminal command
+    // below: agent/runID are parsed from the launcher receipt, so fail closed on
+    // anything outside a strict shell-safe charset instead of relying solely on
+    // the quoting/AppleScript-escaping. (The proper fix — dropping AppleScript for
+    // `open -a Terminal` — is tracked separately as it changes terminal-spawn UX.)
+    let allowed = CharacterSet(
+      charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+    guard !agent.isEmpty, agent.unicodeScalars.allSatisfy(allowed.contains),
+      !runID.isEmpty, runID.unicodeScalars.allSatisfy(allowed.contains)
+    else { return }
+    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return }
+    func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let command = "\(quote(exe)) \(quote(agent)) observe --run-id \(quote(runID))"
+    let asEscaped =
+      command
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+    let script = """
+      tell application "Terminal"
+        activate
+        do script "\(asEscaped)"
+      end tell
+      """
+    let osa = Process()
+    osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    osa.arguments = ["-e", script]
+    try? osa.run()
   }
 
   func bumpFontSize(by delta: CGFloat) {

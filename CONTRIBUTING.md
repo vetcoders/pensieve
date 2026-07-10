@@ -2,7 +2,7 @@
 
 Welcome to the 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. forge. 
 
-We build software differently here at VetCoders. We value *product truth* over local elegance, and *runtime truth* over theoretical correctness. If you want to contribute, please understand our core stance.
+We build software differently here at Vetcoders. We value *product truth* over local elegance, and *runtime truth* over theoretical correctness. If you want to contribute, please understand our core stance.
 
 ## Our Core Stance
 
@@ -20,7 +20,7 @@ We build software differently here at VetCoders. We value *product truth* over l
 ## How to Contribute
 
 1. **Examine before you implement.** Use `loctree` to understand the blast radius.
-2. **Discuss first.** For any major architectural changes, open an issue. We work closely with our founders (Maciej and Monika) to shape the vision.
+2. **Discuss first.** For any major architectural changes, open an issue. We work closely with our founders to shape the vision.
 3. **Write tests.** But prefer e2e coverage for real product pipelines over unit comfort.
 4. **Respect the Living Tree.** We do not use git worktrees for active implementation. Adapt to concurrent edits.
 

@@ -1,15 +1,17 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
 struct PensieveApp: App {
   @NSApplicationDelegateAdaptor(PensieveAppDelegate.self) private var appDelegate
-  @StateObject private var workspaceStore: WorkspaceStore
+  // WorkspaceStore is @Observable now → @State, not @StateObject.
+  @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
 
   init() {
-    _workspaceStore = StateObject(wrappedValue: WorkspaceStore())
+    _workspaceStore = State(wrappedValue: WorkspaceStore())
     _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
     _themeManager = StateObject(wrappedValue: ThemeManager())
   }
@@ -28,10 +30,7 @@ struct PensieveApp: App {
         initialDocument: document.wrappedValue
       )
     }
-    .windowStyle(.titleBar)
-    .windowToolbarStyle(.unified(showsTitle: true))
-    .defaultSize(width: 1180, height: 760)
-    .windowResizability(.contentMinSize)
+    .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
     }
@@ -44,7 +43,8 @@ struct DocumentWindowRootView: View {
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
 
-  @StateObject private var appState: AppState
+  // AppState is @Observable now → @State, not @StateObject.
+  @State private var appState: AppState
   @StateObject private var controller: AppController
   @State private var loadedInitialDocumentID: DocumentRef.ID?
   @State private var initialDocumentLoadResolved = false
@@ -63,7 +63,7 @@ struct DocumentWindowRootView: View {
     self.initialDocument = initialDocument
 
     let appState = AppState(workspaceStore: workspaceStore)
-    _appState = StateObject(wrappedValue: appState)
+    _appState = State(wrappedValue: appState)
     _controller = StateObject(
       wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
   }
@@ -78,11 +78,11 @@ struct DocumentWindowRootView: View {
         StartupPresentationView()
       }
     }
-    .environmentObject(appState)
+    .environment(appState)
     .environmentObject(controller)
     .environmentObject(controller.transcriptionService)
     .environmentObject(themeManager)
-    .focusedSceneObject(appState)
+    .focusedSceneValue(\.appState, appState)
     .focusedSceneObject(controller)
     .background(
       DocumentWindowAccessor(
@@ -97,14 +97,17 @@ struct DocumentWindowRootView: View {
           selected: appState.selectedDocumentID,
           initialDocument: initialDocument,
           loadResolved: initialDocumentLoadResolved),
-        title: appState.documentSession.displayTitle,
-        representedURL: appState.documentSession.url,
-        hasEditableBuffer: appState.documentSession.hasEditableBuffer
+        title: appState.documentTitle,
+        representedURL: appState.documentURL,
+        hasEditableBuffer: appState.documentHasEditableBuffer
       ) { window in
         currentWindow = window
       }
     )
-    .frame(minWidth: 720, minHeight: 480)
+    .frame(
+      minWidth: WindowChromeRecipe.minimumContentSize.width,
+      minHeight: WindowChromeRecipe.minimumContentSize.height
+    )
     .task {
       configureDocumentRouting()
       if let initialDocument {
@@ -112,6 +115,17 @@ struct DocumentWindowRootView: View {
         revealStartupWindow()
       } else {
         launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
+          revealStartupWindow()
+        }
+        // Belt: the launch coordinator is a shared singleton whose startup
+        // decision fires reliably only for the FIRST window. A re-opened or
+        // second launcher window (Dock click with no windows, or the launcher
+        // re-spawned after the last document closed) may never get that
+        // callback and would otherwise stay stuck on the startup spinner. Reveal
+        // this window's empty state regardless after a short grace period — the
+        // coordinator still runs its workspace restore in the background.
+        Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 400_000_000)
           revealStartupWindow()
         }
       }
@@ -126,6 +140,23 @@ struct DocumentWindowRootView: View {
     }
     .onOpenURL { url in
       controller.openFile(url: url)
+    }
+    // App-wide save-on-close guard. Every window (factory-built document tab AND
+    // state-restored WindowGroup scene) shares this root, and every close
+    // trigger — red close button, the tab's "×", the sidebar "Close from Open
+    // Files", or ⌘W falling through to a native window close — posts
+    // `willCloseNotification` for the closing window. Filtering to THIS window's
+    // `currentWindow` flushes only its own session, synchronously, before the
+    // window/`AppState` tears down — closing the ≤1.5s autosave-debounce data
+    // loss without touching the window delegate SwiftUI owns.
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
+      notification in
+      guard let closingWindow = notification.object as? NSWindow,
+        closingWindow === currentWindow
+      else {
+        return
+      }
+      controller.savePendingChangesOnClose()
     }
   }
 
@@ -196,7 +227,8 @@ struct StartupPresentationView: View {
         .foregroundStyle(.tertiary)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor))
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.startupPresentation")
   }
 }

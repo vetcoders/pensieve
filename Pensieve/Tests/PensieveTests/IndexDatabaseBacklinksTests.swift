@@ -94,10 +94,10 @@ final class IndexDatabaseBacklinksTests: XCTestCase {
     let sourceURL = folder.appendingPathComponent("rename-edge.md")
     try "# Target\n".write(to: targetURL, atomically: true, encoding: .utf8)
     try """
-      Stale rename alias [[Old Target]].
-      Missing target [[Missing Target]].
-      Current link [[Target]].
-      """.write(to: sourceURL, atomically: true, encoding: .utf8)
+    Stale rename alias [[Old Target]].
+    Missing target [[Missing Target]].
+    Current link [[Target]].
+    """.write(to: sourceURL, atomically: true, encoding: .utf8)
 
     let documents = [
       document(targetURL, root: folder),
