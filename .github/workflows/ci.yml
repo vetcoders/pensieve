@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      # Pinned to a full commit SHA (v4.3.1): mutable tags can be repointed by
+      # the action owner (supply-chain risk; semgrep github-actions-mutable-action-tag).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Run tests
+        run: make test

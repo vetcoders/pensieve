@@ -167,6 +167,15 @@ final class SyntaxHighlighterTests: XCTestCase {
     XCTAssertEqual(strikethrough(storage, at: at), NSUnderlineStyle.single.rawValue)
   }
 
+  func testHighlightMarkupGetsInlineBackground() {
+    let md = "x ==marked== y"
+    let storage = highlighted(md)
+    let at = index(of: "marked", in: md)
+
+    XCTAssertEqual(color(storage, at: at), NSColor.labelColor)
+    XCTAssertEqual(backgroundColor(storage, at: at), NSColor.systemYellow.withAlphaComponent(0.35))
+  }
+
   func testBlockquoteIsSecondaryLabel() {
     let md = "> quoted line\n"
     let storage = highlighted(md)

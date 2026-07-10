@@ -14,6 +14,7 @@ struct HTMLEmitter: MarkupVisitor {
   /// MarkdownRenderer reads it back via the returned `paragraphCount` to
   /// build editor↔preview anchor maps.
   var nextBlockIndex: Int = 0
+  private var rendersWikilinks = true
 
   mutating func defaultVisit(_ markup: any Markup) -> String {
     markup.children.map { visit($0) }.joined()
@@ -32,6 +33,9 @@ struct HTMLEmitter: MarkupVisitor {
   }
 
   mutating func visitParagraph(_ paragraph: Paragraph) -> String {
+    if let displayMath = MarkdownMath.renderDisplayParagraph(paragraph.plainText) {
+      return wrappedBlock("div", inner: displayMath)
+    }
     let inner = paragraph.children.map { visit($0) }.joined()
     return wrappedBlock("p", inner: inner)
   }
@@ -125,7 +129,7 @@ struct HTMLEmitter: MarkupVisitor {
   // MARK: - Inline
 
   mutating func visitText(_ text: Text) -> String {
-    Self.escapeText(text.string)
+    MarkdownMath.renderText(text.string, wikilinks: rendersWikilinks)
   }
 
   mutating func visitSoftBreak(_ softBreak: SoftBreak) -> String {
@@ -157,7 +161,10 @@ struct HTMLEmitter: MarkupVisitor {
   }
 
   mutating func visitLink(_ link: Link) -> String {
+    let previousRendersWikilinks = rendersWikilinks
+    rendersWikilinks = false
     let inner = link.children.map { visit($0) }.joined()
+    rendersWikilinks = previousRendersWikilinks
     let href = link.destination.map(Self.escapeAttribute) ?? ""
     let title = link.title.map { " title=\"\(Self.escapeAttribute($0))\"" } ?? ""
     return "<a href=\"\(href)\"\(title)>\(inner)</a>"

@@ -1,9 +1,17 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
+  @State private var showDispatch = false
+
+  private var dispatchRoot: URL {
+    appState.folderURL
+      ?? appState.documentURL?.deletingLastPathComponent()
+      ?? FileManager.default.homeDirectoryForCurrentUser
+  }
 
   var body: some View {
     NavigationSplitView {
@@ -11,123 +19,48 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       VStack(spacing: 0) {
-        if !appState.documentTabs.isEmpty || appState.documentSession.isUntitled {
-          DocumentTabStrip()
-          Divider()
-        }
         EditorPreviewSplit()
+        if appState.documentHasEditableBuffer {
+          EditorStatusBar()
+            .opacity(appState.mode == .focus ? 0.45 : 1)
+        }
       }
     }
     .navigationTitle(
-      appState.documentSession.hasEditableBuffer
-        ? appState.documentSession.displayTitle : "Pensieve"
+      appState.documentHasEditableBuffer
+        ? appState.documentTitle : "Pensieve"
     )
-    .navigationSubtitle(appState.activeDocumentDirty ? "Edited" : "")
-  }
-}
-
-struct DocumentTabStrip: View {
-  @EnvironmentObject private var appState: AppState
-  @EnvironmentObject private var controller: AppController
-
-  var body: some View {
-    ScrollView(.horizontal, showsIndicators: false) {
-      HStack(spacing: 0) {
-        if appState.documentSession.isUntitled {
-          untitledTabButton()
-        }
-
-        ForEach(appState.documentTabs) { tab in
-          tabButton(tab)
-        }
-
-        Button {
-          controller.createUntitledDocument()
-        } label: {
-          Image(systemName: "plus")
-            .font(.system(size: 13, weight: .semibold))
-            .frame(width: 34, height: 30)
-        }
-        .buttonStyle(.plain)
-        .help("New File")
-        .accessibilityIdentifier("pensieve.tabStrip.newFile")
-      }
-      .padding(.leading, 6)
+    .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
+    .toolbar {
+      EditorToolbelt(
+        appState: appState,
+        controller: controller,
+        themeManager: themeManager,
+        onDispatchToAgent: {
+          showDispatch = true
+        },
+        isDispatchDisabled:
+          !appState.documentHasEditableBuffer
+          || !SandboxCapabilities.allowsExternalAgentDispatch(),
+        dispatchHelp:
+          SandboxCapabilities.allowsExternalAgentDispatch()
+          ? "Dispatch to Agent"
+          : SandboxCapabilities.dispatchUnavailableExplanation)
     }
-    .frame(height: 31)
-    .background(Color(NSColor.controlBackgroundColor))
-    .accessibilityIdentifier("pensieve.tabStrip")
-  }
-
-  private func tabButton(_ tab: DocumentRef) -> some View {
-    let isSelected = appState.selectedDocumentID?.standardizedFileURL == tab.id.standardizedFileURL
-    let isDirty = isSelected && appState.activeDocumentDirty
-
-    return HStack(spacing: 6) {
-      Text(isDirty ? "\(tab.title) *" : tab.title)
-        .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-        .lineLimit(1)
-        .truncationMode(.middle)
-
-      Button {
-        controller.closeDocumentTab(id: tab.id)
-      } label: {
-        Image(systemName: "xmark")
-          .font(.system(size: 9, weight: .semibold))
-          .foregroundStyle(.secondary)
-      }
-      .buttonStyle(.plain)
-      .help("Close Tab")
-    }
-    .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
-    .padding(.horizontal, 8)
-    .padding(.vertical, 2)
-    .background(tabBackground(isSelected))
-    .contentShape(Rectangle())
-    .onTapGesture {
-      controller.selectDocument(id: tab.id)
-    }
-    .help(tab.displayPath)
-  }
-
-  private func tabBackground(_ isSelected: Bool) -> some View {
-    RoundedRectangle(cornerRadius: 6, style: .continuous)
-      .fill(isSelected ? Color.accentColor.opacity(0.22) : Color.clear)
-  }
-
-  private func untitledTabButton() -> some View {
-    let isDirty = appState.activeDocumentDirty
-
-    return HStack(spacing: 6) {
-      Text(
-        isDirty
-          ? "\(appState.documentSession.displayTitle) *" : appState.documentSession.displayTitle
+    .sheet(isPresented: $showDispatch) {
+      DispatchPopover(
+        controller: controller,
+        isPresented: $showDispatch,
+        documentTitle: appState.documentTitle,
+        defaultRoot: dispatchRoot
       )
-      .font(.system(size: 12, weight: .semibold))
-      .lineLimit(1)
-      .truncationMode(.middle)
-
-      Button {
-        controller.closeActiveDocument()
-      } label: {
-        Image(systemName: "xmark")
-          .font(.system(size: 9, weight: .semibold))
-          .foregroundStyle(.secondary)
-      }
-      .buttonStyle(.plain)
-      .help("Close Tab")
     }
-    .frame(minWidth: 92, maxWidth: 170, minHeight: 30)
-    .padding(.horizontal, 8)
-    .padding(.vertical, 2)
-    .background(tabBackground(true))
-    .contentShape(Rectangle())
-    .help(appState.documentSession.displayTitle)
   }
 }
 
 struct EditorPreviewSplit: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
+  @State private var scrollSyncCoordinator = ScrollSyncCoordinator()
 
   /// Minimum pane width below which `.split` collapses to a single pane.
   /// Two panes × 260 + ~40 chrome = 560; below that, side-by-side stops
@@ -146,16 +79,17 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    if !appState.documentSession.hasEditableBuffer {
+    if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView(
         hasWorkspace: appState.hasWorkspaceContent,
         activity: appState.workspaceActivity
       )
     } else {
       switch appState.mode {
-      case .source, .focus:
-        // Focus mode shares source layout (Wave 2 dimming TBD).
+      case .source:
         EditorView()
+      case .focus:
+        FocusedEditorView()
       case .preview:
         PreviewView()
       case .split:
@@ -166,14 +100,48 @@ struct EditorPreviewSplit: View {
           EditorView()
         } else {
           HSplitView {
-            EditorView()
+            EditorView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
-            PreviewView()
+            PreviewView(scrollSyncCoordinator: scrollSyncCoordinator)
               .frame(minWidth: Self.paneMinWidth)
           }
         }
       }
     }
+  }
+}
+
+private struct FocusedEditorView: View {
+  var body: some View {
+    EditorView()
+      .overlay {
+        FocusModeDimmingOverlay()
+          .allowsHitTesting(false)
+      }
+      .accessibilityIdentifier("pensieve.focus.editor")
+  }
+}
+
+private struct FocusModeDimmingOverlay: View {
+  var body: some View {
+    VStack(spacing: 0) {
+      LinearGradient(
+        colors: [Color.black.opacity(0.10), Color.black.opacity(0)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 88)
+
+      Spacer(minLength: 0)
+
+      LinearGradient(
+        colors: [Color.black.opacity(0), Color.black.opacity(0.08)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .frame(height: 96)
+    }
+    .accessibilityIdentifier("pensieve.focus.dimming")
   }
 }
 
@@ -187,7 +155,10 @@ struct DocumentEmptyStateView: View {
 
   var body: some View {
     VStack(spacing: 18) {
-      if let activity {
+      // Only import-class work (real index writes ahead) takes over the center pane.
+      // Subtle open/validate states stay in the sidebar — a cached, unchanged reopen
+      // must never present itself as "Importing Workspace".
+      if let activity, activity.isProminent {
         WorkspaceActivityView(activity: activity)
           .frame(maxWidth: 340)
           .accessibilityIdentifier("pensieve.emptyState.activity")
@@ -216,7 +187,8 @@ struct DocumentEmptyStateView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor))
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.emptyState")
   }
 

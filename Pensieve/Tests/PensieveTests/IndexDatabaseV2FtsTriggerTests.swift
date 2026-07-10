@@ -219,7 +219,9 @@ final class IndexDatabaseV2FtsTriggerTests: XCTestCase {
     let adHocURL = root.appendingPathComponent("scratch.md")
     try "adhoc plutonium content".write(to: adHocURL, atomically: true, encoding: .utf8)
     let adHocRef = DocumentRef(id: adHocURL.standardizedFileURL, isAdHoc: true)
-    database.index(document: adHocRef, body: "adhoc plutonium content")
+    // Awaiting the off-main twin is the write-completion sync point (it returns after the detached
+    // `pool.write` commits), so the synchronous asserts below see the ad-hoc row.
+    await database.indexInBackground(document: adHocRef, body: "adhoc plutonium content")
 
     let documents = [workspaceDoc, adHocRef]
     XCTAssertEqual(

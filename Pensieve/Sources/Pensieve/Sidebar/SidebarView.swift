@@ -3,8 +3,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SidebarView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  // Live open-tab group (the actual tabs), published by the window registry so
+  // "Open Files" mirrors the tab chain instead of a per-window working set.
+  @ObservedObject private var windowRegistry = DocumentWindowRegistry.shared
   @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var knownRootNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var hoveredDocumentID: DocumentRef.ID?
@@ -29,12 +32,24 @@ struct SidebarView: View {
     }
   }
 
+  /// Empty-state placeholders and open-flow activity are mutually exclusive: while ANY
+  /// workspace activity is in flight the tree area shows progress, never an emptiness
+  /// claim the walk has not verified yet (the "Importing Workspace" + "Empty workspace"
+  /// contradiction from the operator's screenshots).
+  static func showsEmptyPlaceholder(isEmpty: Bool, activity: WorkspaceActivity?) -> Bool {
+    isEmpty && activity == nil
+  }
+
   var body: some View {
     VStack(spacing: 0) {
       header
 
       if !appState.hasWorkspaceContent {
-        emptyState
+        if Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
+          emptyState
+        } else {
+          openingPlaceholder
+        }
       } else if appState.isSearchingWorkspace {
         searchResults
       } else {
@@ -133,6 +148,17 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
+        if sidebarTab == .openFiles, !openTabDocuments.isEmpty {
+          Button {
+            controller.clearOpenFiles()
+          } label: {
+            Image(systemName: "xmark.circle")
+          }
+          .buttonStyle(.borderless)
+          .help("Clear Open Files")
+          .accessibilityIdentifier("pensieve.sidebar.clearOpenFiles")
+        }
+
         Spacer()
         sortMenu
       }
@@ -186,19 +212,29 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.tab.\(tab.rawValue)")
   }
 
+  /// The live open-tab documents (registry order) resolved to refs via the shared
+  /// store. Never drops a live tab: a URL absent from the workspace scan / working
+  /// set (e.g. an ad-hoc file evicted past the open-files cap) is synthesized as an
+  /// ad-hoc ref so the row always mirrors the open tab.
+  private var openTabDocuments: [DocumentRef] {
+    windowRegistry.openTabDocumentIDs.map {
+      appState.document(id: $0) ?? DocumentRef(id: $0, isAdHoc: true)
+    }
+  }
+
   private var openFilesList: some View {
     Group {
-      if appState.openFiles.isEmpty {
+      if openTabDocuments.isEmpty {
         sidebarEmptyTab(
           icon: "doc.text",
           message: "No open files",
           hint: "⌘O opens a file · ⌘N new file")
       } else {
         List {
-          ForEach(appState.sortedOpenFiles) { doc in
+          ForEach(openTabDocuments) { doc in
             Button {
               appState.sidebarFocusedURL = doc.url.standardizedFileURL
-              controller.selectDocument(id: doc.id)
+              controller.openDocumentWindow(id: doc.id)
             } label: {
               documentRow(
                 doc,
@@ -219,9 +255,6 @@ struct SidebarView: View {
               NSItemProvider(object: doc.url as NSURL)
             }
           }
-          .onMove { source, destination in
-            controller.reorderOpenFiles(fromOffsets: source, toOffset: destination)
-          }
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("pensieve.sidebar.list.openFiles")
@@ -232,7 +265,9 @@ struct SidebarView: View {
   private var workspaceList: some View {
     Group {
       if appState.workspaceTree.isEmpty {
-        if appState.workspaceRoots.isEmpty {
+        if !Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
+          openingPlaceholder
+        } else if appState.workspaceRoots.isEmpty {
           sidebarEmptyTab(
             icon: "folder",
             message: "No workspace folder",
@@ -269,6 +304,22 @@ struct SidebarView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
+  /// Shown in place of any empty-state copy while an open-flow activity is in flight —
+  /// the tree is not "empty", it is being restored/verified.
+  private var openingPlaceholder: some View {
+    VStack(spacing: 10) {
+      Spacer()
+      ProgressView()
+        .controlSize(.small)
+      Text(appState.workspaceActivity?.title ?? "Opening Workspace")
+        .font(.subheadline)
+        .foregroundColor(.secondary)
+      Spacer()
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .accessibilityIdentifier("pensieve.sidebar.openingPlaceholder")
+  }
+
   private var emptyWorkspaceRoot: some View {
     VStack(spacing: 12) {
       Spacer()
@@ -293,7 +344,13 @@ struct SidebarView: View {
 
   private var sortMenu: some View {
     Menu {
-      Picker("Sort", selection: $appState.sidebarSortOrder) {
+      Picker(
+        "Sort",
+        selection: Binding(
+          get: { appState.sidebarSortOrder },
+          set: { appState.sidebarSortOrder = $0 }
+        )
+      ) {
         ForEach(SidebarSortOrder.allCases) { order in
           Text(order.label).tag(order)
         }
@@ -564,11 +621,25 @@ struct SidebarView: View {
   @ViewBuilder
   private func documentContextMenu(for doc: DocumentRef) -> some View {
     Button("Open") {
-      controller.selectDocument(id: doc.id)
+      controller.openDocumentWindow(id: doc.id)
+    }
+
+    // One window per document by design: the gesture only makes sense for a
+    // document this window is not currently showing.
+    if appState.selectedDocumentID?.standardizedFileURL != doc.id.standardizedFileURL {
+      Button("Open in New Window") {
+        controller.openDocumentInNewWindow(id: doc.id)
+      }
     }
 
     Button("Open in Default App") {
       openExternally(doc.url)
+    }
+
+    dispatchMenu(for: doc.url)
+
+    Button("Close from Open Files") {
+      controller.closeOpenFile(id: doc.id)
     }
 
     Button("Reveal in Finder") {
@@ -631,6 +702,8 @@ struct SidebarView: View {
         Button("Open in Default App") {
           openExternally(url)
         }
+
+        dispatchMenu(for: url)
 
         Button("Reveal in Finder") {
           revealInFinder(url)
@@ -703,6 +776,16 @@ struct SidebarView: View {
 
       Button("Copy Path") {
         copyPath(url.path)
+      }
+    }
+  }
+
+  private func dispatchMenu(for url: URL) -> some View {
+    Menu("Dispatch to Agent") {
+      ForEach(controller.agentWorkflows, id: \.self) { workflow in
+        Button(workflow) {
+          controller.dispatchFileToAgent(workflow: workflow, url: url)
+        }
       }
     }
   }

@@ -1,18 +1,26 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct EditorView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  private let scrollSyncCoordinator: ScrollSyncCoordinator?
+
+  init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+  }
 
   var body: some View {
-    VStack(spacing: 0) {
+    @Bindable var appState = appState
+    return VStack(spacing: 0) {
       if appState.findBarVisible {
         FindBar()
       }
 
       EditorRepresentable(
         text: documentText,
+        editorMode: appState.mode,
         fontSize: appState.fontSize,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
@@ -22,11 +30,29 @@ struct EditorView: View {
         findCommand: appState.pendingFindCommand,
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
+        aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
+        scrollSyncCoordinator: scrollSyncCoordinator,
+        scrollSyncEnabled: appState.scrollSyncEnabled && appState.mode == .split,
         isDirty: documentDirty,
         onDocumentChanged: controller.documentDidChange,
-        onCloseFindBar: closeFindBar
+        onCloseFindBar: closeFindBar,
+        onFindStateChanged: { total, active in
+          appState.findMatchCount = total
+          appState.findActiveMatchIndex = active
+        },
+        onSelectionChanged: { caret, selectionLength in
+          appState.caretUTF16Offset = caret
+          appState.selectionUTF16Length = selectionLength
+        }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
+      // Let the editor scroll view extend UNDER the unified toolbar so the text
+      // (not just the line-number ruler) slides under it, blurred — the native
+      // Finder look. The scroll view already reaches under the titlebar (the ruler
+      // proves it); SwiftUI's top safe-area inset was the only thing holding the
+      // text below. automaticallyAdjustsContentInsets (default) keeps the caret
+      // line starting below the toolbar while letting scrolled content pass under.
+      .ignoresSafeArea(.container, edges: .top)
     }
     .background(Color(NSColor.textBackgroundColor))
   }
@@ -55,6 +81,7 @@ struct EditorView: View {
 
 struct EditorRepresentable: NSViewRepresentable {
   @Binding var text: String
+  let editorMode: EditorMode
   let fontSize: CGFloat
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
@@ -64,9 +91,59 @@ struct EditorRepresentable: NSViewRepresentable {
   let findCommand: FindBarCommand?
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
+  let aiAutocompleteEnabled: Bool
+  let scrollSyncCoordinator: ScrollSyncCoordinator?
+  let scrollSyncEnabled: Bool
   @Binding var isDirty: Bool
   let onDocumentChanged: @MainActor () -> Void
   let onCloseFindBar: @MainActor () -> Void
+  // Defaults to a no-op so find-navigation tests that build the representable
+  // directly need not wire the count callback they do not exercise.
+  var onFindStateChanged: @MainActor (Int, Int?) -> Void = { _, _ in }
+  // Caret/selection sink for the status bar; no-op default for the same reason.
+  var onSelectionChanged: @MainActor (Int, Int) -> Void = { _, _ in }
+
+  init(
+    text: Binding<String>,
+    editorMode: EditorMode,
+    fontSize: CGFloat,
+    syntaxHighlightingEnabled: Bool,
+    formattingCommand: MarkdownFormatCommand?,
+    findQuery: Binding<String>,
+    findReplacement: Binding<String>,
+    findBarVisible: Bool,
+    findCommand: FindBarCommand?,
+    tableTidyOnPaste: Bool,
+    asciiSafeTables: Bool,
+    aiAutocompleteEnabled: Bool,
+    scrollSyncCoordinator: ScrollSyncCoordinator? = nil,
+    scrollSyncEnabled: Bool = false,
+    isDirty: Binding<Bool>,
+    onDocumentChanged: @escaping @MainActor () -> Void,
+    onCloseFindBar: @escaping @MainActor () -> Void,
+    onFindStateChanged: @escaping @MainActor (Int, Int?) -> Void = { _, _ in },
+    onSelectionChanged: @escaping @MainActor (Int, Int) -> Void = { _, _ in }
+  ) {
+    self._text = text
+    self.editorMode = editorMode
+    self.fontSize = fontSize
+    self.syntaxHighlightingEnabled = syntaxHighlightingEnabled
+    self.formattingCommand = formattingCommand
+    self._findQuery = findQuery
+    self._findReplacement = findReplacement
+    self.findBarVisible = findBarVisible
+    self.findCommand = findCommand
+    self.tableTidyOnPaste = tableTidyOnPaste
+    self.asciiSafeTables = asciiSafeTables
+    self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+    self.scrollSyncEnabled = scrollSyncEnabled
+    self._isDirty = isDirty
+    self.onDocumentChanged = onDocumentChanged
+    self.onCloseFindBar = onCloseFindBar
+    self.onFindStateChanged = onFindStateChanged
+    self.onSelectionChanged = onSelectionChanged
+  }
 
   func makeNSView(context: Context) -> NSScrollView {
     let surface = MarkdownEditorSurface(
@@ -74,7 +151,8 @@ struct EditorRepresentable: NSViewRepresentable {
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
-      asciiSafeTables: asciiSafeTables
+      asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled
     )
     surface.onTextChanged = { newText in
       self.text = newText
@@ -84,21 +162,62 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onCloseFindBar = {
       self.onCloseFindBar()
     }
+    surface.onFindStateChanged = { total, active in
+      DispatchQueue.main.async {
+        self.onFindStateChanged(total, active)
+      }
+    }
+    surface.onSelectionChanged = { caret, selectionLength in
+      DispatchQueue.main.async {
+        self.onSelectionChanged(caret, selectionLength)
+      }
+    }
+    surface.configureScrollSync(
+      coordinator: scrollSyncCoordinator,
+      enabled: scrollSyncEnabled
+    )
+    surface.typewriterScrollEnabled = editorMode == .focus
     context.coordinator.surface = surface
     return surface.scrollView
   }
 
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     guard let surface = context.coordinator.surface else { return }
+    // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
+    // objectWillChange on every keystroke, re-laying out this representable; without this the
+    // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
+    // A genuine text change (document load) is allowed to scroll; a pure re-render keeps the
+    // viewport where the user left it — caret only moves scroll when typing pushes it past
+    // the edge, which AppKit already did before this re-render ran.
+    let textUnchanged = surface.textStorage.string == text
+    let savedOrigin = scroll.contentView.bounds.origin
+    surface.typewriterScrollEnabled = editorMode == .focus
+    surface.configureScrollSync(
+      coordinator: scrollSyncCoordinator,
+      enabled: scrollSyncEnabled
+    )
     surface.update(
       text: text,
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled,
       findQuery: findQuery,
       findBarVisible: findBarVisible
     )
+    if textUnchanged {
+      if surface.typewriterScrollEnabled {
+        surface.centerCaretLineIfNeeded()
+      } else if scroll.contentView.bounds.origin != savedOrigin {
+        // Only re-pin when surface.update() actually drifted the viewport. Firing
+        // scroll(to:)+reflectScrolledClipView on EVERY keystroke posts a redundant
+        // bounds-change → gutter redraw → the per-letter flicker the operator saw in
+        // normal/split mode. No drift ⇒ nothing to restore.
+        scroll.contentView.scroll(to: savedOrigin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+      }
+    }
     context.coordinator.apply(formattingCommand, to: surface)
     if let selectedText = context.coordinator.applyFind(
       findCommand,
@@ -167,25 +286,57 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   let textContentStorage: MarkdownTextStorage
   let textLayoutManager: NSTextLayoutManager
   let textContainer: NSTextContainer
+  let autocompleteController: AutocompleteController
 
   var onTextChanged: ((String) -> Void)?
   var onCloseFindBar: (() -> Void)?
+  var onFindStateChanged: ((Int, Int?) -> Void)?
+  /// Reports (caret UTF-16 offset, selection UTF-16 length) for the status bar.
+  var onSelectionChanged: ((Int, Int) -> Void)?
+  private var lastNotifiedCaretOffset = -1
+  private var lastNotifiedSelectionLength = -1
+  var typewriterScrollEnabled = false
   var isApplyingExternalText = false
+  private var aiAutocompleteEnabled: Bool
+  private var autocompleteCancellable: AnyCancellable?
+  private var autocompleteRenderGeneration: UInt64 = 0
+  private var lastTextChangeSelection: NSRange?
+  private weak var scrollSyncCoordinator: ScrollSyncCoordinator?
+  private var scrollSyncEnabled = false
+  private var pendingScrollSyncSample: DispatchWorkItem?
+  private let scrollSyncDebounce: TimeInterval
+  /// Logical line index (newline count before the caret) at the last typewriter
+  /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
+  private var lastCenteredLine: Int?
   private var findQuery = ""
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
+  private var hasNotifiedFindState = false
+  private var lastNotifiedFindCount = -1
+  private var lastNotifiedFindActiveIndex: Int?
 
   init(
     text: String,
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool = true,
     tableTidyOnPaste: Bool = true,
-    asciiSafeTables: Bool = false
+    asciiSafeTables: Bool = false,
+    aiAutocompleteEnabled: Bool = false,
+    scrollSyncDebounce: TimeInterval = 0.04,
+    // Production autocomplete engine. The factory is lazy: `VistaEngine()` is
+    // a thin FFI handle resolved post-debounce inside the controller, and the
+    // completion path never loads the whisper model (see AutocompleteController
+    // `resolveEngine`), so surface init and typing stay FFI-free.
+    autocompleteController: AutocompleteController = AutocompleteController(
+      engineFactory: { VistaEngine() })
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()
     textStorage = NSTextStorage()
+    self.autocompleteController = autocompleteController
+    self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.scrollSyncDebounce = scrollSyncDebounce
     textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
 
     textContentStorage.textStorage = textStorage
@@ -214,7 +365,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.isHorizontallyResizable = false
     textView.autoresizingMask = [.width]
     textView.backgroundColor = .textBackgroundColor
-    textView.textContainerInset = NSSize(width: 12, height: 10)
+    textView.setAccessibilityIdentifier("pensieve.editor")
+    textView.textContainerInset = NSSize(
+      width: 12,
+      height: WindowChromeRecipe.documentContentTopInset)
 
     scrollView.documentView = textView
     textView.setupGutter(layoutManager: textLayoutManager)
@@ -224,35 +378,57 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     super.init()
 
     textView.delegate = self
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(editorBoundsDidChange(_:)),
+      name: NSView.boundsDidChangeNotification,
+      object: scrollView.contentView
+    )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
     }
     textView.onEscape = { [weak self] in
+      if self?.dismissAutocompleteSuggestion() == true {
+        return true
+      }
       guard self?.isFindBarVisible == true else { return false }
       self?.clearFindHighlights()
       self?.onCloseFindBar?()
       return true
     }
+    textView.onAcceptAutocomplete = { [weak self] in
+      self?.acceptAutocompleteSuggestion() ?? false
+    }
+    bindAutocomplete()
     update(
       text: text,
       fontSize: fontSize,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
-      asciiSafeTables: asciiSafeTables
+      asciiSafeTables: asciiSafeTables,
+      aiAutocompleteEnabled: aiAutocompleteEnabled,
+      findQuery: "",
+      findBarVisible: false
     )
   }
 
+  // No default parameter values on purpose: a defaulted behavior flag already
+  // shipped one silent kill (init passed aiAutocompleteEnabled, the trailing
+  // update() omitted it, and the =false default disabled autocomplete on every
+  // surface). Every call site states every flag; the compiler enforces it.
   func update(
     text: String,
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool,
-    tableTidyOnPaste: Bool = true,
-    asciiSafeTables: Bool = false,
-    findQuery: String = "",
-    findBarVisible: Bool = false
+    tableTidyOnPaste: Bool,
+    asciiSafeTables: Bool,
+    aiAutocompleteEnabled: Bool,
+    findQuery: String,
+    findBarVisible: Bool
   ) {
     textView.tableTidyOnPaste = tableTidyOnPaste
     textView.asciiSafeTables = asciiSafeTables
+    setAIAutocompleteEnabled(aiAutocompleteEnabled)
 
     if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
       textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
@@ -271,21 +447,255 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textStorage.string != text {
       isApplyingExternalText = true
+      lastCenteredLine = nil  // document changed under us; allow the next center
+      invalidateAutocomplete()
+      // A model→view text re-sync must NOT yank the viewport to the caret. Preserve the
+      // caret + scroll across the full re-apply so a re-render never resets selection to 0
+      // and scrolls there (the "screen goes wild on every letter" regression).
+      let savedSelection = textView.selectedRange()
+      let savedOrigin = scrollView.contentView.bounds.origin
       textStorage.replaceCharacters(
         in: NSRange(location: 0, length: textStorage.length), with: text)
       textContentStorage.refreshHighlighting()
+      let newLength = (textStorage.string as NSString).length
+      let caret = min(savedSelection.location, newLength)
+      textView.setSelectedRange(
+        NSRange(location: caret, length: min(savedSelection.length, newLength - caret)))
+      if typewriterScrollEnabled {
+        centerCaretLineIfNeeded()
+      } else {
+        scrollView.contentView.scroll(to: savedOrigin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+      }
       isApplyingExternalText = false
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
   }
 
+  deinit {
+    pendingScrollSyncSample?.cancel()
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  func configureScrollSync(coordinator: ScrollSyncCoordinator?, enabled: Bool) {
+    let wasEnabled = scrollSyncEnabled
+    scrollSyncCoordinator = coordinator
+    scrollSyncEnabled = enabled
+    coordinator?.isEnabled = enabled
+    if wasEnabled, !enabled {
+      pendingScrollSyncSample?.cancel()
+      pendingScrollSyncSample = nil
+    }
+  }
+
+  @objc private func editorBoundsDidChange(_ notification: Notification) {
+    guard notification.object as? NSClipView === scrollView.contentView else { return }
+    scheduleScrollSyncSample()
+  }
+
+  func scheduleScrollSyncSample() {
+    guard scrollSyncEnabled, scrollSyncCoordinator?.isEnabled == true else { return }
+
+    pendingScrollSyncSample?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.emitScrollSyncFromCurrentViewport()
+    }
+    pendingScrollSyncSample = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + scrollSyncDebounce, execute: workItem)
+  }
+
+  private func emitScrollSyncFromCurrentViewport() {
+    pendingScrollSyncSample = nil
+    guard scrollSyncEnabled, let scrollSyncCoordinator else { return }
+    let visible = scrollView.contentView.bounds
+    let documentHeight = scrollView.documentView?.bounds.height ?? textView.bounds.height
+    let position = Self.scrollSyncPosition(visibleRect: visible, documentHeight: documentHeight)
+    scrollSyncCoordinator.editorDidScroll(to: position)
+  }
+
+  static func scrollSyncPosition(visibleRect: NSRect, documentHeight: CGFloat) -> ScrollSyncPosition
+  {
+    let scrollableHeight = max(0, documentHeight - visibleRect.height)
+    guard scrollableHeight > 0 else {
+      return ScrollSyncPosition(progress: 0)
+    }
+    return ScrollSyncPosition(progress: Double(visibleRect.origin.y / scrollableHeight))
+  }
+
   func textDidChange(_ notification: Notification) {
     guard !isApplyingExternalText else { return }
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
-    onTextChanged?(textStorage.string)
+    let latestText = textStorage.string
+    invalidateAutocomplete()
+    onTextChanged?(latestText)
+    if aiAutocompleteEnabled {
+      lastTextChangeSelection = textView.selectedRange()
+      // IME composition (marked text) fires textDidChange per candidate
+      // update; requesting a completion against half-composed characters
+      // wastes the LLM round-trip and risks rendering a ghost inside the
+      // composition. The render path re-checks hasMarkedText for requests
+      // already in flight.
+      if !textView.hasMarkedText() {
+        autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
+      }
+    }
     refreshFindMatches()
+    centerCaretLineIfNeeded()
+    notifySelectionChanged()
+  }
+
+  /// Push the caret offset + selection length up to the status bar, deduped so
+  /// a re-render or no-op selection event never loops the SwiftUI binding.
+  private func notifySelectionChanged() {
+    let range = textView.selectedRange()
+    guard
+      range.location != lastNotifiedCaretOffset
+        || range.length != lastNotifiedSelectionLength
+    else { return }
+    lastNotifiedCaretOffset = range.location
+    lastNotifiedSelectionLength = range.length
+    onSelectionChanged?(range.location, range.length)
+  }
+
+  /// UTF-16 cap on the completion prompt tail. Without it every debounce
+  /// ships the ENTIRE document up to the caret through UniFFI + HTTP — a
+  /// multi-hundred-KB payload per typing pause in a large note. ~4k units
+  /// (≈1–2k tokens) keeps the nearest context, which is all the completion
+  /// endpoint conditions on anyway.
+  static let autocompletePrefixMaxUTF16 = 4096
+
+  private func autocompletePrefix(from text: String) -> String {
+    let caret = textView.selectedRange().location
+    return Self.boundedAutocompletePrefix(text as NSString, caret: caret)
+  }
+
+  static func boundedAutocompletePrefix(
+    _ text: NSString,
+    caret: Int,
+    maxUTF16: Int = MarkdownEditorSurface.autocompletePrefixMaxUTF16
+  ) -> String {
+    let caret = min(max(caret, 0), text.length)
+    guard caret > maxUTF16 else { return text.substring(to: caret) }
+    // Snap the window start down to a composed-character boundary so a
+    // surrogate pair (emoji, rare CJK) is never split; the window may grow
+    // by at most one composed sequence.
+    let start = text.rangeOfComposedCharacterSequence(at: caret - maxUTF16).location
+    return text.substring(with: NSRange(location: start, length: caret - start))
+  }
+
+  private func bindAutocomplete() {
+    autocompleteCancellable = autocompleteController.$suggestion
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] suggestion in
+        self?.scheduleAutocompleteRender(suggestion)
+      }
+  }
+
+  private func setAIAutocompleteEnabled(_ enabled: Bool) {
+    guard aiAutocompleteEnabled != enabled else { return }
+    aiAutocompleteEnabled = enabled
+    if !enabled {
+      invalidateAutocomplete()
+      autocompleteController.cancel()
+    }
+  }
+
+  private func scheduleAutocompleteRender(_ suggestion: String?) {
+    let selection = textView.selectedRange()
+    let renderGeneration = autocompleteRenderGeneration
+    guard aiAutocompleteEnabled, selection.length == 0, !textView.hasMarkedText(),
+      let suggestion, !suggestion.isEmpty
+    else {
+      textView.dismissAutocompleteGhost()
+      return
+    }
+    let caret = selection.location
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      guard self.aiAutocompleteEnabled,
+        self.autocompleteRenderGeneration == renderGeneration,
+        self.textView.selectedRange() == selection,
+        !self.textView.hasMarkedText()
+      else { return }
+      self.textView.setAutocompleteGhost(suggestion, at: caret)
+    }
+  }
+
+  @discardableResult
+  func acceptAutocompleteSuggestion() -> Bool {
+    guard let suggestion = textView.autocompleteGhostText, !suggestion.isEmpty else { return false }
+    // Accepting during IME composition would splice the suggestion through
+    // the marked range and corrupt the composition; refuse so Tab reaches
+    // the input method instead.
+    guard !textView.hasMarkedText() else {
+      invalidateAutocomplete()
+      return false
+    }
+    let range = textView.selectedRange()
+    guard range.length == 0 else {
+      invalidateAutocomplete()
+      return false
+    }
+    guard textView.autocompleteGhostAnchor == range.location else {
+      invalidateAutocomplete()
+      return false
+    }
+    guard textView.shouldChangeText(in: range, replacementString: suggestion) else { return false }
+
+    autocompleteController.cancel()
+    textView.dismissAutocompleteGhost()
+    textStorage.replaceCharacters(in: range, with: suggestion)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(
+      NSRange(location: range.location + (suggestion as NSString).length, length: 0))
+    textView.didChangeText()
+    return true
+  }
+
+  @discardableResult
+  func dismissAutocompleteSuggestion() -> Bool {
+    let hadGhost = textView.hasAutocompleteGhost
+    invalidateAutocomplete()
+    autocompleteController.cancel()
+    return hadGhost
+  }
+
+  func invalidateAutocomplete() {
+    autocompleteRenderGeneration &+= 1
+    textView.dismissAutocompleteGhost()
+  }
+
+  func textView(
+    _ changedTextView: NSTextView,
+    shouldChangeTextIn affectedCharRange: NSRange,
+    replacementString: String?
+  ) -> Bool {
+    guard changedTextView === textView else { return true }
+    guard !isApplyingExternalText else { return true }
+    invalidateAutocomplete()
+    guard textContentStorage.syntaxHighlightingEnabled else { return true }
+    guard let replacementString else { return true }
+    guard
+      let conversion = MarkdownFormatter.autoconversion(
+        in: textStorage.string,
+        range: affectedCharRange,
+        replacement: replacementString
+      )
+    else {
+      return true
+    }
+
+    guard NSMaxRange(conversion.range) <= (textStorage.string as NSString).length else {
+      return true
+    }
+    textStorage.replaceCharacters(in: conversion.range, with: conversion.replacement)
+    textContentStorage.refreshHighlighting()
+    textView.setSelectedRange(conversion.selectedRange)
+    centerCaretLineIfNeeded()
+    textView.didChangeText()
+    return false
   }
 
   func textViewDidChangeSelection(_ notification: Notification) {
@@ -296,6 +706,87 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     } else {
       textView.hideFormattingPopover()
     }
+    let currentSelection = textView.selectedRange()
+    if currentSelection != lastTextChangeSelection {
+      dismissAutocompleteSuggestion()
+    }
+    lastTextChangeSelection = nil
+    centerCaretLineIfNeeded()
+    notifySelectionChanged()
+  }
+
+  func centerCaretLineIfNeeded() {
+    guard typewriterScrollEnabled else { return }
+
+    let textLength = (textStorage.string as NSString).length
+    let selection = textView.selectedRange()
+    let location = min(max(selection.location, 0), textLength)
+
+    // Typewriter holds steady WHILE typing on a line and re-centers only when
+    // the caret's logical line changes. The old guard assumed the caret-glyph
+    // midY is stable for same-line typing — it is NOT (firstRect wobbles a
+    // fraction of a line on each character), so the document jumped on every
+    // keystroke in Focus mode. Anchoring on the newline-count line makes a
+    // same-line edit physically unable to re-center.
+    let caretLine = lineIndex(forUTF16Offset: location)
+    if caretLine == lastCenteredLine { return }
+    lastCenteredLine = caretLine
+
+    let range = NSRange(location: location, length: 0)
+    var actualRange = NSRange(location: NSNotFound, length: 0)
+    let screenRect = textView.firstRect(forCharacterRange: range, actualRange: &actualRange)
+    guard screenRect != .zero else {
+      textView.scrollRangeToVisible(range)
+      return
+    }
+
+    let caretRect: NSRect
+    if let window = textView.window {
+      caretRect = textView.convert(window.convertFromScreen(screenRect), from: nil)
+    } else {
+      caretRect = screenRect
+    }
+
+    let visible = scrollView.contentView.bounds
+    let documentHeight = max(textView.bounds.height, visible.height)
+    let targetY = Self.centeredScrollY(
+      caretMidY: caretRect.midY,
+      visibleHeight: visible.height,
+      documentHeight: documentHeight
+    )
+    // Secondary no-op: on a genuine line change, still skip a sub-pixel scroll.
+    // The PRIMARY same-line guard is the logical-line check at the top —
+    // caretMidY from firstRect is NOT stable across same-line edits, so this
+    // tolerance alone let the document JUMP on every keystroke in Focus mode.
+    guard abs(targetY - visible.origin.y) > 0.5 else { return }
+    scrollView.contentView.scroll(to: NSPoint(x: visible.origin.x, y: targetY))
+    scrollView.reflectScrolledClipView(scrollView.contentView)
+  }
+
+  /// Logical line index = number of newlines before `offset`. Layout-free and
+  /// stable across same-line horizontal edits — the property the typewriter
+  /// re-center guard needs and the caret-glyph rect does not have.
+  private func lineIndex(forUTF16Offset offset: Int) -> Int {
+    let ns = textStorage.string as NSString
+    let clamped = min(max(offset, 0), ns.length)
+    var line = 0
+    var i = 0
+    while i < clamped {
+      if ns.character(at: i) == 0x0A { line += 1 }
+      i += 1
+    }
+    return line
+  }
+
+  static func centeredScrollY(
+    caretMidY: CGFloat,
+    visibleHeight: CGFloat,
+    documentHeight: CGFloat
+  ) -> CGFloat {
+    guard visibleHeight > 0, documentHeight > visibleHeight else { return 0 }
+    let maxY = documentHeight - visibleHeight
+    let centeredY = caretMidY - (visibleHeight / 2)
+    return min(max(centeredY, 0), maxY)
   }
 
   @discardableResult
@@ -304,14 +795,19 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard range.length > 0 else { return false }
     guard NSMaxRange(range) <= (textStorage.string as NSString).length else { return false }
 
-    let selectedText = (textStorage.string as NSString).substring(with: range)
-    let replacement = MarkdownFormatter.format(selectedText, as: format)
-    guard textView.shouldChangeText(in: range, replacementString: replacement) else { return false }
+    guard
+      let edit = MarkdownFormatter.formatSelection(
+        in: textStorage.string,
+        range: range,
+        as: format)
+    else { return false }
+    guard textView.shouldChangeText(in: edit.range, replacementString: edit.replacement) else {
+      return false
+    }
 
-    textStorage.replaceCharacters(in: range, with: replacement)
+    textStorage.replaceCharacters(in: edit.range, with: edit.replacement)
     textContentStorage.refreshHighlighting()
-    textView.setSelectedRange(
-      NSRange(location: range.location, length: (replacement as NSString).length))
+    textView.setSelectedRange(edit.selectedRange)
     textView.didChangeText()
     textView.hideFormattingPopover()
     return true
@@ -378,6 +874,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     removeFindHighlights()
     findMatches = []
     activeFindMatchIndex = nil
+    notifyFindStateChanged()
   }
 
   func selectFindMatch(direction: FindDirection) {
@@ -413,6 +910,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.setSelectedRange(range)
     textView.scrollRangeToVisible(range)
     applyFindHighlights()
+    notifyFindStateChanged()
   }
 
   func replaceCurrentFindMatch(query: String, replacement: String) {
@@ -493,12 +991,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self.activeFindMatchIndex = nil
     }
     applyFindHighlights()
+    notifyFindStateChanged()
   }
 
   private func applyFindHighlights() {
     removeFindHighlights()
-    let passiveColor = NSColor.controlAccentColor.withAlphaComponent(0.18)
-    let activeColor = NSColor.controlAccentColor.withAlphaComponent(0.34)
+    // Clear, high-contrast find shading: every match gets a yellow wash so it is
+    // obvious in the document, and the active match an orange one so it stands
+    // out from the rest of the hits.
+    let passiveColor = NSColor.systemYellow.withAlphaComponent(0.50)
+    let activeColor = NSColor.systemOrange.withAlphaComponent(0.80)
     for (index, range) in findMatches.enumerated() {
       textStorage.addAttribute(
         .backgroundColor,
@@ -509,7 +1011,31 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   private func removeFindHighlights() {
+    // Find highlights only exist when there are matches. Skip the whole-document
+    // attribute mutation when there is nothing to remove: this ran on EVERY
+    // keystroke (textDidChange -> refreshFindMatches) AND every SwiftUI re-render
+    // (updateNSView -> updateFind -> clearFindHighlights), and a full-range
+    // removeAttribute forces a TextKit2 relayout of the visible viewport — the
+    // per-keystroke "text reflows/jumps at a fixed scroll origin" bug, which is
+    // independent of syntax highlighting (hence disabling rich markdown never
+    // helped).
+    guard !findMatches.isEmpty else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
     textStorage.removeAttribute(.backgroundColor, range: fullRange)
+  }
+
+  /// Push the current match total + active index up to the UI (FindBar count),
+  /// deduped so a re-render with unchanged find state never loops the binding.
+  private func notifyFindStateChanged() {
+    if hasNotifiedFindState,
+      lastNotifiedFindCount == findMatches.count,
+      lastNotifiedFindActiveIndex == activeFindMatchIndex
+    {
+      return
+    }
+    hasNotifiedFindState = true
+    lastNotifiedFindCount = findMatches.count
+    lastNotifiedFindActiveIndex = activeFindMatchIndex
+    onFindStateChanged?(findMatches.count, activeFindMatchIndex)
   }
 }

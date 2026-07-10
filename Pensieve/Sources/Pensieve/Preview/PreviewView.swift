@@ -18,21 +18,29 @@ import WebKit
 /// `EnvironmentObject` so the toolbar theme picker, the preview pane, and
 /// any future side surfaces all see the same selection.
 struct PreviewView: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
   @EnvironmentObject private var themeManager: ThemeManager
+  private let scrollSyncCoordinator: ScrollSyncCoordinator?
+
+  init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
+    self.scrollSyncCoordinator = scrollSyncCoordinator
+  }
 
   var body: some View {
     PreviewRepresentable(
       markdown: appState.activeDocumentText,
       fontSize: appState.fontSize,
       theme: themeManager.current,
+      skin: themeManager.skin,
       themeManager: themeManager,
       documentURL: appState.activeDocumentURL,
       autoReload: appState.previewAutoReload,
-      refreshToken: appState.previewRefreshToken
+      refreshToken: appState.previewRefreshToken,
+      scrollSyncCoordinator: scrollSyncCoordinator
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.textBackgroundColor))
+    .background(Color(NSColor.textBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
   }
 }
 
@@ -42,10 +50,12 @@ struct PreviewRepresentable: NSViewRepresentable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
+  let skin: ThemeManager.PreviewTheme
   let themeManager: ThemeManager
   let documentURL: URL?
   let autoReload: Bool
   let refreshToken: Int
+  let scrollSyncCoordinator: ScrollSyncCoordinator?
 
   /// Base URL for relative resource resolution inside the preview WebView.
   /// File-first markdown: relative images/links belong to the note's folder.
@@ -60,7 +70,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(themeManager: themeManager)
+    Coordinator(themeManager: themeManager, scrollSyncCoordinator: scrollSyncCoordinator)
   }
 
   func makeNSView(context: Context) -> PreviewWebView {
@@ -71,6 +81,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func updateNSView(_ nsView: PreviewWebView, context: Context) {
+    context.coordinator.update(scrollSyncCoordinator: scrollSyncCoordinator)
     context.coordinator.submit(request: currentRequest, autoReload: autoReload, initial: false)
   }
 
@@ -83,6 +94,7 @@ struct PreviewRepresentable: NSViewRepresentable {
       markdown: markdown,
       fontSize: fontSize,
       theme: theme,
+      skin: skin,
       documentURL: documentURL,
       refreshToken: refreshToken
     )
@@ -98,18 +110,41 @@ struct PreviewRepresentable: NSViewRepresentable {
   /// pass through.
   final class Coordinator {
     let pipeline: PreviewPipeline
+    private weak var previewView: PreviewWebView?
+    private var scrollSyncCoordinator: ScrollSyncCoordinator?
     private var lastAccepted: PreviewRenderRequest?
 
-    init(themeManager: ThemeManager) {
+    init(
+      themeManager: ThemeManager,
+      scrollSyncCoordinator: ScrollSyncCoordinator? = nil
+    ) {
       self.pipeline = PreviewPipeline(themeManager: themeManager)
+      self.scrollSyncCoordinator = scrollSyncCoordinator
     }
 
     func attach(view: PreviewWebView) {
+      previewView = view
       pipeline.attach(sink: view)
+      scrollSyncCoordinator?.attachPreviewTarget(view)
     }
 
     func detach() {
+      if let previewView {
+        scrollSyncCoordinator?.detachPreviewTarget(previewView)
+      }
+      previewView = nil
       pipeline.detach()
+    }
+
+    func update(scrollSyncCoordinator nextCoordinator: ScrollSyncCoordinator?) {
+      guard !sameCoordinator(as: nextCoordinator) else { return }
+      if let previewView {
+        scrollSyncCoordinator?.detachPreviewTarget(previewView)
+      }
+      scrollSyncCoordinator = nextCoordinator
+      if let previewView {
+        scrollSyncCoordinator?.attachPreviewTarget(previewView)
+      }
     }
 
     func submit(request: PreviewRenderRequest, autoReload: Bool, initial: Bool) {
@@ -122,15 +157,26 @@ struct PreviewRepresentable: NSViewRepresentable {
 
     /// True when the only difference between `previous` and `next` is the
     /// markdown payload or font size — the parts that live-stream as the
-    /// operator types or scrubs the slider. Theme, documentURL, and
+    /// operator types or scrubs the slider. Theme, skin, documentURL, and
     /// refreshToken are operator-triggered control changes; those always
     /// pass through even when auto-reload is off.
     private func shouldGateUpdate(
       from previous: PreviewRenderRequest, to next: PreviewRenderRequest
     ) -> Bool {
       previous.theme == next.theme
+        && previous.skin == next.skin
         && previous.documentURL == next.documentURL
         && previous.refreshToken == next.refreshToken
+    }
+
+    private func sameCoordinator(as other: ScrollSyncCoordinator?) -> Bool {
+      guard let scrollSyncCoordinator else {
+        return other == nil
+      }
+      guard let other else {
+        return false
+      }
+      return scrollSyncCoordinator === other
     }
   }
 }

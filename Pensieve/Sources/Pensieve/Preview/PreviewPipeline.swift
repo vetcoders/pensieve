@@ -4,6 +4,11 @@ import Foundation
 
 // MARK: - Pipeline value types
 
+enum PreviewRenderMode: Equatable {
+  case markdown
+  case plainText
+}
+
 /// One render request to the preview pipeline. Equatable on every input the
 /// pipeline observes so the scheduler can drop duplicates without re-rendering
 /// the markdown AST.
@@ -16,8 +21,38 @@ struct PreviewRenderRequest: Equatable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
+  /// Reading-surface skin layered on top of the flavor CSS. Defaulted so the
+  /// many constructors that predate the skin axis (export, command palette,
+  /// tests) keep compiling and render the established GitHub surface.
+  var skin: ThemeManager.PreviewTheme = .default
   let documentURL: URL?
   var refreshToken: Int = 0
+
+  var renderMode: PreviewRenderMode {
+    if Self.hasShebang(markdown) {
+      return .plainText
+    }
+    guard let documentURL else {
+      return .markdown
+    }
+    let ext = documentURL.pathExtension.lowercased()
+    guard !ext.isEmpty else {
+      return .plainText
+    }
+    return Self.markdownExtensions.contains(ext) ? .markdown : .plainText
+  }
+
+  private static let markdownExtensions: Set<String> = [
+    "md", "markdown", "mdown", "mdwn", "mkd", "mkdn",
+  ]
+
+  private static func hasShebang(_ text: String) -> Bool {
+    let start =
+      text.hasPrefix("\u{feff}")
+      ? text.dropFirst()
+      : text[...]
+    return start.hasPrefix("#!")
+  }
 }
 
 /// A fully composed HTML payload plus its base URL, ready to be loaded into a
@@ -29,46 +64,109 @@ struct PreviewRenderRequest: Equatable {
 struct PreviewDocument: Equatable {
   let html: String
   let baseURL: URL?
+  let bodyHTML: String
+  let styleHTML: String
+  let mermaidJavaScript: String?
+  let katexJavaScript: String?
+  let katexCSS: String?
+  let containsMath: Bool
+  let sourceURL: URL?
+  let refreshToken: Int
 }
 
 extension PreviewDocument {
   /// Compose the preview HTML around a rendered markdown body. Theme CSS is
   /// sanitized so an embedded `</style>` fragment cannot escape the style
-  /// block; appearance CSS and the viewport bridge script come from
-  /// `PreviewWebView` so the renderer-side and webview-side surfaces share
-  /// one source of truth.
+  /// block; appearance CSS comes from `PreviewWebView` so the renderer-side and
+  /// webview-side surfaces share one source of truth.
   static func make(
     body: String,
     css: String,
     fontSize: CGFloat,
+    skin: ThemeManager.PreviewTheme = .default,
     baseURL: URL?,
-    mermaidJavaScript: String? = nil
+    mermaidJavaScript: String? = nil,
+    katexJavaScript: String? = nil,
+    katexCSS: String? = nil,
+    sourceURL: URL? = nil,
+    refreshToken: Int = 0
   ) -> PreviewDocument {
-    let safeCSS = css.replacingOccurrences(of: "</style>", with: "<\\/style>")
+    let safeCSS = sanitizedForInlineEmbedding(css)
+    let styleHTML = """
+      \(safeCSS)
+      \(PreviewWebView.appearanceCSS(fontSize: fontSize, skin: skin))
+      """
     let mermaidScripts =
       mermaidJavaScript.map { javascript in
-        let safeJavaScript = javascript.replacingOccurrences(of: "</script>", with: "<\\/script>")
-        return """
-          <script>\(safeJavaScript)</script>
-          <script>\(PreviewWebView.mermaidBootstrapScript)</script>
-          """
+        """
+        <script>\(sanitizedForInlineEmbedding(javascript))</script>
+        <script>\(PreviewWebView.mermaidBootstrapScript)</script>
+        """
       } ?? ""
+    // KaTeX runtime mirrors the mermaid dance: the bundled <style> and runtime
+    // <script> must precede the math bootstrap so `window.katex` exists when
+    // the bootstrap runs.
+    let katexStyle =
+      katexCSS.map { css in
+        "<style id=\"vc-katex-style\">\(sanitizedForInlineEmbedding(css))</style>"
+      } ?? ""
+    let katexRuntime =
+      katexJavaScript.map { javascript in
+        "<script>\(sanitizedForInlineEmbedding(javascript))</script>"
+      } ?? ""
+    let mathScript =
+      body.contains("data-vc-math=")
+      ? """
+      \(katexStyle)
+      \(katexRuntime)
+      <script>\(PreviewWebView.mathBootstrapScript)</script>
+      """
+      : ""
+    let baseElement =
+      baseURL.map { url in
+        "<base href=\"\(HTMLEmitter.escapeAttribute(url.absoluteString))\">"
+      } ?? ""
+    let containsMath = body.contains("data-vc-math=")
     let html = """
       <!DOCTYPE html>
       <html><head><meta charset="utf-8">
-      <style>
-      \(safeCSS)
-      \(PreviewWebView.appearanceCSS(fontSize: fontSize))
+      \(baseElement)
+      <style id="vc-preview-style">
+      \(styleHTML)
       </style>
       </head><body>
       <article class="markdown-body">
       \(body)
       </article>
       \(mermaidScripts)
-      <script>\(PreviewWebView.bridgeScript)</script>
+      \(mathScript)
       </body></html>
       """
-    return PreviewDocument(html: html, baseURL: baseURL)
+    return PreviewDocument(
+      html: html,
+      baseURL: baseURL,
+      bodyHTML: body,
+      styleHTML: styleHTML,
+      mermaidJavaScript: mermaidJavaScript,
+      katexJavaScript: katexJavaScript,
+      katexCSS: katexCSS,
+      containsMath: containsMath,
+      sourceURL: sourceURL,
+      refreshToken: refreshToken)
+  }
+
+  /// Neutralizes element-closing sequences inside inline <script>/<style>
+  /// payloads. The HTML parser closes those elements on `</script` / `</style`
+  /// case-insensitively, so a plain lowercase `</script>` replacement leaves
+  /// `</SCRIPT>` or `</style >` breakouts open; escape the `</` for every case
+  /// variant instead.
+  private static func sanitizedForInlineEmbedding(_ payload: String) -> String {
+    // Template note: "\\" collapses to one literal backslash, yielding "<\/".
+    payload.replacingOccurrences(
+      of: #"</(?=script|style)"#,
+      with: #"<\\/"#,
+      options: [.regularExpression, .caseInsensitive]
+    )
   }
 }
 
@@ -161,20 +259,50 @@ final class PreviewPipeline {
   /// Synchronously build the document for a request without applying it.
   /// Exposed for tests that exercise document construction independently of
   /// the sink and scheduler.
+  // The vendored runtimes are immutable bundle resources but heavy (mermaid
+  // ~3.3MB, KaTeX runtime + inline-font CSS ~640KB), and `apply` runs on the
+  // main queue per debounced keystroke — cache the disk read + decode once.
+  private static let cachedMermaidJavaScript = PreviewResourceLocator.javascript(
+    named: "mermaid.min")
+  private static let cachedKatexJavaScript = PreviewResourceLocator.javascript(named: "katex.min")
+  private static let cachedKatexCSS = PreviewResourceLocator.css(named: "katex.inline.min")
+
   func makeDocument(for request: PreviewRenderRequest) -> PreviewDocument {
-    let output = renderer.render(request.markdown)
+    let body: String
+    switch request.renderMode {
+    case .markdown:
+      body = renderer.render(request.markdown).body
+    case .plainText:
+      body = Self.plainTextBody(for: request.markdown)
+    }
     let css = themeManager.css(for: request.theme)
     let mermaidJavaScript =
-      output.body.contains("class=\"mermaid\"")
-      ? PreviewResourceLocator.javascript(named: "mermaid.min")
+      body.contains("class=\"mermaid\"")
+      ? Self.cachedMermaidJavaScript
       : nil
+    // Embed the KaTeX payload only when the rendered body actually contains math.
+    let containsMath = body.contains("data-vc-math=")
+    let katexJavaScript = containsMath ? Self.cachedKatexJavaScript : nil
+    let katexCSS = containsMath ? Self.cachedKatexCSS : nil
     return PreviewDocument.make(
-      body: output.body,
+      body: body,
       css: css,
       fontSize: request.fontSize,
+      skin: request.skin,
       baseURL: PreviewRepresentable.resolveBaseURL(for: request.documentURL),
-      mermaidJavaScript: mermaidJavaScript
+      mermaidJavaScript: mermaidJavaScript,
+      katexJavaScript: katexJavaScript,
+      katexCSS: katexCSS,
+      sourceURL: request.documentURL,
+      refreshToken: request.refreshToken
     )
+  }
+
+  private static func plainTextBody(for text: String) -> String {
+    let escaped = HTMLEmitter.escapeText(text)
+    return """
+      <pre class="vc-plain-text" data-vc-block="0" style="font-size: var(--vc-font-size);"><code>\(escaped)</code></pre>
+      """
   }
 
   private func apply(_ request: PreviewRenderRequest) {

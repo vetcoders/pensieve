@@ -73,6 +73,14 @@ body {
  */
 a {
   background: transparent; }
+a.wikilink {
+  background: rgba(75, 107, 251, 0.1);
+  border-radius: 4px;
+  padding: 0 0.18em;
+  text-decoration: none; }
+a.wikilink:hover {
+  background: rgba(75, 107, 251, 0.16);
+  text-decoration: underline; }
 
 /**
  * Address `outline` inconsistency between Chrome and other browsers.

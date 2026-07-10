@@ -21,32 +21,57 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertNotEqual(a, differentTheme)
   }
 
+  func testRenderRequestClassifiesMarkdownExtensionsAndPlainScripts() {
+    let markdown = PreviewRenderRequest(
+      markdown: "# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/notes/a.mdown"))
+    XCTAssertEqual(markdown.renderMode, .markdown)
+
+    let text = PreviewRenderRequest(
+      markdown: "# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/notes/a.txt"))
+    XCTAssertEqual(text.renderMode, .plainText)
+
+    let extensionlessScript = PreviewRenderRequest(
+      markdown: "#!/bin/zsh\n# A", fontSize: 14, theme: .markdown,
+      documentURL: URL(fileURLWithPath: "/tmp/vibecrafted-rescue"))
+    XCTAssertEqual(extensionlessScript.renderMode, .plainText)
+  }
+
   // MARK: - Document construction
 
   func testMakeDocumentEmbedsBodyThemeCSSAndFontSize() {
+    let sourceURL = URL(fileURLWithPath: "/tmp/notes/a.md")
     let document = PreviewDocument.make(
       body: "<p data-vc-block=\"0\">hello</p>",
       css: ".markdown-body { color: tomato; }",
       fontSize: 17,
-      baseURL: URL(fileURLWithPath: "/tmp")
+      baseURL: URL(fileURLWithPath: "/tmp"),
+      sourceURL: sourceURL,
+      refreshToken: 3
     )
 
     // Body wrapped in the markdown-body article.
     XCTAssertTrue(document.html.contains("<article class=\"markdown-body\">"))
     XCTAssertTrue(document.html.contains("<p data-vc-block=\"0\">hello</p>"))
+    XCTAssertEqual(document.bodyHTML, "<p data-vc-block=\"0\">hello</p>")
 
     // Theme CSS is inlined.
     XCTAssertTrue(document.html.contains(".markdown-body { color: tomato; }"))
+    XCTAssertTrue(document.styleHTML.contains(".markdown-body { color: tomato; }"))
 
     // Responsive appearance CSS is composed in with the requested font size.
     XCTAssertTrue(document.html.contains("--vc-font-size: 17px"))
     XCTAssertTrue(document.html.contains("@media (prefers-color-scheme: dark)"))
 
-    // Viewport bridge script is embedded so block-level scroll sync stays wired.
-    XCTAssertTrue(document.html.contains("window.__vcScrollToBlock"))
+    // The old editor-preview scroll bridge was removed; preview documents
+    // should not ship the dead bridge script.
+    XCTAssertFalse(document.html.contains("window.__vcScrollToBlock"))
     XCTAssertFalse(document.html.contains("window.mermaid"))
 
     XCTAssertEqual(document.baseURL?.path, URL(fileURLWithPath: "/tmp").path)
+    XCTAssertEqual(document.sourceURL, sourceURL)
+    XCTAssertEqual(document.refreshToken, 3)
   }
 
   func testMakeDocumentIncludesMermaidRuntimeOnlyWhenProvided() {
@@ -68,6 +93,82 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(withMermaid.html.contains("window.mermaid ="))
     XCTAssertTrue(withMermaid.html.contains("mermaid.run"))
     XCTAssertTrue(withMermaid.html.contains("suppressErrors: true"))
+  }
+
+  func testMakeDocumentIncludesMathBootstrapOnlyForMathBody() {
+    let withoutMath = PreviewDocument.make(
+      body: "<p data-vc-block=\"0\">hello</p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertFalse(withoutMath.html.contains("window.katex"))
+    XCTAssertFalse(withoutMath.html.contains("data-vc-math"))
+
+    let withMath = PreviewDocument.make(
+      body:
+        "<p data-vc-block=\"0\">A <span class=\"vc-math vc-math-inline\" data-vc-math=\"inline\" data-vc-tex=\"x+y\">x+y</span></p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertTrue(withMath.html.contains("window.katex"))
+    XCTAssertTrue(withMath.html.contains("KaTeX runtime unavailable"))
+    XCTAssertTrue(withMath.html.contains("data-vc-tex=\"x+y\""))
+  }
+
+  func testMakeDocumentIncludesKatexRuntimeOnlyWhenProvided() {
+    let mathBody =
+      "<p data-vc-block=\"0\">A <span class=\"vc-math vc-math-inline\" data-vc-math=\"inline\" data-vc-tex=\"x+y\">x+y</span></p>"
+
+    let withoutRuntime = PreviewDocument.make(
+      body: mathBody,
+      css: "",
+      fontSize: 14,
+      baseURL: nil
+    )
+    XCTAssertNil(withoutRuntime.katexJavaScript)
+    XCTAssertNil(withoutRuntime.katexCSS)
+    XCTAssertFalse(withoutRuntime.html.contains("vc-katex-style"))
+
+    let withRuntime = PreviewDocument.make(
+      body: mathBody,
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      katexJavaScript: "window.katex = { render() {} };",
+      katexCSS: ".katex { color: inherit; }"
+    )
+    XCTAssertEqual(withRuntime.katexJavaScript, "window.katex = { render() {} };")
+    XCTAssertEqual(withRuntime.katexCSS, ".katex { color: inherit; }")
+    XCTAssertTrue(withRuntime.html.contains("window.katex = { render() {} };"))
+    XCTAssertTrue(withRuntime.html.contains("<style id=\"vc-katex-style\">"))
+    XCTAssertTrue(withRuntime.html.contains(".katex { color: inherit; }"))
+
+    // Runtime must precede the bootstrap so `window.katex` exists when the
+    // bootstrap walks the math nodes.
+    let runtimeRange = withRuntime.html.range(of: "window.katex = { render() {} };")
+    let bootstrapRange = withRuntime.html.range(of: "KaTeX runtime unavailable")
+    XCTAssertNotNil(runtimeRange)
+    XCTAssertNotNil(bootstrapRange)
+    if let runtimeRange, let bootstrapRange {
+      XCTAssertTrue(runtimeRange.lowerBound < bootstrapRange.lowerBound)
+    }
+  }
+
+  func testMakeDocumentEscapesEmbeddedClosersInKatexAssets() {
+    let document = PreviewDocument.make(
+      body: "<p data-vc-math=\"inline\" data-vc-tex=\"x\">x</p>",
+      css: "",
+      fontSize: 14,
+      baseURL: nil,
+      katexJavaScript: "window.example = '</script>';",
+      katexCSS: ".katex::after { content: '</style>'; }"
+    )
+    XCTAssertFalse(document.html.contains("'</script>'"))
+    XCTAssertTrue(document.html.contains("'<\\/script>'"))
+    XCTAssertFalse(document.html.contains("'</style>'"))
+    XCTAssertTrue(document.html.contains("'<\\/style>'"))
   }
 
   func testMakeDocumentEscapesEmbeddedStyleClose() {
@@ -161,7 +262,7 @@ final class PreviewPipelineTests: XCTestCase {
       markdown: "# Heading\n\nBody.",
       fontSize: 16,
       theme: .markdown,
-      documentURL: nil
+      documentURL: URL(fileURLWithPath: "/tmp/notes/entry.md")
     )
 
     let document = pipeline.makeDocument(for: request)
@@ -169,6 +270,34 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("<h1 data-vc-block=\"0\">Heading</h1>"))
     XCTAssertTrue(document.html.contains("<p data-vc-block=\"1\">Body.</p>"))
     XCTAssertTrue(document.html.contains("--vc-font-size: 16px"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentRendersScriptsAsPlainTextWithoutHeadings() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let source = "#!/bin/zsh\n# komentarz\n# ────\necho '<done>'"
+    let urls = [
+      URL(fileURLWithPath: "/tmp/vibecrafted-rescue.sh"),
+      URL(fileURLWithPath: "/tmp/vibecrafted-rescue.txt"),
+    ]
+
+    for url in urls {
+      let request = PreviewRenderRequest(
+        markdown: source,
+        fontSize: 16,
+        theme: .markdown,
+        documentURL: url
+      )
+
+      let document = pipeline.makeDocument(for: request)
+
+      XCTAssertTrue(document.html.contains("<pre class=\"vc-plain-text\""))
+      XCTAssertTrue(document.html.contains("# komentarz"))
+      XCTAssertTrue(document.html.contains("# ────"))
+      XCTAssertTrue(document.html.contains("&lt;done&gt;"))
+      XCTAssertTrue(document.html.contains("font-size: var(--vc-font-size)"))
+      XCTAssertFalse(document.html.contains("<h1"), document.html)
+    }
   }
 
   @MainActor
@@ -189,6 +318,51 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("mermaid.run"))
     XCTAssertFalse(document.html.contains("cdn.jsdelivr"))
     XCTAssertFalse(document.html.contains("unpkg.com"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentRendersMathThroughHTMLEmitter() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let request = PreviewRenderRequest(
+      markdown: "Inline $a^2+b^2=c^2$",
+      fontSize: 16,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    let document = pipeline.makeDocument(for: request)
+
+    XCTAssertTrue(document.html.contains("class=\"vc-math vc-math-inline\""), document.html)
+    XCTAssertTrue(document.html.contains("data-vc-tex=\"a^2+b^2=c^2\""), document.html)
+    XCTAssertTrue(document.html.contains("window.katex"))
+
+    // The bundled KaTeX runtime + stylesheet must ship with math documents so
+    // `window.katex.render` actually exists at bootstrap time.
+    XCTAssertNotNil(document.katexJavaScript, "bundled KaTeX runtime missing")
+    XCTAssertNotNil(document.katexCSS, "bundled KaTeX stylesheet missing")
+    XCTAssertTrue(document.html.contains("e.katex=t()"), "KaTeX runtime not embedded")
+    XCTAssertTrue(document.html.contains("font-family:KaTeX_AMS"), "KaTeX CSS not embedded")
+    XCTAssertFalse(document.html.contains("cdn.jsdelivr"))
+    XCTAssertFalse(document.html.contains("unpkg.com"))
+  }
+
+  @MainActor
+  func testPipelineMakeDocumentOmitsKatexForPlainDocument() {
+    let pipeline = PreviewPipeline(themeManager: ThemeManager())
+    let request = PreviewRenderRequest(
+      markdown: "# Heading\n\nNo math here.",
+      fontSize: 16,
+      theme: .markdown,
+      documentURL: nil
+    )
+
+    let document = pipeline.makeDocument(for: request)
+
+    XCTAssertNil(document.katexJavaScript, "plain document must not carry the ~270KB runtime")
+    XCTAssertNil(document.katexCSS, "plain document must not carry the ~370KB stylesheet")
+    XCTAssertFalse(document.html.contains("e.katex=t()"))
+    XCTAssertFalse(document.html.contains("font-family:KaTeX_AMS"))
+    XCTAssertFalse(document.html.contains("vc-katex-style"))
   }
 
   @MainActor

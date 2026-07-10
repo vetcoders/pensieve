@@ -2,14 +2,41 @@ import AppKit
 import SwiftUI
 
 struct FindBar: View {
-  @EnvironmentObject private var appState: AppState
+  @Environment(AppState.self) private var appState
+
+  // "3 of 12" while navigating, "12 found" before the first jump, "No results"
+  // when the query matches nothing — shown inline in the bar's search area.
+  private var findCountLabel: String {
+    let total = appState.findMatchCount
+    if total == 0 { return "No results" }
+    if let active = appState.findActiveMatchIndex {
+      return "\(active + 1) of \(total)"
+    }
+    return "\(total) found"
+  }
 
   var body: some View {
-    HStack(spacing: 6) {
+    @Bindable var appState = appState
+    return HStack(spacing: 6) {
+      // Disclosure toggle next to the search field: reveals/hides the Replace
+      // row inline so Replace is discoverable from the bar itself, not only via
+      // the ⌘⌥F menu shortcut.
+      Button {
+        appState.findReplaceMode.toggle()
+      } label: {
+        Image(systemName: appState.findReplaceMode ? "chevron.down" : "chevron.right")
+          .font(.system(size: 11, weight: .semibold))
+          .frame(width: 16, height: 16)
+      }
+      .buttonStyle(.borderless)
+      .help(appState.findReplaceMode ? "Hide Replace" : "Show Replace")
+      .accessibilityIdentifier("pensieve.find.toggleReplace")
+
       NativeSearchField(
         text: $appState.findQuery,
         placeholder: "Find",
         focusToken: appState.findFocusToken,
+        focusOnAppear: true,
         accessibilityIdentifier: "pensieve.find.query"
       ) {
         appState.pendingFindCommand = FindBarCommand(action: .next)
@@ -37,6 +64,14 @@ struct FindBar: View {
         .buttonStyle(.borderless)
         .disabled(appState.findQuery.isEmpty)
         .accessibilityIdentifier("pensieve.find.replaceAll")
+      }
+
+      if !appState.findQuery.isEmpty {
+        Text(findCountLabel)
+          .font(.system(size: 11).monospacedDigit())
+          .foregroundStyle(.secondary)
+          .frame(minWidth: 64, alignment: .trailing)
+          .accessibilityIdentifier("pensieve.find.count")
       }
 
       Button {
@@ -68,7 +103,11 @@ struct FindBar: View {
     }
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
-    .background(Color(NSColor.controlBackgroundColor))
+    // Native find-bar material (Safari / TextEdit style): an opaque, blurred bar
+    // instead of a flat fill. `controlBackgroundColor` was letting the document
+    // text bleed through behind the search field; `.bar` blurs whatever is under
+    // it so the bar reads as a real macOS find bar, not a translucent overlay.
+    .background(.bar)
     .overlay(alignment: .bottom) {
       Divider()
     }

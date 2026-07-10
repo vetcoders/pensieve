@@ -1,0 +1,55 @@
+# scroll-trace.lldb — localize the LIVE per-keystroke editor jump / block-vanish.
+#
+# Static analysis + unit probes exonerate the surface and the SwiftUI re-apply
+# path (see EditorScrollStabilityProbeTests). The symptom the operator sees live
+# ("per-keystroke up/down without viewport mutation, text blocks vanishing")
+# only exists in the real event/responder/IME pipeline, which only a runtime
+# symbolicated backtrace can localize.
+#
+# This instrument breaks on every AppKit scroll primitive AND on Pensieve's
+# forced TextKit2 layout query, prints a marker + 12-frame backtrace, then
+# AUTO-CONTINUES so the app stays usable. Type ONE char with the caret IN VIEW
+# in editor-only mode and read which marker fires:
+#
+#   >>> SCROLL-MUTATION <<<   real scroll happened (clip/textview moved)
+#   >>> LAYOUT-QUERY <<<      currentTopVisibleBlockIndex -> characterIndexForInsertion
+#                             forced a TextKit2 layout pass mid-edit (block vanish)
+#   >>> TYPEWRITER <<<        centerCaretLineIfNeeded re-centered (focus mode)
+#
+# A clean in-view keystroke should fire NONE of these. Whichever fires — and the
+# Pensieve frame in its backtrace — is the residual live bug. If blocks vanish
+# but NOTHING fires, pivot to NSTextViewportLayoutController (deeper relayout).
+
+settings set target.process.stop-on-sharedlibrary-events false
+
+# 1,2 — AppKit scroll primitives (every scroll funnels through these).
+breakpoint set -n "-[NSClipView scrollToPoint:]" -N scroll
+breakpoint set -n "-[NSTextView scrollRangeToVisible:]" -N scroll
+
+# 3 — Pensieve forced-layout query (the block-vanish trigger).
+breakpoint set -r currentTopVisibleBlockIndex -N layoutquery
+
+# 4 — Pensieve typewriter re-center (focus mode).
+breakpoint set -r centerCaretLineIfNeeded -N typewriter
+
+# Auto-continue is expressed as a trailing `continue` in each command list
+# (the `--auto-continue` flag is rejected by Apple lldb's `command add`).
+breakpoint command add 1 2
+script print(">>> SCROLL-MUTATION <<<")
+bt 12
+continue
+DONE
+
+breakpoint command add 3
+script print(">>> LAYOUT-QUERY (currentTopVisibleBlockIndex -> characterIndexForInsertion) <<<")
+bt 12
+continue
+DONE
+
+breakpoint command add 4
+script print(">>> TYPEWRITER (centerCaretLineIfNeeded) <<<")
+bt 12
+continue
+DONE
+
+breakpoint list

@@ -11,9 +11,9 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleGetInfoString</key>
-    <string>Pensieve 0.1.0 (dev)</string>
+    <string>Pensieve 0.0.0 (dev)</string>
     <key>PensieveBuildCommit</key>
     <string>unknown</string>
     <key>PensieveBuildCommitSlug</key>
@@ -23,19 +23,19 @@
     <key>PensieveComponentVersions</key>
     <dict>
         <key>Editor</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>MarkdownRenderer</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Mermaid</key>
-        <string>11.15.0</string>
+        <string>0.0.0</string>
         <key>Preview</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Search</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Storage</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
         <key>Workspace</key>
-        <string>0.1.0</string>
+        <string>0.0.0</string>
     </dict>
     <key>CFBundleExecutable</key>
     <string>Pensieve</string>
@@ -52,13 +52,17 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
     <key>NSHumanReadableCopyright</key>
-    <string>𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI</string>
+    <string>𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticTermination</key>
     <true/>
     <key>NSSupportsSuddenTermination</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Pensieve needs access to your microphone to transcribe your speech into text.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Pensieve needs access to speech recognition to transcribe your voice notes.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>CFBundleDocumentTypes</key>

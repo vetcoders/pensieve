@@ -1,42 +1,234 @@
+import AppKit
+import Combine
 import SwiftUI
 
 @main
 struct PensieveApp: App {
   @NSApplicationDelegateAdaptor(PensieveAppDelegate.self) private var appDelegate
-  @StateObject private var appState: AppState
-  @StateObject private var controller: AppController
+  // WorkspaceStore is @Observable now → @State, not @StateObject.
+  @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
 
   init() {
-    let appState = AppState()
-    _appState = StateObject(wrappedValue: appState)
-    _controller = StateObject(
-      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+    _workspaceStore = State(wrappedValue: WorkspaceStore())
     _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
     _themeManager = StateObject(wrappedValue: ThemeManager())
   }
 
   var body: some Scene {
-    WindowGroup("Pensieve") {
-      ContentView()
-        .environmentObject(appState)
-        .environmentObject(controller)
-        .environmentObject(themeManager)
-        .frame(minWidth: 720, minHeight: 480)
-        .task {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
-        }
-        .onOpenURL { url in
-          launchIntentCoordinator.handle(urls: [url])
-        }
+    // The WindowGroup scene serves the launcher window and any state-restored
+    // legacy document scenes (`initialDocument`). Document opens do NOT go
+    // through `openWindow(value:)` anymore: DocumentWindowRegistry builds
+    // document windows directly in AppKit (DocumentWindowFactory) and attaches
+    // them as native tabs before first presentation.
+    WindowGroup("Pensieve", for: DocumentRef.self) { document in
+      DocumentWindowRootView(
+        workspaceStore: workspaceStore,
+        launchIntentCoordinator: launchIntentCoordinator,
+        themeManager: themeManager,
+        initialDocument: document.wrappedValue
+      )
     }
-    .windowStyle(.titleBar)
-    .windowToolbarStyle(.unified(showsTitle: true))
-    .defaultSize(width: 1180, height: 760)
-    .windowResizability(.contentMinSize)
+    .pensieveDocumentWindowChrome()
     .commands {
-      PensieveCommands(appState: appState, controller: controller)
+      PensieveCommands(themeManager: themeManager)
     }
+  }
+}
+
+struct DocumentWindowRootView: View {
+  let workspaceStore: WorkspaceStore
+  let launchIntentCoordinator: LaunchIntentCoordinator
+  let themeManager: ThemeManager
+  let initialDocument: DocumentRef?
+
+  // AppState is @Observable now → @State, not @StateObject.
+  @State private var appState: AppState
+  @StateObject private var controller: AppController
+  @State private var loadedInitialDocumentID: DocumentRef.ID?
+  @State private var initialDocumentLoadResolved = false
+  @State private var currentWindow: NSWindow?
+  @State private var startupPresentationReady = false
+
+  init(
+    workspaceStore: WorkspaceStore,
+    launchIntentCoordinator: LaunchIntentCoordinator,
+    themeManager: ThemeManager,
+    initialDocument: DocumentRef?
+  ) {
+    self.workspaceStore = workspaceStore
+    self.launchIntentCoordinator = launchIntentCoordinator
+    self.themeManager = themeManager
+    self.initialDocument = initialDocument
+
+    let appState = AppState(workspaceStore: workspaceStore)
+    _appState = State(wrappedValue: appState)
+    _controller = StateObject(
+      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+  }
+
+  var body: some View {
+    ZStack {
+      ContentView()
+        .opacity(startupPresentationReady ? 1 : 0)
+        .allowsHitTesting(startupPresentationReady)
+
+      if !startupPresentationReady {
+        StartupPresentationView()
+      }
+    }
+    .environment(appState)
+    .environmentObject(controller)
+    .environmentObject(controller.transcriptionService)
+    .environmentObject(themeManager)
+    .focusedSceneValue(\.appState, appState)
+    .focusedSceneObject(controller)
+    .background(
+      DocumentWindowAccessor(
+        // Fall back to the scene's initialDocument so the FIRST attach already
+        // carries the document identity: the registry can track the window as
+        // a document window before the (async) document load finishes,
+        // instead of briefly registering a document window as a launcher.
+        // The fallback ends once the load resolves — a FAILED load must stop
+        // advertising the document so the registry releases its mapping
+        // instead of pinning this empty window to the URL forever.
+        documentID: DocumentWindowRootView.accessorDocumentID(
+          selected: appState.selectedDocumentID,
+          initialDocument: initialDocument,
+          loadResolved: initialDocumentLoadResolved),
+        title: appState.documentTitle,
+        representedURL: appState.documentURL,
+        hasEditableBuffer: appState.documentHasEditableBuffer
+      ) { window in
+        currentWindow = window
+      }
+    )
+    .frame(
+      minWidth: WindowChromeRecipe.minimumContentSize.width,
+      minHeight: WindowChromeRecipe.minimumContentSize.height
+    )
+    .task {
+      configureDocumentRouting()
+      if let initialDocument {
+        openInitialDocument(initialDocument)
+        revealStartupWindow()
+      } else {
+        launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller) {
+          revealStartupWindow()
+        }
+        // Belt: the launch coordinator is a shared singleton whose startup
+        // decision fires reliably only for the FIRST window. A re-opened or
+        // second launcher window (Dock click with no windows, or the launcher
+        // re-spawned after the last document closed) may never get that
+        // callback and would otherwise stay stuck on the startup spinner. Reveal
+        // this window's empty state regardless after a short grace period — the
+        // coordinator still runs its workspace restore in the background.
+        Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 400_000_000)
+          revealStartupWindow()
+        }
+      }
+    }
+    .onChange(of: initialDocument?.id) { _ in
+      if let initialDocument {
+        startupPresentationReady = false
+        initialDocumentLoadResolved = false
+        openInitialDocument(initialDocument)
+        revealStartupWindow()
+      }
+    }
+    .onOpenURL { url in
+      controller.openFile(url: url)
+    }
+    // App-wide save-on-close guard. Every window (factory-built document tab AND
+    // state-restored WindowGroup scene) shares this root, and every close
+    // trigger — red close button, the tab's "×", the sidebar "Close from Open
+    // Files", or ⌘W falling through to a native window close — posts
+    // `willCloseNotification` for the closing window. Filtering to THIS window's
+    // `currentWindow` flushes only its own session, synchronously, before the
+    // window/`AppState` tears down — closing the ≤1.5s autosave-debounce data
+    // loss without touching the window delegate SwiftUI owns.
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
+      notification in
+      guard let closingWindow = notification.object as? NSWindow,
+        closingWindow === currentWindow
+      else {
+        return
+      }
+      controller.savePendingChangesOnClose()
+    }
+  }
+
+  private func configureDocumentRouting() {
+    let factory = DocumentWindowFactory(
+      workspaceStore: workspaceStore,
+      launchIntentCoordinator: launchIntentCoordinator,
+      themeManager: themeManager
+    )
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
+      factory.makeWindow(for: ref)
+    }
+    controller.requestOpenDocumentWindow = { ref in
+      DocumentWindowRegistry.shared.open(ref)
+    }
+    controller.requestCloseCurrentWindowIfEmpty = {
+      guard !appState.documentSession.hasEditableBuffer else { return }
+      DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
+    }
+  }
+
+  /// Document identity reported to the window registry. Before the initial
+  /// load resolves, the scene's `initialDocument` stands in for the not-yet
+  /// selected document so the first attaches already carry the identity.
+  /// After the load resolved, only the real session state counts: a failed
+  /// load (deleted/unreadable recent) leaves `selected` nil and the window
+  /// must register as a launcher, releasing the pre-open document mapping.
+  static func accessorDocumentID(
+    selected: URL?,
+    initialDocument: DocumentRef?,
+    loadResolved: Bool
+  ) -> URL? {
+    selected ?? (loadResolved ? nil : initialDocument?.id)
+  }
+
+  private func openInitialDocument(_ ref: DocumentRef) {
+    guard loadedInitialDocumentID?.standardizedFileURL != ref.id.standardizedFileURL else {
+      return
+    }
+    loadedInitialDocumentID = ref.id.standardizedFileURL
+    controller.start(restoringWorkspace: false)
+    controller.openFileInCurrentWindow(url: ref.url)
+    // openFileInCurrentWindow loads synchronously: on success
+    // selectedDocumentID is set, on failure it stays nil. Either way the
+    // pre-load fallback has done its job and must stop.
+    initialDocumentLoadResolved = true
+  }
+
+  private func revealStartupWindow() {
+    DispatchQueue.main.async {
+      startupPresentationReady = true
+    }
+  }
+}
+
+struct StartupPresentationView: View {
+  var body: some View {
+    VStack(spacing: 10) {
+      ProgressView()
+        .controlSize(.small)
+
+      Text("Pensieve")
+        .font(.headline)
+        .foregroundStyle(.secondary)
+
+      Text(BuildIdentity.current.conciseLabel)
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
+    .accessibilityIdentifier("pensieve.startupPresentation")
   }
 }

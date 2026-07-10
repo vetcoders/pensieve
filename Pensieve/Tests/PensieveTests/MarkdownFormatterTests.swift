@@ -16,6 +16,130 @@ final class MarkdownFormatterTests: XCTestCase {
     XCTAssertEqual(MarkdownFormatter.format("one\ntwo", as: .numberedList), "1. one\n1. two\n")
   }
 
+  func testTypingReturnContinuesMarkdownListsAndQuotes() {
+    let unordered = MarkdownFormatter.autoconversion(
+      in: "- alpha",
+      range: NSRange(location: 7, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(unordered?.range, NSRange(location: 7, length: 0))
+    XCTAssertEqual(unordered?.replacement, "\n- ")
+    XCTAssertEqual(unordered?.selectedRange, NSRange(location: 10, length: 0))
+
+    let ordered = MarkdownFormatter.autoconversion(
+      in: "  9. alpha",
+      range: NSRange(location: 10, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(ordered?.replacement, "\n  10. ")
+
+    let task = MarkdownFormatter.autoconversion(
+      in: "- [x] done",
+      range: NSRange(location: 10, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(task?.replacement, "\n- [ ] ")
+
+    let quote = MarkdownFormatter.autoconversion(
+      in: "> thought",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(quote?.replacement, "\n> ")
+  }
+
+  func testTypingReturnOnEmptyMarkdownMarkerExitsTheContainer() {
+    let conversion = MarkdownFormatter.autoconversion(
+      in: "- ",
+      range: NSRange(location: 2, length: 0),
+      replacement: "\n"
+    )
+
+    XCTAssertEqual(conversion?.range, NSRange(location: 0, length: 2))
+    XCTAssertEqual(conversion?.replacement, "")
+    XCTAssertEqual(conversion?.selectedRange, NSRange(location: 0, length: 0))
+  }
+
+  func testTypingEqualsClosesInlineHighlightWhenRichMarkdownIsEnabled() {
+    let conversion = MarkdownFormatter.autoconversion(
+      in: "This is ==important",
+      range: NSRange(location: 19, length: 0),
+      replacement: "="
+    )
+
+    XCTAssertEqual(conversion?.range, NSRange(location: 19, length: 0))
+    XCTAssertEqual(conversion?.replacement, "==")
+    XCTAssertEqual(conversion?.selectedRange, NSRange(location: 21, length: 0))
+  }
+
+  func testTypingEqualsDoesNotCloseEmptyOrAlreadyClosedHighlight() {
+    let opening = MarkdownFormatter.autoconversion(
+      in: "=",
+      range: NSRange(location: 1, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(opening)
+
+    let whitespaceOnly = MarkdownFormatter.autoconversion(
+      in: "== ",
+      range: NSRange(location: 3, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(whitespaceOnly)
+
+    let alreadyClosed = MarkdownFormatter.autoconversion(
+      in: "==done==",
+      range: NSRange(location: 8, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(alreadyClosed)
+
+    let textAfterClosedHighlight = MarkdownFormatter.autoconversion(
+      in: "==done== later",
+      range: NSRange(location: 14, length: 0),
+      replacement: "="
+    )
+    XCTAssertNil(textAfterClosedHighlight)
+  }
+
+  @MainActor
+  func testEditorAutoconversionRunsOnlyWhenRichMarkdownIsEnabled() {
+    let richSurface = MarkdownEditorSurface(
+      text: "- alpha",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true
+    )
+    richSurface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    let didLetAppKitHandleRichReturn =
+      richSurface.textView.delegate?.textView?(
+        richSurface.textView,
+        shouldChangeTextIn: NSRange(location: 7, length: 0),
+        replacementString: "\n"
+      ) ?? true
+
+    XCTAssertFalse(didLetAppKitHandleRichReturn)
+    XCTAssertEqual(richSurface.textStorage.string, "- alpha\n- ")
+    XCTAssertEqual(richSurface.textView.selectedRange(), NSRange(location: 10, length: 0))
+
+    let plainSurface = MarkdownEditorSurface(
+      text: "- alpha",
+      fontSize: 14,
+      syntaxHighlightingEnabled: false
+    )
+    plainSurface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    let didLetAppKitHandlePlainReturn =
+      plainSurface.textView.delegate?.textView?(
+        plainSurface.textView,
+        shouldChangeTextIn: NSRange(location: 7, length: 0),
+        replacementString: "\n"
+      ) ?? false
+
+    XCTAssertTrue(didLetAppKitHandlePlainReturn)
+    XCTAssertEqual(plainSurface.textStorage.string, "- alpha")
+  }
+
   @MainActor
   func testControllerMarkdownFormatCommandAppliesToEditorSelectionAndMarksDirty() {
     var boundText = "alpha beta"
@@ -39,6 +163,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = appState.pendingMarkdownFormatCommand
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
@@ -48,6 +173,7 @@ final class MarkdownFormatterTests: XCTestCase {
       findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
@@ -66,6 +192,61 @@ final class MarkdownFormatterTests: XCTestCase {
   }
 
   @MainActor
+  func testFormatSelectionMapsWrapperStringsToFormatCommands() {
+    // Every wrapper string the Format menu passes must land as the matching
+    // typed command in pendingMarkdownFormatCommand (the editor pickup point).
+    let expectations: [(wrapper: String, format: MarkdownFormat)] = [
+      ("**", .bold), ("*", .italic), ("~~", .strike), (">", .quote),
+      ("`", .code), ("[]()", .link), ("-", .bulletedList), ("1.", .numberedList),
+    ]
+
+    // Completeness latch: the Format app menu hand-rolls these wrapper strings
+    // (Commands.swift), while every other edit surface iterates
+    // `MarkdownFormat.allCases`. A new enum case must show up here — and force
+    // a conscious Format-menu decision — instead of silently missing coverage.
+    XCTAssertEqual(expectations.count, MarkdownFormat.allCases.count)
+    XCTAssertEqual(Set(expectations.map(\.format)), Set(MarkdownFormat.allCases))
+
+    for expectation in expectations {
+      let appState = AppState()
+      let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+      appState.documentSession = DocumentSession(document: ref, text: "alpha")
+      let controller = AppController(appState: appState)
+
+      controller.formatSelection(with: expectation.wrapper)
+
+      XCTAssertEqual(
+        appState.pendingMarkdownFormatCommand?.action,
+        .format(expectation.format),
+        "wrapper \(expectation.wrapper) should map to \(expectation.format)")
+    }
+  }
+
+  @MainActor
+  func testFormatSelectionIgnoresUnknownWrapper() {
+    let appState = AppState()
+    let ref = DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-format-selection.md"))
+    appState.documentSession = DocumentSession(document: ref, text: "alpha")
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "%%")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
+  func testFormatSelectionRequiresEditableBuffer() {
+    // Mirrors the Format menu's disabled predicate: with no editable buffer
+    // the command must not enqueue a formatting request.
+    let appState = AppState()
+    let controller = AppController(appState: appState)
+
+    controller.formatSelection(with: "**")
+
+    XCTAssertNil(appState.pendingMarkdownFormatCommand)
+  }
+
+  @MainActor
   func testEmptySelectionFormattingIsLegacyNoOp() {
     var didRouteDocumentChange = false
     let surface = MarkdownEditorSurface(text: "plain", fontSize: 14)
@@ -78,6 +259,64 @@ final class MarkdownFormatterTests: XCTestCase {
 
     XCTAssertFalse(didApply)
     XCTAssertEqual(surface.textStorage.string, "plain")
+    XCTAssertFalse(didRouteDocumentChange)
+  }
+
+  @MainActor
+  func testWrappingFormatToggleUnwrapsSelectionInsideExistingSpan() {
+    let cases: [(format: MarkdownFormat, marked: String, selected: String)] = [
+      (.bold, "**Lorem ipsum**", "Lorem"),
+      (.italic, "*Lorem ipsum*", "Lorem"),
+      (.strike, "~~Lorem ipsum~~", "Lorem"),
+      (.code, "```\nLorem ipsum\n```", "Lorem"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange((sample.marked as NSString).range(of: sample.selected))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an inner selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem ipsum", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleUnwrapsExactSpanSelection() {
+    let cases: [(format: MarkdownFormat, marked: String)] = [
+      (.bold, "**Lorem**"),
+      (.italic, "*Lorem*"),
+      (.strike, "~~Lorem~~"),
+      (.code, "```\nLorem\n```"),
+    ]
+
+    for sample in cases {
+      let surface = MarkdownEditorSurface(text: sample.marked, fontSize: 14)
+      surface.textView.setSelectedRange(
+        NSRange(location: 0, length: (sample.marked as NSString).length))
+
+      let didApply = surface.applyMarkdownFormat(sample.format)
+
+      XCTAssertTrue(didApply, "\(sample.format) should unwrap from an exact span selection")
+      XCTAssertEqual(surface.textStorage.string, "Lorem", "\(sample.format)")
+    }
+  }
+
+  @MainActor
+  func testWrappingFormatToggleNoOpsPartiallyOverlappingSpan() {
+    var didRouteDocumentChange = false
+    let text = "pre **Lorem ipsum** post"
+    let surface = MarkdownEditorSurface(text: text, fontSize: 14)
+    surface.onTextChanged = { _ in
+      didRouteDocumentChange = true
+    }
+    surface.textView.setSelectedRange((text as NSString).range(of: "pre **Lorem"))
+
+    let didApply = surface.applyMarkdownFormat(.bold)
+
+    XCTAssertFalse(didApply)
+    XCTAssertEqual(surface.textStorage.string, text)
     XCTAssertFalse(didRouteDocumentChange)
   }
 
@@ -102,6 +341,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = FindBarCommand(action: .useSelection)
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: nil,
@@ -111,6 +351,7 @@ final class MarkdownFormatterTests: XCTestCase {
       findCommand: command,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {},
       onCloseFindBar: {}
@@ -153,6 +394,7 @@ final class MarkdownFormatterTests: XCTestCase {
     let command = appState.pendingMarkdownFormatCommand
     let representable = EditorRepresentable(
       text: Binding(get: { boundText }, set: { boundText = $0 }),
+      editorMode: .source,
       fontSize: 14,
       syntaxHighlightingEnabled: true,
       formattingCommand: command,
@@ -162,6 +404,7 @@ final class MarkdownFormatterTests: XCTestCase {
       findCommand: nil,
       tableTidyOnPaste: true,
       asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
       isDirty: Binding(get: { isDirty }, set: { isDirty = $0 }),
       onDocumentChanged: {
         didRouteDocumentChange = true
@@ -241,5 +484,40 @@ final class MarkdownFormatterTests: XCTestCase {
 
     XCTAssertFalse(surface.textView.pasteTableIfNeeded(from: pasteboard))
     XCTAssertEqual(surface.textStorage.string, "")
+  }
+
+  func testTypewriterScrollCentersCaretAndClampsToDocumentBounds() {
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 500,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      400
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 40,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      0
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 1180,
+        visibleHeight: 200,
+        documentHeight: 1200
+      ),
+      1000
+    )
+    XCTAssertEqual(
+      MarkdownEditorSurface.centeredScrollY(
+        caretMidY: 500,
+        visibleHeight: 300,
+        documentHeight: 250
+      ),
+      0
+    )
   }
 }

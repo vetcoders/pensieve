@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import SwiftUI
 
 enum EditorMode: Int, CaseIterable, Identifiable {
@@ -53,39 +53,215 @@ struct FindBarCommand: Equatable, Identifiable {
   let action: Action
 }
 
+@Observable
 @MainActor
-final class AppState: ObservableObject {
-  private static let previewAutoReloadKey = "Pensieve.previewAutoReload"
-  private static let tableTidyOnPasteKey = "Pensieve.tableTidyOnPaste"
-  private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
-  private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
-  private let defaults: UserDefaults
+final class AppState {
+  let workspaceStore: WorkspaceStore
+  let windowModel: DocumentWindowModel
 
-  // Workspace + document selection
-  @Published var folderURL: URL?
-  @Published var workspaceRoots: [WorkspaceRoot] = []
-  @Published var workspaceTree: [WorkspaceNode] = []
-  @Published var documents: [DocumentRef] = [] {
-    didSet { rebuildAllDocumentsCache() }
-  }
-  @Published var openFiles: [DocumentRef] = [] {
-    didSet { rebuildAllDocumentsCache() }
-  }
-  @Published var documentTabs: [DocumentRef] = []
-  @Published var excludedWorkspacePaths: Set<String> = []
-  @Published var selectedDocumentID: DocumentRef.ID?
-  @Published var workspaceSearchQuery: String = ""
-  @Published var workspaceSearchResults: [WorkspaceSearchResult] = []
-  @Published var sidebarFocusedURL: URL?
-  @Published var pendingSidebarRenameURL: URL?
-  @Published var sidebarSortOrder: SidebarSortOrder {
-    didSet {
-      defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
-    }
+  init(
+    workspaceStore: WorkspaceStore? = nil,
+    windowModel: DocumentWindowModel? = nil,
+    defaults: UserDefaults = .standard
+  ) {
+    self.workspaceStore = workspaceStore ?? WorkspaceStore(defaults: defaults)
+    self.windowModel = windowModel ?? DocumentWindowModel(defaults: defaults)
   }
 
-  // Active document
-  @Published var documentSession: DocumentSession = .empty
+  // Forwarded straight to the workspace store; with `@Observable`, reading this
+  // in a view tracks `workspaceStore.workspaceActivity` directly — no manual
+  // objectWillChange fan-in needed (that was the per-keystroke storm source).
+  var workspaceActivity: WorkspaceActivity? {
+    get { workspaceStore.workspaceActivity }
+    set { workspaceStore.workspaceActivity = newValue }
+  }
+
+  var folderURL: URL? {
+    get { workspaceStore.folderURL }
+    set { workspaceStore.folderURL = newValue }
+  }
+
+  var workspaceRoots: [WorkspaceRoot] {
+    get { workspaceStore.workspaceRoots }
+    set { workspaceStore.workspaceRoots = newValue }
+  }
+
+  var workspaceTree: [WorkspaceNode] {
+    get { workspaceStore.workspaceTree }
+    set { workspaceStore.workspaceTree = newValue }
+  }
+
+  var documents: [DocumentRef] {
+    get { workspaceStore.documents }
+    set { workspaceStore.documents = newValue }
+  }
+
+  var openFiles: [DocumentRef] {
+    get { workspaceStore.openFiles }
+    set { workspaceStore.openFiles = newValue }
+  }
+
+  var excludedWorkspacePaths: Set<String> {
+    get { workspaceStore.excludedWorkspacePaths }
+    set { workspaceStore.excludedWorkspacePaths = newValue }
+  }
+
+  var workspaceSearchQuery: String {
+    get { workspaceStore.workspaceSearchQuery }
+    set { workspaceStore.workspaceSearchQuery = newValue }
+  }
+
+  var workspaceSearchResults: [WorkspaceSearchResult] {
+    get { workspaceStore.workspaceSearchResults }
+    set { workspaceStore.workspaceSearchResults = newValue }
+  }
+
+  var sidebarFocusedURL: URL? {
+    get { workspaceStore.sidebarFocusedURL }
+    set { workspaceStore.sidebarFocusedURL = newValue }
+  }
+
+  var pendingSidebarRenameURL: URL? {
+    get { workspaceStore.pendingSidebarRenameURL }
+    set { workspaceStore.pendingSidebarRenameURL = newValue }
+  }
+
+  var sidebarSortOrder: SidebarSortOrder {
+    get { workspaceStore.sidebarSortOrder }
+    set { workspaceStore.sidebarSortOrder = newValue }
+  }
+
+  var bookmarkData: Data? {
+    get { workspaceStore.bookmarkData }
+    set { workspaceStore.bookmarkData = newValue }
+  }
+
+  var selectedDocumentID: DocumentRef.ID? {
+    get { windowModel.selectedDocumentID }
+    set { windowModel.selectedDocumentID = newValue }
+  }
+
+  var documentSession: DocumentSession {
+    get { windowModel.documentSession }
+    set { windowModel.documentSession = newValue }
+  }
+
+  // Discrete metadata mirrors (see DocumentWindowModel). Window chrome reads
+  // these so a text-only edit never invalidates it.
+  var documentTitle: String { windowModel.documentTitle }
+  var documentHasEditableBuffer: Bool { windowModel.documentHasEditableBuffer }
+  var documentURL: URL? { windowModel.documentURL }
+  var documentIsDirty: Bool { windowModel.documentIsDirty }
+
+  var mode: EditorMode {
+    get { windowModel.mode }
+    set { windowModel.mode = newValue }
+  }
+
+  var fontSize: CGFloat {
+    get { windowModel.fontSize }
+    set { windowModel.fontSize = newValue }
+  }
+
+  var richMarkdownEnabled: Bool {
+    get { windowModel.richMarkdownEnabled }
+    set { windowModel.richMarkdownEnabled = newValue }
+  }
+
+  var pendingMarkdownFormatCommand: MarkdownFormatCommand? {
+    get { windowModel.pendingMarkdownFormatCommand }
+    set { windowModel.pendingMarkdownFormatCommand = newValue }
+  }
+
+  var findBarVisible: Bool {
+    get { windowModel.findBarVisible }
+    set { windowModel.findBarVisible = newValue }
+  }
+
+  var findReplaceMode: Bool {
+    get { windowModel.findReplaceMode }
+    set { windowModel.findReplaceMode = newValue }
+  }
+
+  var findQuery: String {
+    get { windowModel.findQuery }
+    set { windowModel.findQuery = newValue }
+  }
+
+  var findReplaceQuery: String {
+    get { windowModel.findReplaceQuery }
+    set { windowModel.findReplaceQuery = newValue }
+  }
+
+  var findFocusToken: Int {
+    get { windowModel.findFocusToken }
+    set { windowModel.findFocusToken = newValue }
+  }
+
+  var pendingFindCommand: FindBarCommand? {
+    get { windowModel.pendingFindCommand }
+    set { windowModel.pendingFindCommand = newValue }
+  }
+
+  var findMatchCount: Int {
+    get { windowModel.findMatchCount }
+    set { windowModel.findMatchCount = newValue }
+  }
+
+  var findActiveMatchIndex: Int? {
+    get { windowModel.findActiveMatchIndex }
+    set { windowModel.findActiveMatchIndex = newValue }
+  }
+
+  var caretUTF16Offset: Int {
+    get { windowModel.caretUTF16Offset }
+    set { windowModel.caretUTF16Offset = newValue }
+  }
+
+  var selectionUTF16Length: Int {
+    get { windowModel.selectionUTF16Length }
+    set { windowModel.selectionUTF16Length = newValue }
+  }
+
+  var tableTidyOnPaste: Bool {
+    get { windowModel.tableTidyOnPaste }
+    set { windowModel.tableTidyOnPaste = newValue }
+  }
+
+  var asciiSafeTables: Bool {
+    get { windowModel.asciiSafeTables }
+    set { windowModel.asciiSafeTables = newValue }
+  }
+
+  var aiAutocompleteEnabled: Bool {
+    get { windowModel.aiAutocompleteEnabled }
+    set { windowModel.aiAutocompleteEnabled = newValue }
+  }
+
+  var scrollSyncEnabled: Bool {
+    get { windowModel.scrollSyncEnabled }
+    set { windowModel.scrollSyncEnabled = newValue }
+  }
+
+  var previewAutoReload: Bool {
+    get { windowModel.previewAutoReload }
+    set { windowModel.previewAutoReload = newValue }
+  }
+
+  var previewRefreshToken: Int {
+    get { windowModel.previewRefreshToken }
+    set { windowModel.previewRefreshToken = newValue }
+  }
+
+  var sidebarVisible: Bool {
+    get { windowModel.sidebarVisible }
+    set { windowModel.sidebarVisible = newValue }
+  }
+
+  var lastError: String? {
+    get { windowModel.lastError }
+    set { windowModel.lastError = newValue }
+  }
 
   var activeDocumentURL: URL? {
     get {
@@ -120,230 +296,52 @@ final class AppState: ObservableObject {
     }
   }
 
-  // Editor preferences
-  @Published var mode: EditorMode = .split
-  @Published var fontSize: CGFloat = 14
-  @Published var richMarkdownEnabled: Bool = true
-  @Published var pendingMarkdownFormatCommand: MarkdownFormatCommand?
-  @Published var findBarVisible: Bool = false
-  @Published var findReplaceMode: Bool = false
-  @Published var findQuery: String = ""
-  @Published var findReplaceQuery: String = ""
-  @Published var findFocusToken: Int = 0
-  @Published var pendingFindCommand: FindBarCommand?
-  @Published var tableTidyOnPaste: Bool {
-    didSet {
-      defaults.set(tableTidyOnPaste, forKey: Self.tableTidyOnPasteKey)
-    }
-  }
-  @Published var asciiSafeTables: Bool {
-    didSet {
-      defaults.set(asciiSafeTables, forKey: Self.asciiSafeTablesKey)
-    }
+  var allDocuments: [DocumentRef] {
+    workspaceStore.allDocuments
   }
 
-  // Preview behaviour. `previewAutoReload` mirrors the legacy
-  // "Automatically reload page" checkbox; `previewRefreshToken` is bumped
-  // by the toolbar refresh button to force a re-render even when
-  // auto-reload is paused or the markdown text is identical.
-  @Published var previewAutoReload: Bool {
-    didSet {
-      defaults.set(previewAutoReload, forKey: Self.previewAutoReloadKey)
-    }
-  }
-  @Published var previewRefreshToken: Int = 0
-
-  // Sidebar visibility
-  @Published var sidebarVisible: Bool = true
-
-  // Storage persistence + user-visible errors
-  @Published var bookmarkData: Data?
-  @Published var lastError: String?
-  @Published var workspaceActivity: WorkspaceActivity?
-
-  init(defaults: UserDefaults = .standard) {
-    self.defaults = defaults
-    if defaults.object(forKey: Self.previewAutoReloadKey) == nil {
-      self.previewAutoReload = false
-    } else {
-      self.previewAutoReload = defaults.bool(forKey: Self.previewAutoReloadKey)
-    }
-    if defaults.object(forKey: Self.tableTidyOnPasteKey) == nil {
-      self.tableTidyOnPaste = true
-    } else {
-      self.tableTidyOnPaste = defaults.bool(forKey: Self.tableTidyOnPasteKey)
-    }
-    if defaults.object(forKey: Self.asciiSafeTablesKey) == nil {
-      self.asciiSafeTables = false
-    } else {
-      self.asciiSafeTables = defaults.bool(forKey: Self.asciiSafeTablesKey)
-    }
-    if let rawSort = defaults.string(forKey: Self.sidebarSortOrderKey),
-      let sortOrder = SidebarSortOrder(rawValue: rawSort)
-    {
-      self.sidebarSortOrder = sortOrder
-    } else {
-      self.sidebarSortOrder = .nameAscending
-    }
-  }
-
-  var selectedDocument: DocumentRef? {
-    guard let id = selectedDocumentID else { return nil }
-    return allDocuments.first(where: { $0.id == id })
-  }
-
-  /// Deduplicated union of workspace + open documents. CACHED: it was a computed
-  /// property that allocated a Set and rebuilt the dedup on every access — and SwiftUI
-  /// evaluates it once per sidebar context-menu row on every layout pass, so a single
-  /// keystroke (which re-lays-out the hosting view) cost O(rows × documents). Now rebuilt
-  /// only when `documents`/`openFiles` change. Profiler showed ~84% of the per-keystroke
-  /// main-thread time in `allDocuments.getter` via `nodeContextMenu`.
-  private(set) var allDocuments: [DocumentRef] = []
-  private var allDocumentsByID: [DocumentRef.ID: DocumentRef] = [:]
-
-  /// O(1) lookup into `allDocuments` by id, avoiding a per-row linear `first(where:)`.
   func document(id: DocumentRef.ID) -> DocumentRef? {
-    allDocumentsByID[id]
-  }
-
-  private func rebuildAllDocumentsCache() {
-    var seen = Set<DocumentRef.ID>()
-    var result: [DocumentRef] = []
-    var byID: [DocumentRef.ID: DocumentRef] = [:]
-    result.reserveCapacity(documents.count + openFiles.count)
-    for ref in documents + openFiles where seen.insert(ref.id).inserted {
-      result.append(ref)
-      byID[ref.id] = ref
-    }
-    allDocuments = result
-    allDocumentsByID = byID
+    workspaceStore.document(id: id)
   }
 
   var sortedOpenFiles: [DocumentRef] {
-    sortDocuments(openFiles)
+    workspaceStore.sortedOpenFiles
   }
 
   var sortedWorkspaceTree: [WorkspaceNode] {
-    sortNodes(workspaceTree)
+    workspaceStore.sortedWorkspaceTree
   }
 
   var hasWorkspaceContent: Bool {
-    !workspaceRoots.isEmpty || !openFiles.isEmpty
+    workspaceStore.hasWorkspaceContent
   }
 
   var isSearchingWorkspace: Bool {
-    !workspaceSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    workspaceStore.isSearchingWorkspace
   }
 
   func bumpFontSize(by delta: CGFloat) {
-    fontSize = max(8, min(48, fontSize + delta))
+    windowModel.bumpFontSize(by: delta)
   }
 
   func resetFontSize() {
-    fontSize = 14
+    windowModel.resetFontSize()
   }
 
-  /// Bumps `previewRefreshToken`, asking the preview pipeline to re-render
-  /// even when the markdown payload is identical or auto-reload is off.
   func requestPreviewRefresh() {
-    previewRefreshToken &+= 1
+    windowModel.requestPreviewRefresh()
   }
 
   func documentRef(for url: URL) -> DocumentRef {
-    let standardizedURL = url.standardizedFileURL
-    return allDocuments.first { $0.url.standardizedFileURL == standardizedURL }
-      ?? makeDocumentRef(for: standardizedURL)
+    workspaceStore.documentRef(for: url)
   }
 
   func makeDocumentRef(for url: URL) -> DocumentRef {
-    let standardizedURL = url.standardizedFileURL
-    if let root =
-      workspaceRoots
-      .map(\.url.standardizedFileURL)
-      .filter({ WorkspaceScanner.contains(standardizedURL, in: $0) })
-      .sorted(by: { $0.path.count > $1.path.count })
-      .first
-    {
-      return DocumentRef(
-        id: standardizedURL,
-        rootURL: root,
-        relativePath: WorkspaceScanner.relativePath(for: standardizedURL, root: root),
-        isAdHoc: false
-      )
-    }
-    return DocumentRef(id: standardizedURL, isAdHoc: true)
-  }
-
-  func rememberDocumentTab(_ ref: DocumentRef) {
-    documentTabs.removeAll { $0.id.standardizedFileURL == ref.id.standardizedFileURL }
-    documentTabs.append(ref)
-    if documentTabs.count > 12 {
-      documentTabs.removeFirst(documentTabs.count - 12)
-    }
-  }
-
-  func forgetDocumentTab(id: DocumentRef.ID) {
-    documentTabs.removeAll { $0.id.standardizedFileURL == id.standardizedFileURL }
-  }
-
-  func pruneDocumentTabs() {
-    let liveIDs = Set(allDocuments.map { $0.id.standardizedFileURL })
-    documentTabs.removeAll { !liveIDs.contains($0.id.standardizedFileURL) }
-  }
-
-  private func sortDocuments(_ documents: [DocumentRef]) -> [DocumentRef] {
-    guard sidebarSortOrder != .manual else { return documents }
-    return documents.sorted { lhs, rhs in
-      compareURLs(lhs.url, rhs.url, lhsTitle: lhs.title, rhsTitle: rhs.title)
-    }
-  }
-
-  private func sortNodes(_ nodes: [WorkspaceNode]) -> [WorkspaceNode] {
-    guard sidebarSortOrder != .manual else { return nodes }
-
-    let sortedChildren =
-      nodes
-      .map { node in
-        var copy = node
-        copy.children = node.children.map(sortNodes)
-        return copy
-      }
-    return sortedChildren.sorted { lhs, rhs in
-      compareWorkspaceNodes(lhs, rhs)
-    }
-  }
-
-  private func compareWorkspaceNodes(_ lhs: WorkspaceNode, _ rhs: WorkspaceNode) -> Bool {
-    if lhs.kind != rhs.kind {
-      return lhs.kind == .folder
-    }
-    return compareURLs(lhs.url, rhs.url, lhsTitle: lhs.name, rhsTitle: rhs.name)
-  }
-
-  private func compareURLs(_ lhs: URL?, _ rhs: URL?, lhsTitle: String, rhsTitle: String) -> Bool {
-    switch sidebarSortOrder {
-    case .manual:
-      return false
-    case .nameAscending, .type:
-      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedAscending
-    case .nameDescending:
-      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedDescending
-    case .modifiedNewest:
-      let lhsDate = lhs.flatMap(Self.modifiedDate) ?? .distantPast
-      let rhsDate = rhs.flatMap(Self.modifiedDate) ?? .distantPast
-      if lhsDate != rhsDate {
-        return lhsDate > rhsDate
-      }
-      return lhsTitle.localizedStandardCompare(rhsTitle) == .orderedAscending
-    }
-  }
-
-  private static func modifiedDate(for url: URL) -> Date? {
-    try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    workspaceStore.makeDocumentRef(for: url)
   }
 }
 
-struct DocumentRef: Identifiable, Hashable, Sendable {
+struct DocumentRef: Identifiable, Hashable, Codable, Sendable {
   let id: URL
   var rootURL: URL?
   var relativePath: String?
@@ -380,20 +378,45 @@ struct WorkspaceNode: Identifiable, Hashable, Sendable {
 }
 
 struct WorkspaceActivity: Equatable, Sendable {
+  /// Stable case tag: drives the `open activity=<case>` trace breadcrumb and the
+  /// prominent-vs-subtle presentation split. The open flow may not KNOW yet whether
+  /// an import is coming — `.opening` is the honest "walking the tree to find out"
+  /// state; only import-class kinds may claim "Importing Workspace".
+  enum Kind: String, Equatable, Sendable {
+    case opening
+    case indexing
+    case checkingCache
+    case cacheHit
+    case cacheMiss
+  }
+
+  var kind: Kind
   var title: String
   var detail: String
   var progress: Double?
 
-  static func scanning(_ label: String) -> WorkspaceActivity {
+  /// Import-class work (index writes genuinely ahead) earns the center takeover in the
+  /// empty document pane; open/validate states stay subtle — sidebar progress only. This
+  /// is what keeps a cached, unchanged reopen free of the "Importing Workspace" takeover.
+  var isProminent: Bool {
+    switch kind {
+    case .indexing, .cacheMiss: return true
+    case .opening, .checkingCache, .cacheHit: return false
+    }
+  }
+
+  static func opening(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
-      title: "Importing Workspace",
-      detail: "Scanning \(label)",
+      kind: .opening,
+      title: "Opening Workspace",
+      detail: "Reading \(label)",
       progress: 0.15
     )
   }
 
   static func indexing(documentCount: Int) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .indexing,
       title: "Importing Workspace",
       detail: "Indexing \(documentCount) Markdown file\(documentCount == 1 ? "" : "s")",
       progress: 0.68
@@ -402,6 +425,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func checkingCache(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .checkingCache,
       title: "Checking Workspace Cache",
       detail: "Validating \(label)",
       progress: 0.05
@@ -410,6 +434,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheHit(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheHit,
       title: "Opening Cached Workspace",
       detail: "Using cached state for \(label)",
       progress: 0.92
@@ -418,6 +443,7 @@ struct WorkspaceActivity: Equatable, Sendable {
 
   static func cacheMiss(_ label: String) -> WorkspaceActivity {
     WorkspaceActivity(
+      kind: .cacheMiss,
       title: "Importing Workspace",
       detail: "Cache miss for \(label)",
       progress: 0.1

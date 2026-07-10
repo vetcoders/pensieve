@@ -87,7 +87,27 @@ dist/
 /.claude/
 /.vibecrafted/
 /agents
-*.md
-!AGENTS.md
 /.junie
 *.txt
+*.log
+# Broad on purpose: internal docs (specs, plans, agent prompts) sync between
+# machines via rsync, NOT through git/GitHub. Keep all markdown out
+# except the named governance/root files below.
+*.md
+!README.md
+!CODE_OF_CONDUCT.md
+!CHANGELOG.md
+!VERSION
+!CONTRIBUTING.md
+!SECURITY.md
+!AGENTS.md
+!THIRD_PARTY_THEMES.md
+/tmp
+/dist
+/docs/superpowers
+*.backup
+/docs/workforce
+/.claude
+
+# vibecrafted-hooks-template warns retention
+.husky/warns/

@@ -36,4 +36,51 @@ final class BuildIdentityTests: XCTestCase {
 
     XCTAssertEqual(identity.commitSlug, "12345678")
   }
+
+  /// `VERSION` (stamped in by scripts/build-release.sh) is the only producer of a
+  /// real marketing version. The bundle template must keep the `0.0.0` placeholder —
+  /// BuildIdentity's own "no version truth" fallback — so an unstamped bundle
+  /// (smoke app, hand-rolled wrapper) reads as "not a release" instead of
+  /// masquerading as an old one.
+  func testInfoPlistTemplateClaimsOnlyPlaceholderVersions() throws {
+    let templateURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // PensieveTests/
+      .deletingLastPathComponent()  // Tests/
+      .deletingLastPathComponent()  // package root
+      .appendingPathComponent("Resources/Info.plist")
+    let data = try Data(contentsOf: templateURL)
+    let info = try XCTUnwrap(
+      PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        as? [String: Any])
+
+    XCTAssertEqual(info["CFBundleShortVersionString"] as? String, "0.0.0")
+    XCTAssertEqual(info["CFBundleGetInfoString"] as? String, "Pensieve 0.0.0 (dev)")
+    XCTAssertEqual(info["PensieveBuildCommitSlug"] as? String, "dev")
+
+    let components = try XCTUnwrap(
+      info[BuildIdentity.componentVersionsKey] as? [String: String])
+    for (name, version) in components {
+      XCTAssertEqual(
+        version, "0.0.0", "component \(name) must stay a placeholder until stamped")
+    }
+  }
+
+  /// scripts/build-release.sh stamps the Mermaid component version by
+  /// extracting it from the vendored runtime's banner (line 1) — the file
+  /// itself is the only producer of that claim. Guard the extraction
+  /// contract: the banner must keep carrying `Mermaid v<x.y.z>`.
+  func testVendoredMermaidBannerCarriesExtractableVersion() throws {
+    let mermaidURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // PensieveTests/
+      .deletingLastPathComponent()  // Tests/
+      .deletingLastPathComponent()  // package root
+      .appendingPathComponent("Sources/Pensieve/Resources/mermaid.min.js")
+    let handle = try FileHandle(forReadingFrom: mermaidURL)
+    defer { try? handle.close() }
+    let banner = String(decoding: handle.readData(ofLength: 256), as: UTF8.self)
+
+    XCTAssertNotNil(
+      banner.range(of: #"Mermaid v\d+\.\d+\.\d+"#, options: .regularExpression),
+      "vendored mermaid.min.js banner lost its extractable version marker")
+  }
 }

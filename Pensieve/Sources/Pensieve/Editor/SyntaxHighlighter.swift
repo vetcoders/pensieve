@@ -15,6 +15,7 @@ class SyntaxHighlighter {
     static let heading = compile("(?m)^#{1,6}\\s+.*$")
     static let bold = compile("\\*\\*.*?\\*\\*|__.*?__")
     static let strikethrough = compile("~~[^~\n]+~~")
+    static let highlight = compile("==[^=\n]+==")
     static let italic = compile(
       "(?<!\\*)\\*(?!\\*).*?(?<!\\*)\\*(?!\\*)|(?<!_)_(?!_).*?(?<!_)_(?!_)")
     static let inlineCode = compile("`[^`\n]+`")
@@ -159,6 +160,14 @@ class SyntaxHighlighter {
       attributes: [
         .foregroundColor: NSColor.systemOrange,
         .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+      ])
+
+    // Highlight: ==text==
+    highlightRegex(
+      Patterns.highlight, in: swiftString, storage: textStorage, targetRange: targetRange,
+      attributes: [
+        .foregroundColor: NSColor.labelColor,
+        .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.35),
       ])
 
     // Italic: *text* or _text_ (basic regex)

@@ -19,6 +19,11 @@ final class IndexDatabase {
   /// Tests await it via `waitForPendingReindex()` instead of sleeping.
   private var pendingIndexUpdateTask: Task<Void, Never>?
 
+  /// Coalesces concurrent off-main opens: the first `ensureOpenInBackground` that finds no pool
+  /// starts the migration on a detached executor and parks this task; later callers await the SAME
+  /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
+  private var openTask: Task<DatabasePool, Error>?
+
   init(
     databaseURL: URL? = nil,
     searchIndexBatchSize: Int = 32,
@@ -29,47 +34,102 @@ final class IndexDatabase {
     self.didInsertSearchIndexBatch = didInsertSearchIndexBatch
   }
 
+  /// Synchronous open — retained for the legacy synchronous workspace path and for tests that drive
+  /// the index directly. The LIVE app (background import path) opens via `openInBackground` so the
+  /// migration never blocks the main run loop. Building the pool + migrating is the heaviest cost
+  /// (incl. the FTS5 content-link rebuild migration), so this must not be on the hot import path.
   func open(into appState: AppState? = nil) {
     do {
-      let url: URL
-      if let configuredDatabaseURL {
-        url = configuredDatabaseURL
-      } else {
-        let directory = try applicationSupportDirectory()
-        url = directory.appendingPathComponent("index.db", isDirectory: false)
-      }
-
-      let directory = url.deletingLastPathComponent()
-      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-      let pool = try DatabasePool(path: url.path)
-
-      var migrator = DatabaseMigrator()
-      migrator.registerMigration("mvp_workspace_search_fts") { db in
-        try db.execute(
-          sql: """
-            CREATE VIRTUAL TABLE IF NOT EXISTS workspace_search_documents
-            USING fts5(
-                path UNINDEXED,
-                title,
-                display_path,
-                body,
-                is_ad_hoc UNINDEXED,
-                updated_at UNINDEXED,
-                tokenize = 'unicode61'
-            )
-            """)
-      }
-      registerIndexV2Migrations(&migrator)
-      try migrator.migrate(pool)
-
+      let url = try resolveDatabaseURL()
+      let pool = try Self.makeDatabasePool(at: url)
       databasePool = pool
       databaseURL = url
     } catch {
-      let message = "Could not open Pensieve index database: \(error.localizedDescription)"
-      appState?.lastError = message
-      NSLog(message)
+      reportOpenFailure(error, appState: appState)
     }
+  }
+
+  /// Opens the index off the main thread. Idempotent and concurrency-safe: returns the existing pool
+  /// immediately, joins an in-flight open, or starts one whose `DatabasePool(path:)` + migrations run
+  /// on a detached background executor. Only the cheap pool/url assignment happens back on the main
+  /// actor. This is the keystone of the P0 fix — every background DB path routes its first-open here.
+  func openInBackground(into appState: AppState? = nil) async {
+    _ = await ensureOpenInBackground(into: appState)
+  }
+
+  private func ensureOpenInBackground(into appState: AppState?) async -> DatabasePool? {
+    if let databasePool { return databasePool }
+    if let openTask { return try? await openTask.value }
+
+    let url: URL
+    do {
+      url = try resolveDatabaseURL()
+    } catch {
+      reportOpenFailure(error, appState: appState)
+      return nil
+    }
+
+    let task = Task<DatabasePool, Error> {
+      try await Task.detached(priority: .userInitiated) {
+        try Self.makeDatabasePool(at: url)
+      }.value
+    }
+    openTask = task
+    defer { openTask = nil }
+
+    do {
+      let pool = try await task.value
+      databasePool = pool
+      databaseURL = url
+      return pool
+    } catch {
+      reportOpenFailure(error, appState: appState)
+      return nil
+    }
+  }
+
+  private func resolveDatabaseURL() throws -> URL {
+    if let configuredDatabaseURL {
+      return configuredDatabaseURL
+    }
+    let directory = try applicationSupportDirectory()
+    return directory.appendingPathComponent("index.db", isDirectory: false)
+  }
+
+  private func reportOpenFailure(_ error: Error, appState: AppState?) {
+    let message = "Could not open Pensieve index database: \(error.localizedDescription)"
+    appState?.lastError = message
+    NSLog("%@", message)
+  }
+
+  /// Builds the GRDB pool and runs all migrations. `nonisolated static` so it can execute on a
+  /// detached background executor (off main). `DatabasePool` already serializes its own reads/writes
+  /// across a managed thread pool; migrations are idempotent (`DatabaseMigrator` runs each once).
+  private nonisolated static func makeDatabasePool(at url: URL) throws -> DatabasePool {
+    let directory = url.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+    let pool = try DatabasePool(path: url.path)
+
+    var migrator = DatabaseMigrator()
+    migrator.registerMigration("mvp_workspace_search_fts") { db in
+      try db.execute(
+        sql: """
+          CREATE VIRTUAL TABLE IF NOT EXISTS workspace_search_documents
+          USING fts5(
+              path UNINDEXED,
+              title,
+              display_path,
+              body,
+              is_ad_hoc UNINDEXED,
+              updated_at UNINDEXED,
+              tokenize = 'unicode61'
+          )
+          """)
+    }
+    registerIndexV2Migrations(&migrator)
+    try migrator.migrate(pool)
+    return pool
   }
 
   /// B-2 IndexDatabase v2 schema (I-01, Wave A foundation).
@@ -90,7 +150,7 @@ final class IndexDatabase {
   /// `document_chunks` are scaffolding DDL only this wave (writers in H-1 and
   /// C-3 respectively). No FTS scaffolding migration is needed here — W-C-1
   /// owns the full FTS5 content-link rebuild as a self-contained migration.
-  private func registerIndexV2Migrations(_ migrator: inout DatabaseMigrator) {
+  private nonisolated static func registerIndexV2Migrations(_ migrator: inout DatabaseMigrator) {
     migrator.registerMigration("b2_v2_workspaces") { db in
       try db.execute(
         sql: """
@@ -452,10 +512,10 @@ final class IndexDatabase {
   /// success flag is observed by awaiting the dedicated `write` task this call owns.
   @discardableResult
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
-    guard let pool = ensureOpen(into: appState) else { return false }
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
-    let previous = pendingIndexUpdateTask
 
     let write = Task { [weak self] () -> Bool in
       await previous?.value
@@ -468,7 +528,7 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        self?.refreshSearchResults(in: appState)
+        await self?.refreshSearchResultsInBackground(in: appState)
         return true
       } catch {
         self?.report(error, appState: appState, action: "rebuild Pensieve search index")
@@ -559,10 +619,10 @@ final class IndexDatabase {
     deletingPaths: [String],
     appState: AppState? = nil
   ) async -> Bool {
-    guard let pool = ensureOpen(into: appState) else { return false }
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
-    let previous = pendingIndexUpdateTask
 
     let write = Task { [weak self] () -> Bool in
       await previous?.value
@@ -576,7 +636,7 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        self?.refreshSearchResults(in: appState)
+        await self?.refreshSearchResultsInBackground(in: appState)
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")
@@ -600,27 +660,52 @@ final class IndexDatabase {
   func indexedDocumentCount(forRootPaths rootPaths: [String], appState: AppState? = nil) -> Int {
     guard !rootPaths.isEmpty, let pool = ensureOpen(into: appState) else { return 0 }
     do {
-      return try pool.read { db in
-        var total = 0
-        for rootPath in rootPaths {
-          let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-          let count =
-            try Int.fetchOne(
-              db,
-              sql: """
-                SELECT COUNT(*) FROM documents d
-                JOIN workspaces w ON w.workspace_id = d.workspace_id
-                WHERE (w.canonical_path || '/' || d.path) LIKE ? ESCAPE '\\'
-                """,
-              arguments: [Self.likePrefixPattern(prefix) + "%"]
-            ) ?? 0
-          total += count
-        }
-        return total
-      }
+      return try Self.indexedDocumentCount(forRootPaths: rootPaths, pool: pool)
     } catch {
       report(error, appState: appState, action: "count Pensieve search index rows")
       return 0
+    }
+  }
+
+  /// Off-main twin of `indexedDocumentCount`. The cold-open skip-gate consults this on the background
+  /// workspace-build task; routing it through `ensureOpenInBackground` + a detached `pool.read` keeps
+  /// the "Scanning…" decision from blocking the run loop.
+  func indexedDocumentCountInBackground(forRootPaths rootPaths: [String], appState: AppState? = nil)
+    async -> Int
+  {
+    guard !rootPaths.isEmpty, let pool = await ensureOpenInBackground(into: appState) else {
+      return 0
+    }
+    do {
+      return try await Task.detached(priority: .userInitiated) {
+        try Self.indexedDocumentCount(forRootPaths: rootPaths, pool: pool)
+      }.value
+    } catch {
+      report(error, appState: appState, action: "count Pensieve search index rows")
+      return 0
+    }
+  }
+
+  private nonisolated static func indexedDocumentCount(
+    forRootPaths rootPaths: [String], pool: DatabasePool
+  ) throws -> Int {
+    try pool.read { db in
+      var total = 0
+      for rootPath in rootPaths {
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        let count =
+          try Int.fetchOne(
+            db,
+            sql: """
+              SELECT COUNT(*) FROM documents d
+              JOIN workspaces w ON w.workspace_id = d.workspace_id
+              WHERE (w.canonical_path || '/' || d.path) LIKE ? ESCAPE '\\'
+              """,
+            arguments: [Self.likePrefixPattern(prefix) + "%"]
+          ) ?? 0
+        total += count
+      }
+      return total
     }
   }
 
@@ -638,12 +723,19 @@ final class IndexDatabase {
     return escaped
   }
 
-  /// Single-doc index entry (autosave tail, ad-hoc open files). Writes the doc as
+  /// Single-doc index entry (ad-hoc open files, explicit one-shot, tests). Writes the doc as
   /// a `documents` row — the single FTS source — so the AI/AU triggers sync
   /// `document_fts`. An ad-hoc / rootless doc lands under the reserved
   /// `__adhoc__` workspace (full standardized path as its `documents.path`); a
   /// workspace doc lands under its own workspace row (relative path). The body is
   /// provided by the caller (the live editor text) rather than re-read from disk.
+  ///
+  /// SYNC: runs `ensureOpen` + `pool.write` + `refreshSearchResults` (a `pool.read`) on the calling
+  /// actor. The production autosave/save tail does NOT use this — it routes through the off-main
+  /// `indexInBackground` twin so a save never stalls the run loop on SQLite. Kept for the explicit
+  /// one-shot/test callers that want a synchronous, immediately-queryable write (the same
+  /// sync/background duality as `reindex` / `reindexInBackground` and `updateSearchIndex` /
+  /// `updateSearchIndexInBackground`).
   func index(document: DocumentRef, body: String, appState: AppState? = nil) {
     guard let pool = ensureOpen(into: appState) else { return }
     let record = Self.documentWriteRecord(from: document, body: body)
@@ -659,6 +751,47 @@ final class IndexDatabase {
     }
   }
 
+  /// Off-main twin of `index(document:body:)` — the single-doc index entry the production autosave /
+  /// save tail uses. The sync `index` ran `ensureOpen` + `pool.write` (ensure-workspace + upsert) AND
+  /// `refreshSearchResults` (a `pool.read`) ON THE MAIN ACTOR on every persisted edit — a synchronous
+  /// SQLite stall on the run loop per save. This routes the write through the shared supersede chain
+  /// (`pendingIndexUpdateTask`) on a detached `.utility` task and hops back to the main actor only to
+  /// publish the refreshed search results, so a save never blocks typing/scrolling. Mirrors
+  /// `updateSearchIndexInBackground`'s detached/chained/`refreshSearchResultsInBackground` shape, so
+  /// concurrent index writes serialize in submission order and a failed write can never leave the FTS
+  /// index half-applied (single transaction).
+  ///
+  /// Returns `true` when the off-main write committed, `false` when it threw (still reported). Tests
+  /// sync on completion via `waitForPendingReindex()` instead of sleeping.
+  @discardableResult
+  func indexInBackground(
+    document: DocumentRef, body: String, appState: AppState? = nil
+  ) async -> Bool {
+    let previous = pendingIndexUpdateTask
+    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
+    let record = Self.documentWriteRecord(from: document, body: body)
+
+    let write = Task { [weak self] () -> Bool in
+      await previous?.value
+      do {
+        try await Task.detached(priority: .utility) {
+          try pool.write { db in
+            try Self.ensureWorkspaceRow(for: record, in: db)
+            try Self.upsertDocument(record, in: db)
+          }
+        }.value
+        await self?.refreshSearchResultsInBackground(in: appState)
+        return true
+      } catch {
+        self?.report(error, appState: appState, action: "update Pensieve search index")
+        return false
+      }
+    }
+    // Supersede chain stays `Void`-typed (see `reindexInBackground`).
+    pendingIndexUpdateTask = Task { _ = await write.value }
+    return await write.value
+  }
+
   func searchInBackground(
     query: String,
     documents: [DocumentRef],
@@ -667,7 +800,7 @@ final class IndexDatabase {
   ) async -> [WorkspaceSearchResult] {
     let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedQuery.isEmpty else { return [] }
-    guard let pool = ensureOpen(into: appState) else { return [] }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return [] }
 
     do {
       return try await Task.detached(priority: .userInitiated) {
@@ -684,6 +817,29 @@ final class IndexDatabase {
     }
   }
 
+  func backlinksInBackground(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int = 50,
+    appState: AppState? = nil
+  ) async -> [WorkspaceBacklinkResult] {
+    guard let pool = await ensureOpenInBackground(into: appState) else { return [] }
+
+    do {
+      return try await Task.detached(priority: .userInitiated) {
+        try Self.performBacklinkSearch(
+          to: target,
+          documents: documents,
+          limit: limit,
+          pool: pool
+        )
+      }.value
+    } catch {
+      report(error, appState: appState, action: "read Pensieve backlinks")
+      return []
+    }
+  }
+
   func refreshSearchResults(in appState: AppState?) {
     guard let appState else { return }
     appState.workspaceSearchResults = search(
@@ -691,6 +847,18 @@ final class IndexDatabase {
       documents: appState.allDocuments,
       appState: appState
     )
+  }
+
+  /// Off-main twin of `refreshSearchResults`. The background index writers used to call the sync
+  /// `refreshSearchResults` on return — which runs `search` (a `pool.read`) ON THE MAIN ACTOR after
+  /// every reindex/delta. This reads the query/documents on the main actor, runs the actual FTS read
+  /// off-main via `searchInBackground`, then publishes the results back on the main actor.
+  func refreshSearchResultsInBackground(in appState: AppState?) async {
+    guard let appState else { return }
+    let query = appState.workspaceSearchQuery
+    let documents = appState.allDocuments
+    let results = await searchInBackground(query: query, documents: documents, appState: appState)
+    appState.workspaceSearchResults = results
   }
 
   func search(
@@ -716,6 +884,27 @@ final class IndexDatabase {
     }
   }
 
+  func backlinks(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int = 50,
+    appState: AppState? = nil
+  ) -> [WorkspaceBacklinkResult] {
+    guard let pool = ensureOpen(into: appState) else { return [] }
+
+    do {
+      return try Self.performBacklinkSearch(
+        to: target,
+        documents: documents,
+        limit: limit,
+        pool: pool
+      )
+    } catch {
+      report(error, appState: appState, action: "read Pensieve backlinks")
+      return []
+    }
+  }
+
   func upsertWorkspace(
     identity: WorkspaceIdentity,
     roots: [URL],
@@ -723,13 +912,24 @@ final class IndexDatabase {
     documents: [DocumentRef],
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     let didInsertBatch = didInsertSearchIndexBatch
     let batchSize = searchIndexBatchSize
 
     do {
+      // Build per-document write records keyed on each doc's OWN root identity
+      // (workspace docs → `WorkspaceIdentity.make(rootURL:)`, ad-hoc → `__adhoc__`),
+      // exactly as the cold reindex (`replaceSearchIndex`) and every reader (search,
+      // `indexedDocumentCount`) key the `documents` table. Keying the document rows
+      // under the MERGED multi-root `identity.workspaceID` instead would write a
+      // SECOND copy of every doc that the reindex can NOT collapse (its records carry
+      // the per-root workspace_id, so the `(workspace_id, path)` skip never matches) —
+      // an N-root cold open double-indexed (20 rows for 10 docs) and leaked duplicate
+      // search hits. For single-root the per-root id IS `identity.workspaceID`
+      // byte-for-byte, so this is a no-op there. The merged identity still anchors the
+      // workspaces REGISTRY row below (manifest / scan_session / stats key on it).
       let records = await Task.detached(priority: .utility) {
-        documents.compactMap(Self.documentRecord)
+        documents.compactMap(Self.documentWriteRecord)
       }.value
       guard
         databaseURL.map({ FileManager.default.fileExists(atPath: $0.path) }) ?? true
@@ -738,27 +938,45 @@ final class IndexDatabase {
       }
       try await Task.detached(priority: .utility) {
         try pool.write { db in
+          // The REGISTRY row for the whole N-root workspace (manifest / scan_session /
+          // stats anchor). Document rows below live under their per-root workspace_ids.
           try Self.upsertWorkspace(identity: identity, roots: roots, lastSeenAt: lastSeenAt, in: db)
-          // `commitWorkspaceManifest` is the cold-scan `documents` writer, and
-          // `documents` is now the single FTS source. Count each row this write
-          // actually (re)indexes — inserted or content-changed — so the
-          // didInsertBatch observability reflects the indexing work on this path
-          // too (the cold-open reindex that follows skips these already-written
-          // rows). Unchanged rows are not counted, so a no-change re-commit
-          // reports 0 (matching the prior contract where reindex skipped them).
-          try Self.upsertDocuments(
-            records: records,
-            workspaceID: identity.workspaceID,
-            indexedAt: lastSeenAt,
-            batchSize: batchSize,
-            didInsertBatch: didInsertBatch,
-            in: db
-          )
-          try Self.tombstoneDocumentsNotIn(
-            paths: records.map(\.path),
-            workspaceID: identity.workspaceID,
-            in: db
-          )
+
+          // Group the documents by their per-root workspace_id, then run the SAME
+          // per-workspace writer the single-root path always used (`indexed_at =
+          // lastSeenAt`, unchanged-row skip, batched `didInsertBatch` observability) —
+          // once per group instead of once under the merged identity. Single-root has
+          // exactly one group whose id IS `identity.workspaceID`, so its write is
+          // byte-identical; multi-root fans out to one group per root.
+          let recordsByWorkspace = Dictionary(grouping: records, by: \.workspaceID)
+          for (workspaceID, group) in recordsByWorkspace {
+            // FK target: the per-root workspaces row, mapped to its real canonical_path
+            // so the search full-path reconstruction (canonical_path || '/' || path)
+            // stays correct for every root.
+            try Self.ensureWorkspaceRow(
+              workspaceID: workspaceID, canonicalPath: group[0].canonicalPath, in: db)
+            try Self.upsertDocuments(
+              records: group.map {
+                IndexDocumentRecord(
+                  path: $0.path, title: $0.title, body: $0.body,
+                  mtime: $0.mtime, size: $0.size, isAdHoc: $0.isAdHoc)
+              },
+              workspaceID: workspaceID,
+              indexedAt: lastSeenAt,
+              batchSize: batchSize,
+              didInsertBatch: didInsertBatch,
+              in: db
+            )
+            try Self.tombstoneDocumentsNotIn(
+              paths: group.map(\.path), workspaceID: workspaceID, in: db)
+          }
+          if recordsByWorkspace.isEmpty {
+            // No documents this commit: preserve the legacy empty-wipe under the
+            // workspace identity (single-root → its own rows; multi-root W_AB owns
+            // no document rows, so this is a harmless no-op).
+            try Self.tombstoneDocumentsNotIn(
+              paths: [], workspaceID: identity.workspaceID, in: db)
+          }
         }
       }.value
     } catch {
@@ -1221,27 +1439,6 @@ final class IndexDatabase {
     )
   }
 
-  private nonisolated static func documentRecord(from document: DocumentRef)
-    -> IndexDocumentRecord?
-  {
-    let url = document.url.standardizedFileURL
-    guard let body = try? String(contentsOf: url, encoding: .utf8) else {
-      return nil
-    }
-    let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-    let modifiedAt =
-      values?.contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
-    let size = values?.fileSize ?? Data(body.utf8).count
-    return IndexDocumentRecord(
-      path: document.relativePath ?? document.displayPath,
-      title: title(fromMarkdown: body, fallback: document.title),
-      body: body,
-      mtime: Int(modifiedAt),
-      size: size,
-      isAdHoc: document.isAdHoc
-    )
-  }
-
   private nonisolated static func title(fromMarkdown body: String, fallback: String) -> String {
     for line in body.split(whereSeparator: \.isNewline) {
       let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -1274,15 +1471,9 @@ final class IndexDatabase {
     // search in workspace A therefore never reads workspace B's rows out of
     // `documents`. The in-memory `documentsByPath` join remains as a safety net
     // (it also maps each hit back to its live `DocumentRef`).
-    var rootScopes = Set<String>()
-    var includeAdHoc = false
-    for document in documents {
-      if !document.isAdHoc, let rootURL = document.rootURL {
-        rootScopes.insert(rootURL.standardizedFileURL.path)
-      } else {
-        includeAdHoc = true
-      }
-    }
+    let scope = searchScope(for: documents)
+    let rootScopes = scope.rootScopes
+    let includeAdHoc = scope.includeAdHoc
     guard !rootScopes.isEmpty || includeAdHoc else { return [] }
 
     let records = try fetchRecords(
@@ -1296,6 +1487,57 @@ final class IndexDatabase {
       results
         .sorted { lhs, rhs in
           if lhs.score != rhs.score { return lhs.score < rhs.score }
+          if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+          return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
+        }
+        .prefix(limit)
+    )
+  }
+
+  private nonisolated static func performBacklinkSearch(
+    to target: DocumentRef,
+    documents: [DocumentRef],
+    limit: Int,
+    pool: DatabasePool
+  ) throws -> [WorkspaceBacklinkResult] {
+    let documentsByPath = Dictionary(
+      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
+    )
+    guard !documentsByPath.isEmpty else { return [] }
+
+    let scope = searchScope(for: documents)
+    guard !scope.rootScopes.isEmpty || scope.includeAdHoc else { return [] }
+
+    let targetPath = target.url.standardizedFileURL.path
+    let records = try fetchBacklinkRecords(
+      rootScopes: Array(scope.rootScopes),
+      includeAdHoc: scope.includeAdHoc,
+      targetPath: targetPath,
+      pool: pool
+    )
+    let targetRecord = records.first(where: { $0.path == targetPath })
+    let targetSlugs = backlinkTargetSlugs(for: target, indexedRecord: targetRecord)
+
+    let results = records.compactMap { record -> WorkspaceBacklinkResult? in
+      guard record.path != targetPath, let sourceDocument = documentsByPath[record.path] else {
+        return nil
+      }
+      let links = MarkdownWikilinks.extract(from: record.body)
+      guard let matchedLink = links.first(where: { targetSlugs.contains($0.slug) }) else {
+        return nil
+      }
+      return WorkspaceBacklinkResult(
+        sourceDocument: sourceDocument,
+        displayPath: record.displayPath,
+        snippet: backlinkSnippet(in: record.body, matching: targetSlugs),
+        matchedTarget: matchedLink.target,
+        updatedAt: Date(timeIntervalSince1970: record.updatedAt)
+      )
+    }
+
+    return Array(
+      results
+        .sorted { lhs, rhs in
           if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
           return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
         }
@@ -1341,25 +1583,14 @@ final class IndexDatabase {
           d.mtime AS updated_at
       """
 
-    // Scope predicate over `workspaces`: canonical_path in the caller's roots,
-    // and/or the reserved ad-hoc workspace. Bound args are appended in order.
-    var scopeClauses: [String] = []
-    var scopeArgs: [DatabaseValueConvertible] = []
-    if !rootScopes.isEmpty {
-      let placeholders = Array(repeating: "?", count: rootScopes.count).joined(separator: ", ")
-      scopeClauses.append("w.canonical_path IN (\(placeholders))")
-      scopeArgs.append(contentsOf: rootScopes)
-    }
-    if includeAdHoc {
-      scopeClauses.append("d.workspace_id = ?")
-      scopeArgs.append(Self.adHocWorkspaceID)
-    }
-    let scopePredicate = "(" + scopeClauses.joined(separator: " OR ") + ")"
+    let scope = scopePredicate(rootScopes: rootScopes, includeAdHoc: includeAdHoc)
+    let scopePredicate = scope.predicate
+    let scopeArgs = scope.arguments
 
     let ftsQuery = makeFTSQuery(from: query)
     if !ftsQuery.isEmpty {
       var matchArgs: StatementArguments = [ftsQuery]
-      matchArgs += StatementArguments(scopeArgs)
+      matchArgs += scopeArgs
       matchArgs += [limit]
       if let records = try? pool.read({ db in
         try SearchDocumentRecord.fetchAll(
@@ -1386,7 +1617,7 @@ final class IndexDatabase {
     }
 
     let pattern = "%\(query.lowercased())%"
-    var likeArgs: StatementArguments = StatementArguments(scopeArgs)
+    var likeArgs = scopeArgs
     likeArgs += [pattern, pattern, pattern, limit]
     return try pool.read { db in
       try SearchDocumentRecord.fetchAll(
@@ -1404,6 +1635,119 @@ final class IndexDatabase {
         arguments: likeArgs
       )
     }
+  }
+
+  private nonisolated static func fetchBacklinkRecords(
+    rootScopes: [String],
+    includeAdHoc: Bool,
+    targetPath: String,
+    pool: DatabasePool
+  ) throws -> [BacklinkDocumentRecord] {
+    let selectClause = """
+      SELECT
+          CASE WHEN w.canonical_path = '' THEN d.path
+               ELSE w.canonical_path || '/' || d.path END AS path,
+          d.title AS title,
+          CASE WHEN w.canonical_path = ''
+               THEN replace(d.path, rtrim(d.path, replace(d.path, '/', '')), '')
+               ELSE d.path END AS display_path,
+          d.body AS body,
+          d.is_ad_hoc AS is_ad_hoc,
+          d.mtime AS updated_at
+      """
+    let scope = scopePredicate(rootScopes: rootScopes, includeAdHoc: includeAdHoc)
+    var arguments = scope.arguments
+    arguments += ["%[[%"]
+    arguments += [targetPath]
+
+    return try pool.read { db in
+      try BacklinkDocumentRecord.fetchAll(
+        db,
+        sql: """
+          \(selectClause)
+          FROM documents d
+          JOIN workspaces w ON w.workspace_id = d.workspace_id
+          WHERE \(scope.predicate)
+            AND (
+              d.body LIKE ?
+              OR (CASE WHEN w.canonical_path = '' THEN d.path
+                       ELSE w.canonical_path || '/' || d.path END) = ?
+            )
+          """,
+        arguments: arguments
+      )
+    }
+  }
+
+  private nonisolated static func searchScope(for documents: [DocumentRef]) -> (
+    rootScopes: Set<String>, includeAdHoc: Bool
+  ) {
+    var rootScopes = Set<String>()
+    var includeAdHoc = false
+    for document in documents {
+      if !document.isAdHoc, let rootURL = document.rootURL {
+        rootScopes.insert(rootURL.standardizedFileURL.path)
+      } else {
+        includeAdHoc = true
+      }
+    }
+    return (rootScopes, includeAdHoc)
+  }
+
+  private nonisolated static func scopePredicate(
+    rootScopes: [String],
+    includeAdHoc: Bool
+  ) -> (predicate: String, arguments: StatementArguments) {
+    var scopeClauses: [String] = []
+    var scopeArgs: [DatabaseValueConvertible] = []
+    if !rootScopes.isEmpty {
+      let placeholders = Array(repeating: "?", count: rootScopes.count).joined(separator: ", ")
+      scopeClauses.append("w.canonical_path IN (\(placeholders))")
+      scopeArgs.append(contentsOf: rootScopes)
+    }
+    if includeAdHoc {
+      scopeClauses.append("d.workspace_id = ?")
+      scopeArgs.append(Self.adHocWorkspaceID)
+    }
+    return (
+      "(" + scopeClauses.joined(separator: " OR ") + ")",
+      StatementArguments(scopeArgs)
+    )
+  }
+
+  private nonisolated static func backlinkTargetSlugs(
+    for target: DocumentRef,
+    indexedRecord: BacklinkDocumentRecord?
+  ) -> Set<String> {
+    let candidates = [
+      target.title,
+      target.displayPath,
+      (target.displayPath as NSString).deletingPathExtension,
+      indexedRecord?.title,
+      indexedRecord?.displayPath,
+      indexedRecord.map { ($0.displayPath as NSString).deletingPathExtension },
+    ]
+    return Set(
+      candidates
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .map(MarkdownWikilinks.slug(for:))
+        .filter { !$0.isEmpty }
+    )
+  }
+
+  private nonisolated static func backlinkSnippet(
+    in body: String,
+    matching targetSlugs: Set<String>
+  ) -> String? {
+    for line in body.split(whereSeparator: \.isNewline) {
+      let text = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+      let links = MarkdownWikilinks.extract(from: text)
+      guard links.contains(where: { targetSlugs.contains($0.slug) }) else { continue }
+      if text.count <= 180 { return text }
+      return String(text.prefix(177)) + "..."
+    }
+    return nil
   }
 
   private nonisolated static func makeResult(
@@ -1515,7 +1859,7 @@ final class IndexDatabase {
   private func report(_ error: Error, appState: AppState?, action: String) {
     let message = "Could not \(action): \(error.localizedDescription)"
     appState?.lastError = message
-    NSLog(message)
+    NSLog("%@", message)
   }
 
   func appendScanSession(
@@ -1530,7 +1874,7 @@ final class IndexDatabase {
     durationMs: Int,
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in
@@ -1567,7 +1911,7 @@ final class IndexDatabase {
     fingerprintMatches: Bool,
     appState: AppState? = nil
   ) async {
-    guard let pool = ensureOpen(into: appState) else { return }
+    guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in
@@ -1612,6 +1956,24 @@ final class IndexDatabase {
 /// join key), `display_path`/`title`/`body` come from `documents`, `is_ad_hoc`
 /// from `documents.is_ad_hoc`, `updated_at` from `documents.mtime`.
 private struct SearchDocumentRecord: FetchableRecord, Sendable {
+  var path: String
+  var title: String
+  var displayPath: String
+  var body: String
+  var isAdHoc: Bool
+  var updatedAt: TimeInterval
+
+  init(row: Row) throws {
+    path = row["path"]
+    title = row["title"]
+    displayPath = row["display_path"]
+    body = row["body"]
+    isAdHoc = (row["is_ad_hoc"] as Int) != 0
+    updatedAt = row["updated_at"]
+  }
+}
+
+private struct BacklinkDocumentRecord: FetchableRecord, Sendable {
   var path: String
   var title: String
   var displayPath: String

@@ -16,6 +16,15 @@ a {
   color: #4183C4; }
 a.absent {
   color: #cc0000; }
+a.wikilink {
+  color: #4b6bfb;
+  background: rgba(75, 107, 251, 0.1);
+  border-radius: 4px;
+  padding: 0 0.18em;
+  text-decoration: none; }
+a.wikilink:hover {
+  background: rgba(75, 107, 251, 0.16);
+  text-decoration: underline; }
 a.anchor {
   display: block;
   padding-left: 30px;
