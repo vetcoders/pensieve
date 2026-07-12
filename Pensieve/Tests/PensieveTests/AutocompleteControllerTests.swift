@@ -6,6 +6,23 @@ import XCTest
 
 @MainActor
 final class AutocompleteControllerTests: XCTestCase {
+  private func waitUntil(
+    timeoutNanoseconds: UInt64 = 1_000_000_000,
+    pollNanoseconds: UInt64 = 10_000_000,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ condition: () -> Bool
+  ) async {
+    let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+    while !condition() {
+      if DispatchTime.now().uptimeNanoseconds >= deadline {
+        XCTFail("condition timed out", file: file, line: line)
+        return
+      }
+      try? await Task.sleep(nanoseconds: pollNanoseconds)
+    }
+  }
+
   func testTypingPauseYieldsSuggestion() async {
     let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, maxTokens in
       XCTAssertEqual(prefix, "hello")
@@ -17,7 +34,9 @@ final class AutocompleteControllerTests: XCTestCase {
     controller.textDidChange(prefix: "hello")
     XCTAssertNil(controller.suggestion)
 
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil {
+      controller.suggestion == " world"
+    }
 
     XCTAssertEqual(controller.suggestion, " world")
     XCTAssertNil(controller.lastError)
@@ -197,7 +216,10 @@ final class AutocompleteControllerTests: XCTestCase {
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
     controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil {
+      attempts.value == 1
+        && controller.lastError?.hasPrefix("completion LLM unavailable") == true
+    }
 
     XCTAssertEqual(attempts.value, 1)
     XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)

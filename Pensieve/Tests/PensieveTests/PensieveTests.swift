@@ -5318,7 +5318,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   private func waitForHighlightingDebounce() {
-    RunLoop.main.run(until: Date().addingTimeInterval(0.16))
+    RunLoop.main.run(until: Date().addingTimeInterval(0.5))
   }
 
   private func waitUntil(

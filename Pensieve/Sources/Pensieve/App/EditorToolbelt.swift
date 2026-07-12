@@ -11,8 +11,8 @@ import SwiftUI
 /// anchor) and per-group `.automatic` heuristics are deliberately absent —
 /// mixing them let the system reorder islands per window width (cut 7-14
 /// regression on the operator's window). Island separation comes from native
-/// `ToolbarSpacer`s on macOS 26; a flexible spacer pushes the trailing
-/// cluster to the window edge.
+/// `ToolbarSpacer`s when compiling against the macOS 26 SwiftUI SDK; a
+/// flexible spacer pushes the trailing cluster to the window edge.
 /// Everything else (transcription tafla, scroll sync, auto reload) lives in a
 /// single overflow menu. Raw format buttons stay inline whenever the buffer is
 /// editable, matching the floating selection bar and the Format app menu without
@@ -65,9 +65,11 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     if showsEditToolbelt {
-      if #available(macOS 26.0, *) {
-        ToolbarSpacer(.fixed)
-      }
+      #if compiler(>=6.3)
+        if #available(macOS 26.0, *) {
+          ToolbarSpacer(.fixed)
+        }
+      #endif
 
       ToolbarItemGroup {
         richMarkdownToggle
@@ -75,9 +77,11 @@ struct EditorToolbelt: ToolbarContent {
       }
     }
 
-    if #available(macOS 26.0, *) {
-      ToolbarSpacer(.flexible)
-    }
+    #if compiler(>=6.3)
+      if #available(macOS 26.0, *) {
+        ToolbarSpacer(.flexible)
+      }
+    #endif
 
     ToolbarItemGroup {
       modePicker

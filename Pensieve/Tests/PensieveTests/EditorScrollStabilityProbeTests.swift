@@ -47,6 +47,19 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
   }
 
   @MainActor
+  private func pinViewportAroundCaret(
+    _ surface: MarkdownEditorSurface, caret: Int
+  ) -> NSPoint {
+    let range = NSRange(location: caret, length: 0)
+    surface.textView.setSelectedRange(range)
+    surface.textView.scrollRangeToVisible(range)
+    surface.scrollView.layoutSubtreeIfNeeded()
+    surface.textLayoutManager.ensureLayout(for: surface.textLayoutManager.documentRange)
+    surface.scrollView.reflectScrolledClipView(surface.scrollView.contentView)
+    return surface.scrollView.contentView.bounds.origin
+  }
+
+  @MainActor
   func test_typing_in_middle_does_not_move_viewport_in_source_mode() throws {
     let (surface, window) = makeHostedSurface(text: longDocument())
     defer { window.contentView = nil }
@@ -54,16 +67,9 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
     // Source/split semantics: typewriter centering is OFF (gated to Focus).
     surface.typewriterScrollEnabled = false
 
-    // Pin a known viewport NOT at the top: scroll to the vertical middle.
-    let docHeight = surface.textView.bounds.height
-    let pinnedY = (docHeight - 400) / 2
-    surface.scrollView.contentView.scroll(to: NSPoint(x: 0, y: pinnedY))
-    surface.scrollView.reflectScrolledClipView(surface.scrollView.contentView)
-    let originBefore = surface.scrollView.contentView.bounds.origin
-
     // Type a single character on a line inside the pinned viewport.
     let caret = (surface.textStorage.string as NSString).length / 2
-    surface.textView.setSelectedRange(NSRange(location: caret, length: 0))
+    let originBefore = pinViewportAroundCaret(surface, caret: caret)
     surface.textView.insertText("x", replacementRange: NSRange(location: caret, length: 0))
     drainMainQueue()
 
@@ -85,14 +91,8 @@ final class EditorScrollStabilityProbeTests: XCTestCase {
 
     surface.typewriterScrollEnabled = false
 
-    let docHeight = surface.textView.bounds.height
-    let pinnedY = (docHeight - 400) / 2
-    surface.scrollView.contentView.scroll(to: NSPoint(x: 0, y: pinnedY))
-    surface.scrollView.reflectScrolledClipView(surface.scrollView.contentView)
-    let originBefore = surface.scrollView.contentView.bounds.origin
-
     let caret = (surface.textStorage.string as NSString).length / 2
-    surface.textView.setSelectedRange(NSRange(location: caret, length: 0))
+    let originBefore = pinViewportAroundCaret(surface, caret: caret)
     surface.textView.insertText("x", replacementRange: NSRange(location: caret, length: 0))
     surface.update(
       text: surface.textStorage.string,
