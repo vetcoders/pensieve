@@ -1,177 +1,761 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pensieve - Native macOS Markdown Editor</title>
-    <meta name="description" content="Pensieve is a fast, local-first macOS Markdown editor with native writing, preview, backlinks, and agent-aware workflows.">
-    <meta name="keywords" content="Pensieve, macOS Markdown editor, local-first notes, SwiftUI editor, markdown preview, Vetcoders">
-    <meta name="author" content="Vetcoders">
-    <meta property="og:title" content="Pensieve - Native macOS Markdown Editor">
-    <meta property="og:description" content="A fast, local-first macOS Markdown editor for source-first writing and agent-aware workflows.">
-    <meta property="og:type" content="website">
-    <meta property="og:url" content="https://vetcoders.github.io/pensieve/">
-    <meta property="og:site_name" content="Pensieve">
-    <meta name="twitter:card" content="summary">
-    <meta name="twitter:title" content="Pensieve - Native macOS Markdown Editor">
-    <meta name="twitter:description" content="A fast, local-first macOS Markdown editor for source-first writing and agent-aware workflows.">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pensieve - Native macOS Markdown Editor | Vetcoders</title>
+    <meta
+      name="description"
+      content="Pensieve is a signed and notarized native macOS Markdown editor for source-first writing, local files, preview, search, backlinks, and agent-aware workflows."
+    />
+    <meta
+      name="keywords"
+      content="Pensieve, macOS Markdown editor, native Markdown editor, local-first notes, Vetcoders"
+    />
+    <meta name="author" content="Vetcoders" />
+    <meta name="robots" content="index,follow" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Pensieve" />
+    <meta property="og:url" content="https://vetcoders.github.io/pensieve/" />
+    <meta property="og:title" content="Pensieve - Native macOS Markdown Editor" />
+    <meta
+      property="og:description"
+      content="A local-first writing desk for Markdown, preview, backlinks, search, and agent-aware dispatch on macOS."
+    />
+    <meta
+      property="og:image"
+      content="https://vetcoders.github.io/pensieve/pensieve-icon.png"
+    />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Pensieve - Native macOS Markdown Editor" />
+    <meta
+      name="twitter:description"
+      content="Native Markdown editing for macOS. Signed, notarized, local-first."
+    />
+    <meta
+      name="twitter:image"
+      content="https://vetcoders.github.io/pensieve/pensieve-icon.png"
+    />
+    <!-- nosemgrep: html.security.audit.missing-integrity.missing-integrity canonical metadata link is not an executable subresource -->
+    <link rel="canonical" href="https://vetcoders.github.io/pensieve/" />
+    <link rel="icon" href="./pensieve-icon.png" />
     <style>
-        :root {
-            --bg-color: #f9f9f9;
-            --text-color: #222;
-            --accent-color: #007aff;
-            --code-bg: #ececec;
-            --font-stack: "iA Writer Duo", "Menlo", "Courier", monospace;
+      :root {
+        --paper: #f7f7f2;
+        --ink: #111312;
+        --muted: #5d625f;
+        --rule: #d7d8d1;
+        --panel: #ffffff;
+        --red: #b34132;
+        --blue: #2f6f91;
+        --green: #637b4f;
+        --shadow: 0 22px 60px rgba(17, 19, 18, 0.18);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.55;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .site-nav {
+        position: absolute;
+        z-index: 10;
+        inset: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        width: min(1120px, calc(100% - 36px));
+        margin: 0 auto;
+        padding: 20px 0;
+        color: #f8f8f4;
+        font-size: 0.92rem;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      .brand img {
+        width: 34px;
+        height: 34px;
+        border-radius: 7px;
+        box-shadow: 0 8px 18px rgba(17, 19, 18, 0.18);
+      }
+
+      .nav-links {
+        display: flex;
+        gap: 18px;
+        align-items: center;
+        color: rgba(248, 248, 244, 0.72);
+      }
+
+      .nav-links a {
+        text-decoration: none;
+      }
+
+      .nav-links a:hover {
+        color: #ffffff;
+      }
+
+      .hero {
+        position: relative;
+        min-height: 88vh;
+        overflow: hidden;
+        display: flex;
+        align-items: flex-end;
+        padding: 116px 0 54px;
+        color: #f8f8f4;
+        background-color: #151817;
+        background-image: linear-gradient(
+            90deg,
+            rgba(17, 19, 18, 0.96) 0%,
+            rgba(17, 19, 18, 0.82) 43%,
+            rgba(17, 19, 18, 0.32) 100%
+          ),
+          url("./pensieve-icon.png");
+        background-repeat: no-repeat;
+        background-position: right 8% center;
+        background-size: min(52vw, 620px);
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        inset: auto 0 0;
+        height: 1px;
+        background: rgba(248, 248, 244, 0.18);
+      }
+
+      .hero-inner,
+      .section-inner {
+        width: min(1120px, calc(100% - 36px));
+        margin: 0 auto;
+      }
+
+      .hero-copy {
+        position: relative;
+        width: min(690px, 100%);
+      }
+
+      .eyebrow {
+        margin: 0 0 18px;
+        color: #e58b73;
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        margin-bottom: 18px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 5.8rem;
+        line-height: 0.93;
+        letter-spacing: 0;
+      }
+
+      .hero-lead {
+        max-width: 58ch;
+        margin-bottom: 24px;
+        color: rgba(248, 248, 244, 0.86);
+        font-size: 1.22rem;
+      }
+
+      .cta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 46px;
+        padding: 11px 16px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        text-decoration: none;
+        font-weight: 750;
+      }
+
+      .btn-primary {
+        color: #111312;
+        background: #f8f8f4;
+      }
+
+      .btn-secondary {
+        color: #f8f8f4;
+        border-color: rgba(248, 248, 244, 0.34);
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .release-note {
+        margin: 18px 0 0;
+        color: rgba(248, 248, 244, 0.66);
+        font-size: 0.94rem;
+      }
+
+      .proof-strip {
+        background: #ffffff;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .proof-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0;
+      }
+
+      .proof-item {
+        min-height: 118px;
+        padding: 24px 20px;
+        border-left: 1px solid var(--rule);
+      }
+
+      .proof-item:first-child {
+        border-left: 0;
+      }
+
+      .proof-item strong {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 1rem;
+      }
+
+      .proof-item span {
+        color: var(--muted);
+        font-size: 0.94rem;
+      }
+
+      section {
+        padding: 78px 0;
+      }
+
+      .editorial {
+        display: grid;
+        grid-template-columns: minmax(0, 0.86fr) minmax(320px, 1.14fr);
+        gap: 52px;
+        align-items: start;
+      }
+
+      .editorial > *,
+      .download-layout > *,
+      .shot-grid > * {
+        min-width: 0;
+      }
+
+      .section-label {
+        margin-bottom: 16px;
+        color: var(--red);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h2 {
+        margin-bottom: 18px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 3.1rem;
+        line-height: 1;
+        letter-spacing: 0;
+      }
+
+      .section-copy {
+        color: var(--muted);
+        font-size: 1.08rem;
+      }
+
+      .workspace-shot {
+        overflow: hidden;
+        border-radius: 8px;
+        background: #161817;
+        box-shadow: var(--shadow);
+        border: 1px solid rgba(17, 19, 18, 0.18);
+      }
+
+      .shot-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        min-height: 44px;
+        padding: 0 14px;
+        color: rgba(248, 248, 244, 0.72);
+        border-bottom: 1px solid rgba(248, 248, 244, 0.12);
+        font-size: 0.82rem;
+      }
+
+      .traffic {
+        display: flex;
+        gap: 7px;
+      }
+
+      .traffic span {
+        display: block;
+        width: 11px;
+        height: 11px;
+        border-radius: 999px;
+      }
+
+      .traffic span:nth-child(1) {
+        background: #e55a48;
+      }
+
+      .traffic span:nth-child(2) {
+        background: #d9ad42;
+      }
+
+      .traffic span:nth-child(3) {
+        background: #6ba95e;
+      }
+
+      .shot-grid {
+        display: grid;
+        grid-template-columns: 0.82fr 1.18fr;
+        min-height: 420px;
+      }
+
+      .source-pane,
+      .preview-pane {
+        padding: 26px;
+      }
+
+      .source-pane {
+        background: #101211;
+        color: #dfe3de;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.9rem;
+        line-height: 1.8;
+      }
+
+      .source-pane .muted {
+        color: #78827a;
+      }
+
+      .source-pane .accent {
+        color: #ec8e73;
+      }
+
+      .preview-pane {
+        background: #fbfbf7;
+        color: #161817;
+      }
+
+      .preview-pane h3 {
+        margin-bottom: 14px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 2rem;
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      .preview-pane p {
+        color: #4c514e;
+      }
+
+      .preview-rule {
+        height: 1px;
+        margin: 22px 0;
+        background: #d7d8d1;
+      }
+
+      .feature-list {
+        display: grid;
+        gap: 14px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .feature-list li {
+        display: grid;
+        grid-template-columns: 28px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+      }
+
+      .feature-list b {
+        display: block;
+        margin-bottom: 2px;
+      }
+
+      .feature-mark {
+        display: inline-flex;
+        width: 28px;
+        height: 28px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 7px;
+        color: #fff;
+        background: var(--blue);
+        font-weight: 800;
+        font-size: 0.82rem;
+      }
+
+      .download-band {
+        background: #121513;
+        color: #f8f8f4;
+      }
+
+      .download-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(280px, 380px);
+        gap: 44px;
+        align-items: center;
+      }
+
+      .download-layout h2 {
+        color: #f8f8f4;
+      }
+
+      .download-layout p {
+        color: rgba(248, 248, 244, 0.72);
+      }
+
+      .download-panel {
+        min-width: 0;
+        border-radius: 8px;
+        border: 1px solid rgba(248, 248, 244, 0.16);
+        background: rgba(248, 248, 244, 0.06);
+        padding: 22px;
+      }
+
+      .download-panel dl {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 18px;
+        margin: 0 0 20px;
+      }
+
+      .download-panel dt {
+        color: rgba(248, 248, 244, 0.56);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        font-weight: 800;
+      }
+
+      .download-panel dd {
+        margin: 3px 0 0;
+        color: #fff;
+        font-weight: 700;
+      }
+
+      .source-command {
+        overflow-x: auto;
+        margin: 18px 0 0;
+        padding: 14px 16px;
+        border-radius: 8px;
+        background: #0b0d0c;
+        color: #dfe3de;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.88rem;
+      }
+
+      .footer {
+        padding: 34px 0 44px;
+        color: var(--muted);
+        border-top: 1px solid var(--rule);
+        font-size: 0.92rem;
+      }
+
+      .footer .section-inner {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
+
+      .footer a {
+        text-decoration: none;
+        color: var(--ink);
+      }
+
+      @media (max-width: 860px) {
+        .nav-links {
+          gap: 12px;
+          font-size: 0.86rem;
         }
 
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --bg-color: #1a1a1a;
-                --text-color: #e0e0e0;
-                --accent-color: #0a84ff;
-                --code-bg: #2a2a2a;
-            }
-        }
-
-        body {
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            font-family: var(--font-stack);
-            line-height: 1.6;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 40px 20px;
-            text-rendering: optimizeLegibility;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        h1, h2, h3 {
-            font-weight: 600;
-            margin-top: 2em;
-            margin-bottom: 0.5em;
+        .hero {
+          min-height: 760px;
+          background-position: right -120px top 86px;
+          background-size: 420px;
         }
 
         h1 {
-            font-size: 2.5rem;
-            letter-spacing: -0.05em;
-            border-bottom: 2px solid var(--text-color);
-            padding-bottom: 10px;
-            display: inline-block;
+          font-size: 4rem;
         }
 
-        p {
-            margin-bottom: 1.5em;
-            font-size: 1.1rem;
+        h2 {
+          font-size: 2.45rem;
         }
 
-        a {
-            color: var(--accent-color);
-            text-decoration: none;
-            border-bottom: 1px solid transparent;
-            transition: border-bottom 0.2s;
+        .proof-grid,
+        .editorial,
+        .download-layout,
+        .shot-grid {
+          grid-template-columns: 1fr;
         }
 
-        a:hover {
-            border-bottom: 1px solid var(--accent-color);
+        .proof-item,
+        .proof-item:first-child {
+          border-left: 0;
+          border-top: 1px solid var(--rule);
         }
 
-        code {
-            background-color: var(--code-bg);
-            padding: 0.2em 0.4em;
-            border-radius: 3px;
-            font-size: 0.9em;
+        .proof-item:first-child {
+          border-top: 0;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .site-nav {
+          align-items: flex-start;
         }
 
-        pre code {
-            display: block;
-            padding: 15px;
-            overflow-x: auto;
-            background-color: var(--code-bg);
-            border-radius: 5px;
-            margin-bottom: 1.5em;
+        .nav-links {
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 8px;
         }
 
-        .cta {
-            margin-top: 3em;
-            text-align: center;
+        .hero {
+          min-height: 720px;
+          padding-top: 118px;
+          background-position: right -128px top 98px;
+          background-size: 350px;
         }
 
-        .btn {
-            display: inline-block;
-            background-color: var(--text-color);
-            color: var(--bg-color);
-            padding: 12px 24px;
-            font-weight: bold;
-            border-radius: 6px;
-            font-size: 1.1rem;
-            transition: transform 0.1s, opacity 0.2s;
+        h1 {
+          font-size: 3.25rem;
         }
 
-        .btn:hover {
-            opacity: 0.9;
-            border-bottom: none;
-            color: var(--bg-color);
-            transform: translateY(-1px);
-        }
-        
-        .footer {
-            margin-top: 5em;
-            font-size: 0.9rem;
-            opacity: 0.6;
-            text-align: center;
-            border-top: 1px solid var(--code-bg);
-            padding-top: 20px;
+        .hero-lead {
+          font-size: 1.06rem;
         }
 
-        .note {
-            border-left: 3px solid var(--accent-color);
-            padding-left: 16px;
-            opacity: 0.9;
+        section {
+          padding: 56px 0;
         }
+
+        .source-pane,
+        .preview-pane {
+          padding: 20px;
+        }
+      }
     </style>
-</head>
-<body>
+  </head>
+  <body>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="brand" href="#top">
+        <img src="./pensieve-icon.png" alt="" width="34" height="34" />
+        <span>Pensieve</span>
+      </a>
+      <div class="nav-links">
+        <a href="#surface">Surface</a>
+        <a href="#download">Download</a>
+        <a href="https://github.com/vetcoders/pensieve">GitHub</a>
+      </div>
+    </nav>
 
-    <header>
-        <h1>Pensieve</h1>
-        <p>A fast, native macOS markdown editor for structured thought.</p>
+    <header class="hero" id="top">
+      <div class="hero-inner">
+        <div class="hero-copy">
+          <p class="eyebrow">Native macOS Markdown editor</p>
+          <h1>Pensieve</h1>
+          <p class="hero-lead">
+            A local-first writing desk for Markdown notes, preview, search,
+            backlinks, and agent-aware dispatch. Built as a native Mac app,
+            distributed as a signed and notarized DMG.
+          </p>
+          <div class="cta-row">
+            <a
+              class="btn btn-primary"
+              href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
+              >Download DMG</a
+            >
+            <a
+              class="btn btn-secondary"
+              href="https://github.com/vetcoders/pensieve/releases/latest"
+              >Release notes</a
+            >
+          </div>
+          <p class="release-note">macOS 15 or newer. Apple silicon build.</p>
+        </div>
+      </div>
     </header>
 
-    <main>
-        <section>
-            <h2>Focus First</h2>
-            <p>Pensieve is built with native macOS primitives to be incredibly fast and lightweight. It strips away the noise, leaving you with pure text and a distraction-free writing environment. The aesthetic is heavily inspired by the source-first purity of iA Writer.</p>
-        </section>
-
-        <section>
-            <h2>Features</h2>
-            <ul>
-                <li><strong>Native Performance:</strong> Written in Swift, avoiding Electron bloat.</li>
-                <li><strong>Source-First Identity:</strong> Focus on the markdown source, not a heavy WYSIWYG facade.</li>
-                <li><strong>Local First:</strong> Your files stay on your machine. No cloud lock-in.</li>
-                <li><strong>Agent-Aware Workflows:</strong> Current-document dispatch and Vista-powered autocomplete are wired into the editor.</li>
-                <li><strong>Dark Mode Support:</strong> Seamless integration with macOS system themes.</li>
-            </ul>
-        </section>
-        
-        <section>
-            <h2>Get Started</h2>
-            <p>You can build Pensieve directly from source while the public distribution lane is being finalized.</p>
-            <pre><code>git clone https://github.com/vetcoders/pensieve.git
-cd pensieve
-make build
-make run</code></pre>
-            <p class="note">The local install lane is <code>make install-app</code>. The Mac App Store lane exists, but submission and signing remain operator-gated.</p>
-        </section>
-
-        <div class="cta">
-            <a href="https://github.com/vetcoders/pensieve" class="btn">View on GitHub</a>
+    <div class="proof-strip">
+      <div class="section-inner proof-grid">
+        <div class="proof-item">
+          <strong>Native by default</strong>
+          <span>Swift, AppKit, SwiftUI, TextKit, and WebKit.</span>
         </div>
+        <div class="proof-item">
+          <strong>Files stay yours</strong>
+          <span>Markdown lives on disk, not behind a cloud account.</span>
+        </div>
+        <div class="proof-item">
+          <strong>Preview included</strong>
+          <span>GitHub-flavored Markdown, tables, math, and diagrams.</span>
+        </div>
+        <div class="proof-item">
+          <strong>Agent-aware</strong>
+          <span>Current-document dispatch and Vista autocomplete hooks.</span>
+        </div>
+      </div>
+    </div>
+
+    <main>
+      <section id="surface">
+        <div class="section-inner editorial">
+          <div>
+            <div class="section-label">Writing surface</div>
+            <h2>Source-first, but not austere.</h2>
+            <p class="section-copy">
+              Pensieve keeps the Markdown source as the primary object while
+              giving the workspace the native conveniences people expect from a
+              Mac editor: fast windows, project search, live preview, document
+              sharing, and file-system respect.
+            </p>
+          </div>
+          <figure class="workspace-shot" aria-label="Pensieve editor preview">
+            <div class="shot-bar">
+              <div class="traffic" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+              <span>field-notes.md</span>
+              <span>Preview</span>
+            </div>
+            <div class="shot-grid">
+              <div class="source-pane" aria-hidden="true">
+                <div><span class="muted">#</span> Field notes</div>
+                <div></div>
+                <div><span class="accent">-</span> observe first</div>
+                <div><span class="accent">-</span> keep the source close</div>
+                <div><span class="accent">-</span> dispatch with context</div>
+                <div></div>
+                <div><span class="muted">[[workspace-index]]</span></div>
+              </div>
+              <div class="preview-pane">
+                <h3>Field notes</h3>
+                <p>
+                  Notes stay readable as plain files, but the editor keeps the
+                  surrounding workspace alive: links, search, preview, and
+                  agent handoff all remain one gesture away.
+                </p>
+                <div class="preview-rule"></div>
+                <ul class="feature-list">
+                  <li>
+                    <span class="feature-mark">M</span>
+                    <span><b>Markdown</b>Source, split, and preview modes.</span>
+                  </li>
+                  <li>
+                    <span class="feature-mark">S</span>
+                    <span><b>Search</b>Workspace index and backlinks.</span>
+                  </li>
+                  <li>
+                    <span class="feature-mark">A</span>
+                    <span><b>Agents</b>Dispatch the current document with context.</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </figure>
+        </div>
+      </section>
+
+      <section class="download-band" id="download">
+        <div class="section-inner download-layout">
+          <div>
+            <div class="section-label">Manual release</div>
+            <h2>A small installer, no workflow theater.</h2>
+            <p>
+              The public artifact is built locally, signed with Developer ID,
+              notarized by Apple, stapled, and uploaded to GitHub Releases.
+              GitHub Pages points to the latest release asset so the download
+              path stays simple.
+            </p>
+            <div class="source-command">
+              git clone https://github.com/vetcoders/pensieve.git<br />
+              cd pensieve &amp;&amp; make run
+            </div>
+          </div>
+          <aside class="download-panel" aria-label="Download details">
+            <dl>
+              <div>
+                <dt>Version</dt>
+                <dd>0.3.0</dd>
+              </div>
+              <div>
+                <dt>Platform</dt>
+                <dd>macOS 15+</dd>
+              </div>
+              <div>
+                <dt>CPU</dt>
+                <dd>Apple silicon</dd>
+              </div>
+              <div>
+                <dt>Trust</dt>
+                <dd>Notarized DMG</dd>
+              </div>
+            </dl>
+            <a
+              class="btn btn-primary"
+              href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
+              >Download Pensieve.dmg</a
+            >
+          </aside>
+        </div>
+      </section>
     </main>
 
     <footer class="footer">
-        <p>&copy; 2026 Vetcoders. Built for thinkers.</p>
+      <div class="section-inner">
+        <span>2026 Vetcoders. Pensieve is built for local-first writing.</span>
+        <span>
+          <a href="https://github.com/vetcoders/pensieve">Source</a> /
+          <a href="https://github.com/vetcoders/pensieve/security">Security</a>
+        </span>
+      </div>
     </footer>
-
-</body>
+  </body>
 </html>
