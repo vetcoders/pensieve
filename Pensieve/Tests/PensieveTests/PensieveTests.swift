@@ -3877,6 +3877,49 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenWordFileImportsUnsavedMarkdownDraftWithoutRegistryRouting() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenWordImportTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let wordURL = folder.appendingPathComponent("Board Brief.docx")
+    let data = try DocumentTransfer.docxData(
+      fromHTML: "<h1>Board Brief</h1><p>Prokurent approval is required.</p>",
+      baseURL: nil
+    )
+    try data.write(to: wordURL, options: .atomic)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: wordURL)
+    for _ in 0..<100 where appState.documentSession.displayTitle != "Board Brief.md" {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(requestedRefs.isEmpty, "imports are drafts, not source-backed document tabs")
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.displayTitle, "Board Brief.md")
+    XCTAssertTrue(appState.activeDocumentText.contains("# Board Brief"))
+    XCTAssertTrue(appState.activeDocumentText.contains("Prokurent approval is required."))
+    XCTAssertNil(appState.lastError)
+  }
+
+  @MainActor
   func testOpenFileRejectsUnsupportedTypeBeforeRoutingToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(

@@ -60,6 +60,10 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut("o", modifiers: [.command])
 
+      Button("Import Word or PDF…") {
+        importDocument()
+      }
+
       Button("Open Folder…") {
         openFolder()
       }
@@ -121,6 +125,16 @@ private struct ActivePensieveCommands: Commands {
 
       Button("Export PDF…") {
         DocumentExport.exportPDF(
+          session: appState.documentSession,
+          theme: themeManager.current,
+          fontSize: appState.fontSize,
+          themeManager: themeManager
+        )
+      }
+      .disabled(!appState.documentHasEditableBuffer)
+
+      Button("Export Word (.docx)…") {
+        DocumentExport.exportDOCX(
           session: appState.documentSession,
           theme: themeManager.current,
           fontSize: appState.fontSize,
@@ -442,10 +456,23 @@ private struct ActivePensieveCommands: Commands {
     panel.canChooseFiles = true
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
-    panel.allowedContentTypes = markdownContentTypes
+    panel.allowedContentTypes = openableContentTypes
     panel.prompt = "Open"
     if panel.runModal() == .OK, let url = panel.url {
       controller.openFile(url: url)
+    }
+  }
+
+  private func importDocument() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = documentImportContentTypes
+    panel.prompt = "Import"
+    panel.message = "Word and text-based PDF files open as unsaved Markdown drafts."
+    if panel.runModal() == .OK, let url = panel.url {
+      controller.importDocument(url: url)
     }
   }
 
@@ -507,6 +534,14 @@ private struct ActivePensieveCommands: Commands {
       UTType(filenameExtension: "markdown"),
       .plainText,
     ].compactMap { $0 }
+  }
+
+  private var documentImportContentTypes: [UTType] {
+    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
+  }
+
+  private var openableContentTypes: [UTType] {
+    markdownContentTypes + documentImportContentTypes
   }
 
   private var sidebarActionTargetURL: URL? {

@@ -3,6 +3,11 @@ import Combine
 import CoreGraphics
 import Foundation
 
+private enum DocumentImportOutcome: Sendable {
+  case success(ImportedMarkdownDocument)
+  case failure(String)
+}
+
 @MainActor
 final class AppController: ObservableObject {
   private let appState: AppState
@@ -42,6 +47,7 @@ final class AppController: ObservableObject {
   }()
   private var didStart = false
   private var isAgentDispatchInFlight = false
+  private var documentImportTask: Task<Void, Never>?
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
@@ -131,6 +137,11 @@ final class AppController: ObservableObject {
       return
     }
 
+    if DocumentTransfer.isImportable(standardizedURL) {
+      importDocument(url: standardizedURL)
+      return
+    }
+
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
       return
     }
@@ -162,7 +173,54 @@ final class AppController: ObservableObject {
   }
 
   func openFileInCurrentWindow(url: URL) {
+    if DocumentTransfer.isImportable(url) {
+      importDocument(url: url)
+      return
+    }
     folderManager.openFile(url: url, into: appState)
+  }
+
+  /// Converts a Word/PDF source off the main actor and opens the result as an
+  /// unsaved Markdown draft. The source file remains untouched; Save therefore
+  /// follows the normal untitled-document Save As path.
+  func importDocument(url: URL) {
+    let sourceURL = url.standardizedFileURL
+    documentImportTask?.cancel()
+    documentImportTask = Task { [weak self] in
+      let outcome = await Task.detached(priority: .userInitiated) {
+        let scopedAccess = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+          if scopedAccess { sourceURL.stopAccessingSecurityScopedResource() }
+        }
+        do {
+          return DocumentImportOutcome.success(
+            try DocumentTransfer.importMarkdown(from: sourceURL)
+          )
+        } catch {
+          return DocumentImportOutcome.failure(error.localizedDescription)
+        }
+      }.value
+
+      guard !Task.isCancelled, let self else { return }
+      documentImportTask = nil
+      switch outcome {
+      case .success(let imported):
+        guard documentStore.prepareForDocumentSwitch(appState: appState) else { return }
+        appState.selectedDocumentID = nil
+        appState.documentSession.restoreUntitled(
+          title: imported.suggestedFileName,
+          text: imported.markdown,
+          recoveryID: UUID()
+        )
+        // The conversion result has no source-backed autosave target. Persist
+        // the dirty untitled session immediately so a crash cannot erase the handoff.
+        documentStore.savePendingChangesOnClose(appState: appState)
+        appState.lastError = nil
+        DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
+      case .failure(let message):
+        appState.lastError = "Import failed: \(message)"
+      }
+    }
   }
 
   @discardableResult

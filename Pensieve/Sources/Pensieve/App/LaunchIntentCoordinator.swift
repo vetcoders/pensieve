@@ -85,7 +85,9 @@ final class LaunchIntentCoordinator: ObservableObject {
       }
     }
 
-    if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first {
+    if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first,
+      WorkspaceScanner.isMarkdownFile(firstURL)
+    {
       controller.selectDocument(id: firstURL.standardizedFileURL)
     }
 
@@ -95,7 +97,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 
   private func isSupportedLaunchFile(_ url: URL) -> Bool {
-    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
+    ["md", "markdown", "txt", "docx", "pdf"].contains(url.pathExtension.lowercased())
   }
 }
 

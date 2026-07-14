@@ -21,6 +21,17 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Split Modes:** `SOURCE` (Cmd+1), `SPLIT` (Cmd+2), `PREVIEW` (Cmd+3), and `FOCUS` (Cmd+4).
 - **Fast Native Core:** Built on Swift 5.9+, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
 - **Agent-Aware Writing:** Current-document dispatch and local Vista-powered autocomplete are wired into the native editor.
+- **Word/PDF Transfer Bridge:** Export Markdown to `.docx`; open or import `.docx` and text-based `.pdf` files as editable Markdown drafts.
+
+## Word and PDF transfer
+
+Pensieve keeps Markdown as the source of truth while making exchange with Word-first collaborators practical:
+
+- **Markdown → Word:** choose **File → Export Word (.docx)…**. Headings, paragraphs, emphasis, links, and lists remain structured in the Word document.
+- **Word → Markdown:** choose **File → Import Word or PDF…**, use **Open File…**, or open a `.docx` with Pensieve from Finder. The source stays untouched and the conversion opens as an unsaved `.md` draft.
+- **PDF → Markdown:** text-based PDFs follow the same import path. Scanned PDFs without a text layer are rejected with an OCR-required message instead of opening a blank document.
+
+The existing HTML and PDF export options remain available in the File menu.
 
 ## Requirements
 

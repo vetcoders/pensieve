@@ -39,6 +39,10 @@ final class DocumentExportTests: XCTestCase {
       DocumentExport.defaultExportFileName(for: session, fileExtension: "pdf"),
       "My Note.pdf"
     )
+    XCTAssertEqual(
+      DocumentExport.defaultExportFileName(for: session, fileExtension: "docx"),
+      "My Note.docx"
+    )
   }
 
   func testDefaultExportFileNameFallsBackForUntitledBuffers() {
