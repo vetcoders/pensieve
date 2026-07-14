@@ -81,8 +81,7 @@ struct EditorPreviewSplit: View {
   private func content(forWidth width: CGFloat) -> some View {
     if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView(
-        hasWorkspace: appState.hasWorkspaceContent,
-        activity: appState.workspaceActivity
+        hasWorkspace: appState.hasWorkspaceContent
       )
     } else {
       switch appState.mode {
@@ -151,19 +150,9 @@ private struct FocusModeDimmingOverlay: View {
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
   let hasWorkspace: Bool
-  let activity: WorkspaceActivity?
 
   var body: some View {
     VStack(spacing: 18) {
-      // Only import-class work (real index writes ahead) takes over the center pane.
-      // Subtle open/validate states stay in the sidebar — a cached, unchanged reopen
-      // must never present itself as "Importing Workspace".
-      if let activity, activity.isProminent {
-        WorkspaceActivityView(activity: activity)
-          .frame(maxWidth: 340)
-          .accessibilityIdentifier("pensieve.emptyState.activity")
-      }
-
       VStack(spacing: 12) {
         Image(systemName: "doc.text")
           .font(.system(size: 48, weight: .light))
@@ -197,33 +186,5 @@ struct DocumentEmptyStateView: View {
       return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
     }
     return "Open a Markdown file or folder from the File menu to get started."
-  }
-}
-
-struct WorkspaceActivityView: View {
-  let activity: WorkspaceActivity
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack(spacing: 8) {
-        ProgressView()
-          .controlSize(.small)
-        Text(activity.title)
-          .font(.headline)
-      }
-
-      Text(activity.detail)
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .lineLimit(2)
-
-      ProgressView(value: activity.progress)
-        .progressViewStyle(.linear)
-    }
-    .padding(14)
-    .background {
-      RoundedRectangle(cornerRadius: 8, style: .continuous)
-        .fill(Color(NSColor.controlBackgroundColor))
-    }
   }
 }

@@ -232,7 +232,8 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     }
 
     let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
-    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let cacheStore = WorkspaceCacheStore(baseDirectory: cacheDir)
+    let substrate = WorkspaceSubstrate(store: cacheStore)
     let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
     // ONE IndexDatabase (one pool) across both launches — a real relaunch reopens the same file.
     let indexDatabase = IndexDatabase(databaseURL: databaseURL)
@@ -281,6 +282,13 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     XCTAssertEqual(sessionsAfterFirst, 1, "first launch writes exactly one cold_scan session")
     firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
 
+    // Simulate an upgrade from a release that already has the manifest/fingerprint/index but
+    // predates the instant presentation cache. The unchanged valid-skip launch below must migrate
+    // that cache once; otherwise every future launch keeps walking the entire tree.
+    let presentationCacheURL = cacheStore.workspaceScansURL(for: identity)
+    try FileManager.default.removeItem(at: presentationCacheURL)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: presentationCacheURL.path))
+
     // ---- Second launch: fresh manager + fresh AppState (empty in-memory tree, like a relaunch).
     let secondCalls = BuilderCallCounter()
     let secondBuilder: WorkspaceScanner.Builder = { rootURLs, exclusions in
@@ -299,6 +307,12 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     await secondManager.waitForPendingWorkspaceBuild()
     await secondManager.waitForPendingIndexUpdate()
     await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      try cacheStore.readWorkspaceScans(for: identity)?.flatMap(\.documents).count,
+      32,
+      "a valid-skip launch must migrate legacy cache state to the instant presentation snapshot"
+    )
 
     // (1) NO double walk: the relaunch walks the tree EXACTLY ONCE.
     XCTAssertEqual(

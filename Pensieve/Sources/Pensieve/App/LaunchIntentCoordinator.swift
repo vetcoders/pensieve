@@ -14,7 +14,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   private var startupDecisionHandler: StartupDecisionHandler?
   private var hasExplicitURLIntent = false
 
-  init(settleDelayNanoseconds: UInt64 = 150_000_000) {
+  init(settleDelayNanoseconds: UInt64 = 0) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
   }
 
@@ -136,9 +136,11 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       NSApp.activate(ignoringOtherApps: true)
     }
 
-    // Force application to show its main window if none was restored
+    // Give SwiftUI one scheduler turn to install its window factory, then create a launcher only
+    // when state restoration produced no window. A fixed 150 ms sleep made every unlucky launch
+    // visibly wait even though no work was pending.
     Task { @MainActor in
-      try? await Task.sleep(nanoseconds: 150_000_000)
+      await Task.yield()
       if NSApp.windows.isEmpty {
         if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
           DocumentWindowRegistry.shared.openLauncherWindow()

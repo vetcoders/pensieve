@@ -360,8 +360,8 @@ struct WorkspaceRoot: Identifiable, Hashable, Sendable {
   var name: String { url.lastPathComponent }
 }
 
-struct WorkspaceNode: Identifiable, Hashable, Sendable {
-  enum Kind: String, Sendable {
+struct WorkspaceNode: Identifiable, Hashable, Codable, Sendable {
+  enum Kind: String, Codable, Sendable {
     case folder
     case document
   }

@@ -177,6 +177,8 @@ final class WorkspaceCacheStore {
   private let baseDirectory: URL
   private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
+  private let treeEncoder = PropertyListEncoder()
+  private let treeDecoder = PropertyListDecoder()
 
   convenience init() {
     self.init(baseDirectory: WorkspaceMetadataStore.applicationSupportDirectory())
@@ -185,6 +187,7 @@ final class WorkspaceCacheStore {
   init(baseDirectory: URL) {
     self.baseDirectory = baseDirectory
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    treeEncoder.outputFormat = .binary
   }
 
   func ensureCacheRoot(for identity: WorkspaceIdentity) throws -> URL {
@@ -220,6 +223,16 @@ final class WorkspaceCacheStore {
     try Self.writeProtected(data, to: root.appendingPathComponent("search-signature.json"))
   }
 
+  /// Persists the already-built sidebar/document tree as a compact binary plist. This is the
+  /// presentation cache: a relaunch can publish the last known-good workspace immediately while
+  /// a fresh filesystem walk validates it in the background. Search correctness remains guarded
+  /// independently by the signature + index cache.
+  func writeWorkspaceScans(_ scans: [WorkspaceScan], for identity: WorkspaceIdentity) throws {
+    let root = try ensureCacheRoot(for: identity)
+    let data = try treeEncoder.encode(scans)
+    try Self.writeProtected(data, to: root.appendingPathComponent("workspace-tree.plist"))
+  }
+
   func clearCache(for identity: WorkspaceIdentity) throws {
     let root = cacheRootURL(for: identity)
     guard FileManager.default.fileExists(atPath: root.path) else { return }
@@ -250,6 +263,11 @@ final class WorkspaceCacheStore {
   func searchSignatureURL(for identity: WorkspaceIdentity) -> URL {
     cacheRootURL(for: identity)
       .appendingPathComponent("search-signature.json", isDirectory: false)
+  }
+
+  func workspaceScansURL(for identity: WorkspaceIdentity) -> URL {
+    cacheRootURL(for: identity)
+      .appendingPathComponent("workspace-tree.plist", isDirectory: false)
   }
 
   func readTreeFingerprint(for identity: WorkspaceIdentity) throws -> TreeFingerprint? {
@@ -290,6 +308,14 @@ final class WorkspaceCacheStore {
       return nil
     }
     return try? decoder.decode(WorkspaceSignature.self, from: data)
+  }
+
+  func readWorkspaceScans(for identity: WorkspaceIdentity) throws -> [WorkspaceScan]? {
+    guard existingCacheRoot(for: identity) != nil else { return nil }
+    let url = workspaceScansURL(for: identity)
+    guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    return try treeDecoder.decode([WorkspaceScan].self, from: data)
   }
 
   private func cacheRootURL(for identity: WorkspaceIdentity) -> URL {

@@ -609,6 +609,7 @@ final class FolderManager {
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
       precomputedFingerprint: coldFingerprint,
+      cachedScans: scans,
       into: appState
     )
     selectRestoredDocument(previousSelection: previousSelection, into: appState)
@@ -660,6 +661,7 @@ final class FolderManager {
     exclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint? = nil,
     precomputedIndexedDocumentCount: Int? = nil,
+    persistPresentationCache: Bool = true,
     into appState: AppState
   ) -> Bool {
     guard !rootURLs.isEmpty else { return false }
@@ -701,6 +703,15 @@ final class FolderManager {
       lastWorkspaceSignature =
         cacheStore.readSearchSignature(for: identity)
         ?? FolderManager.signature(from: scans)
+      if persistPresentationCache {
+        do {
+          try cacheStore.writeWorkspaceScans(scans, for: identity)
+        } catch {
+          // The manifest/index verdict remains valid even if this optional acceleration artifact
+          // cannot be written. Keep the correct no-reindex result and retry migration next launch.
+          NSLog("%@", "Presentation cache migration failed: \(error)")
+        }
+      }
       appState.lastError = nil
       DebugTrace.log("coldStartValidSkip taken roots=\(rootURLs.count)")
       return true
@@ -728,12 +739,20 @@ final class FolderManager {
     // path). Opening + migrating here on main was a source of the "Scanning…" hang.
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
-    // Honest open state for the WHOLE walk: the skip decision lands only after the walk +
-    // fingerprint + DB count below, so claiming "Importing Workspace" here would present
-    // every cached open as a full import (the operator's "indeksuje non stop" perception).
-    // `.opening` is subtle (sidebar progress, no center takeover); the import claim is
-    // made only after the skip-gate genuinely fails.
-    setOpenActivity(.opening(label), into: appState)
+    let restoredCachedWorkspace = restoreCachedWorkspace(
+      rootURLs: rootURLs,
+      previousSelection: previousSelection,
+      into: appState
+    )
+    if restoredCachedWorkspace {
+      // Stale-while-revalidate: the last committed tree is already usable. The walk below still
+      // proves freshness, but it is background maintenance rather than a loading state.
+      setOpenActivity(nil, into: appState)
+    } else {
+      // First open has no presentation cache yet. Keep the activity honest while the initial
+      // off-main walk builds it; subsequent opens take the instant path above.
+      setOpenActivity(.opening(label), into: appState)
+    }
 
     let expectedRootPaths = appState.workspaceRoots.map { $0.url.standardizedFileURL.path }
     let expectedOpenFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
@@ -794,6 +813,7 @@ final class FolderManager {
           exclusions: appState.excludedWorkspacePaths,
           precomputedFingerprint: coldStartFingerprint,
           precomputedIndexedDocumentCount: coldStartIndexedCount,
+          persistPresentationCache: !restoredCachedWorkspace,
           into: appState
         )
       {
@@ -813,6 +833,7 @@ final class FolderManager {
         rootURLs: appState.workspaceRoots.map(\.url),
         exclusions: appState.excludedWorkspacePaths,
         precomputedFingerprint: coldStartFingerprint,
+        cachedScans: scans,
         into: appState
       )
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
@@ -849,7 +870,6 @@ final class FolderManager {
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
   ) -> Bool {
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
-    setOpenActivity(.checkingCache(label), into: appState)
 
     // Cache fast-path keys on the FULL root set (N≥1). The real guard against silently dropping
     // an ADDED folder is `matchesCurrentWorkspace` below: when `open` merged a new root the
@@ -879,11 +899,13 @@ final class FolderManager {
       ),
       !appState.workspaceTree.isEmpty
     else {
-      // Cold-start short-circuit: the substrate was never consulted, so this is NOT a
-      // cache miss — the cold path's skip-gate may still validate the cache. Keep the
-      // subtle `.checkingCache`; the caller sets `.opening` right after.
+      // Cold-start short-circuit: the substrate was never consulted, so do not publish a
+      // synthetic cache-checking state. The background path can restore its presentation cache
+      // immediately before the validation walk begins.
       return false
     }
+
+    setOpenActivity(.checkingCache(label), into: appState)
 
     let identity = WorkspaceIdentity.make(
       roots: rootURLs,
@@ -944,6 +966,35 @@ final class FolderManager {
       .filter { seenOpenFileURLs.insert($0).inserted }
       .map { DocumentRef(id: $0, isAdHoc: true) }
     appState.lastError = nil
+  }
+
+  /// Publishes the last committed workspace tree before the validation walk completes. The cache
+  /// is identity-keyed by the full standardized root set + bookmark, and the root list is checked
+  /// again before use. Fresh scans always replace this state later in the same open flow.
+  private func restoreCachedWorkspace(
+    rootURLs: [URL],
+    previousSelection: DocumentRef.ID?,
+    into appState: AppState
+  ) -> Bool {
+    guard !rootURLs.isEmpty else { return false }
+    let standardizedRoots = rootURLs.map(\.standardizedFileURL).sorted { $0.path < $1.path }
+    let identity = WorkspaceIdentity.make(
+      roots: standardizedRoots,
+      bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
+    )
+    guard let scans = try? cacheStore.readWorkspaceScans(for: identity) else {
+      return false
+    }
+    let cachedRoots = scans.compactMap { $0.rootNode.url?.standardizedFileURL }
+      .sorted { $0.path < $1.path }
+    guard cachedRoots == standardizedRoots else { return false }
+
+    applyWorkspaceScans(scans, into: appState)
+    lastWorkspaceSignature = cacheStore.readSearchSignature(for: identity)
+    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    DebugTrace.log(
+      "presentation cache restored roots=\(rootURLs.count) documents=\(appState.documents.count)")
+    return true
   }
 
   /// Rebuilds the in-memory document tree (always full — it is metadata-only and cheap) and
@@ -1226,6 +1277,7 @@ final class FolderManager {
   private func commitWorkspaceManifest(
     rootURLs: [URL], exclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint? = nil,
+    cachedScans: [WorkspaceScan]? = nil,
     into appState: AppState
   ) -> Task<Void, Never>? {
     guard !rootURLs.isEmpty else { return nil }
@@ -1250,6 +1302,9 @@ final class FolderManager {
         exclusions: exclusions,
         fingerprint: fingerprint
       )
+      if let cachedScans {
+        try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
+      }
       let documents = appState.documents
       return Task {
         await indexDatabase.upsertWorkspace(
@@ -1431,7 +1486,7 @@ private enum WorkspaceDefaults {
   ]
 }
 
-struct WorkspaceScan: Sendable {
+struct WorkspaceScan: Codable, Sendable {
   var documents: [DocumentRef]
   var rootNode: WorkspaceNode
 }

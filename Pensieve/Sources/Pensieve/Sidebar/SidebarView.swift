@@ -309,8 +309,9 @@ struct SidebarView: View {
   private var openingPlaceholder: some View {
     VStack(spacing: 10) {
       Spacer()
-      ProgressView()
-        .controlSize(.small)
+      Image(systemName: "folder")
+        .font(.system(size: 28))
+        .foregroundColor(.secondary)
       Text(appState.workspaceActivity?.title ?? "Opening Workspace")
         .font(.subheadline)
         .foregroundColor(.secondary)
@@ -1048,18 +1049,12 @@ private struct WorkspaceActivityMiniView: View {
   let activity: WorkspaceActivity
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      Text(activity.detail)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .lineLimit(2)
-
-      ProgressView(value: activity.progress)
-        .progressViewStyle(.linear)
-        .controlSize(.small)
-    }
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel("\(activity.title): \(activity.detail)")
-    .accessibilityIdentifier("pensieve.sidebar.activity")
+    Text(activity.detail)
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      .lineLimit(2)
+      .accessibilityElement(children: .combine)
+      .accessibilityLabel("\(activity.title): \(activity.detail)")
+      .accessibilityIdentifier("pensieve.sidebar.activity")
   }
 }

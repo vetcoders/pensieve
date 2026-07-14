@@ -740,9 +740,10 @@ final class WorkspaceSubstrateTests: XCTestCase {
     let identity = WorkspaceIdentity.make(rootURL: root, bookmarkData: Data("bookmark".utf8))
     let store = WorkspaceCacheStore(baseDirectory: temporaryApplicationSupportDirectory())
     _ = try store.ensureCacheRoot(for: identity)
-    // Mirrors WorkspaceCacheStore.protectedWriteOptions used for production manifest writes.
-    try Data("{ not json".utf8).write(
-      to: store.manifestURL(for: identity), options: [.atomic, .completeFileProtection])
+    // This test owns the corrupted payload, not the data-protection policy. Writing the fixture
+    // with `.completeFileProtection` makes the test fail before validation whenever the Mac is
+    // locked; the production store already tests its protected-write fallback separately.
+    try Data("{ not json".utf8).write(to: store.manifestURL(for: identity))
     let substrate = WorkspaceSubstrate(store: store)
 
     let verdict = try substrate.validate(

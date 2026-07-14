@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://vetcoders.github.io/pensieve/sitemap.xml
+Sitemap: https://pensieve.vetcoders.io/sitemap.xml

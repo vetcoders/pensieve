@@ -2771,6 +2771,40 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDefaultLaunchDecisionDoesNotInsertHumanVisibleDelay() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveInstantLaunchTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator()
+    let startedAt = ContinuousClock.now
+
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    let elapsed = ContinuousClock.now - startedAt
+    XCTAssertLessThan(
+      elapsed,
+      .milliseconds(50),
+      "a bare launch must settle within one imperceptible UI frame, not an artificial timer"
+    )
+  }
+
+  @MainActor
   func testLaunchFileIntentKeepsFirstMarkdownActiveAndReportsUnsupportedURLs() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
