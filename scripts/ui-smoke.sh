@@ -26,7 +26,16 @@ osascript -e "with timeout of 2 seconds" \
   -e "end timeout" >/dev/null 2>&1 || true
 sleep 0.5
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-open "$APP_PATH"
+for _ in {1..20}; do
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+open "$APP_PATH" || {
+  # LaunchServices can briefly retain the just-terminated bundle instance
+  # and return -600 even after the process is gone. One bounded retry clears it.
+  sleep 0.5
+  open "$APP_PATH"
+}
 
 log "probing Accessibility surface"
 osascript <<'APPLESCRIPT'
@@ -69,6 +78,13 @@ end assertMenuItem
 set appName to "Pensieve"
 waitForProcess(appName, 12)
 waitForWindow(appName, 12)
+
+-- SwiftUI command groups publish focused-scene values only after the newly
+-- launched window becomes active. A second bundle with the same identifier
+-- may have been frontmost before the smoke killed it, so make focus explicit.
+tell application "Pensieve" to activate
+tell application "System Events" to tell process appName to set frontmost to true
+delay 0.5
 
 assertMenuItem(appName, "File", "New File…")
 assertMenuItem(appName, "File", "Open File…")
