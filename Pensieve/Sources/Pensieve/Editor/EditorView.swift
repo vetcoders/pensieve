@@ -861,10 +861,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       return
     }
 
-    guard query != findQuery || findMatches.isEmpty else {
-      applyFindHighlights()
-      return
-    }
+    // Unchanged query with matches already computed: the highlights are on
+    // screen. SwiftUI routes every render pass through here, and re-applying
+    // thousands of attributes per pass is a main-thread hang on big documents.
+    guard query != findQuery || findMatches.isEmpty else { return }
 
     findQuery = query
     refreshFindMatches()
@@ -995,6 +995,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   private func applyFindHighlights() {
+    // One edit transaction for the whole pass: each unbatched addAttribute is
+    // its own TextKit transaction with a layout invalidation, so a common
+    // query on a large document (thousands of matches) beachballed the main
+    // thread once per match.
+    textStorage.beginEditing()
     removeFindHighlights()
     // Clear, high-contrast find shading: every match gets a yellow wash so it is
     // obvious in the document, and the active match an orange one so it stands
@@ -1008,6 +1013,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
         range: range
       )
     }
+    textStorage.endEditing()
   }
 
   private func removeFindHighlights() {
