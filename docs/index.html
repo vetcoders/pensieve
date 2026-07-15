@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Pensieve - Native macOS Markdown Editor | Vetcoders</title>
+    <title>Pensieve — Native macOS Markdown Editor | Vetcoders</title>
     <meta
       name="description"
       content="Pensieve is a signed and notarized native macOS Markdown editor for source-first writing, local files, Word DOCX export, DOCX and PDF import, preview, search, backlinks, and agent-aware workflows."
@@ -14,10 +14,12 @@
     />
     <meta name="author" content="Vetcoders" />
     <meta name="robots" content="index,follow" />
+    <meta name="theme-color" content="#f7f7f2" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121413" media="(prefers-color-scheme: dark)" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Pensieve" />
     <meta property="og:url" content="https://pensieve.vetcoders.io/" />
-    <meta property="og:title" content="Pensieve - Native macOS Markdown Editor" />
+    <meta property="og:title" content="Pensieve — Native macOS Markdown Editor" />
     <meta
       property="og:description"
       content="A local-first Markdown writing desk with Word DOCX export, DOCX and PDF import, preview, backlinks, search, and agent-aware dispatch on macOS."
@@ -27,7 +29,7 @@
       content="https://pensieve.vetcoders.io/pensieve-icon.png"
     />
     <meta name="twitter:card" content="summary" />
-    <meta name="twitter:title" content="Pensieve - Native macOS Markdown Editor" />
+    <meta name="twitter:title" content="Pensieve — Native macOS Markdown Editor" />
     <meta
       name="twitter:description"
       content="Native Markdown editing for macOS. Signed, notarized, local-first."
@@ -38,7 +40,7 @@
     />
     <!-- nosemgrep: html.security.audit.missing-integrity.missing-integrity canonical metadata link is not an executable subresource -->
     <link rel="canonical" href="https://pensieve.vetcoders.io/" />
-    <link rel="icon" href="./pensieve-icon.png" />
+    <link rel="icon" href="./pensieve-icon-128.png" />
     <style>
       :root {
         --paper: #f7f7f2;
@@ -49,16 +51,31 @@
         --red: #b34132;
         --blue: #2f6f91;
         --green: #637b4f;
-        --shadow: 0 22px 60px rgba(17, 19, 18, 0.18);
+        --code-bg: #101211;
+        --code-ink: #dfe3de;
+        --shadow: 0 22px 60px rgba(17, 19, 18, 0.14);
+        --shadow-soft: 0 10px 30px rgba(17, 19, 18, 0.10);
       }
 
-      * {
-        box-sizing: border-box;
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --paper: #121413;
+          --ink: #f2f1ea;
+          --muted: #a3a89f;
+          --rule: #2b2e2b;
+          --panel: #191c1a;
+          --red: #e08a76;
+          --blue: #7fb4d1;
+          --green: #9cb884;
+          --code-bg: #0b0d0c;
+          --code-ink: #dfe3de;
+          --shadow: 0 22px 60px rgba(0, 0, 0, 0.5);
+          --shadow-soft: 0 10px 30px rgba(0, 0, 0, 0.35);
+        }
       }
 
-      html {
-        scroll-behavior: smooth;
-      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
 
       body {
         margin: 0;
@@ -71,22 +88,27 @@
         -webkit-font-smoothing: antialiased;
       }
 
-      a {
-        color: inherit;
+      a { color: inherit; }
+
+      :focus-visible {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
+        border-radius: 4px;
       }
 
       .site-nav {
-        position: absolute;
+        position: sticky;
+        top: 0;
         z-index: 10;
-        inset: 0 0 auto;
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 18px;
-        width: min(1120px, calc(100% - 36px));
-        margin: 0 auto;
-        padding: 20px 0;
-        color: #f8f8f4;
+        padding: 14px calc((100% - min(1120px, 100% - 36px)) / 2);
+        background: color-mix(in srgb, var(--paper) 82%, transparent);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--rule);
         font-size: 0.92rem;
       }
 
@@ -99,55 +121,23 @@
       }
 
       .brand img {
-        width: 34px;
-        height: 34px;
+        width: 30px;
+        height: 30px;
         border-radius: 7px;
-        box-shadow: 0 8px 18px rgba(17, 19, 18, 0.18);
+        box-shadow: var(--shadow-soft);
       }
 
-      .nav-links {
-        display: flex;
-        gap: 18px;
-        align-items: center;
-        color: rgba(248, 248, 244, 0.72);
+      .nav-links { display: flex; gap: 20px; align-items: center; color: var(--muted); }
+      .nav-links a { text-decoration: none; transition: color 0.18s; }
+      .nav-links a:hover { color: var(--ink); }
+      .nav-links .nav-cta {
+        color: var(--paper);
+        background: var(--ink);
+        padding: 8px 14px;
+        border-radius: 8px;
+        font-weight: 700;
       }
-
-      .nav-links a {
-        text-decoration: none;
-      }
-
-      .nav-links a:hover {
-        color: #ffffff;
-      }
-
-      .hero {
-        position: relative;
-        min-height: 88vh;
-        overflow: hidden;
-        display: flex;
-        align-items: flex-end;
-        padding: 116px 0 54px;
-        color: #f8f8f4;
-        background-color: #151817;
-        background-image: linear-gradient(
-            90deg,
-            rgba(17, 19, 18, 0.96) 0%,
-            rgba(17, 19, 18, 0.82) 43%,
-            rgba(17, 19, 18, 0.32) 100%
-          ),
-          url("./pensieve-icon.png");
-        background-repeat: no-repeat;
-        background-position: right 8% center;
-        background-size: min(52vw, 620px);
-      }
-
-      .hero::after {
-        content: "";
-        position: absolute;
-        inset: auto 0 0;
-        height: 1px;
-        background: rgba(248, 248, 244, 0.18);
-      }
+      .nav-links .nav-cta:hover { color: var(--paper); opacity: 0.88; }
 
       .hero-inner,
       .section-inner {
@@ -155,335 +145,289 @@
         margin: 0 auto;
       }
 
-      .hero-copy {
-        position: relative;
-        width: min(690px, 100%);
+      .hero {
+        padding: 84px 0 72px;
+        overflow: hidden;
+      }
+
+      .hero-inner {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(340px, 1.08fr);
+        gap: 56px;
+        align-items: center;
       }
 
       .eyebrow {
         margin: 0 0 18px;
-        color: #e58b73;
+        color: var(--red);
         font-size: 0.78rem;
         font-weight: 800;
-        letter-spacing: 0.12em;
+        letter-spacing: 0.14em;
         text-transform: uppercase;
       }
 
-      h1,
-      h2,
-      h3,
-      p {
-        margin-top: 0;
-      }
+      h1, h2, h3, p { margin-top: 0; }
 
       h1 {
         margin-bottom: 18px;
         font-family: Georgia, "Times New Roman", serif;
-        font-size: 5.8rem;
-        line-height: 0.93;
-        letter-spacing: 0;
+        font-weight: 400;
+        font-size: clamp(3.4rem, 7vw, 5.6rem);
+        line-height: 0.95;
+        letter-spacing: -0.015em;
       }
 
       .hero-lead {
-        max-width: 58ch;
-        margin-bottom: 24px;
-        color: rgba(248, 248, 244, 0.86);
-        font-size: 1.22rem;
+        max-width: 52ch;
+        margin-bottom: 28px;
+        color: var(--muted);
+        font-size: 1.18rem;
       }
 
-      .cta-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-        align-items: center;
-      }
+      .cta-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
 
       .btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-height: 46px;
-        padding: 11px 16px;
-        border-radius: 8px;
+        gap: 8px;
+        min-height: 48px;
+        padding: 11px 20px;
+        border-radius: 10px;
         border: 1px solid transparent;
         text-decoration: none;
         font-weight: 750;
+        transition: transform 0.18s, box-shadow 0.18s, opacity 0.18s;
+      }
+      .btn:hover { transform: translateY(-2px); box-shadow: var(--shadow-soft); }
+      .btn:active { transform: translateY(0); }
+      .btn-primary { color: var(--paper); background: var(--ink); }
+      .btn-secondary { color: var(--ink); border-color: var(--rule); background: var(--panel); }
+
+      .release-note { margin: 16px 0 0; color: var(--muted); font-size: 0.92rem; }
+      .release-note code {
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+        font-size: 0.85em;
       }
 
-      .btn-primary {
-        color: #111312;
-        background: #f8f8f4;
-      }
-
-      .btn-secondary {
-        color: #f8f8f4;
-        border-color: rgba(248, 248, 244, 0.34);
-      }
-
-      .btn:hover {
-        transform: translateY(-1px);
-      }
-
-      .release-note {
-        margin: 18px 0 0;
-        color: rgba(248, 248, 244, 0.66);
-        font-size: 0.94rem;
-      }
-
-      .proof-strip {
-        background: #ffffff;
-        border-bottom: 1px solid var(--rule);
-      }
-
-      .proof-grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 0;
-      }
-
-      .proof-item {
-        min-height: 118px;
-        padding: 24px 20px;
-        border-left: 1px solid var(--rule);
-      }
-
-      .proof-item:first-child {
-        border-left: 0;
-      }
-
-      .proof-item strong {
-        display: block;
-        margin-bottom: 5px;
-        font-size: 1rem;
-      }
-
-      .proof-item span {
-        color: var(--muted);
-        font-size: 0.94rem;
-      }
-
-      section {
-        padding: 78px 0;
-      }
-
-      .editorial {
-        display: grid;
-        grid-template-columns: minmax(0, 0.86fr) minmax(320px, 1.14fr);
-        gap: 52px;
-        align-items: start;
-      }
-
-      .editorial > *,
-      .download-layout > *,
-      .shot-grid > * {
-        min-width: 0;
-      }
-
-      .section-label {
-        margin-bottom: 16px;
-        color: var(--red);
-        font-size: 0.78rem;
-        font-weight: 800;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-      }
-
-      h2 {
-        margin-bottom: 18px;
-        font-family: Georgia, "Times New Roman", serif;
-        font-size: 3.1rem;
-        line-height: 1;
-        letter-spacing: 0;
-      }
-
-      .section-copy {
-        color: var(--muted);
-        font-size: 1.08rem;
-      }
-
+      /* ── App window (hero visual) ─────────────────────────── */
       .workspace-shot {
+        margin: 0;
         overflow: hidden;
-        border-radius: 8px;
-        background: #161817;
+        border-radius: 12px;
+        background: var(--code-bg);
         box-shadow: var(--shadow);
-        border: 1px solid rgba(17, 19, 18, 0.18);
+        border: 1px solid var(--rule);
+        transform: rotate(0.4deg);
+        transition: transform 0.35s ease, box-shadow 0.35s ease;
       }
+      .workspace-shot:hover { transform: rotate(0deg) translateY(-4px); }
 
       .shot-bar {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 14px;
-        min-height: 44px;
+        min-height: 42px;
         padding: 0 14px;
-        color: rgba(248, 248, 244, 0.72);
-        border-bottom: 1px solid rgba(248, 248, 244, 0.12);
-        font-size: 0.82rem;
+        color: rgba(223, 227, 222, 0.72);
+        border-bottom: 1px solid rgba(248, 248, 244, 0.1);
+        font-size: 0.8rem;
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
       }
 
-      .traffic {
-        display: flex;
-        gap: 7px;
-      }
+      .traffic { display: flex; gap: 7px; }
+      .traffic span { display: block; width: 11px; height: 11px; border-radius: 999px; }
+      .traffic span:nth-child(1) { background: #e55a48; }
+      .traffic span:nth-child(2) { background: #d9ad42; }
+      .traffic span:nth-child(3) { background: #6ba95e; }
 
-      .traffic span {
-        display: block;
-        width: 11px;
-        height: 11px;
-        border-radius: 999px;
-      }
+      .shot-grid { display: grid; grid-template-columns: 0.86fr 1.14fr; min-height: 380px; }
 
-      .traffic span:nth-child(1) {
-        background: #e55a48;
-      }
-
-      .traffic span:nth-child(2) {
-        background: #d9ad42;
-      }
-
-      .traffic span:nth-child(3) {
-        background: #6ba95e;
-      }
-
-      .shot-grid {
-        display: grid;
-        grid-template-columns: 0.82fr 1.18fr;
-        min-height: 420px;
-      }
-
-      .source-pane,
-      .preview-pane {
-        padding: 26px;
-      }
+      .source-pane, .preview-pane { padding: 24px; }
 
       .source-pane {
-        background: #101211;
-        color: #dfe3de;
-        font-family: "SF Mono", Menlo, Consolas, monospace;
-        font-size: 0.9rem;
-        line-height: 1.8;
+        background: var(--code-bg);
+        color: var(--code-ink);
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+        font-size: 0.88rem;
+        line-height: 1.85;
       }
+      .source-pane .mutedtx { color: #78827a; }
+      .source-pane .accent { color: #ec8e73; }
 
-      .source-pane .muted {
-        color: #78827a;
-      }
-
-      .source-pane .accent {
-        color: #ec8e73;
-      }
-
-      .preview-pane {
-        background: #fbfbf7;
-        color: #161817;
-      }
-
+      .preview-pane { background: var(--panel); color: var(--ink); }
       .preview-pane h3 {
-        margin-bottom: 14px;
+        margin-bottom: 12px;
         font-family: Georgia, "Times New Roman", serif;
-        font-size: 2rem;
+        font-weight: 400;
+        font-size: 1.9rem;
         line-height: 1.05;
-        letter-spacing: 0;
+      }
+      .preview-pane p { color: var(--muted); font-size: 0.98rem; }
+      .preview-pane .inline-code {
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+        font-size: 0.86em;
+        padding: 2px 7px;
+        border-radius: 6px;
+        background: color-mix(in srgb, var(--ink) 7%, transparent);
+        box-shadow: 0 1px 4px rgba(17, 19, 18, 0.12);
+      }
+      .preview-rule { height: 1px; margin: 18px 0; background: var(--rule); }
+      .preview-check { color: var(--green); font-weight: 700; font-size: 0.9rem; }
+
+      /* ── Proof strip ──────────────────────────────────────── */
+      .proof-strip { background: var(--panel); border-block: 1px solid var(--rule); }
+      .proof-grid { display: grid; grid-template-columns: repeat(4, 1fr); }
+      .proof-item { min-height: 116px; padding: 24px 20px; border-left: 1px solid var(--rule); }
+      .proof-item:first-child { border-left: 0; }
+      .proof-item strong { display: block; margin-bottom: 5px; font-size: 1rem; }
+      .proof-item span { color: var(--muted); font-size: 0.93rem; }
+
+      section { padding: 84px 0; }
+
+      .section-label {
+        margin-bottom: 16px;
+        color: var(--red);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
       }
 
-      .preview-pane p {
-        color: #4c514e;
+      h2 {
+        margin-bottom: 18px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 400;
+        font-size: clamp(2.1rem, 4vw, 3rem);
+        line-height: 1.02;
       }
 
-      .preview-rule {
-        height: 1px;
-        margin: 22px 0;
-        background: #d7d8d1;
-      }
+      .section-copy { color: var(--muted); font-size: 1.08rem; max-width: 62ch; }
 
-      .feature-list {
+      /* ── Features ─────────────────────────────────────────── */
+      .feature-grid {
         display: grid;
+        grid-template-columns: repeat(2, 1fr);
         gap: 14px;
-        margin: 0;
-        padding: 0;
-        list-style: none;
+        margin-top: 40px;
       }
-
-      .feature-list li {
+      .feature-card {
         display: grid;
-        grid-template-columns: 28px minmax(0, 1fr);
-        gap: 12px;
+        grid-template-columns: 44px minmax(0, 1fr);
+        gap: 16px;
         align-items: start;
+        padding: 22px;
+        border: 1px solid var(--rule);
+        border-radius: 12px;
+        background: var(--panel);
+        transition: transform 0.2s, box-shadow 0.2s;
       }
-
-      .feature-list b {
-        display: block;
-        margin-bottom: 2px;
-      }
-
+      .feature-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-soft); }
+      .feature-card b { display: block; margin-bottom: 3px; }
+      .feature-card span { color: var(--muted); font-size: 0.96rem; }
       .feature-mark {
         display: inline-flex;
-        width: 28px;
-        height: 28px;
+        width: 44px;
+        height: 44px;
         align-items: center;
         justify-content: center;
-        border-radius: 7px;
-        color: #fff;
-        background: var(--blue);
+        border-radius: 10px;
+        font-size: 1.25rem;
+        color: var(--paper);
+      }
+      .fm-md { background: var(--ink); font-family: Georgia, serif; }
+      .fm-search { background: var(--blue); }
+      .fm-agent { background: var(--green); }
+      .fm-word { background: var(--red); }
+
+      /* ── What's new ───────────────────────────────────────── */
+      .whatsnew { background: var(--panel); border-block: 1px solid var(--rule); }
+      .new-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 36px; }
+      .new-card {
+        padding: 26px 24px;
+        border: 1px solid var(--rule);
+        border-radius: 12px;
+        background: var(--paper);
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .new-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-soft); }
+      .new-card .tagchip {
+        display: inline-block;
+        margin-bottom: 14px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.72rem;
         font-weight: 800;
-        font-size: 0.82rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
       }
-
-      .download-band {
-        background: #121513;
-        color: #f8f8f4;
+      .new-card h3 {
+        margin-bottom: 8px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 400;
+        font-size: 1.45rem;
       }
+      .new-card p { margin: 0; color: var(--muted); font-size: 0.97rem; }
 
+      /* ── Download band ────────────────────────────────────── */
+      .download-band { background: #121513; color: #f8f8f4; }
+      @media (prefers-color-scheme: dark) {
+        .download-band { background: #0b0d0c; border-block: 1px solid var(--rule); }
+      }
       .download-layout {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(280px, 380px);
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
         gap: 44px;
         align-items: center;
       }
-
-      .download-layout h2 {
-        color: #f8f8f4;
-      }
-
-      .download-layout p {
-        color: rgba(248, 248, 244, 0.72);
-      }
-
+      .download-layout h2 { color: #f8f8f4; }
+      .download-layout .section-copy { color: rgba(248, 248, 244, 0.72); }
       .download-panel {
         min-width: 0;
-        border-radius: 8px;
+        border-radius: 12px;
         border: 1px solid rgba(248, 248, 244, 0.16);
-        background: rgba(248, 248, 244, 0.06);
-        padding: 22px;
+        background: rgba(248, 248, 244, 0.05);
+        padding: 24px;
       }
-
       .download-panel dl {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 12px 18px;
-        margin: 0 0 20px;
+        gap: 14px 18px;
+        margin: 0 0 18px;
       }
-
       .download-panel dt {
-        color: rgba(248, 248, 244, 0.56);
-        font-size: 0.78rem;
+        color: rgba(248, 248, 244, 0.55);
+        font-size: 0.74rem;
         text-transform: uppercase;
         font-weight: 800;
+        letter-spacing: 0.08em;
       }
-
-      .download-panel dd {
-        margin: 3px 0 0;
-        color: #fff;
-        font-weight: 700;
+      .download-panel dd { margin: 3px 0 0; color: #fff; font-weight: 700; }
+      .download-panel .btn-primary { width: 100%; color: #111312; background: #f8f8f4; }
+      .sha {
+        overflow-x: auto;
+        margin: 16px 0 0;
+        padding: 12px 14px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.42);
+        color: #b9c4ba;
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+        font-size: 0.72rem;
+        line-height: 1.6;
+        white-space: nowrap;
       }
-
+      .sha b { color: #f8f8f4; font-weight: 700; }
       .source-command {
         overflow-x: auto;
-        margin: 18px 0 0;
+        margin: 22px 0 0;
         padding: 14px 16px;
-        border-radius: 8px;
-        background: #0b0d0c;
+        border-radius: 10px;
+        background: rgba(0, 0, 0, 0.42);
         color: #dfe3de;
-        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
         font-size: 0.88rem;
       }
 
@@ -493,104 +437,50 @@
         border-top: 1px solid var(--rule);
         font-size: 0.92rem;
       }
+      .footer .section-inner { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+      .footer a { text-decoration: none; color: var(--ink); }
+      .footer a:hover { color: var(--red); }
 
-      .footer .section-inner {
-        display: flex;
-        justify-content: space-between;
-        gap: 20px;
-        flex-wrap: wrap;
+      /* ── Reveal on scroll ─────────────────────────────────── */
+      .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.6s ease, transform 0.6s ease; }
+      .reveal.in { opacity: 1; transform: none; }
+      @media (prefers-reduced-motion: reduce) {
+        .reveal { opacity: 1; transform: none; transition: none; }
+        .btn, .feature-card, .new-card, .workspace-shot { transition: none; }
+        html { scroll-behavior: auto; }
       }
 
-      .footer a {
-        text-decoration: none;
-        color: var(--ink);
+      @media (max-width: 920px) {
+        .hero-inner { grid-template-columns: 1fr; gap: 40px; }
+        .proof-grid, .new-grid { grid-template-columns: 1fr 1fr; }
+        .proof-item { border-left: 0; border-top: 1px solid var(--rule); }
+        .proof-item:nth-child(-n + 2) { border-top: 0; }
+        .download-layout { grid-template-columns: 1fr; }
       }
 
-      @media (max-width: 860px) {
-        .nav-links {
-          gap: 12px;
-          font-size: 0.86rem;
-        }
-
-        .hero {
-          min-height: 760px;
-          background-position: right -120px top 86px;
-          background-size: 420px;
-        }
-
-        h1 {
-          font-size: 4rem;
-        }
-
-        h2 {
-          font-size: 2.45rem;
-        }
-
-        .proof-grid,
-        .editorial,
-        .download-layout,
-        .shot-grid {
-          grid-template-columns: 1fr;
-        }
-
-        .proof-item,
-        .proof-item:first-child {
-          border-left: 0;
-          border-top: 1px solid var(--rule);
-        }
-
-        .proof-item:first-child {
-          border-top: 0;
-        }
-      }
-
-      @media (max-width: 560px) {
-        .site-nav {
-          align-items: flex-start;
-        }
-
-        .nav-links {
-          flex-direction: column;
-          align-items: flex-end;
-          gap: 8px;
-        }
-
-        .hero {
-          min-height: 720px;
-          padding-top: 118px;
-          background-position: right -128px top 98px;
-          background-size: 350px;
-        }
-
-        h1 {
-          font-size: 3.25rem;
-        }
-
-        .hero-lead {
-          font-size: 1.06rem;
-        }
-
-        section {
-          padding: 56px 0;
-        }
-
-        .source-pane,
-        .preview-pane {
-          padding: 20px;
-        }
+      @media (max-width: 600px) {
+        .nav-links { gap: 12px; font-size: 0.86rem; }
+        section { padding: 60px 0; }
+        .hero { padding: 56px 0; }
+        .feature-grid, .new-grid, .proof-grid { grid-template-columns: 1fr; }
+        .proof-item:nth-child(-n + 2) { border-top: 1px solid var(--rule); }
+        .proof-item:first-child { border-top: 0; }
+        .shot-grid { grid-template-columns: 1fr; }
+        .source-pane { display: none; }
       }
     </style>
   </head>
   <body>
     <nav class="site-nav" aria-label="Primary">
       <a class="brand" href="#top">
-        <img src="./pensieve-icon.png" alt="" width="34" height="34" />
+        <img src="./pensieve-icon-128.png" alt="" width="30" height="30" />
         <span>Pensieve</span>
       </a>
       <div class="nav-links">
         <a href="#surface">Surface</a>
-        <a href="#download">Download</a>
+        <a href="#whatsnew">What’s new</a>
         <a href="https://github.com/vetcoders/pensieve">GitHub</a>
+        <a class="nav-cta" href="#download">Download</a>
       </div>
     </nav>
 
@@ -598,17 +488,18 @@
       <div class="hero-inner">
         <div class="hero-copy">
           <p class="eyebrow">Native macOS Markdown editor</p>
-          <h1>Pensieve</h1>
+          <h1>Your notes,<br />kept as source.</h1>
           <p class="hero-lead">
-            A local-first writing desk for Markdown notes, Word collaboration,
-            preview, search, backlinks, and agent-aware dispatch. Export DOCX,
-            import DOCX or text-based PDF, and keep Markdown as the source.
+            Pensieve is a local-first writing desk for Markdown: preview,
+            search, backlinks, and agent-aware dispatch — with a Word bridge
+            that exports DOCX and brings Word or PDF documents back as
+            editable Markdown.
           </p>
           <div class="cta-row">
             <a
               class="btn btn-primary"
               href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
-              >Download DMG</a
+              >↓&nbsp; Download for macOS</a
             >
             <a
               class="btn btn-secondary"
@@ -616,26 +507,60 @@
               >Release notes</a
             >
           </div>
-          <p class="release-note">macOS 15 or newer. Apple silicon build.</p>
+          <p class="release-note">
+            Version <code>0.4.0</code> · macOS 15+ · Apple silicon · signed &amp; notarized
+          </p>
         </div>
+
+        <figure class="workspace-shot reveal" aria-label="Pensieve editor preview">
+          <div class="shot-bar">
+            <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
+            <span>field-notes.md</span>
+            <span>Preview</span>
+          </div>
+          <div class="shot-grid">
+            <div class="source-pane" aria-hidden="true">
+              <div><span class="mutedtx">#</span> Field notes</div>
+              <div>&nbsp;</div>
+              <div><span class="accent">-</span> observe first</div>
+              <div><span class="accent">-</span> keep the source close</div>
+              <div><span class="accent">-</span> dispatch with context</div>
+              <div>&nbsp;</div>
+              <div><span class="mutedtx">`make run`</span></div>
+              <div>&nbsp;</div>
+              <div><span class="mutedtx">[[workspace-index]]</span></div>
+            </div>
+            <div class="preview-pane">
+              <h3>Field notes</h3>
+              <p>
+                Notes stay readable as plain files, but the workspace stays
+                alive: links, search, preview, and agent handoff remain one
+                gesture away.
+              </p>
+              <p><span class="inline-code">make run</span> — code now sits frameless in preview, under a subtle shadow.</p>
+              <div class="preview-rule"></div>
+              <p class="preview-check">✓ saved to disk · yours, locally</p>
+            </div>
+          </div>
+        </figure>
       </div>
     </header>
 
     <div class="proof-strip">
       <div class="section-inner proof-grid">
-        <div class="proof-item">
+        <div class="proof-item reveal">
           <strong>Native by default</strong>
           <span>Swift, AppKit, SwiftUI, TextKit, and WebKit.</span>
         </div>
-        <div class="proof-item">
+        <div class="proof-item reveal">
           <strong>Files stay yours</strong>
           <span>Markdown lives on disk, not behind a cloud account.</span>
         </div>
-        <div class="proof-item">
+        <div class="proof-item reveal">
           <strong>Preview included</strong>
           <span>GitHub-flavored Markdown, tables, math, and diagrams.</span>
         </div>
-        <div class="proof-item">
+        <div class="proof-item reveal">
           <strong>Agent-aware</strong>
           <span>Current-document dispatch and Vista autocomplete hooks.</span>
         </div>
@@ -644,111 +569,95 @@
 
     <main>
       <section id="surface">
-        <div class="section-inner editorial">
-          <div>
+        <div class="section-inner">
+          <div class="reveal">
             <div class="section-label">Writing surface</div>
             <h2>Source-first, but not austere.</h2>
             <p class="section-copy">
               Pensieve keeps the Markdown source as the primary object while
-              giving the workspace the native conveniences people expect from a
-              Mac editor: fast windows, project search, live preview, document
-              sharing, and file-system respect. File exports cover HTML, PDF,
-              and Word DOCX; Word and text-based PDF documents can return as
+              giving the workspace the native conveniences people expect from
+              a Mac editor: fast windows, project search, live preview,
+              document sharing, and file-system respect. Exports cover HTML,
+              PDF, and Word DOCX; Word and text-based PDF documents return as
               editable Markdown drafts without changing the originals.
             </p>
           </div>
-          <figure class="workspace-shot" aria-label="Pensieve editor preview">
-            <div class="shot-bar">
-              <div class="traffic" aria-hidden="true">
-                <span></span>
-                <span></span>
-                <span></span>
-              </div>
-              <span>field-notes.md</span>
-              <span>Preview</span>
+          <div class="feature-grid">
+            <div class="feature-card reveal">
+              <span class="feature-mark fm-md" aria-hidden="true">¶</span>
+              <span><b>Markdown</b><span>Source, split, and preview modes — the file is the truth.</span></span>
             </div>
-            <div class="shot-grid">
-              <div class="source-pane" aria-hidden="true">
-                <div><span class="muted">#</span> Field notes</div>
-                <div></div>
-                <div><span class="accent">-</span> observe first</div>
-                <div><span class="accent">-</span> keep the source close</div>
-                <div><span class="accent">-</span> dispatch with context</div>
-                <div></div>
-                <div><span class="muted">[[workspace-index]]</span></div>
-              </div>
-              <div class="preview-pane">
-                <h3>Field notes</h3>
-                <p>
-                  Notes stay readable as plain files, but the editor keeps the
-                  surrounding workspace alive: links, search, preview, and
-                  agent handoff all remain one gesture away.
-                </p>
-                <div class="preview-rule"></div>
-                <ul class="feature-list">
-                  <li>
-                    <span class="feature-mark">M</span>
-                    <span><b>Markdown</b>Source, split, and preview modes.</span>
-                  </li>
-                  <li>
-                    <span class="feature-mark">S</span>
-                    <span><b>Search</b>Workspace index and backlinks.</span>
-                  </li>
-                  <li>
-                    <span class="feature-mark">A</span>
-                    <span><b>Agents</b>Dispatch the current document with context.</span>
-                  </li>
-                  <li>
-                    <span class="feature-mark">W</span>
-                    <span><b>Word bridge</b>DOCX export plus DOCX/PDF import to Markdown.</span>
-                  </li>
-                </ul>
-              </div>
+            <div class="feature-card reveal">
+              <span class="feature-mark fm-search" aria-hidden="true">⌕</span>
+              <span><b>Search &amp; backlinks</b><span>Workspace index with backlinks one gesture away.</span></span>
             </div>
-          </figure>
+            <div class="feature-card reveal">
+              <span class="feature-mark fm-agent" aria-hidden="true">✳</span>
+              <span><b>Agents</b><span>Dispatch the current document with full context.</span></span>
+            </div>
+            <div class="feature-card reveal">
+              <span class="feature-mark fm-word" aria-hidden="true">⇄</span>
+              <span><b>Word bridge</b><span>DOCX export plus DOCX/PDF import back to Markdown.</span></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="whatsnew" id="whatsnew">
+        <div class="section-inner">
+          <div class="reveal">
+            <div class="section-label">Release 0.4.0</div>
+            <h2>What’s new.</h2>
+          </div>
+          <div class="new-grid">
+            <div class="new-card reveal">
+              <span class="tagchip">Bridge</span>
+              <h3>Word &amp; PDF transfer</h3>
+              <p>Export structured DOCX from Markdown; import Word documents and text PDFs into recoverable Markdown drafts — from the app or straight from Finder.</p>
+            </div>
+            <div class="new-card reveal">
+              <span class="tagchip">Speed</span>
+              <h3>Instant launch</h3>
+              <p>Startup timers and loading covers removed. Workspaces restore stale-while-revalidate, so the app is usable the moment it opens.</p>
+            </div>
+            <div class="new-card reveal">
+              <span class="tagchip">Polish</span>
+              <h3>Frameless code</h3>
+              <p>Inline and block code drop their borders for a subtle themed shadow — in both light and dark appearance.</p>
+            </div>
+          </div>
         </div>
       </section>
 
       <section class="download-band" id="download">
         <div class="section-inner download-layout">
-          <div>
+          <div class="reveal">
             <div class="section-label">Manual release</div>
             <h2>A small installer, no workflow theater.</h2>
-            <p>
+            <p class="section-copy">
               The public artifact is built locally, signed with Developer ID,
               notarized by Apple, stapled, and uploaded to GitHub Releases.
-              GitHub Pages points to the latest release asset so the download
-              path stays simple.
+              This page points to the latest release asset, so the download
+              path stays simple — and verifiable.
             </p>
             <div class="source-command">
               git clone https://github.com/vetcoders/pensieve.git<br />
               cd pensieve &amp;&amp; make run
             </div>
           </div>
-          <aside class="download-panel" aria-label="Download details">
+          <aside class="download-panel reveal" aria-label="Download details">
             <dl>
-              <div>
-                <dt>Version</dt>
-                <dd>0.4.0</dd>
-              </div>
-              <div>
-                <dt>Platform</dt>
-                <dd>macOS 15+</dd>
-              </div>
-              <div>
-                <dt>CPU</dt>
-                <dd>Apple silicon</dd>
-              </div>
-              <div>
-                <dt>Trust</dt>
-                <dd>Notarized DMG</dd>
-              </div>
+              <div><dt>Version</dt><dd>0.4.0</dd></div>
+              <div><dt>Platform</dt><dd>macOS 15+</dd></div>
+              <div><dt>CPU</dt><dd>Apple silicon</dd></div>
+              <div><dt>Trust</dt><dd>Notarized DMG</dd></div>
             </dl>
             <a
               class="btn btn-primary"
               href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
               >Download Pensieve.dmg</a
             >
+            <div class="sha"><b>SHA-256</b><br />0cb3a9bc51f2798f1553262e4043e9c1f7cd3a077f54848b3a0ac0f76216ce1e</div>
           </aside>
         </div>
       </section>
@@ -758,10 +667,28 @@
       <div class="section-inner">
         <span>2026 Vetcoders. Pensieve is built for local-first writing.</span>
         <span>
-          <a href="https://github.com/vetcoders/pensieve">Source</a> /
+          <a href="https://github.com/vetcoders/pensieve">Source</a> ·
           <a href="https://github.com/vetcoders/pensieve/security">Security</a>
         </span>
       </div>
     </footer>
+
+    <script>
+      (function () {
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+          document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
+          return;
+        }
+        var io = new IntersectionObserver(
+          function (entries) {
+            entries.forEach(function (e) {
+              if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+            });
+          },
+          { threshold: 0.12 }
+        );
+        document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+      })();
+    </script>
   </body>
 </html>
