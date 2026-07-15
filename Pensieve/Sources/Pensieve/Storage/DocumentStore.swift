@@ -1935,7 +1935,7 @@ final class DocumentStore {
   @discardableResult
   func restoreRecoveredDraft(into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
-    guard let draft = recoveryStore.loadDrafts().first else { return false }
+    guard let draft = recoveryStore.claimDraftForRestore() else { return false }
 
     self.appState = appState
     autosaver.cancel()

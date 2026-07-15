@@ -681,6 +681,118 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(restoredState.activeDocumentText, "keep this crash draft")
   }
 
+  /// A window opened FOR a specific document (`start(restoringWorkspace:
+  /// false)` — new document tab, explicit file launch) must show that
+  /// document. Restoring the pending recovery draft into every such window
+  /// hijacked the fresh buffer, and the now-dirty untitled session then
+  /// blocked the requested file's load — every new tab displayed "Recovered
+  /// Untitled" instead of the opened file.
+  @MainActor
+  func testDocumentWindowStartDoesNotHijackWithPendingRecoveryDraft() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRecoveryHijackTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let documentURL = folder.appendingPathComponent("target.md")
+    try "the requested document".write(to: documentURL, atomically: true, encoding: .utf8)
+
+    // A crash draft is pending in the recovery store.
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let seedState = AppState()
+    let seedStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    seedState.documentSession.createUntitled(title: "Untitled.md")
+    seedState.activeDocumentText = "crash draft"
+    seedStore.documentDidChange(appState: seedState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "crash draft" }
+
+    // A fresh window starts to show a specific document (new tab semantics).
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(
+        autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+        indexDatabase: indexDatabase,
+        recoveryStore: recoveryStore
+      ),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    controller.start(restoringWorkspace: false)
+
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "start(restoringWorkspace: false) adopted the pending recovery draft — "
+        + "the dirty untitled session then blocks the document this window "
+        + "was opened for (and re-prompts on every new tab)")
+
+    controller.openFileInCurrentWindow(url: documentURL)
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, documentURL.standardizedFileURL,
+      "document window shows the recovery draft instead of the document it was opened for")
+    XCTAssertEqual(appState.activeDocumentText, "the requested document")
+  }
+
+  /// One crash draft, MANY restoring windows: state restoration re-creates
+  /// every scene from the previous run and each one starts with
+  /// `restoringWorkspace: true`. All production windows share the same
+  /// recovery store, so without a single-handout rule each of them adopted
+  /// the same draft — one draft multiplied into an "Untitled, Untitled 2, …"
+  /// flood of dirty windows.
+  @MainActor
+  func testPendingRecoveryDraftIsAdoptedByOnlyOneRestoringWindow() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSingleRestoreTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let seedState = AppState()
+    let seedStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    seedState.documentSession.createUntitled(title: "Untitled.md")
+    seedState.activeDocumentText = "the one crash draft"
+    seedStore.documentDidChange(appState: seedState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "the one crash draft" }
+
+    // Two windows restore (own DocumentStore each, shared recovery store —
+    // the production topology). Only the FIRST may adopt the draft.
+    let firstWindowState = AppState()
+    let firstWindowStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    XCTAssertTrue(firstWindowStore.restoreRecoveredDraft(into: firstWindowState))
+    XCTAssertEqual(firstWindowState.activeDocumentText, "the one crash draft")
+
+    let secondWindowState = AppState()
+    let secondWindowStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    XCTAssertFalse(
+      secondWindowStore.restoreRecoveredDraft(into: secondWindowState),
+      "a second restoring window adopted the same crash draft — the Untitled flood")
+    XCTAssertFalse(secondWindowState.documentSession.hasEditableBuffer)
+  }
+
   @MainActor
   func testSaveAsDeletesUntitledRecoveryDraft() async throws {
     let folder = FileManager.default.temporaryDirectory
@@ -2846,6 +2958,60 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.activeDocumentText, "first body")
     XCTAssertTrue(appState.lastError?.contains(".md, .markdown, or .txt") == true)
     XCTAssertTrue(appState.workspaceRoots.isEmpty)
+  }
+
+  /// System "Prefer tabs when opening documents: Always" contract: a file
+  /// opened from Finder/Dock while this window already shows a document must
+  /// route to the window registry (a native tab), NOT replace the document the
+  /// user is reading in place. The old drain special-cased the first URL into
+  /// `openFileInCurrentWindow`, which is correct only for a cold-start empty
+  /// window — `openFile` itself already makes that distinction.
+  @MainActor
+  func testRuntimeFileOpenRoutesToDocumentWindowInsteadOfReplacingCurrent() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRuntimeOpenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let readingURL = folder.appendingPathComponent("reading.md")
+    let incomingURL = folder.appendingPathComponent("incoming.md")
+    try "the doc being read".write(to: readingURL, atomically: true, encoding: .utf8)
+    try "the doc arriving from Finder".write(to: incomingURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+
+    // The window is already showing a document (editable buffer)...
+    controller.openFile(url: readingURL)
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, readingURL.standardizedFileURL)
+
+    // ...and document-window routing is wired, as in a real running window.
+    var routedRefs: [URL] = []
+    controller.requestOpenDocumentWindow = { ref in routedRefs.append(ref.id) }
+
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    coordinator.handle(urls: [incomingURL])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(
+      routedRefs.map(\.standardizedFileURL), [incomingURL.standardizedFileURL],
+      "an external open with a document on screen must go to the registry (native tab)")
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, readingURL.standardizedFileURL,
+      "the document the user is reading was replaced in place by the external open")
   }
 
   @MainActor

@@ -74,15 +74,14 @@ final class LaunchIntentCoordinator: ObservableObject {
     let supportedFileURLs = urls.filter(isSupportedLaunchFile)
     let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }
 
-    if controller.requestOpenDocumentWindow != nil, let firstURL = supportedFileURLs.first {
-      controller.openFileInCurrentWindow(url: firstURL)
-      for url in supportedFileURLs.dropFirst() {
-        controller.openFile(url: url)
-      }
-    } else {
-      for url in supportedFileURLs {
-        controller.openFile(url: url)
-      }
+    // `openFile` picks the destination per window state: an empty window is
+    // reused in place (cold start), a window already showing a document routes
+    // to the registry so the file lands as a native tab — the system "Prefer
+    // tabs when opening documents" contract. Special-casing the first URL into
+    // `openFileInCurrentWindow` replaced the document the user was reading
+    // whenever a Finder/Dock open arrived at a running app.
+    for url in supportedFileURLs {
+      controller.openFile(url: url)
     }
 
     if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first,

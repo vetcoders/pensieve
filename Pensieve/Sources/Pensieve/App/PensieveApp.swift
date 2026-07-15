@@ -30,6 +30,12 @@ struct PensieveApp: App {
         initialDocument: document.wrappedValue
       )
     }
+    // Never let SwiftUI spawn a fresh WindowGroup scene per external event:
+    // every Finder/Dock/`open` file event was materializing a detached
+    // standalone window (bypassing the registry's native-tab merge), one per
+    // file. With no scene claiming external events they fall through to
+    // `application(_:open:)` → LaunchIntentCoordinator → registry tabs.
+    .handlesExternalEvents(matching: [])
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)

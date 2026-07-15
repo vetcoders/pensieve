@@ -34,6 +34,20 @@ final class RecoveryStore {
     )
   }
 
+  /// Hand out the newest pending draft AT MOST ONCE per store. All production
+  /// windows share `RecoveryStore.shared`, and every restoring window — a
+  /// state-restored scene, a relaunched launcher — asks for the draft on
+  /// start; without the single-handout rule each of them adopted the same
+  /// draft, multiplying one crash draft into a flood of dirty "Untitled"
+  /// windows.
+  func claimDraftForRestore() -> RecoveryDraft? {
+    guard !hasHandedOutRestoreDraft, let draft = loadDrafts().first else { return nil }
+    hasHandedOutRestoreDraft = true
+    return draft
+  }
+
+  private var hasHandedOutRestoreDraft = false
+
   func loadDrafts() -> [RecoveryDraft] {
     guard
       let urls = try? fileManager.contentsOfDirectory(
