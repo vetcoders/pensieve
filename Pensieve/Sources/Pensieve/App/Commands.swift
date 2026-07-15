@@ -459,7 +459,7 @@ private struct ActivePensieveCommands: Commands {
     panel.allowedContentTypes = openableContentTypes
     panel.prompt = "Open"
     if panel.runModal() == .OK, let url = panel.url {
-      controller.openFile(url: url)
+      controller.openFileInCurrentWindow(url: url)
     }
   }
 

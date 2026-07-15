@@ -4078,6 +4078,41 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testExplicitInWindowOpenDoesNotRouteThroughNewDocumentScene() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveExplicitInWindowOpenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let bookURL = folder.appendingPathComponent("book.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "the book".write(to: bookURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: alphaURL)
+    controller.openFileInCurrentWindow(url: bookURL)
+
+    XCTAssertTrue(requestedRefs.isEmpty, "explicit in-window open must not spawn a new scene")
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, bookURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "the book")
+  }
+
+  @MainActor
   func testDefaultClickSelectsInPlaceAndExplicitGestureRoutesToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
