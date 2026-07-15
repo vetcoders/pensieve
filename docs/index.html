@@ -6,7 +6,7 @@
     <title>Pensieve — Native macOS Markdown Editor | Vetcoders</title>
     <meta
       name="description"
-      content="Pensieve is a signed and notarized native macOS Markdown editor for source-first writing, local files, Word DOCX export, DOCX and PDF import, preview, search, backlinks, and agent-aware workflows."
+      content="Pensieve is a Markdown editor for macOS: live preview, workspace search, backlinks, a table formatter, reading themes, Word DOCX export, and DOCX/PDF import back to Markdown."
     />
     <meta
       name="keywords"
@@ -22,7 +22,7 @@
     <meta property="og:title" content="Pensieve — Native macOS Markdown Editor" />
     <meta
       property="og:description"
-      content="A local-first Markdown writing desk with Word DOCX export, DOCX and PDF import, preview, backlinks, search, and agent-aware dispatch on macOS."
+      content="A Markdown editor for macOS with live preview, search, backlinks, a table formatter, reading themes, Word DOCX export, and DOCX/PDF import."
     />
     <meta
       property="og:image"
@@ -32,7 +32,7 @@
     <meta name="twitter:title" content="Pensieve — Native macOS Markdown Editor" />
     <meta
       name="twitter:description"
-      content="Native Markdown editing for macOS. Signed, notarized, local-first."
+      content="A Markdown editor for macOS. Preview, search, backlinks, and a Word/PDF bridge."
     />
     <meta
       name="twitter:image"
@@ -490,10 +490,9 @@
           <p class="eyebrow">Native macOS Markdown editor</p>
           <h1>Your notes,<br />kept as source.</h1>
           <p class="hero-lead">
-            Pensieve is a local-first writing desk for Markdown: preview,
-            search, backlinks, and agent-aware dispatch — with a Word bridge
-            that exports DOCX and brings Word or PDF documents back as
-            editable Markdown.
+            Pensieve is a Markdown editor for the Mac: live preview, workspace
+            search, backlinks — and a Word bridge that exports DOCX and brings
+            Word or PDF documents back as editable Markdown.
           </p>
           <div class="cta-row">
             <a
@@ -524,9 +523,9 @@
               <div>&nbsp;</div>
               <div><span class="accent">-</span> observe first</div>
               <div><span class="accent">-</span> keep the source close</div>
-              <div><span class="accent">-</span> dispatch with context</div>
+              <div><span class="accent">-</span> write it down once</div>
               <div>&nbsp;</div>
-              <div><span class="mutedtx">`make run`</span></div>
+              <div><span class="mutedtx">| date | note |</span></div>
               <div>&nbsp;</div>
               <div><span class="mutedtx">[[workspace-index]]</span></div>
             </div>
@@ -534,10 +533,9 @@
               <h3>Field notes</h3>
               <p>
                 Notes stay readable as plain files, but the workspace stays
-                alive: links, search, preview, and agent handoff remain one
-                gesture away.
+                alive: links, search, and preview remain one gesture away.
               </p>
-              <p><span class="inline-code">make run</span> — code now sits frameless in preview, under a subtle shadow.</p>
+              <p>Tables format themselves as you type, and the preview follows a theme you pick.</p>
               <div class="preview-rule"></div>
               <p class="preview-check">✓ saved to disk · yours, locally</p>
             </div>
@@ -549,20 +547,20 @@
     <div class="proof-strip">
       <div class="section-inner proof-grid">
         <div class="proof-item reveal">
-          <strong>Native by default</strong>
-          <span>Swift, AppKit, SwiftUI, TextKit, and WebKit.</span>
-        </div>
-        <div class="proof-item reveal">
-          <strong>Files stay yours</strong>
-          <span>Markdown lives on disk, not behind a cloud account.</span>
-        </div>
-        <div class="proof-item reveal">
-          <strong>Preview included</strong>
+          <strong>Live preview</strong>
           <span>GitHub-flavored Markdown, tables, math, and diagrams.</span>
         </div>
         <div class="proof-item reveal">
-          <strong>Agent-aware</strong>
-          <span>Current-document dispatch and Vista autocomplete hooks.</span>
+          <strong>Table formatter</strong>
+          <span>Markdown tables align and pad themselves as you edit.</span>
+        </div>
+        <div class="proof-item reveal">
+          <strong>Reading themes</strong>
+          <span>Swap the preview’s typography and palette per document.</span>
+        </div>
+        <div class="proof-item reveal">
+          <strong>Word &amp; PDF bridge</strong>
+          <span>Export DOCX; import Word and text PDFs back as Markdown.</span>
         </div>
       </div>
     </div>
@@ -592,8 +590,8 @@
               <span><b>Search &amp; backlinks</b><span>Workspace index with backlinks one gesture away.</span></span>
             </div>
             <div class="feature-card reveal">
-              <span class="feature-mark fm-agent" aria-hidden="true">✳</span>
-              <span><b>Agents</b><span>Dispatch the current document with full context.</span></span>
+              <span class="feature-mark fm-agent" aria-hidden="true">☰</span>
+              <span><b>Tables &amp; themes</b><span>A table formatter that keeps up, and switchable reading themes.</span></span>
             </div>
             <div class="feature-card reveal">
               <span class="feature-mark fm-word" aria-hidden="true">⇄</span>
@@ -636,13 +634,10 @@
             <h2>Get the build.</h2>
             <p class="section-copy">
               Releases are published on GitHub; this page always points at the
-              latest DMG. Verify the download against the SHA-256 checksum, or
-              skip the installer entirely and build from source.
+              latest DMG. Open it, drag Pensieve to Applications, done. The
+              checksum below matches the current build if you want to verify
+              the download.
             </p>
-            <div class="source-command">
-              git clone https://github.com/vetcoders/pensieve.git<br />
-              cd pensieve &amp;&amp; make run
-            </div>
           </div>
           <aside class="download-panel reveal" aria-label="Download details">
             <dl>
