@@ -508,7 +508,7 @@
             >
           </div>
           <p class="release-note">
-            Version <code>0.4.0</code> · macOS 15+ · Apple silicon · signed &amp; notarized
+            Version <code>0.4.1</code> · macOS 15+ · Apple silicon
           </p>
         </div>
 
@@ -606,24 +606,24 @@
       <section class="whatsnew" id="whatsnew">
         <div class="section-inner">
           <div class="reveal">
-            <div class="section-label">Release 0.4.0</div>
+            <div class="section-label">Release 0.4.1</div>
             <h2>What’s new.</h2>
           </div>
           <div class="new-grid">
             <div class="new-card reveal">
-              <span class="tagchip">Bridge</span>
-              <h3>Word &amp; PDF transfer</h3>
-              <p>Export structured DOCX from Markdown; import Word documents and text PDFs into recoverable Markdown drafts — from the app or straight from Finder.</p>
+              <span class="tagchip">Windows</span>
+              <h3>Native tabs, respected</h3>
+              <p>Files opened from Finder, the Dock, or <code>open</code> now land as native tabs in the frontmost window — honoring the system “Prefer tabs” setting instead of scattering standalone windows.</p>
             </div>
             <div class="new-card reveal">
               <span class="tagchip">Speed</span>
-              <h3>Instant launch</h3>
-              <p>Startup timers and loading covers removed. Workspaces restore stale-while-revalidate, so the app is usable the moment it opens.</p>
+              <h3>Find without the beachball</h3>
+              <p>Find highlighting on large documents runs in a single text transaction. Thousands of matches no longer stall the editor on every keystroke.</p>
             </div>
             <div class="new-card reveal">
-              <span class="tagchip">Polish</span>
-              <h3>Frameless code</h3>
-              <p>Inline and block code drop their borders for a subtle themed shadow — in both light and dark appearance.</p>
+              <span class="tagchip">Recovery</span>
+              <h3>Drafts stay in their lane</h3>
+              <p>A crash-recovery draft is restored exactly once, into the restored workspace window — it no longer hijacks new documents or multiplies across windows.</p>
             </div>
           </div>
         </div>
@@ -632,13 +632,12 @@
       <section class="download-band" id="download">
         <div class="section-inner download-layout">
           <div class="reveal">
-            <div class="section-label">Manual release</div>
-            <h2>A small installer, no workflow theater.</h2>
+            <div class="section-label">Download</div>
+            <h2>Get the build.</h2>
             <p class="section-copy">
-              The public artifact is built locally, signed with Developer ID,
-              notarized by Apple, stapled, and uploaded to GitHub Releases.
-              This page points to the latest release asset, so the download
-              path stays simple — and verifiable.
+              Releases are published on GitHub; this page always points at the
+              latest DMG. Verify the download against the SHA-256 checksum, or
+              skip the installer entirely and build from source.
             </p>
             <div class="source-command">
               git clone https://github.com/vetcoders/pensieve.git<br />
@@ -647,17 +646,17 @@
           </div>
           <aside class="download-panel reveal" aria-label="Download details">
             <dl>
-              <div><dt>Version</dt><dd>0.4.0</dd></div>
+              <div><dt>Version</dt><dd>0.4.1</dd></div>
               <div><dt>Platform</dt><dd>macOS 15+</dd></div>
               <div><dt>CPU</dt><dd>Apple silicon</dd></div>
-              <div><dt>Trust</dt><dd>Notarized DMG</dd></div>
+              <div><dt>Gatekeeper</dt><dd>Notarized DMG</dd></div>
             </dl>
             <a
               class="btn btn-primary"
               href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
               >Download Pensieve.dmg</a
             >
-            <div class="sha"><b>SHA-256</b><br />0cb3a9bc51f2798f1553262e4043e9c1f7cd3a077f54848b3a0ac0f76216ce1e</div>
+            <div class="sha"><b>SHA-256</b><br />843bac0da92a813022a1f8415ec13ea1d1e2a6d7ce11d6183c841e530e96e8b0</div>
           </aside>
         </div>
       </section>
