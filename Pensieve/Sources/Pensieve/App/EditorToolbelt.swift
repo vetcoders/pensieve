@@ -87,7 +87,7 @@ struct EditorToolbelt: ToolbarContent {
       modePicker
 
       if Self.showsAppearanceControls(for: appState.mode) {
-        AppearanceToolbarButton(themeManager: themeManager)
+        AppearanceToolbarMenu(themeManager: themeManager)
       }
 
       Button(action: { appState.requestPreviewRefresh() }) {
@@ -277,36 +277,14 @@ struct EditorToolbelt: ToolbarContent {
   }
 }
 
-/// Compact replacement for the two wide preview pickers that used to dominate
-/// the titlebar: one monochrome toolbar button opening a popover that hosts
-/// both appearance axes. A plain `View` (not `ToolbarContent`) so it can own
-/// the `@State` driving the popover presentation.
-private struct AppearanceToolbarButton: View {
-  @ObservedObject var themeManager: ThemeManager
-  @State private var isPopoverPresented = false
-
-  var body: some View {
-    Button(action: { isPopoverPresented.toggle() }) {
-      Image(systemName: "paintpalette")
-    }
-    .help("Preview appearance — markdown flavor and reading theme")
-    .accessibilityLabel("Preview Appearance")
-    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
-    .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
-      AppearancePopoverContent(themeManager: themeManager)
-    }
-  }
-}
-
-/// Popover body hosting the flavor and skin pickers. Same `Picker` views as the
-/// old toolbar items — both auto-populate from `CaseIterable` and keep their
-/// accessibility identifiers, so switching either axis drives `ThemeManager`
-/// (and the live preview) exactly as before.
-private struct AppearancePopoverContent: View {
+/// Native menu for the two preview appearance axes. Keeping presentation under
+/// AppKit's menu-button contract avoids transient SwiftUI popover state being
+/// recreated by the toolbar host between mouse-down and mouse-up.
+private struct AppearanceToolbarMenu: View {
   @ObservedObject var themeManager: ThemeManager
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
+    Menu {
       Picker("Flavor", selection: $themeManager.current) {
         ForEach(ThemeManager.Theme.allCases) { theme in
           Text(theme.displayName).tag(theme)
@@ -330,9 +308,12 @@ private struct AppearancePopoverContent: View {
       .pickerStyle(.menu)
       .help("Preview theme — the reading surface for the rendered markdown")
       .accessibilityIdentifier("pensieve.toolbar.skinPicker")
+    } label: {
+      Image(systemName: "paintpalette")
     }
-    .padding(14)
-    .frame(width: 280)
+    .help("Preview appearance — markdown flavor and reading theme")
+    .accessibilityLabel("Preview Appearance")
+    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
   }
 }
 

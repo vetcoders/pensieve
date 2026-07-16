@@ -4,7 +4,7 @@ import XCTest
 @testable import Pensieve
 
 /// Structural smoke for the toolbelt declutter: the appearance controls are
-/// preview-scoped, and the popover pickers keep auto-populating from the
+/// preview-scoped, and the appearance-menu pickers keep auto-populating from the
 /// `CaseIterable` theme axes.
 final class EditorToolbeltTests: XCTestCase {
   // MARK: - Appearance visibility gate
@@ -30,7 +30,7 @@ final class EditorToolbeltTests: XCTestCase {
     XCTAssertEqual(Set(visible), Set([.preview, .split]))
   }
 
-  // MARK: - Popover pickers stay CaseIterable-driven
+  // MARK: - Appearance-menu pickers stay CaseIterable-driven
 
   func testFlavorAxisAutoPopulates() {
     XCTAssertFalse(ThemeManager.Theme.allCases.isEmpty)
@@ -38,7 +38,7 @@ final class EditorToolbeltTests: XCTestCase {
   }
 
   func testSkinAxisAutoPopulates() {
-    // The popover renders one row per case — every skin needs a display name
+    // The menu renders one row per case — every skin needs a display name
     // and a symbol, and the ids the picker tags on must stay unique.
     let skins = ThemeManager.PreviewTheme.allCases
     XCTAssertFalse(skins.isEmpty)

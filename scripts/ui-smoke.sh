@@ -75,6 +75,22 @@ on assertMenuItem(appName, menuName, itemName)
   end tell
 end assertMenuItem
 
+on toolbarElementByDescription(appName, targetDescription)
+  tell application "System Events"
+    tell process appName
+      set toolbarElements to entire contents of toolbar 1 of window 1
+      repeat with elementRef in toolbarElements
+        set elementDescription to ""
+        try
+          set elementDescription to get description of elementRef
+        end try
+        if elementDescription is targetDescription then return contents of elementRef
+      end repeat
+    end tell
+  end tell
+  error "Missing toolbar control: " & targetDescription
+end toolbarElementByDescription
+
 set appName to "Pensieve"
 waitForProcess(appName, 12)
 waitForWindow(appName, 12)
@@ -97,6 +113,51 @@ assertMenuItem(appName, "Format", "Link")
 
 tell application "System Events"
   tell process appName
+    -- Put the preview surface on screen so the appearance control is part of
+    -- the live toolbar, then prove it is a native menu that actually opens.
+    -- A plain button backed by transient SwiftUI popover state can still pass
+    -- static identifier tests while swallowing the first click and flickering
+    -- closed on the second.
+    tell menu bar 1
+      tell menu bar item "Mode"
+        click
+        delay 0.2
+        click menu item "Split Mode" of menu 1
+      end tell
+    end tell
+    delay 0.5
+
+    set appearanceControl to my toolbarElementByDescription(appName, "Preview Appearance")
+    if (role of appearanceControl) is not "AXMenuButton" then
+      error "Preview Appearance must be a native menu button, got " & (role of appearanceControl)
+    end if
+
+    click appearanceControl
+    delay 0.3
+    if (count of menus of appearanceControl) is 0 then
+      error "Preview Appearance menu did not open after click"
+    end if
+    set appearanceItems to get name of every menu item of menu 1 of appearanceControl
+    if appearanceItems does not contain "Flavor" then
+      error "Preview Appearance menu is missing the Flavor picker"
+    end if
+    if appearanceItems does not contain "Theme" then
+      error "Preview Appearance menu is missing the Theme picker"
+    end if
+    key code 53
+    delay 0.5
+
+    -- Dismissing a native menu invalidates its AXUIElement; reacquiring the
+    -- toolbar control mirrors a later user click instead of testing a stale
+    -- Accessibility handle.
+    set appearanceControl to my toolbarElementByDescription(appName, "Preview Appearance")
+    click appearanceControl
+    delay 0.3
+    if (count of menus of appearanceControl) is 0 then
+      error "Preview Appearance menu did not reopen after dismissal"
+    end if
+    key code 53
+
     if (count of windows) is 0 then error "Pensieve has no windows after menu probing"
   end tell
 end tell
