@@ -68,10 +68,7 @@ struct ProviderSettingsView: View {
           .foregroundStyle(.green)
           .accessibilityIdentifier("pensieve.provider.saved")
       } else if settings.usesInheritedEnvironmentAtLaunch {
-        Label(
-          "A provider is already set up by your development environment.",
-          systemImage: "terminal"
-        )
+        Label("A provider is already set up by your environment.", systemImage: "terminal")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
