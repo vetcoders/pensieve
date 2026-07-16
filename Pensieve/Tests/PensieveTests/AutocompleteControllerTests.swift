@@ -218,18 +218,20 @@ final class AutocompleteControllerTests: XCTestCase {
     controller.textDidChange(prefix: "hello")
     await waitUntil {
       attempts.value == 1
-        && controller.lastError?.hasPrefix("completion LLM unavailable") == true
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
     }
 
     XCTAssertEqual(attempts.value, 1)
-    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
 
     controller.textDidChange(prefix: "hello a")
     try? await Task.sleep(nanoseconds: 80_000_000)
 
     XCTAssertEqual(
       attempts.value, 1, "typed unavailable must not be retried per keystroke")
-    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
     XCTAssertNil(controller.suggestion)
   }
 
@@ -243,7 +245,7 @@ final class AutocompleteControllerTests: XCTestCase {
 
     controller.textDidChange(prefix: "hello")
     try? await Task.sleep(nanoseconds: 80_000_000)
-    XCTAssertEqual(controller.lastError, "completion request failed: connection reset")
+    XCTAssertEqual(controller.lastError, "AI autocomplete failed: connection reset")
 
     controller.textDidChange(prefix: "hello a")
     try? await Task.sleep(nanoseconds: 80_000_000)
@@ -270,6 +272,93 @@ final class AutocompleteControllerTests: XCTestCase {
     try? await Task.sleep(nanoseconds: 80_000_000)
 
     XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
+  }
+
+  func testCancelIgnoresUnavailableErrorFromCancelledRequest() async {
+    let attempts = AttemptCounter()
+    let firstRequestStarted = expectation(description: "first request reached the engine")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      if attempts.value == 1 {
+        firstRequestStarted.fulfill()
+        await nonCancellableSleep(nanoseconds: 100_000_000)
+        throw VistaError.ModelError(
+          msg: "completion LLM unavailable: set LLM_ENDPOINT")
+      }
+      return " fresh"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await fulfillment(of: [firstRequestStarted], timeout: 1.0)
+    controller.cancel()
+    try? await Task.sleep(nanoseconds: 150_000_000)
+
+    XCTAssertNil(
+      controller.lastError,
+      "a cancelled request must not restore an error or unavailable latch")
+
+    controller.textDidChange(prefix: "hello again")
+    await waitUntil {
+      controller.suggestion == " fresh"
+    }
+
+    XCTAssertEqual(attempts.value, 2, "cancel() must keep the explicit retry path open")
+  }
+
+  func testControllerDeinitCancelsInFlightRequest() async {
+    let requestStarted = expectation(description: "request reached the engine")
+    let requestCancelled = expectation(description: "deinit cancelled the request")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      requestStarted.fulfill()
+      do {
+        try await Task.sleep(nanoseconds: 10_000_000_000)
+        return " should not complete"
+      } catch is CancellationError {
+        requestCancelled.fulfill()
+        throw CancellationError()
+      }
+    })
+    var controller: AutocompleteController? = AutocompleteController(
+      engine: engine, debounceNanoseconds: 1)
+    weak let weakController = controller
+
+    controller?.textDidChange(prefix: "hello")
+    await fulfillment(of: [requestStarted], timeout: 1.0)
+    controller = nil
+
+    await fulfillment(of: [requestCancelled], timeout: 1.0)
+    XCTAssertNil(weakController, "the completion task must not retain its controller")
+  }
+
+  func testCompositionCancelsInFlightRequestAndSuppressesProviderState() async {
+    let attempts = AttemptCounter()
+    let firstRequestStarted = expectation(description: "first request reached the engine")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      if attempts.value == 1 {
+        firstRequestStarted.fulfill()
+        await nonCancellableSleep(nanoseconds: 100_000_000)
+        return " stale"
+      }
+      return " fresh"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await fulfillment(of: [firstRequestStarted], timeout: 1.0)
+    controller.textDidChange(prefix: "helloに", isComposing: true)
+    try? await Task.sleep(nanoseconds: 150_000_000)
+
+    XCTAssertNil(controller.suggestion)
+    XCTAssertNil(controller.lastError)
+    XCTAssertEqual(attempts.value, 1, "composition updates must not reach the provider")
+
+    controller.textDidChange(prefix: "hello日本")
+    await waitUntil {
+      controller.suggestion == " fresh"
+    }
+    XCTAssertEqual(attempts.value, 2)
   }
 
   func testInitEnabledFlagSurvivesToTypingPath() async {
@@ -486,10 +575,52 @@ final class AutocompleteControllerTests: XCTestCase {
       AutocompleteController.singleLineSuggestion(from: " world\nand more\nlines"), " world")
     XCTAssertEqual(
       AutocompleteController.singleLineSuggestion(from: "\n\nlate start\ntail"), "late start")
+    XCTAssertEqual(
+      AutocompleteController.singleLineSuggestion(from: " \t\n  useful continuation\ntail"),
+      "  useful continuation")
     XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: " world"), " world")
     XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: "hello\n"), "hello")
     XCTAssertNil(AutocompleteController.singleLineSuggestion(from: "\n\n"))
+    XCTAssertNil(AutocompleteController.singleLineSuggestion(from: " \t\n  \n"))
     XCTAssertNil(AutocompleteController.singleLineSuggestion(from: ""))
+  }
+
+  func testUnavailableErrorsUseProviderWordingWithoutKernelDetails() async {
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      throw VistaError.ModelError(
+        msg: "completion LLM unavailable: set LLM_ENDPOINT or LLM_ASSISTIVE_ENDPOINT")
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await waitUntil {
+      controller.lastError != nil
+    }
+
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
+    XCTAssertFalse(controller.lastError?.localizedCaseInsensitiveContains("vista") == true)
+    XCTAssertFalse(controller.lastError?.contains("LLM_ENDPOINT") == true)
+  }
+
+  func testEditorSurfacePublishesAutocompleteFailureToProductStatusSink() async {
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      throw VistaError.ModelError(msg: "completion request failed: provider offline")
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: controller
+    )
+    var observedError: String?
+    surface.onAutocompleteErrorChanged = { observedError = $0 }
+
+    controller.textDidChange(prefix: "hello")
+    await waitUntil { observedError != nil }
+
+    XCTAssertEqual(observedError, "AI autocomplete failed: provider offline")
   }
 
   func testMultilineCompletionPublishesOnlyFirstLine() async {

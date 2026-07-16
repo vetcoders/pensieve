@@ -185,12 +185,6 @@ private struct ActivePensieveCommands: Commands {
     }
 
     CommandGroup(after: .toolbar) {
-      Button(transcriptionTaflaMenuTitle) {
-        controller.toggleTranscriptionTafla()
-      }
-      .keyboardShortcut("t", modifiers: [.command, .option])
-      .accessibilityIdentifier("pensieve.tafla.menu.viewToggle")
-
       Toggle(
         "AI Autocomplete",
         isOn: Binding(
@@ -286,10 +280,11 @@ private struct ActivePensieveCommands: Commands {
 
     // Tab navigation (Quick Win)
     CommandGroup(after: .windowArrangement) {
-      Button(transcriptionTaflaMenuTitle) {
+      Button(dictationMenuTitle) {
         controller.toggleTranscriptionTafla()
       }
-      .accessibilityIdentifier("pensieve.tafla.menu.windowToggle")
+      .keyboardShortcut("d", modifiers: [.command, .option])
+      .accessibilityIdentifier("pensieve.dictation.menu.windowToggle")
 
       Divider()
 
@@ -550,10 +545,10 @@ private struct ActivePensieveCommands: Commands {
       ?? appState.selectedDocumentID
   }
 
-  private var transcriptionTaflaMenuTitle: String {
+  private var dictationMenuTitle: String {
     controller.isTranscriptionTaflaVisible
-      ? "Hide Transcription Tafla"
-      : "Show Transcription Tafla"
+      ? "Hide Dictation"
+      : "Show Dictation"
   }
 
   private func isDirectory(_ url: URL) -> Bool {

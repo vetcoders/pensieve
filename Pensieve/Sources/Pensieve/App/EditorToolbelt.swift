@@ -13,7 +13,7 @@ import SwiftUI
 /// regression on the operator's window). Island separation comes from native
 /// `ToolbarSpacer`s when compiling against the macOS 26 SwiftUI SDK; a
 /// flexible spacer pushes the trailing cluster to the window edge.
-/// Everything else (transcription tafla, scroll sync, auto reload) lives in a
+/// Everything else (Dictation, scroll sync, auto reload) lives in a
 /// single overflow menu. Raw format buttons stay inline whenever the buffer is
 /// editable, matching the floating selection bar and the Format app menu without
 /// adding formatter logic.
@@ -231,7 +231,7 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   /// Single overflow for the non-daily controls the trailing side used to
-  /// carry raw: transcription tafla, scroll sync, auto reload. They are
+  /// carry raw: Dictation, scroll sync, auto reload. They are
   /// set-and-forget toggles, so one `ellipsis.circle` menu holds them all;
   /// share/appearance/reload/dispatch stay visible as the daily drivers.
   private var overflowMenu: some View {
@@ -242,9 +242,22 @@ struct EditorToolbelt: ToolbarContent {
           set: { _ in controller.toggleTranscriptionTafla() }
         )
       ) {
-        Label("Transcription Tafla", systemImage: "waveform.circle")
+        Label("Dictation", systemImage: "waveform.circle")
       }
-      .accessibilityIdentifier("pensieve.toolbar.taflaToggle")
+      .accessibilityIdentifier("pensieve.toolbar.dictationToggle")
+
+      Divider()
+
+      Toggle(
+        isOn: Binding(
+          get: { appState.aiAutocompleteEnabled },
+          set: { appState.aiAutocompleteEnabled = $0 }
+        )
+      ) {
+        Label("AI Autocomplete", systemImage: "sparkles")
+      }
+      .help("Suggest the next phrase as you type; press Tab to accept")
+      .accessibilityIdentifier("pensieve.toolbar.autocompleteToggle")
 
       Divider()
 
@@ -271,7 +284,7 @@ struct EditorToolbelt: ToolbarContent {
     } label: {
       Image(systemName: "ellipsis.circle")
     }
-    .help("More — transcription tafla, scroll sync, auto reload")
+    .help("More — Dictation, AI Autocomplete, scroll sync, auto reload")
     .accessibilityLabel("More Controls")
     .accessibilityIdentifier(Self.overflowIdentifier)
   }

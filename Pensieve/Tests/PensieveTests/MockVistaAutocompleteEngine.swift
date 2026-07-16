@@ -16,14 +16,20 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
   typealias CompletionHandler = @Sendable (String, UInt32) async throws -> String
   typealias FormattingHandler = @Sendable (String, Bool) async throws -> String
   typealias InitModelHandler = @Sendable () throws -> Void
+  typealias IsRecordingHandler = @Sendable () -> Bool
+  typealias RemoveEventListenerHandler = @Sendable () -> Void
   typealias StartRecordingHandler = @Sendable (String?) throws -> Void
+  typealias StopRecordingHandler = @Sendable () throws -> String
 
   private let completionHandler: CompletionHandler
   private let formattingAvailable: Bool
   private let formattingHandler: FormattingHandler
   private let initModelHandler: InitModelHandler
+  private let isRecordingHandler: IsRecordingHandler
   private let modelLoaded: Bool
+  private let removeEventListenerHandler: RemoveEventListenerHandler
   private let startRecordingHandler: StartRecordingHandler
+  private let stopRecordingHandler: StopRecordingHandler
 
   init(
     completionHandler: @escaping CompletionHandler =
@@ -32,14 +38,20 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
     formattingHandler: @escaping FormattingHandler = { text, _ in text },
     modelLoaded: Bool = true,
     initModelHandler: @escaping InitModelHandler = {},
-    startRecordingHandler: @escaping StartRecordingHandler = { _ in }
+    isRecordingHandler: @escaping IsRecordingHandler = { false },
+    removeEventListenerHandler: @escaping RemoveEventListenerHandler = {},
+    startRecordingHandler: @escaping StartRecordingHandler = { _ in },
+    stopRecordingHandler: @escaping StopRecordingHandler = { "" }
   ) {
     self.completionHandler = completionHandler
     self.formattingAvailable = formattingAvailable
     self.formattingHandler = formattingHandler
     self.modelLoaded = modelLoaded
     self.initModelHandler = initModelHandler
+    self.isRecordingHandler = isRecordingHandler
+    self.removeEventListenerHandler = removeEventListenerHandler
     self.startRecordingHandler = startRecordingHandler
+    self.stopRecordingHandler = stopRecordingHandler
   }
 
   func complete(prefix: String, maxTokens: UInt32) async throws -> String {
@@ -70,7 +82,7 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
 
   func isModelLoaded() -> Bool { modelLoaded }
 
-  func isRecording() -> Bool { false }
+  func isRecording() -> Bool { isRecordingHandler() }
 
   func latestHistoryPath() throws -> String { "" }
 
@@ -87,7 +99,7 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
     )
   }
 
-  func removeEventListener() {}
+  func removeEventListener() { removeEventListenerHandler() }
 
   func resetConversation() {}
 
@@ -105,7 +117,7 @@ final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendabl
 
   func stopPipeline() throws -> String { "" }
 
-  func stopRecording() throws -> String { "" }
+  func stopRecording() throws -> String { try stopRecordingHandler() }
 
   func transcribeFile(audioPath: String) async throws -> TranscriptionResult {
     throw MockVistaAutocompleteEngineUnsupportedOperation(operation: "transcribeFile")

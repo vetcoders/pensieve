@@ -5,10 +5,12 @@ import SwiftUI
 struct EditorView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  @State private var autocompleteError: String?
   private let scrollSyncCoordinator: ScrollSyncCoordinator?
 
   init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
     self.scrollSyncCoordinator = scrollSyncCoordinator
+    _autocompleteError = State(initialValue: nil)
   }
 
   var body: some View {
@@ -43,6 +45,9 @@ struct EditorView: View {
         onSelectionChanged: { caret, selectionLength in
           appState.caretUTF16Offset = caret
           appState.selectionUTF16Length = selectionLength
+        },
+        onAutocompleteErrorChanged: { error in
+          autocompleteError = error
         }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -53,6 +58,34 @@ struct EditorView: View {
       // text below. automaticallyAdjustsContentInsets (default) keeps the caret
       // line starting below the toolbar while letting scrolled content pass under.
       .ignoresSafeArea(.container, edges: .top)
+      .overlay(alignment: .top) {
+        if appState.aiAutocompleteEnabled, let autocompleteError {
+          HStack(spacing: 8) {
+            Label(autocompleteError, systemImage: "sparkles")
+              .font(.caption)
+              .lineLimit(2)
+
+            Spacer(minLength: 12)
+
+            Button {
+              self.autocompleteError = nil
+            } label: {
+              Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss AI Autocomplete status")
+          }
+          .padding(.horizontal, 12)
+          .padding(.vertical, 9)
+          .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
+          .overlay {
+            RoundedRectangle(cornerRadius: 9)
+              .stroke(Color.orange.opacity(0.45), lineWidth: 1)
+          }
+          .padding(12)
+          .accessibilityIdentifier("pensieve.autocomplete.error")
+        }
+      }
     }
     .background(Color(NSColor.textBackgroundColor))
   }
@@ -102,6 +135,7 @@ struct EditorRepresentable: NSViewRepresentable {
   var onFindStateChanged: @MainActor (Int, Int?) -> Void = { _, _ in }
   // Caret/selection sink for the status bar; no-op default for the same reason.
   var onSelectionChanged: @MainActor (Int, Int) -> Void = { _, _ in }
+  var onAutocompleteErrorChanged: @MainActor (String?) -> Void = { _ in }
 
   init(
     text: Binding<String>,
@@ -122,7 +156,8 @@ struct EditorRepresentable: NSViewRepresentable {
     onDocumentChanged: @escaping @MainActor () -> Void,
     onCloseFindBar: @escaping @MainActor () -> Void,
     onFindStateChanged: @escaping @MainActor (Int, Int?) -> Void = { _, _ in },
-    onSelectionChanged: @escaping @MainActor (Int, Int) -> Void = { _, _ in }
+    onSelectionChanged: @escaping @MainActor (Int, Int) -> Void = { _, _ in },
+    onAutocompleteErrorChanged: @escaping @MainActor (String?) -> Void = { _ in }
   ) {
     self._text = text
     self.editorMode = editorMode
@@ -143,6 +178,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self.onCloseFindBar = onCloseFindBar
     self.onFindStateChanged = onFindStateChanged
     self.onSelectionChanged = onSelectionChanged
+    self.onAutocompleteErrorChanged = onAutocompleteErrorChanged
   }
 
   func makeNSView(context: Context) -> NSScrollView {
@@ -172,6 +208,11 @@ struct EditorRepresentable: NSViewRepresentable {
         self.onSelectionChanged(caret, selectionLength)
       }
     }
+    surface.onAutocompleteErrorChanged = { error in
+      DispatchQueue.main.async {
+        self.onAutocompleteErrorChanged(error)
+      }
+    }
     surface.configureScrollSync(
       coordinator: scrollSyncCoordinator,
       enabled: scrollSyncEnabled
@@ -183,6 +224,7 @@ struct EditorRepresentable: NSViewRepresentable {
 
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     guard let surface = context.coordinator.surface else { return }
+    surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
     // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
@@ -293,12 +335,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onFindStateChanged: ((Int, Int?) -> Void)?
   /// Reports (caret UTF-16 offset, selection UTF-16 length) for the status bar.
   var onSelectionChanged: ((Int, Int) -> Void)?
+  var onAutocompleteErrorChanged: ((String?) -> Void)?
   private var lastNotifiedCaretOffset = -1
   private var lastNotifiedSelectionLength = -1
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
   private var autocompleteCancellable: AnyCancellable?
+  private var autocompleteErrorCancellable: AnyCancellable?
   private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
   private weak var scrollSyncCoordinator: ScrollSyncCoordinator?
@@ -537,9 +581,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       // wastes the LLM round-trip and risks rendering a ghost inside the
       // composition. The render path re-checks hasMarkedText for requests
       // already in flight.
-      if !textView.hasMarkedText() {
-        autocompleteController.textDidChange(prefix: autocompletePrefix(from: latestText))
-      }
+      autocompleteController.textDidChange(
+        prefix: autocompletePrefix(from: latestText),
+        isComposing: textView.hasMarkedText()
+      )
     }
     refreshFindMatches()
     centerCaretLineIfNeeded()
@@ -590,6 +635,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       .receive(on: DispatchQueue.main)
       .sink { [weak self] suggestion in
         self?.scheduleAutocompleteRender(suggestion)
+      }
+    autocompleteErrorCancellable = autocompleteController.$lastError
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] error in
+        self?.onAutocompleteErrorChanged?(error)
       }
   }
 

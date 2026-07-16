@@ -47,4 +47,24 @@ final class AppPermissionServiceTests: XCTestCase {
       "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
     )
   }
+
+  func testDeveloperIDEntitlementsAllowMicrophoneCapture() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let packageRoot =
+      testFile
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let entitlementsURL = packageRoot.appendingPathComponent("Resources/Pensieve.entitlements")
+    let data = try Data(contentsOf: entitlementsURL)
+    let plist = try XCTUnwrap(
+      PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+    )
+
+    XCTAssertEqual(
+      plist["com.apple.security.device.audio-input"] as? Bool,
+      true,
+      "The signed Developer ID app must carry the audio-input entitlement used by Dictation."
+    )
+  }
 }

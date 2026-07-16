@@ -36,7 +36,6 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   func show() {
     let panel = panel ?? makePanel()
     self.panel = panel
-    AppPermissionService.preflightTaflaPermissions()
     panel.orderFront(nil)
     installSendEventMonitor()
     onVisibilityChanged?()
@@ -59,12 +58,12 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
   private func makePanel() -> NSPanel {
     let panel = NonActivatingTaflaPanel(
-      contentRect: NSRect(x: 160, y: 160, width: 520, height: 360),
+      contentRect: NSRect(x: 160, y: 160, width: 720, height: 520),
       styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
       backing: .buffered,
       defer: false
     )
-    panel.title = "Tafla"
+    panel.title = "Dictation"
     panel.titleVisibility = .hidden
     panel.titlebarAppearsTransparent = true
     panel.isFloatingPanel = true
@@ -74,7 +73,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     panel.hidesOnDeactivate = false
     panel.isReleasedWhenClosed = false
     panel.delegate = self
-    panel.minSize = NSSize(width: 360, height: 240)
+    panel.minSize = NSSize(width: 560, height: 420)
     panel.backgroundColor = .clear
     panel.isOpaque = false
 
@@ -89,7 +88,12 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       }
     )
     let hostingView = NSHostingView(rootView: root)
-    hostingView.setAccessibilityIdentifier("pensieve.tafla.panel")
+    hostingView.setAccessibilityIdentifier("pensieve.dictation.panel")
+    hostingView.setAccessibilityRole(.group)
+    hostingView.setAccessibilityLabel("Dictation controls")
+    hostingView.setAccessibilityHelp(
+      "Record speech, review the transcript, and insert it into the active document."
+    )
     panel.contentView = hostingView
     return panel
   }
@@ -126,6 +130,7 @@ private final class NonActivatingTaflaPanel: NSPanel {
 
 @MainActor
 private final class TranscriptionTaflaRoutingState: ObservableObject {
+  @Published var language: TranscriptionLanguageChoice = .automatic
   @Published var formatMode: TranscriptionFormatMode = .polish
   @Published var sendTarget: TranscriptionSendTarget = .editor
 }
@@ -142,110 +147,132 @@ private struct TranscriptionTaflaPanelView: View {
   var body: some View {
     ZStack {
       TaflaVisualEffect()
-      VStack(alignment: .leading, spacing: 12) {
+      VStack(alignment: .leading, spacing: 14) {
         header
+        Divider()
         modeControls
         transcript
+        actionBar
         footer
       }
-      .padding(16)
+      .padding(20)
     }
-    .frame(minWidth: 360, minHeight: 240)
-    .accessibilityIdentifier("pensieve.tafla.root")
+    .frame(minWidth: 520, minHeight: 380)
+    .accessibilityIdentifier("pensieve.dictation.root")
   }
 
   private var modeControls: some View {
-    HStack(spacing: 12) {
-      Picker("Format", selection: $routingState.formatMode) {
-        ForEach(TranscriptionFormatMode.allCases) { mode in
-          Text(mode.title).tag(mode)
-        }
-      }
-      .pickerStyle(.segmented)
-      .frame(width: 168)
-      .accessibilityIdentifier("pensieve.tafla.mode")
+    HStack(alignment: .top, spacing: 16) {
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Language")
+          .font(.caption)
+          .foregroundStyle(.secondary)
 
-      Picker("Target", selection: $routingState.sendTarget) {
-        ForEach(TranscriptionSendTarget.allCases) { target in
-          Text(target.title).tag(target)
+        Picker("Recognition language", selection: $routingState.language) {
+          ForEach(TranscriptionLanguageChoice.allCases) { language in
+            Text(language.title).tag(language)
+          }
         }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .disabled(service.isRecording || service.isPreparingRecording)
+        .accessibilityIdentifier("pensieve.dictation.language")
       }
-      .pickerStyle(.segmented)
-      .frame(width: 244)
-      .accessibilityIdentifier("pensieve.tafla.target")
+      .frame(maxWidth: .infinity, alignment: .leading)
 
-      Spacer()
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Output style")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
+        Picker("Output style", selection: $routingState.formatMode) {
+          ForEach(TranscriptionFormatMode.allCases) { mode in
+            Text(mode.title).tag(mode)
+          }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("pensieve.dictation.mode")
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Insert into")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
+        Picker("Insert into", selection: $routingState.sendTarget) {
+          ForEach(TranscriptionSendTarget.allCases) { target in
+            Text(target.title).tag(target)
+          }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("pensieve.dictation.target")
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .padding(12)
+    .background {
+      RoundedRectangle(cornerRadius: 10, style: .continuous)
+        .fill(Color(NSColor.controlBackgroundColor).opacity(0.62))
     }
   }
 
   private var header: some View {
-    HStack(spacing: 10) {
-      Label("Tafla", systemImage: service.isRecording ? "waveform.circle.fill" : "waveform.circle")
-        .font(.headline)
-        .accessibilityIdentifier("pensieve.tafla.title")
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
+        Label(
+          "Dictation",
+          systemImage: service.isRecording ? "waveform.circle.fill" : "waveform.circle"
+        )
+        .font(.title3.weight(.semibold))
+        .accessibilityIdentifier("pensieve.dictation.title")
 
-      Spacer()
+        Text("Speak naturally, then review and insert the result.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+      }
+
+      Spacer(minLength: 16)
 
       Button(action: start) {
-        if service.isPreparingRecording {
-          ProgressView()
-            .controlSize(.small)
-        } else {
-          Image(systemName: "mic.fill")
+        HStack(spacing: 6) {
+          if service.isPreparingRecording {
+            ProgressView()
+              .controlSize(.small)
+          } else {
+            Image(systemName: "mic.fill")
+          }
+          Text(service.isPreparingRecording ? "Preparing…" : "Record")
         }
       }
       .buttonStyle(.borderedProminent)
+      .frame(minWidth: 92)
       .disabled(service.isRecording || service.isPreparingRecording)
       .help(service.isPreparingRecording ? "Loading speech model…" : "Start Recording")
-      .accessibilityIdentifier("pensieve.tafla.start")
+      .accessibilityIdentifier("pensieve.dictation.start")
 
       Button(action: stop) {
-        Image(systemName: "stop.fill")
+        Label(service.isPreparingRecording ? "Cancel" : "Stop", systemImage: "stop.fill")
       }
       .buttonStyle(.bordered)
       // Enabled during Preparing too: a slow/hung model load must stay
       // cancellable, otherwise the panel has no control to leave that state.
       .disabled(!service.isRecording && !service.isPreparingRecording)
       .help(service.isPreparingRecording ? "Cancel Preparation" : "Stop Recording")
-      .accessibilityIdentifier("pensieve.tafla.stop")
+      .accessibilityIdentifier("pensieve.dictation.stop")
 
-      Button(action: reset) {
-        Image(systemName: "arrow.counterclockwise")
-      }
-      .buttonStyle(.bordered)
-      .help("Reset Transcript")
-      .accessibilityIdentifier("pensieve.tafla.reset")
-
-      Button(action: format) {
-        Image(systemName: formatSystemImageName)
-      }
-      .buttonStyle(.bordered)
-      .disabled(!service.hasComposedText || isFormatting || service.isFormatting)
-      .help("Format Transcript")
-      .accessibilityIdentifier("pensieve.tafla.format")
-
-      Button(action: copyTranscript) {
-        Image(systemName: "doc.on.doc")
-      }
-      .buttonStyle(.bordered)
-      .disabled(!service.hasComposedText)
-      .help("Copy Transcript")
-      .accessibilityIdentifier("pensieve.tafla.copy")
-
-      Button(action: send) {
-        Image(systemName: "paperplane.fill")
-      }
-      .buttonStyle(.borderedProminent)
-      .disabled(!service.hasComposedText)
-      .help("Send Transcript")
-      .accessibilityIdentifier("pensieve.tafla.send")
+      Divider()
+        .frame(height: 24)
 
       Button(action: onClose) {
         Image(systemName: "xmark")
       }
       .buttonStyle(.borderless)
-      .help("Hide Tafla")
-      .accessibilityIdentifier("pensieve.tafla.close")
+      .help("Hide Dictation")
+      .accessibilityIdentifier("pensieve.dictation.close")
     }
   }
 
@@ -258,7 +285,7 @@ private struct TranscriptionTaflaPanelView: View {
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .topLeading)
           .padding(12)
-          .id("pensieve.tafla.transcript.bottom")
+          .id("pensieve.dictation.transcript.bottom")
       }
       .background(Color(NSColor.textBackgroundColor).opacity(0.58))
       .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -266,10 +293,50 @@ private struct TranscriptionTaflaPanelView: View {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
           .stroke(Color.primary.opacity(0.12), lineWidth: 1)
       }
-      .accessibilityIdentifier("pensieve.tafla.transcript")
-      .onChange(of: service.rendered) { _ in
-        proxy.scrollTo("pensieve.tafla.transcript.bottom", anchor: .bottom)
+      .accessibilityIdentifier("pensieve.dictation.transcript")
+      .onChange(of: service.rendered) {
+        proxy.scrollTo("pensieve.dictation.transcript.bottom", anchor: .bottom)
       }
+    }
+  }
+
+  private var actionBar: some View {
+    HStack(spacing: 10) {
+      Button(action: reset) {
+        Label("Clear", systemImage: "arrow.counterclockwise")
+      }
+      .buttonStyle(.bordered)
+      .help("Reset Transcript")
+      .accessibilityIdentifier("pensieve.dictation.reset")
+
+      Button(action: format) {
+        Label(
+          isFormatting || service.isFormatting ? "Formatting…" : "Format",
+          systemImage: formatSystemImageName
+        )
+      }
+      .buttonStyle(.bordered)
+      .disabled(!service.hasComposedText || isFormatting || service.isFormatting)
+      .help("Format Transcript")
+      .accessibilityIdentifier("pensieve.dictation.format")
+
+      Button(action: copyTranscript) {
+        Label("Copy", systemImage: "doc.on.doc")
+      }
+      .buttonStyle(.bordered)
+      .disabled(!service.hasComposedText)
+      .help("Copy Transcript")
+      .accessibilityIdentifier("pensieve.dictation.copy")
+
+      Spacer(minLength: 12)
+
+      Button(action: send) {
+        Label("Insert", systemImage: "arrow.down.doc.fill")
+      }
+      .buttonStyle(.borderedProminent)
+      .disabled(!service.hasComposedText)
+      .help("Insert Transcript")
+      .accessibilityIdentifier("pensieve.dictation.send")
     }
   }
 
@@ -278,14 +345,14 @@ private struct TranscriptionTaflaPanelView: View {
       Circle()
         .fill(service.isRecording ? Color.red : Color.secondary.opacity(0.55))
         .frame(width: 8, height: 8)
-        .accessibilityIdentifier("pensieve.tafla.recordingIndicator")
+        .accessibilityIdentifier("pensieve.dictation.recordingIndicator")
 
       Text(statusText)
         .font(.caption)
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .truncationMode(.middle)
-        .accessibilityIdentifier("pensieve.tafla.status")
+        .accessibilityIdentifier("pensieve.dictation.status")
 
       Spacer()
 
@@ -295,7 +362,7 @@ private struct TranscriptionTaflaPanelView: View {
           .foregroundStyle(.red)
           .lineLimit(1)
           .truncationMode(.middle)
-          .accessibilityIdentifier("pensieve.tafla.error")
+          .accessibilityIdentifier("pensieve.dictation.error")
       }
     }
   }
@@ -321,7 +388,7 @@ private struct TranscriptionTaflaPanelView: View {
   private func start() {
     // Model init + capture start run in the background; failures surface
     // through service.lastError (already part of errorText).
-    service.startRecording()
+    service.startRecording(language: routingState.language.engineIdentifier)
     controlError = nil
   }
 

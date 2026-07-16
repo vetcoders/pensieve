@@ -566,20 +566,22 @@ final class AppController: ObservableObject {
     let text = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return false }
     guard appState.documentSession.hasEditableBuffer else {
-      appState.lastError = "Open an editable document before sending from Tafla."
+      appState.lastError = "Open an editable document before inserting Dictation."
       return false
     }
 
     if let textView = activeTextView ?? NSApp.keyWindow?.firstResponder as? MarkdownTextView,
-      textView.insertTextAtSelection(text)
+      textView.insertDictationAtSelection(text)
     {
       transcriptionService.resetTranscript()
+      transcriptionService.updateDispatchStatus("Inserted into the active document.")
       appState.lastError = nil
       return true
     }
 
     appendTranscriptionToDocument(text)
     transcriptionService.resetTranscript()
+    transcriptionService.updateDispatchStatus("Inserted at the end of the active document.")
     appState.lastError = nil
     return true
   }

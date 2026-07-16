@@ -360,6 +360,48 @@ class MarkdownTextView: NSTextView {
     return true
   }
 
+  /// Inserts speech at the current selection as prose rather than gluing the
+  /// transcript to adjacent Markdown tokens. Dictation commonly arrives
+  /// trimmed, so the editor owns boundary whitespace using the surrounding
+  /// UTF-16 selection that AppKit already uses.
+  @discardableResult
+  func insertDictationAtSelection(_ transcript: String) -> Bool {
+    let cleaned = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty else { return false }
+
+    let selection = selectedRange()
+    let source = string as NSString
+    guard NSMaxRange(selection) <= source.length else { return false }
+
+    var insertion = cleaned
+    if selection.location > 0 {
+      let previous = source.substring(with: NSRange(location: selection.location - 1, length: 1))
+      if Self.dictationNeedsLeadingSpace(after: previous) {
+        insertion = " " + insertion
+      }
+    }
+
+    let trailingLocation = NSMaxRange(selection)
+    if trailingLocation < source.length {
+      let next = source.substring(with: NSRange(location: trailingLocation, length: 1))
+      if Self.dictationNeedsTrailingSpace(before: next) {
+        insertion += " "
+      }
+    }
+
+    return insertTextAtSelection(insertion)
+  }
+
+  private static func dictationNeedsLeadingSpace(after character: String) -> Bool {
+    guard character.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+    return character.rangeOfCharacter(from: CharacterSet(charactersIn: "([{“‘")) == nil
+  }
+
+  private static func dictationNeedsTrailingSpace(before character: String) -> Bool {
+    guard character.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+    return character.rangeOfCharacter(from: CharacterSet(charactersIn: ".,!?;:)]}”’")) == nil
+  }
+
   private func registerSmartPasteUndo(location: Int, current: String, replacement: String) {
     undoManager?.registerUndo(withTarget: self) { target in
       target.replaceSmartPasteText(location: location, current: current, replacement: replacement)

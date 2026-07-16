@@ -10,7 +10,13 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// Production wires a real factory at the MarkdownEditorSurface init site;
   /// only engine-less test/preview controllers ever report this.
   static let engineUnavailableMessage =
-    "AI autocomplete is not available: no completion engine is configured."
+    "AI autocomplete is unavailable because no completion provider is configured."
+
+  /// User-facing copy for a configured engine whose completion provider is
+  /// unavailable. Keep kernel names and environment-variable implementation
+  /// details out of the editor status surface.
+  static let completionProviderUnavailableMessage =
+    "AI autocomplete is unavailable because the completion provider is not configured."
 
   /// vista-kernel flattens every completion failure into
   /// `VistaError.ModelError`; the unavailable class (LLM endpoint/model env
@@ -65,12 +71,18 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     return engine != nil || engineFactory != nil
   }
 
-  func textDidChange(prefix: String) {
+  /// Starts a completion request for committed text. Composition updates are
+  /// explicit so an in-flight request cannot publish state while an IME owns
+  /// the caret; the default keeps existing non-IME call sites source-compatible.
+  func textDidChange(prefix: String, isComposing: Bool = false) {
     requestID &+= 1
     let currentRequestID = requestID
     completionTask?.cancel()
+    completionTask = nil
     suggestion = nil
     lastError = nil
+
+    guard !isComposing else { return }
 
     guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       return
@@ -92,32 +104,38 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
       do {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
         try Task.checkCancellation()
-        guard let self, let engine = self.resolveEngine() else { return }
+        // Resolve through the weak reference without retaining the controller
+        // across the provider await. This lets deinit cancel a hung request.
+        guard let engine = self?.resolveEngine() else { return }
         let completion = try await engine.complete(prefix: prefix, maxTokens: maxTokens)
         try Task.checkCancellation()
 
         await MainActor.run { [weak self] in
           guard let self else { return }
           guard self.requestID == currentRequestID else { return }
+          self.completionTask = nil
           self.suggestion = Self.singleLineSuggestion(from: completion)
         }
       } catch is CancellationError {
-        return
+        await MainActor.run { [weak self] in
+          guard let self, self.requestID == currentRequestID else { return }
+          self.completionTask = nil
+        }
       } catch {
         let message = Self.displayMessage(for: error)
         let latchesUnavailable = Self.isTypedUnavailable(error)
-        if latchesUnavailable {
-          DebugTrace.log("autocomplete engine unavailable: \(message)")
-        }
         await MainActor.run { [weak self] in
           guard let self else { return }
+          // Every completion outcome is request-scoped. In particular, a
+          // cancelled request must never silently re-arm the unavailable latch
+          // after cancel() opened the explicit retry path.
+          guard self.requestID == currentRequestID else { return }
+          self.completionTask = nil
           if latchesUnavailable {
-            // Latch even when this request was superseded — unavailability is
-            // a truth about the engine, not about one request.
             self.engineUnavailable = true
             self.engineUnavailableDetail = message
+            DebugTrace.log("autocomplete provider unavailable: \(message)")
           }
-          guard self.requestID == currentRequestID else { return }
           self.suggestion = nil
           self.lastError = message
         }
@@ -139,12 +157,13 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// (MarkdownTextView, `lineBreakMode = .byClipping`); publishing a
   /// multi-line completion would paint its tail squeezed to the right of the
   /// caret while Tab inserts the whole block — text the user never saw. Cap
-  /// the suggestion at the first non-empty line so what the ghost shows is
-  /// exactly what accept inserts.
+  /// the suggestion at the first non-blank line so what the ghost shows is
+  /// exactly what accept inserts. Providers occasionally prefix completions
+  /// with blank/whitespace-only lines; those are not useful ghost text.
   static func singleLineSuggestion(from completion: String) -> String? {
-    let cleaned = completion.trimmingCharacters(in: .newlines)
-    let firstLine = cleaned.components(separatedBy: .newlines).first ?? ""
-    return firstLine.isEmpty ? nil : firstLine
+    completion.components(separatedBy: .newlines).first { line in
+      !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
   }
 
   /// Resolves (and caches) the engine. Runs inside the completion task, after
@@ -169,9 +188,24 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// description for non-FFI errors (tests, futures).
   private static func displayMessage(for error: Error) -> String {
     if case VistaError.ModelError(let msg) = error {
-      return msg
+      if msg.hasPrefix(typedUnavailablePrefix) {
+        return completionProviderUnavailableMessage
+      }
+
+      let requestFailurePrefix = "completion request failed: "
+      if msg.hasPrefix(requestFailurePrefix) {
+        return "AI autocomplete failed: \(msg.dropFirst(requestFailurePrefix.count))"
+      }
+
+      let responseFailurePrefix = "completion response parse failed: "
+      if msg.hasPrefix(responseFailurePrefix) {
+        return "AI autocomplete returned an invalid response: "
+          + msg.dropFirst(responseFailurePrefix.count)
+      }
+
+      return "AI autocomplete failed: \(msg)"
     }
-    return error.localizedDescription
+    return "AI autocomplete failed: \(error.localizedDescription)"
   }
 
   private static func isTypedUnavailable(_ error: Error) -> Bool {

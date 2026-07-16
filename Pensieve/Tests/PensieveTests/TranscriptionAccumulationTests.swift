@@ -5,6 +5,22 @@ import XCTest
 
 @MainActor
 final class TranscriptionAccumulationTests: XCTestCase {
+  func testDictationOutputStylesDescribeFormattingInsteadOfPretendingToBeLanguages() {
+    XCTAssertEqual(TranscriptionFormatMode.polish.title, "Clean Up")
+    XCTAssertEqual(TranscriptionFormatMode.kurier.title, "Kurier")
+    XCTAssertFalse(TranscriptionFormatMode.polish.assistive)
+    XCTAssertTrue(TranscriptionFormatMode.kurier.assistive)
+  }
+
+  func testDictationRecognitionLanguagesMapToExplicitLocales() {
+    XCTAssertEqual(TranscriptionLanguageChoice.automatic.title, "Auto")
+    XCTAssertNil(TranscriptionLanguageChoice.automatic.engineIdentifier)
+    XCTAssertEqual(TranscriptionLanguageChoice.polish.title, "Polish")
+    XCTAssertEqual(TranscriptionLanguageChoice.polish.engineIdentifier, "pl-PL")
+    XCTAssertEqual(TranscriptionLanguageChoice.english.title, "English")
+    XCTAssertEqual(TranscriptionLanguageChoice.english.engineIdentifier, "en-US")
+  }
+
   func testPreviewTailReplacesWithoutDroppingCommittedText() {
     let service = TranscriptionService()
 
@@ -17,12 +33,12 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.rendered, "opening thought")
 
     service.receivePreview("second utterance")
-    XCTAssertEqual(service.rendered, "opening thought\nsecond utterance")
+    XCTAssertEqual(service.rendered, "opening thought second utterance")
 
     service.receivePreview("second utterance extended")
     XCTAssertEqual(service.committed, "opening thought")
     XCTAssertEqual(service.preview, "second utterance extended")
-    XCTAssertEqual(service.rendered, "opening thought\nsecond utterance extended")
+    XCTAssertEqual(service.rendered, "opening thought second utterance extended")
   }
 
   func testSparseFinalContinuousSpeechCadenceAccumulatesEveryFinal() {
@@ -39,10 +55,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
 
     XCTAssertEqual(
       service.committed,
-      """
-      monologue part one growing still
-      monologue part two keeps going
-      """
+      "monologue part one growing still monologue part two keeps going"
     )
     XCTAssertEqual(service.preview, "")
     XCTAssertEqual(service.rendered, service.committed)
@@ -60,20 +73,20 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.rendered, "alpha")
 
     service.receivePreview("alpha beta")
-    XCTAssertEqual(service.rendered, "alpha\nbeta")
+    XCTAssertEqual(service.rendered, "alpha beta")
     service.commitActivePreviewForCadence()
 
-    XCTAssertEqual(service.committed, "alpha\nbeta")
+    XCTAssertEqual(service.committed, "alpha beta")
     XCTAssertEqual(service.preview, "")
-    XCTAssertEqual(service.rendered, "alpha\nbeta")
+    XCTAssertEqual(service.rendered, "alpha beta")
 
     service.receivePreview("alpha beta gamma")
-    XCTAssertEqual(service.rendered, "alpha\nbeta\ngamma")
+    XCTAssertEqual(service.rendered, "alpha beta gamma")
     service.receiveFinal("alpha beta gamma", language: "en")
 
-    XCTAssertEqual(service.committed, "alpha\nbeta\ngamma")
+    XCTAssertEqual(service.committed, "alpha beta gamma")
     XCTAssertEqual(service.preview, "")
-    XCTAssertEqual(service.rendered, "alpha\nbeta\ngamma")
+    XCTAssertEqual(service.rendered, "alpha beta gamma")
   }
 
   func testCadenceCommitLeavesTailPreviewCadenceGrowing() {
@@ -85,9 +98,35 @@ final class TranscriptionAccumulationTests: XCTestCase {
     service.commitActivePreviewForCadence()
     service.receivePreview("gamma")
 
-    XCTAssertEqual(service.committed, "alpha\nbeta")
+    XCTAssertEqual(service.committed, "alpha beta")
     XCTAssertEqual(service.preview, "gamma")
-    XCTAssertEqual(service.rendered, "alpha\nbeta\ngamma")
+    XCTAssertEqual(service.rendered, "alpha beta gamma")
+  }
+
+  func testStopRecordingCommitsTheEngineFinalEvenWithoutAFinalCallback() throws {
+    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.receivePreview("draft words")
+    let stoppedText = try service.stopRecording()
+
+    XCTAssertEqual(stoppedText, "confirmed final words")
+    XCTAssertEqual(service.committed, "confirmed final words")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "confirmed final words")
+  }
+
+  func testStopRecordingDoesNotDuplicateFinalAlreadyDeliveredByCallback() throws {
+    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+    service.receiveFinal("confirmed final words", language: "en")
+
+    let stoppedText = try service.stopRecording()
+
+    XCTAssertEqual(stoppedText, "confirmed final words")
+    XCTAssertEqual(service.committed, "confirmed final words")
+    XCTAssertEqual(service.preview, "")
+    XCTAssertEqual(service.rendered, "confirmed final words")
   }
 
   @MainActor
@@ -132,6 +171,125 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertTrue(service.isRecording)
     XCTAssertFalse(service.isPreparingRecording)
     XCTAssertNil(service.lastError)
+  }
+
+  @MainActor
+  func testStartRecordingPassesSelectedRecognitionLanguageToEngine() async {
+    let languages = LockedStringLog()
+    let engine = MockVistaAutocompleteEngine(
+      startRecordingHandler: { language in languages.append(language ?? "auto") })
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording(language: TranscriptionLanguageChoice.polish.engineIdentifier)
+
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertEqual(languages.values, ["pl-PL"])
+    XCTAssertTrue(service.isRecording)
+  }
+
+  @MainActor
+  func testPartialCaptureStartFailureRollsBackAndAllowsRetry() async {
+    let events = LockedStringLog()
+    let recording = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      isRecordingHandler: { recording.isSet },
+      removeEventListenerHandler: { events.append("removeListener") },
+      startRecordingHandler: { _ in
+        events.append("start")
+        recording.set()
+        if events.values.filter({ $0 == "start" }).count == 1 {
+          throw DictationLifecycleTestError.partialStart
+        }
+      },
+      stopRecordingHandler: {
+        events.append("stop")
+        recording.clear()
+        return ""
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where service.lastError == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertFalse(service.isRecording)
+    XCTAssertEqual(events.values, ["start", "stop", "removeListener"])
+
+    service.startRecording()
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(service.isRecording, "a rolled-back partial start must remain retryable")
+    XCTAssertEqual(events.values.filter { $0 == "start" }.count, 2)
+  }
+
+  @MainActor
+  func testStaleEngineCaptureIsStoppedBeforeFreshDictationStart() async {
+    let events = LockedStringLog()
+    let recording = LockedFlag()
+    recording.set()
+    let engine = MockVistaAutocompleteEngine(
+      isRecordingHandler: { recording.isSet },
+      startRecordingHandler: { _ in
+        events.append("start")
+        recording.set()
+      },
+      stopRecordingHandler: {
+        events.append("stop")
+        recording.clear()
+        return ""
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(service.isRecording)
+    XCTAssertEqual(events.values, ["stop", "start"])
+  }
+
+  @MainActor
+  func testAsynchronousEngineErrorStopsCaptureDetachesListenerAndDrainsFinalText() async {
+    let events = LockedStringLog()
+    let recording = LockedFlag()
+    let engine = MockVistaAutocompleteEngine(
+      isRecordingHandler: { recording.isSet },
+      removeEventListenerHandler: { events.append("removeListener") },
+      startRecordingHandler: { _ in recording.set() },
+      stopRecordingHandler: {
+        events.append("stop")
+        recording.clear()
+        return "confirmed recovery text"
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+    service.startRecording()
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    service.receivePreview("draft recovery text")
+
+    service.onError(msg: "capture backend failed")
+    for _ in 0..<200 where events.values.last != "removeListener" {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertFalse(service.isRecording)
+    XCTAssertEqual(service.lastError, "capture backend failed")
+    XCTAssertEqual(events.values, ["stop", "removeListener"])
+    XCTAssertEqual(service.committed, "confirmed recovery text")
+    XCTAssertEqual(service.preview, "")
   }
 
   @MainActor
@@ -283,7 +441,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(surface.textView.selectedRange(), NSRange(location: 11, length: 0))
   }
 
-  func testAppControllerSendsCompositionToProvidedActiveEditorAndClearsTafla() {
+  func testAppControllerSendsCompositionToProvidedActiveEditorWithNaturalWordBoundary() {
     let appState = AppState()
     appState.documentSession.createUntitled()
     let service = TranscriptionService(cadenceCommitNanoseconds: 0)
@@ -296,12 +454,56 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let surface = MarkdownEditorSurface(text: "target", fontSize: 14)
     surface.textView.setSelectedRange(NSRange(location: 6, length: 0))
 
-    service.receiveFinal("tafla text", language: "en")
+    service.receiveFinal("dictated text", language: "en")
 
     XCTAssertTrue(controller.sendTranscriptionToActiveEditor(activeTextView: surface.textView))
-    XCTAssertEqual(surface.textStorage.string, "targettafla text")
+    XCTAssertEqual(surface.textStorage.string, "target dictated text")
     XCTAssertEqual(service.rendered, "")
     XCTAssertNil(appState.lastError)
+  }
+
+  func testDictationInsertionPreservesPunctuationAndReplacesSelection() {
+    let punctuationSurface = MarkdownEditorSurface(text: "Hello.", fontSize: 14)
+    punctuationSurface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+
+    XCTAssertTrue(punctuationSurface.textView.insertDictationAtSelection("world"))
+    XCTAssertEqual(punctuationSurface.textStorage.string, "Hello world.")
+    XCTAssertEqual(punctuationSurface.textView.selectedRange(), NSRange(location: 11, length: 0))
+
+    let replacementSurface = MarkdownEditorSurface(text: "before wrong after", fontSize: 14)
+    replacementSurface.textView.setSelectedRange(NSRange(location: 7, length: 5))
+
+    XCTAssertTrue(replacementSurface.textView.insertDictationAtSelection("dictated"))
+    XCTAssertEqual(replacementSurface.textStorage.string, "before dictated after")
+  }
+
+  func testDictationInsertionAtMarkdownLineStartDoesNotAddIndentNoise() {
+    let surface = MarkdownEditorSurface(text: "# Heading\n", fontSize: 14)
+    surface.textView.setSelectedRange(NSRange(location: 10, length: 0))
+
+    XCTAssertTrue(surface.textView.insertDictationAtSelection("A clean paragraph"))
+    XCTAssertEqual(surface.textStorage.string, "# Heading\nA clean paragraph")
+  }
+
+  func testDictationInsertionParticipatesInTheEditorsUndoStack() throws {
+    let surface = MarkdownEditorSurface(text: "Before after", fontSize: 14)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false
+    )
+    window.contentView = surface.scrollView
+    surface.textView.allowsUndo = true
+    window.makeFirstResponder(surface.textView)
+    surface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    XCTAssertTrue(surface.textView.insertDictationAtSelection("dictated"))
+    XCTAssertEqual(surface.textStorage.string, "Before dictated after")
+
+    let undoManager = try XCTUnwrap(surface.textView.undoManager)
+    undoManager.undo()
+    XCTAssertEqual(surface.textStorage.string, "Before after")
   }
 
   func testAppControllerRoutesEditorTargetWithoutLaunchingAgent() {
@@ -322,7 +524,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     service.receiveFinal("editor route", language: "en")
 
     XCTAssertTrue(controller.sendTranscription(target: .editor, activeTextView: surface.textView))
-    XCTAssertEqual(surface.textStorage.string, "targeteditor route")
+    XCTAssertEqual(surface.textStorage.string, "target editor route")
     XCTAssertEqual(service.rendered, "")
     XCTAssertTrue(launcher.dispatchedPrompts().isEmpty)
   }
@@ -400,11 +602,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
 
     XCTAssertEqual(
       service.committed,
-      """
-      first utterance
-      second utterance
-      third utterance
-      """
+      "first utterance second utterance third utterance"
     )
     XCTAssertEqual(service.preview, "")
     XCTAssertEqual(service.rendered, service.committed)
@@ -429,6 +627,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
 
     service.receiveFinal("stale utterance", language: "en")
     service.receivePreview("stale preview")
+    service.updateDispatchStatus("Inserted into the active document.")
     service.resetTranscript()
 
     XCTAssertEqual(service.committed, "")
@@ -436,6 +635,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(service.rendered, "")
     XCTAssertNil(service.lastLanguage)
     XCTAssertNil(service.lastError)
+    XCTAssertNil(service.dispatchStatus)
 
     service.receivePreview("fresh preview")
     service.receiveFinal("fresh final", language: "es")
@@ -502,11 +702,21 @@ private final class LockedFlag: @unchecked Sendable {
     lock.unlock()
   }
 
+  func clear() {
+    lock.lock()
+    value = false
+    lock.unlock()
+  }
+
   var isSet: Bool {
     lock.lock()
     defer { lock.unlock() }
     return value
   }
+}
+
+private enum DictationLifecycleTestError: Error {
+  case partialStart
 }
 
 private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dictation panel with automatic, Polish, and English recognition; continuous Preview/Final transcript assembly; and selection-aware insertion into the active Markdown editor.
+
+### Changed
+
+- AI Autocomplete is discoverable from the editor toolbar and now cancels stale or IME-composition requests without leaking provider internals into user-facing errors.
+
+### Fixed
+
+- Signed Developer ID builds carry the microphone entitlement, Dictation drains the engine's final result without duplication, and failed or stale capture sessions are cleaned up before retry.
+
 ## [0.3.0] - 2026-07-05
 
 ### Added
@@ -16,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FTS5 search index now syncs from the `documents` table via triggers (collapsing the previous double-write) while preserving the existing search behavior, ranking, and ad-hoc (out-of-workspace) document search.
 - Per-scan operational telemetry: a `scan_sessions` append-only log plus a `workspace_stats` aggregate (file/folder counts, last scan/index timestamps, index health) — the data source for an upcoming workspace dashboard.
 - App Store lane: sandbox entitlements, MAS packaging target, sandbox dispatch gating, microphone usage metadata, and bookmark coverage for security-scoped workspace access.
-- Real AI autocomplete path: the vendored qube-ffi bridge now exposes `complete()`, and the editor constructs autocomplete with a production Vista engine factory instead of a mock-only path.
+- Real AI autocomplete path: the native completion bridge now exposes `complete()`, and the editor constructs autocomplete with a production completion engine instead of a mock-only path.
 - Current-document agent dispatch, format-selection menu routing, scroll-sync toggle, and compact Appearance/Edit toolbar menus.
 
 ### Changed
