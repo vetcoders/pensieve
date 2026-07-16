@@ -5,7 +5,13 @@ struct ContentView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
+  @ObservedObject private var providerSettings: ProviderSettings
   @State private var showDispatch = false
+  @State private var providerOnboarding = ProviderOnboardingState()
+
+  init(providerSettings: ProviderSettings = .shared) {
+    _providerSettings = ObservedObject(wrappedValue: providerSettings)
+  }
 
   var body: some View {
     NavigationSplitView {
@@ -50,6 +56,37 @@ struct ContentView: View {
         onRootSelected: { appState.rememberDispatchRoot($0) }
       )
     }
+    .sheet(isPresented: providerOnboardingBinding) {
+      ProviderOnboardingView(isPresented: providerOnboardingBinding)
+    }
+    .onAppear {
+      evaluateProviderOnboarding()
+    }
+    .onChange(of: appState.aiAutocompleteEnabled) {
+      evaluateProviderOnboarding()
+    }
+    .onChange(of: providerSettings.isConfigured) { _, configured in
+      if configured {
+        providerOnboarding.dismiss()
+      }
+    }
+  }
+
+  private var providerOnboardingBinding: Binding<Bool> {
+    Binding(
+      get: { providerOnboarding.isPresented },
+      set: { isPresented in
+        if !isPresented {
+          providerOnboarding.dismiss()
+        }
+      }
+    )
+  }
+
+  private func evaluateProviderOnboarding() {
+    providerOnboarding.evaluate(
+      autocompleteEnabled: appState.aiAutocompleteEnabled,
+      providerConfigured: providerSettings.isConfigured)
   }
 }
 

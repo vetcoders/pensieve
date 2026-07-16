@@ -9,8 +9,10 @@ struct PensieveApp: App {
   @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
+  private let providerSettings: ProviderSettings
 
   init() {
+    providerSettings = ProviderSettings.shared
     _workspaceStore = State(wrappedValue: WorkspaceStore())
     _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
     _themeManager = StateObject(wrappedValue: ThemeManager())
@@ -39,6 +41,10 @@ struct PensieveApp: App {
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
+    }
+
+    Settings {
+      ProviderSettingsView(settings: providerSettings)
     }
   }
 }

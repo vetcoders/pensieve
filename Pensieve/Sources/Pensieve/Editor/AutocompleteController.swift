@@ -10,13 +10,13 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// Production wires a real factory at the MarkdownEditorSurface init site;
   /// only engine-less test/preview controllers ever report this.
   static let engineUnavailableMessage =
-    "AI autocomplete is unavailable because no completion provider is configured."
+    "AI autocomplete needs a completion provider. Configure one in Settings."
 
   /// User-facing copy for a configured engine whose completion provider is
   /// unavailable. Keep kernel names and environment-variable implementation
   /// details out of the editor status surface.
   static let completionProviderUnavailableMessage =
-    "AI autocomplete is unavailable because the completion provider is not configured."
+    "AI autocomplete needs a completion provider. Configure one in Settings."
 
   /// vista-kernel flattens every completion failure into
   /// `VistaError.ModelError`; the unavailable class (LLM endpoint/model env
@@ -39,6 +39,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private var engine: VistaEngineProtocol?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
+  private var providerSettingsCancellable: AnyCancellable?
   // Typed-unavailable is engine-global state, deliberately NOT request-scoped:
   // once the kernel reports the completion LLM is not configured, asking again
   // on every keystroke cannot succeed. cancel() clears the latch so the user
@@ -56,10 +57,19 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     self.engineFactory = engineFactory
     self.debounceNanoseconds = debounceNanoseconds
     self.maxTokens = maxTokens
+    self.providerSettingsCancellable = NotificationCenter.default.publisher(
+      for: .completionProviderSettingsDidChange
+    ).sink { [weak self] _ in
+      // vista-kernel resolves provider env on every completion request. Saving
+      // settings therefore only needs to clear our permanent-unavailable latch;
+      // the next keystroke immediately observes the new live process values.
+      self?.cancel()
+    }
   }
 
   deinit {
     completionTask?.cancel()
+    providerSettingsCancellable?.cancel()
   }
 
   /// True when a suggestion could ever be produced (injected engine or
