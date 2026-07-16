@@ -416,12 +416,20 @@ if (( ! DO_DMG )); then
 else
 log "Building DMG"
 rm -f "$DMG_PATH"
+# Stage a drag-install layout: the app plus an /Applications symlink, so the
+# mounted image offers the drop target instead of a lone .app.
+DMG_STAGING="$DIST_DIR/dmg-staging"
+rm -rf "$DMG_STAGING"
+mkdir -p "$DMG_STAGING"
+cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+ln -s /Applications "$DMG_STAGING/Applications"
 hdiutil create \
     -volname "$DMG_VOLNAME" \
-    -srcfolder "$APP_BUNDLE" \
+    -srcfolder "$DMG_STAGING" \
     -ov \
     -format UDZO \
     "$DMG_PATH" 2>&1 | tail -3
+rm -rf "$DMG_STAGING"
 ok "DMG: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
 
 log "Signing DMG"
