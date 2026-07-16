@@ -695,6 +695,12 @@ struct SidebarView: View {
         let doc = appState.document(id: documentID)
       {
         documentContextMenu(for: doc)
+
+        Divider()
+
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
+        }
       } else {
         Button("Open") {
           controller.selectWorkspaceNode(node)
@@ -726,6 +732,12 @@ struct SidebarView: View {
 
         Divider()
 
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
+        }
+
+        Divider()
+
         Button("Copy Name") {
           copyPath(url.lastPathComponent)
         }
@@ -743,6 +755,18 @@ struct SidebarView: View {
       Button("New Folder") {
         expandedNodeIDs.insert(node.id)
         _ = controller.createFolder(in: url)
+      }
+
+      Divider()
+
+      if isWorkspaceRoot(url) {
+        Button("Remove Folder from Workspace") {
+          controller.removeWorkspaceRoot(url: url)
+        }
+      } else {
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
+        }
       }
 
       Divider()
@@ -797,6 +821,13 @@ struct SidebarView: View {
 
   private var rootCreationURL: URL? {
     appState.workspaceRoots.first?.url.standardizedFileURL ?? appState.folderURL
+  }
+
+  private func isWorkspaceRoot(_ url: URL) -> Bool {
+    let standardizedURL = url.standardizedFileURL
+    return appState.workspaceRoots.contains {
+      $0.url.standardizedFileURL == standardizedURL
+    }
   }
 
   private func createRootDocument() {

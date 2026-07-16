@@ -372,6 +372,14 @@ final class AppController: ObservableObject {
     folderManager.addExcludedURLs(urls, into: appState)
   }
 
+  func excludeFromWorkspace(url: URL) {
+    folderManager.addExcludedURLs([url], into: appState)
+  }
+
+  func removeWorkspaceRoot(url: URL) {
+    folderManager.removeRoot(url, into: appState)
+  }
+
   func clearWorkspaceExclusions() {
     folderManager.clearExclusions(into: appState)
   }

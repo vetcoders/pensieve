@@ -2748,7 +2748,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testWorkspaceExclusionsPersistAndFilterImportedPaths() throws {
+  func testWorkspaceExclusionsPersistAndFilterImportedPaths() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveExclusionTests-\(UUID().uuidString)", isDirectory: true)
     let drafts = folder.appendingPathComponent("Drafts", isDirectory: true)
@@ -2770,18 +2770,26 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documents.count, 2)
 
     manager.addExcludedURLs([drafts], into: appState)
+    await manager.waitForPendingForcedRefresh()
+    await manager.waitForPendingIndexUpdate()
+    await manager.waitForPendingWorkspaceIndexWrite()
 
-    XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Drafts"]))
+    let expectedExclusion = try XCTUnwrap(
+      WorkspaceExclusion.scopedKey(for: drafts, roots: [folder])
+    )
+    XCTAssertEqual(appState.excludedWorkspacePaths, Set([expectedExclusion]))
     XCTAssertEqual(
       appState.documents.map { $0.url.resolvingSymlinksInPath() },
       [keepURL.resolvingSymlinksInPath()])
-    XCTAssertEqual(metadataStore.load().excludedPaths, ["Drafts"])
+    XCTAssertEqual(metadataStore.load().excludedPaths, [expectedExclusion])
     XCTAssertFalse(appState.documents.contains(where: { $0.url == skipURL.standardizedFileURL }))
 
     let relaunchedState = AppState()
     let relaunchedManager = FolderManager(
       metadataStore: metadataStore, indexDatabase: indexDatabase)
     relaunchedManager.open(url: folder, into: relaunchedState)
+    await relaunchedManager.waitForPendingIndexUpdate()
+    await relaunchedManager.waitForPendingWorkspaceIndexWrite()
     XCTAssertEqual(
       relaunchedState.documents.map { $0.url.resolvingSymlinksInPath() },
       [keepURL.resolvingSymlinksInPath()])
@@ -3449,7 +3457,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testControllerRoutesWorkspaceCommands() throws {
+  func testControllerRoutesWorkspaceCommands() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveWorkspaceCommandTests-\(UUID().uuidString)", isDirectory: true)
@@ -3466,10 +3474,11 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    let folderManager = FolderManager(
+      metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase)
     let controller = AppController(
       appState: appState,
-      folderManager: FolderManager(
-        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      folderManager: folderManager,
       documentStore: DocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
@@ -3478,10 +3487,19 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documents.count, 2)
 
     controller.excludeFromWorkspace(urls: [hidden])
-    XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Hidden"]))
+    await folderManager.waitForPendingForcedRefresh()
+    await folderManager.waitForPendingIndexUpdate()
+    await folderManager.waitForPendingWorkspaceIndexWrite()
+    let expectedExclusion = try XCTUnwrap(
+      WorkspaceExclusion.scopedKey(for: hidden, roots: [folder])
+    )
+    XCTAssertEqual(appState.excludedWorkspacePaths, Set([expectedExclusion]))
     XCTAssertEqual(appState.documents.count, 1)
 
     controller.clearWorkspaceExclusions()
+    await folderManager.waitForPendingForcedRefresh()
+    await folderManager.waitForPendingIndexUpdate()
+    await folderManager.waitForPendingWorkspaceIndexWrite()
     XCTAssertTrue(appState.excludedWorkspacePaths.isEmpty)
     XCTAssertEqual(appState.documents.count, 2)
   }
@@ -3865,7 +3883,9 @@ final class PensieveSmokeTests: XCTestCase {
     controller.excludeFromWorkspace(urls: [drafts])
     // The exclusion edit refreshes the workspace, which now writes the FTS delta off-main and
     // re-runs the search projection on completion. Await that before asserting on results.
+    await manager.waitForPendingForcedRefresh()
     await manager.waitForPendingIndexUpdate()
+    await manager.waitForPendingWorkspaceIndexWrite()
 
     XCTAssertFalse(appState.documents.contains { $0.url == skipURL.standardizedFileURL })
     XCTAssertTrue(appState.workspaceSearchResults.isEmpty)
