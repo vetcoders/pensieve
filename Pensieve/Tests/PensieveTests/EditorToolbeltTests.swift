@@ -106,6 +106,8 @@ final class EditorToolbeltTests: XCTestCase {
       [
         EditorToolbelt.shareIdentifier,
         EditorToolbelt.dispatchIdentifier,
+        EditorToolbelt.undoIdentifier,
+        EditorToolbelt.redoIdentifier,
         EditorToolbelt.richMarkdownToggleIdentifier,
       ]
       + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
@@ -113,7 +115,10 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
       ]
 
     XCTAssertEqual(
@@ -121,14 +126,14 @@ final class EditorToolbeltTests: XCTestCase {
       expectedOrder)
   }
 
-  func testTitlebarIslandsKeepShareDispatchSeparateFromPrincipalEditRow() {
+  func testTitlebarFamiliesPreserveSemanticOrder() {
     XCTAssertEqual(
-      EditorToolbelt.visibleToolbarIslandOrder(for: .split, hasEditableBuffer: true),
-      [.shareDispatch, .edit, .trailing])
+      EditorToolbelt.visibleToolbarFamilyOrder(for: .split, hasEditableBuffer: true),
+      [.documentDispatch, .history, .editing, .view, .previewRuntime, .assistants])
 
     XCTAssertEqual(
-      EditorToolbelt.visibleToolbarIslandOrder(for: .source, hasEditableBuffer: false),
-      [.shareDispatch, .trailing])
+      EditorToolbelt.visibleToolbarFamilyOrder(for: .source, hasEditableBuffer: false),
+      [.documentDispatch, .view, .previewRuntime, .assistants])
   }
 
   func testTitlebarOrderKeepsModesTrailingWhenEditRowIsUnavailable() {
@@ -140,7 +145,10 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
       ])
 
     XCTAssertEqual(
@@ -150,8 +158,72 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.dispatchIdentifier,
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
       ])
+  }
+}
+
+@MainActor
+final class EditorToolbeltTestsHistory: XCTestCase {
+  @MainActor
+  private final class HistoryProbe: NSObject {
+    let undoManager: UndoManager
+    private(set) var value = 0
+
+    init(undoManager: UndoManager) {
+      self.undoManager = undoManager
+    }
+
+    func setValue(_ newValue: Int) {
+      let previous = value
+      undoManager.registerUndo(withTarget: self) { target in
+        target.setValue(previous)
+      }
+      value = newValue
+    }
+  }
+
+  func testHistoryActionsUseStandardResponderSelectorsAndLabels() {
+    XCTAssertEqual(
+      NSStringFromSelector(ToolbarResponderHistoryState.Action.undo.selector), "undo:")
+    XCTAssertEqual(
+      NSStringFromSelector(ToolbarResponderHistoryState.Action.redo.selector), "redo:")
+
+    for action in ToolbarResponderHistoryState.Action.allCases {
+      XCTAssertFalse(action.label.isEmpty)
+      XCTAssertFalse(action.systemImage.isEmpty)
+      XCTAssertFalse(action.accessibilityIdentifier.isEmpty)
+    }
+  }
+
+  func testAvailabilityTracksActiveTextViewUndoManagerWithoutAnotherStack() throws {
+    let surface = MarkdownEditorSurface(text: "history", fontSize: 14)
+    let undoManager = try XCTUnwrap(surface.textView.undoManager)
+    let probe = HistoryProbe(undoManager: undoManager)
+
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: false, canRedo: false))
+
+    probe.setValue(1)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: true, canRedo: false))
+
+    undoManager.undo()
+    XCTAssertEqual(probe.value, 0)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: false, canRedo: true))
+
+    undoManager.redo()
+    XCTAssertEqual(probe.value, 1)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: true, canRedo: false))
   }
 }
 
