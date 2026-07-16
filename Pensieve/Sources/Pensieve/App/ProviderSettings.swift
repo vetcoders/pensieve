@@ -60,8 +60,7 @@ enum CompletionProviderShape: String, CaseIterable, Identifiable {
 
   var unsupportedMessage: String? {
     guard !isSupportedByCompletionEngine else { return nil }
-    return
-      "Anthropic Messages requires a completion-engine update. Pensieve will not save, apply, or send this configuration yet."
+    return "Anthropic Messages support is coming in an upcoming update."
   }
 }
 

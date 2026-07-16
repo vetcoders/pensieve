@@ -20,7 +20,7 @@ struct ProviderSettingsView: View {
       VStack(alignment: .leading, spacing: 6) {
         Text("AI Autocomplete")
           .font(.title2.weight(.semibold))
-        Text("Choose the provider request shape explicitly. Pensieve applies Responses today.")
+        Text("Connect the provider that powers inline suggestions as you type.")
           .foregroundStyle(.secondary)
       }
 
@@ -45,11 +45,8 @@ struct ProviderSettingsView: View {
       .formStyle(.grouped)
 
       VStack(alignment: .leading, spacing: 5) {
-        Label("The API key is stored only in your macOS Keychain.", systemImage: "key.fill")
-        Text(
-          "Endpoint and model are saved as app preferences. Existing provider environment "
-            + "variables win at launch; Save applies these fields to the running app immediately."
-        )
+        Label("Your API key is stored only in the macOS Keychain.", systemImage: "key.fill")
+        Text("Changes take effect immediately — no restart needed.")
       }
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -71,7 +68,7 @@ struct ProviderSettingsView: View {
           .foregroundStyle(.green)
           .accessibilityIdentifier("pensieve.provider.saved")
       } else if settings.usesInheritedEnvironmentAtLaunch {
-        Label("Using provider environment inherited at launch.", systemImage: "terminal")
+        Label("A provider is already set up by your development environment.", systemImage: "terminal")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
@@ -112,9 +109,9 @@ struct ProviderOnboardingView: View {
       }
 
       Text(
-        "Pensieve needs a Responses endpoint and model before it can suggest the next phrase. "
-          + "Settings normalizes compatible URLs to /v1/responses. Anthropic Messages remains "
-          + "visible but fail-closed until the completion engine supports it."
+        "Connect an AI provider and Pensieve will suggest the next phrase as you type. "
+          + "All you need is your provider's address and a model name — "
+          + "your API key stays in the macOS Keychain."
       )
       .font(.callout)
       .fixedSize(horizontal: false, vertical: true)
