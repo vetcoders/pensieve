@@ -5,6 +5,75 @@ import XCTest
 
 @MainActor
 final class ProviderSettingsTests: XCTestCase {
+  func testOpenAIResponsesEndpointNormalizationMatchesCanonicalInputs() {
+    for testCase in responsesEndpointCases() {
+      XCTAssertEqual(
+        ProviderSettings.normalizeOpenAIResponsesEndpoint(testCase.input),
+        testCase.expected,
+        "input: \(testCase.input)")
+    }
+  }
+
+  func testEveryCompatibleAndLegacyEndpointIsStoredAndAppliedAsResponses() throws {
+    for testCase in responsesEndpointCases() {
+      let (defaults, suiteName) = makeDefaults()
+      defer { defaults.removePersistentDomain(forName: suiteName) }
+      let environment = InMemoryProviderEnvironment()
+      let settings = ProviderSettings(
+        defaults: defaults,
+        keychain: InMemoryProviderAPIKeyStore(),
+        environment: environment)
+      settings.endpoint = testCase.input
+      settings.model = "completion-model"
+
+      try settings.save()
+
+      XCTAssertEqual(settings.endpoint, testCase.expected, "input: \(testCase.input)")
+      XCTAssertEqual(
+        environment.values["LLM_ASSISTIVE_ENDPOINT"], testCase.expected,
+        "input: \(testCase.input)")
+      XCTAssertFalse(
+        environment.setCalls.contains { $0.value.contains("/chat/completions") },
+        "legacy request shape reached the environment for input: \(testCase.input)")
+
+      let restoredEnvironment = InMemoryProviderEnvironment()
+      let restored = ProviderSettings(
+        defaults: defaults,
+        keychain: InMemoryProviderAPIKeyStore(),
+        environment: restoredEnvironment)
+      XCTAssertEqual(restored.endpoint, testCase.expected, "input: \(testCase.input)")
+      XCTAssertEqual(
+        restoredEnvironment.values["LLM_ASSISTIVE_ENDPOINT"], testCase.expected,
+        "persisted input: \(testCase.input)")
+    }
+  }
+
+  func testAnthropicMessagesFailsClosedWithoutPersistingOrApplying() {
+    let (defaults, suiteName) = makeDefaults()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let keychain = InMemoryProviderAPIKeyStore()
+    let environment = InMemoryProviderEnvironment()
+    let settings = ProviderSettings(
+      defaults: defaults, keychain: keychain, environment: environment)
+    settings.providerShape = .anthropicMessages
+    settings.endpoint = "https://api.libraxis.cloud/v1/messages"
+    settings.model = "claude-model"
+    settings.apiKey = "anthropic-secret"
+
+    XCTAssertFalse(settings.isDraftValid)
+    XCTAssertNotNil(settings.providerShape.unsupportedMessage)
+    XCTAssertThrowsError(try settings.save()) { error in
+      guard case ProviderSettingsError.unsupportedProviderShape(.anthropicMessages) = error
+      else {
+        return XCTFail("unexpected error: \(error)")
+      }
+    }
+    XCTAssertTrue(environment.setCalls.isEmpty)
+    XCTAssertTrue(environment.values.isEmpty)
+    XCTAssertNil(keychain.apiKey)
+    XCTAssertNil(defaults.string(forKey: "Pensieve.completionProvider.endpoint"))
+  }
+
   func testSecondStoreRestoresPreferencesAndKeychainWithoutPersistingSecretInDefaults() throws {
     let (defaults, suiteName) = makeDefaults()
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -19,7 +88,9 @@ final class ProviderSettingsTests: XCTestCase {
     settings.apiKey = secret
     try settings.save()
 
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_ENDPOINT"], "https://provider.example/v1")
+    XCTAssertEqual(
+      environment.values["LLM_ASSISTIVE_ENDPOINT"],
+      "https://provider.example/v1/responses")
     XCTAssertEqual(environment.values["LLM_ASSISTIVE_MODEL"], "completion-model")
     XCTAssertEqual(environment.values["LLM_ASSISTIVE_API_KEY"], secret)
     XCTAssertEqual(keychain.apiKey, secret)
@@ -31,7 +102,8 @@ final class ProviderSettingsTests: XCTestCase {
       defaults: defaults,
       keychain: keychain,
       environment: InMemoryProviderEnvironment())
-    XCTAssertEqual(restored.endpoint, "https://provider.example/v1")
+    XCTAssertEqual(restored.providerShape, .openAIResponses)
+    XCTAssertEqual(restored.endpoint, "https://provider.example/v1/responses")
     XCTAssertEqual(restored.model, "completion-model")
     XCTAssertEqual(restored.apiKey, secret)
   }
@@ -150,6 +222,27 @@ final class ProviderSettingsTests: XCTestCase {
 
     XCTAssertEqual(attempts.value, 2)
     XCTAssertNil(controller.lastError)
+  }
+
+  private func responsesEndpointCases() -> [(input: String, expected: String)] {
+    let expected = "https://api.libraxis.cloud/v1/responses"
+    return [
+      ("https://api.libraxis.cloud", expected),
+      ("https://api.libraxis.cloud/", expected),
+      ("  https://api.libraxis.cloud  ", expected),
+      ("https://api.libraxis.cloud/v1", expected),
+      ("https://api.libraxis.cloud/v1/", expected),
+      (" https://api.libraxis.cloud/v1/\n", expected),
+      ("https://api.libraxis.cloud/v1/responses", expected),
+      ("https://api.libraxis.cloud/v1/responses/", expected),
+      (" https://api.libraxis.cloud/v1/responses/ ", expected),
+      ("https://api.libraxis.cloud/v1/chat/completions", expected),
+      ("https://api.libraxis.cloud/v1/chat/completions/", expected),
+      ("\thttps://api.libraxis.cloud/v1/chat/completions/\n", expected),
+      ("https://api.libraxis.cloud/v1/completions", expected),
+      ("https://api.libraxis.cloud/v1/completions/", expected),
+      (" https://api.libraxis.cloud/v1/completions/ ", expected),
+    ]
   }
 
   private func makeDefaults() -> (UserDefaults, String) {

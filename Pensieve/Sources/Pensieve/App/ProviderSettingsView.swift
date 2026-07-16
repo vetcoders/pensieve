@@ -20,14 +20,23 @@ struct ProviderSettingsView: View {
       VStack(alignment: .leading, spacing: 6) {
         Text("AI Autocomplete")
           .font(.title2.weight(.semibold))
-        Text("Connect one OpenAI-compatible completion provider.")
+        Text("Choose the provider request shape explicitly. Pensieve applies Responses today.")
           .foregroundStyle(.secondary)
       }
 
       Form {
-        TextField("Endpoint", text: $settings.endpoint, prompt: Text("https://api.example.com/v1"))
-          .textContentType(.URL)
-          .accessibilityIdentifier("pensieve.provider.endpoint")
+        Picker("Provider API", selection: $settings.providerShape) {
+          ForEach(CompletionProviderShape.allCases) { shape in
+            Text(shape.displayName).tag(shape)
+          }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("pensieve.provider.shape")
+        TextField(
+          "Endpoint", text: $settings.endpoint, prompt: Text(settings.providerShape.endpointPrompt)
+        )
+        .textContentType(.URL)
+        .accessibilityIdentifier("pensieve.provider.endpoint")
         TextField("Model", text: $settings.model, prompt: Text("model-name"))
           .accessibilityIdentifier("pensieve.provider.model")
         SecureField("API Key", text: $settings.apiKey, prompt: Text("Optional for local providers"))
@@ -45,7 +54,13 @@ struct ProviderSettingsView: View {
       .font(.caption)
       .foregroundStyle(.secondary)
 
-      if let error = settings.lastError {
+      if let unsupportedMessage = settings.providerShape.unsupportedMessage {
+        Label(unsupportedMessage, systemImage: "hand.raised.fill")
+          .font(.caption)
+          .foregroundStyle(.orange)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("pensieve.provider.unsupportedShape")
+      } else if let error = settings.lastError {
         Label(error, systemImage: "exclamationmark.triangle.fill")
           .font(.caption)
           .foregroundStyle(.red)
@@ -72,7 +87,7 @@ struct ProviderSettingsView: View {
       }
     }
     .padding(24)
-    .frame(width: 520, height: 410, alignment: .topLeading)
+    .frame(width: 560, height: 470, alignment: .topLeading)
     .accessibilityIdentifier("pensieve.provider.settings")
   }
 }
@@ -97,8 +112,9 @@ struct ProviderOnboardingView: View {
       }
 
       Text(
-        "Pensieve needs an endpoint and model before it can suggest the next phrase. "
-          + "API keys are optional for local providers and otherwise stay in Keychain."
+        "Pensieve needs a Responses endpoint and model before it can suggest the next phrase. "
+          + "Settings normalizes compatible URLs to /v1/responses. Anthropic Messages remains "
+          + "visible but fail-closed until the completion engine supports it."
       )
       .font(.callout)
       .fixedSize(horizontal: false, vertical: true)

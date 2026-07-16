@@ -23,9 +23,52 @@ protocol ProviderEnvironmentManaging {
   func removeValue(forKey key: String) throws
 }
 
+enum CompletionProviderShape: String, CaseIterable, Identifiable {
+  case openAIResponses = "openai-responses"
+  case anthropicMessages = "anthropic-messages"
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .openAIResponses:
+      return "OpenAI Responses"
+    case .anthropicMessages:
+      return "Anthropic Messages"
+    }
+  }
+
+  var endpointPrompt: String {
+    switch self {
+    case .openAIResponses:
+      return "https://api.example.com/v1/responses"
+    case .anthropicMessages:
+      return "https://api.example.com/v1/messages"
+    }
+  }
+
+  /// This is the single product gate to flip after vista-kernel gains a real
+  /// Anthropic Messages request/header/response implementation.
+  var isSupportedByCompletionEngine: Bool {
+    switch self {
+    case .openAIResponses:
+      return true
+    case .anthropicMessages:
+      return false
+    }
+  }
+
+  var unsupportedMessage: String? {
+    guard !isSupportedByCompletionEngine else { return nil }
+    return
+      "Anthropic Messages requires a completion-engine update. Pensieve will not save, apply, or send this configuration yet."
+  }
+}
+
 enum ProviderSettingsError: LocalizedError {
   case endpointRequired
   case modelRequired
+  case unsupportedProviderShape(CompletionProviderShape)
   case invalidKeychainData
   case keychain(OSStatus)
   case environment(operation: String, key: String, code: Int32)
@@ -36,6 +79,9 @@ enum ProviderSettingsError: LocalizedError {
       return "Enter a provider endpoint."
     case .modelRequired:
       return "Enter a provider model."
+    case .unsupportedProviderShape(let shape):
+      return
+        "\(shape.displayName) requires a completion-engine update and was not saved or applied."
     case .invalidKeychainData:
       return "The saved provider API key could not be read."
     case .keychain(let status):
@@ -139,10 +185,12 @@ final class ProviderSettings: ObservableObject {
 
   private static let endpointDefaultsKey = "Pensieve.completionProvider.endpoint"
   private static let modelDefaultsKey = "Pensieve.completionProvider.model"
+  private static let providerShapeDefaultsKey = "Pensieve.completionProvider.shape"
   private static let assistiveEndpointKey = "LLM_ASSISTIVE_ENDPOINT"
   private static let assistiveModelKey = "LLM_ASSISTIVE_MODEL"
   private static let assistiveAPIKey = "LLM_ASSISTIVE_API_KEY"
 
+  @Published var providerShape: CompletionProviderShape
   @Published var endpoint: String
   @Published var model: String
   @Published var apiKey: String
@@ -164,7 +212,12 @@ final class ProviderSettings: ObservableObject {
     self.defaults = defaults
     self.keychain = keychain
     self.environment = environment
-    self.endpoint = defaults.string(forKey: Self.endpointDefaultsKey) ?? ""
+    self.providerShape =
+      CompletionProviderShape(
+        rawValue: defaults.string(forKey: Self.providerShapeDefaultsKey) ?? ""
+      ) ?? .openAIResponses
+    self.endpoint = Self.normalizeOpenAIResponsesEndpoint(
+      defaults.string(forKey: Self.endpointDefaultsKey) ?? "")
     self.model = defaults.string(forKey: Self.modelDefaultsKey) ?? ""
     self.apiKey = ""
     self.saveStatus = nil
@@ -190,12 +243,14 @@ final class ProviderSettings: ObservableObject {
   /// The kernel requires endpoint + model, but intentionally permits an empty
   /// API key for local/keyless OpenAI-compatible endpoints.
   var isConfigured: Bool {
-    Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
+    providerShape.isSupportedByCompletionEngine
+      && Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
       && Self.hasNonEmptyValue(in: Self.modelEnvironmentKeys, environment: environment)
   }
 
   var isDraftValid: Bool {
-    !trimmed(endpoint).isEmpty && !trimmed(model).isEmpty
+    providerShape.isSupportedByCompletionEngine
+      && !trimmed(endpoint).isEmpty && !trimmed(model).isEmpty
   }
 
   var usesInheritedEnvironmentAtLaunch: Bool {
@@ -208,11 +263,15 @@ final class ProviderSettings: ObservableObject {
   /// terminal/developer workflows intact while making Finder launches work.
   func save() throws {
     do {
-      let endpoint = trimmed(endpoint)
+      guard providerShape.isSupportedByCompletionEngine else {
+        throw ProviderSettingsError.unsupportedProviderShape(providerShape)
+      }
+      let rawEndpoint = trimmed(endpoint)
       let model = trimmed(model)
       let apiKey = trimmed(apiKey)
-      guard !endpoint.isEmpty else { throw ProviderSettingsError.endpointRequired }
+      guard !rawEndpoint.isEmpty else { throw ProviderSettingsError.endpointRequired }
       guard !model.isEmpty else { throw ProviderSettingsError.modelRequired }
+      let endpoint = Self.normalizeOpenAIResponsesEndpoint(rawEndpoint)
 
       if apiKey.isEmpty {
         try keychain.deleteAPIKey()
@@ -222,6 +281,7 @@ final class ProviderSettings: ObservableObject {
 
       defaults.set(endpoint, forKey: Self.endpointDefaultsKey)
       defaults.set(model, forKey: Self.modelDefaultsKey)
+      defaults.set(providerShape.rawValue, forKey: Self.providerShapeDefaultsKey)
       self.endpoint = endpoint
       self.model = model
       self.apiKey = apiKey
@@ -245,8 +305,13 @@ final class ProviderSettings: ObservableObject {
   }
 
   private func applyPersistedConfigurationAtLaunch() throws {
+    guard providerShape.isSupportedByCompletionEngine else {
+      throw ProviderSettingsError.unsupportedProviderShape(providerShape)
+    }
     try fillMissingEnvironmentValue(
-      trimmed(endpoint), aliases: Self.endpointEnvironmentKeys, key: Self.assistiveEndpointKey)
+      Self.normalizeOpenAIResponsesEndpoint(endpoint),
+      aliases: Self.endpointEnvironmentKeys,
+      key: Self.assistiveEndpointKey)
     try fillMissingEnvironmentValue(
       trimmed(model), aliases: Self.modelEnvironmentKeys, key: Self.assistiveModelKey)
     // Never pair a saved secret with a developer-inherited endpoint/model: a
@@ -283,6 +348,24 @@ final class ProviderSettings: ObservableObject {
 
   private func trimmed(_ value: String) -> String {
     value.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  /// Canonicalizes every UI-managed OpenAI-compatible endpoint onto the only
+  /// request shape vista-kernel can safely emit today: OpenAI Responses.
+  static func normalizeOpenAIResponsesEndpoint(_ endpoint: String) -> String {
+    var base = endpoint.trimmingCharacters(
+      in: .whitespacesAndNewlines.union(.init(charactersIn: "/")))
+    guard !base.isEmpty else { return "" }
+
+    for suffix in ["/v1/responses", "/v1/chat/completions", "/v1/completions"]
+    where base.hasSuffix(suffix) {
+      base.removeLast(suffix.count)
+      return base + "/v1/responses"
+    }
+    if base.hasSuffix("/v1") {
+      base.removeLast(3)
+    }
+    return base + "/v1/responses"
   }
 
   private static func hasNonEmptyValue(
