@@ -136,6 +136,23 @@ final class AppState {
     set { workspaceStore.bookmarkData = newValue }
   }
 
+  @discardableResult
+  func rememberDispatchRoot(_ url: URL) -> Bool {
+    workspaceStore.rememberDispatchRoot(url)
+  }
+
+  func resolveDispatchRoot(
+    explicitOverride: URL? = nil,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) -> URL {
+    workspaceStore.resolveDispatchRoot(
+      explicitOverride: explicitOverride,
+      workspaceRoot: folderURL ?? workspaceRoots.first?.url,
+      documentURL: documentURL,
+      homeDirectory: homeDirectory
+    )
+  }
+
   var selectedDocumentID: DocumentRef.ID? {
     get { windowModel.selectedDocumentID }
     set { windowModel.selectedDocumentID = newValue }

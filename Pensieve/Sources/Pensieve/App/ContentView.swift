@@ -7,12 +7,6 @@ struct ContentView: View {
   @EnvironmentObject private var themeManager: ThemeManager
   @State private var showDispatch = false
 
-  private var dispatchRoot: URL {
-    appState.folderURL
-      ?? appState.documentURL?.deletingLastPathComponent()
-      ?? FileManager.default.homeDirectoryForCurrentUser
-  }
-
   var body: some View {
     NavigationSplitView {
       SidebarView()
@@ -52,7 +46,8 @@ struct ContentView: View {
         controller: controller,
         isPresented: $showDispatch,
         documentTitle: appState.documentTitle,
-        defaultRoot: dispatchRoot
+        defaultRoot: appState.resolveDispatchRoot(),
+        onRootSelected: { appState.rememberDispatchRoot($0) }
       )
     }
   }

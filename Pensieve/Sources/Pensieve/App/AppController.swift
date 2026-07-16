@@ -652,10 +652,8 @@ final class AppController: ObservableObject {
       startStatus ?? "Dispatching \(label) to \(workflow)...")
     let launcher = agentPromptLauncher
     let agent = defaultAgent
-    let workingDirectoryURL =
-      agentWorkspaceRoot
-      ?? appState.folderURL
-      ?? FileManager.default.homeDirectoryForCurrentUser
+    let workingDirectoryURL = appState.resolveDispatchRoot(
+      explicitOverride: agentWorkspaceRoot)
     let appState = appState
     let transcriptionService = transcriptionService
 

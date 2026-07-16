@@ -14,6 +14,7 @@ struct DispatchPopover: View {
   @ObservedObject var controller: AppController
   @Binding var isPresented: Bool
   let documentTitle: String
+  let onRootSelected: (URL) -> Void
 
   @State private var agent: String
   @State private var workflow: String
@@ -32,11 +33,13 @@ struct DispatchPopover: View {
     controller: AppController,
     isPresented: Binding<Bool>,
     documentTitle: String,
-    defaultRoot: URL
+    defaultRoot: URL,
+    onRootSelected: @escaping (URL) -> Void
   ) {
     self.controller = controller
     self._isPresented = isPresented
     self.documentTitle = documentTitle
+    self.onRootSelected = onRootSelected
     self._agent = State(initialValue: controller.availableAgents.first ?? "codex")
     self._workflow = State(
       initialValue: controller.agentWorkflows.contains("implement")
@@ -183,7 +186,11 @@ struct DispatchPopover: View {
     panel.directoryURL = rootURL
     panel.prompt = "Use as run root"
     let apply: (NSApplication.ModalResponse) -> Void = { response in
-      if response == .OK, let url = panel.url { rootURL = url }
+      if response == .OK, let url = panel.url {
+        let standardizedURL = url.standardizedFileURL
+        onRootSelected(standardizedURL)
+        rootURL = standardizedURL
+      }
     }
     // Present as a sheet on the dispatch sheet's own window so the dispatch UI is
     // NOT torn down (which would lose the chosen folder). runModal() is only the
