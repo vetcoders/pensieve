@@ -8,7 +8,7 @@ final class FolderManager {
   typealias StandardizeFileURL = (URL) -> URL
 
   static let shared = FolderManager()
-  private let watcher = FileWatcher()
+  private let watcher: FileWatcher
   private let metadataStore: WorkspaceMetadataStore
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
@@ -33,6 +33,9 @@ final class FolderManager {
   /// `applyRefresh` or superseded by an ad-hoc file open left `.opening` on screen forever.
   private var openFlowGeneration: UInt64 = 0
   private var watcherRefreshTask: Task<Void, Never>?
+  /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
+  /// completed refresh from one that was cancel-replaced by a newer event mid-await.
+  private var watcherRefreshGeneration: UInt64 = 0
   /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
   /// task so a filesystem event cannot cancel a user-requested refresh.
   private var forcedRefreshTask: Task<Void, Never>?
@@ -62,6 +65,7 @@ final class FolderManager {
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
     workspaceValidationProbe: @escaping WorkspaceSubstrate.ValidationProbe = { _ in },
+    watcher: FileWatcher = FileWatcher(),
     selfWriteSuppressionInterval: TimeInterval = 1.2,
     watcherDebounceMilliseconds: UInt64 = 300,
     standardizeFileURL: @escaping StandardizeFileURL = { $0.standardizedFileURL },
@@ -75,6 +79,7 @@ final class FolderManager {
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.cancellableBuilder
     self.workspaceSubstrate = workspaceSubstrate
     self.workspaceValidationProbe = workspaceValidationProbe
+    self.watcher = watcher
     self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
     self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
     self.standardizeFileURL = standardizeFileURL
@@ -402,9 +407,15 @@ final class FolderManager {
   }
 
   /// Awaits the in-flight debounced watcher refresh (debounce sleep + off-main scan + rebuild)
-  /// so tests can drive `scheduleWatcherRefresh` deterministically instead of sleeping.
+  /// so tests can drive `scheduleWatcherRefresh` deterministically instead of sleeping. A live
+  /// FSEvents delivery can cancel-replace the awaited task mid-wait, so drain until the awaited
+  /// generation is the one that actually ran.
   func waitForPendingWatcherRefresh() async {
-    await watcherRefreshTask?.value
+    while let task = watcherRefreshTask {
+      let generation = watcherRefreshGeneration
+      await task.value
+      if watcherRefreshGeneration == generation { return }
+    }
   }
 
   /// Deterministic sync point for exclusion/root-removal tests and callers that need the forced
@@ -431,7 +442,7 @@ final class FolderManager {
   }
 
   func noteSelfWrite(at url: URL) {
-    recentSelfWritePaths[url.standardizedFileURL.path] = Date()
+    recentSelfWritePaths[FileWatcherEvent.canonicalPath(for: url.path)] = Date()
   }
 
   /// Starts one off-main reconcile for explicit one-shot callers (create, save, move, trash).
@@ -552,12 +563,64 @@ final class FolderManager {
   /// independent signature comparisons and required publications hop back to the main actor.
   /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
   func scheduleWatcherRefresh(into appState: AppState) {
+    watcherRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
       try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
       guard !Task.isCancelled else { return }
       guard let self, let appState else { return }
       await self.performWatcherRefresh(into: appState)
+    }
+  }
+
+  /// Filters only events whose path is the exact path (or a descendant) this process recently
+  /// wrote. A mixed FSEvents batch therefore keeps unrelated external mutations, and stream-loss
+  /// or root-change markers always run the full safe reconcile regardless of self-write history.
+  func actionableWatcherEvents(_ events: [FileWatcher.Event]) -> [FileWatcher.Event] {
+    pruneExpiredSelfWrites()
+    guard !recentSelfWritePaths.isEmpty else { return events }
+
+    return events.filter { event in
+      guard !event.requiresFullReconcile else { return true }
+      return !recentSelfWritePaths.keys.contains { selfWritePath in
+        event.path == selfWritePath || event.path.hasPrefix(selfWritePath + "/")
+      }
+    }
+  }
+
+  /// Drops events the workspace scanner can never surface, mirroring `shouldInclude` plus the
+  /// W1-A signature truth that only folders and supported documents carry freshness weight:
+  /// hidden or `WorkspaceDefaults.excludedNames` components below a root, and flagged-as-file
+  /// events on unsupported names (atomic-save `<name>.sb-*` temp siblings, logs, images). The
+  /// exceptions are load-bearing: `.gitignore` content drives ignore rules so its change must
+  /// rescan, events without an is-file flag are kept (no negative evidence), and stream-loss or
+  /// root-changed markers always survive. Self-write suppression stays a separate, noted-paths
+  /// concern.
+  func scannerVisibleWatcherEvents(
+    _ events: [FileWatcher.Event],
+    rootPaths: [String]
+  ) -> [FileWatcher.Event] {
+    events.filter { event in
+      guard !event.requiresFullReconcile else { return true }
+      guard
+        let root = rootPaths.first(where: {
+          event.path == $0 || event.path.hasPrefix($0 + "/")
+        })
+      else { return true }
+      let components = event.path.dropFirst(root.count).split(separator: "/").map(String.init)
+      guard let name = components.last else { return true }
+      func invisible(_ component: String) -> Bool {
+        component.hasPrefix(".") || WorkspaceDefaults.excludedNames.contains(component)
+      }
+      if components.dropLast().contains(where: invisible) { return false }
+      if name == ".gitignore" { return true }
+      if invisible(name) { return false }
+      if event.flags.contains(.itemIsFile),
+        !WorkspaceScanner.isMarkdownFile(URL(fileURLWithPath: event.path))
+      {
+        return false
+      }
+      return true
     }
   }
 
@@ -1712,11 +1775,25 @@ final class FolderManager {
     }
 
     do {
-      try watcher.start(watching: urls) { [weak self, weak appState] in
+      try watcher.start(watching: urls) { [weak self, weak appState] events in
+        let deliveredOffMain = !Thread.isMainThread
         Task { @MainActor in
           guard let self, let appState else { return }
-          guard !self.shouldSuppressWatcherRefresh(into: appState) else { return }
-          // RC-2: coalesce bursts + run the expensive .md scan off the main actor.
+          let rootPaths = appState.workspaceRoots.map {
+            FileWatcherEvent.canonicalPath(for: $0.url.path)
+          }
+          let visibleEvents = self.scannerVisibleWatcherEvents(events, rootPaths: rootPaths)
+          let actionableEvents = self.actionableWatcherEvents(visibleEvents)
+          let requiresFullReconcile = actionableEvents.contains(where: \.requiresFullReconcile)
+          DebugTrace.log(
+            "watcher events=\(events.count) visible=\(visibleEvents.count) "
+              + "actionable=\(actionableEvents.count) "
+              + "full=\(requiresFullReconcile) deliveryOffMain=\(deliveredOffMain) "
+              + "paths=\(events.map { "\($0.path):\($0.flags.rawValue)" }.joined(separator: ","))"
+          )
+          guard !actionableEvents.isEmpty else { return }
+          // FolderManager is the sole application-level coalescer. Every surviving path batch
+          // feeds W1-A's canonical full snapshot; flags only prevent unsafe path-level trust.
           self.scheduleWatcherRefresh(into: appState)
         }
       }
@@ -1787,17 +1864,6 @@ final class FolderManager {
       return "\(rootCount) folders"
     default:
       return "\(rootCount) folders and \(fileCount) files"
-    }
-  }
-
-  private func shouldSuppressWatcherRefresh(into appState: AppState) -> Bool {
-    pruneExpiredSelfWrites()
-    guard !recentSelfWritePaths.isEmpty else { return false }
-
-    let workspaceRoots = appState.workspaceRoots.map(\.url)
-    return recentSelfWritePaths.keys.contains { path in
-      let url = URL(fileURLWithPath: path)
-      return workspaceRoots.contains { WorkspaceScanner.contains(url, in: $0) }
     }
   }
 

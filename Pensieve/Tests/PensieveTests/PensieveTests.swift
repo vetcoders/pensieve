@@ -5444,6 +5444,17 @@ final class PensieveSmokeTests: XCTestCase {
       try? FileManager.default.removeItem(at: folder)
     }
 
+    // Production topology: the index database lives in Application Support, never inside a
+    // watched root. With per-path self-write filtering, SQLite churn inside the watched folder
+    // would otherwise count as an external mutation and break this contract's premise.
+    let support = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSelfWriteWatcherSupport-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: support)
+    }
+
     let noteURL = folder.appendingPathComponent("watched.md")
     try "before save".write(to: noteURL, atomically: true, encoding: .utf8)
 
@@ -5453,7 +5464,7 @@ final class PensieveSmokeTests: XCTestCase {
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let appState = AppState()
-    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: support)
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,

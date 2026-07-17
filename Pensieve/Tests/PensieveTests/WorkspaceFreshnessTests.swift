@@ -282,6 +282,10 @@ final class WorkspaceFreshnessTests: XCTestCase {
         return WorkspaceScanner.defaultBuilder(roots, exclusions)
       },
       workspaceSubstrate: WorkspaceSubstrate(store: cacheStore),
+      // This suite asserts exact scan counts around manually driven reconciles. A live FSEvents
+      // stream on the fixture root would deliver real events for the same mutations and add
+      // machine-timing-dependent scans, so the watcher gets an inert injected source.
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertFileWatcherEventSource() }),
       watcherDebounceMilliseconds: 1
     )
     return Harness(
@@ -384,4 +388,13 @@ private final class SearchWriteRecorder: @unchecked Sendable {
     defer { lock.unlock() }
     return batchSizes.reduce(0, +)
   }
+}
+
+private final class InertFileWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
+  func start(
+    paths: [String],
+    onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void
+  ) throws {}
+
+  func stop() {}
 }
