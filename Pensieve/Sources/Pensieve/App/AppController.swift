@@ -15,6 +15,7 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let documentWindowRegistry: DocumentWindowRegistry
+  let recentDocuments: RecentDocumentsStore
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
@@ -69,6 +70,7 @@ final class AppController: ObservableObject {
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
+    recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
     agentWorkspaceRoot: URL? = nil,
@@ -80,6 +82,7 @@ final class AppController: ObservableObject {
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
+    self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
     self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
@@ -148,6 +151,7 @@ final class AppController: ObservableObject {
     }
 
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
+      noteRecentDocumentIfOpened(standardizedURL)
       return
     }
 
@@ -175,14 +179,41 @@ final class AppController: ObservableObject {
     }
     DebugTrace.log("openFile -> load in current window: \(ref.id.lastPathComponent)")
     documentStore.load(ref: ref, into: appState)
+    noteRecentDocumentIfOpened(standardizedURL)
   }
 
   func openFileInCurrentWindow(url: URL) {
     if DocumentTransfer.isImportable(url) {
+      // Import SOURCE files (Word/PDF) become unsaved drafts; the source is
+      // not a recent document. The draft enters history once saved (saveAs).
       importDocument(url: url)
       return
     }
     folderManager.openFile(url: url, into: appState)
+    noteRecentDocumentIfOpened(url)
+  }
+
+  /// Open Recent menu action: same routing discipline as any explicit open
+  /// (an empty window is reused in place, otherwise the file lands as a native
+  /// tab via the window registry — never a competing window path).
+  func openRecentDocument(url: URL) {
+    let standardizedURL = url.standardizedFileURL
+    guard FileManager.default.fileExists(atPath: standardizedURL.path) else {
+      appState.lastError =
+        "Could not open \(standardizedURL.lastPathComponent): the file has been moved or deleted."
+      recentDocuments.refresh()
+      return
+    }
+    openFile(url: standardizedURL)
+  }
+
+  /// Records `url` into Open Recent only when this window's session actually
+  /// shows it — the one truthful post-condition every synchronous open path
+  /// shares. Failed loads (unreadable, dirty-session cancel) never record.
+  private func noteRecentDocumentIfOpened(_ url: URL) {
+    let standardizedURL = url.standardizedFileURL
+    guard appState.documentSession.url?.standardizedFileURL == standardizedURL else { return }
+    recentDocuments.noteOpened(standardizedURL)
   }
 
   /// Converts a Word/PDF source off the main actor and opens the result as an
@@ -395,10 +426,14 @@ final class AppController: ObservableObject {
   @discardableResult
   func saveActiveDocument(as url: URL) -> Bool {
     let didSave = documentStore.saveAs(appState: appState, to: url)
-    if didSave, let savedURL = appState.documentSession.url,
-      appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(savedURL, in: $0.url) })
-    {
-      folderManager.refresh(into: appState)
+    if didSave, let savedURL = appState.documentSession.url {
+      // A draft (untitled or imported Word/PDF) becomes a real file document
+      // here — that is the moment it earns its Open Recent entry.
+      recentDocuments.noteOpened(savedURL)
+      if appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(savedURL, in: $0.url) }
+      ) {
+        folderManager.refresh(into: appState)
+      }
     }
     return didSave
   }
@@ -438,6 +473,7 @@ final class AppController: ObservableObject {
     }
 
     _ = documentStore.select(ref: ref, into: appState)
+    noteRecentDocumentIfOpened(ref.id)
   }
 
   /// Resolves a sidebar/search row ID to a `DocumentRef`. Resolves via the

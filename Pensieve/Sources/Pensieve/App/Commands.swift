@@ -27,7 +27,8 @@ struct PensieveCommands: Commands {
       ActivePensieveCommands(
         appState: appState,
         controller: controller,
-        themeManager: themeManager
+        themeManager: themeManager,
+        recentDocuments: controller.recentDocuments
       )
     }
   }
@@ -38,6 +39,7 @@ private struct ActivePensieveCommands: Commands {
   var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
+  @ObservedObject var recentDocuments: RecentDocumentsStore
 
   var body: some Commands {
     CommandGroup(replacing: .appInfo) {
@@ -59,6 +61,23 @@ private struct ActivePensieveCommands: Commands {
         openFile()
       }
       .keyboardShortcut("o", modifiers: [.command])
+
+      Menu("Open Recent") {
+        ForEach(recentDocuments.recentDocuments, id: \.self) { url in
+          Button(RecentDocumentsStore.menuTitle(for: url)) {
+            controller.openRecentDocument(url: url)
+          }
+        }
+
+        if !recentDocuments.recentDocuments.isEmpty {
+          Divider()
+        }
+
+        Button("Clear Menu") {
+          recentDocuments.clear()
+        }
+        .disabled(recentDocuments.recentDocuments.isEmpty)
+      }
 
       Button("Import Word or PDF…") {
         importDocument()
