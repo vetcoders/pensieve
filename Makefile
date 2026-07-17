@@ -108,6 +108,11 @@ ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
 .PHONY: test-ui
 test-ui: ui-smoke  ## Alias for the accessibility UI smoke harness
 
+.PHONY: bugmap-smoke
+bugmap-smoke:  ## BUGMAP P0 runtime matrix against dist/Pensieve.app (EVIDENCE_DIR=…)
+	@$(SCRIPTS)/bugmap-p0-smoke.sh --app "$(APP_BUNDLE)" \
+		--evidence "$(or $(EVIDENCE_DIR),dist/bugmap-evidence)"
+
 .PHONY: lint
 lint:  ## Required format check; fails if swift-format is missing
 	@if ! command -v swift-format >/dev/null 2>&1; then \
