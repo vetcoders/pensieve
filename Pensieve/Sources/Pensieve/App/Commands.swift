@@ -318,14 +318,15 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("[", modifiers: [.command, .shift])
     }
 
-    // Agents menu — fast dispatch path for the ACTIVE document: default agent,
-    // workspace root, workflow from the curated deck. The toolbar ✈ sheet stays
-    // the configurable path (agent/root pickers, in-sheet confirmation).
+    // Agents menu — every item opens the SAME configuration sheet as the
+    // toolbar ✈ (one gateway: subject + workflow/agent/root pickers + explicit
+    // Dispatch confirmation). A menu click never launches a run by itself; it
+    // only preselects the clicked workflow for the ACTIVE document.
     // Sandboxed (App Store) build: items stay visible but disabled — dispatch
     // spawns external processes the sandbox forbids (SandboxCapabilities).
     CommandMenu("Agents") {
-      Button("Dispatch Document to Agent") {
-        controller.dispatchCurrentDocumentToAgent(workflow: "implement")
+      Button("Dispatch Document to Agent…") {
+        controller.requestCurrentDocumentDispatch(workflow: "implement", source: .agentsMenu)
       }
       .keyboardShortcut("d", modifiers: [.command, .shift])
       .disabled(
@@ -336,8 +337,9 @@ private struct ActivePensieveCommands: Commands {
 
       Menu("Dispatch Document with Workflow") {
         ForEach(controller.agentWorkflows, id: \.self) { workflow in
-          Button(workflow) {
-            controller.dispatchCurrentDocumentToAgent(workflow: workflow)
+          Button("\(workflow)…") {
+            controller.requestCurrentDocumentDispatch(
+              workflow: workflow, source: .agentsWorkflowMenu)
           }
         }
       }

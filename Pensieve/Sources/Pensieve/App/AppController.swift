@@ -29,11 +29,12 @@ final class AppController: ObservableObject {
   /// Agents discovered at runtime from `vibecrafted doctor` (agent-stream:<name>).
   /// `discoverAgents()` refines this, but it only overwrites on a NON-empty probe,
   /// and current `vibecrafted doctor` output no longer emits `agent-stream:<name>`
-  /// markers — so this seed is what the picker actually shows. Seed the full
-  /// canonical fleet (matches the `vibecrafted` command deck) instead of a single
-  /// agent, so the operator can pick any of them without waiting on broken probing.
+  /// markers — so this seed is what the picker actually shows. Seed the canonical
+  /// fleet the live CLI actually accepts (gemini was removed from the deployed
+  /// AGENTS set); offering an agent the CLI rejects turns a confirmed dispatch
+  /// into a guaranteed failure.
   @Published var availableAgents: [String] = [
-    "claude", "codex", "gemini", "agy", "junie", "grok",
+    "claude", "codex", "agy", "junie", "grok",
   ]
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
@@ -646,35 +647,72 @@ final class AppController: ObservableObject {
     )
   }
 
+  // MARK: - Dispatch gateway (request → sheet → confirm)
+
+  /// Gateway entry for the CURRENT document (toolbar ✈, Agents menu, Agents
+  /// workflow submenu). Builds the typed intent and asks THIS window's
+  /// `ContentView` to present the canonical configuration sheet — it never
+  /// launches anything. A saved document dispatches as a file, an unsaved
+  /// buffer as its text; both stay editable in the sheet before Dispatch.
   @discardableResult
-  func dispatchCurrentDocumentToAgent(workflow: String) -> Bool {
+  func requestCurrentDocumentDispatch(
+    workflow: String,
+    source: DispatchIntent.Source,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) -> Bool {
+    guard allowsExternalDispatch else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
     guard appState.documentSession.hasEditableBuffer else {
       appState.lastError = "Open an editable document before dispatching to an agent."
       return false
     }
 
+    let subject: DispatchIntent.Subject
     if let url = appState.documentSession.url {
-      return dispatchFileToAgent(workflow: workflow, url: url)
+      subject = .savedDocument(url)
+    } else {
+      subject = .unsavedBuffer(
+        title: appState.documentSession.displayTitle,
+        text: appState.activeDocumentText
+      )
     }
-
-    return dispatchToAgent(
-      workflow: workflow,
-      payload: .prompt(appState.activeDocumentText),
-      label: appState.documentSession.displayTitle
-    )
+    appState.pendingDispatchIntent = DispatchIntent(
+      subject: subject, workflow: workflow, source: source)
+    return true
   }
 
+  /// Gateway entry for a sidebar file action: same sheet, `.file` subject.
   @discardableResult
-  func dispatchFileToAgent(workflow: String, url: URL) -> Bool {
-    dispatchToAgent(
-      workflow: workflow,
-      payload: .file(url.path),
-      label: url.lastPathComponent
-    )
+  func requestFileDispatch(
+    url: URL,
+    workflow: String,
+    source: DispatchIntent.Source,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) -> Bool {
+    guard allowsExternalDispatch else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
+    appState.pendingDispatchIntent = DispatchIntent(
+      subject: .fileURL(url.standardizedFileURL), workflow: workflow, source: source)
+    return true
   }
 
+  /// Default run root the sheet opens with: the injected override (tests,
+  /// scripted launches) wins, then the W1-B remembered root, then workspace/
+  /// document/home fallbacks — the same chain the launch itself uses.
+  func defaultDispatchRoot() -> URL {
+    appState.resolveDispatchRoot(explicitOverride: agentWorkspaceRoot)
+  }
+
+  /// Transcription tafla's "send to agent" funnel. This is NOT a blind UI
+  /// route: it only fires from the tafla's explicit send control, on the
+  /// dictated text itself. Private so no menu/toolbar/sidebar surface can
+  /// reach a launch without the gateway sheet.
   @discardableResult
-  func dispatchToAgent(
+  private func dispatchToAgent(
     workflow: String,
     payload: AgentDispatchPayload,
     label: String,
@@ -803,28 +841,43 @@ final class AppController: ObservableObject {
     case failure(message: String)
   }
 
-  /// Headless dispatch of the OPEN document via the canonical uv-core entry,
-  /// which prints a parseable launch receipt (run_id / report path) and detaches.
-  /// Returns the outcome so the sheet can show "Dispatched ✓ run: …". The plan is
-  /// always the open document (--file); `rootURL` is only WHERE the agent runs
-  /// (--root). Terminal observability is a separate, user-triggered affordance
+  /// The ONLY UI → launch path: headless dispatch of a confirmed intent via
+  /// the canonical uv-core entry, which prints a parseable launch receipt
+  /// (run_id / report path) and detaches. Called exclusively by the gateway
+  /// sheet's Dispatch button; the sheet shows "Dispatched ✓ run: …" from the
+  /// returned outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
+  /// values; the payload comes from the intent's subject snapshot. Terminal
+  /// observability is a separate, user-triggered affordance
   /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
-  func dispatchOpenDocument(workflow: String, agent: String, rootURL: URL) async
-    -> DocumentDispatchOutcome
-  {
-    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+  func confirmDispatch(
+    intent: DispatchIntent,
+    workflow: String,
+    agent: String,
+    rootURL: URL,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) async -> DocumentDispatchOutcome {
+    guard allowsExternalDispatch else {
       return .failure(message: SandboxCapabilities.dispatchUnavailableExplanation)
     }
-    guard let docURL = appState.documentSession.url else {
-      return .failure(message: "Save the document before dispatching it to an agent.")
+    let payload = intent.payload
+    guard !payload.isEmpty else {
+      return .failure(message: "There is nothing to dispatch — the document is empty.")
     }
+    // Second line of defense behind the sheet's synchronous phase guard: even
+    // if two confirmations race in, only one may reach the launcher.
+    guard !isAgentDispatchInFlight else {
+      return .failure(message: "A dispatch is already running. Wait for it to finish.")
+    }
+    isAgentDispatchInFlight = true
+    defer { isAgentDispatchInFlight = false }
+
     let launcher = agentPromptLauncher
-    let title = appState.documentSession.displayTitle
+    let title = intent.subjectLabel
     do {
       let metadata = try await Task.detached(priority: .userInitiated) {
         try launcher.dispatch(
           workflow: workflow, agent: agent,
-          payload: .file(docURL.path), workingDirectoryURL: rootURL)
+          payload: payload, workingDirectoryURL: rootURL)
       }.value
       guard metadata.exitCode == 0 else {
         appState.lastError = metadata.statusLine

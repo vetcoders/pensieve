@@ -62,7 +62,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
   }
 
   @MainActor
-  func testDispatchOpenDocumentReturnsFailureWithoutSavedDocument() async {
+  func testConfirmDispatchRefusesEmptyDraftWithoutLaunching() async {
     let appState = AppState()
     let launcher = RecordingAgentPromptLauncher()
     let controller = AppController(
@@ -72,21 +72,26 @@ final class AgentPromptDispatcherTests: XCTestCase {
       transcriptionService: TranscriptionService(cadenceCommitNanoseconds: 0),
       agentPromptLauncher: launcher
     )
+    let emptyDraft = DispatchIntent(
+      subject: .unsavedBuffer(title: "Untitled", text: "   \n"),
+      workflow: "workflow",
+      source: .toolbar)
 
-    let outcome = await controller.dispatchOpenDocument(
+    let outcome = await controller.confirmDispatch(
+      intent: emptyDraft,
       workflow: "workflow",
       agent: "codex",
       rootURL: URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true))
 
     guard case .failure(let message) = outcome else {
-      return XCTFail("Expected unsaved documents to fail dispatch")
+      return XCTFail("Expected an empty draft to fail dispatch")
     }
-    XCTAssertEqual(message, "Save the document before dispatching it to an agent.")
+    XCTAssertEqual(message, "There is nothing to dispatch — the document is empty.")
     XCTAssertTrue(launcher.requests().isEmpty)
   }
 
   @MainActor
-  func testDispatchOpenDocumentReturnsSuccessOutcomeAndUpdatesStatus() async {
+  func testConfirmDispatchReturnsSuccessOutcomeAndUpdatesStatus() async {
     let documentURL = URL(fileURLWithPath: "/tmp/pensieve-dispatch-note.md").standardizedFileURL
     let rootURL = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
       .standardizedFileURL
@@ -113,7 +118,9 @@ final class AgentPromptDispatcherTests: XCTestCase {
       agentPromptLauncher: launcher
     )
 
-    let outcome = await controller.dispatchOpenDocument(
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .savedDocument(documentURL), workflow: "workflow", source: .toolbar),
       workflow: "workflow",
       agent: "codex",
       rootURL: rootURL)
@@ -124,7 +131,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(runID, "work-260615-success")
     XCTAssertEqual(receivedReportPath, reportPath)
     let expectedStatusLine =
-      "Dispatched pensieve-dispatch-note → workflow (codex) in pensieve-dispatch-root"
+      "Dispatched pensieve-dispatch-note.md → workflow (codex) in pensieve-dispatch-root"
     XCTAssertEqual(statusLine, expectedStatusLine)
     XCTAssertNil(appState.lastError)
     XCTAssertEqual(
@@ -142,7 +149,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
   }
 
   @MainActor
-  func testDispatchOpenDocumentReturnsFailureOutcomeForNonZeroLauncherExit() async {
+  func testConfirmDispatchReturnsFailureOutcomeForNonZeroLauncherExit() async {
     let documentURL = URL(fileURLWithPath: "/tmp/pensieve-dispatch-failure.md").standardizedFileURL
     let rootURL = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
       .standardizedFileURL
@@ -168,7 +175,9 @@ final class AgentPromptDispatcherTests: XCTestCase {
       agentPromptLauncher: launcher
     )
 
-    let outcome = await controller.dispatchOpenDocument(
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .savedDocument(documentURL), workflow: "workflow", source: .toolbar),
       workflow: "workflow",
       agent: "codex",
       rootURL: rootURL)
@@ -182,10 +191,10 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(launcher.requests().map(\.payload), [.file(documentURL.path)])
   }
 
-  // MARK: - Current-document dispatch (Agents menu route)
+  // MARK: - Current-document gateway request (Agents menu / toolbar routes)
 
   @MainActor
-  func testDispatchCurrentDocumentRefusesWithoutEditableBuffer() {
+  func testRequestCurrentDocumentDispatchRefusesWithoutEditableBuffer() {
     let appState = AppState()
     let launcher = RecordingAgentPromptLauncher()
     let controller = AppController(
@@ -196,17 +205,19 @@ final class AgentPromptDispatcherTests: XCTestCase {
       agentPromptLauncher: launcher
     )
 
-    // The Agents menu items disable on this exact predicate; the method must
-    // refuse on the same state so a stale menu can never fire a blind dispatch.
+    // The Agents menu items disable on this exact predicate; the request must
+    // refuse on the same state so a stale menu can never surface a dead sheet.
     XCTAssertFalse(appState.documentHasEditableBuffer)
-    XCTAssertFalse(controller.dispatchCurrentDocumentToAgent(workflow: "review"))
+    XCTAssertFalse(
+      controller.requestCurrentDocumentDispatch(workflow: "review", source: .agentsMenu))
     XCTAssertEqual(
       appState.lastError, "Open an editable document before dispatching to an agent.")
+    XCTAssertNil(appState.pendingDispatchIntent)
     XCTAssertTrue(launcher.requests().isEmpty)
   }
 
   @MainActor
-  func testDispatchCurrentDocumentRoutesActiveFileAsFilePayload() async {
+  func testRequestThenConfirmRoutesActiveFileAsFilePayload() async {
     let documentURL = URL(fileURLWithPath: "/tmp/pensieve-current-doc.md").standardizedFileURL
     let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
       .standardizedFileURL
@@ -233,10 +244,27 @@ final class AgentPromptDispatcherTests: XCTestCase {
       agentWorkspaceRoot: workspaceRoot
     )
 
+    // The menu click only raises the intent — nothing may launch yet.
     XCTAssertTrue(appState.documentHasEditableBuffer)
-    XCTAssertTrue(controller.dispatchCurrentDocumentToAgent(workflow: "review"))
-    await waitForDispatchStatus(service, containing: "work-current-doc")
+    XCTAssertTrue(
+      controller.requestCurrentDocumentDispatch(workflow: "review", source: .agentsMenu))
+    XCTAssertTrue(launcher.requests().isEmpty)
+    guard let intent = appState.pendingDispatchIntent else {
+      return XCTFail("Expected the request to raise a pending dispatch intent")
+    }
+    XCTAssertEqual(intent.subject, .savedDocument(documentURL))
+    XCTAssertEqual(intent.workflow, "review")
+    XCTAssertEqual(intent.source, .agentsMenu)
 
+    // Only the sheet's confirmation reaches the launcher.
+    let outcome = await controller.confirmDispatch(
+      intent: intent,
+      workflow: intent.workflow,
+      agent: controller.defaultAgent,
+      rootURL: controller.defaultDispatchRoot())
+    guard case .success = outcome else {
+      return XCTFail("Expected confirmed dispatch to succeed")
+    }
     XCTAssertEqual(
       launcher.requests(),
       [
@@ -249,7 +277,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
   }
 
   @MainActor
-  func testDispatchCurrentDocumentRoutesUntitledBufferAsPromptPayload() async {
+  func testRequestThenConfirmRoutesUntitledBufferAsPromptPayload() async {
     let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true)
       .standardizedFileURL
     let appState = AppState()
@@ -274,9 +302,23 @@ final class AgentPromptDispatcherTests: XCTestCase {
     )
 
     XCTAssertTrue(appState.documentHasEditableBuffer)
-    XCTAssertTrue(controller.dispatchCurrentDocumentToAgent(workflow: "workflow"))
-    await waitForDispatchStatus(service, containing: "work-untitled-doc")
+    XCTAssertTrue(
+      controller.requestCurrentDocumentDispatch(workflow: "workflow", source: .agentsWorkflowMenu))
+    XCTAssertTrue(launcher.requests().isEmpty)
+    guard let intent = appState.pendingDispatchIntent else {
+      return XCTFail("Expected the request to raise a pending dispatch intent")
+    }
+    XCTAssertEqual(
+      intent.subject, .unsavedBuffer(title: "Scratch.md", text: "ship the plan"))
 
+    let outcome = await controller.confirmDispatch(
+      intent: intent,
+      workflow: intent.workflow,
+      agent: controller.defaultAgent,
+      rootURL: controller.defaultDispatchRoot())
+    guard case .success = outcome else {
+      return XCTFail("Expected confirmed dispatch to succeed")
+    }
     XCTAssertEqual(
       launcher.requests(),
       [
@@ -286,21 +328,6 @@ final class AgentPromptDispatcherTests: XCTestCase {
           payload: .prompt("ship the plan"),
           workingDirectoryURL: workspaceRoot)
       ])
-  }
-
-  private func waitForDispatchStatus(
-    _ service: TranscriptionService,
-    containing needle: String,
-    timeout: TimeInterval = 1.0
-  ) async {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-      if await MainActor.run(body: { service.dispatchStatus?.contains(needle) == true }) {
-        return
-      }
-      try? await Task.sleep(nanoseconds: 10_000_000)
-    }
-    XCTFail("Timed out waiting for dispatch status containing \(needle)")
   }
 }
 

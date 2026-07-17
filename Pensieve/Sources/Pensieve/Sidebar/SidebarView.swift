@@ -805,14 +805,18 @@ struct SidebarView: View {
     }
   }
 
+  /// Every workflow row opens the canonical configuration sheet with THIS file
+  /// preselected — the click itself never launches a run. Disabled wholesale in
+  /// the sandboxed (App Store) build, matching the toolbar and Agents menu.
   private func dispatchMenu(for url: URL) -> some View {
     Menu("Dispatch to Agent") {
       ForEach(controller.agentWorkflows, id: \.self) { workflow in
-        Button(workflow) {
-          controller.dispatchFileToAgent(workflow: workflow, url: url)
+        Button("\(workflow)…") {
+          controller.requestFileDispatch(url: url, workflow: workflow, source: .sidebar)
         }
       }
     }
+    .disabled(!SandboxCapabilities.allowsExternalAgentDispatch())
   }
 
   private func openExternally(_ url: URL) {

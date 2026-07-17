@@ -8,7 +8,6 @@ struct ContentView: View {
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
-  @State private var showDispatch = false
 
   @MainActor
   init(
@@ -46,7 +45,7 @@ struct ContentView: View {
         controller: controller,
         themeManager: themeManager,
         onDispatchToAgent: {
-          showDispatch = true
+          controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
         },
         isDispatchDisabled:
           !appState.documentHasEditableBuffer
@@ -56,13 +55,18 @@ struct ContentView: View {
           ? "Dispatch to Agent"
           : SandboxCapabilities.dispatchUnavailableExplanation)
     }
-    .sheet(isPresented: $showDispatch) {
+    // The ONE dispatch surface: every route (toolbar, Agents menu, sidebar)
+    // lands as this window's pendingDispatchIntent and presents here, in the
+    // window that raised it. `.sheet(item:)` keys presentation on the intent
+    // itself, so a fresh request while the sheet is up swaps content instead
+    // of queueing a second sheet (W2-G single-presentation discipline).
+    .sheet(item: dispatchIntentBinding) { intent in
       DispatchPopover(
         controller: controller,
-        isPresented: $showDispatch,
-        documentTitle: appState.documentTitle,
-        defaultRoot: appState.resolveDispatchRoot(),
-        onRootSelected: { appState.rememberDispatchRoot($0) }
+        intent: intent,
+        defaultRoot: controller.defaultDispatchRoot(),
+        onRootSelected: { appState.rememberDispatchRoot($0) },
+        onClose: { appState.pendingDispatchIntent = nil }
       )
     }
     .sheet(isPresented: onboardingSheetBinding) {
@@ -101,6 +105,13 @@ struct ContentView: View {
       providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
       evaluateProviderOnboarding()
     }
+  }
+
+  private var dispatchIntentBinding: Binding<DispatchIntent?> {
+    Binding(
+      get: { appState.pendingDispatchIntent },
+      set: { appState.pendingDispatchIntent = $0 }
+    )
   }
 
   private var onboardingSheetBinding: Binding<Bool> {

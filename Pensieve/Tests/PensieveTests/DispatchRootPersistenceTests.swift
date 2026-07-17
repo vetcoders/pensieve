@@ -138,9 +138,21 @@ final class DispatchRootPersistenceTests: XCTestCase {
       agentPromptLauncher: launcher,
       agentWorkspaceRoot: injectedRoot)
 
-    XCTAssertTrue(controller.dispatchCurrentDocumentToAgent(workflow: "review"))
-    try await waitUntil { !launcher.workingDirectories().isEmpty }
+    // The injected override must reach the gateway's default root and, once
+    // the sheet confirms with it, the launcher receipt exactly.
+    XCTAssertTrue(
+      controller.requestCurrentDocumentDispatch(workflow: "review", source: .agentsMenu))
+    let intent = try XCTUnwrap(appState.pendingDispatchIntent)
+    XCTAssertEqual(controller.defaultDispatchRoot(), injectedRoot.standardizedFileURL)
 
+    let outcome = await controller.confirmDispatch(
+      intent: intent,
+      workflow: intent.workflow,
+      agent: "codex",
+      rootURL: controller.defaultDispatchRoot())
+    guard case .success = outcome else {
+      return XCTFail("Expected confirmed dispatch to succeed")
+    }
     XCTAssertEqual(launcher.workingDirectories(), [injectedRoot.standardizedFileURL])
   }
 

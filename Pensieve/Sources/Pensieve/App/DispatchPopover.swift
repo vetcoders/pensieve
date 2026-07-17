@@ -1,20 +1,22 @@
 import AppKit
 import SwiftUI
 
-/// Dispatch configuration SHEET for the toolbar ✈ button.
+/// The CANONICAL dispatch configuration sheet — the only surface that may turn
+/// a `DispatchIntent` into a launch.
 ///
-/// Flow (operator spec): Agent (discovered) → Path (WHERE to run) → Workflow →
-/// summary → Dispatch. The PLAN is always the currently-open document; `rootURL`
-/// only chooses WHERE the agent runs. Dispatch is headless via the canonical
-/// uv-core entry (parseable run_id) and confirms IN the sheet ("Dispatched ✓
-/// run: …") so the user always knows whether it fired. Presented as a `.sheet`
-/// (not a transient popover) so the "Choose…" NSOpenPanel can run as a
-/// sheet-on-sheet without dismissing it and losing the chosen folder.
+/// Every route (toolbar ✈, Agents menu, Agents workflow submenu, sidebar file
+/// actions) raises an intent; this sheet shows the explicit subject, the
+/// preselected workflow, the agent picker, the remembered run root, and a
+/// summary — nothing runs until the user presses Dispatch. Dispatch is headless
+/// via the canonical uv-core entry (parseable run_id) and confirms IN the sheet
+/// ("Dispatched ✓ run: …") so the user always knows whether it fired. Presented
+/// as a `.sheet` (not a transient popover) so the "Choose…" NSOpenPanel can run
+/// as a sheet-on-sheet without dismissing it and losing the chosen folder.
 struct DispatchPopover: View {
   @ObservedObject var controller: AppController
-  @Binding var isPresented: Bool
-  let documentTitle: String
+  let intent: DispatchIntent
   let onRootSelected: (URL) -> Void
+  let onClose: () -> Void
 
   @State private var agent: String
   @State private var workflow: String
@@ -31,19 +33,25 @@ struct DispatchPopover: View {
 
   init(
     controller: AppController,
-    isPresented: Binding<Bool>,
-    documentTitle: String,
+    intent: DispatchIntent,
     defaultRoot: URL,
-    onRootSelected: @escaping (URL) -> Void
+    onRootSelected: @escaping (URL) -> Void,
+    onClose: @escaping () -> Void
   ) {
     self.controller = controller
-    self._isPresented = isPresented
-    self.documentTitle = documentTitle
+    self.intent = intent
     self.onRootSelected = onRootSelected
-    self._agent = State(initialValue: controller.availableAgents.first ?? "codex")
+    self.onClose = onClose
+    // Agent defaults to codex (the ⇧⌘D default) whenever the fleet offers it;
+    // the picker stays fully editable before Dispatch.
+    let agents = controller.availableAgents
+    self._agent = State(
+      initialValue: agents.contains(controller.defaultAgent)
+        ? controller.defaultAgent : (agents.first ?? controller.defaultAgent))
+    // Workflow preselects whatever the user clicked to get here.
     self._workflow = State(
-      initialValue: controller.agentWorkflows.contains("implement")
-        ? "implement" : (controller.agentWorkflows.first ?? "implement"))
+      initialValue: controller.agentWorkflows.contains(intent.workflow)
+        ? intent.workflow : (controller.agentWorkflows.first ?? intent.workflow))
     self._rootURL = State(initialValue: defaultRoot)
   }
 
@@ -54,10 +62,31 @@ struct DispatchPopover: View {
     }
   }
 
+  private var subjectDetail: String {
+    switch intent.subject {
+    case .savedDocument(let url), .fileURL(let url):
+      return url.path
+    case .unsavedBuffer:
+      return "The draft's text is sent as the prompt."
+    }
+  }
+
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Dispatch to Agent")
         .font(.headline)
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Subject").font(.caption).foregroundStyle(.secondary)
+        Text(intent.subjectLabel)
+          .font(.system(size: 12, weight: .semibold))
+          .lineLimit(1)
+          .accessibilityIdentifier("pensieve.dispatch.subject")
+        Text(subjectDetail)
+          .font(.system(size: 11)).foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.head)
+      }
 
       Picker("Agent", selection: $agent) {
         ForEach(controller.availableAgents, id: \.self) { Text($0).tag($0) }
@@ -91,7 +120,7 @@ struct DispatchPopover: View {
         Text("Summary").font(.caption).foregroundStyle(.secondary)
         Text("\(workflow) · \(agent)")
           .font(.system(size: 12, weight: .semibold))
-        Text("plan: \(documentTitle)")
+        Text("subject: \(intent.subjectLabel)")
           .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
         Text("where: \(rootURL.lastPathComponent)")
           .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -114,9 +143,15 @@ struct DispatchPopover: View {
           .font(.system(size: 11)).foregroundStyle(.red).lineLimit(3)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
+      if intent.subjectIsEmpty {
+        Text("This document is empty. Write something before dispatching.")
+          .font(.system(size: 11)).foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("pensieve.dispatch.emptySubjectNote")
+      }
       HStack {
         Spacer()
-        Button("Cancel") { isPresented = false }
+        Button("Cancel") { onClose() }
           .keyboardShortcut(.cancelAction)
         Button("Dispatch") {
           // Synchronous re-entry guard: flip to .dispatching in the tap handler
@@ -128,6 +163,7 @@ struct DispatchPopover: View {
           Task { await runDispatch() }
         }
         .keyboardShortcut(.defaultAction)
+        .disabled(intent.subjectIsEmpty)
         .accessibilityIdentifier("pensieve.dispatch.confirm")
       }
     case .dispatching:
@@ -158,7 +194,7 @@ struct DispatchPopover: View {
             }
           }
           Spacer()
-          Button("Done") { isPresented = false }
+          Button("Done") { onClose() }
             .keyboardShortcut(.defaultAction)
         }
       }
@@ -168,8 +204,8 @@ struct DispatchPopover: View {
   private func runDispatch() async {
     // phase is already .dispatching (set synchronously by the Dispatch button's
     // re-entry guard) before this Task runs.
-    let outcome = await controller.dispatchOpenDocument(
-      workflow: workflow, agent: agent, rootURL: rootURL)
+    let outcome = await controller.confirmDispatch(
+      intent: intent, workflow: workflow, agent: agent, rootURL: rootURL)
     switch outcome {
     case .success(let runID, let reportPath, _):
       phase = .dispatched(runID: runID, reportPath: reportPath)

@@ -280,6 +280,13 @@ final class AppState {
     set { windowModel.lastError = newValue }
   }
 
+  /// The dispatch-gateway request for THIS window. Menu/toolbar/sidebar
+  /// surfaces set it (via `AppController.request…Dispatch`); this window's
+  /// `ContentView` presents the canonical configuration sheet for it and
+  /// clears it on dismissal. Stored per window, so a request raised from the
+  /// focused window can never surface a sheet in another one.
+  var pendingDispatchIntent: DispatchIntent?
+
   var activeDocumentURL: URL? {
     get {
       documentSession.url
