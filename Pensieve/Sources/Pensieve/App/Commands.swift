@@ -520,16 +520,7 @@ private struct ActivePensieveCommands: Commands {
 
   private func moveSidebarTargetToTrash() {
     guard let url = sidebarActionTargetURL else { return }
-    if isDirectory(url) {
-      let alert = NSAlert()
-      alert.messageText = "Move \(url.lastPathComponent) to Trash?"
-      alert.informativeText = "This folder and its contents will move to the system Trash."
-      alert.alertStyle = .warning
-      alert.addButton(withTitle: "Move to Trash")
-      alert.addButton(withTitle: "Cancel")
-      guard alert.runModal() == .alertFirstButtonReturn else { return }
-    }
-    controller.moveItemToTrash(url: url)
+    Task { await controller.moveItemToTrash(url: url) }
   }
 
   private func excludeFromWorkspace() {

@@ -272,23 +272,57 @@ final class FolderManager {
   }
 
   @discardableResult
-  func moveToTrash(url: URL, into appState: AppState) -> Bool {
+  func moveToTrash(url: URL, into appState: AppState) async -> Bool {
     let source = url.standardizedFileURL
-    appState.lastError = nil
-    recycleItems([source]) { [weak self, weak appState] _, error in
-      Task { @MainActor in
-        guard let self, let appState else { return }
-        if let error {
-          appState.lastError =
-            "Could not move \(source.lastPathComponent) to Trash: \(error.localizedDescription)"
-          return
+    let recycleStartedAt = DispatchTime.now().uptimeNanoseconds
+    let recycleResult: (errorDescription: String?, completedAt: UInt64) =
+      await withCheckedContinuation { continuation in
+        recycleItems([source]) { _, error in
+          continuation.resume(
+            returning: (error?.localizedDescription, DispatchTime.now().uptimeNanoseconds)
+          )
         }
-        self.noteSelfWrite(at: source)
-        self.removeReferences(for: source, into: appState)
-        self.refresh(into: appState)
-        appState.lastError = nil
       }
+    let finderMilliseconds = Self.elapsedMilliseconds(
+      from: recycleStartedAt,
+      to: recycleResult.completedAt
+    )
+    DebugTrace.log(
+      "trash recycle completed path=\(source.path) finder_ms=\(Self.traceMilliseconds(finderMilliseconds)) outcome=\(recycleResult.errorDescription == nil ? "success" : "failure")"
+    )
+
+    if let errorDescription = recycleResult.errorDescription {
+      appState.lastError =
+        "Could not move \(source.lastPathComponent) to Trash: \(errorDescription)"
+      return false
     }
+
+    let pruneStartedAt = DispatchTime.now().uptimeNanoseconds
+    appState.workspaceTree = Self.prunedWorkspaceTree(
+      appState.workspaceTree,
+      removing: source
+    )
+    let pruneCompletedAt = DispatchTime.now().uptimeNanoseconds
+    DebugTrace.log(
+      "trash tree pruned path=\(source.path) completion_to_prune_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: recycleResult.completedAt, to: pruneCompletedAt))) prune_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: pruneStartedAt, to: pruneCompletedAt)))"
+    )
+
+    removeReferences(for: source, into: appState)
+    noteSelfWrite(at: source)
+    appState.lastError = nil
+
+    let reconcileStartedAt = DispatchTime.now().uptimeNanoseconds
+    let reconcileTask = scheduleExplicitRefresh(
+      into: appState,
+      forcePresentation: true
+    )
+    await reconcileTask?.value
+    let indexTask = indexUpdateTask
+    await indexTask?.value
+    let reconcileCompletedAt = DispatchTime.now().uptimeNanoseconds
+    DebugTrace.log(
+      "trash reconcile completed path=\(source.path) reconcile_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: reconcileStartedAt, to: reconcileCompletedAt))) finder_ms=\(Self.traceMilliseconds(finderMilliseconds))"
+    )
     return true
   }
 
@@ -332,7 +366,11 @@ final class FolderManager {
   private func removeReferences(for source: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
     let sourcePath = sourceURL.path
+    appState.documents.removeAll { isSameOrDescendant($0.url.path, of: sourcePath) }
     appState.openFiles.removeAll { isSameOrDescendant($0.url.path, of: sourcePath) }
+    appState.workspaceSearchResults.removeAll {
+      isSameOrDescendant($0.document.url.path, of: sourcePath)
+    }
     if let selected = appState.selectedDocumentID,
       isSameOrDescendant(selected.path, of: sourcePath)
     {
@@ -343,6 +381,52 @@ final class FolderManager {
 
   private func isSameOrDescendant(_ path: String, of ancestorPath: String) -> Bool {
     return path == ancestorPath || path.hasPrefix(ancestorPath + "/")
+  }
+
+  /// Pure presentation mutation used only after Finder confirms the recycle. It removes the
+  /// target node as one subtree, so empty and unsupported-only folders disappear without waiting
+  /// for FSEvents or walking the filesystem on the main actor. Node URLs are compared by raw
+  /// path: WorkspaceScanner standardizes every node URL at construction, and re-standardizing
+  /// per node here is what would push a large-tree prune past its latency budget.
+  nonisolated static func prunedWorkspaceTree(
+    _ nodes: [WorkspaceNode],
+    removing source: URL
+  ) -> [WorkspaceNode] {
+    let sourcePath = source.standardizedFileURL.path
+    return nodes.compactMap { prunedWorkspaceNode($0, removingPath: sourcePath) }
+  }
+
+  private nonisolated static func prunedWorkspaceNode(
+    _ node: WorkspaceNode,
+    removingPath sourcePath: String
+  ) -> WorkspaceNode? {
+    if let nodePath = node.url?.path {
+      if nodePath == sourcePath || nodePath.hasPrefix(sourcePath + "/") {
+        return nil
+      }
+      // Only an ancestor of the source can hold it in its subtree; every other
+      // sibling subtree survives unchanged, without a per-node copy walk.
+      guard sourcePath.hasPrefix(nodePath + "/") else { return node }
+    }
+
+    var prunedNode = node
+    if let children = node.children {
+      prunedNode.children = children.compactMap {
+        prunedWorkspaceNode($0, removingPath: sourcePath)
+      }
+    }
+    return prunedNode
+  }
+
+  private nonisolated static func elapsedMilliseconds(
+    from start: UInt64, to end: UInt64
+  ) -> Double {
+    guard end >= start else { return 0 }
+    return Double(end - start) / 1_000_000
+  }
+
+  private nonisolated static func traceMilliseconds(_ value: Double) -> String {
+    String(format: "%.3f", value)
   }
 
   private func availableDuplicateURL(for source: URL) -> URL {
@@ -632,14 +716,15 @@ final class FolderManager {
     scheduleExplicitRefresh(into: appState, forcePresentation: true)
   }
 
+  @discardableResult
   private func scheduleExplicitRefresh(
     into appState: AppState,
     forcePresentation: Bool
-  ) {
-    guard appState.hasWorkspaceContent else { return }
+  ) -> Task<Void, Never>? {
+    guard appState.hasWorkspaceContent else { return nil }
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
-    forcedRefreshTask = Task { [weak self, weak appState] in
+    let task = Task { [weak self, weak appState] in
       guard let self, let appState, appState.hasWorkspaceContent else { return }
       let roots = appState.workspaceRoots.map(\.url)
       let rootPaths = roots.map { $0.standardizedFileURL.path }
@@ -666,6 +751,8 @@ final class FolderManager {
         forcePresentation: forcePresentation
       )
     }
+    forcedRefreshTask = task
+    return task
   }
 
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run

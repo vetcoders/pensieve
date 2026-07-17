@@ -664,7 +664,7 @@ struct SidebarView: View {
     }
 
     Button("Move to Trash") {
-      controller.moveItemToTrash(url: doc.url)
+      Task { await controller.moveItemToTrash(url: doc.url) }
     }
 
     Divider()
@@ -727,7 +727,7 @@ struct SidebarView: View {
         }
 
         Button("Move to Trash") {
-          controller.moveItemToTrash(url: url)
+          Task { await controller.moveItemToTrash(url: url) }
         }
 
         Divider()
@@ -779,8 +779,12 @@ struct SidebarView: View {
         controller.duplicateItem(url: url)
       }
 
-      Button("Move to Trash") {
-        confirmMoveFolderToTrash(url)
+      // Workspace roots are detached through "Remove Folder from Workspace";
+      // AppController.moveItemToTrash rejects them, so don't offer the item.
+      if !isWorkspaceRoot(url) {
+        Button("Move to Trash") {
+          Task { await controller.moveItemToTrash(url: url) }
+        }
       }
 
       Divider()
@@ -885,18 +889,6 @@ struct SidebarView: View {
   private func cancelRename() {
     renamingURL = nil
     renameText = ""
-  }
-
-  private func confirmMoveFolderToTrash(_ url: URL) {
-    let alert = NSAlert()
-    alert.messageText = "Move \(url.lastPathComponent) to Trash?"
-    alert.informativeText = "This folder and its contents will move to the system Trash."
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "Move to Trash")
-    alert.addButton(withTitle: "Cancel")
-    if alert.runModal() == .alertFirstButtonReturn {
-      controller.moveItemToTrash(url: url)
-    }
   }
 
   private func handleDrop(_ providers: [NSItemProvider], into folderURL: URL?) -> Bool {

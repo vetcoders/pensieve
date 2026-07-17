@@ -10,6 +10,8 @@ private enum DocumentImportOutcome: Sendable {
 
 @MainActor
 final class AppController: ObservableObject {
+  typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+
   private let appState: AppState
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
@@ -20,6 +22,7 @@ final class AppController: ObservableObject {
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
+  private let confirmFolderTrash: FolderTrashConfirmation
   let agentWorkflows: [String] = [
     "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
     "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
@@ -76,7 +79,16 @@ final class AppController: ObservableObject {
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
     agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
-    workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
+    workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000,
+    confirmFolderTrash: @escaping FolderTrashConfirmation = { url in
+      let alert = NSAlert()
+      alert.messageText = "Move \(url.lastPathComponent) to Trash?"
+      alert.informativeText = "This folder and its contents will move to the system Trash."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Move to Trash")
+      alert.addButton(withTitle: "Cancel")
+      return alert.runModal() == .alertFirstButtonReturn
+    }
   ) {
     self.appState = appState
     self.folderManager = folderManager
@@ -89,6 +101,7 @@ final class AppController: ObservableObject {
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
+    self.confirmFolderTrash = confirmFolderTrash
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -328,28 +341,46 @@ final class AppController: ObservableObject {
     folderManager.duplicate(url: url, into: appState)
   }
 
-  @discardableResult
-  func moveItemToTrash(url: URL) -> Bool {
+  func moveItemToTrash(url: URL) async -> Bool {
     let source = url.standardizedFileURL
-    guard closeDocumentsAffectedByTrash(at: source) else { return false }
-    return folderManager.moveToTrash(url: source, into: appState)
-  }
+    DebugTrace.log("trash request path=\(source.path)")
 
-  @discardableResult
-  private func closeDocumentsAffectedByTrash(at source: URL) -> Bool {
-    if let selected = appState.selectedDocumentID,
-      isAffectedByTrash(documentID: selected, source: source)
-    {
-      guard documentStore.select(ref: nil, into: appState) else { return false }
+    guard !isWorkspaceRoot(source) else {
+      appState.lastError =
+        "Workspace roots can’t be moved to Trash. Remove the folder from the workspace first, then move it in Finder."
+      DebugTrace.log("trash request rejected root=\(source.path)")
+      return false
     }
 
+    if isDirectory(source), !confirmFolderTrash(source) {
+      DebugTrace.log("trash request cancelled path=\(source.path)")
+      return false
+    }
+
+    guard await folderManager.moveToTrash(url: source, into: appState) else { return false }
+    closeDocumentWindowsAffectedByTrash(at: source)
+    return true
+  }
+
+  private func closeDocumentWindowsAffectedByTrash(at source: URL) {
     let affectedDocumentIDs = documentWindowRegistry.openTabDocumentIDs.filter {
       isAffectedByTrash(documentID: $0, source: source)
     }
     for documentID in affectedDocumentIDs {
       documentWindowRegistry.closeDocumentWindow(documentID)
     }
-    return true
+  }
+
+  private func isWorkspaceRoot(_ source: URL) -> Bool {
+    appState.workspaceRoots.contains {
+      $0.url.standardizedFileURL == source.standardizedFileURL
+    }
+  }
+
+  private func isDirectory(_ source: URL) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory)
+      && isDirectory.boolValue
   }
 
   private func isAffectedByTrash(documentID: URL, source: URL) -> Bool {
