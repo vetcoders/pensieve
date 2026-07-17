@@ -104,12 +104,17 @@ delay 0.5
 
 assertMenuItem(appName, "File", "New File…")
 assertMenuItem(appName, "File", "Open File…")
+assertMenuItem(appName, "File", "Open Recent")
 assertMenuItem(appName, "File", "Open Folder…")
 assertMenuItem(appName, "File", "Close")
 assertMenuItem(appName, "Mode", "Source Mode")
 assertMenuItem(appName, "Mode", "Split Mode")
 assertMenuItem(appName, "Format", "Bold")
 assertMenuItem(appName, "Format", "Link")
+-- Dispatch entry points are menu rows that only open the confirmation sheet
+-- (W3-A gateway); their presence in the menu bar is part of the P0 contract.
+assertMenuItem(appName, "Agents", "Dispatch Document to Agent…")
+assertMenuItem(appName, "Agents", "Dispatch Document with Workflow")
 
 tell application "System Events"
   tell process appName

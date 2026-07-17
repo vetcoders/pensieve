@@ -140,7 +140,18 @@ if [[ ${#GUI_BLOCKERS[@]} -gt 0 ]]; then
 else
   # G1+G2+G3 ride the existing accessibility walk (it owns launch, menu and
   # toolbar truth); G4 samples the fresh process during a scripted file open.
-  if "$REPO_ROOT/scripts/ui-smoke.sh" "$APP_PATH" >"$EVIDENCE_DIR/ui-smoke.txt" 2>&1; then
+  # One bounded retry: System Events can drop a stale AppleEvent handle
+  # (-10000) right after a quit+relaunch of the same bundle identifier.
+  UI_SMOKE_OK=0
+  for attempt in 1 2; do
+    if "$REPO_ROOT/scripts/ui-smoke.sh" "$APP_PATH" \
+      >"$EVIDENCE_DIR/ui-smoke.txt" 2>&1; then
+      UI_SMOKE_OK=1
+      break
+    fi
+    [[ "$attempt" -eq 1 ]] && sleep 2
+  done
+  if [[ "$UI_SMOKE_OK" -eq 1 ]]; then
     row PASS G1-launch-ax "ui-smoke launch + window + AX probe green"
     if [[ "$CRITICAL_ONLY" -ne 1 ]]; then
       row PASS G2-menu-census "menu census green (ui-smoke.txt)"
@@ -162,11 +173,16 @@ else
     open -a "$APP_PATH" "$OPEN_FIXTURE" || true
     sample "$SMOKE_PID" 3 -f "$SAMPLE_FILE" >/dev/null 2>&1 || true
     if [[ -s "$SAMPLE_FILE" ]]; then
-      STORM_HITS="$(grep -c "registerOpenFile" "$SAMPLE_FILE" || true)"
-      if [[ "${STORM_HITS:-0}" -le 1 ]]; then
-        row PASS G4-open-sample "sample captured, registerOpenFile frames: ${STORM_HITS:-0} (open-sample.txt)"
+      # `sample` frames carry a leading sample count (1 sample ≈ 1 ms on the
+      # stack). The P0-14 storm was a per-document standardizedFileURL sweep
+      # pinning the main thread for hundreds of ms, so the honest metric is
+      # total samples inside registerOpenFile, not textual occurrences.
+      STORM_SAMPLES="$(sed -nE 's/.*[^0-9]([0-9]+) FolderManager\.registerOpenFile.*/\1/p' \
+        "$SAMPLE_FILE" | awk '{sum += $1} END {print sum + 0}')"
+      if [[ "${STORM_SAMPLES:-0}" -lt 50 ]]; then
+        row PASS G4-open-sample "registerOpenFile on-stack ≈${STORM_SAMPLES:-0}ms of 3000ms sampled (open-sample.txt)"
       else
-        row FAIL G4-open-sample "registerOpenFile appears $STORM_HITS times in a 3s sample (open-sample.txt)"
+        row FAIL G4-open-sample "registerOpenFile on-stack ≈${STORM_SAMPLES}ms in a 3s sample — storm signature (open-sample.txt)"
       fi
     else
       row FAIL G4-open-sample "sample produced no output"
