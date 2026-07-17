@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 @MainActor
 final class FolderManager {
   typealias RecycleItems = ([URL], @escaping @Sendable ([URL: URL], Error?) -> Void) -> Void
+  typealias StandardizeFileURL = (URL) -> URL
 
   static let shared = FolderManager()
   private let watcher = FileWatcher()
@@ -14,6 +15,7 @@ final class FolderManager {
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
   private let workspaceValidationProbe: WorkspaceSubstrate.ValidationProbe
+  private let standardizeFileURL: StandardizeFileURL
   private let recycleItems: RecycleItems
   /// Shares the substrate's cache store so the persisted `.md` signature lands in the SAME
   /// identity-keyed cache directory (`Workspaces/<workspaceID>/`) as the manifest/fingerprint.
@@ -62,6 +64,7 @@ final class FolderManager {
     workspaceValidationProbe: @escaping WorkspaceSubstrate.ValidationProbe = { _ in },
     selfWriteSuppressionInterval: TimeInterval = 1.2,
     watcherDebounceMilliseconds: UInt64 = 300,
+    standardizeFileURL: @escaping StandardizeFileURL = { $0.standardizedFileURL },
     recycleItems: @escaping RecycleItems = { urls, completion in
       NSWorkspace.shared.recycle(urls, completionHandler: completion)
     }
@@ -74,6 +77,7 @@ final class FolderManager {
     self.workspaceValidationProbe = workspaceValidationProbe
     self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
     self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
+    self.standardizeFileURL = standardizeFileURL
     self.recycleItems = recycleItems
   }
 
@@ -133,9 +137,10 @@ final class FolderManager {
       return nil
     }
 
-    let standardizedURL = url.standardizedFileURL
+    let standardizedURL = standardizeFileURL(url)
+    let standardizedPath = standardizedURL.path
     if let ref = appState.allDocuments.first(where: {
-      $0.url.standardizedFileURL == url.standardizedFileURL
+      $0.url.path == standardizedPath
     }) {
       appState.lastError = nil
       return ref
@@ -149,7 +154,7 @@ final class FolderManager {
     }
 
     let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
-    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
+    appState.openFiles.removeAll { $0.id.path == standardizedPath }
     appState.openFiles.append(ref)
     pruneOpenFiles(into: appState, protecting: standardizedURL)
     appState.lastError = nil
@@ -308,11 +313,12 @@ final class FolderManager {
   private func replaceReferences(from source: URL, to target: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
     let targetURL = target.standardizedFileURL
+    let sourcePath = sourceURL.path
 
     appState.openFiles = appState.openFiles.map { ref in
-      ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
+      ref.url.path == sourcePath ? appState.makeDocumentRef(for: targetURL) : ref
     }
-    if appState.selectedDocumentID?.standardizedFileURL == sourceURL {
+    if appState.selectedDocumentID?.path == sourcePath {
       appState.selectedDocumentID = targetURL
       appState.documentSession.document = appState.makeDocumentRef(for: targetURL)
     }
@@ -320,16 +326,17 @@ final class FolderManager {
 
   private func removeReferences(for source: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
-    appState.openFiles.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
-    if let selected = appState.selectedDocumentID, isSameOrDescendant(selected, of: sourceURL) {
+    let sourcePath = sourceURL.path
+    appState.openFiles.removeAll { isSameOrDescendant($0.url.path, of: sourcePath) }
+    if let selected = appState.selectedDocumentID,
+      isSameOrDescendant(selected.path, of: sourcePath)
+    {
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
     }
   }
 
-  private func isSameOrDescendant(_ url: URL, of ancestor: URL) -> Bool {
-    let path = url.standardizedFileURL.path
-    let ancestorPath = ancestor.standardizedFileURL.path
+  private func isSameOrDescendant(_ path: String, of ancestorPath: String) -> Bool {
     return path == ancestorPath || path.hasPrefix(ancestorPath + "/")
   }
 
@@ -493,7 +500,8 @@ final class FolderManager {
     appState.workspaceTree[rootIndex] = rootNode
 
     if kind == .document {
-      appState.documents.removeAll { $0.url.standardizedFileURL == standardizedURL }
+      let standardizedPath = standardizedURL.path
+      appState.documents.removeAll { $0.url.path == standardizedPath }
       appState.documents.append(
         DocumentRef(
           id: standardizedURL,
@@ -502,7 +510,7 @@ final class FolderManager {
           isAdHoc: false
         )
       )
-      appState.openFiles.removeAll { $0.url.standardizedFileURL == standardizedURL }
+      appState.openFiles.removeAll { $0.url.path == standardizedPath }
     }
   }
 
@@ -2668,8 +2676,9 @@ final class DocumentStore {
 
   private func documentRef(for url: URL, appState: AppState) -> DocumentRef {
     let standardizedURL = url.standardizedFileURL
+    let standardizedPath = standardizedURL.path
     if let existing = appState.allDocuments.first(where: {
-      $0.url.standardizedFileURL == standardizedURL
+      $0.url.path == standardizedPath
     }) {
       return existing
     }
@@ -2707,11 +2716,12 @@ final class DocumentStore {
   private func registerSavedDocument(
     _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState
   ) {
-    let isNewSessionURL = previousID?.standardizedFileURL != ref.id.standardizedFileURL
+    let refPath = ref.id.path
+    let isNewSessionURL = previousID?.path != refPath
 
     if ref.isAdHoc {
       if !appState.openFiles.contains(where: {
-        $0.id.standardizedFileURL == ref.id.standardizedFileURL
+        $0.id.path == refPath
       }
       ) {
         appState.openFiles.append(ref)
@@ -2726,7 +2736,7 @@ final class DocumentStore {
         }
       }
     } else if !appState.documents.contains(where: {
-      $0.id.standardizedFileURL == ref.id.standardizedFileURL
+      $0.id.path == refPath
     }) {
       appState.documents.append(ref)
     }
@@ -2793,13 +2803,11 @@ final class DocumentStore {
 private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
   guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
 
-  let activeID =
-    protectedID?.standardizedFileURL
-    ?? appState.selectedDocumentID?.standardizedFileURL
+  let activePath = (protectedID ?? appState.selectedDocumentID)?.path
   var protected: DocumentRef?
   var candidates = appState.openFiles
-  if let activeID,
-    let index = candidates.firstIndex(where: { $0.id.standardizedFileURL == activeID })
+  if let activePath,
+    let index = candidates.firstIndex(where: { $0.id.path == activePath })
   {
     protected = candidates.remove(at: index)
   }
