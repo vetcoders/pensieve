@@ -23,6 +23,13 @@ struct DispatchPopover: View {
   @State private var rootURL: URL
   @State private var hostWindow: NSWindow?
   @State private var phase: Phase = .configuring
+  /// Swarm-only: the chosen report writer ("" = the workflow's own default,
+  /// which launches with NO positional agent). Only offered when the
+  /// descriptor declares the positional-synthesizer policy.
+  @State private var synthesizer: String = ""
+  /// Agent token to observe after a launch; nil for a default swarm run,
+  /// which has no single agent to observe.
+  @State private var observeAgent: String?
 
   enum Phase: Equatable {
     case configuring
@@ -88,11 +95,7 @@ struct DispatchPopover: View {
           .truncationMode(.head)
       }
 
-      Picker("Agent", selection: $agent) {
-        ForEach(controller.availableAgents, id: \.self) { Text($0).tag($0) }
-      }
-      .disabled(!isConfiguring)
-      .accessibilityIdentifier("pensieve.dispatch.agent")
+      agentSection
 
       VStack(alignment: .leading, spacing: 4) {
         Text("Path (where to run)").font(.caption).foregroundStyle(.secondary)
@@ -118,8 +121,9 @@ struct DispatchPopover: View {
 
       VStack(alignment: .leading, spacing: 2) {
         Text("Summary").font(.caption).foregroundStyle(.secondary)
-        Text("\(workflow) · \(agent)")
+        Text("\(workflow) · \(summaryAgentLabel)")
           .font(.system(size: 12, weight: .semibold))
+          .accessibilityIdentifier("pensieve.dispatch.summaryAgents")
         Text("subject: \(intent.subjectLabel)")
           .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
         Text("where: \(rootURL.lastPathComponent)")
@@ -132,7 +136,96 @@ struct DispatchPopover: View {
     .padding(16)
     .frame(width: 380)
     .background(WindowReader { hostWindow = $0 })
-    .onAppear { controller.discoverAgents() }
+    .onAppear {
+      controller.discoverAgents()
+      // Fresh truth for THIS sheet session: a config edit between two sheet
+      // presentations must never serve yesterday's swarm membership.
+      controller.refreshWorkflowCapabilities(force: true)
+    }
+    .onChange(of: workflow) { synthesizer = "" }
+  }
+
+  // MARK: - Agent section (capability-truth driven)
+
+  private var plan: WorkflowDispatchPlan {
+    controller.dispatchPlan(for: workflow)
+  }
+
+  private var summaryAgentLabel: String {
+    switch plan {
+    case .singleAgent:
+      return agent
+    case .swarm(let swarm):
+      let team = swarm.members.joined(separator: " + ")
+      return synthesizer.isEmpty ? team : "\(team) · report: \(synthesizer)"
+    case .loading, .unavailable:
+      return "—"
+    }
+  }
+
+  @ViewBuilder private var agentSection: some View {
+    switch plan {
+    case .singleAgent:
+      Picker("Agent", selection: $agent) {
+        ForEach(controller.availableAgents, id: \.self) { Text($0).tag($0) }
+      }
+      .disabled(!isConfiguring)
+      .accessibilityIdentifier("pensieve.dispatch.agent")
+    case .swarm(let swarm):
+      swarmSection(swarm)
+    case .loading:
+      HStack(spacing: 6) {
+        ProgressView().controlSize(.small)
+        Text("Checking how \(workflow) runs…")
+          .font(.system(size: 11)).foregroundStyle(.secondary)
+      }
+      .accessibilityIdentifier("pensieve.dispatch.capabilitiesLoading")
+    case .unavailable(let reason):
+      VStack(alignment: .leading, spacing: 4) {
+        Text(reason)
+          .font(.system(size: 11)).foregroundStyle(.red).lineLimit(4)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("pensieve.dispatch.capabilitiesError")
+        Button("Retry") { controller.refreshWorkflowCapabilities(force: true) }
+          .accessibilityIdentifier("pensieve.dispatch.retryCapabilities")
+      }
+    }
+  }
+
+  private func swarmSection(_ swarm: SwarmDispatchPlan) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text("Agents").font(.caption).foregroundStyle(.secondary)
+      Text(
+        "Runs \(swarm.members.count) agents in parallel: "
+          + swarm.members.joined(separator: ", ")
+      )
+      .font(.system(size: 12, weight: .semibold))
+      .accessibilityIdentifier("pensieve.dispatch.swarmMembers")
+      if let source = swarm.selectionSource, !source.isEmpty {
+        Text("Agents set in \(source)")
+          .font(.system(size: 10)).foregroundStyle(.secondary)
+          .lineLimit(1).truncationMode(.head)
+      }
+      ForEach(swarm.unsupportedConfigured, id: \.self) { token in
+        Label(
+          "\(token) is configured but not supported — it won't run.",
+          systemImage: "exclamationmark.triangle"
+        )
+        .font(.system(size: 11)).foregroundStyle(.orange)
+        .accessibilityIdentifier("pensieve.dispatch.unsupportedAgent.\(token)")
+      }
+      if swarm.synthesizerChoices.isEmpty {
+        Text("Final report by \(swarm.defaultSynthesizerDescription).")
+          .font(.system(size: 11)).foregroundStyle(.secondary)
+      } else {
+        Picker("Final report by", selection: $synthesizer) {
+          Text("Default (\(swarm.defaultSynthesizerDescription))").tag("")
+          ForEach(swarm.synthesizerChoices, id: \.self) { Text($0).tag($0) }
+        }
+        .disabled(!isConfiguring)
+        .accessibilityIdentifier("pensieve.dispatch.synthesizer")
+      }
+    }
   }
 
   @ViewBuilder private var actionRow: some View {
@@ -163,7 +256,7 @@ struct DispatchPopover: View {
           Task { await runDispatch() }
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(intent.subjectIsEmpty)
+        .disabled(intent.subjectIsEmpty || !plan.isLaunchable)
         .accessibilityIdentifier("pensieve.dispatch.confirm")
       }
     case .dispatching:
@@ -188,9 +281,9 @@ struct DispatchPopover: View {
               NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: reportPath)])
             }
           }
-          if let runID {
+          if let runID, let observeAgent {
             Button("Observe in Terminal") {
-              controller.observeRunInTerminal(agent: agent, runID: runID)
+              controller.observeRunInTerminal(agent: observeAgent, runID: runID)
             }
           }
           Spacer()
@@ -204,8 +297,21 @@ struct DispatchPopover: View {
   private func runDispatch() async {
     // phase is already .dispatching (set synchronously by the Dispatch button's
     // re-entry guard) before this Task runs.
+    let agents: [String]
+    switch plan {
+    case .singleAgent:
+      agents = [agent]
+    case .swarm:
+      agents = synthesizer.isEmpty ? [] : [synthesizer]
+    case .loading, .unavailable:
+      // The Dispatch button is disabled for these plans; if a race lands here
+      // anyway, refuse in the UI — confirmDispatch would refuse too.
+      phase = .failed("This workflow can't be dispatched right now.")
+      return
+    }
+    observeAgent = agents.first
     let outcome = await controller.confirmDispatch(
-      intent: intent, workflow: workflow, agent: agent, rootURL: rootURL)
+      intent: intent, workflow: workflow, agents: agents, rootURL: rootURL)
     switch outcome {
     case .success(let runID, let reportPath, _):
       phase = .dispatched(runID: runID, reportPath: reportPath)

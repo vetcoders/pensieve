@@ -7,7 +7,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
   func testBuildsArgumentsForFilePayloads() {
     let arguments = VibecraftedAgentPromptLauncher.arguments(
       workflow: "review",
-      agent: "codex",
+      agents: ["codex"],
       payload: .file("/x.md")
     )
 
@@ -17,11 +17,25 @@ final class AgentPromptDispatcherTests: XCTestCase {
   func testBuildsArgumentsForPromptPayloads() {
     let arguments = VibecraftedAgentPromptLauncher.arguments(
       workflow: "workflow",
-      agent: "codex",
+      agents: ["codex"],
       payload: .prompt("ship the proof")
     )
 
     XCTAssertEqual(arguments, ["workflow", "codex", "--prompt", "ship the proof"])
+  }
+
+  func testBuildsSwarmArgumentsWithoutFabricatingAnAgent() {
+    // A default swarm run launches the workflow with NO positional agent —
+    // the CLI resolves its own configured members.
+    XCTAssertEqual(
+      VibecraftedAgentPromptLauncher.arguments(
+        workflow: "research", agents: [], payload: .file("/x.md")),
+      ["research", "--file", "/x.md"])
+    // A chosen synthesizer is one positional agent, in CLI order.
+    XCTAssertEqual(
+      VibecraftedAgentPromptLauncher.arguments(
+        workflow: "research", agents: ["grok"], payload: .prompt("dig in")),
+      ["research", "grok", "--prompt", "dig in"])
   }
 
   func testDispatchMetadataParsesRunIDReportPathAndStatusLineFromReceipt() {
@@ -80,7 +94,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
     let outcome = await controller.confirmDispatch(
       intent: emptyDraft,
       workflow: "workflow",
-      agent: "codex",
+      agents: ["codex"],
       rootURL: URL(fileURLWithPath: "/tmp/pensieve-dispatch-root", isDirectory: true))
 
     guard case .failure(let message) = outcome else {
@@ -122,7 +136,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       intent: DispatchIntent(
         subject: .savedDocument(documentURL), workflow: "workflow", source: .toolbar),
       workflow: "workflow",
-      agent: "codex",
+      agents: ["codex"],
       rootURL: rootURL)
 
     guard case .success(let runID, let receivedReportPath, let statusLine) = outcome else {
@@ -142,7 +156,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       [
         RecordingAgentPromptLauncher.Request(
           workflow: "workflow",
-          agent: "codex",
+          agents: ["codex"],
           payload: .file(documentURL.path),
           workingDirectoryURL: rootURL)
       ])
@@ -179,7 +193,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       intent: DispatchIntent(
         subject: .savedDocument(documentURL), workflow: "workflow", source: .toolbar),
       workflow: "workflow",
-      agent: "codex",
+      agents: ["codex"],
       rootURL: rootURL)
 
     guard case .failure(let message) = outcome else {
@@ -260,7 +274,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
     let outcome = await controller.confirmDispatch(
       intent: intent,
       workflow: intent.workflow,
-      agent: controller.defaultAgent,
+      agents: [controller.defaultAgent],
       rootURL: controller.defaultDispatchRoot())
     guard case .success = outcome else {
       return XCTFail("Expected confirmed dispatch to succeed")
@@ -270,7 +284,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       [
         RecordingAgentPromptLauncher.Request(
           workflow: "review",
-          agent: controller.defaultAgent,
+          agents: [controller.defaultAgent],
           payload: .file(documentURL.path),
           workingDirectoryURL: workspaceRoot)
       ])
@@ -314,7 +328,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
     let outcome = await controller.confirmDispatch(
       intent: intent,
       workflow: intent.workflow,
-      agent: controller.defaultAgent,
+      agents: [controller.defaultAgent],
       rootURL: controller.defaultDispatchRoot())
     guard case .success = outcome else {
       return XCTFail("Expected confirmed dispatch to succeed")
@@ -324,7 +338,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       [
         RecordingAgentPromptLauncher.Request(
           workflow: "workflow",
-          agent: controller.defaultAgent,
+          agents: [controller.defaultAgent],
           payload: .prompt("ship the plan"),
           workingDirectoryURL: workspaceRoot)
       ])
@@ -334,7 +348,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
 private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
   struct Request: Equatable {
     let workflow: String
-    let agent: String
+    let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
   }
@@ -356,7 +370,7 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @uncheck
 
   func dispatch(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
@@ -364,7 +378,7 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @uncheck
     recordedRequests.append(
       Request(
         workflow: workflow,
-        agent: agent,
+        agents: agents,
         payload: payload,
         workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
     lock.unlock()

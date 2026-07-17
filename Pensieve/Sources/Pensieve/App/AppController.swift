@@ -39,6 +39,13 @@ final class AppController: ObservableObject {
   @Published var availableAgents: [String] = [
     "claude", "codex", "agy", "junie", "grok",
   ]
+  /// Capability truth from `vibecrafted capabilities --json` (W2-C): the ONLY
+  /// authority on whether a workflow runs one agent or a swarm, who the swarm
+  /// members are, and which configured tokens are unsupported. Probed fresh on
+  /// every sheet presentation — never cached across the operator's config edits.
+  @Published private(set) var workflowCapabilitiesState: WorkflowCapabilitiesState = .idle
+  private let workflowCapabilitiesProvider: WorkflowCapabilitiesProviding
+  private var workflowCapabilitiesRefreshTask: Task<Void, Never>?
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
@@ -77,6 +84,8 @@ final class AppController: ObservableObject {
     recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
+    workflowCapabilitiesProvider: WorkflowCapabilitiesProviding =
+      VibecraftedWorkflowCapabilitiesProvider(),
     agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000,
@@ -97,6 +106,7 @@ final class AppController: ObservableObject {
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
+    self.workflowCapabilitiesProvider = workflowCapabilitiesProvider
     self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
@@ -774,7 +784,7 @@ final class AppController: ObservableObject {
       do {
         let metadata = try launcher.dispatch(
           workflow: workflow,
-          agent: agent,
+          agents: [agent],
           payload: payload,
           workingDirectoryURL: workingDirectoryURL
         )
@@ -821,6 +831,56 @@ final class AppController: ObservableObject {
     transcriptionService.updateDispatchStatus(message)
     appState.lastError = message
     isAgentDispatchInFlight = false
+  }
+
+  // MARK: - Workflow capability truth (W2-C consumption)
+
+  /// How the sheet may present `workflow` right now, from capability truth.
+  /// Pure derivation over the published state — recomputed on every render.
+  func dispatchPlan(for workflow: String) -> WorkflowDispatchPlan {
+    WorkflowDispatchPlanner.plan(workflow: workflow, state: workflowCapabilitiesState)
+  }
+
+  /// Probe `vibecrafted capabilities --json` OFF the main thread. Called on
+  /// every sheet presentation (`force: true` from the sheet, so a config edit
+  /// between two sheets is always picked up) and from the sheet's Retry
+  /// button. Never blocks presentation: the sheet renders the loading state.
+  func refreshWorkflowCapabilities(force: Bool = false) {
+    guard workflowCapabilitiesRefreshTask == nil else { return }
+    if !force, case .loaded = workflowCapabilitiesState { return }
+    workflowCapabilitiesState = .loading
+    let provider = workflowCapabilitiesProvider
+    workflowCapabilitiesRefreshTask = Task.detached(priority: .utility) { [weak self] in
+      let result: Result<WorkflowCapabilities, Error>
+      do {
+        result = .success(try provider.fetchCapabilities())
+      } catch {
+        result = .failure(error)
+      }
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        self.workflowCapabilitiesRefreshTask = nil
+        switch result {
+        case .success(let capabilities):
+          self.workflowCapabilitiesState = .loaded(capabilities)
+          self.adoptCapabilityAgentUniverse(capabilities.agents)
+        case .failure(let error):
+          self.workflowCapabilitiesState = .failed(error.localizedDescription)
+        }
+      }
+    }
+  }
+
+  /// Fold the capability agent universe into the picker: keep the seed's
+  /// preference order for tokens the CLI still accepts, append newly supported
+  /// ones, drop retired ones. `swarm` is an execution-target token, not a
+  /// pickable single-agent lane.
+  private func adoptCapabilityAgentUniverse(_ universe: [String]) {
+    let lanes = universe.filter { $0 != "swarm" }
+    guard !lanes.isEmpty else { return }
+    let kept = availableAgents.filter { lanes.contains($0) }
+    let added = lanes.filter { !kept.contains($0) }
+    availableAgents = kept + added
   }
 
   // MARK: - Agent discovery + Terminal dispatch
@@ -883,7 +943,7 @@ final class AppController: ObservableObject {
   func confirmDispatch(
     intent: DispatchIntent,
     workflow: String,
-    agent: String,
+    agents: [String],
     rootURL: URL,
     allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
   ) async -> DocumentDispatchOutcome {
@@ -893,6 +953,31 @@ final class AppController: ObservableObject {
     let payload = intent.payload
     guard !payload.isEmpty else {
       return .failure(message: "There is nothing to dispatch — the document is empty.")
+    }
+    // Capability gate: the launch must be a shape the workflow's descriptor
+    // sanctions. A single-agent workflow launches with exactly one agent; a
+    // swarm launches with none (its configured members run) or with one
+    // declared synthesizer choice. Unknown semantics never launch.
+    switch dispatchPlan(for: workflow) {
+    case .singleAgent:
+      guard agents.count == 1 else {
+        return .failure(message: "Pick one agent for \(workflow) before dispatching.")
+      }
+    case .swarm(let plan):
+      guard
+        agents.isEmpty
+          || (agents.count == 1 && plan.synthesizerChoices.contains(agents[0]))
+      else {
+        return .failure(
+          message:
+            "\(agents.joined(separator: ", ")) can't take the \(workflow) run. "
+            + "Available: \(plan.synthesizerChoices.joined(separator: ", ")).")
+      }
+    case .loading:
+      return .failure(
+        message: "Still checking how \(workflow) runs. Try again in a moment.")
+    case .unavailable(let reason):
+      return .failure(message: reason)
     }
     // Second line of defense behind the sheet's synchronous phase guard: even
     // if two confirmations race in, only one may reach the launcher.
@@ -904,10 +989,11 @@ final class AppController: ObservableObject {
 
     let launcher = agentPromptLauncher
     let title = intent.subjectLabel
+    let agentLabel = agents.isEmpty ? "agent team" : agents.joined(separator: ", ")
     do {
       let metadata = try await Task.detached(priority: .userInitiated) {
         try launcher.dispatch(
-          workflow: workflow, agent: agent,
+          workflow: workflow, agents: agents,
           payload: payload, workingDirectoryURL: rootURL)
       }.value
       guard metadata.exitCode == 0 else {
@@ -916,7 +1002,8 @@ final class AppController: ObservableObject {
         return .failure(message: metadata.statusLine)
       }
       appState.lastError = nil
-      let line = "Dispatched \(title) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
+      let line =
+        "Dispatched \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
       transcriptionService.updateDispatchStatus(
         metadata.runID.map { "\(line) · run: \($0)" } ?? line)
       return .success(

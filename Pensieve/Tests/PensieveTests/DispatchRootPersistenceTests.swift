@@ -148,7 +148,7 @@ final class DispatchRootPersistenceTests: XCTestCase {
     let outcome = await controller.confirmDispatch(
       intent: intent,
       workflow: intent.workflow,
-      agent: "codex",
+      agents: ["codex"],
       rootURL: controller.defaultDispatchRoot())
     guard case .success = outcome else {
       return XCTFail("Expected confirmed dispatch to succeed")
@@ -189,7 +189,7 @@ private final class DispatchRootRecordingLauncher: AgentPromptLaunching, @unchec
 
   func dispatch(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {

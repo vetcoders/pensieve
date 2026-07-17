@@ -738,7 +738,7 @@ private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Se
 
   func dispatch(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
