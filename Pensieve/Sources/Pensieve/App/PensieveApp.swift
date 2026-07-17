@@ -80,7 +80,7 @@ struct DocumentWindowRootView: View {
   }
 
   var body: some View {
-    ContentView()
+    ContentView(hostWindow: $currentWindow)
       .environment(appState)
       .environmentObject(controller)
       .environmentObject(controller.transcriptionService)

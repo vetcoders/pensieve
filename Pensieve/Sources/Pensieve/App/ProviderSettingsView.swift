@@ -1,17 +1,5 @@
 import SwiftUI
 
-struct ProviderOnboardingState: Equatable {
-  private(set) var isPresented = false
-
-  mutating func evaluate(autocompleteEnabled: Bool, providerConfigured: Bool) {
-    isPresented = autocompleteEnabled && !providerConfigured
-  }
-
-  mutating func dismiss() {
-    isPresented = false
-  }
-}
-
 struct ProviderSettingsView: View {
   @ObservedObject var settings: ProviderSettings
 

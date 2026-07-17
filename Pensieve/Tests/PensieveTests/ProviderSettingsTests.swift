@@ -177,19 +177,67 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertTrue(environment.removeCalls.contains("LLM_ASSISTIVE_API_KEY"))
   }
 
-  func testOnboardingStateOffersSetupWithoutDisablingAutocomplete() {
-    var state = ProviderOnboardingState()
+  func testOnboardingCoordinatorPresentsAtMostOnceAcrossWindowContexts() {
+    let coordinator = ProviderOnboardingCoordinator(
+      autocompleteEnabled: true,
+      providerConfigured: false)
+    let windows = [NSObject(), NSObject(), NSObject()]
 
-    state.evaluate(autocompleteEnabled: true, providerConfigured: false)
-    XCTAssertTrue(state.isPresented)
+    for (index, window) in windows.enumerated() {
+      coordinator.evaluate(
+        windowID: ObjectIdentifier(window),
+        isKeyWindow: index == 1)
+    }
 
-    state.dismiss()
-    XCTAssertFalse(state.isPresented)
+    XCTAssertEqual(
+      windows.filter { coordinator.isPresented(in: ObjectIdentifier($0)) }.count,
+      1)
+    XCTAssertEqual(coordinator.presentingWindowID, ObjectIdentifier(windows[1]))
 
-    state.evaluate(autocompleteEnabled: true, providerConfigured: true)
-    XCTAssertFalse(state.isPresented)
-    state.evaluate(autocompleteEnabled: false, providerConfigured: false)
-    XCTAssertFalse(state.isPresented)
+    coordinator.dismiss()
+    for window in windows {
+      coordinator.evaluate(
+        windowID: ObjectIdentifier(window),
+        isKeyWindow: true)
+    }
+
+    XCTAssertNil(coordinator.presentingWindowID)
+    XCTAssertTrue(windows.allSatisfy { !coordinator.isPresented(in: ObjectIdentifier($0)) })
+  }
+
+  func testOnboardingCoordinatorStaysSilentWhenDisabledOrConfigured() {
+    let coordinator = ProviderOnboardingCoordinator(
+      autocompleteEnabled: false,
+      providerConfigured: false)
+    let windowID = ObjectIdentifier(NSObject())
+
+    coordinator.evaluate(windowID: windowID, isKeyWindow: true)
+    XCTAssertNil(coordinator.presentingWindowID)
+
+    coordinator.setAutocompleteEnabled(true)
+    coordinator.setProviderConfigured(true)
+    coordinator.evaluate(windowID: windowID, isKeyWindow: true)
+    XCTAssertNil(coordinator.presentingWindowID)
+  }
+
+  func testOnboardingCoordinatorRearmsOnceAfterAutocompleteEnableCycle() {
+    let coordinator = ProviderOnboardingCoordinator(
+      autocompleteEnabled: true,
+      providerConfigured: false)
+    let firstWindow = NSObject()
+    let nextWindow = NSObject()
+
+    coordinator.evaluate(
+      windowID: ObjectIdentifier(firstWindow),
+      isKeyWindow: true)
+    coordinator.dismiss()
+    coordinator.setAutocompleteEnabled(false)
+    coordinator.setAutocompleteEnabled(true)
+    coordinator.evaluate(
+      windowID: ObjectIdentifier(nextWindow),
+      isKeyWindow: true)
+
+    XCTAssertEqual(coordinator.presentingWindowID, ObjectIdentifier(nextWindow))
   }
 
   func testSavingSettingsClearsTypedUnavailableLatchForNextRequest() async throws {

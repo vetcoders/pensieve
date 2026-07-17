@@ -5,12 +5,21 @@ struct ContentView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
-  @ObservedObject private var providerSettings: ProviderSettings
+  @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
+  @Binding private var hostWindow: NSWindow?
+  private let providerSettings: ProviderSettings
   @State private var showDispatch = false
-  @State private var providerOnboarding = ProviderOnboardingState()
 
-  init(providerSettings: ProviderSettings = .shared) {
-    _providerSettings = ObservedObject(wrappedValue: providerSettings)
+  @MainActor
+  init(
+    hostWindow: Binding<NSWindow?> = .constant(nil),
+    providerSettings: ProviderSettings = .shared,
+    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil
+  ) {
+    _hostWindow = hostWindow
+    self.providerSettings = providerSettings
+    _providerOnboardingCoordinator = ObservedObject(
+      wrappedValue: providerOnboardingCoordinator ?? .shared)
   }
 
   var body: some View {
@@ -56,37 +65,68 @@ struct ContentView: View {
         onRootSelected: { appState.rememberDispatchRoot($0) }
       )
     }
-    .sheet(isPresented: providerOnboardingBinding) {
-      ProviderOnboardingView(isPresented: providerOnboardingBinding)
+    .sheet(isPresented: onboardingSheetBinding) {
+      ProviderOnboardingView(isPresented: onboardingSheetBinding)
     }
     .onAppear {
       evaluateProviderOnboarding()
     }
-    .onChange(of: appState.aiAutocompleteEnabled) {
+    .onChange(of: hostWindow?.windowNumber) {
       evaluateProviderOnboarding()
     }
-    .onChange(of: providerSettings.isConfigured) { _, configured in
-      if configured {
-        providerOnboarding.dismiss()
+    .onChange(of: appState.aiAutocompleteEnabled) {
+      providerOnboardingCoordinator.setAutocompleteEnabled(appState.aiAutocompleteEnabled)
+      evaluateProviderOnboarding()
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(
+        for: NSWindow.didBecomeKeyNotification)
+    ) { notification in
+      guard let window = notification.object as? NSWindow,
+        window === hostWindow
+      else {
+        return
       }
+      evaluateProviderOnboarding()
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(
+        for: .completionProviderSettingsDidChange)
+    ) { notification in
+      guard let settings = notification.object as? ProviderSettings,
+        settings === providerSettings
+      else {
+        return
+      }
+      providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
+      evaluateProviderOnboarding()
     }
   }
 
-  private var providerOnboardingBinding: Binding<Bool> {
+  private var onboardingSheetBinding: Binding<Bool> {
     Binding(
-      get: { providerOnboarding.isPresented },
+      get: { providerOnboardingCoordinator.isPresented(in: hostWindowID) },
       set: { isPresented in
-        if !isPresented {
-          providerOnboarding.dismiss()
+        if !isPresented,
+          providerOnboardingCoordinator.isPresented(in: hostWindowID)
+        {
+          providerOnboardingCoordinator.dismiss()
         }
       }
     )
   }
 
+  private var hostWindowID: ObjectIdentifier? {
+    hostWindow.map(ObjectIdentifier.init)
+  }
+
   private func evaluateProviderOnboarding() {
-    providerOnboarding.evaluate(
+    providerOnboardingCoordinator.initializeIfNeeded(
       autocompleteEnabled: appState.aiAutocompleteEnabled,
       providerConfigured: providerSettings.isConfigured)
+    providerOnboardingCoordinator.evaluate(
+      windowID: hostWindowID,
+      isKeyWindow: hostWindow?.isKeyWindow == true)
   }
 }
 
