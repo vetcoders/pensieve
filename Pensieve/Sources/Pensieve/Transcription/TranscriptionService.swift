@@ -35,26 +35,63 @@ enum TranscriptionLanguageChoice: String, CaseIterable, Identifiable, Sendable {
 }
 
 enum TranscriptionFormatMode: String, CaseIterable, Identifiable, Sendable {
-  case polish
-  case kurier
+  case cleanUp
+  case writingAssistant
 
   var id: String { rawValue }
 
   var title: String {
     switch self {
-    case .polish:
+    case .cleanUp:
       return "Clean Up"
-    case .kurier:
-      return "Kurier"
+    case .writingAssistant:
+      return "Writing Assistant"
+    }
+  }
+
+  var detail: String {
+    switch self {
+    case .cleanUp:
+      return "Fix transcription errors without changing your meaning."
+    case .writingAssistant:
+      return "Improve structure and clarity while keeping the message yours."
+    }
+  }
+
+  var actionTitle: String {
+    switch self {
+    case .cleanUp:
+      return "Clean Up Text"
+    case .writingAssistant:
+      return "Run Writing Assistant"
     }
   }
 
   var assistive: Bool {
     switch self {
-    case .polish:
+    case .cleanUp:
       return false
-    case .kurier:
+    case .writingAssistant:
       return true
+    }
+  }
+
+  var providerInstructions: String {
+    switch self {
+    case .cleanUp:
+      return """
+        You are a transcription formatter. Fix punctuation, capitalization, obvious speech-recognition \
+        errors, and accidental repetition. Preserve every fact, name, number, uncertainty, tone, and the \
+        original language. Do not answer the content, add commentary, or invent information. Return only \
+        the cleaned text.
+        """
+    case .writingAssistant:
+      return """
+        You are a voice-native writing assistant. Turn the dictated text into clear, natural writing while \
+        preserving every fact, name, number, constraint, opinion, uncertainty, tone, and the original \
+        language. You may restructure sentences and paragraphs and remove verbal scaffolding, but never \
+        answer the content, invent information, or describe the edit. Return only the rewritten text.
+        """
     }
   }
 }
@@ -70,7 +107,34 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
     case .editor:
       return "Editor"
     case .agent:
-      return "Dispatch to agent"
+      return "Agent"
+    }
+  }
+
+  var actionTitle: String {
+    switch self {
+    case .editor:
+      return "Insert"
+    case .agent:
+      return "Dispatch"
+    }
+  }
+
+  var actionSystemImageName: String {
+    switch self {
+    case .editor:
+      return "arrow.down.doc.fill"
+    case .agent:
+      return "paperplane.fill"
+    }
+  }
+
+  var actionHelp: String {
+    switch self {
+    case .editor:
+      return "Insert transcript into the active editor"
+    case .agent:
+      return "Dispatch transcript to an agent"
     }
   }
 
@@ -105,6 +169,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   private let requiresMicrophonePermission: MicrophonePermissionPolicy
   private let microphonePermissionRequester: MicrophonePermissionRequester
   private let cadenceCommitNanoseconds: UInt64
+  private let aiTextResponder: (any AITextResponding)?
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
   private var errorCleanupTask: Task<Void, Never>?
@@ -120,12 +185,19 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     microphonePermissionRequester: @escaping MicrophonePermissionRequester = {
       try await TranscriptionService.ensureMicrophonePermission()
     },
+    aiTextResponder: (any AITextResponding)? = nil,
     cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
     self.engine = engine
     self.engineFactory = engineFactory
     self.requiresMicrophonePermission = requiresMicrophonePermission
     self.microphonePermissionRequester = microphonePermissionRequester
+    // Production keeps speech capture in qube-ffi but routes provider text
+    // through the same safe Responses seam as autocomplete. Explicit engine
+    // injection keeps existing unit seams deterministic unless a responder is
+    // also supplied deliberately.
+    self.aiTextResponder =
+      aiTextResponder ?? (engine == nil ? OpenAIResponsesAutocompleteBackend() : nil)
     self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""
@@ -273,7 +345,10 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   var isFormattingAvailable: Bool {
-    activeEngine().isFormattingAvailable()
+    if let aiTextResponder {
+      return aiTextResponder.isConfigured
+    }
+    return activeEngine().isFormattingAvailable()
   }
 
   func updateDispatchStatus(_ status: String?) {
@@ -281,12 +356,11 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   @discardableResult
-  func formatComposition(mode: TranscriptionFormatMode = .polish) async -> String {
+  func formatComposition(mode: TranscriptionFormatMode = .cleanUp) async -> String {
     let source = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !source.isEmpty else { return "" }
 
-    let engine = activeEngine()
-    guard engine.isFormattingAvailable() else {
+    guard isFormattingAvailable else {
       lastError = nil
       return source
     }
@@ -295,15 +369,32 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     defer { isFormatting = false }
 
     do {
-      let formatted = try await engine.formatText(text: source, assistive: mode.assistive)
+      let formatted: String
+      if let aiTextResponder {
+        formatted = try await aiTextResponder.respond(
+          input: source, instructions: mode.providerInstructions)
+      } else {
+        formatted = try await activeEngine().formatText(text: source, assistive: mode.assistive)
+      }
       let cleaned = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
       replaceComposition(with: cleaned.isEmpty ? source : cleaned)
       lastError = nil
       return rendered
     } catch {
-      lastError = error.localizedDescription
+      lastError = Self.formattingFailureMessage(for: error)
       return source
     }
+  }
+
+  private static func formattingFailureMessage(for error: Error) -> String {
+    if case VistaError.ModelError(let message) = error {
+      for prefix in ["completion request failed: ", "completion response parse failed: "]
+      where message.hasPrefix(prefix) {
+        return "AI action failed: \(message.dropFirst(prefix.count))"
+      }
+      return "AI action failed: \(message)"
+    }
+    return "AI action failed: \(error.localizedDescription)"
   }
 
   func replaceComposition(with text: String) {

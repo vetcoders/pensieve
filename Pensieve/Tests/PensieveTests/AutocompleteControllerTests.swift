@@ -64,11 +64,14 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 
   func testNewKeystrokeCancelsPriorTaskBeforeEngineCompletes() async {
+    let staleTaskGate = AsyncGate()
+    let staleTaskStarted = expectation(description: "stale completion task started")
     let staleTaskObservedCancellation = expectation(
       description: "stale completion task observed cancellation")
     let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, _ in
       if prefix == "alpha" {
-        await nonCancellableSleep(nanoseconds: 80_000_000)
+        staleTaskStarted.fulfill()
+        await staleTaskGate.wait()
         XCTAssertTrue(Task.isCancelled)
         staleTaskObservedCancellation.fulfill()
         return " stale"
@@ -78,11 +81,12 @@ final class AutocompleteControllerTests: XCTestCase {
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
 
     controller.textDidChange(prefix: "alpha")
-    try? await Task.sleep(nanoseconds: 20_000_000)
+    await fulfillment(of: [staleTaskStarted], timeout: 1.0)
     controller.textDidChange(prefix: "alpha b")
+    await staleTaskGate.open()
 
     await fulfillment(of: [staleTaskObservedCancellation], timeout: 1.0)
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { controller.suggestion == " fresh" }
 
     XCTAssertEqual(controller.suggestion, " fresh")
     XCTAssertNotEqual(controller.suggestion, " stale")
@@ -677,6 +681,24 @@ private func nonCancellableSleep(nanoseconds: UInt64) async {
     DispatchQueue.global().asyncAfter(deadline: .now() + .nanoseconds(Int(nanoseconds))) {
       continuation.resume()
     }
+  }
+}
+
+private actor AsyncGate {
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var isOpen = false
+
+  func wait() async {
+    if isOpen { return }
+    await withCheckedContinuation { continuation in
+      self.continuation = continuation
+    }
+  }
+
+  func open() {
+    isOpen = true
+    continuation?.resume()
+    continuation = nil
   }
 }
 

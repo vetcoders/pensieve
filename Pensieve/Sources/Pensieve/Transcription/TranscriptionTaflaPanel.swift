@@ -74,6 +74,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     panel.isReleasedWhenClosed = false
     panel.delegate = self
     panel.minSize = NSSize(width: 560, height: 420)
+    panel.contentMinSize = NSSize(width: 560, height: 420)
     panel.backgroundColor = .clear
     panel.isOpaque = false
 
@@ -88,13 +89,20 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       }
     )
     let hostingView = NSHostingView(rootView: root)
-    hostingView.setAccessibilityIdentifier("pensieve.dictation.panel")
-    hostingView.setAccessibilityRole(.group)
-    hostingView.setAccessibilityLabel("Dictation controls")
-    hostingView.setAccessibilityHelp(
+    // Match CodeScribe's proven floating-panel host: the window owns its size,
+    // while an absolute frame sync keeps SwiftUI from exporting changing
+    // fitting-size constraints back into the resizable panel.
+    hostingView.sizingOptions = []
+    hostingView.translatesAutoresizingMaskIntoConstraints = true
+    hostingView.autoresizingMask = []
+    let contentContainer = TaflaContentContainer(hostingView: hostingView)
+    contentContainer.setAccessibilityIdentifier("pensieve.dictation.panel")
+    contentContainer.setAccessibilityRole(.group)
+    contentContainer.setAccessibilityLabel("Dictation controls")
+    contentContainer.setAccessibilityHelp(
       "Record speech, review the transcript, and insert it into the active document."
     )
-    panel.contentView = hostingView
+    panel.contentView = contentContainer
     return panel
   }
 
@@ -124,14 +132,43 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 }
 
 private final class NonActivatingTaflaPanel: NSPanel {
-  override var canBecomeKey: Bool { false }
+  // A non-activating panel can still become key for its own controls. Without
+  // this, pickers, selectable transcript text, and buttons present as live but
+  // cannot reliably receive keyboard/click interaction.
+  override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { false }
+}
+
+private final class TaflaContentContainer: NSView {
+  private let hostingView: NSView
+
+  init(hostingView: NSView) {
+    self.hostingView = hostingView
+    super.init(frame: .zero)
+    addSubview(hostingView)
+    hostingView.frame = bounds
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) is not used")
+  }
+
+  override func setFrameSize(_ newSize: NSSize) {
+    super.setFrameSize(newSize)
+    hostingView.frame = bounds
+  }
+
+  override func layout() {
+    super.layout()
+    hostingView.frame = bounds
+  }
 }
 
 @MainActor
 private final class TranscriptionTaflaRoutingState: ObservableObject {
   @Published var language: TranscriptionLanguageChoice = .automatic
-  @Published var formatMode: TranscriptionFormatMode = .polish
+  @Published var formatMode: TranscriptionFormatMode = .cleanUp
   @Published var sendTarget: TranscriptionSendTarget = .editor
 }
 
@@ -181,11 +218,11 @@ private struct TranscriptionTaflaPanelView: View {
       .frame(maxWidth: .infinity, alignment: .leading)
 
       VStack(alignment: .leading, spacing: 6) {
-        Text("Output style")
+        Text("AI action")
           .font(.caption)
           .foregroundStyle(.secondary)
 
-        Picker("Output style", selection: $routingState.formatMode) {
+        Picker("AI action", selection: $routingState.formatMode) {
           ForEach(TranscriptionFormatMode.allCases) { mode in
             Text(mode.title).tag(mode)
           }
@@ -193,15 +230,21 @@ private struct TranscriptionTaflaPanelView: View {
         .labelsHidden()
         .pickerStyle(.segmented)
         .accessibilityIdentifier("pensieve.dictation.mode")
+
+        Text(routingState.formatMode.detail)
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("pensieve.dictation.modeDescription")
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
       VStack(alignment: .leading, spacing: 6) {
-        Text("Insert into")
+        Text("Send result to")
           .font(.caption)
           .foregroundStyle(.secondary)
 
-        Picker("Insert into", selection: $routingState.sendTarget) {
+        Picker("Send result to", selection: $routingState.sendTarget) {
           ForEach(TranscriptionSendTarget.allCases) { target in
             Text(target.title).tag(target)
           }
@@ -229,7 +272,7 @@ private struct TranscriptionTaflaPanelView: View {
         .font(.title3.weight(.semibold))
         .accessibilityIdentifier("pensieve.dictation.title")
 
-        Text("Speak naturally, then review and insert the result.")
+        Text("Record speech, clean it up for the editor, or send it to an agent.")
           .font(.caption)
           .foregroundStyle(.secondary)
           .lineLimit(1)
@@ -279,13 +322,20 @@ private struct TranscriptionTaflaPanelView: View {
   private var transcript: some View {
     ScrollViewReader { proxy in
       ScrollView {
-        Text(service.rendered)
-          .font(.system(.body, design: .monospaced))
-          .foregroundStyle(.primary)
-          .textSelection(.enabled)
-          .frame(maxWidth: .infinity, alignment: .topLeading)
-          .padding(12)
-          .id("pensieve.dictation.transcript.bottom")
+        Group {
+          if service.rendered.isEmpty {
+            Text("Your live transcript will appear here.")
+              .foregroundStyle(.secondary)
+          } else {
+            Text(service.rendered)
+              .foregroundStyle(.primary)
+              .textSelection(.enabled)
+          }
+        }
+        .font(.system(.body, design: .monospaced))
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(12)
+        .id("pensieve.dictation.transcript.bottom")
       }
       .background(Color(NSColor.textBackgroundColor).opacity(0.58))
       .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -311,13 +361,17 @@ private struct TranscriptionTaflaPanelView: View {
 
       Button(action: format) {
         Label(
-          isFormatting || service.isFormatting ? "Formatting…" : "Format",
+          isFormatting || service.isFormatting
+            ? "Working…" : routingState.formatMode.actionTitle,
           systemImage: formatSystemImageName
         )
       }
       .buttonStyle(.bordered)
-      .disabled(!service.hasComposedText || isFormatting || service.isFormatting)
-      .help("Format Transcript")
+      .disabled(
+        !service.hasComposedText || !service.isFormattingAvailable || isFormatting
+          || service.isFormatting
+      )
+      .help(formatActionHelp)
       .accessibilityIdentifier("pensieve.dictation.format")
 
       Button(action: copyTranscript) {
@@ -331,11 +385,13 @@ private struct TranscriptionTaflaPanelView: View {
       Spacer(minLength: 12)
 
       Button(action: send) {
-        Label("Insert", systemImage: "arrow.down.doc.fill")
+        Label(
+          routingState.sendTarget.actionTitle,
+          systemImage: routingState.sendTarget.actionSystemImageName)
       }
       .buttonStyle(.borderedProminent)
       .disabled(!service.hasComposedText)
-      .help("Insert Transcript")
+      .help(routingState.sendTarget.actionHelp)
       .accessibilityIdentifier("pensieve.dictation.send")
     }
   }
@@ -383,6 +439,13 @@ private struct TranscriptionTaflaPanelView: View {
 
   private var formatSystemImageName: String {
     isFormatting || service.isFormatting ? "wand.and.stars.inverse" : "wand.and.stars"
+  }
+
+  private var formatActionHelp: String {
+    guard service.isFormattingAvailable else {
+      return "Configure an AI provider in Settings to use this action."
+    }
+    return routingState.formatMode.detail
   }
 
   private func start() {

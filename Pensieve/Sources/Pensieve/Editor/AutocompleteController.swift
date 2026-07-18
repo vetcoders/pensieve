@@ -1,8 +1,25 @@
 import Combine
 import Foundation
 
+protocol AutocompleteCompleting: Sendable {
+  func complete(prefix: String, maxTokens: UInt32) async throws -> String
+}
+
+private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked Sendable {
+  private let engine: VistaEngineProtocol
+
+  init(engine: VistaEngineProtocol) {
+    self.engine = engine
+  }
+
+  func complete(prefix: String, maxTokens: UInt32) async throws -> String {
+    try await engine.complete(prefix: prefix, maxTokens: maxTokens)
+  }
+}
+
 final class AutocompleteController: ObservableObject, @unchecked Sendable {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
+  typealias CompletionFactory = @Sendable () -> any AutocompleteCompleting
 
   static let defaultDebounceNanoseconds: UInt64 = 400_000_000
 
@@ -29,14 +46,13 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   @Published private(set) var suggestion: String?
   @Published private(set) var lastError: String?
 
-  private let engineFactory: EngineFactory?
+  private let completionFactory: CompletionFactory?
   private let debounceNanoseconds: UInt64
   private let maxTokens: UInt32
-  // Engine resolution happens post-debounce inside the completion task (the
-  // FFI constructor never runs on the typing path), so the cache is guarded
-  // by a lock rather than main-actor isolation.
-  private let engineLock = NSLock()
-  private var engine: VistaEngineProtocol?
+  // Backend resolution happens post-debounce inside the completion task, so
+  // the cache is guarded by a lock rather than main-actor isolation.
+  private let completionLock = NSLock()
+  private var completionBackend: (any AutocompleteCompleting)?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
   private var providerSettingsCancellable: AnyCancellable?
@@ -53,16 +69,40 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
     maxTokens: UInt32 = 32
   ) {
-    self.engine = engine
-    self.engineFactory = engineFactory
+    if let engine {
+      self.completionBackend = VistaAutocompleteAdapter(engine: engine)
+    } else {
+      self.completionBackend = nil
+    }
+    if let engineFactory {
+      self.completionFactory = { VistaAutocompleteAdapter(engine: engineFactory()) }
+    } else {
+      self.completionFactory = nil
+    }
     self.debounceNanoseconds = debounceNanoseconds
     self.maxTokens = maxTokens
+    observeProviderSettings()
+  }
+
+  init(
+    completionFactory: @escaping CompletionFactory,
+    debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
+    maxTokens: UInt32 = 32
+  ) {
+    self.completionBackend = nil
+    self.completionFactory = completionFactory
+    self.debounceNanoseconds = debounceNanoseconds
+    self.maxTokens = maxTokens
+    observeProviderSettings()
+  }
+
+  private func observeProviderSettings() {
     self.providerSettingsCancellable = NotificationCenter.default.publisher(
       for: .completionProviderSettingsDidChange
     ).sink { [weak self] _ in
-      // vista-kernel resolves provider env on every completion request. Saving
-      // settings therefore only needs to clear our permanent-unavailable latch;
-      // the next keystroke immediately observes the new live process values.
+      // The live backend resolves provider env on every request. Saving settings
+      // only needs to clear the permanent-unavailable latch; the next keystroke
+      // immediately observes the new process values.
       self?.cancel()
     }
   }
@@ -76,9 +116,9 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// factory). Checked on the typing path instead of resolving the engine,
   /// so no FFI call happens between keystrokes.
   var hasEngineSource: Bool {
-    engineLock.lock()
-    defer { engineLock.unlock() }
-    return engine != nil || engineFactory != nil
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    return completionBackend != nil || completionFactory != nil
   }
 
   /// Starts a completion request for committed text. Composition updates are
@@ -116,8 +156,8 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         try Task.checkCancellation()
         // Resolve through the weak reference without retaining the controller
         // across the provider await. This lets deinit cancel a hung request.
-        guard let engine = self?.resolveEngine() else { return }
-        let completion = try await engine.complete(prefix: prefix, maxTokens: maxTokens)
+        guard let backend = self?.resolveCompletionBackend() else { return }
+        let completion = try await backend.complete(prefix: prefix, maxTokens: maxTokens)
         try Task.checkCancellation()
 
         await MainActor.run { [weak self] in
@@ -176,20 +216,18 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     }
   }
 
-  /// Resolves (and caches) the engine. Runs inside the completion task, after
-  /// the debounce: the `VistaEngine()` FFI constructor — a thin handle; the
-  /// heavy whisper model is a process-global singleton the completion path
-  /// never touches (qube-ffi lib.rs `init_model` vs `complete`) — is paid at
-  /// most once, off the typing path.
-  private func resolveEngine() -> VistaEngineProtocol? {
-    engineLock.lock()
-    defer { engineLock.unlock() }
-    if let engine {
-      return engine
+  /// Resolves and caches the completion backend after the debounce. Production
+  /// uses a small Responses client; the Vista adapter remains for focused tests
+  /// and compatible injected engines without coupling autocomplete to STT.
+  private func resolveCompletionBackend() -> (any AutocompleteCompleting)? {
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    if let completionBackend {
+      return completionBackend
     }
-    guard let engineFactory else { return nil }
-    let created = engineFactory()
-    engine = created
+    guard let completionFactory else { return nil }
+    let created = completionFactory()
+    completionBackend = created
     return created
   }
 

@@ -368,12 +368,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     asciiSafeTables: Bool = false,
     aiAutocompleteEnabled: Bool = false,
     scrollSyncDebounce: TimeInterval = 0.04,
-    // Production autocomplete engine. The factory is lazy: `VistaEngine()` is
-    // a thin FFI handle resolved post-debounce inside the controller, and the
-    // completion path never loads the whisper model (see AutocompleteController
-    // `resolveEngine`), so surface init and typing stay FFI-free.
+    // Production autocomplete backend. The factory is lazy and resolved only
+    // after the debounce. STT/formatting stay in qube-ffi; editor completion uses
+    // the current provider-safe Responses request contract directly.
     autocompleteController: AutocompleteController = AutocompleteController(
-      engineFactory: { VistaEngine() })
+      completionFactory: { OpenAIResponsesAutocompleteBackend() })
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()

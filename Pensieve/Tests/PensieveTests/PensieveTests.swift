@@ -637,14 +637,14 @@ final class PensieveSmokeTests: XCTestCase {
     for character in ["a", "b", "c", "d", "e"] {
       appState.activeDocumentText += character
       store.documentDidChange(appState: appState)
-      try await Task.sleep(nanoseconds: 10_000_000)
     }
 
-    try await Task.sleep(nanoseconds: 80_000_000)
-    XCTAssertEqual(saveCount, 1)
-    XCTAssertEqual(indexCount, 0)
-
-    try await Task.sleep(nanoseconds: 110_000_000)
+    try await waitUntil {
+      saveCount == 1 && indexCount == 1
+    }
+    // Give a stale cancelled task enough time to betray duplicate work. The
+    // assertion is about coalescence, not scheduler ordering between two timers.
+    try await Task.sleep(nanoseconds: 180_000_000)
     XCTAssertEqual(saveCount, 1)
     XCTAssertEqual(indexCount, 1)
   }

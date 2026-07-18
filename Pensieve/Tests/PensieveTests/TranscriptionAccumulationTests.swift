@@ -6,10 +6,10 @@ import XCTest
 @MainActor
 final class TranscriptionAccumulationTests: XCTestCase {
   func testDictationOutputStylesDescribeFormattingInsteadOfPretendingToBeLanguages() {
-    XCTAssertEqual(TranscriptionFormatMode.polish.title, "Clean Up")
-    XCTAssertEqual(TranscriptionFormatMode.kurier.title, "Kurier")
-    XCTAssertFalse(TranscriptionFormatMode.polish.assistive)
-    XCTAssertTrue(TranscriptionFormatMode.kurier.assistive)
+    XCTAssertEqual(TranscriptionFormatMode.cleanUp.title, "Clean Up")
+    XCTAssertEqual(TranscriptionFormatMode.writingAssistant.title, "Writing Assistant")
+    XCTAssertFalse(TranscriptionFormatMode.cleanUp.assistive)
+    XCTAssertTrue(TranscriptionFormatMode.writingAssistant.assistive)
   }
 
   func testDictationRecognitionLanguagesMapToExplicitLocales() {
@@ -396,24 +396,41 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertNil(service.lastError)
   }
 
-  func testFormatCompositionUsesKurierAssistiveFormatterWhenSelected() async {
+  func testFormatCompositionUsesWritingAssistantFormatterWhenSelected() async {
     let engine = MockVistaAutocompleteEngine(
       formattingAvailable: true,
       formattingHandler: { text, assistive in
         XCTAssertTrue(assistive)
-        return "kurier: \(text)"
+        return "assistant: \(text)"
       }
     )
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.receivePreview("chaotic spoken mission")
-    let formatted = await service.formatComposition(mode: .kurier)
+    let formatted = await service.formatComposition(mode: .writingAssistant)
 
-    XCTAssertEqual(formatted, "kurier: chaotic spoken mission")
-    XCTAssertEqual(service.committed, "kurier: chaotic spoken mission")
+    XCTAssertEqual(formatted, "assistant: chaotic spoken mission")
+    XCTAssertEqual(service.committed, "assistant: chaotic spoken mission")
     XCTAssertEqual(service.preview, "")
-    XCTAssertEqual(service.rendered, "kurier: chaotic spoken mission")
+    XCTAssertEqual(service.rendered, "assistant: chaotic spoken mission")
     XCTAssertFalse(service.isFormatting)
+    XCTAssertNil(service.lastError)
+  }
+
+  func testProductionFormattingSeamUsesProviderSafeResponsesBackend() async {
+    let responder = MockAITextResponder(result: "rewritten transcript")
+    let service = TranscriptionService(
+      engine: MockVistaAutocompleteEngine(formattingAvailable: false),
+      aiTextResponder: responder,
+      cadenceCommitNanoseconds: 0)
+    service.receivePreview("chaotic spoken mission")
+
+    let formatted = await service.formatComposition(mode: .writingAssistant)
+
+    XCTAssertEqual(formatted, "rewritten transcript")
+    XCTAssertEqual(responder.lastInput, "chaotic spoken mission")
+    XCTAssertTrue(responder.lastInstructions?.contains("voice-native writing assistant") == true)
+    XCTAssertTrue(responder.lastInstructions?.contains("Return only the rewritten text") == true)
     XCTAssertNil(service.lastError)
   }
 
@@ -672,6 +689,38 @@ final class TranscriptionAccumulationTests: XCTestCase {
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("Timed out waiting for dispatch status containing \(needle)")
+  }
+}
+
+private final class MockAITextResponder: AITextResponding, @unchecked Sendable {
+  let isConfigured = true
+  private let lock = NSLock()
+  private let result: String
+  private var storedInput: String?
+  private var storedInstructions: String?
+
+  init(result: String) {
+    self.result = result
+  }
+
+  func respond(input: String, instructions: String) async throws -> String {
+    lock.withLock {
+      storedInput = input
+      storedInstructions = instructions
+    }
+    return result
+  }
+
+  var lastInput: String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return storedInput
+  }
+
+  var lastInstructions: String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return storedInstructions
   }
 }
 
