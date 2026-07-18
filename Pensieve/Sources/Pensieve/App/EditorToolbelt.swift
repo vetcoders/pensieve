@@ -353,19 +353,19 @@ final class ToolbarResponderHistoryState: ObservableObject {
   @Published private(set) var availability = Availability(canUndo: false, canRedo: false)
   private var cancellables = Set<AnyCancellable>()
 
-  init(center: NotificationCenter = .default) {
-    let names: [Notification.Name] = [
-      .NSUndoManagerCheckpoint,
-      .NSUndoManagerDidUndoChange,
-      .NSUndoManagerDidRedoChange,
-      NSWindow.didBecomeKeyNotification,
-      NSWindow.didBecomeMainNotification,
-      NSText.didBeginEditingNotification,
-      NSText.didChangeNotification,
-      NSText.didEndEditingNotification,
-    ]
+  static let refreshNotificationNames: [Notification.Name] = [
+    .NSUndoManagerDidCloseUndoGroup,
+    .NSUndoManagerDidUndoChange,
+    .NSUndoManagerDidRedoChange,
+    NSWindow.didBecomeKeyNotification,
+    NSWindow.didBecomeMainNotification,
+    NSText.didBeginEditingNotification,
+    NSText.didChangeNotification,
+    NSText.didEndEditingNotification,
+  ]
 
-    Publishers.MergeMany(names.map { center.publisher(for: $0) })
+  init(center: NotificationCenter = .default) {
+    Publishers.MergeMany(Self.refreshNotificationNames.map { center.publisher(for: $0) })
       .receive(on: RunLoop.main)
       .sink { [weak self] _ in
         Task { @MainActor in
@@ -399,7 +399,9 @@ final class ToolbarResponderHistoryState: ObservableObject {
   }
 
   func refresh() {
-    availability = Self.availability(for: NSApp.keyWindow?.firstResponder)
+    let nextAvailability = Self.availability(for: NSApp.keyWindow?.firstResponder)
+    guard nextAvailability != availability else { return }
+    availability = nextAvailability
   }
 }
 

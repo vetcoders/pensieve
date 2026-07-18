@@ -199,6 +199,18 @@ final class EditorToolbeltTestsHistory: XCTestCase {
     }
   }
 
+  func testHistoryRefreshNotificationsCannotFeedBackThroughUndoCheckpoint() {
+    XCTAssertFalse(
+      ToolbarResponderHistoryState.refreshNotificationNames.contains(.NSUndoManagerCheckpoint),
+      "reading canUndo/canRedo emits a checkpoint, so observing it creates an infinite refresh loop"
+    )
+    XCTAssertTrue(
+      ToolbarResponderHistoryState.refreshNotificationNames.contains(
+        .NSUndoManagerDidCloseUndoGroup),
+      "closed undo groups must still refresh toolbar availability"
+    )
+  }
+
   func testAvailabilityTracksActiveTextViewUndoManagerWithoutAnotherStack() throws {
     let surface = MarkdownEditorSurface(text: "history", fontSize: 14)
     let undoManager = try XCTUnwrap(surface.textView.undoManager)
