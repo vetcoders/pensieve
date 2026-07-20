@@ -284,6 +284,36 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testStaleEngineStopFailureStillRetriesWhenCaptureBecameIdle() async {
+    let events = LockedStringLog()
+    let recording = LockedFlag()
+    recording.set()
+    let engine = MockVistaAutocompleteEngine(
+      isRecordingHandler: { recording.isSet },
+      removeEventListenerHandler: { events.append("removeListener") },
+      startRecordingHandler: { _ in
+        events.append("start")
+        recording.set()
+      },
+      stopRecordingHandler: {
+        events.append("stop")
+        recording.clear()
+        throw DictationLifecycleTestError.staleStop
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where !service.isRecording {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(service.isRecording)
+    XCTAssertNil(service.lastError)
+    XCTAssertEqual(events.values, ["stop", "removeListener", "start"])
+  }
+
+  @MainActor
   func testAsynchronousEngineErrorStopsCaptureDetachesListenerAndDrainsFinalText() async {
     let events = LockedStringLog()
     let recording = LockedFlag()

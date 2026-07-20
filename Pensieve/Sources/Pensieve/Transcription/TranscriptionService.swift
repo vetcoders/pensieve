@@ -248,8 +248,22 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
         // engine active. Drain that stale session before attaching this
         // service, so old callbacks cannot leak into a fresh transcript.
         if engine.isRecording() {
-          defer { engine.removeEventListener() }
-          _ = try engine.stopRecording()
+          var staleStopError: Error?
+          do {
+            _ = try engine.stopRecording()
+          } catch {
+            staleStopError = error
+          }
+          engine.removeEventListener()
+          // Some engines throw while tearing capture down even though their
+          // state has already become idle. That is recoverable. Starting over
+          // a capture that still reports active is not: preserve that error so
+          // two owners never compete for the same microphone session.
+          if engine.isRecording() {
+            throw staleStopError
+              ?? VistaError.ModelError(
+                msg: "dictation unavailable: stale microphone capture is still active")
+          }
         }
         if !engine.isModelLoaded() {
           try engine.initModel()
