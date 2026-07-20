@@ -16,6 +16,23 @@ fi
 semgrep scan --config auto --quiet --json "$@" >"$report"
 
 allowed="$(jq -c '.accepted_findings' "$policy")"
+invalid_policy="$(jq -r '
+  .accepted_findings[]
+  | select(
+      (.rule_id | type) != "string"
+      or (.path | type) != "string"
+      or (.max_count | type) != "number"
+      or .max_count < 1
+      or (.max_count | floor) != .max_count
+    )
+  | "\(.path // "<missing path>"): \(.rule_id // "<missing rule>") has invalid max_count"
+' "$policy")"
+if [[ -n "$invalid_policy" ]]; then
+  printf '%s\n' "$invalid_policy" >&2
+  printf '[fail] Semgrep reviewed policy is invalid.\n' >&2
+  exit 1
+fi
+
 unexpected="$({
   jq -r --argjson allowed "$allowed" '
     .results[] as $result
@@ -35,18 +52,16 @@ accepted_count="$(jq -r --argjson allowed "$allowed" '
     | select(any($allowed[]; .rule_id == $result.check_id and .path == $result.path))]
   | length
 ' "$report")"
-if [[ $# -eq 0 ]]; then
-  missing_policy="$(jq -r --argjson allowed "$allowed" '
-    $allowed[] as $entry
-    | ([.results[] | select(.check_id == $entry.rule_id and .path == $entry.path)] | length) as $count
-    | select($count != 1)
-    | "\($entry.path): \($entry.rule_id) expected exactly once, found \($count)"
-  ' "$report")"
-  if [[ -n "$missing_policy" ]]; then
-    printf '%s\n' "$missing_policy" >&2
-    printf '[fail] Semgrep reviewed policy drifted from the scanner output.\n' >&2
-    exit 1
-  fi
+excess_policy="$(jq -r --argjson allowed "$allowed" '
+  $allowed[] as $entry
+  | ([.results[] | select(.check_id == $entry.rule_id and .path == $entry.path)] | length) as $count
+  | select($count > $entry.max_count)
+  | "\($entry.path): \($entry.rule_id) allows at most \($entry.max_count), found \($count)"
+' "$report")"
+if [[ -n "$excess_policy" ]]; then
+  printf '%s\n' "$excess_policy" >&2
+  printf '[fail] Semgrep reviewed policy exceeded its accepted finding bound.\n' >&2
+  exit 1
 fi
 engine_warning_count="$(jq -r '.errors | length' "$report")"
 printf '[ok] Semgrep passed (%s reviewed policy finding(s), %s parser warning(s)).\n' \
