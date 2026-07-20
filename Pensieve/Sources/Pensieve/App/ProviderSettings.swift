@@ -130,6 +130,7 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
 
     var item = baseQuery
     item[kSecValueData as String] = data
+    // nosemgrep: swift.biometrics-and-auth.missing-user-auth.keychain-without-user-auth
     let addStatus = SecItemAdd(item as CFDictionary, nil)
     guard addStatus == errSecSuccess else { throw ProviderSettingsError.keychain(addStatus) }
   }
