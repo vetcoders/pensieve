@@ -1906,23 +1906,20 @@ final class FolderManager {
     }
   }
 
-  /// Rebuilds both root and ad-hoc file bookmark sets without adding a second persistence path.
-  /// Clearing first is deliberate: a removed root must not survive a partial rewrite and return
-  /// on relaunch. Any failure is surfaced while the live workspace still keeps its in-memory
-  /// surviving roots.
+  /// Rebuilds both root and ad-hoc file bookmark sets through BookmarkStore's prepare-then-replace
+  /// path. A removed root cannot return on relaunch, while failure to create a new bookmark leaves
+  /// the previously valid persisted workspace intact instead of clearing it partially.
   private func rewriteWorkspaceBookmarks(
     rootURLs: [URL],
     fileURLs: [URL],
     into appState: AppState
   ) -> String? {
-    bookmarkStore.clear(into: appState)
     do {
-      for rootURL in rootURLs {
-        try bookmarkStore.persistRoot(url: rootURL, into: appState)
-      }
-      for fileURL in fileURLs {
-        try bookmarkStore.persistFile(url: fileURL, into: appState)
-      }
+      try bookmarkStore.replaceWorkspace(
+        rootURLs: rootURLs,
+        fileURLs: fileURLs,
+        into: appState
+      )
       return nil
     } catch {
       return "Could not update workspace bookmarks: \(error.localizedDescription)"

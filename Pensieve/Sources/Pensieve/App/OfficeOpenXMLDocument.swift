@@ -544,7 +544,9 @@ private struct ZipArchive {
   private static let maximumEntryCount = 10_000
 
   private struct Entry {
+    let flags: UInt16
     let method: UInt16
+    let checksum: UInt32
     let compressedSize: Int
     let uncompressedSize: Int
     let localHeaderOffset: Int
@@ -564,6 +566,9 @@ private struct ZipArchive {
 
   func data(for name: String) throws -> Data? {
     guard let entry = entries[name] else { return nil }
+    guard entry.flags & 0x0001 == 0 else {
+      throw OfficeOpenXMLDocument.Error.invalidArchive
+    }
     guard entry.compressedSize <= Self.maximumPartSize,
       entry.uncompressedSize <= Self.maximumPartSize
     else { throw OfficeOpenXMLDocument.Error.partTooLarge }
@@ -579,14 +584,22 @@ private struct ZipArchive {
       throw OfficeOpenXMLDocument.Error.invalidArchive
     }
     let payload = data.subdata(in: start..<end)
+    let decoded: Data
     switch entry.method {
     case 0:
-      return payload
+      guard entry.compressedSize == entry.uncompressedSize else {
+        throw OfficeOpenXMLDocument.Error.invalidArchive
+      }
+      decoded = payload
     case 8:
-      return try Self.inflate(payload, uncompressedSize: entry.uncompressedSize)
+      decoded = try Self.inflate(payload, uncompressedSize: entry.uncompressedSize)
     default:
       throw OfficeOpenXMLDocument.Error.unsupportedCompression(entry.method)
     }
+    guard decoded.count == entry.uncompressedSize, Self.crc(decoded) == entry.checksum else {
+      throw OfficeOpenXMLDocument.Error.invalidArchive
+    }
+    return decoded
   }
 
   static func write(entries: [(name: String, data: Data)]) -> Data {
@@ -673,7 +686,9 @@ private struct ZipArchive {
     var cursor = Int(centralOffset)
     for _ in 0..<entryCount {
       guard data.uint32(at: cursor) == 0x0201_4B50,
+        let flags = data.uint16(at: cursor + 8),
         let method = data.uint16(at: cursor + 10),
+        let checksum = data.uint32(at: cursor + 16),
         let compressedSize = data.uint32(at: cursor + 20),
         let uncompressedSize = data.uint32(at: cursor + 24),
         let nameLength = data.uint16(at: cursor + 28),
@@ -688,7 +703,9 @@ private struct ZipArchive {
         let name = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8)
       else { throw OfficeOpenXMLDocument.Error.invalidArchive }
       result[name] = Entry(
+        flags: flags,
         method: method,
+        checksum: checksum,
         compressedSize: Int(compressedSize),
         uncompressedSize: Int(uncompressedSize),
         localHeaderOffset: Int(localOffset)
@@ -702,11 +719,11 @@ private struct ZipArchive {
     guard uncompressedSize > 0 else { return Data() }
     var output = Data(count: uncompressedSize)
     let outputCount = output.count
-    let status = data.withUnsafeBytes { inputBuffer in
-      output.withUnsafeMutableBytes { outputBuffer -> Int32 in
+    let result = data.withUnsafeBytes { inputBuffer in
+      output.withUnsafeMutableBytes { outputBuffer -> (status: Int32, input: Int, output: Int) in
         guard let input = inputBuffer.bindMemory(to: Bytef.self).baseAddress,
           let destination = outputBuffer.bindMemory(to: Bytef.self).baseAddress
-        else { return Z_DATA_ERROR }
+        else { return (Z_DATA_ERROR, 0, 0) }
         var stream = z_stream()
         stream.next_in = UnsafeMutablePointer(mutating: input)
         stream.avail_in = uInt(data.count)
@@ -718,12 +735,16 @@ private struct ZipArchive {
           ZLIB_VERSION,
           Int32(MemoryLayout<z_stream>.size)
         )
-        guard initialized == Z_OK else { return initialized }
+        guard initialized == Z_OK else { return (initialized, 0, 0) }
         defer { inflateEnd(&stream) }
-        return zlib.inflate(&stream, Z_FINISH)
+        let status = zlib.inflate(&stream, Z_FINISH)
+        return (status, Int(stream.total_in), Int(stream.total_out))
       }
     }
-    guard status == Z_STREAM_END else { throw OfficeOpenXMLDocument.Error.invalidArchive }
+    guard result.status == Z_STREAM_END,
+      result.input == data.count,
+      result.output == uncompressedSize
+    else { throw OfficeOpenXMLDocument.Error.invalidArchive }
     return output
   }
 

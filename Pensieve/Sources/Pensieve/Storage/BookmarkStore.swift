@@ -53,6 +53,46 @@ final class BookmarkStore {
     appState.lastError = nil
   }
 
+  /// Replaces the complete persisted workspace only after every new bookmark has been created.
+  /// This preserves the previous relaunch state if one of the requested URLs cannot produce a
+  /// security-scoped bookmark; callers can still update their live in-memory workspace and surface
+  /// the persistence failure without erasing otherwise valid roots.
+  func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
+    let roots = try rootURLs.map { url in
+      (
+        url.standardizedFileURL,
+        try url.bookmarkData(
+          options: [.withSecurityScope],
+          includingResourceValuesForKeys: nil,
+          relativeTo: nil
+        )
+      )
+    }
+    let files = try fileURLs.map { url in
+      (
+        url.standardizedFileURL,
+        try url.bookmarkData(
+          options: [.withSecurityScope],
+          includingResourceValuesForKeys: nil,
+          relativeTo: nil
+        )
+      )
+    }
+
+    stopAllAccess()
+    defaults.set(roots.map(\.1), forKey: rootBookmarksKey)
+    defaults.set(files.map(\.1), forKey: fileBookmarksKey)
+    if let firstRoot = roots.first?.1 {
+      defaults.set(firstRoot, forKey: legacyFolderBookmarkKey)
+    } else {
+      defaults.removeObject(forKey: legacyFolderBookmarkKey)
+    }
+    appState.bookmarkData = roots.first?.1
+    for root in roots { activate(root.0) }
+    for file in files { activate(file.0) }
+    appState.lastError = nil
+  }
+
   func restore(into appState: AppState) -> URL? {
     guard let data = bookmarkData else {
       appState.bookmarkData = nil

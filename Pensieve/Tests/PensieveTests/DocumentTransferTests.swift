@@ -82,6 +82,20 @@ final class DocumentTransferTests: XCTestCase {
     XCTAssertTrue(markdown.contains("Offsets stay relative."), markdown)
   }
 
+  func testDOCXReaderRejectsPartWhoseChecksumDoesNotMatch() throws {
+    var archive = try DocumentTransfer.docxData(
+      fromHTML: "<p>Checksum sentinel</p>", baseURL: nil)
+    let sentinel = Data("Checksum sentinel".utf8)
+    let range = try XCTUnwrap(archive.range(of: sentinel))
+    archive[range.lowerBound] ^= 0x01
+
+    XCTAssertThrowsError(try OfficeOpenXMLDocument.readMarkdown(archive)) { error in
+      guard case OfficeOpenXMLDocument.Error.invalidArchive = error else {
+        return XCTFail("Expected invalidArchive, got \(error)")
+      }
+    }
+  }
+
   func testPDFImportExtractsTextIntoMarkdownDraft() throws {
     let url = temporaryURL(named: "Board Resolution.pdf")
     try makeTextPDF("Prokurent approval is required.").write(to: url, options: .atomic)

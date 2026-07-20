@@ -102,4 +102,18 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
       restored.rootURLs.isEmpty,
       "a vanished root must be dropped silently (startup state, not a user error)")
   }
+
+  func testFailedWorkspaceReplacementPreservesPreviouslyPersistedRoots() throws {
+    let store = BookmarkStore(defaults: defaults)
+    let state = AppState()
+    try store.persistRoot(url: folder, into: state)
+    let missing = folder.appendingPathComponent("missing", isDirectory: true)
+
+    XCTAssertThrowsError(
+      try store.replaceWorkspace(rootURLs: [missing], fileURLs: [], into: state)
+    )
+
+    let restored = BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+    XCTAssertEqual(restored.rootURLs.map(\.standardizedFileURL), [folder.standardizedFileURL])
+  }
 }
