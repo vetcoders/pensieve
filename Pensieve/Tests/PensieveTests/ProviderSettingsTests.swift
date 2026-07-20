@@ -150,7 +150,7 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertEqual(restored.providerShape, .openAIResponses)
     XCTAssertEqual(restored.endpoint, "https://provider.example/v1/responses")
     XCTAssertEqual(restored.model, "completion-model")
-    XCTAssertEqual(restored.apiKey, secret)
+    XCTAssertEqual(restored.apiKey, "", "saved secrets are never reflected into the settings UI")
   }
 
   func testInheritedEnvironmentWinsAtLaunchAndPersistedSettingsDoNotClobberIt() throws {
@@ -214,8 +214,7 @@ final class ProviderSettingsTests: XCTestCase {
     settings.apiKey = "secret"
     try settings.save()
 
-    settings.apiKey = "  "
-    try settings.save()
+    try settings.forgetSavedAPIKey()
 
     XCTAssertNil(keychain.apiKey)
     XCTAssertNil(environment.values["LLM_ASSISTIVE_API_KEY"])

@@ -98,7 +98,6 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
     var query = baseQuery
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
-
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     if status == errSecItemNotFound { return nil }
@@ -161,6 +160,7 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
     }
     return accessControl
   }
+
 }
 
 struct ProcessProviderEnvironment: ProviderEnvironmentManaging {
@@ -252,12 +252,6 @@ final class ProviderSettings: ObservableObject {
       in: Self.endpointEnvironmentKeys, environment: environment)
     self.launchHadModelEnvironment = Self.hasNonEmptyValue(
       in: Self.modelEnvironmentKeys, environment: environment)
-
-    do {
-      self.apiKey = try keychain.loadAPIKey() ?? ""
-    } catch {
-      self.lastError = error.localizedDescription
-    }
 
     do {
       try applyPersistedConfigurationAtLaunch()
@@ -375,9 +369,7 @@ final class ProviderSettings: ObservableObject {
       guard !model.isEmpty else { throw ProviderSettingsError.modelRequired }
       let endpoint = providerShape.normalizeEndpoint(rawEndpoint)
 
-      if apiKey.isEmpty {
-        try keychain.deleteAPIKey()
-      } else {
+      if !apiKey.isEmpty {
         try keychain.storeAPIKey(apiKey)
       }
 
@@ -391,14 +383,27 @@ final class ProviderSettings: ObservableObject {
       try setManagedValue(endpoint, forKey: Self.assistiveEndpointKey)
       try setManagedValue(model, forKey: Self.assistiveModelKey)
       try setManagedValue(providerShape.rawValue, forKey: Self.assistiveProviderKey)
-      if apiKey.isEmpty {
-        try removeManagedValueIfOwned(forKey: Self.assistiveAPIKey)
-      } else {
+      if !apiKey.isEmpty {
         try setManagedValue(apiKey, forKey: Self.assistiveAPIKey)
       }
 
       lastError = nil
       saveStatus = "Saved and applied to AI features."
+      NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: self)
+    } catch {
+      saveStatus = nil
+      lastError = error.localizedDescription
+      throw error
+    }
+  }
+
+  func forgetSavedAPIKey() throws {
+    do {
+      try keychain.deleteAPIKey()
+      try removeManagedValueIfOwned(forKey: Self.assistiveAPIKey)
+      apiKey = ""
+      lastError = nil
+      saveStatus = "Saved API key removed."
       NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: self)
     } catch {
       saveStatus = nil
@@ -428,10 +433,6 @@ final class ProviderSettings: ObservableObject {
     // stale cloud key must not be sent to an unrelated local or test server.
     // Developers can provide an env key explicitly; a deliberate UI Save also
     // binds the visible triple and applies it as one user-owned override.
-    if !launchHadEndpointEnvironment && !launchHadModelEnvironment {
-      try fillMissingEnvironmentValue(
-        trimmed(apiKey), aliases: Self.apiKeyEnvironmentKeys, key: Self.assistiveAPIKey)
-    }
   }
 
   private func fillMissingEnvironmentValue(

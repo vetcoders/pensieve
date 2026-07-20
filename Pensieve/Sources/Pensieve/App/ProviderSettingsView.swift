@@ -61,6 +61,10 @@ struct ProviderSettingsView: View {
           .onChange(of: settings.apiKey) {
             settings.providerDiscoveryInputDidChange()
           }
+        Button("Forget Saved API Key", role: .destructive) {
+          try? settings.forgetSavedAPIKey()
+        }
+        .accessibilityIdentifier("pensieve.provider.forgetAPIKey")
       }
       .formStyle(.grouped)
 

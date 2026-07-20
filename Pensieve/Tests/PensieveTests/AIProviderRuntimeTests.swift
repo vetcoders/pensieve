@@ -4,6 +4,30 @@ import XCTest
 @testable import Pensieve
 
 final class AIProviderRuntimeTests: XCTestCase {
+  func testKeychainSecretLoadsLazilyOnlyWhenAIRequestStarts() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+      "LLM_ASSISTIVE_MODEL": "gpt-test",
+    ])
+    let keychain = StubProviderKeychain(value: "saved-key")
+    let recorder = RequestRecorder()
+    let runtime = AIProviderRuntime(environment: environment, keychain: keychain) { request in
+      recorder.record(request)
+      return (
+        Data(#"{"output_text":" next"}"#.utf8),
+        Self.response(for: request, statusCode: 200)
+      )
+    }
+
+    XCTAssertTrue(runtime.isConfigured)
+    XCTAssertEqual(keychain.loadCount, 0)
+    _ = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "text", afterCursor: ""), maxTokens: 16)
+
+    XCTAssertEqual(keychain.loadCount, 1)
+    XCTAssertEqual(recorder.request?.value(forHTTPHeaderField: "Authorization"), "Bearer saved-key")
+  }
+
   func testRewriteUsesExplicitIntentPayloadAndReturnsRangeScopedCandidate() async throws {
     let environment = StubProviderEnvironment([
       "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
@@ -168,6 +192,7 @@ final class AIProviderRuntimeTests: XCTestCase {
     let environment = StubProviderEnvironment([
       "LLM_ENDPOINT": "https://api.example.test/v1/responses",
       "LLM_MODEL": "gpt-5",
+      "LLM_API_KEY": "test-key",
     ])
     let responseData = Data(
       #"{"error":{"message":"Unsupported parameter: temperature\nremove it"}}"#.utf8)
@@ -192,6 +217,7 @@ final class AIProviderRuntimeTests: XCTestCase {
     let environment = StubProviderEnvironment([
       "LLM_ENDPOINT": "https://api.example.test/v1/responses",
       "LLM_MODEL": "gpt-5",
+      "LLM_API_KEY": "test-key",
     ])
     let backend = OpenAIResponsesAutocompleteBackend(environment: environment) { _ in
       throw URLError(.cancelled)
@@ -332,4 +358,24 @@ private final class SequencedRequestSender: @unchecked Sendable {
         url: request.url!, statusCode: next.0, httpVersion: "HTTP/1.1", headerFields: nil)!
     )
   }
+}
+
+private final class StubProviderKeychain: ProviderAPIKeyStoring, @unchecked Sendable {
+  private let lock = NSLock()
+  private let value: String?
+  private var loads = 0
+
+  init(value: String?) {
+    self.value = value
+  }
+
+  func loadAPIKey() throws -> String? {
+    lock.withLock { loads += 1 }
+    return value
+  }
+
+  func storeAPIKey(_ apiKey: String) throws {}
+  func deleteAPIKey() throws {}
+
+  var loadCount: Int { lock.withLock { loads } }
 }

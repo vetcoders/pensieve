@@ -47,13 +47,16 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
   typealias RequestSender = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
 
   private let environment: ProviderEnvironmentManaging
+  private let keychain: ProviderAPIKeyStoring
   private let sendRequest: RequestSender
 
   init(
     environment: ProviderEnvironmentManaging = ProcessProviderEnvironment(),
+    keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
     sendRequest: RequestSender? = nil
   ) {
     self.environment = environment
+    self.keychain = keychain
     self.sendRequest =
       sendRequest ?? { request in
         try await Self.liveRequest(request)
@@ -61,7 +64,8 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
   }
 
   var isConfigured: Bool {
-    (try? resolveConfiguration()) != nil
+    firstNonEmptyValue(for: ProviderSettings.endpointEnvironmentKeys) != nil
+      && firstNonEmptyValue(for: ProviderSettings.modelEnvironmentKeys) != nil
   }
 
   func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
@@ -306,11 +310,18 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
       shape == .anthropicMessages
       ? ProviderSettings.anthropicAPIKeyEnvironmentKeys + ProviderSettings.apiKeyEnvironmentKeys
       : ProviderSettings.apiKeyEnvironmentKeys
+    var apiKey = firstNonEmptyValue(for: keySearch)
+    let isLocalEndpoint =
+      endpoint.host == "localhost" || endpoint.host == "127.0.0.1"
+      || endpoint.host == "::1"
+    if apiKey == nil, !isLocalEndpoint {
+      apiKey = try keychain.loadAPIKey()
+    }
     return Configuration(
       shape: shape,
       endpoint: endpoint,
       model: model,
-      apiKey: firstNonEmptyValue(for: keySearch))
+      apiKey: apiKey)
   }
 
   private func firstNonEmptyValue(for keys: [String]) -> String? {

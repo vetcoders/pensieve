@@ -38,7 +38,11 @@ open "$APP_PATH" || {
 }
 
 log "probing Accessibility surface"
-osascript <<'APPLESCRIPT'
+ax_runner=()
+if command -v gtimeout >/dev/null 2>&1; then
+  ax_runner=(gtimeout --signal=TERM 60)
+fi
+"${ax_runner[@]}" osascript <<'APPLESCRIPT'
 on waitForProcess(appName, timeoutSeconds)
   tell application "System Events"
     repeat with i from 1 to (timeoutSeconds * 10)
