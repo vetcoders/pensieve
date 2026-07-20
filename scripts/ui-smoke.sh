@@ -163,6 +163,26 @@ tell application "System Events"
     end if
     key code 53
 
+    set rewriteControl to my toolbarElementByDescription(appName, "Rewrite with AI")
+    if (role of rewriteControl) is not "AXMenuButton" then
+      error "Rewrite with AI must be a native menu button, got " & (role of rewriteControl)
+    end if
+    if enabled of rewriteControl then
+      click rewriteControl
+      delay 0.3
+      if (count of menus of rewriteControl) is 0 then
+        error "Rewrite with AI menu did not open after click"
+      end if
+      set rewriteItems to get name of every menu item of menu 1 of rewriteControl
+      if rewriteItems does not contain "Improve Writing" then
+        error "Rewrite with AI menu is missing Improve Writing"
+      end if
+      if rewriteItems does not contain "Fix Grammar" then
+        error "Rewrite with AI menu is missing Fix Grammar"
+      end if
+      key code 53
+    end if
+
     if (count of windows) is 0 then error "Pensieve has no windows after menu probing"
   end tell
 end tell

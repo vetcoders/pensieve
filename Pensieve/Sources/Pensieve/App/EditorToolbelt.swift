@@ -36,6 +36,7 @@ struct EditorToolbelt: ToolbarContent {
   static let scrollSyncIdentifier = "pensieve.toolbar.scrollSync"
   static let dictationIdentifier = "pensieve.toolbar.dictationToggle"
   static let autocompleteIdentifier = "pensieve.toolbar.autocompleteToggle"
+  static let rewriteIdentifier = "pensieve.toolbar.aiRewrite"
   static let undoIdentifier = "pensieve.toolbar.undo"
   static let redoIdentifier = "pensieve.toolbar.redo"
   static let richMarkdownToggleIdentifier = "pensieve.toolbar.richMarkdownToggle"
@@ -115,6 +116,7 @@ struct EditorToolbelt: ToolbarContent {
       ControlGroup {
         dictationToggle
         autocompleteToggle
+        rewriteMenu
       }
     } label: {
       Label("Assistants", systemImage: "sparkles")
@@ -160,6 +162,7 @@ struct EditorToolbelt: ToolbarContent {
     identifiers.append(scrollSyncIdentifier)
     identifiers.append(dictationIdentifier)
     identifiers.append(autocompleteIdentifier)
+    identifiers.append(rewriteIdentifier)
     return identifiers
   }
 
@@ -315,6 +318,21 @@ struct EditorToolbelt: ToolbarContent {
     }
     .help("Suggest the next phrase as you type; press Tab to accept")
     .accessibilityIdentifier(Self.autocompleteIdentifier)
+  }
+
+  private var rewriteMenu: some View {
+    Menu {
+      ForEach(RewriteIntent.allCases, id: \.self) { intent in
+        Button(intent.label) {
+          appState.pendingAIRewriteCommand = AIRewriteCommand(action: .request(intent))
+        }
+      }
+    } label: {
+      Label("Rewrite with AI", systemImage: "wand.and.stars")
+    }
+    .help("Rewrite the selection or current paragraph with AI")
+    .disabled(!hasEditableBuffer || appState.mode == .preview)
+    .accessibilityIdentifier(Self.rewriteIdentifier)
   }
 }
 

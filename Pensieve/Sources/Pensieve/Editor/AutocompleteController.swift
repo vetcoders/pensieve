@@ -45,7 +45,9 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
   @Published private(set) var suggestion: String?
   @Published private(set) var lastError: String?
+  @Published private(set) var rewritePreview: AIRewritePreview?
   private(set) var candidate: AICandidate?
+  private var rewriteCandidate: AICandidate?
 
   private let completionFactory: CompletionFactory?
   private let debounceNanoseconds: UInt64
@@ -57,6 +59,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private var completionBackend: (any AutocompleteCompleting)?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
+  private var rewriteTask: Task<Void, Never>?
   private var providerSettingsCancellable: AnyCancellable?
   private var documentSession = DocumentAISession(documentID: "unbound")
   private var documentRevision: UInt64 = 0
@@ -117,6 +120,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
   deinit {
     completionTask?.cancel()
+    rewriteTask?.cancel()
     providerSettingsCancellable?.cancel()
   }
 
@@ -144,6 +148,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     isComposing: Bool = false,
     replacementRange: NSRange = NSRange(location: 0, length: 0)
   ) {
+    cancelRewrite()
     documentRevision &+= 1
     requestID &+= 1
     let currentRequestID = requestID
@@ -272,6 +277,72 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     lastError = nil
     engineUnavailable = false
     engineUnavailableDetail = nil
+    cancelRewrite()
+  }
+
+  func requestRewrite(context: RewriteContext, intent: RewriteIntent) {
+    rewriteTask?.cancel()
+    rewriteTask = nil
+    rewriteCandidate = nil
+    rewritePreview = nil
+    lastError = nil
+    guard hasEngineSource else {
+      lastError = Self.engineUnavailableMessage
+      return
+    }
+    let session = documentSession
+    rewriteTask = Task(priority: .userInitiated) { [weak self] in
+      do {
+        guard let backend = self?.resolveCompletionBackend() as? any AIRewriting else {
+          throw VistaError.ModelError(msg: "completion LLM unavailable: rewrite is unsupported")
+        }
+        let produced = try await backend.rewrite(
+          context: context, intent: intent, session: session)
+        try Task.checkCancellation()
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.rewriteTask = nil
+          self.rewriteCandidate = produced
+          self.rewritePreview = AIRewritePreview(
+            id: UUID(),
+            original: context.text,
+            proposed: produced.text,
+            intent: intent,
+            replacementRange: produced.replacementRange,
+            documentRevision: produced.documentRevision)
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        await MainActor.run { [weak self] in
+          self?.rewriteTask = nil
+          self?.lastError = Self.displayMessage(for: error)
+        }
+      }
+    }
+  }
+
+  func candidateForRewriteAcceptance(_ preview: AIRewritePreview) -> AICandidate? {
+    guard let rewriteCandidate,
+      rewriteCandidate.documentID == documentSession.documentID,
+      rewriteCandidate.text == preview.proposed,
+      rewriteCandidate.documentRevision == preview.documentRevision,
+      rewriteCandidate.replacementRange == preview.replacementRange
+    else { return nil }
+    return rewriteCandidate
+  }
+
+  func commitAppliedRewrite(_ candidate: AICandidate) {
+    commitAppliedCandidate(candidate)
+    rewriteCandidate = nil
+    rewritePreview = nil
+  }
+
+  func cancelRewrite() {
+    rewriteTask?.cancel()
+    rewriteTask = nil
+    rewriteCandidate = nil
+    rewritePreview = nil
   }
 
   func candidateForAcceptance(_ text: String, at range: NSRange) -> AICandidate? {

@@ -119,6 +119,7 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.scrollSyncIdentifier,
         EditorToolbelt.dictationIdentifier,
         EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ]
 
     XCTAssertEqual(
@@ -149,6 +150,7 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.scrollSyncIdentifier,
         EditorToolbelt.dictationIdentifier,
         EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ])
 
     XCTAssertEqual(
@@ -162,6 +164,7 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.scrollSyncIdentifier,
         EditorToolbelt.dictationIdentifier,
         EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ])
   }
 }

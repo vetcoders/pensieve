@@ -191,6 +191,16 @@ final class AppState {
     set { windowModel.pendingMarkdownFormatCommand = newValue }
   }
 
+  var pendingAIRewriteCommand: AIRewriteCommand? {
+    get { windowModel.pendingAIRewriteCommand }
+    set { windowModel.pendingAIRewriteCommand = newValue }
+  }
+
+  var aiRewritePreview: AIRewritePreview? {
+    get { windowModel.aiRewritePreview }
+    set { windowModel.aiRewritePreview = newValue }
+  }
+
   var findBarVisible: Bool {
     get { windowModel.findBarVisible }
     set { windowModel.findBarVisible = newValue }

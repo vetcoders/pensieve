@@ -18,6 +18,35 @@ enum RewriteIntent: String, Codable, CaseIterable, Equatable, Sendable {
   case shorten
   case expand
   case fixGrammar
+
+  var label: String {
+    switch self {
+    case .improve: return "Improve Writing"
+    case .shorten: return "Make Shorter"
+    case .expand: return "Expand"
+    case .fixGrammar: return "Fix Grammar"
+    }
+  }
+}
+
+struct AIRewriteCommand: Equatable, Identifiable, Sendable {
+  enum Action: Equatable, Sendable {
+    case request(RewriteIntent)
+    case accept
+    case cancel
+  }
+
+  let id = UUID()
+  let action: Action
+}
+
+struct AIRewritePreview: Equatable, Identifiable, Sendable {
+  let id: UUID
+  let original: String
+  let proposed: String
+  let intent: RewriteIntent
+  let replacementRange: NSRange
+  let documentRevision: UInt64
 }
 
 struct ProviderFingerprint: Codable, Equatable, Sendable {
@@ -108,6 +137,14 @@ protocol SessionAutocompleteCompleting: Sendable {
     session: DocumentAISession,
     documentRevision: UInt64,
     replacementRange: NSRange
+  ) async throws -> AICandidate
+}
+
+protocol AIRewriting: Sendable {
+  func rewrite(
+    context: RewriteContext,
+    intent: RewriteIntent,
+    session: DocumentAISession
   ) async throws -> AICandidate
 }
 

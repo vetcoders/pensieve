@@ -26,6 +26,7 @@ struct EditorView: View {
         fontSize: appState.fontSize,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
+        rewriteCommand: appState.pendingAIRewriteCommand,
         findQuery: $appState.findQuery,
         findReplacement: $appState.findReplaceQuery,
         findBarVisible: appState.findBarVisible,
@@ -49,6 +50,9 @@ struct EditorView: View {
         },
         onAutocompleteErrorChanged: { error in
           autocompleteError = error
+        },
+        onRewritePreviewChanged: { preview in
+          appState.aiRewritePreview = preview
         }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -87,6 +91,41 @@ struct EditorView: View {
           .accessibilityIdentifier("pensieve.autocomplete.error")
         }
       }
+      .overlay(alignment: .bottom) {
+        if let preview = appState.aiRewritePreview {
+          VStack(alignment: .leading, spacing: 10) {
+            Text(preview.intent.label)
+              .font(.headline)
+            ScrollView {
+              Text(preview.proposed)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+            }
+            .frame(maxHeight: 160)
+            HStack {
+              Button("Cancel") {
+                appState.pendingAIRewriteCommand = AIRewriteCommand(action: .cancel)
+              }
+              .keyboardShortcut(.cancelAction)
+              .accessibilityIdentifier("pensieve.rewrite.cancel")
+              Spacer()
+              Button("Accept Rewrite") {
+                appState.pendingAIRewriteCommand = AIRewriteCommand(action: .accept)
+              }
+              .keyboardShortcut(.defaultAction)
+              .accessibilityIdentifier("pensieve.rewrite.accept")
+            }
+          }
+          .padding(16)
+          .frame(maxWidth: 520)
+          .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+          .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(.separator, lineWidth: 1)
+          }
+          .padding(16)
+          .accessibilityIdentifier("pensieve.rewrite.preview")
+        }
+      }
     }
     .background(Color(NSColor.textBackgroundColor))
   }
@@ -119,6 +158,7 @@ struct EditorRepresentable: NSViewRepresentable {
   let fontSize: CGFloat
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
+  let rewriteCommand: AIRewriteCommand?
   @Binding var findQuery: String
   @Binding var findReplacement: String
   let findBarVisible: Bool
@@ -138,6 +178,7 @@ struct EditorRepresentable: NSViewRepresentable {
   // Caret/selection sink for the status bar; no-op default for the same reason.
   var onSelectionChanged: @MainActor (Int, Int) -> Void = { _, _ in }
   var onAutocompleteErrorChanged: @MainActor (String?) -> Void = { _ in }
+  var onRewritePreviewChanged: @MainActor (AIRewritePreview?) -> Void = { _ in }
 
   init(
     text: Binding<String>,
@@ -145,6 +186,7 @@ struct EditorRepresentable: NSViewRepresentable {
     fontSize: CGFloat,
     syntaxHighlightingEnabled: Bool,
     formattingCommand: MarkdownFormatCommand?,
+    rewriteCommand: AIRewriteCommand? = nil,
     findQuery: Binding<String>,
     findReplacement: Binding<String>,
     findBarVisible: Bool,
@@ -160,13 +202,15 @@ struct EditorRepresentable: NSViewRepresentable {
     onCloseFindBar: @escaping @MainActor () -> Void,
     onFindStateChanged: @escaping @MainActor (Int, Int?) -> Void = { _, _ in },
     onSelectionChanged: @escaping @MainActor (Int, Int) -> Void = { _, _ in },
-    onAutocompleteErrorChanged: @escaping @MainActor (String?) -> Void = { _ in }
+    onAutocompleteErrorChanged: @escaping @MainActor (String?) -> Void = { _ in },
+    onRewritePreviewChanged: @escaping @MainActor (AIRewritePreview?) -> Void = { _ in }
   ) {
     self._text = text
     self.editorMode = editorMode
     self.fontSize = fontSize
     self.syntaxHighlightingEnabled = syntaxHighlightingEnabled
     self.formattingCommand = formattingCommand
+    self.rewriteCommand = rewriteCommand
     self._findQuery = findQuery
     self._findReplacement = findReplacement
     self.findBarVisible = findBarVisible
@@ -183,6 +227,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self.onFindStateChanged = onFindStateChanged
     self.onSelectionChanged = onSelectionChanged
     self.onAutocompleteErrorChanged = onAutocompleteErrorChanged
+    self.onRewritePreviewChanged = onRewritePreviewChanged
   }
 
   func makeNSView(context: Context) -> NSScrollView {
@@ -218,6 +263,11 @@ struct EditorRepresentable: NSViewRepresentable {
         self.onAutocompleteErrorChanged(error)
       }
     }
+    surface.onRewritePreviewChanged = { preview in
+      DispatchQueue.main.async {
+        self.onRewritePreviewChanged(preview)
+      }
+    }
     surface.configureScrollSync(
       coordinator: scrollSyncCoordinator,
       enabled: scrollSyncEnabled
@@ -230,6 +280,7 @@ struct EditorRepresentable: NSViewRepresentable {
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     guard let surface = context.coordinator.surface else { return }
     surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
+    surface.onRewritePreviewChanged = onRewritePreviewChanged
     surface.configureDocument(id: documentID)
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
@@ -267,6 +318,7 @@ struct EditorRepresentable: NSViewRepresentable {
       }
     }
     context.coordinator.apply(formattingCommand, to: surface)
+    context.coordinator.apply(rewriteCommand, to: surface)
     if let selectedText = context.coordinator.applyFind(
       findCommand,
       to: surface,
@@ -284,6 +336,7 @@ struct EditorRepresentable: NSViewRepresentable {
   final class Coordinator {
     var surface: MarkdownEditorSurface?
     private var lastAppliedFormattingCommandID: UUID?
+    private var lastAppliedRewriteCommandID: UUID?
     private var lastAppliedFindCommandID: UUID?
 
     func apply(_ command: MarkdownFormatCommand?, to surface: MarkdownEditorSurface) {
@@ -291,6 +344,12 @@ struct EditorRepresentable: NSViewRepresentable {
       guard command.id != lastAppliedFormattingCommandID else { return }
       lastAppliedFormattingCommandID = command.id
       surface.applyMarkdownCommand(command)
+    }
+
+    func apply(_ command: AIRewriteCommand?, to surface: MarkdownEditorSurface) {
+      guard let command, command.id != lastAppliedRewriteCommandID else { return }
+      lastAppliedRewriteCommandID = command.id
+      surface.applyRewriteCommand(command)
     }
 
     func applyFind(
@@ -342,6 +401,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Reports (caret UTF-16 offset, selection UTF-16 length) for the status bar.
   var onSelectionChanged: ((Int, Int) -> Void)?
   var onAutocompleteErrorChanged: ((String?) -> Void)?
+  var onRewritePreviewChanged: ((AIRewritePreview?) -> Void)?
   private var lastNotifiedCaretOffset = -1
   private var lastNotifiedSelectionLength = -1
   var typewriterScrollEnabled = false
@@ -349,6 +409,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var aiAutocompleteEnabled: Bool
   private var autocompleteCancellable: AnyCancellable?
   private var autocompleteErrorCancellable: AnyCancellable?
+  private var rewritePreviewCancellable: AnyCancellable?
+  private var documentRevision: UInt64 = 0
   private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
   private weak var scrollSyncCoordinator: ScrollSyncCoordinator?
@@ -458,6 +520,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       self?.acceptAutocompleteSuggestion() ?? false
     }
     bindAutocomplete()
+    bindRewritePreview()
     update(
       text: text,
       fontSize: fontSize,
@@ -505,6 +568,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textStorage.string != text {
       isApplyingExternalText = true
+      documentRevision &+= 1
+      autocompleteController.cancelRewrite()
       lastCenteredLine = nil  // document changed under us; allow the next center
       invalidateAutocomplete()
       // A model→view text re-sync must NOT yank the viewport to the caret. Preserve the
@@ -591,6 +656,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
     let latestText = textStorage.string
+    documentRevision &+= 1
     if textView.undoManager?.isUndoing == true {
       autocompleteController.invalidateContinuation()
     }
@@ -686,6 +752,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       }
   }
 
+  private func bindRewritePreview() {
+    rewritePreviewCancellable = autocompleteController.$rewritePreview
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] preview in
+        self?.onRewritePreviewChanged?(preview)
+      }
+  }
+
   private func setAIAutocompleteEnabled(_ enabled: Bool) {
     guard aiAutocompleteEnabled != enabled else { return }
     aiAutocompleteEnabled = enabled
@@ -766,6 +840,73 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   func configureDocument(id: String) {
     autocompleteController.configureDocument(id: id)
+  }
+
+  func applyRewriteCommand(_ command: AIRewriteCommand) {
+    switch command.action {
+    case .request(let intent):
+      requestRewrite(intent: intent)
+    case .accept:
+      acceptRewritePreview()
+    case .cancel:
+      autocompleteController.cancelRewrite()
+    }
+  }
+
+  private func requestRewrite(intent: RewriteIntent) {
+    let selection = textView.selectedRange()
+    let range = selection.length > 0 ? selection : currentParagraphRange(at: selection.location)
+    guard range.length > 0, NSMaxRange(range) <= textStorage.length else { return }
+    let original = (textStorage.string as NSString).substring(with: range)
+    autocompleteController.requestRewrite(
+      context: RewriteContext(
+        text: original,
+        rangeLocation: range.location,
+        rangeLength: range.length,
+        documentRevision: documentRevision),
+      intent: intent)
+  }
+
+  @discardableResult
+  private func acceptRewritePreview() -> Bool {
+    guard let preview = autocompleteController.rewritePreview,
+      preview.documentRevision == documentRevision,
+      NSMaxRange(preview.replacementRange) <= textStorage.length,
+      (textStorage.string as NSString).substring(with: preview.replacementRange)
+        == preview.original,
+      let candidate = autocompleteController.candidateForRewriteAcceptance(preview)
+    else {
+      autocompleteController.cancelRewrite()
+      return false
+    }
+    textView.insertText(preview.proposed, replacementRange: preview.replacementRange)
+    let appliedRange = NSRange(
+      location: preview.replacementRange.location,
+      length: (preview.proposed as NSString).length)
+    guard NSMaxRange(appliedRange) <= textStorage.length,
+      (textStorage.string as NSString).substring(with: appliedRange) == preview.proposed
+    else {
+      autocompleteController.cancelRewrite()
+      return false
+    }
+    autocompleteController.commitAppliedRewrite(candidate)
+    textContentStorage.refreshHighlighting()
+    return true
+  }
+
+  private func currentParagraphRange(at caret: Int) -> NSRange {
+    let text = textStorage.string as NSString
+    guard text.length > 0 else { return NSRange(location: 0, length: 0) }
+    let safeCaret = min(max(caret, 0), max(text.length - 1, 0))
+    var start = 0
+    var end = 0
+    var contentsEnd = 0
+    text.getParagraphStart(
+      &start,
+      end: &end,
+      contentsEnd: &contentsEnd,
+      for: NSRange(location: safeCaret, length: 0))
+    return NSRange(location: start, length: contentsEnd - start)
   }
 
   func textView(

@@ -55,6 +55,8 @@ final class DocumentWindowModel {
   var fontSize: CGFloat = 14
   var richMarkdownEnabled: Bool = true
   var pendingMarkdownFormatCommand: MarkdownFormatCommand?
+  var pendingAIRewriteCommand: AIRewriteCommand?
+  var aiRewritePreview: AIRewritePreview?
   var findBarVisible: Bool = false
   var findReplaceMode: Bool = false
   var findQuery: String = ""

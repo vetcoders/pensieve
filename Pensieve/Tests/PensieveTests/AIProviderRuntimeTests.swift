@@ -3,7 +3,42 @@ import XCTest
 
 @testable import Pensieve
 
-final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
+final class AIProviderRuntimeTests: XCTestCase {
+  func testRewriteUsesExplicitIntentPayloadAndReturnsRangeScopedCandidate() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+      "LLM_ASSISTIVE_MODEL": "gpt-test",
+      "LLM_ASSISTIVE_API_KEY": "key",
+    ])
+    let recorder = RequestRecorder()
+    let runtime = AIProviderRuntime(environment: environment) { request in
+      recorder.record(request)
+      return (
+        Data(#"{"id":"resp-rewrite","output_text":"Improved text."}"#.utf8),
+        Self.response(for: request, statusCode: 200)
+      )
+    }
+
+    let candidate = try await runtime.rewrite(
+      context: RewriteContext(
+        text: "Rough text.", rangeLocation: 12, rangeLength: 11, documentRevision: 9),
+      intent: .improve,
+      session: DocumentAISession(documentID: "doc"))
+
+    XCTAssertEqual(candidate.text, "Improved text.")
+    XCTAssertEqual(candidate.replacementRange, NSRange(location: 12, length: 11))
+    XCTAssertEqual(candidate.documentRevision, 9)
+    let body = try requestJSON(try XCTUnwrap(recorder.request))
+    XCTAssertTrue((body["instructions"] as? String)?.contains("Markdown editing engine") == true)
+    let input = try XCTUnwrap(body["input"] as? [[String: Any]])
+    let content = try XCTUnwrap(input.last?["content"] as? [[String: Any]])
+    let payloadText = try XCTUnwrap(content.first?["text"] as? String)
+    let payload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(payloadText.utf8)) as? [String: Any])
+    XCTAssertEqual(payload["task"] as? String, "rewrite_document_selection")
+    XCTAssertEqual(payload["rewrite_intent"] as? String, "improve")
+    XCTAssertEqual(payload["selection"] as? String, "Rough text.")
+  }
   func testOpenAIUsesCommittedResponseIDAndFallsBackExactlyOnceOn404() async throws {
     let environment = StubProviderEnvironment([
       "LLM_ASSISTIVE_PROVIDER": "openai-responses",

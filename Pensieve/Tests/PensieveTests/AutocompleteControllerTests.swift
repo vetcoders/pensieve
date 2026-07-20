@@ -186,6 +186,62 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(store.session(for: "doc-undo").continuation, .none)
   }
 
+  func testRewriteUsesExactSelectionAndAcceptsAsOneUndoableEdit() async {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("rewrite-session-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    let backend = RewriteStubBackend(output: "A polished sentence.")
+    let controller = AutocompleteController(
+      completionFactory: { backend }, debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "A rough sentence.",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-rewrite",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 0, length: 17))
+
+    surface.applyRewriteCommand(AIRewriteCommand(action: .request(.improve)))
+    await waitUntil { controller.rewritePreview != nil }
+    XCTAssertEqual(backend.context?.text, "A rough sentence.")
+    surface.applyRewriteCommand(AIRewriteCommand(action: .accept))
+
+    XCTAssertEqual(surface.textStorage.string, "A polished sentence.")
+    surface.textView.undoManager?.undo()
+    XCTAssertEqual(surface.textStorage.string, "A rough sentence.")
+    XCTAssertEqual(store.session(for: "doc-rewrite").continuation, .none)
+  }
+
+  func testRewriteWithoutSelectionUsesCurrentParagraphAndRefusesStaleRange() async {
+    let backend = RewriteStubBackend(output: "Rewritten second paragraph.")
+    let controller = AutocompleteController(
+      completionFactory: { backend }, debounceNanoseconds: 1)
+    let original = "First paragraph.\nSecond paragraph.\nThird paragraph."
+    let surface = MarkdownEditorSurface(
+      text: original,
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-stale-rewrite",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 20, length: 0))
+    surface.applyRewriteCommand(AIRewriteCommand(action: .request(.improve)))
+    await waitUntil { controller.rewritePreview != nil }
+    XCTAssertEqual(backend.context?.text, "Second paragraph.")
+
+    surface.textView.insertText("X", replacementRange: NSRange(location: 0, length: 0))
+    surface.applyRewriteCommand(AIRewriteCommand(action: .accept))
+
+    XCTAssertEqual(surface.textStorage.string, "X" + original)
+    XCTAssertNil(controller.rewritePreview)
+  }
+
   func testDismissAutocompleteDoesNotMutateTextStorage() {
     let surface = makeSurface(text: "hello")
     surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
@@ -804,6 +860,44 @@ private actor AsyncGate {
     isOpen = true
     continuation?.resume()
     continuation = nil
+  }
+}
+
+private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, @unchecked Sendable {
+  private let lock = NSLock()
+  private let output: String
+  private var storedContext: RewriteContext?
+
+  init(output: String) {
+    self.output = output
+  }
+
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
+    output
+  }
+
+  func rewrite(
+    context: RewriteContext,
+    intent: RewriteIntent,
+    session: DocumentAISession
+  ) async throws -> AICandidate {
+    lock.withLock {
+      storedContext = context
+    }
+    return AICandidate(
+      documentID: session.documentID,
+      text: output,
+      providerInput: context.text,
+      providerFingerprint: ProviderFingerprint(
+        shape: .openAIResponses, endpoint: "https://rewrite.test/v1/responses", model: "test"),
+      pendingContinuation: .openAI(previousResponseID: "resp-rewrite"),
+      invalidatedOpaqueContinuation: false,
+      documentRevision: context.documentRevision,
+      replacementRange: NSRange(location: context.rangeLocation, length: context.rangeLength))
+  }
+
+  var context: RewriteContext? {
+    lock.withLock { storedContext }
   }
 }
 
