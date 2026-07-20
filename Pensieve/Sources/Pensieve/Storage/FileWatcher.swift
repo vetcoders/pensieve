@@ -256,7 +256,7 @@ private final class FSEventsFileWatcherEventSource: FileWatcherEventSource {
     rawFlags: UnsafePointer<FSEventStreamEventFlags>
   ) {
     guard count > 0, let onEvents else { return }
-    let pathObjects = unsafeBitCast(rawPaths, to: NSArray.self)
+    let pathObjects = Unmanaged<NSArray>.fromOpaque(rawPaths).takeUnretainedValue()
     let paths = pathObjects.compactMap { $0 as? String }
     let eventCount = min(count, paths.count)
     guard eventCount > 0 else { return }

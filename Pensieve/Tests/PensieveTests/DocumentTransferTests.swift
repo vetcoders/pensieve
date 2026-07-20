@@ -68,6 +68,20 @@ final class DocumentTransferTests: XCTestCase {
     XCTAssertTrue(imported.markdown.contains("Standard Word package"), imported.markdown)
   }
 
+  func testDOCXReaderAcceptsDataSliceWithNonzeroStartIndex() throws {
+    let archive = try DocumentTransfer.docxData(
+      fromHTML: "<h1>Sliced archive</h1><p>Offsets stay relative.</p>", baseURL: nil)
+    var padded = Data(repeating: 0xAA, count: 7)
+    padded.append(archive)
+    let slice = padded.dropFirst(7)
+
+    XCTAssertEqual(slice.startIndex, 7)
+    let markdown = try OfficeOpenXMLDocument.readMarkdown(slice)
+
+    XCTAssertTrue(markdown.contains("# Sliced archive"), markdown)
+    XCTAssertTrue(markdown.contains("Offsets stay relative."), markdown)
+  }
+
   func testPDFImportExtractsTextIntoMarkdownDraft() throws {
     let url = temporaryURL(named: "Board Resolution.pdf")
     try makeTextPDF("Prokurent approval is required.").write(to: url, options: .atomic)

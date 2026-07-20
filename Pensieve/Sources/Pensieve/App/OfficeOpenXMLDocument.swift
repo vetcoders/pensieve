@@ -554,8 +554,12 @@ private struct ZipArchive {
   private let entries: [String: Entry]
 
   init(data: Data) throws {
-    self.data = data
-    self.entries = try Self.readDirectory(from: data)
+    // ZIP offsets are relative to the first archive byte. A Data slice keeps
+    // its parent's nonzero indices, so normalize once at the parser boundary
+    // instead of making every range and integer read translate indices.
+    let archive = Data(data)
+    self.data = archive
+    self.entries = try Self.readDirectory(from: archive)
   }
 
   func data(for name: String) throws -> Data? {
@@ -777,16 +781,18 @@ private func safeXMLParser(_ data: Data) throws -> XMLParser {
 
 extension Data {
   fileprivate func uint16(at offset: Int) -> UInt16? {
-    guard offset >= 0, offset + 2 <= count else { return nil }
-    return UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
+    guard offset >= 0, offset <= count, count - offset >= 2 else { return nil }
+    let start = index(startIndex, offsetBy: offset)
+    return UInt16(self[start]) | (UInt16(self[index(after: start)]) << 8)
   }
 
   fileprivate func uint32(at offset: Int) -> UInt32? {
-    guard offset >= 0, offset + 4 <= count else { return nil }
-    return UInt32(self[offset])
-      | (UInt32(self[offset + 1]) << 8)
-      | (UInt32(self[offset + 2]) << 16)
-      | (UInt32(self[offset + 3]) << 24)
+    guard offset >= 0, offset <= count, count - offset >= 4 else { return nil }
+    let start = index(startIndex, offsetBy: offset)
+    return UInt32(self[start])
+      | (UInt32(self[index(start, offsetBy: 1)]) << 8)
+      | (UInt32(self[index(start, offsetBy: 2)]) << 16)
+      | (UInt32(self[index(start, offsetBy: 3)]) << 24)
   }
 
   fileprivate mutating func appendLE<T: FixedWidthInteger>(_ value: T) {

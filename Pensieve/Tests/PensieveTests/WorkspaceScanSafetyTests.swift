@@ -47,6 +47,34 @@ final class WorkspaceScanSafetyTests: XCTestCase {
     )
   }
 
+  func testScannerPreservesWorkspaceOpenedThroughSymlinkWithoutFollowingNestedSymlinks() throws {
+    let container = try makeTemporaryFolder(prefix: "PensieveSymlinkRoot")
+    let external = try makeTemporaryFolder(prefix: "PensieveSymlinkRootExternal")
+    defer {
+      try? FileManager.default.removeItem(at: container)
+      try? FileManager.default.removeItem(at: external)
+    }
+
+    let realRoot = container.appendingPathComponent("real", isDirectory: true)
+    let linkedRoot = container.appendingPathComponent("linked")
+    try FileManager.default.createDirectory(at: realRoot, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: linkedRoot, withDestinationURL: realRoot)
+    try "# Local".write(
+      to: realRoot.appendingPathComponent("local.md"), atomically: true, encoding: .utf8)
+    try "# External".write(
+      to: external.appendingPathComponent("external.md"), atomically: true, encoding: .utf8)
+    try FileManager.default.createSymbolicLink(
+      at: realRoot.appendingPathComponent("external-link"), withDestinationURL: external)
+
+    let scans = WorkspaceScanner.build(rootURLs: [linkedRoot], exclusions: [])
+
+    XCTAssertEqual(scans.count, 1)
+    XCTAssertEqual(
+      scans[0].documents.map(\.url),
+      [linkedRoot.appendingPathComponent("local.md").standardizedFileURL])
+    XCTAssertFalse(flatten(scans[0].rootNode).contains { $0.name == "external-link" })
+  }
+
   func testCancellableScannerThrowsWithoutReturningPartialScan() async throws {
     let root = try makeTemporaryFolder(prefix: "PensieveScanCancellation")
     defer { try? FileManager.default.removeItem(at: root) }

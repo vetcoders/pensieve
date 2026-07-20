@@ -142,6 +142,11 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
   }
 
   private var baseQuery: [String: Any] {
+    // Keep the macOS Keychain default accessibility (`WhenUnlocked`). This app
+    // only reads provider credentials in the foreground; `AfterFirstUnlock`
+    // would unnecessarily expose them while the Mac is locked. Explicit
+    // `kSecAttrAccessible` also requires opting into the Data Protection
+    // Keychain on macOS, which is a separate storage migration.
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,

@@ -259,6 +259,31 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   @MainActor
+  func testStaleEngineStopFailureDetachesListenerAndDoesNotStartOverActiveCapture() async {
+    let events = LockedStringLog()
+    let engine = MockVistaAutocompleteEngine(
+      isRecordingHandler: { true },
+      removeEventListenerHandler: { events.append("removeListener") },
+      startRecordingHandler: { _ in events.append("start") },
+      stopRecordingHandler: {
+        events.append("stop")
+        throw DictationLifecycleTestError.staleStop
+      }
+    )
+    let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
+
+    service.startRecording()
+    for _ in 0..<200 where service.lastError == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertFalse(service.isPreparingRecording)
+    XCTAssertFalse(service.isRecording)
+    XCTAssertNotNil(service.lastError)
+    XCTAssertEqual(events.values, ["stop", "removeListener"])
+  }
+
+  @MainActor
   func testAsynchronousEngineErrorStopsCaptureDetachesListenerAndDrainsFinalText() async {
     let events = LockedStringLog()
     let recording = LockedFlag()
@@ -766,6 +791,7 @@ private final class LockedFlag: @unchecked Sendable {
 
 private enum DictationLifecycleTestError: Error {
   case partialStart
+  case staleStop
 }
 
 private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {

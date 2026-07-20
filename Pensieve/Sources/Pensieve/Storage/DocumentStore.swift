@@ -2228,12 +2228,10 @@ enum WorkspaceScanner {
   ) throws -> WorkspaceScan {
     try cancellationCheck()
     let root = url.standardizedFileURL
-    let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
     var visitedDirectories = Set<String>()
     let scan = try scanChildren(
       folder: root,
       root: root,
-      resolvedRoot: resolvedRoot,
       exclusions: exclusions,
       gitIgnoreRules: [],
       visitedDirectories: &visitedDirectories,
@@ -2254,32 +2252,28 @@ enum WorkspaceScanner {
   private static func scanChildren(
     folder url: URL,
     root: URL,
-    resolvedRoot: URL,
     exclusions: Set<String>,
     gitIgnoreRules inheritedGitIgnoreRules: [GitIgnoreRule],
     visitedDirectories: inout Set<String>,
     cancellationCheck: () throws -> Void
   ) throws -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
     try cancellationCheck()
-    let resolvedDirectory = url.resolvingSymlinksInPath().standardizedFileURL
-    guard contains(resolvedDirectory, in: resolvedRoot),
-      visitedDirectories.insert(resolvedDirectory.path).inserted
+    let standardizedDirectory = url.standardizedFileURL
+    guard contains(standardizedDirectory, in: root),
+      visitedDirectories.insert(standardizedDirectory.path).inserted
     else {
       return ([], [])
     }
 
     let fm = FileManager.default
-    guard
-      let urls = try? fm.contentsOfDirectory(
-        at: url,
-        // Ask only for link identity here. Directory/file type is queried only after `entry`
-        // proves this URL itself is not a symlink, avoiding Foundation's target-type resolution.
-        includingPropertiesForKeys: [.isSymbolicLinkKey],
-        options: []
-      )
-    else {
+    guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
       return ([], [])
     }
+    // The URL-based directory API rejects a workspace root that is itself a
+    // symlink on current macOS. Enumerate names through the path API, then
+    // anchor each child to the logical workspace URL. Entry classification
+    // below reads link identity before directory/file target type.
+    let urls = childNames.map { url.appendingPathComponent($0) }
 
     var documents: [DocumentRef] = []
     var nodes: [WorkspaceNode] = []
@@ -2292,7 +2286,6 @@ enum WorkspaceScanner {
       if let entry = entry(
         for: childURL,
         root: root,
-        resolvedRoot: resolvedRoot,
         exclusions: exclusions,
         gitIgnoreRules: gitIgnoreRules
       ) {
@@ -2307,7 +2300,6 @@ enum WorkspaceScanner {
         let childScan = try scanChildren(
           folder: entry.url,
           root: root,
-          resolvedRoot: resolvedRoot,
           exclusions: exclusions,
           gitIgnoreRules: gitIgnoreRules,
           visitedDirectories: &visitedDirectories,
@@ -2349,7 +2341,6 @@ enum WorkspaceScanner {
   private static func entry(
     for url: URL,
     root: URL,
-    resolvedRoot: URL,
     exclusions: Set<String>,
     gitIgnoreRules: [GitIgnoreRule]
   )
@@ -2364,9 +2355,6 @@ enum WorkspaceScanner {
       let linkValues = try? standardizedURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
       linkValues.isSymbolicLink != true
     else { return nil }
-
-    let resolvedURL = standardizedURL.resolvingSymlinksInPath().standardizedFileURL
-    guard contains(resolvedURL, in: resolvedRoot) else { return nil }
 
     let values = try? standardizedURL.resourceValues(forKeys: [
       .isDirectoryKey, .isRegularFileKey,

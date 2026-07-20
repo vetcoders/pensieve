@@ -248,6 +248,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
         // engine active. Drain that stale session before attaching this
         // service, so old callbacks cannot leak into a fresh transcript.
         if engine.isRecording() {
+          defer { engine.removeEventListener() }
           _ = try engine.stopRecording()
         }
         if !engine.isModelLoaded() {
