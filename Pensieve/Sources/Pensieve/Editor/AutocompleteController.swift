@@ -75,7 +75,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     engineFactory: EngineFactory? = nil,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
     maxTokens: UInt32 = 32,
-    sessionStore: DocumentAISessionStore = DocumentAISessionStore()
+    sessionStore: DocumentAISessionStore = .shared
   ) {
     if let engine {
       self.completionBackend = VistaAutocompleteAdapter(engine: engine)
@@ -97,7 +97,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     completionFactory: @escaping CompletionFactory,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
     maxTokens: UInt32 = 32,
-    sessionStore: DocumentAISessionStore = DocumentAISessionStore()
+    sessionStore: DocumentAISessionStore = .shared
   ) {
     self.completionBackend = nil
     self.completionFactory = completionFactory

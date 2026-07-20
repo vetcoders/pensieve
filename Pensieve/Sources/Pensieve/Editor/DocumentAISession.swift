@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum AIEditingTask: Equatable, Sendable {
@@ -53,6 +54,14 @@ struct ProviderFingerprint: Codable, Equatable, Sendable {
   let shape: CompletionProviderShape
   let endpoint: String
   let model: String
+
+  fileprivate var persistenceDigest: String {
+    Self.digest("\(shape.rawValue)\u{0}\(endpoint)\u{0}\(model)")
+  }
+
+  fileprivate static func digest(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
 }
 
 struct AcceptedAITurn: Codable, Equatable, Sendable {
@@ -65,32 +74,41 @@ enum DocumentAIContinuation: Codable, Equatable, Sendable {
   case openAI(previousResponseID: String)
 }
 
-struct DocumentAISession: Codable, Equatable, Sendable {
+struct DocumentAISession: Equatable, Sendable {
   static let maximumTurns = 12
   static let maximumLedgerUTF8Bytes = 48 * 1024
 
   let documentID: String
   var providerFingerprint: ProviderFingerprint?
+  private var restoredProviderFingerprintDigest: String?
   var acceptedTurns: [AcceptedAITurn]
   var continuation: DocumentAIContinuation
 
   init(
     documentID: String,
     providerFingerprint: ProviderFingerprint? = nil,
+    restoredProviderFingerprintDigest: String? = nil,
     acceptedTurns: [AcceptedAITurn] = [],
     continuation: DocumentAIContinuation = .none
   ) {
     self.documentID = documentID
     self.providerFingerprint = providerFingerprint
+    self.restoredProviderFingerprintDigest = restoredProviderFingerprintDigest
     self.acceptedTurns = acceptedTurns
     self.continuation = continuation
   }
 
   mutating func prepare(for fingerprint: ProviderFingerprint) {
-    if providerFingerprint != fingerprint {
+    let restoredFingerprintMatches =
+      providerFingerprint == nil
+      && restoredProviderFingerprintDigest == fingerprint.persistenceDigest
+    if providerFingerprint != fingerprint && !restoredFingerprintMatches {
       providerFingerprint = fingerprint
       continuation = .none
+    } else if restoredFingerprintMatches {
+      providerFingerprint = fingerprint
     }
+    restoredProviderFingerprintDigest = nil
   }
 
   mutating func accept(_ candidate: AICandidate) {
@@ -116,6 +134,10 @@ struct DocumentAISession: Codable, Equatable, Sendable {
 
   private var ledgerUTF8Bytes: Int {
     acceptedTurns.reduce(0) { $0 + $1.input.utf8.count + $1.output.utf8.count }
+  }
+
+  fileprivate var persistenceFingerprintDigest: String? {
+    providerFingerprint?.persistenceDigest ?? restoredProviderFingerprintDigest
   }
 }
 
@@ -149,25 +171,42 @@ protocol AIRewriting: Sendable {
 }
 
 final class DocumentAISessionStore: @unchecked Sendable {
+  static let shared = DocumentAISessionStore()
+
   private let lock = NSLock()
   private let fileURL: URL
   private var sessions: [String: DocumentAISession]
+  private var persistedRecords: [String: PersistedRecord]
 
   init(fileURL: URL? = nil) {
     self.fileURL = fileURL ?? Self.defaultFileURL()
     if let data = try? Data(contentsOf: self.fileURL),
-      let decoded = try? JSONDecoder().decode([String: DocumentAISession].self, from: data)
+      let envelope = try? JSONDecoder().decode(PersistedEnvelope.self, from: data),
+      envelope.version == PersistedEnvelope.currentVersion
     {
-      self.sessions = decoded
+      self.persistedRecords = envelope.records
     } else {
-      self.sessions = [:]
+      self.persistedRecords = [:]
+      // Pre-release builds briefly stored document paths and accepted text in
+      // this file. Never carry that plaintext format forward.
+      if FileManager.default.fileExists(atPath: self.fileURL.path) {
+        try? FileManager.default.removeItem(at: self.fileURL)
+      }
     }
+    self.sessions = [:]
   }
 
   func session(for documentID: String) -> DocumentAISession {
     lock.lock()
     defer { lock.unlock() }
-    return sessions[documentID] ?? DocumentAISession(documentID: documentID)
+    if let session = sessions[documentID] { return session }
+    let persisted = persistedRecords[Self.documentDigest(documentID)]
+    let session = DocumentAISession(
+      documentID: documentID,
+      restoredProviderFingerprintDigest: persisted?.providerFingerprintDigest,
+      continuation: persisted?.continuation ?? .none)
+    sessions[documentID] = session
+    return session
   }
 
   func save(_ session: DocumentAISession) {
@@ -175,15 +214,33 @@ final class DocumentAISessionStore: @unchecked Sendable {
     defer { lock.unlock() }
     sessions[session.documentID] = session
 
-    guard let data = try? JSONEncoder().encode(sessions) else { return }
     do {
+      let key = Self.documentDigest(session.documentID)
+      if case .none = session.continuation {
+        persistedRecords.removeValue(forKey: key)
+      } else if let fingerprintDigest = session.persistenceFingerprintDigest {
+        persistedRecords[key] = PersistedRecord(
+          providerFingerprintDigest: fingerprintDigest,
+          continuation: session.continuation)
+      }
+      let data = try JSONEncoder().encode(
+        PersistedEnvelope(version: PersistedEnvelope.currentVersion, records: persistedRecords))
       try FileManager.default.createDirectory(
         at: fileURL.deletingLastPathComponent(),
         withIntermediateDirectories: true)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700],
+        ofItemAtPath: fileURL.deletingLastPathComponent().path)
       try data.write(to: fileURL, options: .atomic)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     } catch {
       DebugTrace.log("could not persist document AI session: \(error.localizedDescription)")
     }
+  }
+
+  private static func documentDigest(_ documentID: String) -> String {
+    ProviderFingerprint.digest(documentID)
   }
 
   private static func defaultFileURL() -> URL {
@@ -192,5 +249,17 @@ final class DocumentAISessionStore: @unchecked Sendable {
       .first ?? FileManager.default.temporaryDirectory
     return root.appendingPathComponent("Pensieve", isDirectory: true)
       .appendingPathComponent("document-ai-sessions.json")
+  }
+
+  private struct PersistedEnvelope: Codable {
+    static let currentVersion = 1
+
+    let version: Int
+    let records: [String: PersistedRecord]
+  }
+
+  private struct PersistedRecord: Codable {
+    let providerFingerprintDigest: String
+    let continuation: DocumentAIContinuation
   }
 }

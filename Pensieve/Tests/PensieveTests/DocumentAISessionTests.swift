@@ -42,7 +42,7 @@ final class DocumentAISessionTests: XCTestCase {
     XCTAssertEqual(session.providerFingerprint, anthropic)
   }
 
-  func testStoreRestoresDocumentStateWithoutProviderSecret() throws {
+  func testStorePersistsOnlyHashedIdentityAndOpaqueContinuation() throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("DocumentAISessionTests-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -51,25 +51,65 @@ final class DocumentAISessionTests: XCTestCase {
     let fingerprint = ProviderFingerprint(
       shape: .openAIResponses, endpoint: "https://provider.test/v1/responses", model: "model")
     var session = DocumentAISession(documentID: "doc")
-    session.accept(candidate(documentID: "doc", fingerprint: fingerprint, output: "accepted"))
+    session.accept(
+      candidate(
+        documentID: "doc", fingerprint: fingerprint, output: "secret-author-text",
+        responseID: "resp-opaque"))
     store.save(session)
 
-    XCTAssertEqual(DocumentAISessionStore(fileURL: file).session(for: "doc"), session)
+    let restored = DocumentAISessionStore(fileURL: file).session(for: "doc")
+    XCTAssertTrue(restored.acceptedTurns.isEmpty)
+    XCTAssertEqual(restored.continuation, session.continuation)
+    var prepared = restored
+    prepared.prepare(for: fingerprint)
+    XCTAssertEqual(prepared.continuation, session.continuation)
+    var mismatched = DocumentAISessionStore(fileURL: file).session(for: "doc")
+    mismatched.prepare(
+      for: ProviderFingerprint(
+        shape: .anthropicMessages,
+        endpoint: "https://api.anthropic.com/v1/messages",
+        model: "other-model"))
+    XCTAssertEqual(mismatched.continuation, .none)
     let persisted = try String(contentsOf: file, encoding: .utf8)
-    XCTAssertFalse(persisted.contains("api-key"))
+    XCTAssertFalse(persisted.contains("doc"))
+    XCTAssertFalse(persisted.contains("input"))
+    XCTAssertFalse(persisted.contains("secret-author-text"))
+    XCTAssertFalse(persisted.contains("provider.test"))
+    let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+    XCTAssertEqual(attributes[.posixPermissions] as? NSNumber, NSNumber(value: 0o600))
+  }
+
+  func testStoreDeletesLegacyPlaintextSessionFile() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "DocumentAISessionLegacyTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let file = root.appendingPathComponent("sessions.json")
+    let legacy =
+      #"{"file:///private/note.md":{"acceptedTurns":["#
+      + #"{"input":"private","output":"text"}]}}"#
+    try Data(legacy.utf8).write(to: file)
+
+    let restored = DocumentAISessionStore(fileURL: file).session(for: "file:///private/note.md")
+
+    XCTAssertTrue(restored.acceptedTurns.isEmpty)
+    XCTAssertEqual(restored.continuation, .none)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
   }
 
   private func candidate(
     documentID: String,
     fingerprint: ProviderFingerprint,
-    output: String
+    output: String,
+    responseID: String? = nil
   ) -> AICandidate {
     AICandidate(
       documentID: documentID,
       text: output,
       providerInput: "input",
       providerFingerprint: fingerprint,
-      pendingContinuation: .openAI(previousResponseID: "resp-\(output)"),
+      pendingContinuation: .openAI(previousResponseID: responseID ?? "resp-\(output)"),
       invalidatedOpaqueContinuation: false,
       documentRevision: 1,
       replacementRange: NSRange(location: 3, length: 0))
