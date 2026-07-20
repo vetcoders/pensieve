@@ -59,7 +59,11 @@ ICON_RESOURCE="$APP_NAME.icns"
 KEYS_DIR="${HOME}/.keys"
 NOTARY_ENV="$KEYS_DIR/.notary.env"
 SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
-FFI_PROFILE="${FFI_PROFILE:-debug}"
+# Development builds keep Package.swift's debug default. Every release lane
+# defaults to the optimized vendored runtime and exports the choice so the
+# SwiftPM manifest links the same profile that is later embedded in the app.
+FFI_PROFILE="${FFI_PROFILE:-release}"
+export FFI_PROFILE
 
 # ─── Args ─────────────────────────────────────────────────────────────────
 DO_NOTARIZE=1
@@ -107,6 +111,12 @@ case "$FFI_PROFILE" in
     debug|release) ;;
     *) die "FFI_PROFILE must be debug or release, got: $FFI_PROFILE" ;;
 esac
+if (( ! DMG_ONLY )) && [[ "$FFI_PROFILE" != "release" ]]; then
+    if (( DO_NOTARIZE || APPSTORE )); then
+        die "Distributable releases require FFI_PROFILE=release; debug FFI is local-only."
+    fi
+    warn "FFI_PROFILE=debug — local signed app will contain the debug qube-ffi runtime."
+fi
 
 plist_set_string() {
     local plist="$1"

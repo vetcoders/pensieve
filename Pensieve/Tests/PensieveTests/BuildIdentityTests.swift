@@ -91,6 +91,23 @@ final class BuildIdentityTests: XCTestCase {
     XCTAssertTrue(landingPage.contains("macOS 15+"))
   }
 
+  func testReleasePipelineDefaultsToOptimizedFFIAndRejectsDebugDistribution() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let releaseScript = try String(
+      contentsOf: packageRoot.deletingLastPathComponent()
+        .appendingPathComponent("scripts/build-release.sh"),
+      encoding: .utf8)
+
+    XCTAssertTrue(releaseScript.contains(#"FFI_PROFILE="${FFI_PROFILE:-release}""#))
+    XCTAssertTrue(releaseScript.contains("export FFI_PROFILE"))
+    XCTAssertTrue(
+      releaseScript.contains(
+        "Distributable releases require FFI_PROFILE=release; debug FFI is local-only."))
+  }
+
   /// scripts/build-release.sh stamps the Mermaid component version by
   /// extracting it from the vendored runtime's banner (line 1) — the file
   /// itself is the only producer of that claim. Guard the extraction
