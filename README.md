@@ -37,12 +37,17 @@ The existing HTML and PDF export options remain available in the File menu.
 ## Requirements
 
 - macOS 15 or newer.
-- Xcode 16 command line tools with Swift 6.0+ (the package remains in Swift 5 language mode).
 - Apple Silicon is the daily-driver target; Intel compatibility is not the current release gate.
 
-## Try It Locally
+## Download
 
-Pensieve is still in a local release lane. The Mac App Store submit, public download, and LFS/provenance decisions are operator-gated, so the honest trial path today is from source:
+Download the latest signed and notarized release from
+[GitHub Releases](https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg),
+open the DMG, and drag Pensieve to Applications.
+
+## Build from source
+
+Source builds require Xcode 16 command line tools with Swift 6.0+; the package remains in Swift 5 language mode.
 
 ```bash
 git clone https://github.com/vetcoders/pensieve.git
