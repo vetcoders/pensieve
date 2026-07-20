@@ -60,10 +60,10 @@ struct SidebarView: View {
     .onAppear {
       reconcileWorkspaceRootExpansion()
     }
-    .onChange(of: rootNodeIDs) { _ in
+    .onChange(of: rootNodeIDs) { _, _ in
       reconcileWorkspaceRootExpansion()
     }
-    .onChange(of: appState.pendingSidebarRenameURL) { url in
+    .onChange(of: appState.pendingSidebarRenameURL) { _, url in
       guard let url else { return }
       beginRename(url: url, currentName: url.lastPathComponent)
       appState.pendingSidebarRenameURL = nil

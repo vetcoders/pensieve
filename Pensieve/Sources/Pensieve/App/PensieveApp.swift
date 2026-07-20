@@ -119,7 +119,7 @@ struct DocumentWindowRootView: View {
           launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
         }
       }
-      .onChange(of: initialDocument?.id) { _ in
+      .onChange(of: initialDocument?.id) { _, _ in
         if let initialDocument {
           initialDocumentLoadResolved = false
           openInitialDocument(initialDocument)
