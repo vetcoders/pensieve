@@ -56,6 +56,11 @@ final class BuildIdentityTests: XCTestCase {
     XCTAssertEqual(info["CFBundleShortVersionString"] as? String, "0.0.0")
     XCTAssertEqual(info["CFBundleGetInfoString"] as? String, "Pensieve 0.0.0 (dev)")
     XCTAssertEqual(info["PensieveBuildCommitSlug"] as? String, "dev")
+    XCTAssertEqual(
+      info["LSMinimumSystemVersion"] as? String,
+      "15.0",
+      "the shipped bundle must not claim support below SwiftPM's macOS 15 deployment target"
+    )
 
     let components = try XCTUnwrap(
       info[BuildIdentity.componentVersionsKey] as? [String: String])
@@ -63,6 +68,27 @@ final class BuildIdentityTests: XCTestCase {
       XCTAssertEqual(
         version, "0.0.0", "component \(name) must stay a placeholder until stamped")
     }
+  }
+
+  func testPackageAndPublicDocsAgreeOnMacOS15Support() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let repositoryRoot = packageRoot.deletingLastPathComponent()
+    let packageManifest = try String(
+      contentsOf: packageRoot.appendingPathComponent("Package.swift"), encoding: .utf8)
+    let readme = try String(
+      contentsOf: repositoryRoot.appendingPathComponent("README.md"), encoding: .utf8)
+    let contributing = try String(
+      contentsOf: repositoryRoot.appendingPathComponent("CONTRIBUTING.md"), encoding: .utf8)
+    let landingPage = try String(
+      contentsOf: repositoryRoot.appendingPathComponent("docs/index.html"), encoding: .utf8)
+
+    XCTAssertTrue(packageManifest.contains(".macOS(.v15)"))
+    XCTAssertTrue(readme.contains("macOS 15 or newer"))
+    XCTAssertTrue(contributing.contains("macOS 15.0 (Sequoia) or newer"))
+    XCTAssertTrue(landingPage.contains("macOS 15+"))
   }
 
   /// scripts/build-release.sh stamps the Mermaid component version by

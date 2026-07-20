@@ -36,8 +36,8 @@ The existing HTML and PDF export options remain available in the File menu.
 
 ## Requirements
 
-- macOS 14 or newer.
-- Xcode command line tools with Swift 5.9+.
+- macOS 15 or newer.
+- Xcode 16 command line tools with Swift 6.0+ (the package remains in Swift 5 language mode).
 - Apple Silicon is the daily-driver target; Intel compatibility is not the current release gate.
 
 ## Try It Locally
