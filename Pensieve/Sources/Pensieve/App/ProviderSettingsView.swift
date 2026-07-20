@@ -28,6 +28,9 @@ struct ProviderSettingsView: View {
         )
         .textContentType(.URL)
         .accessibilityIdentifier("pensieve.provider.endpoint")
+        .onChange(of: settings.endpoint) {
+          settings.providerDiscoveryInputDidChange()
+        }
         HStack {
           TextField("Model", text: $settings.model, prompt: Text("model-name"))
             .accessibilityIdentifier("pensieve.provider.model")
@@ -55,6 +58,9 @@ struct ProviderSettingsView: View {
         }
         SecureField("API Key", text: $settings.apiKey, prompt: Text("Optional for local providers"))
           .accessibilityIdentifier("pensieve.provider.apiKey")
+          .onChange(of: settings.apiKey) {
+            settings.providerDiscoveryInputDidChange()
+          }
       }
       .formStyle(.grouped)
 

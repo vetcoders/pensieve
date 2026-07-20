@@ -35,6 +35,16 @@ struct DocumentSession: Equatable {
     document?.id
   }
 
+  var persistentAIDocumentID: String? {
+    if let url {
+      return "file:\(url.standardizedFileURL.absoluteString)"
+    }
+    if let recoveryID {
+      return "recovery:\(recoveryID.uuidString.lowercased())"
+    }
+    return nil
+  }
+
   var isUntitled: Bool {
     guard case .untitled = kind else { return false }
     return true

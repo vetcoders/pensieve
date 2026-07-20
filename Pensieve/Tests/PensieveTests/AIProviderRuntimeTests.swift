@@ -4,6 +4,83 @@ import XCTest
 @testable import Pensieve
 
 final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
+  func testOpenAIUsesCommittedResponseIDAndFallsBackExactlyOnceOn404() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_PROVIDER": "openai-responses",
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+      "LLM_ASSISTIVE_MODEL": "gpt-test",
+      "LLM_ASSISTIVE_API_KEY": "key",
+    ])
+    let recorder = RequestRecorder()
+    let sender = SequencedRequestSender(responses: [
+      (404, #"{"error":{"message":"not found"}}"#),
+      (200, #"{"id":"resp-new","output_text":" continuation"}"#),
+    ])
+    let runtime = AIProviderRuntime(environment: environment) { request in
+      recorder.record(request)
+      return try sender.send(request)
+    }
+    let fingerprint = ProviderFingerprint(
+      shape: .openAIResponses,
+      endpoint: "https://api.openai.com/v1/responses",
+      model: "gpt-test")
+    let session = DocumentAISession(
+      documentID: "doc",
+      providerFingerprint: fingerprint,
+      acceptedTurns: [AcceptedAITurn(input: "old-input", output: "old-output")],
+      continuation: .openAI(previousResponseID: "resp-expired"))
+
+    let candidate = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "New", afterCursor: " tail"),
+      maxTokens: 32,
+      session: session,
+      documentRevision: 7,
+      replacementRange: NSRange(location: 3, length: 0))
+
+    XCTAssertEqual(recorder.requests.count, 2)
+    let first = try requestJSON(recorder.requests[0])
+    XCTAssertEqual(first["previous_response_id"] as? String, "resp-expired")
+    let second = try requestJSON(recorder.requests[1])
+    XCTAssertNil(second["previous_response_id"])
+    XCTAssertEqual((second["input"] as? [[String: Any]])?.count, 3)
+    XCTAssertTrue(candidate.invalidatedOpaqueContinuation)
+    XCTAssertEqual(candidate.pendingContinuation, .openAI(previousResponseID: "resp-new"))
+  }
+
+  func testAnthropicReplaysAcceptedLedgerAndNeverUsesMessageIDAsContinuation() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_PROVIDER": "anthropic-messages",
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.anthropic.com/v1/messages",
+      "LLM_ASSISTIVE_MODEL": "claude-test",
+      "LLM_ANTHROPIC_API_KEY": "key",
+    ])
+    let recorder = RequestRecorder()
+    let runtime = AIProviderRuntime(environment: environment) { request in
+      recorder.record(request)
+      return (
+        Data(#"{"id":"msg_123","content":[{"type":"text","text":" next"}]}"#.utf8),
+        Self.response(for: request, statusCode: 200)
+      )
+    }
+    let session = DocumentAISession(
+      documentID: "doc",
+      providerFingerprint: ProviderFingerprint(
+        shape: .anthropicMessages,
+        endpoint: "https://api.anthropic.com/v1/messages",
+        model: "claude-test"),
+      acceptedTurns: [AcceptedAITurn(input: "one", output: "two")])
+
+    let candidate = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "three", afterCursor: ""),
+      maxTokens: 16,
+      session: session,
+      documentRevision: 1,
+      replacementRange: NSRange(location: 5, length: 0))
+
+    let body = try requestJSON(try XCTUnwrap(recorder.request))
+    XCTAssertEqual((body["messages"] as? [[String: Any]])?.count, 3)
+    XCTAssertEqual(candidate.pendingContinuation, .none)
+  }
   func testRequestUsesCodeScribeResponsesContractWithoutUnsupportedSamplingOrTokenCap()
     async throws
   {
@@ -159,6 +236,11 @@ final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
     HTTPURLResponse(
       url: request.url!, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
   }
+
+  private func requestJSON(_ request: URLRequest) throws -> [String: Any] {
+    try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
+  }
 }
 
 private struct StubProviderEnvironment: ProviderEnvironmentManaging {
@@ -175,17 +257,44 @@ private struct StubProviderEnvironment: ProviderEnvironmentManaging {
 
 private final class RequestRecorder: @unchecked Sendable {
   private let lock = NSLock()
-  private var storedRequest: URLRequest?
+  private var storedRequests: [URLRequest] = []
 
   func record(_ request: URLRequest) {
     lock.lock()
-    storedRequest = request
+    storedRequests.append(request)
     lock.unlock()
   }
 
   var request: URLRequest? {
     lock.lock()
     defer { lock.unlock() }
-    return storedRequest
+    return storedRequests.last
+  }
+
+  var requests: [URLRequest] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storedRequests
+  }
+}
+
+private final class SequencedRequestSender: @unchecked Sendable {
+  private let lock = NSLock()
+  private var responses: [(Int, String)]
+
+  init(responses: [(Int, String)]) {
+    self.responses = responses
+  }
+
+  func send(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !responses.isEmpty else { throw URLError(.badServerResponse) }
+    let next = responses.removeFirst()
+    return (
+      Data(next.1.utf8),
+      HTTPURLResponse(
+        url: request.url!, statusCode: next.0, httpVersion: "HTTP/1.1", headerFields: nil)!
+    )
   }
 }

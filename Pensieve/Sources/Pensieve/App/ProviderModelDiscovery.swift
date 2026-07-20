@@ -75,15 +75,16 @@ final class ProviderModelDiscovery: ProviderModelDiscovering, @unchecked Sendabl
     }
     do {
       let models = try await fetch(shape: shape, endpoint: endpoint, apiKey: key)
+      try Task.checkCancellation()
       let normalized = Self.normalize(models)
       if let data = try? JSONEncoder().encode(normalized) {
-        defaults.set(data, forKey: cacheKey(for: shape))
+        defaults.set(data, forKey: cacheKey(for: shape, endpoint: endpoint))
       }
       return ProviderModelDiscoveryResult(models: normalized, source: .fresh)
     } catch is CancellationError {
       throw CancellationError()
     } catch {
-      if let cached = cachedModels(for: shape), !cached.isEmpty {
+      if let cached = cachedModels(for: shape, endpoint: endpoint), !cached.isEmpty {
         return ProviderModelDiscoveryResult(
           models: cached,
           source: .cache(reason: error.localizedDescription))
@@ -174,13 +175,21 @@ final class ProviderModelDiscovery: ProviderModelDiscovering, @unchecked Sendabl
     return data
   }
 
-  private func cachedModels(for shape: CompletionProviderShape) -> [DiscoveredProviderModel]? {
-    guard let data = defaults.data(forKey: cacheKey(for: shape)) else { return nil }
+  private func cachedModels(
+    for shape: CompletionProviderShape, endpoint: String
+  ) -> [DiscoveredProviderModel]? {
+    guard let data = defaults.data(forKey: cacheKey(for: shape, endpoint: endpoint)) else {
+      return nil
+    }
     return try? JSONDecoder().decode([DiscoveredProviderModel].self, from: data)
   }
 
-  private func cacheKey(for shape: CompletionProviderShape) -> String {
-    "\(cachePrefix).\(shape.rawValue)"
+  private func cacheKey(for shape: CompletionProviderShape, endpoint: String) -> String {
+    let fingerprint = Data(shape.normalizeEndpoint(endpoint).utf8).base64EncodedString()
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "=", with: "")
+    return "\(cachePrefix).\(shape.rawValue).\(fingerprint)"
   }
 
   private static func normalize(_ models: [DiscoveredProviderModel])

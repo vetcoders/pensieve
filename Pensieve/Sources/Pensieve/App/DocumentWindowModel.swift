@@ -11,6 +11,7 @@ final class DocumentWindowModel {
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private static let scrollSyncEnabledKey = "Pensieve.scrollSyncEnabled"
   private let defaults: UserDefaults
+  private var ephemeralAIDocumentID = UUID()
 
   var selectedDocumentID: DocumentRef.ID?
 
@@ -22,6 +23,11 @@ final class DocumentWindowModel {
   /// which only change when the metadata actually changes (guarded didSet).
   var documentSession: DocumentSession = .empty {
     didSet {
+      if oldValue.persistentAIDocumentID != documentSession.persistentAIDocumentID,
+        documentSession.persistentAIDocumentID == nil
+      {
+        ephemeralAIDocumentID = UUID()
+      }
       let title = documentSession.displayTitle
       if documentTitle != title { documentTitle = title }
       let editable = documentSession.hasEditableBuffer
@@ -30,6 +36,11 @@ final class DocumentWindowModel {
       if documentURL != url { documentURL = url }
       if documentIsDirty != documentSession.isDirty { documentIsDirty = documentSession.isDirty }
     }
+  }
+
+  var aiDocumentID: String {
+    documentSession.persistentAIDocumentID
+      ?? "window:\(ephemeralAIDocumentID.uuidString.lowercased())"
   }
 
   /// Discrete, low-frequency mirrors of `documentSession` metadata. Chrome views

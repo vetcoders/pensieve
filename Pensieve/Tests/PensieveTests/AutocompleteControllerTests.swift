@@ -103,6 +103,89 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertNil(surface.textView.autocompleteGhostText)
   }
 
+  func testOnlyAppliedSuggestionCommitsDocumentSession() async {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AutocompleteSessionTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = DocumentAISessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" }),
+      debounceNanoseconds: 1,
+      sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: true,
+      documentID: "doc-accept",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    controller.textDidChange(
+      context: AutocompleteContext(beforeCursor: "hello", afterCursor: ""),
+      replacementRange: NSRange(location: 5, length: 0))
+    await waitUntil { controller.suggestion == " world" }
+    surface.textView.setAutocompleteGhost(" world", at: 5)
+
+    XCTAssertTrue(surface.acceptAutocompleteSuggestion())
+    XCTAssertEqual(store.session(for: "doc-accept").acceptedTurns.map(\.output), [" world"])
+  }
+
+  func testDismissedSuggestionDoesNotCommitDocumentSession() async {
+    let store = DocumentAISessionStore(
+      fileURL: FileManager.default.temporaryDirectory
+        .appendingPathComponent("dismissed-\(UUID().uuidString).json"))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" }),
+      debounceNanoseconds: 1,
+      sessionStore: store)
+    controller.configureDocument(id: "doc-dismiss")
+    controller.textDidChange(
+      context: AutocompleteContext(beforeCursor: "hello", afterCursor: ""),
+      replacementRange: NSRange(location: 5, length: 0))
+    await waitUntil { controller.suggestion == " world" }
+
+    controller.cancel()
+
+    XCTAssertTrue(store.session(for: "doc-dismiss").acceptedTurns.isEmpty)
+  }
+
+  func testNativeUndoRestoresExactBytesAndInvalidatesOpaqueContinuation() {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("undo-session-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    store.save(
+      DocumentAISession(
+        documentID: "doc-undo",
+        providerFingerprint: ProviderFingerprint(
+          shape: .openAIResponses,
+          endpoint: "https://api.openai.com/v1/responses",
+          model: "gpt-test"),
+        acceptedTurns: [AcceptedAITurn(input: "hello", output: " world")],
+        continuation: .openAI(previousResponseID: "resp-committed")))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(), debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello world",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-undo",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 11, length: 0))
+
+    surface.textView.insertText("!", replacementRange: NSRange(location: 11, length: 0))
+    XCTAssertEqual(surface.textStorage.string, "hello world!")
+    surface.textView.undoManager?.undo()
+
+    XCTAssertEqual(surface.textStorage.string, "hello world")
+    XCTAssertEqual(store.session(for: "doc-undo").continuation, .none)
+  }
+
   func testDismissAutocompleteDoesNotMutateTextStorage() {
     let surface = makeSurface(text: "hello")
     surface.textView.setSelectedRange(NSRange(location: 5, length: 0))

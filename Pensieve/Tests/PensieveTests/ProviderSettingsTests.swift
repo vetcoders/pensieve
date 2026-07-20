@@ -5,6 +5,31 @@ import XCTest
 
 @MainActor
 final class ProviderSettingsTests: XCTestCase {
+  func testProviderSwitchCancelsDiscoveryAndRestoresDiscoverButton() async {
+    let (defaults, suiteName) = makeDefaults()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let started = expectation(description: "discovery started")
+    let cancelled = expectation(description: "discovery cancelled")
+    let discovery = BlockingProviderDiscovery(started: started, cancelled: cancelled)
+    let settings = ProviderSettings(
+      defaults: defaults,
+      keychain: InMemoryProviderAPIKeyStore(),
+      environment: InMemoryProviderEnvironment(),
+      modelDiscovery: discovery)
+    settings.endpoint = "https://api.openai.com/v1/responses"
+    let task = Task { await settings.discoverModels() }
+    await fulfillment(of: [started], timeout: 1)
+    XCTAssertTrue(settings.isDiscoveringModels)
+
+    settings.providerShape = .anthropicMessages
+    settings.providerShapeDidChange()
+
+    await fulfillment(of: [cancelled], timeout: 1)
+    await task.value
+    XCTAssertFalse(settings.isDiscoveringModels)
+    XCTAssertTrue(settings.discoveredModels.isEmpty)
+  }
+
   func testOpenAIResponsesEndpointNormalizationMatchesCanonicalInputs() {
     for testCase in responsesEndpointCases() {
       XCTAssertEqual(
@@ -335,6 +360,31 @@ final class ProviderSettingsTests: XCTestCase {
       }
       try? await Task.sleep(nanoseconds: pollNanoseconds)
     }
+  }
+}
+
+private final class BlockingProviderDiscovery: ProviderModelDiscovering, @unchecked Sendable {
+  private let started: XCTestExpectation
+  private let cancelled: XCTestExpectation
+
+  init(started: XCTestExpectation, cancelled: XCTestExpectation) {
+    self.started = started
+    self.cancelled = cancelled
+  }
+
+  func discover(
+    shape: CompletionProviderShape,
+    endpoint: String,
+    apiKey: String
+  ) async throws -> ProviderModelDiscoveryResult {
+    started.fulfill()
+    do {
+      try await Task.sleep(nanoseconds: 10_000_000_000)
+    } catch is CancellationError {
+      cancelled.fulfill()
+      throw CancellationError()
+    }
+    return ProviderModelDiscoveryResult(models: [], source: .fresh)
   }
 }
 

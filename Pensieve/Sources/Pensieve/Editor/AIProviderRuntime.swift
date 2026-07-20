@@ -41,7 +41,9 @@ struct AutocompleteContext: Equatable, Sendable {
 /// Provider-neutral text runtime shared by editor completion and dictation AI
 /// transforms. OpenAI Responses and Anthropic Messages have deliberately
 /// separate request/header/response contracts behind this single task seam.
-final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchecked Sendable {
+final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteCompleting,
+  AITextResponding, @unchecked Sendable
+{
   typealias RequestSender = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
 
   private let environment: ProviderEnvironmentManaging
@@ -63,20 +65,82 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
   }
 
   func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
-    try await request(
-      input: context.providerInput,
-      instructions: Self.autocompleteInstructions(maxTokens: maxTokens),
-      maxTokens: maxTokens)
+    let candidate = try await complete(
+      context: context,
+      maxTokens: maxTokens,
+      session: DocumentAISession(documentID: "stateless"),
+      documentRevision: 0,
+      replacementRange: NSRange(location: 0, length: 0))
+    return candidate.text
+  }
+
+  func complete(
+    context: AutocompleteContext,
+    maxTokens: UInt32,
+    session: DocumentAISession,
+    documentRevision: UInt64,
+    replacementRange: NSRange
+  ) async throws -> AICandidate {
+    let configuration = try resolveConfiguration()
+    let fingerprint = configuration.fingerprint
+    var preparedSession = session
+    preparedSession.prepare(for: fingerprint)
+    let input = context.providerInput
+    let result: ProviderResult
+    var invalidatedOpaqueContinuation = false
+    do {
+      result = try await request(
+        configuration: configuration,
+        input: input,
+        instructions: Self.autocompleteInstructions(maxTokens: maxTokens),
+        maxTokens: maxTokens,
+        session: preparedSession,
+        useOpaqueContinuation: true)
+    } catch RuntimeError.invalidContinuation {
+      // An opaque Responses chain can expire server-side. Replay the explicit,
+      // accepted ledger exactly once and never retry a cancelled request.
+      try Task.checkCancellation()
+      invalidatedOpaqueContinuation = true
+      result = try await request(
+        configuration: configuration,
+        input: input,
+        instructions: Self.autocompleteInstructions(maxTokens: maxTokens),
+        maxTokens: maxTokens,
+        session: preparedSession,
+        useOpaqueContinuation: false)
+    }
+    return AICandidate(
+      documentID: session.documentID,
+      text: result.text,
+      providerInput: input,
+      providerFingerprint: fingerprint,
+      pendingContinuation: result.responseID.map(DocumentAIContinuation.openAI)
+        ?? .none,
+      invalidatedOpaqueContinuation: invalidatedOpaqueContinuation,
+      documentRevision: documentRevision,
+      replacementRange: replacementRange)
   }
 
   func respond(input: String, instructions: String) async throws -> String {
-    try await request(input: input, instructions: instructions, maxTokens: nil)
+    let configuration = try resolveConfiguration()
+    return try await request(
+      configuration: configuration,
+      input: input,
+      instructions: instructions,
+      maxTokens: nil,
+      session: DocumentAISession(documentID: "dictation"),
+      useOpaqueContinuation: false
+    ).text
   }
 
-  private func request(input: String, instructions: String, maxTokens: UInt32?) async throws
-    -> String
-  {
-    let configuration = try resolveConfiguration()
+  private func request(
+    configuration: Configuration,
+    input: String,
+    instructions: String,
+    maxTokens: UInt32?,
+    session: DocumentAISession,
+    useOpaqueContinuation: Bool
+  ) async throws -> ProviderResult {
     var request = URLRequest(url: configuration.endpoint)
     request.httpMethod = "POST"
     request.timeoutInterval = 30
@@ -89,15 +153,26 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
           request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
           request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         }
+        let previousResponseID: String? = {
+          guard useOpaqueContinuation,
+            case .openAI(let value) = session.continuation
+          else { return nil }
+          return value
+        }()
+        let replay =
+          previousResponseID == nil
+          ? Self.replayedResponsesInput(session.acceptedTurns, currentInput: input)
+          : [
+            ResponsesInputItem(
+              role: "user",
+              content: [ResponsesInputContent(type: "input_text", text: input)])
+          ]
         request.httpBody = try JSONEncoder().encode(
           ResponsesRequest(
             model: configuration.model,
-            input: [
-              ResponsesInputItem(
-                role: "user",
-                content: [ResponsesInputContent(type: "input_text", text: input)])
-            ],
-            instructions: instructions))
+            input: replay,
+            instructions: instructions,
+            previousResponseID: previousResponseID))
       case .anthropicMessages:
         guard let apiKey = configuration.apiKey else {
           throw VistaError.ModelError(
@@ -109,11 +184,8 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
           AnthropicRequest(
             model: configuration.model,
             system: instructions,
-            messages: [
-              AnthropicMessage(
-                role: "user",
-                content: [AnthropicContent(type: "text", text: input)])
-            ],
+            messages: Self.replayedAnthropicMessages(
+              session.acceptedTurns, currentInput: input),
             maxTokens: maxTokens ?? 4096))
       }
     } catch let error as VistaError {
@@ -138,6 +210,14 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
 
     guard (200..<300).contains(response.statusCode) else {
       let detail = Self.providerErrorMessage(from: data)
+      if configuration.shape == .openAIResponses,
+        useOpaqueContinuation,
+        case .openAI = session.continuation,
+        response.statusCode == 404
+          || (response.statusCode == 400 && Self.isInvalidContinuationError(data))
+      {
+        throw RuntimeError.invalidContinuation
+      }
       throw VistaError.ModelError(
         msg: "completion request failed: HTTP \(response.statusCode): \(detail)")
     }
@@ -150,7 +230,7 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
           throw VistaError.ModelError(
             msg: "completion response parse failed: response did not contain output text")
         }
-        return completion
+        return ProviderResult(text: completion, responseID: decoded.id)
       case .anthropicMessages:
         let decoded = try JSONDecoder().decode(AnthropicResponse.self, from: data)
         let text = decoded.content.compactMap(\.text).joined()
@@ -162,7 +242,9 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
           throw VistaError.ModelError(
             msg: "completion request failed: provider refused the request")
         }
-        return text
+        // Anthropic msg_* identifiers are response identifiers, not continuation
+        // tokens. Messages continuity is always the explicit accepted ledger.
+        return ProviderResult(text: text, responseID: nil)
       }
     } catch let error as VistaError {
       throw error
@@ -224,6 +306,45 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
     """
   }
 
+  private static func replayedResponsesInput(
+    _ turns: [AcceptedAITurn], currentInput: String
+  ) -> [ResponsesInputItem] {
+    var input: [ResponsesInputItem] = []
+    for turn in turns {
+      input.append(
+        ResponsesInputItem(
+          role: "user",
+          content: [ResponsesInputContent(type: "input_text", text: turn.input)]))
+      input.append(
+        ResponsesInputItem(
+          role: "assistant",
+          content: [ResponsesInputContent(type: "output_text", text: turn.output)]))
+    }
+    input.append(
+      ResponsesInputItem(
+        role: "user",
+        content: [ResponsesInputContent(type: "input_text", text: currentInput)]))
+    return input
+  }
+
+  private static func replayedAnthropicMessages(
+    _ turns: [AcceptedAITurn], currentInput: String
+  ) -> [AnthropicMessage] {
+    var messages: [AnthropicMessage] = []
+    for turn in turns {
+      messages.append(
+        AnthropicMessage(
+          role: "user", content: [AnthropicContent(type: "text", text: turn.input)]))
+      messages.append(
+        AnthropicMessage(
+          role: "assistant", content: [AnthropicContent(type: "text", text: turn.output)]))
+    }
+    messages.append(
+      AnthropicMessage(
+        role: "user", content: [AnthropicContent(type: "text", text: currentInput)]))
+    return messages
+  }
+
   private static func liveRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
     let (data, response) = try await URLSession.shared.data(for: request)
     guard let response = response as? HTTPURLResponse else {
@@ -244,6 +365,15 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
     return "provider rejected the request"
   }
 
+  private static func isInvalidContinuationError(_ data: Data) -> Bool {
+    guard let error = try? JSONDecoder().decode(ProviderErrorEnvelope.self, from: data).error
+    else { return false }
+    let fields = [error.param, error.code, error.message].compactMap { $0?.lowercased() }
+    return fields.contains { value in
+      value.contains("previous_response") || value.contains("response id")
+    }
+  }
+
   private static func singleLine(_ value: String) -> String {
     value.split(whereSeparator: \Character.isNewline).joined(separator: " ")
   }
@@ -254,17 +384,41 @@ final class AIProviderRuntime: AutocompleteCompleting, AITextResponding, @unchec
 typealias OpenAIResponsesAutocompleteBackend = AIProviderRuntime
 
 extension AIProviderRuntime {
+  fileprivate enum RuntimeError: Error {
+    case invalidContinuation
+  }
+
   fileprivate struct Configuration {
     let shape: CompletionProviderShape
     let endpoint: URL
     let model: String
     let apiKey: String?
+
+    var fingerprint: ProviderFingerprint {
+      ProviderFingerprint(
+        shape: shape,
+        endpoint: endpoint.absoluteString,
+        model: model)
+    }
+  }
+
+  fileprivate struct ProviderResult {
+    let text: String
+    let responseID: String?
   }
 
   fileprivate struct ResponsesRequest: Encodable {
     let model: String
     let input: [ResponsesInputItem]
     let instructions: String
+    let previousResponseID: String?
+
+    enum CodingKeys: String, CodingKey {
+      case model
+      case input
+      case instructions
+      case previousResponseID = "previous_response_id"
+    }
   }
 
   fileprivate struct ResponsesInputItem: Encodable {
@@ -278,10 +432,12 @@ extension AIProviderRuntime {
   }
 
   fileprivate struct ResponsesResponse: Decodable {
+    let id: String?
     let outputText: String?
     let output: [ResponsesOutputItem]?
 
     enum CodingKeys: String, CodingKey {
+      case id
       case outputText = "output_text"
       case output
     }
@@ -344,5 +500,7 @@ extension AIProviderRuntime {
 
   fileprivate struct ProviderError: Decodable {
     let message: String?
+    let param: String?
+    let code: String?
   }
 }

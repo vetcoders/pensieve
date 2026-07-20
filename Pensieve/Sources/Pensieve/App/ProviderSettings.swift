@@ -23,7 +23,7 @@ protocol ProviderEnvironmentManaging {
   func removeValue(forKey key: String) throws
 }
 
-enum CompletionProviderShape: String, CaseIterable, Identifiable, Sendable {
+enum CompletionProviderShape: String, Codable, CaseIterable, Identifiable, Sendable {
   case openAIResponses = "openai-responses"
   case anthropicMessages = "anthropic-messages"
 
@@ -223,6 +223,7 @@ final class ProviderSettings: ObservableObject {
   private let modelDiscovery: ProviderModelDiscovering
   private var managedEnvironmentKeys: Set<String> = []
   private var discoveryGeneration: UInt64 = 0
+  private var discoveryTask: Task<Void, Never>?
   private let launchHadEndpointEnvironment: Bool
   private let launchHadModelEnvironment: Bool
 
@@ -282,9 +283,7 @@ final class ProviderSettings: ObservableObject {
 
   @MainActor
   func providerShapeDidChange() {
-    discoveryGeneration &+= 1
-    discoveredModels = []
-    modelDiscoveryStatus = nil
+    cancelModelDiscovery(clearModels: true)
     let lowercasedEndpoint = endpoint.lowercased()
     if lowercasedEndpoint.contains("api.openai.com")
       || lowercasedEndpoint.contains("api.anthropic.com")
@@ -303,7 +302,13 @@ final class ProviderSettings: ObservableObject {
   }
 
   @MainActor
+  func providerDiscoveryInputDidChange() {
+    cancelModelDiscovery(clearModels: true)
+  }
+
+  @MainActor
   func discoverModels() async {
+    discoveryTask?.cancel()
     discoveryGeneration &+= 1
     let generation = discoveryGeneration
     let shape = providerShape
@@ -311,30 +316,50 @@ final class ProviderSettings: ObservableObject {
     let apiKey = trimmed(apiKey)
     isDiscoveringModels = true
     modelDiscoveryStatus = nil
-    defer {
-      if discoveryGeneration == generation {
-        isDiscoveringModels = false
+    let task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        if self.discoveryGeneration == generation {
+          self.isDiscoveringModels = false
+          self.discoveryTask = nil
+        }
+      }
+      do {
+        let result = try await self.modelDiscovery.discover(
+          shape: shape, endpoint: endpoint, apiKey: apiKey)
+        try Task.checkCancellation()
+        guard self.discoveryGeneration == generation,
+          self.providerShape == shape,
+          shape.normalizeEndpoint(self.endpoint) == endpoint
+        else { return }
+        self.discoveredModels = result.models
+        switch result.source {
+        case .fresh:
+          self.modelDiscoveryStatus = "Found \(result.models.count) models."
+        case .cache:
+          self.modelDiscoveryStatus =
+            "Provider unavailable — showing the last known model list."
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        guard self.discoveryGeneration == generation else { return }
+        self.discoveredModels = []
+        self.modelDiscoveryStatus = error.localizedDescription
       }
     }
+    discoveryTask = task
+    await task.value
+  }
 
-    do {
-      let result = try await modelDiscovery.discover(
-        shape: shape, endpoint: endpoint, apiKey: apiKey)
-      guard discoveryGeneration == generation, providerShape == shape else { return }
-      discoveredModels = result.models
-      switch result.source {
-      case .fresh:
-        modelDiscoveryStatus = "Found \(result.models.count) models."
-      case .cache:
-        modelDiscoveryStatus = "Provider unavailable — showing the last known model list."
-      }
-    } catch is CancellationError {
-      return
-    } catch {
-      guard discoveryGeneration == generation else { return }
-      discoveredModels = []
-      modelDiscoveryStatus = error.localizedDescription
-    }
+  @MainActor
+  private func cancelModelDiscovery(clearModels: Bool) {
+    discoveryGeneration &+= 1
+    discoveryTask?.cancel()
+    discoveryTask = nil
+    isDiscoveringModels = false
+    if clearModels { discoveredModels = [] }
+    modelDiscoveryStatus = nil
   }
 
   /// Explicit Save is the user override: it writes the highest-priority

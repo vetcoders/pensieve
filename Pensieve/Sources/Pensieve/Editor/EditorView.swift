@@ -33,6 +33,7 @@ struct EditorView: View {
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
         aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
+        documentID: appState.aiDocumentID,
         scrollSyncCoordinator: scrollSyncCoordinator,
         scrollSyncEnabled: appState.scrollSyncEnabled && appState.mode == .split,
         isDirty: documentDirty,
@@ -125,6 +126,7 @@ struct EditorRepresentable: NSViewRepresentable {
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
   let aiAutocompleteEnabled: Bool
+  let documentID: String
   let scrollSyncCoordinator: ScrollSyncCoordinator?
   let scrollSyncEnabled: Bool
   @Binding var isDirty: Bool
@@ -150,6 +152,7 @@ struct EditorRepresentable: NSViewRepresentable {
     tableTidyOnPaste: Bool,
     asciiSafeTables: Bool,
     aiAutocompleteEnabled: Bool,
+    documentID: String = "transient",
     scrollSyncCoordinator: ScrollSyncCoordinator? = nil,
     scrollSyncEnabled: Bool = false,
     isDirty: Binding<Bool>,
@@ -171,6 +174,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self.tableTidyOnPaste = tableTidyOnPaste
     self.asciiSafeTables = asciiSafeTables
     self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.documentID = documentID
     self.scrollSyncCoordinator = scrollSyncCoordinator
     self.scrollSyncEnabled = scrollSyncEnabled
     self._isDirty = isDirty
@@ -188,7 +192,8 @@ struct EditorRepresentable: NSViewRepresentable {
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
-      aiAutocompleteEnabled: aiAutocompleteEnabled
+      aiAutocompleteEnabled: aiAutocompleteEnabled,
+      documentID: documentID
     )
     surface.onTextChanged = { newText in
       self.text = newText
@@ -225,6 +230,7 @@ struct EditorRepresentable: NSViewRepresentable {
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     guard let surface = context.coordinator.surface else { return }
     surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
+    surface.configureDocument(id: documentID)
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
     // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
@@ -367,6 +373,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
     aiAutocompleteEnabled: Bool = false,
+    documentID: String = "transient",
     scrollSyncDebounce: TimeInterval = 0.04,
     // Production autocomplete backend. The factory is lazy and resolved only
     // after the debounce. STT/formatting stay in qube-ffi; editor completion uses
@@ -420,12 +427,20 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     super.init()
 
+    autocompleteController.configureDocument(id: documentID)
+
     textView.delegate = self
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(editorBoundsDidChange(_:)),
       name: NSView.boundsDidChangeNotification,
       object: scrollView.contentView
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(editorWillUndo(_:)),
+      name: .NSUndoManagerWillUndoChange,
+      object: textView.undoManager
     )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
@@ -537,6 +552,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scheduleScrollSyncSample()
   }
 
+  @objc private func editorWillUndo(_ notification: Notification) {
+    guard notification.object as? UndoManager === textView.undoManager else { return }
+    autocompleteController.invalidateContinuation()
+  }
+
   func scheduleScrollSyncSample() {
     guard scrollSyncEnabled, scrollSyncCoordinator?.isEnabled == true else { return }
 
@@ -571,6 +591,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
     let latestText = textStorage.string
+    if textView.undoManager?.isUndoing == true {
+      autocompleteController.invalidateContinuation()
+    }
     invalidateAutocomplete()
     onTextChanged?(latestText)
     if aiAutocompleteEnabled {
@@ -582,7 +605,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       // already in flight.
       autocompleteController.textDidChange(
         context: autocompleteContext(from: latestText),
-        isComposing: textView.hasMarkedText()
+        isComposing: textView.hasMarkedText(),
+        replacementRange: NSRange(location: textView.selectedRange().location, length: 0)
       )
     }
     refreshFindMatches()
@@ -713,13 +737,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     guard textView.shouldChangeText(in: range, replacementString: suggestion) else { return false }
 
-    autocompleteController.cancel()
+    let acceptedCandidate = autocompleteController.candidateForAcceptance(suggestion, at: range)
     textView.dismissAutocompleteGhost()
-    textStorage.replaceCharacters(in: range, with: suggestion)
+    textView.insertText(suggestion, replacementRange: range)
+    let insertedRange = NSRange(location: range.location, length: (suggestion as NSString).length)
+    guard NSMaxRange(insertedRange) <= textStorage.length,
+      (textStorage.string as NSString).substring(with: insertedRange) == suggestion
+    else { return false }
+    if let acceptedCandidate {
+      autocompleteController.commitAppliedCandidate(acceptedCandidate)
+    }
     textContentStorage.refreshHighlighting()
-    textView.setSelectedRange(
-      NSRange(location: range.location + (suggestion as NSString).length, length: 0))
-    textView.didChangeText()
     return true
   }
 
@@ -734,6 +762,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   func invalidateAutocomplete() {
     autocompleteRenderGeneration &+= 1
     textView.dismissAutocompleteGhost()
+  }
+
+  func configureDocument(id: String) {
+    autocompleteController.configureDocument(id: id)
   }
 
   func textView(

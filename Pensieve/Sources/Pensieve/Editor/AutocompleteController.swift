@@ -45,10 +45,12 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
   @Published private(set) var suggestion: String?
   @Published private(set) var lastError: String?
+  private(set) var candidate: AICandidate?
 
   private let completionFactory: CompletionFactory?
   private let debounceNanoseconds: UInt64
   private let maxTokens: UInt32
+  private let sessionStore: DocumentAISessionStore
   // Backend resolution happens post-debounce inside the completion task, so
   // the cache is guarded by a lock rather than main-actor isolation.
   private let completionLock = NSLock()
@@ -56,6 +58,8 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
   private var providerSettingsCancellable: AnyCancellable?
+  private var documentSession = DocumentAISession(documentID: "unbound")
+  private var documentRevision: UInt64 = 0
   // Typed-unavailable is engine-global state, deliberately NOT request-scoped:
   // once the kernel reports the completion LLM is not configured, asking again
   // on every keystroke cannot succeed. cancel() clears the latch so the user
@@ -67,7 +71,8 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     engine: VistaEngineProtocol? = nil,
     engineFactory: EngineFactory? = nil,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
-    maxTokens: UInt32 = 32
+    maxTokens: UInt32 = 32,
+    sessionStore: DocumentAISessionStore = DocumentAISessionStore()
   ) {
     if let engine {
       self.completionBackend = VistaAutocompleteAdapter(engine: engine)
@@ -81,18 +86,21 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     }
     self.debounceNanoseconds = debounceNanoseconds
     self.maxTokens = maxTokens
+    self.sessionStore = sessionStore
     observeProviderSettings()
   }
 
   init(
     completionFactory: @escaping CompletionFactory,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
-    maxTokens: UInt32 = 32
+    maxTokens: UInt32 = 32,
+    sessionStore: DocumentAISessionStore = DocumentAISessionStore()
   ) {
     self.completionBackend = nil
     self.completionFactory = completionFactory
     self.debounceNanoseconds = debounceNanoseconds
     self.maxTokens = maxTokens
+    self.sessionStore = sessionStore
     observeProviderSettings()
   }
 
@@ -121,15 +129,28 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     return completionBackend != nil || completionFactory != nil
   }
 
+  func configureDocument(id: String) {
+    guard documentSession.documentID != id else { return }
+    cancel()
+    documentSession = sessionStore.session(for: id)
+    documentRevision = 0
+  }
+
   /// Starts a completion request for committed text. Composition updates are
   /// explicit so an in-flight request cannot publish state while an IME owns
   /// the caret; the default keeps existing non-IME call sites source-compatible.
-  func textDidChange(context: AutocompleteContext, isComposing: Bool = false) {
+  func textDidChange(
+    context: AutocompleteContext,
+    isComposing: Bool = false,
+    replacementRange: NSRange = NSRange(location: 0, length: 0)
+  ) {
+    documentRevision &+= 1
     requestID &+= 1
     let currentRequestID = requestID
     completionTask?.cancel()
     completionTask = nil
     suggestion = nil
+    candidate = nil
     lastError = nil
 
     guard !isComposing else { return }
@@ -150,6 +171,8 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
     let debounceNanoseconds = debounceNanoseconds
     let maxTokens = maxTokens
+    let session = documentSession
+    let revision = documentRevision
     completionTask = Task(priority: .userInitiated) { [weak self] in
       do {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
@@ -157,14 +180,52 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         // Resolve through the weak reference without retaining the controller
         // across the provider await. This lets deinit cancel a hung request.
         guard let backend = self?.resolveCompletionBackend() else { return }
-        let completion = try await backend.complete(context: context, maxTokens: maxTokens)
+        let produced: AICandidate
+        if let sessionBackend = backend as? any SessionAutocompleteCompleting {
+          produced = try await sessionBackend.complete(
+            context: context,
+            maxTokens: maxTokens,
+            session: session,
+            documentRevision: revision,
+            replacementRange: replacementRange)
+        } else {
+          let completion = try await backend.complete(context: context, maxTokens: maxTokens)
+          produced = AICandidate(
+            documentID: session.documentID,
+            text: completion,
+            providerInput: context.beforeCursor,
+            providerFingerprint: ProviderFingerprint(
+              shape: .openAIResponses, endpoint: "injected", model: "injected"),
+            pendingContinuation: .none,
+            invalidatedOpaqueContinuation: false,
+            documentRevision: revision,
+            replacementRange: replacementRange)
+        }
         try Task.checkCancellation()
 
         await MainActor.run { [weak self] in
           guard let self else { return }
           guard self.requestID == currentRequestID else { return }
           self.completionTask = nil
-          self.suggestion = Self.singleLineSuggestion(from: completion)
+          if produced.invalidatedOpaqueContinuation {
+            self.documentSession.invalidateOpaqueContinuation()
+            self.sessionStore.save(self.documentSession)
+          }
+          guard let visible = Self.singleLineSuggestion(from: produced.text) else {
+            self.candidate = nil
+            self.suggestion = nil
+            return
+          }
+          self.candidate = AICandidate(
+            documentID: produced.documentID,
+            text: visible,
+            providerInput: produced.providerInput,
+            providerFingerprint: produced.providerFingerprint,
+            pendingContinuation: produced.pendingContinuation,
+            invalidatedOpaqueContinuation: produced.invalidatedOpaqueContinuation,
+            documentRevision: produced.documentRevision,
+            replacementRange: produced.replacementRange)
+          self.suggestion = visible
         }
       } catch is CancellationError {
         await MainActor.run { [weak self] in
@@ -187,6 +248,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
             DebugTrace.log("autocomplete provider unavailable: \(message)")
           }
           self.suggestion = nil
+          self.candidate = nil
           self.lastError = message
         }
       }
@@ -206,9 +268,38 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     completionTask?.cancel()
     completionTask = nil
     suggestion = nil
+    candidate = nil
     lastError = nil
     engineUnavailable = false
     engineUnavailableDetail = nil
+  }
+
+  func candidateForAcceptance(_ text: String, at range: NSRange) -> AICandidate? {
+    guard let candidate,
+      candidate.documentID == documentSession.documentID,
+      candidate.text == text,
+      candidate.documentRevision == documentRevision,
+      candidate.replacementRange == range
+    else {
+      return nil
+    }
+    return candidate
+  }
+
+  func commitAppliedCandidate(_ candidate: AICandidate) {
+    guard candidate.documentID == documentSession.documentID else { return }
+    requestID &+= 1
+    completionTask?.cancel()
+    completionTask = nil
+    documentSession.accept(candidate)
+    sessionStore.save(documentSession)
+    self.candidate = nil
+    suggestion = nil
+  }
+
+  func invalidateContinuation() {
+    documentSession.invalidateOpaqueContinuation()
+    sessionStore.save(documentSession)
   }
 
   /// The ghost renderer is a single-line floating field at the caret

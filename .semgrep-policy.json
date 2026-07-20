@@ -5,6 +5,12 @@
       "path": "Pensieve/Resources/Info.plist",
       "decision": "Use Apple's system trust store instead of certificate pinning.",
       "rationale": "Pensieve talks to user-selected AI providers. Pinning provider certificates would break endpoint choice and certificate rotation while adding no stable trust boundary for this product."
+    },
+    {
+      "rule_id": "html.security.audit.missing-integrity.missing-integrity",
+      "path": "docs/index.html",
+      "decision": "Canonical metadata is not an executable subresource.",
+      "rationale": "The canonical link declares the preferred document URL and neither fetches nor executes third-party content, so subresource integrity does not apply."
     }
   ]
 }

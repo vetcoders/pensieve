@@ -169,6 +169,7 @@ final class AppState {
   var documentHasEditableBuffer: Bool { windowModel.documentHasEditableBuffer }
   var documentURL: URL? { windowModel.documentURL }
   var documentIsDirty: Bool { windowModel.documentIsDirty }
+  var aiDocumentID: String { windowModel.aiDocumentID }
 
   var mode: EditorMode {
     get { windowModel.mode }
