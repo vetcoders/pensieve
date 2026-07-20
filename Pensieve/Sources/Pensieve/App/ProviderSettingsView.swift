@@ -20,13 +20,39 @@ struct ProviderSettingsView: View {
         }
         .pickerStyle(.segmented)
         .accessibilityIdentifier("pensieve.provider.shape")
+        .onChange(of: settings.providerShape) {
+          settings.providerShapeDidChange()
+        }
         TextField(
           "Endpoint", text: $settings.endpoint, prompt: Text(settings.providerShape.endpointPrompt)
         )
         .textContentType(.URL)
         .accessibilityIdentifier("pensieve.provider.endpoint")
-        TextField("Model", text: $settings.model, prompt: Text("model-name"))
-          .accessibilityIdentifier("pensieve.provider.model")
+        HStack {
+          TextField("Model", text: $settings.model, prompt: Text("model-name"))
+            .accessibilityIdentifier("pensieve.provider.model")
+          Button {
+            Task { await settings.discoverModels() }
+          } label: {
+            if settings.isDiscoveringModels {
+              ProgressView()
+                .controlSize(.small)
+            } else {
+              Label("Discover", systemImage: "arrow.clockwise")
+            }
+          }
+          .disabled(settings.isDiscoveringModels || settings.endpoint.isEmpty)
+          .accessibilityIdentifier("pensieve.provider.discoverModels")
+        }
+        if !settings.discoveredModels.isEmpty {
+          Picker("Available models", selection: $settings.model) {
+            Text("Choose a model…").tag("")
+            ForEach(settings.discoveredModels) { model in
+              Text(model.displayName).tag(model.id)
+            }
+          }
+          .accessibilityIdentifier("pensieve.provider.discoveredModel")
+        }
         SecureField("API Key", text: $settings.apiKey, prompt: Text("Optional for local providers"))
           .accessibilityIdentifier("pensieve.provider.apiKey")
       }
@@ -39,13 +65,15 @@ struct ProviderSettingsView: View {
       .font(.caption)
       .foregroundStyle(.secondary)
 
-      if let unsupportedMessage = settings.providerShape.unsupportedMessage {
-        Label(unsupportedMessage, systemImage: "hand.raised.fill")
+      if let discoveryStatus = settings.modelDiscoveryStatus {
+        Label(discoveryStatus, systemImage: "network")
           .font(.caption)
-          .foregroundStyle(.orange)
+          .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
-          .accessibilityIdentifier("pensieve.provider.unsupportedShape")
-      } else if let error = settings.lastError {
+          .accessibilityIdentifier("pensieve.provider.discoveryStatus")
+      }
+
+      if let error = settings.lastError {
         Label(error, systemImage: "exclamationmark.triangle.fill")
           .font(.caption)
           .foregroundStyle(.red)
@@ -72,7 +100,7 @@ struct ProviderSettingsView: View {
       }
     }
     .padding(24)
-    .frame(width: 560, height: 470, alignment: .topLeading)
+    .frame(width: 560, height: 540, alignment: .topLeading)
     .accessibilityIdentifier("pensieve.provider.settings")
   }
 }

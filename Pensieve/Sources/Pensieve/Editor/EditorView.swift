@@ -581,7 +581,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       // composition. The render path re-checks hasMarkedText for requests
       // already in flight.
       autocompleteController.textDidChange(
-        prefix: autocompletePrefix(from: latestText),
+        context: autocompleteContext(from: latestText),
         isComposing: textView.hasMarkedText()
       )
     }
@@ -609,10 +609,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// (≈1–2k tokens) keeps the nearest context, which is all the completion
   /// endpoint conditions on anyway.
   static let autocompletePrefixMaxUTF16 = 4096
+  static let autocompleteSuffixMaxUTF16 = 2048
 
-  private func autocompletePrefix(from text: String) -> String {
+  private func autocompleteContext(from text: String) -> AutocompleteContext {
     let caret = textView.selectedRange().location
-    return Self.boundedAutocompletePrefix(text as NSString, caret: caret)
+    return Self.boundedAutocompleteContext(text as NSString, caret: caret)
   }
 
   static func boundedAutocompletePrefix(
@@ -627,6 +628,25 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // by at most one composed sequence.
     let start = text.rangeOfComposedCharacterSequence(at: caret - maxUTF16).location
     return text.substring(with: NSRange(location: start, length: caret - start))
+  }
+
+  static func boundedAutocompleteContext(
+    _ text: NSString,
+    caret: Int,
+    beforeMaxUTF16: Int = MarkdownEditorSurface.autocompletePrefixMaxUTF16,
+    afterMaxUTF16: Int = MarkdownEditorSurface.autocompleteSuffixMaxUTF16
+  ) -> AutocompleteContext {
+    let caret = min(max(caret, 0), text.length)
+    let before = boundedAutocompletePrefix(text, caret: caret, maxUTF16: beforeMaxUTF16)
+    let rawAfterLength = min(max(afterMaxUTF16, 0), text.length - caret)
+    guard rawAfterLength > 0 else {
+      return AutocompleteContext(beforeCursor: before, afterCursor: "")
+    }
+    let afterRange = text.rangeOfComposedCharacterSequences(
+      for: NSRange(location: caret, length: rawAfterLength))
+    return AutocompleteContext(
+      beforeCursor: before,
+      afterCursor: text.substring(with: afterRange))
   }
 
   private func bindAutocomplete() {

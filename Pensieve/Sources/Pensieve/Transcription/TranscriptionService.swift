@@ -193,11 +193,11 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     self.requiresMicrophonePermission = requiresMicrophonePermission
     self.microphonePermissionRequester = microphonePermissionRequester
     // Production keeps speech capture in qube-ffi but routes provider text
-    // through the same safe Responses seam as autocomplete. Explicit engine
+    // through the same provider-neutral runtime as autocomplete. Explicit engine
     // injection keeps existing unit seams deterministic unless a responder is
     // also supplied deliberately.
     self.aiTextResponder =
-      aiTextResponder ?? (engine == nil ? OpenAIResponsesAutocompleteBackend() : nil)
+      aiTextResponder ?? (engine == nil ? AIProviderRuntime() : nil)
     self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><!-- nosemgrep: swift.insecure-communication.ats.ats-pinning.ATS-consider-pinning -->
+<plist version="1.0">
 <!-- Pensieve supports operator-configured provider endpoints. Static ATS
      certificate pins would reject legitimate custom providers and routine
      certificate rotation; system trust plus ATS remains the intended policy. -->

@@ -10,14 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Dictation panel with automatic, Polish, and English recognition; continuous Preview/Final transcript assembly; and selection-aware insertion into the active Markdown editor.
+- Native OpenAI Responses and Anthropic Messages provider runtimes with dynamic model discovery and last-known-good model caching.
 
 ### Changed
 
 - AI Autocomplete is discoverable from the editor toolbar and now cancels stale or IME-composition requests without leaking provider internals into user-facing errors.
+- Inline autocomplete now receives explicit text before and after the cursor and continues the authored document instead of treating questions in it as chat prompts.
 
 ### Fixed
 
 - Signed Developer ID builds carry the microphone entitlement, Dictation drains the engine's final result without duplication, and failed or stale capture sessions are cleaned up before retry.
+- Provider API keys require current-device biometrics, and reviewed ATS policy keeps user-selected endpoints on Apple's system trust store without inline scanner suppressions.
 
 ## [0.3.0] - 2026-07-05
 

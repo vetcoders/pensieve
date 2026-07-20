@@ -23,7 +23,7 @@ protocol ProviderEnvironmentManaging {
   func removeValue(forKey key: String) throws
 }
 
-enum CompletionProviderShape: String, CaseIterable, Identifiable {
+enum CompletionProviderShape: String, CaseIterable, Identifiable, Sendable {
   case openAIResponses = "openai-responses"
   case anthropicMessages = "anthropic-messages"
 
@@ -41,33 +41,26 @@ enum CompletionProviderShape: String, CaseIterable, Identifiable {
   var endpointPrompt: String {
     switch self {
     case .openAIResponses:
-      return "https://api.example.com/v1/responses"
+      return "https://api.openai.com/v1/responses"
     case .anthropicMessages:
-      return "https://api.example.com/v1/messages"
+      return "https://api.anthropic.com/v1/messages"
     }
   }
 
-  /// This is the single product gate to flip after vista-kernel gains a real
-  /// Anthropic Messages request/header/response implementation.
-  var isSupportedByCompletionEngine: Bool {
+  func normalizeEndpoint(_ endpoint: String) -> String {
     switch self {
     case .openAIResponses:
-      return true
+      return ProviderSettings.normalizeOpenAIResponsesEndpoint(endpoint)
     case .anthropicMessages:
-      return false
+      return ProviderSettings.normalizeAnthropicMessagesEndpoint(endpoint)
     }
   }
 
-  var unsupportedMessage: String? {
-    guard !isSupportedByCompletionEngine else { return nil }
-    return "Anthropic Messages support is coming in an upcoming update."
-  }
 }
 
 enum ProviderSettingsError: LocalizedError {
   case endpointRequired
   case modelRequired
-  case unsupportedProviderShape(CompletionProviderShape)
   case invalidKeychainData
   case keychain(OSStatus)
   case environment(operation: String, key: String, code: Int32)
@@ -78,9 +71,6 @@ enum ProviderSettingsError: LocalizedError {
       return "Enter a provider endpoint."
     case .modelRequired:
       return "Enter a provider model."
-    case .unsupportedProviderShape(let shape):
-      return
-        "\(shape.displayName) requires a completion-engine update and was not saved or applied."
     case .invalidKeychainData:
       return "The saved provider API key could not be read."
     case .keychain(let status):
@@ -121,16 +111,24 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
 
   func storeAPIKey(_ apiKey: String) throws {
     let data = Data(apiKey.utf8)
-    let attributes = [kSecValueData as String: data]
+    let accessControl = try makeAccessControl()
+    let attributes: [String: Any] = [
+      kSecValueData as String: data,
+      kSecAttrAccessControl as String: accessControl,
+    ]
     let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
     if updateStatus == errSecSuccess { return }
     guard updateStatus == errSecItemNotFound else {
       throw ProviderSettingsError.keychain(updateStatus)
     }
 
-    var item = baseQuery
-    item[kSecValueData as String] = data
-    // nosemgrep: swift.biometrics-and-auth.missing-user-auth.keychain-without-user-auth
+    let item: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+      kSecValueData as String: data,
+      kSecAttrAccessControl as String: accessControl,
+    ]
     let addStatus = SecItemAdd(item as CFDictionary, nil)
     guard addStatus == errSecSuccess else { throw ProviderSettingsError.keychain(addStatus) }
   }
@@ -143,16 +141,25 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
   }
 
   private var baseQuery: [String: Any] {
-    // Keep the macOS Keychain default accessibility (`WhenUnlocked`). This app
-    // only reads provider credentials in the foreground; `AfterFirstUnlock`
-    // would unnecessarily expose them while the Mac is locked. Explicit
-    // `kSecAttrAccessible` also requires opting into the Data Protection
-    // Keychain on macOS, which is a separate storage migration.
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: account,
     ]
+  }
+
+  private func makeAccessControl() throws -> SecAccessControl {
+    var error: Unmanaged<CFError>?
+    guard
+      let accessControl = SecAccessControlCreateWithFlags(
+        nil,
+        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        .biometryCurrentSet,
+        &error)
+    else {
+      throw ProviderSettingsError.keychain(errSecParam)
+    }
+    return accessControl
   }
 }
 
@@ -187,6 +194,10 @@ final class ProviderSettings: ObservableObject {
   static let apiKeyEnvironmentKeys = [
     "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY", "LLM_API_KEY",
   ]
+  static let anthropicAPIKeyEnvironmentKeys = ["LLM_ANTHROPIC_API_KEY"]
+  static let providerShapeEnvironmentKeys = [
+    "LLM_ASSISTIVE_PROVIDER", "LLM_FORMATTING_PROVIDER", "LLM_PROVIDER",
+  ]
 
   private static let endpointDefaultsKey = "Pensieve.completionProvider.endpoint"
   private static let modelDefaultsKey = "Pensieve.completionProvider.model"
@@ -194,6 +205,7 @@ final class ProviderSettings: ObservableObject {
   private static let assistiveEndpointKey = "LLM_ASSISTIVE_ENDPOINT"
   private static let assistiveModelKey = "LLM_ASSISTIVE_MODEL"
   private static let assistiveAPIKey = "LLM_ASSISTIVE_API_KEY"
+  private static let assistiveProviderKey = "LLM_ASSISTIVE_PROVIDER"
 
   @Published var providerShape: CompletionProviderShape
   @Published var endpoint: String
@@ -201,27 +213,35 @@ final class ProviderSettings: ObservableObject {
   @Published var apiKey: String
   @Published private(set) var saveStatus: String?
   @Published private(set) var lastError: String?
+  @Published private(set) var discoveredModels: [DiscoveredProviderModel] = []
+  @Published private(set) var modelDiscoveryStatus: String?
+  @Published private(set) var isDiscoveringModels = false
 
   private let defaults: UserDefaults
   private let keychain: ProviderAPIKeyStoring
   private let environment: ProviderEnvironmentManaging
+  private let modelDiscovery: ProviderModelDiscovering
   private var managedEnvironmentKeys: Set<String> = []
+  private var discoveryGeneration: UInt64 = 0
   private let launchHadEndpointEnvironment: Bool
   private let launchHadModelEnvironment: Bool
 
   init(
     defaults: UserDefaults = .standard,
     keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
-    environment: ProviderEnvironmentManaging = ProcessProviderEnvironment()
+    environment: ProviderEnvironmentManaging = ProcessProviderEnvironment(),
+    modelDiscovery: ProviderModelDiscovering? = nil
   ) {
     self.defaults = defaults
     self.keychain = keychain
     self.environment = environment
-    self.providerShape =
+    self.modelDiscovery = modelDiscovery ?? ProviderModelDiscovery(defaults: defaults)
+    let persistedShape =
       CompletionProviderShape(
         rawValue: defaults.string(forKey: Self.providerShapeDefaultsKey) ?? ""
       ) ?? .openAIResponses
-    self.endpoint = Self.normalizeOpenAIResponsesEndpoint(
+    self.providerShape = persistedShape
+    self.endpoint = persistedShape.normalizeEndpoint(
       defaults.string(forKey: Self.endpointDefaultsKey) ?? "")
     self.model = defaults.string(forKey: Self.modelDefaultsKey) ?? ""
     self.apiKey = ""
@@ -248,18 +268,73 @@ final class ProviderSettings: ObservableObject {
   /// The kernel requires endpoint + model, but intentionally permits an empty
   /// API key for local/keyless OpenAI-compatible endpoints.
   var isConfigured: Bool {
-    providerShape.isSupportedByCompletionEngine
-      && Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
+    Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
       && Self.hasNonEmptyValue(in: Self.modelEnvironmentKeys, environment: environment)
   }
 
   var isDraftValid: Bool {
-    providerShape.isSupportedByCompletionEngine
-      && !trimmed(endpoint).isEmpty && !trimmed(model).isEmpty
+    !trimmed(endpoint).isEmpty && !trimmed(model).isEmpty
   }
 
   var usesInheritedEnvironmentAtLaunch: Bool {
     launchHadEndpointEnvironment && launchHadModelEnvironment
+  }
+
+  @MainActor
+  func providerShapeDidChange() {
+    discoveryGeneration &+= 1
+    discoveredModels = []
+    modelDiscoveryStatus = nil
+    let lowercasedEndpoint = endpoint.lowercased()
+    if lowercasedEndpoint.contains("api.openai.com")
+      || lowercasedEndpoint.contains("api.anthropic.com")
+      || trimmed(endpoint).isEmpty
+    {
+      endpoint = providerShape.endpointPrompt
+    } else {
+      endpoint = providerShape.normalizeEndpoint(endpoint)
+    }
+    let normalizedModel = trimmed(model).lowercased()
+    if providerShape == .anthropicMessages, normalizedModel.hasPrefix("gpt-") {
+      model = ""
+    } else if providerShape == .openAIResponses, normalizedModel.hasPrefix("claude-") {
+      model = ""
+    }
+  }
+
+  @MainActor
+  func discoverModels() async {
+    discoveryGeneration &+= 1
+    let generation = discoveryGeneration
+    let shape = providerShape
+    let endpoint = shape.normalizeEndpoint(endpoint)
+    let apiKey = trimmed(apiKey)
+    isDiscoveringModels = true
+    modelDiscoveryStatus = nil
+    defer {
+      if discoveryGeneration == generation {
+        isDiscoveringModels = false
+      }
+    }
+
+    do {
+      let result = try await modelDiscovery.discover(
+        shape: shape, endpoint: endpoint, apiKey: apiKey)
+      guard discoveryGeneration == generation, providerShape == shape else { return }
+      discoveredModels = result.models
+      switch result.source {
+      case .fresh:
+        modelDiscoveryStatus = "Found \(result.models.count) models."
+      case .cache:
+        modelDiscoveryStatus = "Provider unavailable — showing the last known model list."
+      }
+    } catch is CancellationError {
+      return
+    } catch {
+      guard discoveryGeneration == generation else { return }
+      discoveredModels = []
+      modelDiscoveryStatus = error.localizedDescription
+    }
   }
 
   /// Explicit Save is the user override: it writes the highest-priority
@@ -268,15 +343,12 @@ final class ProviderSettings: ObservableObject {
   /// terminal/developer workflows intact while making Finder launches work.
   func save() throws {
     do {
-      guard providerShape.isSupportedByCompletionEngine else {
-        throw ProviderSettingsError.unsupportedProviderShape(providerShape)
-      }
       let rawEndpoint = trimmed(endpoint)
       let model = trimmed(model)
       let apiKey = trimmed(apiKey)
       guard !rawEndpoint.isEmpty else { throw ProviderSettingsError.endpointRequired }
       guard !model.isEmpty else { throw ProviderSettingsError.modelRequired }
-      let endpoint = Self.normalizeOpenAIResponsesEndpoint(rawEndpoint)
+      let endpoint = providerShape.normalizeEndpoint(rawEndpoint)
 
       if apiKey.isEmpty {
         try keychain.deleteAPIKey()
@@ -293,6 +365,7 @@ final class ProviderSettings: ObservableObject {
 
       try setManagedValue(endpoint, forKey: Self.assistiveEndpointKey)
       try setManagedValue(model, forKey: Self.assistiveModelKey)
+      try setManagedValue(providerShape.rawValue, forKey: Self.assistiveProviderKey)
       if apiKey.isEmpty {
         try removeManagedValueIfOwned(forKey: Self.assistiveAPIKey)
       } else {
@@ -300,7 +373,7 @@ final class ProviderSettings: ObservableObject {
       }
 
       lastError = nil
-      saveStatus = "Saved and applied to AI Autocomplete."
+      saveStatus = "Saved and applied to AI features."
       NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: self)
     } catch {
       saveStatus = nil
@@ -310,15 +383,22 @@ final class ProviderSettings: ObservableObject {
   }
 
   private func applyPersistedConfigurationAtLaunch() throws {
-    guard providerShape.isSupportedByCompletionEngine else {
-      throw ProviderSettingsError.unsupportedProviderShape(providerShape)
-    }
+    let persistedEndpoint = providerShape.normalizeEndpoint(endpoint)
+    let persistedModel = trimmed(model)
     try fillMissingEnvironmentValue(
-      Self.normalizeOpenAIResponsesEndpoint(endpoint),
+      persistedEndpoint,
       aliases: Self.endpointEnvironmentKeys,
       key: Self.assistiveEndpointKey)
     try fillMissingEnvironmentValue(
-      trimmed(model), aliases: Self.modelEnvironmentKeys, key: Self.assistiveModelKey)
+      persistedModel, aliases: Self.modelEnvironmentKeys, key: Self.assistiveModelKey)
+    if !launchHadEndpointEnvironment && !launchHadModelEnvironment
+      && !persistedEndpoint.isEmpty && !persistedModel.isEmpty
+    {
+      try fillMissingEnvironmentValue(
+        providerShape.rawValue,
+        aliases: Self.providerShapeEnvironmentKeys,
+        key: Self.assistiveProviderKey)
+    }
     // Never pair a saved secret with a developer-inherited endpoint/model: a
     // stale cloud key must not be sent to an unrelated local or test server.
     // Developers can provide an env key explicitly; a deliberate UI Save also
@@ -371,6 +451,22 @@ final class ProviderSettings: ObservableObject {
       base.removeLast(3)
     }
     return base + "/v1/responses"
+  }
+
+  static func normalizeAnthropicMessagesEndpoint(_ endpoint: String) -> String {
+    var base = endpoint.trimmingCharacters(
+      in: .whitespacesAndNewlines.union(.init(charactersIn: "/")))
+    guard !base.isEmpty else { return "" }
+
+    for suffix in ["/v1/messages", "/v1/responses", "/v1/chat/completions"]
+    where base.hasSuffix(suffix) {
+      base.removeLast(suffix.count)
+      return base + "/v1/messages"
+    }
+    if base.hasSuffix("/v1") {
+      base.removeLast(3)
+    }
+    return base + "/v1/messages"
   }
 
   private static func hasNonEmptyValue(

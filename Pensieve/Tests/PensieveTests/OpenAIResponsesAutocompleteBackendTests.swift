@@ -21,7 +21,10 @@ final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
       return (responseData, Self.response(for: request, statusCode: 200))
     }
 
-    let completion = try await backend.complete(prefix: "A useful prefix", maxTokens: 32)
+    let completion = try await backend.complete(
+      context: AutocompleteContext(
+        beforeCursor: "A useful question?", afterCursor: "\n\n## Next section"),
+      maxTokens: 32)
 
     XCTAssertEqual(completion, " useful continuation")
     let request = try XCTUnwrap(recorder.request)
@@ -34,7 +37,19 @@ final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
     XCTAssertEqual(json["model"] as? String, "gpt-5")
     XCTAssertNil(json["temperature"])
     XCTAssertNil(json["max_output_tokens"])
-    XCTAssertTrue((json["instructions"] as? String)?.contains("at most 32 visible tokens") == true)
+    let instructions = try XCTUnwrap(json["instructions"] as? String)
+    XCTAssertTrue(instructions.contains("not a chat assistant"))
+    XCTAssertTrue(instructions.contains("questions"))
+    XCTAssertTrue(instructions.contains("at most 32 visible tokens"))
+    let input = try XCTUnwrap(json["input"] as? [[String: Any]])
+    let content = try XCTUnwrap(input.first?["content"] as? [[String: Any]])
+    let payloadText = try XCTUnwrap(content.first?["text"] as? String)
+    let payloadData = try XCTUnwrap(payloadText.data(using: .utf8))
+    let payload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: payloadData) as? [String: Any])
+    XCTAssertEqual(payload["task"] as? String, "continue_author_document")
+    XCTAssertEqual(payload["before_cursor"] as? String, "A useful question?")
+    XCTAssertEqual(payload["after_cursor"] as? String, "\n\n## Next section")
   }
 
   func testProviderErrorIsTypedAndReducedToOneLine() async throws {
@@ -49,7 +64,8 @@ final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
     }
 
     do {
-      _ = try await backend.complete(prefix: "prefix", maxTokens: 32)
+      _ = try await backend.complete(
+        context: AutocompleteContext(beforeCursor: "prefix", afterCursor: ""), maxTokens: 32)
       XCTFail("expected a typed provider failure")
     } catch VistaError.ModelError(let message) {
       XCTAssertEqual(
@@ -70,13 +86,73 @@ final class OpenAIResponsesAutocompleteBackendTests: XCTestCase {
     }
 
     do {
-      _ = try await backend.complete(prefix: "prefix", maxTokens: 32)
+      _ = try await backend.complete(
+        context: AutocompleteContext(beforeCursor: "prefix", afterCursor: ""), maxTokens: 32)
       XCTFail("expected cancellation")
     } catch is CancellationError {
       // Expected: cancellation must not become a visible autocomplete failure.
     } catch {
       XCTFail("unexpected error: \(error)")
     }
+  }
+
+  func testAnthropicMessagesUsesNativeHeadersBodyAndParser() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_PROVIDER": "anthropic-messages",
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.anthropic.com/v1/messages",
+      "LLM_ASSISTIVE_MODEL": "claude-sonnet-4-5",
+      "LLM_ANTHROPIC_API_KEY": "anthropic-key",
+    ])
+    let recorder = RequestRecorder()
+    let responseData = Data(
+      #"{"content":[{"type":"text","text":" dalszy ciąg"}],"stop_reason":"end_turn"}"#.utf8)
+    let backend = AIProviderRuntime(environment: environment) { request in
+      recorder.record(request)
+      return (responseData, Self.response(for: request, statusCode: 200))
+    }
+
+    let completion = try await backend.complete(
+      context: AutocompleteContext(beforeCursor: "Czy to ma sens?", afterCursor: " Tak."),
+      maxTokens: 24)
+
+    XCTAssertEqual(completion, " dalszy ciąg")
+    let request = try XCTUnwrap(recorder.request)
+    XCTAssertEqual(request.url?.absoluteString, "https://api.anthropic.com/v1/messages")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "anthropic-key")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+    let body = try XCTUnwrap(request.httpBody)
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    XCTAssertEqual(json["model"] as? String, "claude-sonnet-4-5")
+    XCTAssertEqual(json["max_tokens"] as? Int, 24)
+    XCTAssertTrue((json["system"] as? String)?.contains("not a chat assistant") == true)
+  }
+
+  func testDictationResponseUsesAnthropicMessagesRuntime() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_PROVIDER": "anthropic-messages",
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.anthropic.com/v1/messages",
+      "LLM_ASSISTIVE_MODEL": "claude-sonnet-4-5",
+      "LLM_ANTHROPIC_API_KEY": "anthropic-key",
+    ])
+    let recorder = RequestRecorder()
+    let responseData = Data(
+      #"{"content":[{"type":"text","text":"Poprawiony tekst."}],"stop_reason":"end_turn"}"#.utf8)
+    let runtime = AIProviderRuntime(environment: environment) { request in
+      recorder.record(request)
+      return (responseData, Self.response(for: request, statusCode: 200))
+    }
+
+    let output = try await runtime.respond(
+      input: "surowa transkrypcja", instructions: "Correct grammar only.")
+
+    XCTAssertEqual(output, "Poprawiony tekst.")
+    let body = try XCTUnwrap(recorder.request?.httpBody)
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    XCTAssertEqual(json["system"] as? String, "Correct grammar only.")
+    let messages = try XCTUnwrap(json["messages"] as? [[String: Any]])
+    let content = try XCTUnwrap(messages.first?["content"] as? [[String: Any]])
+    XCTAssertEqual(content.first?["text"] as? String, "surowa transkrypcja")
   }
 
   private static func response(for request: URLRequest, statusCode: Int) -> HTTPURLResponse {

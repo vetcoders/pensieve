@@ -1,0 +1,10 @@
+{
+  "accepted_findings": [
+    {
+      "rule_id": "swift.insecure-communication.ats.ats-pinning.ATS-consider-pinning",
+      "path": "Pensieve/Resources/Info.plist",
+      "decision": "Use Apple's system trust store instead of certificate pinning.",
+      "rationale": "Pensieve talks to user-selected AI providers. Pinning provider certificates would break endpoint choice and certificate rotation while adding no stable trust boundary for this product."
+    }
+  ]
+}

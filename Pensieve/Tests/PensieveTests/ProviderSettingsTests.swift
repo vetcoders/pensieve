@@ -14,6 +14,22 @@ final class ProviderSettingsTests: XCTestCase {
     }
   }
 
+  func testChangingProviderSwitchesKnownOfficialEndpoint() {
+    let (defaults, suiteName) = makeDefaults()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let settings = ProviderSettings(
+      defaults: defaults,
+      keychain: InMemoryProviderAPIKeyStore(),
+      environment: InMemoryProviderEnvironment())
+    settings.endpoint = "https://api.openai.com/v1/responses"
+    settings.providerShape = .anthropicMessages
+
+    settings.providerShapeDidChange()
+
+    XCTAssertEqual(settings.endpoint, "https://api.anthropic.com/v1/messages")
+    XCTAssertTrue(settings.discoveredModels.isEmpty)
+  }
+
   func testEveryCompatibleAndLegacyEndpointIsStoredAndAppliedAsResponses() throws {
     for testCase in responsesEndpointCases() {
       let (defaults, suiteName) = makeDefaults()
@@ -48,7 +64,7 @@ final class ProviderSettingsTests: XCTestCase {
     }
   }
 
-  func testAnthropicMessagesFailsClosedWithoutPersistingOrApplying() {
+  func testAnthropicMessagesPersistsAndAppliesNativeRuntimeShape() throws {
     let (defaults, suiteName) = makeDefaults()
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let keychain = InMemoryProviderAPIKeyStore()
@@ -56,22 +72,26 @@ final class ProviderSettingsTests: XCTestCase {
     let settings = ProviderSettings(
       defaults: defaults, keychain: keychain, environment: environment)
     settings.providerShape = .anthropicMessages
-    settings.endpoint = "https://api.libraxis.cloud/v1/messages"
+    settings.endpoint = "https://api.anthropic.com/v1"
     settings.model = "claude-model"
     settings.apiKey = "anthropic-secret"
 
-    XCTAssertFalse(settings.isDraftValid)
-    XCTAssertNotNil(settings.providerShape.unsupportedMessage)
-    XCTAssertThrowsError(try settings.save()) { error in
-      guard case ProviderSettingsError.unsupportedProviderShape(.anthropicMessages) = error
-      else {
-        return XCTFail("unexpected error: \(error)")
-      }
-    }
-    XCTAssertTrue(environment.setCalls.isEmpty)
-    XCTAssertTrue(environment.values.isEmpty)
-    XCTAssertNil(keychain.apiKey)
-    XCTAssertNil(defaults.string(forKey: "Pensieve.completionProvider.endpoint"))
+    XCTAssertTrue(settings.isDraftValid)
+    try settings.save()
+
+    XCTAssertEqual(settings.endpoint, "https://api.anthropic.com/v1/messages")
+    XCTAssertEqual(environment.values["LLM_ASSISTIVE_PROVIDER"], "anthropic-messages")
+    XCTAssertEqual(
+      environment.values["LLM_ASSISTIVE_ENDPOINT"],
+      "https://api.anthropic.com/v1/messages")
+    XCTAssertEqual(environment.values["LLM_ASSISTIVE_MODEL"], "claude-model")
+    XCTAssertEqual(environment.values["LLM_ASSISTIVE_API_KEY"], "anthropic-secret")
+    XCTAssertEqual(keychain.apiKey, "anthropic-secret")
+
+    let restored = ProviderSettings(
+      defaults: defaults, keychain: keychain, environment: InMemoryProviderEnvironment())
+    XCTAssertEqual(restored.providerShape, .anthropicMessages)
+    XCTAssertEqual(restored.endpoint, "https://api.anthropic.com/v1/messages")
   }
 
   func testSecondStoreRestoresPreferencesAndKeychainWithoutPersistingSecretInDefaults() throws {

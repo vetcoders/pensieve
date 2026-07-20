@@ -1344,6 +1344,7 @@ final class PensieveSmokeTests: XCTestCase {
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
       workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 10
     )
 
@@ -1437,6 +1438,7 @@ final class PensieveSmokeTests: XCTestCase {
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
       workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 30
     )
 
@@ -1471,6 +1473,7 @@ final class PensieveSmokeTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 10
     )
 

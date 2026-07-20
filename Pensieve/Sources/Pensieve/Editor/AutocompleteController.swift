@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 protocol AutocompleteCompleting: Sendable {
-  func complete(prefix: String, maxTokens: UInt32) async throws -> String
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String
 }
 
 private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked Sendable {
@@ -12,8 +12,8 @@ private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked
     self.engine = engine
   }
 
-  func complete(prefix: String, maxTokens: UInt32) async throws -> String {
-    try await engine.complete(prefix: prefix, maxTokens: maxTokens)
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
+    try await engine.complete(prefix: context.beforeCursor, maxTokens: maxTokens)
   }
 }
 
@@ -124,7 +124,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// Starts a completion request for committed text. Composition updates are
   /// explicit so an in-flight request cannot publish state while an IME owns
   /// the caret; the default keeps existing non-IME call sites source-compatible.
-  func textDidChange(prefix: String, isComposing: Bool = false) {
+  func textDidChange(context: AutocompleteContext, isComposing: Bool = false) {
     requestID &+= 1
     let currentRequestID = requestID
     completionTask?.cancel()
@@ -134,7 +134,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
     guard !isComposing else { return }
 
-    guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    guard !context.beforeCursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       return
     }
 
@@ -157,7 +157,7 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         // Resolve through the weak reference without retaining the controller
         // across the provider await. This lets deinit cancel a hung request.
         guard let backend = self?.resolveCompletionBackend() else { return }
-        let completion = try await backend.complete(prefix: prefix, maxTokens: maxTokens)
+        let completion = try await backend.complete(context: context, maxTokens: maxTokens)
         try Task.checkCancellation()
 
         await MainActor.run { [weak self] in
@@ -191,6 +191,14 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
         }
       }
     }
+  }
+
+  /// Compatibility seam for focused tests and non-editor callers that only
+  /// own a prefix. Production editor requests always include suffix context.
+  func textDidChange(prefix: String, isComposing: Bool = false) {
+    textDidChange(
+      context: AutocompleteContext(beforeCursor: prefix, afterCursor: ""),
+      isComposing: isComposing)
   }
 
   func cancel() {

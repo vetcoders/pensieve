@@ -190,11 +190,11 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(factoryCalls.value, 0, "the factory must not run at construction time")
 
     controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { controller.suggestion == " world" }
     XCTAssertEqual(controller.suggestion, " world")
 
     controller.textDidChange(prefix: "hello w")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { factoryCalls.value == 1 }
 
     XCTAssertEqual(factoryCalls.value, 1, "the resolved engine must be cached across requests")
   }
@@ -502,6 +502,28 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertLessThanOrEqual(bounded.utf16.count, cap + 1)
     XCTAssertTrue(bounded.hasPrefix("😀"), "window start must snap to a composed boundary")
     XCTAssertTrue(bounded.hasSuffix("😀"))
+  }
+
+  func testBoundedAutocompleteContextPreservesBothSidesOfCaret() {
+    let text = "Przed kursorem?Po kursorze." as NSString
+    let caret = ("Przed kursorem?" as NSString).length
+
+    let context = MarkdownEditorSurface.boundedAutocompleteContext(
+      text, caret: caret, beforeMaxUTF16: 9, afterMaxUTF16: 11)
+
+    XCTAssertEqual(context.beforeCursor, "kursorem?")
+    XCTAssertEqual(context.afterCursor, "Po kursorze")
+  }
+
+  func testBoundedAutocompleteContextDoesNotSplitSuffixEmoji() {
+    let text = "start😀middle" as NSString
+    let caret = ("start" as NSString).length
+
+    let context = MarkdownEditorSurface.boundedAutocompleteContext(
+      text, caret: caret, beforeMaxUTF16: 20, afterMaxUTF16: 1)
+
+    XCTAssertEqual(context.beforeCursor, "start")
+    XCTAssertEqual(context.afterCursor, "😀")
   }
 
   func testTypingPathSendsBoundedPrefix() async {
