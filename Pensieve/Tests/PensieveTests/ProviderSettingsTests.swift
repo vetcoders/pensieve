@@ -5,6 +5,36 @@ import XCTest
 
 @MainActor
 final class ProviderSettingsTests: XCTestCase {
+  func testExplicitDiscoveryUsesSavedKeyButKeepsLocalEndpointsKeyless() async throws {
+    let (defaults, suiteName) = makeDefaults()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let keychain = InMemoryProviderAPIKeyStore()
+    keychain.apiKey = "saved-key"
+    let discovery = RecordingProviderDiscovery()
+    let settings = ProviderSettings(
+      defaults: defaults,
+      keychain: keychain,
+      environment: InMemoryProviderEnvironment(),
+      modelDiscovery: discovery)
+    settings.providerShape = .anthropicMessages
+    settings.endpoint = "https://api.anthropic.com/v1/messages"
+
+    await settings.discoverModels()
+
+    let remoteAPIKeys = await discovery.apiKeys
+    XCTAssertEqual(remoteAPIKeys, ["saved-key"])
+    XCTAssertEqual(keychain.loadCount, 1)
+    XCTAssertEqual(settings.apiKey, "", "saved secrets must not be reflected into the UI")
+
+    settings.providerShape = .openAIResponses
+    settings.endpoint = "http://127.0.0.1:11434/v1/responses"
+    await settings.discoverModels()
+
+    let allAPIKeys = await discovery.apiKeys
+    XCTAssertEqual(allAPIKeys, ["saved-key", ""])
+    XCTAssertEqual(keychain.loadCount, 1, "local discovery must not load or send a cloud key")
+  }
+
   func testProviderSwitchCancelsDiscoveryAndRestoresDiscoverButton() async {
     let (defaults, suiteName) = makeDefaults()
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -389,10 +419,27 @@ private final class BlockingProviderDiscovery: ProviderModelDiscovering, @unchec
 
 private final class InMemoryProviderAPIKeyStore: ProviderAPIKeyStoring {
   var apiKey: String?
+  private(set) var loadCount = 0
 
-  func loadAPIKey() throws -> String? { apiKey }
+  func loadAPIKey() throws -> String? {
+    loadCount += 1
+    return apiKey
+  }
   func storeAPIKey(_ apiKey: String) throws { self.apiKey = apiKey }
   func deleteAPIKey() throws { apiKey = nil }
+}
+
+private actor RecordingProviderDiscovery: ProviderModelDiscovering {
+  private(set) var apiKeys: [String] = []
+
+  func discover(
+    shape: CompletionProviderShape,
+    endpoint: String,
+    apiKey: String
+  ) async throws -> ProviderModelDiscoveryResult {
+    apiKeys.append(apiKey)
+    return ProviderModelDiscoveryResult(models: [], source: .fresh)
+  }
 }
 
 private final class InMemoryProviderEnvironment: ProviderEnvironmentManaging {

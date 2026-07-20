@@ -307,7 +307,7 @@ final class ProviderSettings: ObservableObject {
     let generation = discoveryGeneration
     let shape = providerShape
     let endpoint = shape.normalizeEndpoint(endpoint)
-    let apiKey = trimmed(apiKey)
+    let enteredAPIKey = trimmed(apiKey)
     isDiscoveringModels = true
     modelDiscoveryStatus = nil
     let task = Task { @MainActor [weak self] in
@@ -319,6 +319,12 @@ final class ProviderSettings: ObservableObject {
         }
       }
       do {
+        let apiKey: String
+        if enteredAPIKey.isEmpty, !Self.isLocalProviderEndpoint(endpoint) {
+          apiKey = try self.keychain.loadAPIKey() ?? ""
+        } else {
+          apiKey = enteredAPIKey
+        }
         let result = try await self.modelDiscovery.discover(
           shape: shape, endpoint: endpoint, apiKey: apiKey)
         try Task.checkCancellation()
@@ -459,6 +465,11 @@ final class ProviderSettings: ObservableObject {
 
   private func trimmed(_ value: String) -> String {
     value.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func isLocalProviderEndpoint(_ endpoint: String) -> Bool {
+    guard let host = URL(string: endpoint)?.host?.lowercased() else { return false }
+    return host == "localhost" || host == "127.0.0.1" || host == "::1"
   }
 
   /// Canonicalizes every UI-managed OpenAI-compatible endpoint onto the only
