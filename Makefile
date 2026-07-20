@@ -127,8 +127,20 @@ format:  ## Apply swift-format in-place when installed (best-effort helper)
 		&& cd $(PKG_DIR) && swift-format format --in-place $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' -print) \
 		|| printf "$(C_YELLOW)[skip]$(C_RESET) swift-format not installed (brew install swift-format)\n"
 
+.PHONY: semgrep
+semgrep:  ## Security scan with reviewed, repository-owned finding policy
+	@if ! command -v semgrep >/dev/null 2>&1; then \
+		printf "$(C_YELLOW)[missing]$(C_RESET) semgrep is required for security/release gates (brew install semgrep)\n"; \
+		exit 1; \
+	fi
+	@if ! command -v jq >/dev/null 2>&1; then \
+		printf "$(C_YELLOW)[missing]$(C_RESET) jq is required for the Semgrep policy gate (brew install jq)\n"; \
+		exit 1; \
+	fi
+	@$(SCRIPTS)/semgrep-with-policy.sh
+
 .PHONY: gates
-gates: test lint  ## Run all quality gates (test + lint)
+gates: test lint semgrep  ## Run all quality gates (test + lint + security)
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) all gates passed\n"
 
 .PHONY: init-hooks
