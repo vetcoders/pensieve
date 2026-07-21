@@ -377,3 +377,62 @@ final class FormattingAccessoryChromeTruthTests: XCTestCase {
     XCTAssertEqual(allowed.minY, contentTop, accuracy: 0.5)
   }
 }
+
+/// Regression for the dangling-undo-target SIGSEGV (crash report Pensieve
+/// 2026-07-19-060545): the text view registers undo actions targeting `self`
+/// into the WINDOW's undo manager, which outlives the view. When SwiftUI rebuilds
+/// the editor representable, the freed view is still referenced by those entries
+/// (NSUndoManager holds targets unsafe-unretained), so the first Cmd+Z afterwards
+/// drives `undoNestedGroup → popAndInvoke → objc_msgSend` onto a dangling pointer.
+/// Detaching the view from its window must scrub every entry targeting it from the
+/// outgoing window's undo manager.
+@MainActor
+final class MarkdownTextViewUndoDetachTests: XCTestCase {
+  func testDetachingFromWindowClearsUndoActionsTargetingTextView() throws {
+    let surface = MarkdownEditorSurface(text: "detach", fontSize: 14)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    window.contentView = surface.scrollView
+    surface.scrollView.frame = window.contentView?.bounds ?? .zero
+    surface.scrollView.layoutSubtreeIfNeeded()
+
+    let textView = surface.textView
+    XCTAssertTrue(textView.window === window, "text view must be attached before the test starts")
+
+    // The window's undo manager is the exact instance the text view registers into
+    // while attached (`super.undoManager` resolves to it, no delegate override).
+    let windowUndoManager = try XCTUnwrap(window.undoManager)
+    XCTAssertTrue(
+      textView.undoManager === windowUndoManager,
+      "attached text view must share the window's undo manager")
+
+    // Register an entry targeting the view — same shape as AppKit typing-undo and
+    // `registerSmartPasteUndo` (both use a target of `self`).
+    // Close the group deterministically: `removeAllActions(withTarget:)` scrubs a
+    // block-based entry only once its group is closed, and AppKit's default
+    // `groupsByEvent` closes groups on run-loop turns we do not spin here. Real teardown
+    // happens on a later event with the group already closed — this reproduces that state.
+    windowUndoManager.groupsByEvent = false
+    windowUndoManager.beginUndoGrouping()
+    windowUndoManager.registerUndo(withTarget: textView) { tv in
+      _ = tv  // undo body is irrelevant; the dangling *target* is the crash surface.
+    }
+    windowUndoManager.endUndoGrouping()
+    XCTAssertTrue(
+      windowUndoManager.canUndo, "precondition: the registered entry must be live before detach")
+
+    // Detach the whole editor subtree from the window (the SwiftUI teardown path).
+    surface.scrollView.removeFromSuperview()
+    XCTAssertNil(textView.window, "text view must be detached after removeFromSuperview")
+
+    XCTAssertFalse(
+      windowUndoManager.canUndo,
+      "detaching the text view must clear its entries from the window's undo manager, "
+        + "or the freed view is left as a dangling undo target (SIGSEGV on next Cmd+Z)")
+  }
+}

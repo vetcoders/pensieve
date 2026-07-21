@@ -23,6 +23,42 @@ class MarkdownTextView: NSTextView {
     super.undoManager ?? fallbackUndoManager
   }
 
+  /// The window undo manager our entries land in, captured while attached so we can
+  /// scrub them on detach. See `viewWillMove(toWindow:)` for why `self.window` is not a
+  /// reliable source at detach time.
+  private weak var attachedWindowUndoManager: UndoManager?
+
+  /// Detach guard for the window's undo stack.
+  ///
+  /// This view registers undo actions with a target of `self` into the WINDOW's undo
+  /// manager — both implicitly (AppKit typing-undo via `allowsUndo`) and explicitly
+  /// (`registerSmartPasteUndo`). That manager lives with the window, not the view, and
+  /// holds its targets `unsafe-unretained`. When SwiftUI tears this representable down
+  /// and rebuilds it, the old view is freed while its entries stay in the window's
+  /// manager — so the first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke →
+  /// objc_msgSend` onto a dangling pointer (the SIGSEGV in crash report 2026-07-19).
+  ///
+  /// Clearing on `deinit` cannot fix this: by then `super.undoManager` is already `nil`,
+  /// so we would scrub the `fallbackUndoManager` and miss the window's real one. Nor can
+  /// we read `self.window?.undoManager` here: when an ANCESTOR (the scroll view) is
+  /// removed, the superview chain is already severed by the time this descendant's
+  /// `viewWillMove` fires, so `self.window` resolves to `nil`. We therefore scrub the
+  /// manager captured in `viewDidMoveToWindow` while the view was still attached.
+  override func viewWillMove(toWindow newWindow: NSWindow?) {
+    if newWindow !== window {
+      (window?.undoManager ?? attachedWindowUndoManager)?.removeAllActions(withTarget: self)
+    }
+    super.viewWillMove(toWindow: newWindow)
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    // Remember the manager our undo entries register into while we are attached, so the
+    // detach guard above has a handle on it even if a future detach path leaves
+    // `self.window` unresolvable (e.g. a `contentView` swap rather than removeFromSuperview).
+    attachedWindowUndoManager = window?.undoManager
+  }
+
   override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
     super.init(frame: frameRect, textContainer: container)
     setup()
