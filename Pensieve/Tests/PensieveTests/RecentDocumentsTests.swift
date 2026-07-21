@@ -256,12 +256,8 @@ final class RecentDocumentsTests: XCTestCase {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
     let indexDatabase = IndexDatabase(databaseURL: root.appendingPathComponent("index.db"))
-    let suiteName = "PensieveRecentDocumentsTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveRecentDocumentsTests"))
     let metadataStore = WorkspaceMetadataStore(
       metadataURL: root.appendingPathComponent("workspace.json", isDirectory: false))
     let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: root))

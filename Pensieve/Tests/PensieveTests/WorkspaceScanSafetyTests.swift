@@ -255,10 +255,7 @@ final class WorkspaceScanSafetyTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveScanSafetyBookmarks-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveScanSafetyBookmarks"))
   }
 
   private func flatten(_ root: WorkspaceNode) -> [WorkspaceNode] {

@@ -345,11 +345,8 @@ final class FileWatcherRecursiveTests: XCTestCase {
       searchIndexBatchSize: 1,
       didInsertSearchIndexBatch: { searchWrites.record($0) }
     )
-    let suiteName = "PensieveFileWatcherBookmarks-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveFileWatcherBookmarks"))
     let cacheStore = WorkspaceCacheStore(
       baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true))
     let scanProbe = WatcherScanProbe()

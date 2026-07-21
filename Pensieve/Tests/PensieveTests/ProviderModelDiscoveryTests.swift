@@ -5,8 +5,7 @@ import XCTest
 
 final class ProviderModelDiscoveryTests: XCTestCase {
   func testOpenAIDiscoversNormalizesAndCachesModels() async throws {
-    let (defaults, suiteName) = makeDiscoveryDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDiscoveryDefaults()
     let recorder = ModelRequestRecorder()
     let discovery = ProviderModelDiscovery(defaults: defaults) { request in
       recorder.record(request)
@@ -28,8 +27,7 @@ final class ProviderModelDiscoveryTests: XCTestCase {
   }
 
   func testOpenAICompatibleLocalDiscoveryAllowsKeylessEndpoint() async throws {
-    let (defaults, suiteName) = makeDiscoveryDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDiscoveryDefaults()
     let recorder = ModelRequestRecorder()
     let discovery = ProviderModelDiscovery(defaults: defaults) { request in
       recorder.record(request)
@@ -49,8 +47,7 @@ final class ProviderModelDiscoveryTests: XCTestCase {
   }
 
   func testAnthropicDiscoveryFollowsPaginationWithNativeHeaders() async throws {
-    let (defaults, suiteName) = makeDiscoveryDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDiscoveryDefaults()
     let recorder = ModelRequestRecorder()
     let discovery = ProviderModelDiscovery(defaults: defaults) { request in
       recorder.record(request)
@@ -81,8 +78,7 @@ final class ProviderModelDiscoveryTests: XCTestCase {
   }
 
   func testDiscoveryFallsBackToLastGoodCache() async throws {
-    let (defaults, suiteName) = makeDiscoveryDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDiscoveryDefaults()
     let successful = ProviderModelDiscovery(defaults: defaults) { request in
       let data = Data(#"{"data":[{"id":"gpt-cached"}]}"#.utf8)
       return (data, Self.response(for: request, statusCode: 200))
@@ -109,9 +105,8 @@ final class ProviderModelDiscoveryTests: XCTestCase {
       url: request.url!, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
   }
 
-  private func makeDiscoveryDefaults() -> (UserDefaults, String) {
-    let suiteName = "ProviderModelDiscoveryTests.\(UUID().uuidString)"
-    return (UserDefaults(suiteName: suiteName)!, suiteName)
+  private func makeDiscoveryDefaults() -> UserDefaults {
+    makeEphemeralDefaults(prefix: "ProviderModelDiscoveryTests")
   }
 }
 

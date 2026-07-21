@@ -251,10 +251,8 @@ final class WorkspaceExclusionTests: XCTestCase {
     let indexDatabase = IndexDatabase(
       databaseURL: support.appendingPathComponent("index.db")
     )
-    let suiteName = "PensieveWorkspaceExclusionBookmarks-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveWorkspaceExclusionBookmarks"))
     let workspaceSubstrate = WorkspaceSubstrate(
       store: WorkspaceCacheStore(
         baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true)

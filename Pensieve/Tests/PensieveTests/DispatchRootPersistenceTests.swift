@@ -5,7 +5,6 @@ import XCTest
 
 final class DispatchRootPersistenceTests: XCTestCase {
   private var temporaryRoot: URL!
-  private var defaultsSuites: [String] = []
 
   override func setUpWithError() throws {
     temporaryRoot = FileManager.default.temporaryDirectory
@@ -15,9 +14,6 @@ final class DispatchRootPersistenceTests: XCTestCase {
   }
 
   override func tearDownWithError() throws {
-    for suiteName in defaultsSuites {
-      UserDefaults.standard.removePersistentDomain(forName: suiteName)
-    }
     try? FileManager.default.removeItem(at: temporaryRoot)
   }
 
@@ -157,11 +153,7 @@ final class DispatchRootPersistenceTests: XCTestCase {
   }
 
   private func makeDefaults() throws -> UserDefaults {
-    let suiteName = "Pensieve.DispatchRootPersistenceTests.\(UUID().uuidString)"
-    defaultsSuites.append(suiteName)
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    return defaults
+    makeEphemeralDefaults(prefix: "Pensieve.DispatchRootPersistenceTests")
   }
 
   private func makeDirectory(_ relativePath: String) throws -> URL {

@@ -6,8 +6,7 @@ import XCTest
 @MainActor
 final class ProviderSettingsTests: XCTestCase {
   func testExplicitDiscoveryUsesSavedKeyButKeepsLocalEndpointsKeyless() async throws {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let keychain = InMemoryProviderAPIKeyStore()
     keychain.apiKey = "saved-key"
     let discovery = RecordingProviderDiscovery()
@@ -36,8 +35,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testProviderSwitchCancelsDiscoveryAndRestoresDiscoverButton() async {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let started = expectation(description: "discovery started")
     let cancelled = expectation(description: "discovery cancelled")
     let discovery = BlockingProviderDiscovery(started: started, cancelled: cancelled)
@@ -70,8 +68,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testChangingProviderSwitchesKnownOfficialEndpoint() {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let settings = ProviderSettings(
       defaults: defaults,
       keychain: InMemoryProviderAPIKeyStore(),
@@ -87,8 +84,7 @@ final class ProviderSettingsTests: XCTestCase {
 
   func testEveryCompatibleAndLegacyEndpointIsStoredAndAppliedAsResponses() throws {
     for testCase in responsesEndpointCases() {
-      let (defaults, suiteName) = makeDefaults()
-      defer { defaults.removePersistentDomain(forName: suiteName) }
+      let defaults = makeDefaults()
       let environment = InMemoryProviderEnvironment()
       let settings = ProviderSettings(
         defaults: defaults,
@@ -120,8 +116,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testAnthropicMessagesPersistsAndAppliesNativeRuntimeShape() throws {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let keychain = InMemoryProviderAPIKeyStore()
     let environment = InMemoryProviderEnvironment()
     let settings = ProviderSettings(
@@ -150,8 +145,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testSecondStoreRestoresPreferencesAndKeychainWithoutPersistingSecretInDefaults() throws {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let (defaults, suiteName) = makeEphemeralDefaultsSuite(prefix: "ProviderSettingsTests")
     let keychain = InMemoryProviderAPIKeyStore()
     let environment = InMemoryProviderEnvironment()
     let secret = "sk-provider-settings-secret"
@@ -184,8 +178,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testInheritedEnvironmentWinsAtLaunchAndPersistedSettingsDoNotClobberIt() throws {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let keychain = InMemoryProviderAPIKeyStore()
     let seedEnvironment = InMemoryProviderEnvironment()
     let seed = ProviderSettings(
@@ -213,8 +206,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testWhitespaceEndpointOrModelNeverTouchesEnvironment() {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let environment = InMemoryProviderEnvironment()
     let settings = ProviderSettings(
       defaults: defaults,
@@ -233,8 +225,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 
   func testDeletingAPIKeyRemovesKeychainItemAndOnlyAppOwnedEnvironmentValue() throws {
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let keychain = InMemoryProviderAPIKeyStore()
     let environment = InMemoryProviderEnvironment()
     let settings = ProviderSettings(
@@ -329,8 +320,7 @@ final class ProviderSettingsTests: XCTestCase {
     }
     XCTAssertEqual(attempts.value, 1)
 
-    let (defaults, suiteName) = makeDefaults()
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeDefaults()
     let settings = ProviderSettings(
       defaults: defaults,
       keychain: InMemoryProviderAPIKeyStore(),
@@ -367,11 +357,8 @@ final class ProviderSettingsTests: XCTestCase {
     ]
   }
 
-  private func makeDefaults() -> (UserDefaults, String) {
-    let suiteName = "ProviderSettingsTests.\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
-    return (defaults, suiteName)
+  private func makeDefaults() -> UserDefaults {
+    makeEphemeralDefaults(prefix: "ProviderSettingsTests")
   }
 
   private func waitUntil(

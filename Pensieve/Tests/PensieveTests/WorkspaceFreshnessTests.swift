@@ -266,10 +266,8 @@ final class WorkspaceFreshnessTests: XCTestCase {
       searchIndexBatchSize: 1,
       didInsertSearchIndexBatch: { writes.record($0) }
     )
-    let suiteName = "PensieveWorkspaceFreshnessBookmarks-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveWorkspaceFreshnessBookmarks"))
     let cacheStore = WorkspaceCacheStore(
       baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true))
     let scanProbe = FreshnessScanProbe()

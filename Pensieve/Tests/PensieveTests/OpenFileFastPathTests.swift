@@ -121,11 +121,8 @@ final class OpenFileFastPathTests: XCTestCase {
     let support = root.appendingPathComponent("Support", isDirectory: true)
     try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
 
-    let suiteName = "PensieveOpenFileFastPathBookmarks-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
+    let defaults = makeEphemeralDefaults(prefix: "PensieveOpenFileFastPathBookmarks")
     addTeardownBlock {
-      defaults.removePersistentDomain(forName: suiteName)
       try? FileManager.default.removeItem(at: root)
     }
 
