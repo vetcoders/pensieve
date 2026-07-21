@@ -9,7 +9,7 @@ final class TrashConfirmationTests: XCTestCase {
     let fixture = try TrashTestFixture.make()
     let fileURL = fixture.root.appendingPathComponent("file.md").standardizedFileURL
     try "# File".write(to: fileURL, atomically: true, encoding: .utf8)
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -29,7 +29,7 @@ final class TrashConfirmationTests: XCTestCase {
     let folderURL = fixture.root.appendingPathComponent("folder", isDirectory: true)
       .standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -50,7 +50,7 @@ final class TrashConfirmationTests: XCTestCase {
     let folderURL = fixture.root.appendingPathComponent("folder", isDirectory: true)
       .standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-    let harness = try TrashTestHarness(root: fixture.root, confirmationResult: false)
+    let harness = try makeTrashHarness(root: fixture.root, confirmationResult: false)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -79,6 +79,7 @@ final class TrashTestHarness {
 
   init(
     root: URL,
+    bookmarkDefaults: UserDefaults,
     confirmationResult: Bool = true,
     workspaceBuilder: WorkspaceScanner.Builder? = nil
   ) throws {
@@ -97,7 +98,7 @@ final class TrashTestHarness {
     )
     self.indexDatabase = indexDatabase
 
-    let bookmarkStore = try Self.temporaryBookmarkStore()
+    let bookmarkStore = BookmarkStore(defaults: bookmarkDefaults)
     let metadataStore = WorkspaceMetadataStore(
       metadataURL: root.appendingPathComponent("workspace.json", isDirectory: false)
     )
@@ -211,15 +212,24 @@ final class TrashTestHarness {
   private static func pathOrder(_ lhs: URL, _ rhs: URL) -> Bool {
     lhs.standardizedFileURL.path < rhs.standardizedFileURL.path
   }
+}
 
-  private static func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveWorkspaceTrashTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable"
+extension XCTestCase {
+  /// Builds a `TrashTestHarness` whose `BookmarkStore` lives in an ephemeral
+  /// `UserDefaults` suite; the suite and its backing plist are removed on test
+  /// teardown so runs never strand plists in `~/Library/Preferences`.
+  @MainActor
+  func makeTrashHarness(
+    root: URL,
+    confirmationResult: Bool = true,
+    workspaceBuilder: WorkspaceScanner.Builder? = nil
+  ) throws -> TrashTestHarness {
+    try TrashTestHarness(
+      root: root,
+      bookmarkDefaults: makeEphemeralDefaults(prefix: "PensieveWorkspaceTrashTests"),
+      confirmationResult: confirmationResult,
+      workspaceBuilder: workspaceBuilder
     )
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
   }
 }
 

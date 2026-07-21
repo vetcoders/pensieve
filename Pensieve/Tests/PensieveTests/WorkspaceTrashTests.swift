@@ -12,7 +12,7 @@ final class WorkspaceTrashTests: XCTestCase {
     let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
     try "# Nested unique-trash-token".write(to: fileURL, atomically: true, encoding: .utf8)
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -59,7 +59,7 @@ final class WorkspaceTrashTests: XCTestCase {
     let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
     try "# Failure preservation".write(to: fileURL, atomically: true, encoding: .utf8)
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -103,7 +103,7 @@ final class WorkspaceTrashTests: XCTestCase {
     let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
     try "# Cancel preservation".write(to: fileURL, atomically: true, encoding: .utf8)
-    let harness = try TrashTestHarness(root: fixture.root, confirmationResult: false)
+    let harness = try makeTrashHarness(root: fixture.root, confirmationResult: false)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -133,7 +133,7 @@ final class WorkspaceTrashTests: XCTestCase {
       .standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
     let blocker = BlockingWorkspaceBuilder()
-    let harness = try TrashTestHarness(root: fixture.root, workspaceBuilder: blocker.builder)
+    let harness = try makeTrashHarness(root: fixture.root, workspaceBuilder: blocker.builder)
     defer {
       blocker.releaseScan()
       harness.closeWorkspace()
@@ -200,7 +200,7 @@ final class WorkspaceTrashTests: XCTestCase {
 
   func testWorkspaceRootTrashIsRejectedBeforeConfirmationOrRecycle() async throws {
     let fixture = try TrashTestFixture.make()
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()
@@ -271,7 +271,7 @@ final class WorkspaceTrashTests: XCTestCase {
     if let unsupportedFileName {
       try Data("not indexed".utf8).write(to: folderURL.appendingPathComponent(unsupportedFileName))
     }
-    let harness = try TrashTestHarness(root: fixture.root)
+    let harness = try makeTrashHarness(root: fixture.root)
     defer {
       harness.closeWorkspace()
       fixture.cleanup()

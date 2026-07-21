@@ -527,11 +527,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     // workspace in a SINGLE open, exactly like a real app restart. (We deliberately do NOT call
     // `closeWorkspace` — it clears the bookmark store; a relaunch is a fresh process, not a folder
     // close. Fresh manager + fresh AppState already gives the empty in-memory tree / nil baseline.)
-    let suiteName = "PensieveMultiRootSkipTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
-    defaults.removePersistentDomain(forName: suiteName)
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveMultiRootSkipTests")
     let bookmarkStore = BookmarkStore(defaults: defaults)
 
     let rootPaths = [rootA, rootB].map { $0.standardizedFileURL.path }
@@ -696,11 +692,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let databaseURL = support.appendingPathComponent("index.db", isDirectory: false)
     let indexDatabase = IndexDatabase(databaseURL: databaseURL)
 
-    let suiteName = "PensieveMultiRootChangeTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
-    defaults.removePersistentDomain(forName: suiteName)
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveMultiRootChangeTests")
     let bookmarkStore = BookmarkStore(defaults: defaults)
 
     // Seed both roots, then open the 2-root workspace in ONE call via restore (see the sibling
@@ -781,12 +773,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveIndexV2StatsBookmarkTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveIndexV2StatsBookmarkTests"))
   }
 }
 

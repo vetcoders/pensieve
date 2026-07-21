@@ -193,10 +193,7 @@ final class IndexDatabaseV2WriterTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() -> BookmarkStore {
-    let suiteName = "PensieveIndexV2BookmarkTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveIndexV2BookmarkTests"))
   }
 
   private func readWorkspaces(at databaseURL: URL) throws -> [WorkspaceRow] {

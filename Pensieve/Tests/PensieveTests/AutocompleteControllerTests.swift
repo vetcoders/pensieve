@@ -801,9 +801,7 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 
   func testAIAutocompleteSettingDefaultsOffAndPersists() {
-    let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "AutocompleteControllerTests")
 
     let model = DocumentWindowModel(defaults: defaults)
     XCTAssertFalse(model.aiAutocompleteEnabled)
