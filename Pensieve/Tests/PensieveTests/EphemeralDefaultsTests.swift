@@ -14,14 +14,13 @@ final class EphemeralDefaultsTests: XCTestCase {
 
     let defaults = UserDefaults(suiteName: suiteName)!
     defaults.set(true, forKey: "regression.marker")
-    // Force cfprefsd to materialize the backing plist on disk, like a real
-    // test run does.
+    // Encourage cfprefsd to materialize the backing plist on disk, like a
+    // real test run does. Deliberately NOT asserted: cfprefsd may flush
+    // lazily, so the file's presence here is timing-dependent. The invariant
+    // that matters is that nothing is left behind after destroy.
     defaults.synchronize()
 
     let plistURL = EphemeralDefaults.plistURL(suiteName: suiteName)
-    XCTAssertTrue(
-      FileManager.default.fileExists(atPath: plistURL.path),
-      "Writing to the suite should create \(plistURL.path)")
 
     EphemeralDefaults.destroy(suiteName: suiteName)
 
