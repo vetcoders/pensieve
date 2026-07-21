@@ -33,7 +33,20 @@ enum EphemeralDefaults {
       // after we delete it.
       defaults.synchronize()
     }
-    try? FileManager.default.removeItem(at: plistURL(suiteName: suiteName))
+    let plistURL = plistURL(suiteName: suiteName)
+    try? FileManager.default.removeItem(at: plistURL)
+    // cfprefsd may still flush the (now empty) domain to disk AFTER the
+    // delete above — the same lazy write-back that caused the original leak.
+    // Give it a short settle window: re-delete if the file reappears, and
+    // stop as soon as it has stayed gone for one poll interval.
+    for _ in 0..<20 {
+      Thread.sleep(forTimeInterval: 0.1)
+      if FileManager.default.fileExists(atPath: plistURL.path) {
+        try? FileManager.default.removeItem(at: plistURL)
+      } else {
+        break
+      }
+    }
   }
 }
 

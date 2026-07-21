@@ -27,9 +27,7 @@ final class EphemeralDefaultsTests: XCTestCase {
     XCTAssertNil(
       UserDefaults(suiteName: suiteName)?.object(forKey: "regression.marker"),
       "destroy must empty the domain")
-    XCTAssertFalse(
-      FileManager.default.fileExists(atPath: plistURL.path),
-      "destroy must delete the backing plist, not just empty the domain")
+    assertPlistEventuallyGone(atPath: plistURL.path)
   }
 
   func testMakeEphemeralDefaultsCleansUpAfterTheTest() {
@@ -41,9 +39,7 @@ final class EphemeralDefaultsTests: XCTestCase {
         XCTFail("plistPath was never set")
         return
       }
-      XCTAssertFalse(
-        FileManager.default.fileExists(atPath: plistPath),
-        "teardown must leave no suite plist behind at \(plistPath)")
+      self.assertPlistEventuallyGone(atPath: plistPath)
     }
 
     let (defaults, suiteName) = makeEphemeralDefaultsSuite(
@@ -51,5 +47,22 @@ final class EphemeralDefaultsTests: XCTestCase {
     plistPath = EphemeralDefaults.plistURL(suiteName: suiteName).path
     defaults.set("value", forKey: "teardown.marker")
     defaults.synchronize()
+  }
+
+  /// Waits (up to `timeout`) for cfprefsd's lazy write-back to settle and the
+  /// suite plist to be gone. Re-deleting a reappearing file is `destroy`'s
+  /// job — the test only waits and reports.
+  private func assertPlistEventuallyGone(
+    atPath path: String, timeout: TimeInterval = 5,
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while Date() < deadline {
+      if !FileManager.default.fileExists(atPath: path) { return }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+    XCTFail(
+      "Suite plist still exists after \(timeout)s; cleanup must delete \(path)",
+      file: file, line: line)
   }
 }
