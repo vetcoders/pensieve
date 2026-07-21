@@ -324,9 +324,7 @@ final class PreviewThemeTests: XCTestCase {
   // MARK: - ThemeManager persists the skin
 
   func testThemeManagerPersistsSkinSelection() {
-    let suiteName = "pensieve.preview.skin.tests"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.tests")
 
     let manager = ThemeManager(defaults: defaults)
     XCTAssertEqual(manager.skin, .default)
@@ -334,8 +332,6 @@ final class PreviewThemeTests: XCTestCase {
 
     let reloaded = ThemeManager(defaults: defaults)
     XCTAssertEqual(reloaded.skin, .paper)
-
-    defaults.removePersistentDomain(forName: suiteName)
   }
 }
 

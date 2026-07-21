@@ -17,15 +17,17 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
   private var folder: URL!
 
   override func setUp() async throws {
-    suiteName = "BookmarkStoreSecurityScopeTests-\(UUID().uuidString)"
-    defaults = UserDefaults(suiteName: suiteName)!
+    // Suite cleanup (domain + backing plist) is registered as a teardown
+    // block by the helper.
+    let suite = makeEphemeralDefaultsSuite(prefix: "BookmarkStoreSecurityScopeTests")
+    suiteName = suite.suiteName
+    defaults = suite.defaults
     folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(suiteName, isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   }
 
   override func tearDown() async throws {
-    defaults.removePersistentDomain(forName: suiteName)
     try? FileManager.default.removeItem(at: folder)
   }
 

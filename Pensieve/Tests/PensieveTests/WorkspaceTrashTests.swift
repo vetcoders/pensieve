@@ -183,12 +183,7 @@ final class WorkspaceTrashTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveWorkspaceTrashTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveWorkspaceTrashTests"))
   }
 
   private static func makeWindow() -> NSWindow {

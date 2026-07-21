@@ -361,11 +361,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testPreviewAutoReloadDefaultsOffButPreservesStoredPreference() {
-    let suiteName = "PensievePreviewDefaultsTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensievePreviewDefaultsTests")
 
     XCTAssertFalse(AppState(defaults: defaults).previewAutoReload)
     XCTAssertTrue(AppState(defaults: defaults).tableTidyOnPaste)
@@ -408,11 +404,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testSidebarSortOrderPersistsToDefaults() {
-    let suiteName = "PensieveSidebarSortTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveSidebarSortTests")
 
     let appState = AppState(defaults: defaults)
     appState.sidebarSortOrder = .nameDescending
@@ -1017,11 +1009,7 @@ final class PensieveSmokeTests: XCTestCase {
   func testRestoreLastFolderInBackgroundPublishesShellBeforeScanAndEventuallyIndexesSearch()
     async throws
   {
-    let suiteName = "PensieveAsyncRestoreTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveAsyncRestoreTests")
 
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveAsyncRestoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -2711,11 +2699,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testLaunchFileIntentLoadsBeforeRestoredWorkspaceCanScan() async throws {
-    let suiteName = "PensieveLaunchIntentTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveLaunchIntentTests")
 
     let restoredFolder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRestoredWorkspace-\(UUID().uuidString)", isDirectory: true)
@@ -2816,11 +2800,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testBareLaunchSettlesAndShowsLauncherWhenSavedWorkspaceIsGone() async throws {
-    let suiteName = "PensieveBareLaunchTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveBareLaunchTests")
 
     let removedFolder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRemovedWorkspace-\(UUID().uuidString)", isDirectory: true)
@@ -5266,11 +5246,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testBookmarkRestoreClearsDeletedFolder() throws {
-    let suiteName = "PensieveBookmarkTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveBookmarkTests")
 
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveBookmarkTests-\(UUID().uuidString)", isDirectory: true)
@@ -5300,10 +5276,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   private func temporaryBookmarkStore() -> BookmarkStore {
-    let suiteName = "PensieveBookmarkStoreTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveBookmarkStoreTests"))
   }
 
   private func temporaryApplicationSupportDirectory() -> URL {

@@ -7,10 +7,7 @@ final class ScrollSyncTests: XCTestCase {
 
   @MainActor
   func testScrollSyncDefaultsOffAndPersists() throws {
-    let suiteName = "Pensieve.ScrollSyncTests.\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    defaults.removePersistentDomain(forName: suiteName)
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "Pensieve.ScrollSyncTests")
 
     let freshModel = DocumentWindowModel(defaults: defaults)
     XCTAssertFalse(freshModel.scrollSyncEnabled)
