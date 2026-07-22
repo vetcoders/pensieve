@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - File watching rebuilt on FSEvents with canonical paths — deep filesystem changes (nested folders, renames) now reach the workspace tree.
 - Move-to-Trash is immediate and nonblocking: workspace state mutates only after the recycle succeeds, and a failed or cancelled trash preserves tree, selection, session, windows, and search index exactly.
 - Opening external files standardizes the URL once on the fast path; selected files open in the current window as native tabs.
-- Editor toolbelt uses native control families and a native themes menu, and no longer floods undo checkpoints with feedback storms.
+- Editor toolbelt uses native control families and a native themes menu.
 - Release DMG offers a drag-install layout with an `/Applications` shortcut; release artifacts embed the optimized (release-profile) FFI runtime; the macOS deployment target contract is aligned and SwiftUI deployment warnings are gone.
 - Landing page copy rewritten as plain product truth with a real app screenshot.
 
@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace and DOCX persistence hardened; AI sessions persist only opaque state; model discovery reuses the saved API key; provider endpoints are normalized to the Responses/Messages doctrine.
 - Test suites no longer strand `UserDefaults` suite plists in `~/Library/Preferences` — every suite goes through an ephemeral-defaults helper that removes the domain, its backing plist, and cfprefsd's lazy write-back.
 - Reviewed ATS policy keeps user-selected endpoints on Apple's system trust store without inline scanner suppressions.
+- Main-thread livelock on toolbar history state: `ToolbarResponderHistoryState` subscribed to `.NSUndoManagerCheckpoint`, and reading `canUndo`/`canRedo` in the refresh handler itself posts a checkpoint notification — a self-feeding refresh cascade at run-loop speed (observed at 147% CPU and multi-GB memory growth, no crash report). The checkpoint subscription is removed (real transitions arrive via `DidUndoChange`/`DidRedoChange` and text/window notifications), availability writes are equality-guarded, and a regression test forbids re-subscribing the checkpoint.
+
+### Known Issues
+
+- Ending up with an empty workspace can shut the app down without a way back in — no window is left and the launcher does not reopen, so the app has to be relaunched by hand and may not come up. Confirmed 2026-07-22; this is a regression of the 2026-06-28 fix `dfeda7b` (“reopen launcher when the last document closes”). Fix is planned as a separate cut.
 
 ## [0.4.1] - 2026-07-16
 
