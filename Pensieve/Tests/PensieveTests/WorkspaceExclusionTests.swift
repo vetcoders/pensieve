@@ -171,7 +171,12 @@ final class WorkspaceExclusionTests: XCTestCase {
     let documentB = try XCTUnwrap(
       appState.documents.first { $0.url.standardizedFileURL == noteB.standardizedFileURL }
     )
-    DocumentStore(indexDatabase: harness.indexDatabase).load(ref: documentA, into: appState)
+    DocumentStore(
+      indexDatabase: harness.indexDatabase,
+      recoveryStore: RecoveryStore(
+        directoryURL: sandbox.support.appendingPathComponent("Recovery", isDirectory: true)
+      )
+    ).load(ref: documentA, into: appState)
     appState.activeDocumentText = "unsaved root A buffer"
     appState.activeDocumentDirty = true
 
