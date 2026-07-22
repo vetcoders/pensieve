@@ -180,6 +180,15 @@ final class DocumentWindowRegistry: ObservableObject {
     closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
   }
 
+  /// Process-wide close handling for reusable SwiftUI/AppKit scene windows.
+  /// Unlike `handleDocumentWindowClosed`, this must not tombstone the window,
+  /// but it still owns the close-vs-quit contract: closing the final scene with
+  /// Command-W leaves a launcher behind.
+  func handleApplicationWindowClosed(_ window: NSWindow) {
+    reconcileClosedWindow(window)
+    reopenLauncherIfAppWouldBeWindowless()
+  }
+
   /// Cleanup WITHOUT tombstoning: forget the window's documents and drop its
   /// bookkeeping maps. Safe for ANY closing window (the process-wide willClose
   /// observer routes here), so it never poisons a reusable window instance via a
@@ -206,16 +215,24 @@ final class DocumentWindowRegistry: ObservableObject {
     guard !isTerminating, makeDocumentWindow != nil else { return }
     scheduleDeferredMainWork { [weak self] in
       guard let self, !self.isTerminating else { return }
-      self.purgeClosedLauncherWindows()
-      guard !self.hasContentWindow else { return }
-      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
-      guard !hasLauncher else { return }
-      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
-        $0.window?.contentView != nil
-      }
-      guard !hasLiveDocumentWindow else { return }
+      guard !self.applicationHasLiveWindow() else { return }
       self.openLauncherWindow()
     }
+  }
+
+  /// Whether the app still has a window that can carry real product UI.
+  /// AppKit/SwiftUI can retain invisible placeholder scenes in `NSApp.windows`;
+  /// those phantoms must not block cold-start recovery or count as survivors
+  /// when redundant launchers are reaped.
+  func applicationHasLiveWindow() -> Bool {
+    purgeClosedLauncherWindows()
+    if launcherWindows.values.contains(where: { $0.window != nil })
+      || contentWindows.values.contains(where: { $0.window != nil })
+      || windowsByDocumentID.values.contains(where: { $0.window != nil })
+    {
+      return true
+    }
+    return applicationWindows().contains(where: isLiveApplicationWindow)
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
@@ -470,7 +487,9 @@ final class DocumentWindowRegistry: ObservableObject {
     // from the kill list entirely; they survive on their own merit.
     var toClose = reapable.filter(isReapSafe)
     let toCloseIDs = Set(toClose.map(ObjectIdentifier.init))
-    let aSurvivorRemains = allWindows.contains { !toCloseIDs.contains(ObjectIdentifier($0)) }
+    let aSurvivorRemains = allWindows.contains {
+      !toCloseIDs.contains(ObjectIdentifier($0)) && isLiveApplicationWindow($0)
+    }
     if !aSurvivorRemains, !toClose.isEmpty {
       toClose.removeLast()
     }
@@ -497,6 +516,16 @@ final class DocumentWindowRegistry: ObservableObject {
     guard isTrackedLauncher || isUntrackedLauncher else { return false }
     return contentWindows[windowID]?.window == nil
       && !windowsByDocumentID.values.contains { $0.window === window }
+  }
+
+  private func isLiveApplicationWindow(_ window: NSWindow) -> Bool {
+    let windowID = ObjectIdentifier(window)
+    return window.isVisible
+      || launcherWindows[windowID]?.window === window
+      || contentWindows[windowID]?.window === window
+      || windowsByDocumentID.values.contains { $0.window === window }
+      || window.representedURL != nil
+      || (!window.title.isEmpty && window.title != "Pensieve" && window.title != "<untitled>")
   }
 
   private func registerLauncher(_ window: NSWindow) {
@@ -560,7 +589,7 @@ final class DocumentWindowRegistry: ObservableObject {
     applicationWindows().contains { window in
       guard window !== launcherWindow else { return false }
       guard launcherWindows[ObjectIdentifier(window)]?.window == nil else { return false }
-      return window.representedURL != nil || window.title != "Pensieve"
+      return isLiveApplicationWindow(window)
     }
   }
 

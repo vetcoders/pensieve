@@ -111,18 +111,18 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
     // tabs are not), so they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
-    // row. handleDocumentWindowClosed is idempotent and a safe no-op for windows
-    // it never tracked, so routing every close through it keeps the list honest.
+    // row. The process-wide close handler is idempotent and safe for windows it
+    // never tracked, so routing every close through it keeps the list honest.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
       guard let window = note.object as? NSWindow else { return }
       MainActor.assumeIsolated {
-        // Reconcile-only (no tombstone): this fires for EVERY window, including
-        // reusable SwiftUI scenes; tombstoning them would permanently reject a
-        // later re-attach of the same instance. DocumentWindow.onClose still
-        // tombstones its own (never-reused) windows via handleDocumentWindowClosed.
-        DocumentWindowRegistry.shared.reconcileClosedWindow(window)
+        // Reconcile without tombstoning, then preserve the last-window launcher
+        // contract. This fires for EVERY window, including reusable SwiftUI
+        // scenes; tombstoning them would permanently reject a later re-attach.
+        // DocumentWindow.onClose still tombstones its own factory windows.
+        DocumentWindowRegistry.shared.handleApplicationWindowClosed(window)
       }
     }
     traceObservers.append(openTabReconciler)
@@ -137,12 +137,14 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       NSApp.activate(ignoringOtherApps: true)
     }
 
-    // Give SwiftUI one scheduler turn to install its window factory, then create a launcher only
-    // when state restoration produced no window. A fixed 150 ms sleep made every unlucky launch
-    // visibly wait even though no work was pending.
+    // Give SwiftUI one scheduler turn to install its window factory, then create
+    // a launcher only when restoration produced no LIVE window. `NSApp.windows`
+    // alone is insufficient because SwiftUI can retain invisible placeholder
+    // scenes. A fixed 150 ms sleep made every unlucky launch visibly wait even
+    // though no work was pending.
     Task { @MainActor in
       await Task.yield()
-      if NSApp.windows.isEmpty {
+      if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
         if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
           DocumentWindowRegistry.shared.openLauncherWindow()
         } else {

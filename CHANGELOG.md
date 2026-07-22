@@ -44,10 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suites no longer strand `UserDefaults` suite plists in `~/Library/Preferences` — every suite goes through an ephemeral-defaults helper that removes the domain, its backing plist, and cfprefsd's lazy write-back.
 - Reviewed ATS policy keeps user-selected endpoints on Apple's system trust store without inline scanner suppressions.
 - Main-thread livelock on toolbar history state: `ToolbarResponderHistoryState` subscribed to `.NSUndoManagerCheckpoint`, and reading `canUndo`/`canRedo` in the refresh handler itself posts a checkpoint notification — a self-feeding refresh cascade at run-loop speed (observed at 147% CPU and multi-GB memory growth, no crash report). The checkpoint subscription is removed (real transitions arrive via `DidUndoChange`/`DidRedoChange` and text/window notifications), availability writes are equality-guarded, and a regression test forbids re-subscribing the checkpoint.
-
-### Known Issues
-
-- Ending up with an empty workspace can shut the app down without a way back in — no window is left and the launcher does not reopen, so the app has to be relaunched by hand and may not come up. Confirmed 2026-07-22; this is a regression of the 2026-06-28 fix `dfeda7b` (“reopen launcher when the last document closes”). Fix is planned as a separate cut.
+- Closing the final document or empty workspace window with ⌘W now leaves exactly one live launcher; invisible SwiftUI placeholder scenes no longer suppress cold-start recovery or let launcher reaping leave the app windowless. ⌘Q still terminates without resurrecting a window.
 
 ## [0.4.1] - 2026-07-16
 

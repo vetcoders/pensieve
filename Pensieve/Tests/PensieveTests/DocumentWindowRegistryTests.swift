@@ -211,6 +211,92 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testGlobalWillCloseReopensLauncherAndReapIgnoresPhantomScene() throws {
+    let docID = URL(fileURLWithPath: "/tmp/pensieve-scene-close.md").standardizedFileURL
+    let docWindow = Self.makeWindow()
+    let phantomScene = Self.makeWindow(title: "<untitled>")
+    let launcherWindow = Self.makeWindow()
+    defer {
+      docWindow.close()
+      phantomScene.close()
+      launcherWindow.close()
+    }
+
+    var factoryRefs: [DocumentRef?] = []
+    var deferredWork: [() -> Void] = []
+    var sweepWork: [() -> Void] = []
+    var closedIDs: [ObjectIdentifier] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { sweepWork.append($0) },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [phantomScene, launcherWindow] },
+      closeWindow: { closedIDs.append(ObjectIdentifier($0)) },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return ref == nil ? launcherWindow : docWindow
+      }
+    )
+
+    registry.open(DocumentRef(id: docID))
+    registry.handleApplicationWindowClosed(docWindow)
+
+    while !deferredWork.isEmpty {
+      deferredWork.removeFirst()()
+    }
+    while !sweepWork.isEmpty {
+      sweepWork.removeFirst()()
+    }
+    while !deferredWork.isEmpty {
+      deferredWork.removeFirst()()
+    }
+
+    XCTAssertEqual(
+      factoryRefs.filter { $0 == nil }.count,
+      1,
+      "closing the final reusable scene via Command-W must create exactly one launcher")
+    XCTAssertTrue(
+      registry.applicationHasLiveWindow(),
+      "the replacement launcher must remain the app's live window")
+    XCTAssertFalse(
+      closedIDs.contains(ObjectIdentifier(launcherWindow)),
+      "an invisible phantom scene must not let the reap sweep delete the only launcher")
+  }
+
+  @MainActor
+  func testColdStartPhantomSceneDoesNotCountAsLiveWindow() throws {
+    let phantomScene = Self.makeWindow(title: "<untitled>")
+    let launcherWindow = Self.makeWindow()
+    defer {
+      phantomScene.close()
+      launcherWindow.close()
+    }
+
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [phantomScene, launcherWindow] },
+      makeDocumentWindow: { _ in launcherWindow }
+    )
+
+    XCTAssertFalse(
+      registry.applicationHasLiveWindow(),
+      "an invisible untracked SwiftUI placeholder must not suppress the cold-start launcher")
+
+    registry.openLauncherWindow()
+
+    XCTAssertTrue(
+      registry.applicationHasLiveWindow(),
+      "a tracked launcher remains live even before AppKit makes it visible")
+  }
+
+  @MainActor
   func testClosingOneOfSeveralDocumentWindowsDoesNotReopenALauncher() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-keep-alpha.md").standardizedFileURL
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-keep-beta.md").standardizedFileURL
@@ -271,7 +357,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
     registry.open(DocumentRef(id: docID))
     registry.beginTermination()
-    registry.handleDocumentWindowClosed(docWindow)
+    registry.handleApplicationWindowClosed(docWindow)
     for work in deferredWork { work() }
 
     XCTAssertFalse(
@@ -306,7 +392,10 @@ final class DocumentWindowRegistryTests: XCTestCase {
       closedIDs.isEmpty,
       "reaping the only window would leave the app windowless — it must be kept")
 
-    // A non-reapable window survives → reap the redundant launcher beside it.
+    // A tracked content window survives → reap the redundant launcher beside it.
+    registry.attach(
+      survivor,
+      documentID: URL(fileURLWithPath: "/tmp/pensieve-reap-survivor.md"))
     registry.reapLaunchersKeepingLastWindow([launcherB], among: [launcherB, survivor])
     XCTAssertEqual(
       closedIDs, [ObjectIdentifier(launcherB)],
@@ -314,7 +403,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
-  private static func makeWindow() -> NSWindow {
+  private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
@@ -322,6 +411,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       defer: false)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
+    window.title = title
     return window
   }
 }
