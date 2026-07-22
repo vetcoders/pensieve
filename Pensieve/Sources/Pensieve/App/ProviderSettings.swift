@@ -108,12 +108,17 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
     return apiKey
   }
 
+  // The item lives in the file-based login keychain on purpose. Attaching a
+  // SecAccessControl (e.g. .biometryCurrentSet) routes the item to the
+  // data-protection keychain, which on macOS requires keychain entitlements
+  // backed by a provisioning profile — the Developer ID release signature
+  // carries none, so every store failed with errSecMissingEntitlement
+  // (-34018) and cloud autocomplete could never save its key. Silent access
+  // to the login-keychain item is still bound to this app's code signature.
   func storeAPIKey(_ apiKey: String) throws {
     let data = Data(apiKey.utf8)
-    let accessControl = try makeAccessControl()
     let attributes: [String: Any] = [
-      kSecValueData as String: data,
-      kSecAttrAccessControl as String: accessControl,
+      kSecValueData as String: data
     ]
     let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
     if updateStatus == errSecSuccess { return }
@@ -126,7 +131,6 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
       kSecAttrService as String: service,
       kSecAttrAccount as String: account,
       kSecValueData as String: data,
-      kSecAttrAccessControl as String: accessControl,
     ]
     let addStatus = SecItemAdd(item as CFDictionary, nil)
     guard addStatus == errSecSuccess else { throw ProviderSettingsError.keychain(addStatus) }
@@ -145,20 +149,6 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
       kSecAttrService as String: service,
       kSecAttrAccount as String: account,
     ]
-  }
-
-  private func makeAccessControl() throws -> SecAccessControl {
-    var error: Unmanaged<CFError>?
-    guard
-      let accessControl = SecAccessControlCreateWithFlags(
-        nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        .biometryCurrentSet,
-        &error)
-    else {
-      throw ProviderSettingsError.keychain(errSecParam)
-    }
-    return accessControl
   }
 
 }

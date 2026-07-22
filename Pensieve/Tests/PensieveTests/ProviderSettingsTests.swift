@@ -205,6 +205,25 @@ final class ProviderSettingsTests: XCTestCase {
       "a saved key must never be paired automatically with an inherited provider")
   }
 
+  // Guards the release keychain contract: the item MUST stay in the
+  // file-based login keychain. A SecAccessControl (biometry) variant routes
+  // it to the data-protection keychain, which Developer ID builds without a
+  // provisioning profile cannot touch — SecItemAdd then fails with
+  // errSecMissingEntitlement (-34018) and the API key can never be saved.
+  func testKeychainStoreRoundTripsWithoutEntitlements() throws {
+    let store = KeychainProviderAPIKeyStore(
+      service: "io.vetcoders.pensieve.tests.completion-provider-\(UUID().uuidString)")
+    addTeardownBlock { try? store.deleteAPIKey() }
+
+    XCTAssertNil(try store.loadAPIKey())
+    try store.storeAPIKey("sk-add-path")
+    XCTAssertEqual(try store.loadAPIKey(), "sk-add-path")
+    try store.storeAPIKey("sk-update-path")
+    XCTAssertEqual(try store.loadAPIKey(), "sk-update-path")
+    try store.deleteAPIKey()
+    XCTAssertNil(try store.loadAPIKey())
+  }
+
   func testWhitespaceEndpointOrModelNeverTouchesEnvironment() {
     let defaults = makeDefaults()
     let environment = InMemoryProviderEnvironment()
