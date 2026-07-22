@@ -65,6 +65,8 @@ struct EditorToolbelt: ToolbarContent {
   let onDispatchToAgent: () -> Void
   let isDispatchDisabled: Bool
   let dispatchHelp: String
+  @State private var customRewriteInstruction = ""
+  @State private var isCustomRewritePromptPresented = false
 
   static let shareIdentifier = "pensieve.toolbar.share"
   static let dispatchIdentifier = "pensieve.toolbar.dispatchToAgent"
@@ -590,12 +592,37 @@ struct EditorToolbelt: ToolbarContent {
           appState.pendingAIRewriteCommand = AIRewriteCommand(action: .request(intent))
         }
       }
+      Divider()
+      Button("Napisz, co zrobić z tym tekstem…") {
+        isCustomRewritePromptPresented = true
+      }
     } label: {
       Label("Rewrite with AI", systemImage: "wand.and.stars")
     }
     .help("Rewrite the selection or current paragraph with AI")
     .disabled(!hasEditableBuffer || appState.mode == .preview)
     .accessibilityIdentifier(Self.rewriteIdentifier)
+    .alert(
+      "Napisz, co zrobić z tym tekstem",
+      isPresented: $isCustomRewritePromptPresented
+    ) {
+      TextField("Instrukcja", text: $customRewriteInstruction)
+      Button("Anuluj", role: .cancel) {
+        customRewriteInstruction = ""
+      }
+      Button("Przepisz") {
+        let instruction = customRewriteInstruction.trimmingCharacters(
+          in: .whitespacesAndNewlines)
+        guard !instruction.isEmpty else { return }
+        appState.pendingAIRewriteCommand = AIRewriteCommand(
+          action: .request(.custom(instruction)))
+        customRewriteInstruction = ""
+      }
+      .disabled(
+        customRewriteInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    } message: {
+      Text("Opisz jednorazową zmianę dla zaznaczenia lub bieżącego akapitu.")
+    }
   }
 }
 
