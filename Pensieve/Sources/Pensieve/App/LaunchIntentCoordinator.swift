@@ -14,7 +14,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   private var startupDecisionHandler: StartupDecisionHandler?
   private var hasExplicitURLIntent = false
 
-  init(settleDelayNanoseconds: UInt64 = 150_000_000) {
+  init(settleDelayNanoseconds: UInt64 = 0) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
   }
 
@@ -74,18 +74,19 @@ final class LaunchIntentCoordinator: ObservableObject {
     let supportedFileURLs = urls.filter(isSupportedLaunchFile)
     let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }
 
-    if controller.requestOpenDocumentWindow != nil, let firstURL = supportedFileURLs.first {
-      controller.openFileInCurrentWindow(url: firstURL)
-      for url in supportedFileURLs.dropFirst() {
-        controller.openFile(url: url)
-      }
-    } else {
-      for url in supportedFileURLs {
-        controller.openFile(url: url)
-      }
+    // `openFile` picks the destination per window state: an empty window is
+    // reused in place (cold start), a window already showing a document routes
+    // to the registry so the file lands as a native tab — the system "Prefer
+    // tabs when opening documents" contract. Special-casing the first URL into
+    // `openFileInCurrentWindow` replaced the document the user was reading
+    // whenever a Finder/Dock open arrived at a running app.
+    for url in supportedFileURLs {
+      controller.openFile(url: url)
     }
 
-    if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first {
+    if controller.requestOpenDocumentWindow == nil, let firstURL = supportedFileURLs.first,
+      WorkspaceScanner.isMarkdownFile(firstURL)
+    {
       controller.selectDocument(id: firstURL.standardizedFileURL)
     }
 
@@ -95,7 +96,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 
   private func isSupportedLaunchFile(_ url: URL) -> Bool {
-    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
+    ["md", "markdown", "txt", "docx", "pdf"].contains(url.pathExtension.lowercased())
   }
 }
 
@@ -110,18 +111,18 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
     // tabs are not), so they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
-    // row. handleDocumentWindowClosed is idempotent and a safe no-op for windows
-    // it never tracked, so routing every close through it keeps the list honest.
+    // row. The process-wide close handler is idempotent and safe for windows it
+    // never tracked, so routing every close through it keeps the list honest.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
       guard let window = note.object as? NSWindow else { return }
       MainActor.assumeIsolated {
-        // Reconcile-only (no tombstone): this fires for EVERY window, including
-        // reusable SwiftUI scenes; tombstoning them would permanently reject a
-        // later re-attach of the same instance. DocumentWindow.onClose still
-        // tombstones its own (never-reused) windows via handleDocumentWindowClosed.
-        DocumentWindowRegistry.shared.reconcileClosedWindow(window)
+        // Reconcile without tombstoning, then preserve the last-window launcher
+        // contract. This fires for EVERY window, including reusable SwiftUI
+        // scenes; tombstoning them would permanently reject a later re-attach.
+        // DocumentWindow.onClose still tombstones its own factory windows.
+        DocumentWindowRegistry.shared.handleApplicationWindowClosed(window)
       }
     }
     traceObservers.append(openTabReconciler)
@@ -136,10 +137,14 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       NSApp.activate(ignoringOtherApps: true)
     }
 
-    // Force application to show its main window if none was restored
+    // Give SwiftUI one scheduler turn to install its window factory, then create
+    // a launcher only when restoration produced no LIVE window. `NSApp.windows`
+    // alone is insufficient because SwiftUI can retain invisible placeholder
+    // scenes. A fixed 150 ms sleep made every unlucky launch visibly wait even
+    // though no work was pending.
     Task { @MainActor in
-      try? await Task.sleep(nanoseconds: 150_000_000)
-      if NSApp.windows.isEmpty {
+      await Task.yield()
+      if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
         if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
           DocumentWindowRegistry.shared.openLauncherWindow()
         } else {

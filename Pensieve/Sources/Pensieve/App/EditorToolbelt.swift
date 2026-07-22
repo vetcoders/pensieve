@@ -1,22 +1,18 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// Window toolbar contents for the main editor scene.
 ///
 /// Titlebar contract: keep SwiftUI's native sidebar toggle first, leave
-/// `.navigation` empty so the document title leads, then TITLE →
-/// SHARE/DISPATCH → EDIT → MODES/THEMES. Declaration order is the ONLY
-/// layout truth: every group uses the default placement, so the system
-/// renders them left-to-right exactly as declared. `.principal` (a centre
-/// anchor) and per-group `.automatic` heuristics are deliberately absent —
-/// mixing them let the system reorder islands per window width (cut 7-14
-/// regression on the operator's window). Island separation comes from native
-/// `ToolbarSpacer`s when compiling against the macOS 26 SwiftUI SDK; a
-/// flexible spacer pushes the trailing cluster to the window edge.
-/// Everything else (transcription tafla, scroll sync, auto reload) lives in a
-/// single overflow menu. Raw format buttons stay inline whenever the buffer is
-/// editable, matching the floating selection bar and the Format app menu without
-/// adding formatter logic.
+/// `.navigation` empty so the document title leads, then document/dispatch →
+/// history → editing → view → preview runtime → assistants. Declaration order
+/// is the only ordering authority. Each semantic family is a labeled native
+/// toolbar group with a system `ControlGroup`; macOS owns width compression and
+/// overflow. There is no app-authored ellipsis taxonomy and no spacer pretending
+/// to prove visual separation. Raw format buttons stay inline whenever the
+/// buffer is editable, matching the floating selection bar and the Format app
+/// menu without adding formatter logic.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -36,13 +32,22 @@ struct EditorToolbelt: ToolbarContent {
   static let modePickerIdentifier = "pensieve.toolbar.modePicker"
   static let appearanceIdentifier = "pensieve.toolbar.appearance"
   static let reloadIdentifier = "pensieve.toolbar.reload"
-  static let overflowIdentifier = "pensieve.toolbar.overflow"
+  static let autoReloadIdentifier = "pensieve.toolbar.autoReload"
+  static let scrollSyncIdentifier = "pensieve.toolbar.scrollSync"
+  static let dictationIdentifier = "pensieve.toolbar.dictationToggle"
+  static let autocompleteIdentifier = "pensieve.toolbar.autocompleteToggle"
+  static let rewriteIdentifier = "pensieve.toolbar.aiRewrite"
+  static let undoIdentifier = "pensieve.toolbar.undo"
+  static let redoIdentifier = "pensieve.toolbar.redo"
   static let richMarkdownToggleIdentifier = "pensieve.toolbar.richMarkdownToggle"
 
-  enum ToolbarIslandIdentifier: String, Equatable {
-    case shareDispatch
-    case edit
-    case trailing
+  enum ToolbarFamilyIdentifier: String, Equatable {
+    case documentDispatch
+    case history
+    case editing
+    case view
+    case previewRuntime
+    case assistants
   }
 
   /// The edit menu and editor-facing controls light up for ANY editable buffer —
@@ -60,45 +65,61 @@ struct EditorToolbelt: ToolbarContent {
 
   var body: some ToolbarContent {
     ToolbarItemGroup {
-      shareButton
-      dispatchButton
+      ControlGroup {
+        shareButton
+        dispatchButton
+      }
+    } label: {
+      Label("Document and Dispatch", systemImage: "doc")
     }
 
     if showsEditToolbelt {
-      #if compiler(>=6.3)
-        if #available(macOS 26.0, *) {
-          ToolbarSpacer(.fixed)
-        }
-      #endif
+      ToolbarItemGroup {
+        ToolbarHistoryControls()
+      } label: {
+        Label("History", systemImage: "arrow.uturn.backward")
+      }
 
       ToolbarItemGroup {
-        richMarkdownToggle
-        formatButtons
+        ControlGroup {
+          richMarkdownToggle
+          formatButtons
+        }
+      } label: {
+        Label("Editing", systemImage: "textformat")
       }
     }
 
-    #if compiler(>=6.3)
-      if #available(macOS 26.0, *) {
-        ToolbarSpacer(.flexible)
+    ToolbarItemGroup {
+      ControlGroup {
+        modePicker
+
+        if Self.showsAppearanceControls(for: appState.mode) {
+          AppearanceToolbarMenu(themeManager: themeManager)
+        }
       }
-    #endif
+    } label: {
+      Label("View", systemImage: "rectangle.split.2x1")
+    }
 
     ToolbarItemGroup {
-      modePicker
-
-      if Self.showsAppearanceControls(for: appState.mode) {
-        AppearanceToolbarButton(themeManager: themeManager)
+      ControlGroup {
+        reloadButton
+        autoReloadToggle
+        scrollSyncToggle
       }
+    } label: {
+      Label("Preview Runtime", systemImage: "arrow.clockwise")
+    }
 
-      Button(action: { appState.requestPreviewRefresh() }) {
-        Image(systemName: "arrow.clockwise")
+    ToolbarItemGroup {
+      ControlGroup {
+        dictationToggle
+        autocompleteToggle
+        rewriteMenu
       }
-      .help("Reload Preview")
-      .disabled(!hasEditableBuffer)
-      .accessibilityLabel("Reload Preview")
-      .accessibilityIdentifier(Self.reloadIdentifier)
-
-      overflowMenu
+    } label: {
+      Label("Assistants", systemImage: "sparkles")
     }
   }
 
@@ -124,6 +145,8 @@ struct EditorToolbelt: ToolbarContent {
     ]
 
     if showsEditToolbelt(for: mode, hasEditableBuffer: hasEditableBuffer) {
+      identifiers.append(undoIdentifier)
+      identifiers.append(redoIdentifier)
       identifiers.append(richMarkdownToggleIdentifier)
       identifiers.append(contentsOf: MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier))
     }
@@ -135,29 +158,34 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     identifiers.append(reloadIdentifier)
-    identifiers.append(overflowIdentifier)
+    identifiers.append(autoReloadIdentifier)
+    identifiers.append(scrollSyncIdentifier)
+    identifiers.append(dictationIdentifier)
+    identifiers.append(autocompleteIdentifier)
+    identifiers.append(rewriteIdentifier)
     return identifiers
   }
 
-  static func visibleToolbarIslandOrder(
+  static func visibleToolbarFamilyOrder(
     for mode: EditorMode,
     hasEditableBuffer: Bool
-  ) -> [ToolbarIslandIdentifier] {
-    var islands: [ToolbarIslandIdentifier] = [.shareDispatch]
+  ) -> [ToolbarFamilyIdentifier] {
+    var families: [ToolbarFamilyIdentifier] = [.documentDispatch]
 
     if showsEditToolbelt(for: mode, hasEditableBuffer: hasEditableBuffer) {
-      islands.append(.edit)
+      families.append(.history)
+      families.append(.editing)
     }
 
-    islands.append(.trailing)
-    return islands
+    families.append(contentsOf: [.view, .previewRuntime, .assistants])
+    return families
   }
 
   // MARK: - Subgroups
 
   private var shareButton: some View {
     Button(action: { DocumentSharing.share(session: appState.documentSession) }) {
-      Image(systemName: "square.and.arrow.up")
+      Label("Share", systemImage: "square.and.arrow.up")
     }
     .help("Share")
     .disabled(!hasEditableBuffer)
@@ -205,7 +233,7 @@ struct EditorToolbelt: ToolbarContent {
       Button {
         controller.applyMarkdownFormat(format)
       } label: {
-        Image(systemName: format.systemImageName)
+        Label(format.label, systemImage: format.systemImageName)
       }
       .help(format.label)
       .accessibilityLabel(format.label)
@@ -222,7 +250,7 @@ struct EditorToolbelt: ToolbarContent {
         set: { _ in controller.toggleRichMarkdown() }
       )
     ) {
-      Image(systemName: "textformat.alt")
+      Label("Rich Markdown", systemImage: "textformat.alt")
     }
     .help("Rich Markdown (⌘/)")
     .accessibilityLabel("Rich Markdown")
@@ -230,83 +258,198 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityIdentifier(Self.richMarkdownToggleIdentifier)
   }
 
-  /// Single overflow for the non-daily controls the trailing side used to
-  /// carry raw: transcription tafla, scroll sync, auto reload. They are
-  /// set-and-forget toggles, so one `ellipsis.circle` menu holds them all;
-  /// share/appearance/reload/dispatch stay visible as the daily drivers.
-  private var overflowMenu: some View {
+  private var reloadButton: some View {
+    Button(action: { appState.requestPreviewRefresh() }) {
+      Label("Reload Preview", systemImage: "arrow.clockwise")
+    }
+    .help("Reload Preview")
+    .disabled(!hasEditableBuffer)
+    .accessibilityIdentifier(Self.reloadIdentifier)
+  }
+
+  private var autoReloadToggle: some View {
+    Toggle(
+      isOn: Binding(
+        get: { appState.previewAutoReload },
+        set: { appState.previewAutoReload = $0 }
+      )
+    ) {
+      Label("Auto Reload Preview", systemImage: "arrow.triangle.2.circlepath")
+    }
+    .help("Automatically reload the preview after edits")
+    .accessibilityIdentifier(Self.autoReloadIdentifier)
+  }
+
+  private var scrollSyncToggle: some View {
+    Toggle(
+      isOn: Binding(
+        get: { appState.scrollSyncEnabled },
+        set: { appState.scrollSyncEnabled = $0 }
+      )
+    ) {
+      Label("Scroll Sync", systemImage: "arrow.up.and.down")
+    }
+    .help("Keep editor and preview positions synchronized")
+    .disabled(!hasEditableBuffer)
+    .accessibilityIdentifier(Self.scrollSyncIdentifier)
+  }
+
+  private var dictationToggle: some View {
+    Toggle(
+      isOn: Binding(
+        get: { controller.isTranscriptionTaflaVisible },
+        set: { _ in controller.toggleTranscriptionTafla() }
+      )
+    ) {
+      Label("Dictation", systemImage: "waveform.circle")
+    }
+    .help("Open Dictation")
+    .accessibilityIdentifier(Self.dictationIdentifier)
+  }
+
+  private var autocompleteToggle: some View {
+    Toggle(
+      isOn: Binding(
+        get: { appState.aiAutocompleteEnabled },
+        set: { appState.aiAutocompleteEnabled = $0 }
+      )
+    ) {
+      Label("AI Autocomplete", systemImage: "sparkles")
+    }
+    .help("Suggest the next phrase as you type; press Tab to accept")
+    .accessibilityIdentifier(Self.autocompleteIdentifier)
+  }
+
+  private var rewriteMenu: some View {
     Menu {
-      Toggle(
-        isOn: Binding(
-          get: { controller.isTranscriptionTaflaVisible },
-          set: { _ in controller.toggleTranscriptionTafla() }
-        )
-      ) {
-        Label("Transcription Tafla", systemImage: "waveform.circle")
+      ForEach(RewriteIntent.allCases, id: \.self) { intent in
+        Button(intent.label) {
+          appState.pendingAIRewriteCommand = AIRewriteCommand(action: .request(intent))
+        }
       }
-      .accessibilityIdentifier("pensieve.toolbar.taflaToggle")
-
-      Divider()
-
-      Toggle(
-        isOn: Binding(
-          get: { appState.scrollSyncEnabled },
-          set: { appState.scrollSyncEnabled = $0 }
-        )
-      ) {
-        Label("Scroll Sync", systemImage: "arrow.up.and.down")
-      }
-      .disabled(!hasEditableBuffer)
-      .accessibilityIdentifier("pensieve.toolbar.scrollSync")
-
-      Toggle(
-        isOn: Binding(
-          get: { appState.previewAutoReload },
-          set: { appState.previewAutoReload = $0 }
-        )
-      ) {
-        Label("Auto Reload Preview", systemImage: "arrow.triangle.2.circlepath")
-      }
-      .accessibilityIdentifier("pensieve.toolbar.autoReload")
     } label: {
-      Image(systemName: "ellipsis.circle")
+      Label("Rewrite with AI", systemImage: "wand.and.stars")
     }
-    .help("More — transcription tafla, scroll sync, auto reload")
-    .accessibilityLabel("More Controls")
-    .accessibilityIdentifier(Self.overflowIdentifier)
+    .help("Rewrite the selection or current paragraph with AI")
+    .disabled(!hasEditableBuffer || appState.mode == .preview)
+    .accessibilityIdentifier(Self.rewriteIdentifier)
   }
 }
 
-/// Compact replacement for the two wide preview pickers that used to dominate
-/// the titlebar: one monochrome toolbar button opening a popover that hosts
-/// both appearance axes. A plain `View` (not `ToolbarContent`) so it can own
-/// the `@State` driving the popover presentation.
-private struct AppearanceToolbarButton: View {
-  @ObservedObject var themeManager: ThemeManager
-  @State private var isPopoverPresented = false
+/// Responder-chain history actions for the toolbar. The state mirrors only the
+/// active responder's existing undo manager; it never owns or duplicates a
+/// history stack. Standard AppKit selectors keep the toolbar on the same path
+/// as Edit > Undo/Redo and the focused `NSTextView`.
+@MainActor
+final class ToolbarResponderHistoryState: ObservableObject {
+  @MainActor
+  enum Action: String, CaseIterable {
+    case undo
+    case redo
+
+    var selector: Selector { NSSelectorFromString("\(rawValue):") }
+    var label: String { rawValue.capitalized }
+    var systemImage: String {
+      switch self {
+      case .undo: return "arrow.uturn.backward"
+      case .redo: return "arrow.uturn.forward"
+      }
+    }
+    var accessibilityIdentifier: String {
+      switch self {
+      case .undo: return EditorToolbelt.undoIdentifier
+      case .redo: return EditorToolbelt.redoIdentifier
+      }
+    }
+  }
+
+  struct Availability: Equatable {
+    let canUndo: Bool
+    let canRedo: Bool
+  }
+
+  @Published private(set) var availability = Availability(canUndo: false, canRedo: false)
+  private var cancellables = Set<AnyCancellable>()
+
+  static let refreshNotificationNames: [Notification.Name] = [
+    .NSUndoManagerDidCloseUndoGroup,
+    .NSUndoManagerDidUndoChange,
+    .NSUndoManagerDidRedoChange,
+    NSWindow.didBecomeKeyNotification,
+    NSWindow.didBecomeMainNotification,
+    NSText.didBeginEditingNotification,
+    NSText.didChangeNotification,
+    NSText.didEndEditingNotification,
+  ]
+
+  init(center: NotificationCenter = .default) {
+    Publishers.MergeMany(Self.refreshNotificationNames.map { center.publisher(for: $0) })
+      .receive(on: RunLoop.main)
+      .sink { [weak self] _ in
+        Task { @MainActor in
+          self?.refresh()
+        }
+      }
+      .store(in: &cancellables)
+
+    refresh()
+  }
+
+  static func availability(for responder: NSResponder?) -> Availability {
+    guard let undoManager = responder?.undoManager else {
+      return Availability(canUndo: false, canRedo: false)
+    }
+    return Availability(canUndo: undoManager.canUndo, canRedo: undoManager.canRedo)
+  }
+
+  func isEnabled(_ action: Action) -> Bool {
+    switch action {
+    case .undo: return availability.canUndo
+    case .redo: return availability.canRedo
+    }
+  }
+
+  @discardableResult
+  func perform(_ action: Action) -> Bool {
+    let sent = NSApp.sendAction(action.selector, to: nil, from: nil)
+    refresh()
+    return sent
+  }
+
+  func refresh() {
+    let nextAvailability = Self.availability(for: NSApp.keyWindow?.firstResponder)
+    guard nextAvailability != availability else { return }
+    availability = nextAvailability
+  }
+}
+
+private struct ToolbarHistoryControls: View {
+  @StateObject private var history = ToolbarResponderHistoryState()
 
   var body: some View {
-    Button(action: { isPopoverPresented.toggle() }) {
-      Image(systemName: "paintpalette")
-    }
-    .help("Preview appearance — markdown flavor and reading theme")
-    .accessibilityLabel("Preview Appearance")
-    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
-    .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
-      AppearancePopoverContent(themeManager: themeManager)
+    ControlGroup {
+      ForEach(ToolbarResponderHistoryState.Action.allCases, id: \.self) { action in
+        Button {
+          history.perform(action)
+        } label: {
+          Label(action.label, systemImage: action.systemImage)
+        }
+        .help(action == .undo ? "Undo (⌘Z)" : "Redo (⇧⌘Z)")
+        .disabled(!history.isEnabled(action))
+        .accessibilityIdentifier(action.accessibilityIdentifier)
+      }
     }
   }
 }
 
-/// Popover body hosting the flavor and skin pickers. Same `Picker` views as the
-/// old toolbar items — both auto-populate from `CaseIterable` and keep their
-/// accessibility identifiers, so switching either axis drives `ThemeManager`
-/// (and the live preview) exactly as before.
-private struct AppearancePopoverContent: View {
+/// Native menu for the two preview appearance axes. Keeping presentation under
+/// AppKit's menu-button contract avoids transient SwiftUI popover state being
+/// recreated by the toolbar host between mouse-down and mouse-up.
+private struct AppearanceToolbarMenu: View {
   @ObservedObject var themeManager: ThemeManager
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
+    Menu {
       Picker("Flavor", selection: $themeManager.current) {
         ForEach(ThemeManager.Theme.allCases) { theme in
           Text(theme.displayName).tag(theme)
@@ -330,9 +473,12 @@ private struct AppearancePopoverContent: View {
       .pickerStyle(.menu)
       .help("Preview theme — the reading surface for the rendered markdown")
       .accessibilityIdentifier("pensieve.toolbar.skinPicker")
+    } label: {
+      Label("Preview Appearance", systemImage: "paintpalette")
     }
-    .padding(14)
-    .frame(width: 280)
+    .help("Preview appearance — markdown flavor and reading theme")
+    .accessibilityLabel("Preview Appearance")
+    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
   }
 }
 

@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class WorkspaceStore {
   static let maxOpenFiles = 12
+  private static let dispatchRootPathKey = "Pensieve.dispatch.lastRunRootPath"
   private static let sidebarSortOrderKey = "Pensieve.sidebarSortOrder"
   private let defaults: UserDefaults
 
@@ -27,6 +28,7 @@ final class WorkspaceStore {
   var pendingSidebarRenameURL: URL?
   var bookmarkData: Data?
   var workspaceActivity: WorkspaceActivity?
+  private(set) var lastDispatchRootURL: URL?
   var sidebarSortOrder: SidebarSortOrder {
     didSet {
       defaults.set(sidebarSortOrder.rawValue, forKey: Self.sidebarSortOrderKey)
@@ -39,6 +41,9 @@ final class WorkspaceStore {
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
+    if let path = defaults.string(forKey: Self.dispatchRootPathKey) {
+      self.lastDispatchRootURL = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
     if let rawSort = defaults.string(forKey: Self.sidebarSortOrderKey),
       let sortOrder = SidebarSortOrder(rawValue: rawSort)
     {
@@ -46,6 +51,48 @@ final class WorkspaceStore {
     } else {
       self.sidebarSortOrder = .nameAscending
     }
+  }
+
+  /// Persists the operator's explicitly chosen run root immediately. This is a
+  /// global UI preference, not workspace metadata: one path follows the operator
+  /// across documents and app launches.
+  @discardableResult
+  func rememberDispatchRoot(
+    _ url: URL,
+    fileManager: FileManager = .default
+  ) -> Bool {
+    guard let directory = Self.readableDirectory(url, fileManager: fileManager) else {
+      return false
+    }
+    lastDispatchRootURL = directory
+    defaults.set(directory.path, forKey: Self.dispatchRootPathKey)
+    return true
+  }
+
+  /// Resolves the one fallback chain used by agent launch routes. The injected
+  /// override is intentionally trusted for test/automation seams; all persisted
+  /// and UI-derived candidates must still exist as readable directories.
+  func resolveDispatchRoot(
+    explicitOverride: URL? = nil,
+    workspaceRoot: URL?,
+    documentURL: URL?,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+    fileManager: FileManager = .default
+  ) -> URL {
+    if let explicitOverride {
+      return explicitOverride.standardizedFileURL
+    }
+
+    let documentDirectory = documentURL?.deletingLastPathComponent()
+    for candidate in [lastDispatchRootURL, workspaceRoot, documentDirectory, homeDirectory] {
+      if let directory = Self.readableDirectory(candidate, fileManager: fileManager) {
+        return directory
+      }
+    }
+
+    // The real home directory is expected to exist. Keeping the resolver total
+    // avoids a crash if a synthetic test supplies an unavailable fallback.
+    return homeDirectory.standardizedFileURL
   }
 
   func document(id: DocumentRef.ID) -> DocumentRef? {
@@ -159,5 +206,22 @@ final class WorkspaceStore {
 
   private static func modifiedDate(for url: URL) -> Date? {
     try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+  }
+
+  private static func readableDirectory(
+    _ url: URL?,
+    fileManager: FileManager
+  ) -> URL? {
+    guard let url else { return nil }
+    let standardizedURL = url.standardizedFileURL
+    var isDirectory: ObjCBool = false
+    guard
+      fileManager.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+      isDirectory.boolValue,
+      fileManager.isReadableFile(atPath: standardizedURL.path)
+    else {
+      return nil
+    }
+    return standardizedURL
   }
 }

@@ -23,6 +23,42 @@ class MarkdownTextView: NSTextView {
     super.undoManager ?? fallbackUndoManager
   }
 
+  /// The window undo manager our entries land in, captured while attached so we can
+  /// scrub them on detach. See `viewWillMove(toWindow:)` for why `self.window` is not a
+  /// reliable source at detach time.
+  private weak var attachedWindowUndoManager: UndoManager?
+
+  /// Detach guard for the window's undo stack.
+  ///
+  /// This view registers undo actions with a target of `self` into the WINDOW's undo
+  /// manager — both implicitly (AppKit typing-undo via `allowsUndo`) and explicitly
+  /// (`registerSmartPasteUndo`). That manager lives with the window, not the view, and
+  /// holds its targets `unsafe-unretained`. When SwiftUI tears this representable down
+  /// and rebuilds it, the old view is freed while its entries stay in the window's
+  /// manager — so the first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke →
+  /// objc_msgSend` onto a dangling pointer (the SIGSEGV in crash report 2026-07-19).
+  ///
+  /// Clearing on `deinit` cannot fix this: by then `super.undoManager` is already `nil`,
+  /// so we would scrub the `fallbackUndoManager` and miss the window's real one. Nor can
+  /// we read `self.window?.undoManager` here: when an ANCESTOR (the scroll view) is
+  /// removed, the superview chain is already severed by the time this descendant's
+  /// `viewWillMove` fires, so `self.window` resolves to `nil`. We therefore scrub the
+  /// manager captured in `viewDidMoveToWindow` while the view was still attached.
+  override func viewWillMove(toWindow newWindow: NSWindow?) {
+    if newWindow !== window {
+      (window?.undoManager ?? attachedWindowUndoManager)?.removeAllActions(withTarget: self)
+    }
+    super.viewWillMove(toWindow: newWindow)
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    // Remember the manager our undo entries register into while we are attached, so the
+    // detach guard above has a handle on it even if a future detach path leaves
+    // `self.window` unresolvable (e.g. a `contentView` swap rather than removeFromSuperview).
+    attachedWindowUndoManager = window?.undoManager
+  }
+
   override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
     super.init(frame: frameRect, textContainer: container)
     setup()
@@ -358,6 +394,48 @@ class MarkdownTextView: NSTextView {
       NSRange(location: insertionRange.location + (text as NSString).length, length: 0))
     didChangeText()
     return true
+  }
+
+  /// Inserts speech at the current selection as prose rather than gluing the
+  /// transcript to adjacent Markdown tokens. Dictation commonly arrives
+  /// trimmed, so the editor owns boundary whitespace using the surrounding
+  /// UTF-16 selection that AppKit already uses.
+  @discardableResult
+  func insertDictationAtSelection(_ transcript: String) -> Bool {
+    let cleaned = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty else { return false }
+
+    let selection = selectedRange()
+    let source = string as NSString
+    guard NSMaxRange(selection) <= source.length else { return false }
+
+    var insertion = cleaned
+    if selection.location > 0 {
+      let previous = source.substring(with: NSRange(location: selection.location - 1, length: 1))
+      if Self.dictationNeedsLeadingSpace(after: previous) {
+        insertion = " " + insertion
+      }
+    }
+
+    let trailingLocation = NSMaxRange(selection)
+    if trailingLocation < source.length {
+      let next = source.substring(with: NSRange(location: trailingLocation, length: 1))
+      if Self.dictationNeedsTrailingSpace(before: next) {
+        insertion += " "
+      }
+    }
+
+    return insertTextAtSelection(insertion)
+  }
+
+  private static func dictationNeedsLeadingSpace(after character: String) -> Bool {
+    guard character.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+    return character.rangeOfCharacter(from: CharacterSet(charactersIn: "([{“‘")) == nil
+  }
+
+  private static func dictationNeedsTrailingSpace(before character: String) -> Bool {
+    guard character.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+    return character.rangeOfCharacter(from: CharacterSet(charactersIn: ".,!?;:)]}”’")) == nil
   }
 
   private func registerSmartPasteUndo(location: Int, current: String, replacement: String) {

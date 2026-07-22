@@ -11,6 +11,70 @@ import XCTest
 ///      `applyRefresh` without ever owning the activity display.
 @MainActor
 final class WorkspaceOpenActivityTests: XCTestCase {
+  func testColdStartPublishesCachedWorkspaceBeforeValidationWalkFinishes() async throws {
+    let folder = try makeTemporaryFolder()
+    let support = try makeTemporaryFolder(prefix: "PensieveCachedWorkspaceSupportTests")
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+      try? FileManager.default.removeItem(at: support)
+    }
+    let noteURL = folder.appendingPathComponent("instant.md")
+    try "# Cached immediately".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let store = WorkspaceCacheStore(baseDirectory: support)
+    let substrate = WorkspaceSubstrate(store: store)
+    let bookmarkStore = try temporaryBookmarkStore()
+    let indexDatabase = IndexDatabase(
+      databaseURL: support.appendingPathComponent("index.db", isDirectory: false))
+
+    let warmState = AppState()
+    let warmManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceSubstrate: substrate
+    )
+    warmManager.open(url: folder, into: warmState)
+    await warmManager.waitForPendingIndexUpdate()
+
+    let scanStarted = DispatchSemaphore(value: 0)
+    let releaseScan = DispatchSemaphore(value: 0)
+    let coldState = AppState()
+    let coldManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: bookmarkStore,
+      workspaceBuilder: { roots, exclusions in
+        scanStarted.signal()
+        releaseScan.wait()
+        return WorkspaceScanner.defaultBuilder(roots, exclusions)
+      },
+      workspaceSubstrate: substrate
+    )
+
+    let startedAt = ContinuousClock.now
+    coldManager.openInBackground(url: folder, into: coldState)
+    XCTAssertEqual(scanStarted.wait(timeout: .now() + 1), .success)
+    let elapsedToUsableWorkspace = ContinuousClock.now - startedAt
+    XCTAssertLessThan(
+      elapsedToUsableWorkspace,
+      .milliseconds(100),
+      "the cached workspace must become usable in a fraction of a second"
+    )
+    XCTAssertEqual(
+      coldState.documents.map(\.url),
+      [noteURL.standardizedFileURL],
+      "a cached workspace must be usable before background validation finishes"
+    )
+    XCTAssertNil(
+      coldState.workspaceActivity,
+      "stale-while-revalidate must not cover cached content with an opening spinner"
+    )
+
+    releaseScan.signal()
+    await coldManager.waitForPendingWorkspaceBuild()
+  }
+
   func testWorkspaceMismatchMidWalkClearsOpeningActivity() async throws {
     let folder = try makeTemporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -116,9 +180,9 @@ final class WorkspaceOpenActivityTests: XCTestCase {
     XCTAssertEqual(appState.allDocuments.count, 1)
   }
 
-  private func makeTemporaryFolder() throws -> URL {
+  private func makeTemporaryFolder(prefix: String = "PensieveOpenActivityTests") throws -> URL {
     let folder = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveOpenActivityTests-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     return folder
   }
@@ -132,12 +196,7 @@ final class WorkspaceOpenActivityTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveOpenActivityBookmarkTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveOpenActivityBookmarkTests"))
   }
 }
 

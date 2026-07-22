@@ -64,6 +64,47 @@ enum DocumentExport {
     }
   }
 
+  static func exportDOCX(
+    session: DocumentSession,
+    theme: ThemeManager.Theme,
+    fontSize: CGFloat,
+    themeManager: ThemeManager
+  ) {
+    guard
+      let document = renderDocument(
+        session: session,
+        theme: theme,
+        fontSize: fontSize,
+        themeManager: themeManager
+      )
+    else { return }
+
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [UTType(filenameExtension: "docx") ?? .data]
+    panel.canCreateDirectories = true
+    panel.nameFieldStringValue = defaultExportFileName(for: session, fileExtension: "docx")
+    panel.prompt = "Export"
+
+    guard panel.runModal() == .OK, let outputURL = panel.url else { return }
+    let html = document.html
+    let baseURL = document.baseURL
+
+    Task.detached(priority: .userInitiated) {
+      let scopedAccess = outputURL.startAccessingSecurityScopedResource()
+      defer {
+        if scopedAccess { outputURL.stopAccessingSecurityScopedResource() }
+      }
+      do {
+        let data = try DocumentTransfer.docxData(fromHTML: html, baseURL: baseURL)
+        try data.write(to: outputURL, options: .atomic)
+      } catch {
+        await MainActor.run {
+          showExportFailure(title: "Word Export Failed", error: error)
+        }
+      }
+    }
+  }
+
   static func renderDocument(
     session: DocumentSession,
     theme: ThemeManager.Theme,

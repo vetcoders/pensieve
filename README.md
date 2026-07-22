@@ -20,17 +20,34 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Preview & Two-Way Links:** Rich markdown preview, backlinks, wikilinks, Mermaid, math, and source-first editing.
 - **Split Modes:** `SOURCE` (Cmd+1), `SPLIT` (Cmd+2), `PREVIEW` (Cmd+3), and `FOCUS` (Cmd+4).
 - **Fast Native Core:** Built on Swift 5.9+, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
-- **Agent-Aware Writing:** Current-document dispatch and local Vista-powered autocomplete are wired into the native editor.
+- **Dictation:** Capture speech locally, review continuous transcript text, and insert it at the active Markdown selection with natural spacing and undo.
+- **Agent-Aware Writing:** Current-document dispatch and local AI autocomplete are wired into the native editor.
+- **Word/PDF Transfer Bridge:** Export Markdown to `.docx`; open or import `.docx` and text-based `.pdf` files as editable Markdown drafts.
+
+## Word and PDF transfer
+
+Pensieve keeps Markdown as the source of truth while making exchange with Word-first collaborators practical:
+
+- **Markdown → Word:** choose **File → Export Word (.docx)…**. Headings, paragraphs, emphasis, links, and lists remain structured in the Word document.
+- **Word → Markdown:** choose **File → Import Word or PDF…**, use **Open File…**, or open a `.docx` with Pensieve from Finder. The source stays untouched and the conversion opens as an unsaved `.md` draft.
+- **PDF → Markdown:** text-based PDFs follow the same import path. Scanned PDFs without a text layer are rejected with an OCR-required message instead of opening a blank document.
+
+The existing HTML and PDF export options remain available in the File menu.
 
 ## Requirements
 
-- macOS 14 or newer.
-- Xcode command line tools with Swift 5.9+.
+- macOS 15 or newer.
 - Apple Silicon is the daily-driver target; Intel compatibility is not the current release gate.
 
-## Try It Locally
+## Download
 
-Pensieve is still in a local release lane. The Mac App Store submit, public download, and LFS/provenance decisions are operator-gated, so the honest trial path today is from source:
+Download the latest signed and notarized release from
+[GitHub Releases](https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg),
+open the DMG, and drag Pensieve to Applications.
+
+## Build from source
+
+Source builds require Xcode 16 command line tools with Swift 6.0+; the package remains in Swift 5 language mode.
 
 ```bash
 git clone https://github.com/vetcoders/pensieve.git

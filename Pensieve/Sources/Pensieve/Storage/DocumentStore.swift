@@ -5,14 +5,17 @@ import UniformTypeIdentifiers
 @MainActor
 final class FolderManager {
   typealias RecycleItems = ([URL], @escaping @Sendable ([URL: URL], Error?) -> Void) -> Void
+  typealias StandardizeFileURL = (URL) -> URL
 
   static let shared = FolderManager()
-  private let watcher = FileWatcher()
+  private let watcher: FileWatcher
   private let metadataStore: WorkspaceMetadataStore
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
+  private let workspaceValidationProbe: WorkspaceSubstrate.ValidationProbe
+  private let standardizeFileURL: StandardizeFileURL
   private let recycleItems: RecycleItems
   /// Shares the substrate's cache store so the persisted `.md` signature lands in the SAME
   /// identity-keyed cache directory (`Workspaces/<workspaceID>/`) as the manifest/fingerprint.
@@ -22,6 +25,7 @@ final class FolderManager {
   private let selfWriteSuppressionInterval: TimeInterval
   private let watcherDebounceNanoseconds: UInt64
   private var workspaceBuildTask: Task<Void, Never>?
+  private var workspaceValidationTask: Task<WorkspaceValidationResult, Error>?
   /// Ownership token for the open-flow activity presentation. Each open flow (and
   /// `closeWorkspace`) bumps it; an in-flight background build that exits on ANY path —
   /// cancellation, workspace mismatch, or normal completion — clears `workspaceActivity`
@@ -29,17 +33,30 @@ final class FolderManager {
   /// `applyRefresh` or superseded by an ad-hoc file open left `.opening` on screen forever.
   private var openFlowGeneration: UInt64 = 0
   private var watcherRefreshTask: Task<Void, Never>?
-  /// Tracks the off-main FTS index write launched by `rebuildWorkspace` (incremental delta OR
-  /// full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so callers
-  /// can await it. The underlying `pool.write` is a single transaction inside
+  /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
+  /// completed refresh from one that was cancel-replaced by a newer event mid-await.
+  private var watcherRefreshGeneration: UInt64 = 0
+  /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
+  /// task so a filesystem event cannot cancel a user-requested refresh.
+  private var forcedRefreshTask: Task<Void, Never>?
+  /// Tracks the off-main FTS index write launched by live refresh or cold indexing (incremental
+  /// delta OR full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so
+  /// callers can await it. The underlying `pool.write` is a single transaction inside
   /// `IndexDatabase`, so cancelling here only abandons the await — it never half-writes the
   /// index. The actual writes are serialized by `IndexDatabase.pendingIndexUpdateTask`.
   private var indexUpdateTask: Task<Void, Never>?
+  /// Tracks the manifest-side workspace/document/stat writes separately from the FTS delta.
+  /// Synchronous open and forced-refresh paths previously launched this work unowned, which
+  /// made close and deterministic tests race an otherwise valid database transaction.
+  private var workspaceIndexWriteTask: Task<Void, Never>?
   private var recentSelfWritePaths: [String: Date] = [:]
   /// Last applied `.md` signature (structured `path -> FileSignature` map). The
   /// baseline the next watcher/refresh diffs against. `nil` means "no baseline"
   /// (cold open, or after `closeWorkspace`) — the next rebuild full-indexes.
   private var lastWorkspaceSignature: WorkspaceSignature?
+  /// Last published sidebar identity. Unlike the search signature, this includes every visible
+  /// root, folder, and supported document by standardized path + node kind, but no file stats.
+  private var lastWorkspacePresentationSignature: WorkspacePresentationSignature?
 
   init(
     metadataStore: WorkspaceMetadataStore = .shared,
@@ -47,8 +64,11 @@ final class FolderManager {
     bookmarkStore: BookmarkStore? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
+    workspaceValidationProbe: @escaping WorkspaceSubstrate.ValidationProbe = { _ in },
+    watcher: FileWatcher = FileWatcher(),
     selfWriteSuppressionInterval: TimeInterval = 1.2,
     watcherDebounceMilliseconds: UInt64 = 300,
+    standardizeFileURL: @escaping StandardizeFileURL = { $0.standardizedFileURL },
     recycleItems: @escaping RecycleItems = { urls, completion in
       NSWorkspace.shared.recycle(urls, completionHandler: completion)
     }
@@ -56,10 +76,13 @@ final class FolderManager {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
-    self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.defaultBuilder
+    self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.cancellableBuilder
     self.workspaceSubstrate = workspaceSubstrate
+    self.workspaceValidationProbe = workspaceValidationProbe
+    self.watcher = watcher
     self.selfWriteSuppressionInterval = selfWriteSuppressionInterval
     self.watcherDebounceNanoseconds = watcherDebounceMilliseconds * 1_000_000
+    self.standardizeFileURL = standardizeFileURL
     self.recycleItems = recycleItems
   }
 
@@ -119,9 +142,10 @@ final class FolderManager {
       return nil
     }
 
-    let standardizedURL = url.standardizedFileURL
+    let standardizedURL = standardizeFileURL(url)
+    let standardizedPath = standardizedURL.path
     if let ref = appState.allDocuments.first(where: {
-      $0.url.standardizedFileURL == url.standardizedFileURL
+      $0.url.path == standardizedPath
     }) {
       appState.lastError = nil
       return ref
@@ -135,7 +159,7 @@ final class FolderManager {
     }
 
     let ref = DocumentRef(id: standardizedURL, isAdHoc: true)
-    appState.openFiles.removeAll { $0.id.standardizedFileURL == standardizedURL }
+    appState.openFiles.removeAll { $0.id.path == standardizedPath }
     appState.openFiles.append(ref)
     pruneOpenFiles(into: appState, protecting: standardizedURL)
     appState.lastError = nil
@@ -168,6 +192,7 @@ final class FolderManager {
     if appState.workspaceRoots.contains(where: {
       WorkspaceScanner.contains(standardizedURL, in: $0.url)
     }) {
+      publishKnownWorkspaceItem(at: standardizedURL, kind: .document, into: appState)
       refresh(into: appState)
       if let ref = appState.documents.first(where: { $0.url.standardizedFileURL == standardizedURL }
       ) {
@@ -185,6 +210,7 @@ final class FolderManager {
     do {
       try FileManager.default.createDirectory(at: targetURL, withIntermediateDirectories: true)
       noteSelfWrite(at: targetURL)
+      publishKnownWorkspaceItem(at: targetURL, kind: .folder, into: appState)
       refresh(into: appState, force: true)
       appState.lastError = nil
       return true
@@ -246,23 +272,57 @@ final class FolderManager {
   }
 
   @discardableResult
-  func moveToTrash(url: URL, into appState: AppState) -> Bool {
+  func moveToTrash(url: URL, into appState: AppState) async -> Bool {
     let source = url.standardizedFileURL
-    appState.lastError = nil
-    recycleItems([source]) { [weak self, weak appState] _, error in
-      Task { @MainActor in
-        guard let self, let appState else { return }
-        if let error {
-          appState.lastError =
-            "Could not move \(source.lastPathComponent) to Trash: \(error.localizedDescription)"
-          return
+    let recycleStartedAt = DispatchTime.now().uptimeNanoseconds
+    let recycleResult: (errorDescription: String?, completedAt: UInt64) =
+      await withCheckedContinuation { continuation in
+        recycleItems([source]) { _, error in
+          continuation.resume(
+            returning: (error?.localizedDescription, DispatchTime.now().uptimeNanoseconds)
+          )
         }
-        self.noteSelfWrite(at: source)
-        self.removeReferences(for: source, into: appState)
-        self.refresh(into: appState)
-        appState.lastError = nil
       }
+    let finderMilliseconds = Self.elapsedMilliseconds(
+      from: recycleStartedAt,
+      to: recycleResult.completedAt
+    )
+    DebugTrace.log(
+      "trash recycle completed path=\(source.path) finder_ms=\(Self.traceMilliseconds(finderMilliseconds)) outcome=\(recycleResult.errorDescription == nil ? "success" : "failure")"
+    )
+
+    if let errorDescription = recycleResult.errorDescription {
+      appState.lastError =
+        "Could not move \(source.lastPathComponent) to Trash: \(errorDescription)"
+      return false
     }
+
+    let pruneStartedAt = DispatchTime.now().uptimeNanoseconds
+    appState.workspaceTree = Self.prunedWorkspaceTree(
+      appState.workspaceTree,
+      removing: source
+    )
+    let pruneCompletedAt = DispatchTime.now().uptimeNanoseconds
+    DebugTrace.log(
+      "trash tree pruned path=\(source.path) completion_to_prune_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: recycleResult.completedAt, to: pruneCompletedAt))) prune_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: pruneStartedAt, to: pruneCompletedAt)))"
+    )
+
+    removeReferences(for: source, into: appState)
+    noteSelfWrite(at: source)
+    appState.lastError = nil
+
+    let reconcileStartedAt = DispatchTime.now().uptimeNanoseconds
+    let reconcileTask = scheduleExplicitRefresh(
+      into: appState,
+      forcePresentation: true
+    )
+    await reconcileTask?.value
+    let indexTask = indexUpdateTask
+    await indexTask?.value
+    let reconcileCompletedAt = DispatchTime.now().uptimeNanoseconds
+    DebugTrace.log(
+      "trash reconcile completed path=\(source.path) reconcile_ms=\(Self.traceMilliseconds(Self.elapsedMilliseconds(from: reconcileStartedAt, to: reconcileCompletedAt))) finder_ms=\(Self.traceMilliseconds(finderMilliseconds))"
+    )
     return true
   }
 
@@ -292,11 +352,12 @@ final class FolderManager {
   private func replaceReferences(from source: URL, to target: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
     let targetURL = target.standardizedFileURL
+    let sourcePath = sourceURL.path
 
     appState.openFiles = appState.openFiles.map { ref in
-      ref.url.standardizedFileURL == sourceURL ? appState.makeDocumentRef(for: targetURL) : ref
+      ref.url.path == sourcePath ? appState.makeDocumentRef(for: targetURL) : ref
     }
-    if appState.selectedDocumentID?.standardizedFileURL == sourceURL {
+    if appState.selectedDocumentID?.path == sourcePath {
       appState.selectedDocumentID = targetURL
       appState.documentSession.document = appState.makeDocumentRef(for: targetURL)
     }
@@ -304,17 +365,68 @@ final class FolderManager {
 
   private func removeReferences(for source: URL, into appState: AppState) {
     let sourceURL = source.standardizedFileURL
-    appState.openFiles.removeAll { isSameOrDescendant($0.url, of: sourceURL) }
-    if let selected = appState.selectedDocumentID, isSameOrDescendant(selected, of: sourceURL) {
+    let sourcePath = sourceURL.path
+    appState.documents.removeAll { isSameOrDescendant($0.url.path, of: sourcePath) }
+    appState.openFiles.removeAll { isSameOrDescendant($0.url.path, of: sourcePath) }
+    appState.workspaceSearchResults.removeAll {
+      isSameOrDescendant($0.document.url.path, of: sourcePath)
+    }
+    if let selected = appState.selectedDocumentID,
+      isSameOrDescendant(selected.path, of: sourcePath)
+    {
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
     }
   }
 
-  private func isSameOrDescendant(_ url: URL, of ancestor: URL) -> Bool {
-    let path = url.standardizedFileURL.path
-    let ancestorPath = ancestor.standardizedFileURL.path
+  private func isSameOrDescendant(_ path: String, of ancestorPath: String) -> Bool {
     return path == ancestorPath || path.hasPrefix(ancestorPath + "/")
+  }
+
+  /// Pure presentation mutation used only after Finder confirms the recycle. It removes the
+  /// target node as one subtree, so empty and unsupported-only folders disappear without waiting
+  /// for FSEvents or walking the filesystem on the main actor. Node URLs are compared by raw
+  /// path: WorkspaceScanner standardizes every node URL at construction, and re-standardizing
+  /// per node here is what would push a large-tree prune past its latency budget.
+  nonisolated static func prunedWorkspaceTree(
+    _ nodes: [WorkspaceNode],
+    removing source: URL
+  ) -> [WorkspaceNode] {
+    let sourcePath = source.standardizedFileURL.path
+    return nodes.compactMap { prunedWorkspaceNode($0, removingPath: sourcePath) }
+  }
+
+  private nonisolated static func prunedWorkspaceNode(
+    _ node: WorkspaceNode,
+    removingPath sourcePath: String
+  ) -> WorkspaceNode? {
+    if let nodePath = node.url?.path {
+      if nodePath == sourcePath || nodePath.hasPrefix(sourcePath + "/") {
+        return nil
+      }
+      // Only an ancestor of the source can hold it in its subtree; every other
+      // sibling subtree survives unchanged, without a per-node copy walk.
+      guard sourcePath.hasPrefix(nodePath + "/") else { return node }
+    }
+
+    var prunedNode = node
+    if let children = node.children {
+      prunedNode.children = children.compactMap {
+        prunedWorkspaceNode($0, removingPath: sourcePath)
+      }
+    }
+    return prunedNode
+  }
+
+  private nonisolated static func elapsedMilliseconds(
+    from start: UInt64, to end: UInt64
+  ) -> Double {
+    guard end >= start else { return 0 }
+    return Double(end - start) / 1_000_000
+  }
+
+  private nonisolated static func traceMilliseconds(_ value: Double) -> String {
+    String(format: "%.3f", value)
   }
 
   private func availableDuplicateURL(for source: URL) -> URL {
@@ -379,44 +491,163 @@ final class FolderManager {
   }
 
   /// Awaits the in-flight debounced watcher refresh (debounce sleep + off-main scan + rebuild)
-  /// so tests can drive `scheduleWatcherRefresh` deterministically instead of sleeping.
+  /// so tests can drive `scheduleWatcherRefresh` deterministically instead of sleeping. A live
+  /// FSEvents delivery can cancel-replace the awaited task mid-wait, so drain until the awaited
+  /// generation is the one that actually ran.
   func waitForPendingWatcherRefresh() async {
-    await watcherRefreshTask?.value
+    while let task = watcherRefreshTask {
+      let generation = watcherRefreshGeneration
+      await task.value
+      if watcherRefreshGeneration == generation { return }
+    }
   }
 
-  /// Awaits the off-main FTS index write launched by the most recent `rebuildWorkspace` so
+  /// Deterministic sync point for exclusion/root-removal tests and callers that need the forced
+  /// off-main scan, in-memory rebuild, and presentation-cache write to have completed.
+  func waitForPendingForcedRefresh() async {
+    await forcedRefreshTask?.value
+  }
+
+  /// Awaits the off-main FTS index write launched by the most recent refresh/cold index so
   /// tests can assert on the index deterministically. This awaits the FolderManager-side
   /// handle; the canonical write-completion sync point is `IndexDatabase.waitForPendingReindex()`
   /// (which both background variants chain on and await internally).
   func waitForPendingIndexUpdate() async {
+    // `refresh(into:)` is intentionally synchronous at the API boundary but schedules its one
+    // filesystem walk off-main. Await that reconcile first so legacy callers that already use
+    // this index completion point cannot race the task that creates `indexUpdateTask`.
+    await forcedRefreshTask?.value
     await indexUpdateTask?.value
   }
 
-  func noteSelfWrite(at url: URL) {
-    recentSelfWritePaths[url.standardizedFileURL.path] = Date()
+  func waitForPendingWorkspaceIndexWrite() async {
+    await forcedRefreshTask?.value
+    await workspaceIndexWriteTask?.value
   }
 
-  /// Synchronous refresh. Computes the `.md` signature on the calling actor (cheap for the
-  /// explicit one-shot callers: file create, exclusion edits, tests) and rebuilds when it
-  /// differs from the last applied signature. The watcher path does NOT call this directly —
-  /// it goes through `scheduleWatcherRefresh` so the expensive scan runs off the main actor
-  /// (RC-2).
-  func refresh(into appState: AppState, force: Bool = false) {
-    guard appState.hasWorkspaceContent else { return }
+  func noteSelfWrite(at url: URL) {
+    recentSelfWritePaths[FileWatcherEvent.canonicalPath(for: url.path)] = Date()
+  }
 
-    let roots = appState.workspaceRoots.map(\.url)
-    let exclusions = appState.excludedWorkspacePaths
-    let signature = FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
-    applyRefresh(into: appState, signature: signature, force: force)
+  /// Starts one off-main reconcile for explicit one-shot callers (create, save, move, trash).
+  /// The public API stays synchronous, but no directory enumeration or per-document stat walk
+  /// runs on the main actor. Callers that need completion can await `waitForPendingForcedRefresh`.
+  func refresh(into appState: AppState, force: Bool = false) {
+    if let activeURL = appState.documentSession.url,
+      WorkspaceScanner.isMarkdownFile(activeURL),
+      !appState.documents.contains(where: {
+        $0.url.standardizedFileURL == activeURL.standardizedFileURL
+      })
+    {
+      // Save As can create a supported workspace document before the off-main reconcile runs.
+      // Publish that one already-known path immediately so selection/rename UX stays coherent;
+      // the scheduled snapshot remains authoritative and still updates both signatures/cache.
+      publishKnownWorkspaceItem(at: activeURL, kind: .document, into: appState)
+    }
+    scheduleExplicitRefresh(into: appState, forcePresentation: force)
+  }
+
+  /// Publishes a path that this process just created without enumerating or stat-walking the
+  /// workspace. The subsequent off-main snapshot remains authoritative and repairs ordering,
+  /// signatures, search, and cache; this narrow optimistic insertion preserves synchronous
+  /// create/save-as UI behavior while that reconcile is in flight.
+  private func publishKnownWorkspaceItem(
+    at url: URL,
+    kind: WorkspaceNode.Kind,
+    into appState: AppState
+  ) {
+    let standardizedURL = url.standardizedFileURL
+    let matchingRoot = appState.workspaceRoots
+      .map(\.url)
+      .filter { WorkspaceScanner.contains(standardizedURL, in: $0) }
+      .max(by: { $0.standardizedFileURL.path.count < $1.standardizedFileURL.path.count })
+    guard let root = matchingRoot?.standardizedFileURL else { return }
+
+    let relativePath = WorkspaceScanner.relativePath(for: standardizedURL, root: root)
+    let exclusions = WorkspaceExclusion.relativePaths(
+      for: root,
+      from: appState.excludedWorkspacePaths
+    )
+    guard
+      !exclusions.contains(where: { exclusion in
+        relativePath == exclusion || relativePath.hasPrefix(exclusion + "/")
+      })
+    else { return }
+
+    let node = WorkspaceNode(
+      id: "\(kind.rawValue):\(standardizedURL.path)",
+      name: kind == .document
+        ? standardizedURL.deletingPathExtension().lastPathComponent
+        : standardizedURL.lastPathComponent,
+      kind: kind,
+      url: standardizedURL,
+      children: kind == .folder ? [] : nil
+    )
+    let parentURL = standardizedURL.deletingLastPathComponent()
+    guard
+      let rootIndex = appState.workspaceTree.firstIndex(where: {
+        $0.url?.standardizedFileURL == root
+      })
+    else { return }
+
+    var rootNode = appState.workspaceTree[rootIndex]
+    guard insertKnownWorkspaceNode(node, under: parentURL, into: &rootNode) else { return }
+    appState.workspaceTree[rootIndex] = rootNode
+
+    if kind == .document {
+      let standardizedPath = standardizedURL.path
+      appState.documents.removeAll { $0.url.path == standardizedPath }
+      appState.documents.append(
+        DocumentRef(
+          id: standardizedURL,
+          rootURL: root,
+          relativePath: relativePath,
+          isAdHoc: false
+        )
+      )
+      appState.openFiles.removeAll { $0.url.path == standardizedPath }
+    }
+  }
+
+  private func insertKnownWorkspaceNode(
+    _ insertedNode: WorkspaceNode,
+    under parentURL: URL,
+    into node: inout WorkspaceNode
+  ) -> Bool {
+    if node.url?.standardizedFileURL == parentURL.standardizedFileURL {
+      var children = node.children ?? []
+      children.removeAll { $0.id == insertedNode.id }
+      children.append(insertedNode)
+      children.sort(by: FolderManager.workspaceNodeSort)
+      node.children = children
+      return true
+    }
+
+    guard var children = node.children else { return false }
+    for index in children.indices {
+      if insertKnownWorkspaceNode(insertedNode, under: parentURL, into: &children[index]) {
+        node.children = children
+        return true
+      }
+    }
+    return false
+  }
+
+  private nonisolated static func workspaceNodeSort(
+    _ lhs: WorkspaceNode,
+    _ rhs: WorkspaceNode
+  ) -> Bool {
+    if lhs.kind != rhs.kind { return lhs.kind == .folder }
+    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
   /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
-  /// single refresh after a short quiet period, then computes the `.md` signature on a
-  /// background task (full directory enumeration + per-file stat) so foreign filesystem churn
-  /// (Spotlight, a live folder, sibling app writes) never blocks the main actor. Only the
-  /// cheap signature comparison and — if it changed — the rebuild hop back to the main actor.
+  /// single refresh after a short quiet period, then builds one presentation + search snapshot
+  /// on a background task so foreign filesystem churn never blocks the main actor. Only the
+  /// independent signature comparisons and required publications hop back to the main actor.
   /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
   func scheduleWatcherRefresh(into appState: AppState) {
+    watcherRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
       try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
@@ -426,67 +657,183 @@ final class FolderManager {
     }
   }
 
-  /// Body of the debounced watcher refresh. The signature scan runs off the main actor; only
-  /// the comparison + rebuild touch `appState` / `lastWorkspaceSignature` on the main
-  /// actor. Re-checks `hasWorkspaceContent` after the hop in case the workspace was closed
-  /// while the scan was in flight.
+  /// Filters only events whose path is the exact path (or a descendant) this process recently
+  /// wrote. A mixed FSEvents batch therefore keeps unrelated external mutations, and stream-loss
+  /// or root-change markers always run the full safe reconcile regardless of self-write history.
+  func actionableWatcherEvents(_ events: [FileWatcher.Event]) -> [FileWatcher.Event] {
+    pruneExpiredSelfWrites()
+    guard !recentSelfWritePaths.isEmpty else { return events }
+
+    return events.filter { event in
+      guard !event.requiresFullReconcile else { return true }
+      return !recentSelfWritePaths.keys.contains { selfWritePath in
+        event.path == selfWritePath || event.path.hasPrefix(selfWritePath + "/")
+      }
+    }
+  }
+
+  /// Drops events the workspace scanner can never surface, mirroring `shouldInclude` plus the
+  /// W1-A signature truth that only folders and supported documents carry freshness weight:
+  /// hidden or `WorkspaceDefaults.excludedNames` components below a root, and flagged-as-file
+  /// events on unsupported names (atomic-save `<name>.sb-*` temp siblings, logs, images). The
+  /// exceptions are load-bearing: `.gitignore` content drives ignore rules so its change must
+  /// rescan, events without an is-file flag are kept (no negative evidence), and stream-loss or
+  /// root-changed markers always survive. Self-write suppression stays a separate, noted-paths
+  /// concern.
+  func scannerVisibleWatcherEvents(
+    _ events: [FileWatcher.Event],
+    rootPaths: [String]
+  ) -> [FileWatcher.Event] {
+    events.filter { event in
+      guard !event.requiresFullReconcile else { return true }
+      guard
+        let root = rootPaths.first(where: {
+          event.path == $0 || event.path.hasPrefix($0 + "/")
+        })
+      else { return true }
+      let components = event.path.dropFirst(root.count).split(separator: "/").map(String.init)
+      guard let name = components.last else { return true }
+      func invisible(_ component: String) -> Bool {
+        component.hasPrefix(".") || WorkspaceDefaults.excludedNames.contains(component)
+      }
+      if components.dropLast().contains(where: invisible) { return false }
+      if name == ".gitignore" { return true }
+      if invisible(name) { return false }
+      if event.flags.contains(.itemIsFile),
+        !WorkspaceScanner.isMarkdownFile(URL(fileURLWithPath: event.path))
+      {
+        return false
+      }
+      return true
+    }
+  }
+
+  /// Exclusions can change the visible folder tree without changing a single markdown file.
+  /// Always rebuild for those explicit user actions, but reuse the cancellable scanner off the
+  /// main actor and feed its result into `applyRefresh` so this path never reintroduces the
+  /// main-thread workspace walks removed by W0-A.
+  private func scheduleForcedRefresh(into appState: AppState) {
+    scheduleExplicitRefresh(into: appState, forcePresentation: true)
+  }
+
+  @discardableResult
+  private func scheduleExplicitRefresh(
+    into appState: AppState,
+    forcePresentation: Bool
+  ) -> Task<Void, Never>? {
+    guard appState.hasWorkspaceContent else { return nil }
+    watcherRefreshTask?.cancel()
+    forcedRefreshTask?.cancel()
+    let task = Task { [weak self, weak appState] in
+      guard let self, let appState, appState.hasWorkspaceContent else { return }
+      let roots = appState.workspaceRoots.map(\.url)
+      let rootPaths = roots.map { $0.standardizedFileURL.path }
+      let exclusions = appState.excludedWorkspacePaths
+      let workspaceBuilder = self.workspaceBuilder
+
+      let snapshot = await Task.detached(priority: .userInitiated) {
+        FolderManager.refreshSnapshot(
+          roots: roots,
+          exclusions: exclusions,
+          builder: workspaceBuilder
+        )
+      }.value
+      guard !Task.isCancelled else { return }
+      guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
+        appState.excludedWorkspacePaths == exclusions
+      else { return }
+
+      self.applyRefresh(
+        into: appState,
+        snapshot: snapshot,
+        roots: roots,
+        exclusions: exclusions,
+        forcePresentation: forcePresentation
+      )
+    }
+    forcedRefreshTask = task
+    return task
+  }
+
+  /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
+  /// off-main; only delta decisions and publication touch main-actor state.
   private func performWatcherRefresh(into appState: AppState) async {
     guard appState.hasWorkspaceContent else { return }
     let roots = appState.workspaceRoots.map(\.url)
+    let rootPaths = roots.map { $0.standardizedFileURL.path }
     let exclusions = appState.excludedWorkspacePaths
-
-    // Step 1 — the `.md` signature scan OFF the main actor (full enumeration + per-file stat).
-    let signature = await Task.detached(priority: .utility) {
-      FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
-    }.value
-    guard !Task.isCancelled else { return }
-    guard appState.hasWorkspaceContent else { return }
-
-    // Step 2 — cheap delta check on the main actor. A non-`.md` change (screenshot, .DS_Store,
-    // .git, sibling app writes) leaves the `.md` signature unchanged → skip the rebuild entirely.
-    // Only a genuine `.md` change pays for the rebuild scan.
-    if let baseline = lastWorkspaceSignature, let signature,
-      WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
-    {
-      return
-    }
-
-    // Step 3 — a `.md` file actually changed: enumerate the tree for the rebuild OFF the main
-    // actor too, then hop to main only to assign it. Previously `rebuildWorkspace` re-enumerated
-    // the whole tree (54k+ files) ON the main actor here — the steady beachball under live churn.
     let workspaceBuilder = workspaceBuilder
-    let scans = await Task.detached(priority: .utility) {
-      workspaceBuilder(roots, exclusions)
+
+    let snapshot = await Task.detached(priority: .utility) {
+      FolderManager.refreshSnapshot(
+        roots: roots,
+        exclusions: exclusions,
+        builder: workspaceBuilder
+      )
     }.value
     guard !Task.isCancelled else { return }
-    guard appState.hasWorkspaceContent else { return }
-    applyRefresh(into: appState, signature: signature, scans: scans)
+    guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
+      appState.excludedWorkspacePaths == exclusions
+    else { return }
+    applyRefresh(
+      into: appState,
+      snapshot: snapshot,
+      roots: roots,
+      exclusions: exclusions
+    )
   }
 
-  /// Shared rebuild tail used by both the synchronous `refresh` and the off-main watcher
-  /// path. Compares the freshly-computed `.md` signature against the last applied one; when
-  /// unchanged it skips the full rebuild + FTS reindex storm. When changed it rebuilds the
-  /// in-memory tree and updates the FTS index proportionally to the CHANGE (delta upsert/
-  /// delete) when a baseline exists — full reindex only on cold open. Reselects, preserving
-  /// dirty-session protection (a dirty active buffer is never clobbered). Must run on the main
-  /// actor — it mutates `appState`.
+  /// Independently authorizes sidebar/cache publication and FTS publication from the two
+  /// signatures derived by the same off-main scan. Folder-only changes never write search;
+  /// content-only changes never republish the tree. Selection and dirty-buffer protection apply
+  /// whenever either visible universe changes.
   private func applyRefresh(
     into appState: AppState,
-    signature: WorkspaceSignature?,
-    force: Bool = false,
-    scans: [WorkspaceScan]? = nil
+    snapshot: WorkspaceRefreshSnapshot,
+    roots: [URL],
+    exclusions: Set<String>,
+    forcePresentation: Bool = false
   ) {
-    if !force, let signature, let baseline = lastWorkspaceSignature,
-      WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
-    {
-      // The .md tree is unchanged — a non-.md change (screenshot, .DS_Store, sibling
-      // app writes) fired the watcher. Skip the full rebuild + FTS reindex storm.
-      return
+    let presentationChanged =
+      forcePresentation
+      || lastWorkspacePresentationSignature != snapshot.presentationSignature
+    let searchChanged: Bool
+    if let baseline = lastWorkspaceSignature, let signature = snapshot.searchSignature {
+      searchChanged = !WorkspaceSignature.delta(from: baseline, to: signature).isEmpty
+    } else {
+      // Missing evidence is fail-open for search: never bless an uncertain FTS baseline.
+      searchChanged = true
     }
 
+    let presentationState = presentationChanged ? "changed" : "stable"
+    let searchState = searchChanged ? "changed" : "stable"
+    DebugTrace.log("freshness presentation=\(presentationState) search=\(searchState)")
+    guard presentationChanged || searchChanged else { return }
+
     workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
     let previousSelection = appState.selectedDocumentID
-    rebuildWorkspace(into: appState, signature: signature, precomputedScans: scans)
+    let protectsDirtySession = appState.documentSession.isDirty
+
+    if presentationChanged {
+      applyWorkspaceScans(snapshot.scans, into: appState)
+      if let fingerprint = snapshot.fingerprint {
+        workspaceIndexWriteTask = commitWorkspaceManifest(
+          rootURLs: roots,
+          exclusions: exclusions,
+          precomputedFingerprint: fingerprint,
+          cachedScans: snapshot.scans,
+          into: appState
+        )
+      }
+    }
+
+    if searchChanged {
+      updateWorkspaceSearchIndex(
+        signature: snapshot.searchSignature,
+        into: appState
+      )
+    }
     let documents = appState.allDocuments
 
     if let previousSelection, documents.contains(where: { $0.id == previousSelection }) {
@@ -496,6 +843,13 @@ final class FolderManager {
       {
         DocumentStore.shared.load(ref: ref, into: appState)
       }
+      return
+    }
+
+    // Excluding/removing the selected subtree must mirror close-workspace protection: the
+    // workspace collection may no longer contain this document, but its dirty editor session is
+    // still the user's unsaved work and must not be replaced by another document or cleared.
+    if protectsDirtySession {
       return
     }
 
@@ -515,19 +869,82 @@ final class FolderManager {
     var excluded = appState.excludedWorkspacePaths
     for url in urls {
       guard
-        let relativePath = relativeExcludedPath(for: url, roots: appState.workspaceRoots.map(\.url))
+        let scopedPath = WorkspaceExclusion.scopedKey(
+          for: url,
+          roots: appState.workspaceRoots.map(\.url)
+        )
       else {
         continue
       }
-      excluded.insert(relativePath)
+      excluded.insert(scopedPath)
     }
+    guard excluded != appState.excludedWorkspacePaths else { return }
     persistExcludedPaths(excluded, into: appState)
-    refresh(into: appState)
+    appState.workspaceSearchResults = []
+    scheduleForcedRefresh(into: appState)
   }
 
   func clearExclusions(into appState: AppState) {
+    guard !appState.excludedWorkspacePaths.isEmpty else { return }
     persistExcludedPaths([], into: appState)
-    refresh(into: appState)
+    appState.workspaceSearchResults = []
+    scheduleForcedRefresh(into: appState)
+  }
+
+  /// Removes one directory root from a multi-root workspace without touching its contents.
+  /// The surviving root/file bookmarks are rebuilt through the same persistence APIs used by
+  /// open-folder, the watcher is narrowed immediately, and the forced refresh drops the root
+  /// from the tree, document collection, FTS delta, and presentation cache.
+  func removeRoot(_ url: URL, into appState: AppState) {
+    let standardizedURL = url.standardizedFileURL
+    guard
+      let targetRoot = appState.workspaceRoots.first(where: {
+        $0.url.standardizedFileURL == standardizedURL
+      })
+    else { return }
+
+    if appState.workspaceRoots.count == 1 {
+      let indexedPaths = appState.allDocuments.map { $0.url.standardizedFileURL.path }
+      closeWorkspace(into: appState)
+      if !indexedPaths.isEmpty {
+        let indexDatabase = indexDatabase
+        indexUpdateTask = Task { [weak appState] in
+          _ = await indexDatabase.updateSearchIndexInBackground(
+            upserting: [],
+            deletingPaths: indexedPaths,
+            appState: appState
+          )
+        }
+      }
+      return
+    }
+
+    let survivingRoots = appState.workspaceRoots.filter {
+      $0.url.standardizedFileURL != targetRoot.url.standardizedFileURL
+    }
+    let survivingRootURLs = survivingRoots.map(\.url)
+    let openFileURLs = appState.openFiles.map(\.url)
+    let retainedExclusions = appState.excludedWorkspacePaths.filter {
+      !WorkspaceExclusion.isScoped($0, to: standardizedURL)
+    }
+    let bookmarkError = rewriteWorkspaceBookmarks(
+      rootURLs: survivingRootURLs,
+      fileURLs: openFileURLs,
+      into: appState
+    )
+
+    persistExcludedPaths(Set(retainedExclusions), into: appState)
+    appState.workspaceRoots = survivingRoots
+    appState.folderURL = survivingRootURLs.first?.standardizedFileURL
+    appState.workspaceSearchResults.removeAll {
+      WorkspaceScanner.contains($0.document.url, in: standardizedURL)
+    }
+    startWatching(urls: survivingRootURLs, appState: appState)
+    scheduleForcedRefresh(into: appState)
+
+    if let bookmarkError {
+      appState.lastError = bookmarkError
+    }
   }
 
   /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
@@ -536,18 +953,22 @@ final class FolderManager {
   /// editor; otherwise the editor is cleared too.
   func closeWorkspace(into appState: AppState) {
     workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
     // Take ownership of the activity display so the cancelled build's terminal clear
     // cannot race the direct `workspaceActivity = nil` below.
     openFlowGeneration &+= 1
     watcherRefreshTask?.cancel()
+    forcedRefreshTask?.cancel()
     // Cancel any still-awaiting off-main index update. The underlying single-transaction
     // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
     indexUpdateTask?.cancel()
+    workspaceIndexWriteTask?.cancel()
     watcher.stop()
     bookmarkStore.clear(into: appState)
     // Clearing the baseline means the next open of any workspace cold-starts with a FULL
     // reindex (no stale delta against a foreign workspace's signature).
     lastWorkspaceSignature = nil
+    lastWorkspacePresentationSignature = nil
     recentSelfWritePaths.removeAll()
     appState.workspaceRoots = []
     appState.workspaceTree = []
@@ -567,6 +988,7 @@ final class FolderManager {
 
   private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
     workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
@@ -605,10 +1027,11 @@ final class FolderManager {
     // Multi-root delegates to the single-root v1 fingerprint byte-for-byte when count == 1, so
     // single-root manifests are unchanged; N>1 gets the root-qualified v2 fingerprint.
     let coldFingerprint = try? TreeFingerprint.compute(from: scans, roots: rootURLs)
-    _ = commitWorkspaceManifest(
+    workspaceIndexWriteTask = commitWorkspaceManifest(
       rootURLs: rootURLs,
       exclusions: appState.excludedWorkspacePaths,
       precomputedFingerprint: coldFingerprint,
+      cachedScans: scans,
       into: appState
     )
     selectRestoredDocument(previousSelection: previousSelection, into: appState)
@@ -620,14 +1043,12 @@ final class FolderManager {
   /// cold-open walk already produced (`scans` — its tree was already applied to `appState`).
   /// Computes the current `.md` signature, then defers the skip/incremental/full FTS decision to
   /// `performColdIndex` (which reads the PERSISTED signature + the index-content guard). Unlike
-  /// `rebuildWorkspace` — the watcher/refresh tail that always issues an index write keyed on the
-  /// IN-MEMORY baseline — this honors the on-disk baseline so a relaunch with no `.md` changes
+  /// the live refresh search tail keyed on the IN-MEMORY baseline, this honors the on-disk
+  /// baseline so a relaunch with no `.md` changes
   /// SKIPS the reindex entirely. The caller owns the one walk; this never re-walks.
   private func coldRebuildWorkspace(scans: [WorkspaceScan], into appState: AppState) {
     let roots = appState.workspaceRoots.map(\.url)
-    let exclusions = appState.excludedWorkspacePaths
-    let currentSignature =
-      FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
+    let currentSignature = FolderManager.signature(from: scans)
     indexUpdateTask = performColdIndex(
       rootURLs: roots, currentSignature: currentSignature, into: appState)
   }
@@ -660,6 +1081,7 @@ final class FolderManager {
     exclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint? = nil,
     precomputedIndexedDocumentCount: Int? = nil,
+    persistPresentationCache: Bool = true,
     into appState: AppState
   ) -> Bool {
     guard !rootURLs.isEmpty else { return false }
@@ -701,6 +1123,15 @@ final class FolderManager {
       lastWorkspaceSignature =
         cacheStore.readSearchSignature(for: identity)
         ?? FolderManager.signature(from: scans)
+      if persistPresentationCache {
+        do {
+          try cacheStore.writeWorkspaceScans(scans, for: identity)
+        } catch {
+          // The manifest/index verdict remains valid even if this optional acceleration artifact
+          // cannot be written. Keep the correct no-reindex result and retry migration next launch.
+          NSLog("%@", "Presentation cache migration failed: \(error)")
+        }
+      }
       appState.lastError = nil
       DebugTrace.log("coldStartValidSkip taken roots=\(rootURLs.count)")
       return true
@@ -714,38 +1145,75 @@ final class FolderManager {
     rootURLs: [URL], fileURLs: [URL], into appState: AppState
   ) {
     workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
     let generation = openFlowGeneration
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
-    let metadata = metadataStore.load()
-    let exclusions = Set(metadata.excludedPaths)
-    if attemptHotReopen(rootURLs: rootURLs, exclusions: exclusions, into: appState) {
-      return
-    }
+    let requestedRootPaths = rootURLs.map { $0.standardizedFileURL.path }
+    let requestedOpenFilePaths =
+      fileURLs
+      .filter(WorkspaceScanner.isMarkdownFile)
+      .map { $0.standardizedFileURL.path }
+    let isHotReopen =
+      !rootURLs.isEmpty && !appState.workspaceTree.isEmpty
+      && matchesCurrentWorkspace(
+        rootPaths: requestedRootPaths,
+        openFilePaths: requestedOpenFilePaths,
+        in: appState
+      )
 
-    // The index is opened OFF the main thread inside `workspaceBuildTask` below (every DB consumer on
-    // this path — the skip-gate count, manifest commit, cold index — now opens via the background
-    // path). Opening + migrating here on main was a source of the "Scanning…" hang.
+    // Preserve the existing/cached tree while ONE detached validation job walks + fingerprints.
+    // No substrate validation, scanner build, fingerprint, or signature fallback runs before this
+    // method returns to the main actor.
     let previousSelection = appState.selectedDocumentID
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
-    // Honest open state for the WHOLE walk: the skip decision lands only after the walk +
-    // fingerprint + DB count below, so claiming "Importing Workspace" here would present
-    // every cached open as a full import (the operator's "indeksuje non stop" perception).
-    // `.opening` is subtle (sidebar progress, no center takeover); the import claim is
-    // made only after the skip-gate genuinely fails.
-    setOpenActivity(.opening(label), into: appState)
+    let restoredPresentationCache =
+      !isHotReopen
+      && restoreCachedWorkspace(
+        rootURLs: rootURLs,
+        previousSelection: previousSelection,
+        into: appState
+      )
+    let hasStalePresentation = isHotReopen || restoredPresentationCache
+    if hasStalePresentation {
+      // Stale-while-revalidate: the last committed tree is already usable. The walk below still
+      // proves freshness, but it is background maintenance rather than a loading state.
+      setOpenActivity(nil, into: appState)
+    } else {
+      // First open has no presentation cache yet. Keep the activity honest while the initial
+      // off-main walk builds it; subsequent opens take the instant path above.
+      setOpenActivity(.opening(label), into: appState)
+    }
 
     let expectedRootPaths = appState.workspaceRoots.map { $0.url.standardizedFileURL.path }
     let expectedOpenFilePaths = appState.openFiles.map { $0.url.standardizedFileURL.path }
     let roots = appState.workspaceRoots.map(\.url)
     let scanExclusions = appState.excludedWorkspacePaths
-    let workspaceBuilder = workspaceBuilder
-    let scanTask = Task.detached(priority: .userInitiated) {
-      workspaceBuilder(roots, scanExclusions)
+    guard !roots.isEmpty else {
+      applyWorkspaceScans([], into: appState)
+      selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      setOpenActivity(nil, into: appState)
+      return
     }
 
+    let identity = WorkspaceIdentity.make(
+      roots: roots,
+      bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
+    )
+    let workspaceBuilder = workspaceBuilder
+    let workspaceSubstrate = workspaceSubstrate
+    let workspaceValidationProbe = workspaceValidationProbe
+    let validationTask = workspaceSubstrate.startValidation(
+      identity: identity,
+      currentRoots: roots,
+      currentExclusions: scanExclusions,
+      workspaceBuilder: workspaceBuilder,
+      persistPresentationCache: !hasStalePresentation,
+      probe: workspaceValidationProbe
+    )
+    workspaceValidationTask = validationTask
+
     workspaceBuildTask = Task { [weak self, weak appState] in
-      let scans = await scanTask.value
       guard let self, let appState else { return }
       // EVERY exit from this task — cancellation guard, workspace mismatch, or the
       // normal tail — must tear the `.opening`/`.indexing` presentation down, unless a
@@ -753,7 +1221,22 @@ final class FolderManager {
       // the "Opening Workspace" spinner on screen forever (e.g. an ad-hoc file opened
       // mid-walk fails the workspace match; `applyRefresh` cancels the build outright).
       defer { self.finishOpenFlow(generation: generation, into: appState) }
-      guard !Task.isCancelled,
+      let validation: WorkspaceValidationResult
+      do {
+        validation = try await withTaskCancellationHandler {
+          try await validationTask.value
+        } onCancel: {
+          validationTask.cancel()
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        guard generation == self.openFlowGeneration else { return }
+        appState.lastError = "Could not validate workspace: \(error.localizedDescription)"
+        return
+      }
+
+      guard !Task.isCancelled, generation == self.openFlowGeneration,
         self.matchesCurrentWorkspace(
           rootPaths: expectedRootPaths,
           openFilePaths: expectedOpenFilePaths,
@@ -763,79 +1246,91 @@ final class FolderManager {
         return
       }
 
-      self.applyWorkspaceScans(scans, into: appState)
+      if case .some(.accessDenied(let reason)) = validation.verdict {
+        appState.lastError = "Could not open cached workspace: \(reason)"
+        return
+      }
+
+      // Publication happens only after cancellation, generation, roots, and open-file guards.
+      self.applyWorkspaceScans(validation.scans, into: appState)
 
       // Open the index OFF the main thread (coalesced — subsequent DB consumers reuse this pool).
       await self.indexDatabase.openInBackground(into: appState)
-      guard !Task.isCancelled else { return }
-
-      // Cold-start skip-gate: a fresh launch hits this background path (empty in-memory tree, so
-      // `attemptHotReopen` short-circuited). Before re-committing every document + re-running the
-      // FTS reindex + flashing "Indexing N", consult the EXISTING substrate verdict against the
-      // persisted `tree-fingerprint.json`. The fingerprint is computed OFF the main actor from
-      // the single walk we already have (no second walk), then the main-actor gate decides.
-      let liveRoots = appState.workspaceRoots.map(\.url)
-      let coldStartFingerprint: TreeFingerprint? =
-        await Task.detached(priority: .utility) {
-          // Keyed on the FULL root set: N==1 reduces to the legacy v1 hash, N>1 is root-qualified v2.
-          try? TreeFingerprint.compute(from: scans, roots: liveRoots)
-        }.value
-      guard !Task.isCancelled else { return }
-      // The empty-index guard reads a COUNT — also off the main thread — before the skip decision.
-      // Counts rows across EVERY root so a multi-root workspace passes the invariant-2 guard.
-      let coldStartIndexedCount =
-        await self.indexDatabase.indexedDocumentCountInBackground(
-          forRootPaths: liveRoots.map { $0.standardizedFileURL.path }, appState: appState)
-      guard !Task.isCancelled else { return }
-      if let coldStartFingerprint,
-        self.attemptColdStartValidSkip(
-          scans: scans,
-          rootURLs: liveRoots,
-          exclusions: appState.excludedWorkspacePaths,
-          precomputedFingerprint: coldStartFingerprint,
-          precomputedIndexedDocumentCount: coldStartIndexedCount,
-          into: appState
+      guard !Task.isCancelled, generation == self.openFlowGeneration,
+        self.matchesCurrentWorkspace(
+          rootPaths: expectedRootPaths,
+          openFilePaths: expectedOpenFilePaths,
+          in: appState
         )
-      {
-        // Unchanged workspace: tree already restored from the single walk; no manifest re-commit,
-        // no reindex, no "Indexing N". Just select + watch; the defer clears the activity.
+      else { return }
+
+      let cacheIsValid: Bool
+      if case .some(.valid) = validation.verdict {
+        cacheIsValid = true
+      } else {
+        cacheIsValid = false
+      }
+
+      // In-session hot reopen preserves its prior index-content invariant. Cold launch additionally
+      // proves the index has rows before taking the valid-skip route.
+      if cacheIsValid, isHotReopen {
+        self.setOpenActivity(.cacheHit(label), into: appState)
+        self.lastWorkspaceSignature = validation.searchSignature
+        appState.lastError = nil
         self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         return
       }
 
-      DebugTrace.log("cold reindex roots=\(liveRoots.count)")
+      let indexedCount = await self.indexDatabase.indexedDocumentCountInBackground(
+        forRootPaths: roots.map { $0.standardizedFileURL.path }, appState: appState)
+      guard !Task.isCancelled, generation == self.openFlowGeneration,
+        self.matchesCurrentWorkspace(
+          rootPaths: expectedRootPaths,
+          openFilePaths: expectedOpenFilePaths,
+          in: appState
+        )
+      else { return }
+
+      if cacheIsValid, indexedCount > 0 {
+        self.setOpenActivity(.cacheHit(label), into: appState)
+        self.lastWorkspaceSignature = validation.searchSignature
+        appState.lastError = nil
+        DebugTrace.log("coldStartValidSkip taken roots=\(roots.count)")
+        self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
+        return
+      }
+
+      if validation.verdict != nil {
+        self.setOpenActivity(.cacheMiss(label), into: appState)
+      }
+      DebugTrace.log("cold reindex roots=\(roots.count)")
       // The skip-gate said no: manifest commit + index writes are genuinely ahead — the
       // "Importing Workspace" claim becomes honest exactly here, never during the walk.
       self.setOpenActivity(
         .indexing(documentCount: appState.allDocuments.count), into: appState)
-      let workspaceIndexWriteTask = self.commitWorkspaceManifest(
-        rootURLs: appState.workspaceRoots.map(\.url),
-        exclusions: appState.excludedWorkspacePaths,
-        precomputedFingerprint: coldStartFingerprint,
-        into: appState
-      )
+      let workspaceIndexWriteTask: Task<Void, Never>?
+      if let fingerprint = validation.fingerprint {
+        workspaceIndexWriteTask = self.commitWorkspaceManifest(
+          rootURLs: roots,
+          exclusions: scanExclusions,
+          precomputedFingerprint: fingerprint,
+          cachedScans: validation.scans,
+          into: appState
+        )
+      } else {
+        workspaceIndexWriteTask = nil
+      }
+      self.workspaceIndexWriteTask = workspaceIndexWriteTask
       self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       await workspaceIndexWriteTask?.value
-      // Cold open: instead of an UNCONDITIONAL full reindex, consult the PERSISTED `.md`
-      // signature + the index-content guard. Compute the current `.md` signature off the main
-      // actor first (it doubles as the next watcher baseline whether we skip, delta, or full).
-      let currentSignature = await Task.detached(priority: .utility) {
-        FolderManager.currentWorkspaceSignature(roots: roots, exclusions: scanExclusions)
-      }.value
-      guard !Task.isCancelled else { return }
-      // Content guard for the cold-index decision, read OFF the main thread (the sync read inside
-      // `performColdIndex` would otherwise run on main during "Indexing…").
-      let coldRoots = appState.workspaceRoots.map(\.url)
-      let coldIndexHasContent =
-        await self.indexDatabase.indexedDocumentCountInBackground(
-          forRootPaths: coldRoots.map { $0.standardizedFileURL.path }, appState: appState) > 0
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, generation == self.openFlowGeneration else { return }
       let indexTask = self.performColdIndex(
-        rootURLs: coldRoots,
-        currentSignature: currentSignature,
-        precomputedIndexHasContent: coldIndexHasContent,
+        rootURLs: roots,
+        currentSignature: validation.searchSignature,
+        precomputedIndexHasContent: indexedCount > 0,
         into: appState
       )
       self.indexUpdateTask = indexTask
@@ -849,7 +1344,6 @@ final class FolderManager {
     rootURLs: [URL], exclusions: Set<String>, into appState: AppState
   ) -> Bool {
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: appState.openFiles.map(\.url))
-    setOpenActivity(.checkingCache(label), into: appState)
 
     // Cache fast-path keys on the FULL root set (N≥1). The real guard against silently dropping
     // an ADDED folder is `matchesCurrentWorkspace` below: when `open` merged a new root the
@@ -879,11 +1373,13 @@ final class FolderManager {
       ),
       !appState.workspaceTree.isEmpty
     else {
-      // Cold-start short-circuit: the substrate was never consulted, so this is NOT a
-      // cache miss — the cold path's skip-gate may still validate the cache. Keep the
-      // subtle `.checkingCache`; the caller sets `.opening` right after.
+      // Cold-start short-circuit: the substrate was never consulted, so do not publish a
+      // synthetic cache-checking state. The background path can restore its presentation cache
+      // immediately before the validation walk begins.
       return false
     }
+
+    setOpenActivity(.checkingCache(label), into: appState)
 
     let identity = WorkspaceIdentity.make(
       roots: rootURLs,
@@ -946,31 +1442,45 @@ final class FolderManager {
     appState.lastError = nil
   }
 
-  /// Rebuilds the in-memory document tree (always full — it is metadata-only and cheap) and
-  /// updates the FTS index. The index update is proportional to the CHANGE: when a previous
-  /// `.md` signature baseline exists, only the added/modified files are re-upserted and the
-  /// removed files' rows are deleted (delta). A FULL reindex happens ONLY on cold open — when
-  /// there is no baseline yet (first open, or after `closeWorkspace` cleared it). After the
-  /// rebuild the freshly-computed signature becomes the new baseline.
-  ///
-  /// `signature` is the pre-computed `.md` signature from the caller (already computed off the
-  /// main actor on the watcher path). When `nil` (a callsite that did not pre-compute, or a
-  /// stat failure), it is recomputed here so the baseline is never left stale.
-  private func rebuildWorkspace(
-    into appState: AppState, signature: WorkspaceSignature? = nil,
-    precomputedScans: [WorkspaceScan]? = nil
+  /// Publishes the last committed workspace tree before the validation walk completes. The cache
+  /// is identity-keyed by the full standardized root set + bookmark, and the root list is checked
+  /// again before use. Fresh scans always replace this state later in the same open flow.
+  private func restoreCachedWorkspace(
+    rootURLs: [URL],
+    previousSelection: DocumentRef.ID?,
+    into appState: AppState
+  ) -> Bool {
+    guard !rootURLs.isEmpty else { return false }
+    let standardizedRoots = rootURLs.map(\.standardizedFileURL).sorted { $0.path < $1.path }
+    let identity = WorkspaceIdentity.make(
+      roots: standardizedRoots,
+      bookmarkData: appState.bookmarkData ?? bookmarkStore.bookmarkData
+    )
+    guard let scans = try? cacheStore.readWorkspaceScans(for: identity) else {
+      return false
+    }
+    let cachedRoots = scans.compactMap { $0.rootNode.url?.standardizedFileURL }
+      .sorted { $0.path < $1.path }
+    guard cachedRoots == standardizedRoots else { return false }
+
+    applyWorkspaceScans(scans, into: appState)
+    lastWorkspaceSignature = cacheStore.readSearchSignature(for: identity)
+    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    DebugTrace.log(
+      "presentation cache restored roots=\(rootURLs.count) documents=\(appState.documents.count)")
+    return true
+  }
+
+  /// Applies only the search side of a freshness snapshot. Presentation is independently
+  /// published when its signature changes; this method never walks or republishes the tree.
+  /// A known baseline uses an incremental delta, while missing stat evidence fails open to a
+  /// full background reindex without blessing a new baseline.
+  private func updateWorkspaceSearchIndex(
+    signature newSignature: WorkspaceSignature?,
+    into appState: AppState
   ) {
     let roots = appState.workspaceRoots.map(\.url)
-    let exclusions = appState.excludedWorkspacePaths
     let baseline = lastWorkspaceSignature
-    // Reuse an off-main enumeration when the caller already walked the tree (watcher path), so
-    // the main actor never re-enumerates a large workspace (54k+ files) just to rebuild it —
-    // that on-main re-walk was the steady beachball under live `.md` churn.
-    let scans = precomputedScans ?? workspaceBuilder(roots, exclusions)
-    applyWorkspaceScans(scans, into: appState)
-
-    let newSignature =
-      signature ?? FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
 
     // The FTS index write runs OFF the main actor on a tracked Task. FolderManager is
     // @MainActor and this method is sync, so the body of either background variant — which
@@ -1035,9 +1545,7 @@ final class FolderManager {
       }
     }
 
-    lastWorkspaceSignature =
-      newSignature
-      ?? FolderManager.currentWorkspaceSignature(roots: roots, exclusions: exclusions)
+    lastWorkspaceSignature = newSignature
   }
 
   /// Restores the in-memory `.md` baseline to `priorBaseline` after a FAILED FTS write, but ONLY
@@ -1054,6 +1562,23 @@ final class FolderManager {
     lastWorkspaceSignature = priorBaseline
   }
 
+  /// Produces every refresh artifact from one injected scanner walk. Presentation identity is
+  /// pure path/kind data; search identity stats only the supported documents from those scans;
+  /// the cache fingerprint is also derived from the scans without re-enumerating the workspace.
+  nonisolated static func refreshSnapshot(
+    roots: [URL],
+    exclusions: Set<String>,
+    builder: WorkspaceScanner.Builder
+  ) -> WorkspaceRefreshSnapshot {
+    let scans = builder(roots, exclusions)
+    return WorkspaceRefreshSnapshot(
+      scans: scans,
+      presentationSignature: WorkspacePresentationSignature(scans: scans),
+      searchSignature: signature(from: scans),
+      fingerprint: try? TreeFingerprint.compute(from: scans, roots: roots)
+    )
+  }
+
   /// Precise structured `.md`-tree signature (`standardizedPath -> FileSignature{mtime,size}`)
   /// across all workspace roots. Replaces the opaque joined-String fingerprint: the same
   /// `path | full-precision mtime | size` evidence, now keyed by path so the watcher/refresh
@@ -1066,16 +1591,18 @@ final class FolderManager {
   /// a rebuild. Returns nil when there are no roots or a file cannot be stat'd — callers then
   /// full-rebuild (fail open; never skip / never delta on uncertainty).
   ///
-  /// `nonisolated static` so the watcher path can run this expensive full-directory
-  /// enumeration + per-file `resourceValues` stat OFF the main actor (RC-2). Inputs (`[URL]`,
-  /// `Set<String>`) and the `WorkspaceSignature?` result are all `Sendable`, so it crosses the
-  /// actor boundary cleanly. Instance callers (the synchronous `refresh`) reach it via the
-  /// same static.
+  /// `nonisolated static` so the legacy hot-reopen fallback can also be moved across an actor
+  /// boundary when that call path becomes asynchronous. Live refreshes do not call this helper;
+  /// they derive both freshness signatures from `refreshSnapshot` and its one injected walk.
   nonisolated static func currentWorkspaceSignature(roots: [URL], exclusions: Set<String>)
     -> WorkspaceSignature?
   {
     guard !roots.isEmpty else { return nil }
-    return signature(from: WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions))
+    guard
+      let scans = try? WorkspaceScanner.buildCancellable(
+        rootURLs: roots, exclusions: exclusions)
+    else { return nil }
+    return signature(from: scans)
   }
 
   /// Builds a `WorkspaceSignature` from ALREADY-WALKED scans, statting each `.md` document but
@@ -1088,6 +1615,7 @@ final class FolderManager {
     var entries: [String: FileSignature] = [:]
     entries.reserveCapacity(documents.count)
     for document in documents {
+      guard !Task.isCancelled else { return nil }
       guard
         let values = try? document.url.resourceValues(forKeys: [
           .contentModificationDateKey, .fileSizeKey,
@@ -1226,6 +1754,7 @@ final class FolderManager {
   private func commitWorkspaceManifest(
     rootURLs: [URL], exclusions: Set<String>,
     precomputedFingerprint: TreeFingerprint? = nil,
+    cachedScans: [WorkspaceScan]? = nil,
     into appState: AppState
   ) -> Task<Void, Never>? {
     guard !rootURLs.isEmpty else { return nil }
@@ -1250,6 +1779,9 @@ final class FolderManager {
         exclusions: exclusions,
         fingerprint: fingerprint
       )
+      if let cachedScans {
+        try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
+      }
       let documents = appState.documents
       return Task {
         await indexDatabase.upsertWorkspace(
@@ -1293,6 +1825,7 @@ final class FolderManager {
   private func applyWorkspaceScans(_ scans: [WorkspaceScan], into appState: AppState) {
     appState.documents = scans.flatMap(\.documents)
     appState.workspaceTree = scans.map(\.rootNode)
+    lastWorkspacePresentationSignature = WorkspacePresentationSignature(scans: scans)
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
@@ -1329,30 +1862,31 @@ final class FolderManager {
     }
 
     do {
-      try watcher.start(watching: urls) { [weak self, weak appState] in
+      try watcher.start(watching: urls) { [weak self, weak appState] events in
+        let deliveredOffMain = !Thread.isMainThread
         Task { @MainActor in
           guard let self, let appState else { return }
-          guard !self.shouldSuppressWatcherRefresh(into: appState) else { return }
-          // RC-2: coalesce bursts + run the expensive .md scan off the main actor.
+          let rootPaths = appState.workspaceRoots.map {
+            FileWatcherEvent.canonicalPath(for: $0.url.path)
+          }
+          let visibleEvents = self.scannerVisibleWatcherEvents(events, rootPaths: rootPaths)
+          let actionableEvents = self.actionableWatcherEvents(visibleEvents)
+          let requiresFullReconcile = actionableEvents.contains(where: \.requiresFullReconcile)
+          DebugTrace.log(
+            "watcher events=\(events.count) visible=\(visibleEvents.count) "
+              + "actionable=\(actionableEvents.count) "
+              + "full=\(requiresFullReconcile) deliveryOffMain=\(deliveredOffMain) "
+              + "paths=\(events.map { "\($0.path):\($0.flags.rawValue)" }.joined(separator: ","))"
+          )
+          guard !actionableEvents.isEmpty else { return }
+          // FolderManager is the sole application-level coalescer. Every surviving path batch
+          // feeds W1-A's canonical full snapshot; flags only prevent unsafe path-level trust.
           self.scheduleWatcherRefresh(into: appState)
         }
       }
     } catch {
       appState.lastError = "Could not watch folder: \(error.localizedDescription)"
     }
-  }
-
-  private func relativeExcludedPath(for url: URL, roots: [URL]) -> String? {
-    let standardizedURL = url.standardizedFileURL
-    let matchingRoot =
-      roots
-      .map(\.standardizedFileURL)
-      .filter { standardizedURL.path == $0.path || standardizedURL.path.hasPrefix($0.path + "/") }
-      .sorted { $0.path.count > $1.path.count }
-      .first
-    guard let matchingRoot else { return nil }
-    let path = WorkspaceScanner.relativePath(for: standardizedURL, root: matchingRoot)
-    return path.isEmpty ? nil : path
   }
 
   private func matchesCurrentWorkspace(
@@ -1369,6 +1903,26 @@ final class FolderManager {
       appState.lastError = nil
     } catch {
       appState.lastError = "Could not save workspace exclusions: \(error.localizedDescription)"
+    }
+  }
+
+  /// Rebuilds both root and ad-hoc file bookmark sets through BookmarkStore's prepare-then-replace
+  /// path. A removed root cannot return on relaunch, while failure to create a new bookmark leaves
+  /// the previously valid persisted workspace intact instead of clearing it partially.
+  private func rewriteWorkspaceBookmarks(
+    rootURLs: [URL],
+    fileURLs: [URL],
+    into appState: AppState
+  ) -> String? {
+    do {
+      try bookmarkStore.replaceWorkspace(
+        rootURLs: rootURLs,
+        fileURLs: fileURLs,
+        into: appState
+      )
+      return nil
+    } catch {
+      return "Could not update workspace bookmarks: \(error.localizedDescription)"
     }
   }
 
@@ -1397,17 +1951,6 @@ final class FolderManager {
     }
   }
 
-  private func shouldSuppressWatcherRefresh(into appState: AppState) -> Bool {
-    pruneExpiredSelfWrites()
-    guard !recentSelfWritePaths.isEmpty else { return false }
-
-    let workspaceRoots = appState.workspaceRoots.map(\.url)
-    return recentSelfWritePaths.keys.contains { path in
-      let url = URL(fileURLWithPath: path)
-      return workspaceRoots.contains { WorkspaceScanner.contains(url, in: $0) }
-    }
-  }
-
   private func pruneExpiredSelfWrites() {
     let now = Date()
     recentSelfWritePaths = recentSelfWritePaths.filter { _, writeDate in
@@ -1431,9 +1974,53 @@ private enum WorkspaceDefaults {
   ]
 }
 
-struct WorkspaceScan: Sendable {
+struct WorkspaceScan: Codable, Sendable {
   var documents: [DocumentRef]
   var rootNode: WorkspaceNode
+}
+
+/// Deterministic identity of the sidebar's visible universe. Every root, folder, and supported
+/// document contributes its standardized path and semantic kind; unsupported files never enter
+/// the scanner tree and therefore cannot perturb presentation freshness.
+struct WorkspacePresentationSignature: Equatable, Sendable {
+  struct Entry: Equatable, Sendable {
+    var path: String
+    var kind: WorkspaceNode.Kind
+  }
+
+  var entries: [Entry]
+
+  init(scans: [WorkspaceScan]) {
+    var collected: [Entry] = []
+
+    func collect(_ node: WorkspaceNode) {
+      if let url = node.url {
+        collected.append(
+          Entry(path: url.standardizedFileURL.path, kind: node.kind)
+        )
+      }
+      for child in node.children ?? [] {
+        collect(child)
+      }
+    }
+
+    for scan in scans {
+      collect(scan.rootNode)
+    }
+    entries = collected.sorted {
+      if $0.path != $1.path { return $0.path < $1.path }
+      return $0.kind.rawValue < $1.kind.rawValue
+    }
+  }
+}
+
+/// One off-main filesystem walk and every artifact derived from it. `TreeFingerprint` remains a
+/// cache-validation artifact; it is carried beside, not reused as, either live freshness gate.
+struct WorkspaceRefreshSnapshot: @unchecked Sendable {
+  var scans: [WorkspaceScan]
+  var presentationSignature: WorkspacePresentationSignature
+  var searchSignature: WorkspaceSignature?
+  var fingerprint: TreeFingerprint?
 }
 
 /// Per-file `.md` signature: full-precision modification time + byte size. Two
@@ -1496,6 +2083,56 @@ struct WorkspaceSignature: Codable, Equatable, Sendable {
   }
 }
 
+/// Persisted exclusion identity. New entries are scoped to one standardized root so `docs`
+/// under root A never hides `docs` under root B. Bare legacy entries remain readable and apply
+/// to every root exactly as they did before this migration.
+enum WorkspaceExclusion {
+  private static let separator = "::"
+
+  static func scopedKey(for url: URL, roots: [URL]) -> String? {
+    let standardizedURL = url.standardizedFileURL
+    let matchingRoot =
+      roots
+      .map(\.standardizedFileURL)
+      .filter { WorkspaceScanner.contains(standardizedURL, in: $0) }
+      .sorted { $0.path.count > $1.path.count }
+      .first
+    guard let matchingRoot else { return nil }
+    let relativePath = WorkspaceScanner.relativePath(for: standardizedURL, root: matchingRoot)
+    guard !relativePath.isEmpty else { return nil }
+    return matchingRoot.path + separator + relativePath
+  }
+
+  static func relativePaths(for root: URL, from exclusions: Set<String>) -> Set<String> {
+    let rootPath = root.standardizedFileURL.path
+    return Set(
+      exclusions.compactMap { exclusion in
+        guard let scoped = split(exclusion) else {
+          return exclusion
+        }
+        return scoped.rootPath == rootPath ? scoped.relativePath : nil
+      }
+    )
+  }
+
+  static func isScoped(_ exclusion: String, to root: URL) -> Bool {
+    guard let scoped = split(exclusion) else { return false }
+    return scoped.rootPath == root.standardizedFileURL.path
+  }
+
+  private static func split(_ exclusion: String) -> (rootPath: String, relativePath: String)? {
+    // Root-scoped keys always start with an absolute path. This preserves a legacy relative path
+    // that happens to contain `::` instead of misclassifying it as a scoped key.
+    guard exclusion.hasPrefix("/"), let range = exclusion.range(of: separator) else {
+      return nil
+    }
+    let rootPath = String(exclusion[..<range.lowerBound])
+    let relativePath = String(exclusion[range.upperBound...])
+    guard !rootPath.isEmpty, !relativePath.isEmpty else { return nil }
+    return (rootPath, relativePath)
+  }
+}
+
 enum WorkspaceScanner {
   typealias Builder = @Sendable (_ rootURLs: [URL], _ exclusions: Set<String>) -> [WorkspaceScan]
 
@@ -1503,8 +2140,48 @@ enum WorkspaceScanner {
     build(rootURLs: rootURLs, exclusions: exclusions)
   }
 
+  /// Runtime builder: cancellation may surface only as an empty compatibility value here, but
+  /// every production caller checks task cancellation immediately after the call and therefore
+  /// never publishes it as a complete scan.
+  static let cancellableBuilder: Builder = { rootURLs, exclusions in
+    (try? buildCancellable(rootURLs: rootURLs, exclusions: exclusions)) ?? []
+  }
+
+  /// Compatibility entry point for synchronous callers and fixture construction. Production
+  /// background opens use `buildCancellable`; this wrapper never exposes a partial traversal.
   static func build(rootURLs: [URL], exclusions: Set<String>) -> [WorkspaceScan] {
-    rootURLs.map { scan(folder: $0, exclusions: exclusions) }
+    (try? build(rootURLs: rootURLs, exclusions: exclusions, cancellationCheck: {})) ?? []
+  }
+
+  /// Cooperative scanner used by runtime background work. Cancellation is checked before each
+  /// root, directory enumeration, entry classification, and recursive descent. It throws instead
+  /// of returning a partial tree, so cancellation can never be mistaken for a complete scan.
+  static func buildCancellable(rootURLs: [URL], exclusions: Set<String>) throws -> [WorkspaceScan] {
+    try build(
+      rootURLs: rootURLs,
+      exclusions: exclusions,
+      cancellationCheck: { try Task.checkCancellation() }
+    )
+  }
+
+  private static func build(
+    rootURLs: [URL],
+    exclusions: Set<String>,
+    cancellationCheck: () throws -> Void
+  ) throws -> [WorkspaceScan] {
+    var scans: [WorkspaceScan] = []
+    scans.reserveCapacity(rootURLs.count)
+    for rootURL in rootURLs {
+      try cancellationCheck()
+      let rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
+      scans.append(
+        try scan(
+          folder: rootURL,
+          exclusions: rootExclusions,
+          cancellationCheck: cancellationCheck
+        ))
+    }
+    return scans
   }
 
   static let unsupportedOpenMessage =
@@ -1541,9 +2218,22 @@ enum WorkspaceScanner {
     return components.dropFirst(rootComponents.count).joined(separator: "/")
   }
 
-  private static func scan(folder url: URL, exclusions: Set<String>) -> WorkspaceScan {
+  private static func scan(
+    folder url: URL,
+    exclusions: Set<String>,
+    cancellationCheck: () throws -> Void
+  ) throws -> WorkspaceScan {
+    try cancellationCheck()
     let root = url.standardizedFileURL
-    let scan = scanChildren(folder: root, root: root, exclusions: exclusions, gitIgnoreRules: [])
+    var visitedDirectories = Set<String>()
+    let scan = try scanChildren(
+      folder: root,
+      root: root,
+      exclusions: exclusions,
+      gitIgnoreRules: [],
+      visitedDirectories: &visitedDirectories,
+      cancellationCheck: cancellationCheck
+    )
     return WorkspaceScan(
       documents: scan.documents,
       rootNode: WorkspaceNode(
@@ -1560,35 +2250,57 @@ enum WorkspaceScanner {
     folder url: URL,
     root: URL,
     exclusions: Set<String>,
-    gitIgnoreRules inheritedGitIgnoreRules: [GitIgnoreRule]
-  ) -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
-    let fm = FileManager.default
-    guard
-      let urls = try? fm.contentsOfDirectory(
-        at: url,
-        includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
-        options: []
-      )
+    gitIgnoreRules inheritedGitIgnoreRules: [GitIgnoreRule],
+    visitedDirectories: inout Set<String>,
+    cancellationCheck: () throws -> Void
+  ) throws -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
+    try cancellationCheck()
+    let standardizedDirectory = url.standardizedFileURL
+    guard contains(standardizedDirectory, in: root),
+      visitedDirectories.insert(standardizedDirectory.path).inserted
     else {
       return ([], [])
     }
+
+    let fm = FileManager.default
+    guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
+      return ([], [])
+    }
+    // The URL-based directory API rejects a workspace root that is itself a
+    // symlink on current macOS. Enumerate names through the path API, then
+    // anchor each child to the logical workspace URL. Entry classification
+    // below reads link identity before directory/file target type.
+    let urls = childNames.map { url.appendingPathComponent($0) }
 
     var documents: [DocumentRef] = []
     var nodes: [WorkspaceNode] = []
     let gitIgnoreRules =
       inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
-    let entries = urls.compactMap {
-      entry(for: $0, root: root, exclusions: exclusions, gitIgnoreRules: gitIgnoreRules)
+    var entries: [WorkspaceDirectoryEntry] = []
+    entries.reserveCapacity(urls.count)
+    for childURL in urls {
+      try cancellationCheck()
+      if let entry = entry(
+        for: childURL,
+        root: root,
+        exclusions: exclusions,
+        gitIgnoreRules: gitIgnoreRules
+      ) {
+        entries.append(entry)
+      }
     }
-    .sorted(by: workspaceSort)
+    entries.sort(by: workspaceSort)
 
     for entry in entries {
+      try cancellationCheck()
       if entry.isDirectory {
-        let childScan = scanChildren(
+        let childScan = try scanChildren(
           folder: entry.url,
           root: root,
           exclusions: exclusions,
-          gitIgnoreRules: gitIgnoreRules
+          gitIgnoreRules: gitIgnoreRules,
+          visitedDirectories: &visitedDirectories,
+          cancellationCheck: cancellationCheck
         )
         documents.append(contentsOf: childScan.documents)
         nodes.append(
@@ -1631,7 +2343,19 @@ enum WorkspaceScanner {
   )
     -> WorkspaceDirectoryEntry?
   {
-    let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+    let standardizedURL = url.standardizedFileURL
+    guard contains(standardizedURL, in: root) else { return nil }
+
+    // Classify the link itself before asking Foundation whether its target is a directory/file.
+    // Symlinked folders/files are excluded wholesale: no external targets, no self-cycle edges.
+    guard
+      let linkValues = try? standardizedURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
+      linkValues.isSymbolicLink != true
+    else { return nil }
+
+    let values = try? standardizedURL.resourceValues(forKeys: [
+      .isDirectoryKey, .isRegularFileKey,
+    ])
     let relativePath = relativePath(for: url, root: root)
     let isDirectory = values?.isDirectory == true
     let isRegularFile = values?.isRegularFile == true
@@ -1648,7 +2372,7 @@ enum WorkspaceScanner {
     }
 
     return WorkspaceDirectoryEntry(
-      url: url,
+      url: standardizedURL,
       relativePath: relativePath,
       isDirectory: isDirectory,
       isRegularFile: isRegularFile
@@ -1880,7 +2604,7 @@ final class DocumentStore {
   @discardableResult
   func restoreRecoveredDraft(into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
-    guard let draft = recoveryStore.loadDrafts().first else { return false }
+    guard let draft = recoveryStore.claimDraftForRestore() else { return false }
 
     self.appState = appState
     autosaver.cancel()
@@ -2090,8 +2814,9 @@ final class DocumentStore {
 
   private func documentRef(for url: URL, appState: AppState) -> DocumentRef {
     let standardizedURL = url.standardizedFileURL
+    let standardizedPath = standardizedURL.path
     if let existing = appState.allDocuments.first(where: {
-      $0.url.standardizedFileURL == standardizedURL
+      $0.url.path == standardizedPath
     }) {
       return existing
     }
@@ -2129,11 +2854,12 @@ final class DocumentStore {
   private func registerSavedDocument(
     _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState
   ) {
-    let isNewSessionURL = previousID?.standardizedFileURL != ref.id.standardizedFileURL
+    let refPath = ref.id.path
+    let isNewSessionURL = previousID?.path != refPath
 
     if ref.isAdHoc {
       if !appState.openFiles.contains(where: {
-        $0.id.standardizedFileURL == ref.id.standardizedFileURL
+        $0.id.path == refPath
       }
       ) {
         appState.openFiles.append(ref)
@@ -2148,7 +2874,7 @@ final class DocumentStore {
         }
       }
     } else if !appState.documents.contains(where: {
-      $0.id.standardizedFileURL == ref.id.standardizedFileURL
+      $0.id.path == refPath
     }) {
       appState.documents.append(ref)
     }
@@ -2215,13 +2941,11 @@ final class DocumentStore {
 private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
   guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
 
-  let activeID =
-    protectedID?.standardizedFileURL
-    ?? appState.selectedDocumentID?.standardizedFileURL
+  let activePath = (protectedID ?? appState.selectedDocumentID)?.path
   var protected: DocumentRef?
   var candidates = appState.openFiles
-  if let activeID,
-    let index = candidates.firstIndex(where: { $0.id.standardizedFileURL == activeID })
+  if let activePath,
+    let index = candidates.firstIndex(where: { $0.id.path == activePath })
   {
     protected = candidates.remove(at: index)
   }

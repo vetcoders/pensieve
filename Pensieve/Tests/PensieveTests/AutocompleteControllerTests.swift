@@ -64,11 +64,14 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 
   func testNewKeystrokeCancelsPriorTaskBeforeEngineCompletes() async {
+    let staleTaskGate = AsyncGate()
+    let staleTaskStarted = expectation(description: "stale completion task started")
     let staleTaskObservedCancellation = expectation(
       description: "stale completion task observed cancellation")
     let engine = MockVistaAutocompleteEngine(completionHandler: { prefix, _ in
       if prefix == "alpha" {
-        await nonCancellableSleep(nanoseconds: 80_000_000)
+        staleTaskStarted.fulfill()
+        await staleTaskGate.wait()
         XCTAssertTrue(Task.isCancelled)
         staleTaskObservedCancellation.fulfill()
         return " stale"
@@ -78,11 +81,12 @@ final class AutocompleteControllerTests: XCTestCase {
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
 
     controller.textDidChange(prefix: "alpha")
-    try? await Task.sleep(nanoseconds: 20_000_000)
+    await fulfillment(of: [staleTaskStarted], timeout: 1.0)
     controller.textDidChange(prefix: "alpha b")
+    await staleTaskGate.open()
 
     await fulfillment(of: [staleTaskObservedCancellation], timeout: 1.0)
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { controller.suggestion == " fresh" }
 
     XCTAssertEqual(controller.suggestion, " fresh")
     XCTAssertNotEqual(controller.suggestion, " stale")
@@ -97,6 +101,145 @@ final class AutocompleteControllerTests: XCTestCase {
 
     XCTAssertEqual(surface.textStorage.string, "hello world")
     XCTAssertNil(surface.textView.autocompleteGhostText)
+  }
+
+  func testOnlyAppliedSuggestionCommitsDocumentSession() async {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AutocompleteSessionTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = DocumentAISessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" }),
+      debounceNanoseconds: 1,
+      sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: true,
+      documentID: "doc-accept",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 5, length: 0))
+    controller.textDidChange(
+      context: AutocompleteContext(beforeCursor: "hello", afterCursor: ""),
+      replacementRange: NSRange(location: 5, length: 0))
+    await waitUntil { controller.suggestion == " world" }
+    surface.textView.setAutocompleteGhost(" world", at: 5)
+
+    XCTAssertTrue(surface.acceptAutocompleteSuggestion())
+    XCTAssertEqual(store.session(for: "doc-accept").acceptedTurns.map(\.output), [" world"])
+  }
+
+  func testDismissedSuggestionDoesNotCommitDocumentSession() async {
+    let store = DocumentAISessionStore(
+      fileURL: FileManager.default.temporaryDirectory
+        .appendingPathComponent("dismissed-\(UUID().uuidString).json"))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(completionHandler: { _, _ in " world" }),
+      debounceNanoseconds: 1,
+      sessionStore: store)
+    controller.configureDocument(id: "doc-dismiss")
+    controller.textDidChange(
+      context: AutocompleteContext(beforeCursor: "hello", afterCursor: ""),
+      replacementRange: NSRange(location: 5, length: 0))
+    await waitUntil { controller.suggestion == " world" }
+
+    controller.cancel()
+
+    XCTAssertTrue(store.session(for: "doc-dismiss").acceptedTurns.isEmpty)
+  }
+
+  func testNativeUndoRestoresExactBytesAndInvalidatesOpaqueContinuation() {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("undo-session-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    store.save(
+      DocumentAISession(
+        documentID: "doc-undo",
+        providerFingerprint: ProviderFingerprint(
+          shape: .openAIResponses,
+          endpoint: "https://api.openai.com/v1/responses",
+          model: "gpt-test"),
+        acceptedTurns: [AcceptedAITurn(input: "hello", output: " world")],
+        continuation: .openAI(previousResponseID: "resp-committed")))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(), debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello world",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-undo",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 11, length: 0))
+
+    surface.textView.insertText("!", replacementRange: NSRange(location: 11, length: 0))
+    XCTAssertEqual(surface.textStorage.string, "hello world!")
+    surface.textView.undoManager?.undo()
+
+    XCTAssertEqual(surface.textStorage.string, "hello world")
+    XCTAssertEqual(store.session(for: "doc-undo").continuation, .none)
+  }
+
+  func testRewriteUsesExactSelectionAndAcceptsAsOneUndoableEdit() async {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("rewrite-session-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    let backend = RewriteStubBackend(output: "A polished sentence.")
+    let controller = AutocompleteController(
+      completionFactory: { backend }, debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "A rough sentence.",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-rewrite",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 0, length: 17))
+
+    surface.applyRewriteCommand(AIRewriteCommand(action: .request(.improve)))
+    await waitUntil { controller.rewritePreview != nil }
+    XCTAssertEqual(backend.context?.text, "A rough sentence.")
+    surface.applyRewriteCommand(AIRewriteCommand(action: .accept))
+
+    XCTAssertEqual(surface.textStorage.string, "A polished sentence.")
+    surface.textView.undoManager?.undo()
+    XCTAssertEqual(surface.textStorage.string, "A rough sentence.")
+    XCTAssertEqual(store.session(for: "doc-rewrite").continuation, .none)
+  }
+
+  func testRewriteWithoutSelectionUsesCurrentParagraphAndRefusesStaleRange() async {
+    let backend = RewriteStubBackend(output: "Rewritten second paragraph.")
+    let controller = AutocompleteController(
+      completionFactory: { backend }, debounceNanoseconds: 1)
+    let original = "First paragraph.\nSecond paragraph.\nThird paragraph."
+    let surface = MarkdownEditorSurface(
+      text: original,
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-stale-rewrite",
+      autocompleteController: controller)
+    surface.textView.setSelectedRange(NSRange(location: 20, length: 0))
+    surface.applyRewriteCommand(AIRewriteCommand(action: .request(.improve)))
+    await waitUntil { controller.rewritePreview != nil }
+    XCTAssertEqual(backend.context?.text, "Second paragraph.")
+
+    surface.textView.insertText("X", replacementRange: NSRange(location: 0, length: 0))
+    surface.applyRewriteCommand(AIRewriteCommand(action: .accept))
+
+    XCTAssertEqual(surface.textStorage.string, "X" + original)
+    XCTAssertNil(controller.rewritePreview)
   }
 
   func testDismissAutocompleteDoesNotMutateTextStorage() {
@@ -186,11 +329,11 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(factoryCalls.value, 0, "the factory must not run at construction time")
 
     controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { controller.suggestion == " world" }
     XCTAssertEqual(controller.suggestion, " world")
 
     controller.textDidChange(prefix: "hello w")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { factoryCalls.value == 1 }
 
     XCTAssertEqual(factoryCalls.value, 1, "the resolved engine must be cached across requests")
   }
@@ -218,18 +361,20 @@ final class AutocompleteControllerTests: XCTestCase {
     controller.textDidChange(prefix: "hello")
     await waitUntil {
       attempts.value == 1
-        && controller.lastError?.hasPrefix("completion LLM unavailable") == true
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
     }
 
     XCTAssertEqual(attempts.value, 1)
-    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
 
     controller.textDidChange(prefix: "hello a")
     try? await Task.sleep(nanoseconds: 80_000_000)
 
     XCTAssertEqual(
       attempts.value, 1, "typed unavailable must not be retried per keystroke")
-    XCTAssertTrue(controller.lastError?.hasPrefix("completion LLM unavailable") == true)
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
     XCTAssertNil(controller.suggestion)
   }
 
@@ -243,7 +388,7 @@ final class AutocompleteControllerTests: XCTestCase {
 
     controller.textDidChange(prefix: "hello")
     try? await Task.sleep(nanoseconds: 80_000_000)
-    XCTAssertEqual(controller.lastError, "completion request failed: connection reset")
+    XCTAssertEqual(controller.lastError, "AI autocomplete failed: connection reset")
 
     controller.textDidChange(prefix: "hello a")
     try? await Task.sleep(nanoseconds: 80_000_000)
@@ -270,6 +415,93 @@ final class AutocompleteControllerTests: XCTestCase {
     try? await Task.sleep(nanoseconds: 80_000_000)
 
     XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
+  }
+
+  func testCancelIgnoresUnavailableErrorFromCancelledRequest() async {
+    let attempts = AttemptCounter()
+    let firstRequestStarted = expectation(description: "first request reached the engine")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      if attempts.value == 1 {
+        firstRequestStarted.fulfill()
+        await nonCancellableSleep(nanoseconds: 100_000_000)
+        throw VistaError.ModelError(
+          msg: "completion LLM unavailable: set LLM_ENDPOINT")
+      }
+      return " fresh"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await fulfillment(of: [firstRequestStarted], timeout: 1.0)
+    controller.cancel()
+    try? await Task.sleep(nanoseconds: 150_000_000)
+
+    XCTAssertNil(
+      controller.lastError,
+      "a cancelled request must not restore an error or unavailable latch")
+
+    controller.textDidChange(prefix: "hello again")
+    await waitUntil {
+      controller.suggestion == " fresh"
+    }
+
+    XCTAssertEqual(attempts.value, 2, "cancel() must keep the explicit retry path open")
+  }
+
+  func testControllerDeinitCancelsInFlightRequest() async {
+    let requestStarted = expectation(description: "request reached the engine")
+    let requestCancelled = expectation(description: "deinit cancelled the request")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      requestStarted.fulfill()
+      do {
+        try await Task.sleep(nanoseconds: 10_000_000_000)
+        return " should not complete"
+      } catch is CancellationError {
+        requestCancelled.fulfill()
+        throw CancellationError()
+      }
+    })
+    var controller: AutocompleteController? = AutocompleteController(
+      engine: engine, debounceNanoseconds: 1)
+    weak let weakController = controller
+
+    controller?.textDidChange(prefix: "hello")
+    await fulfillment(of: [requestStarted], timeout: 1.0)
+    controller = nil
+
+    await fulfillment(of: [requestCancelled], timeout: 1.0)
+    XCTAssertNil(weakController, "the completion task must not retain its controller")
+  }
+
+  func testCompositionCancelsInFlightRequestAndSuppressesProviderState() async {
+    let attempts = AttemptCounter()
+    let firstRequestStarted = expectation(description: "first request reached the engine")
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      attempts.increment()
+      if attempts.value == 1 {
+        firstRequestStarted.fulfill()
+        await nonCancellableSleep(nanoseconds: 100_000_000)
+        return " stale"
+      }
+      return " fresh"
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await fulfillment(of: [firstRequestStarted], timeout: 1.0)
+    controller.textDidChange(prefix: "helloに", isComposing: true)
+    try? await Task.sleep(nanoseconds: 150_000_000)
+
+    XCTAssertNil(controller.suggestion)
+    XCTAssertNil(controller.lastError)
+    XCTAssertEqual(attempts.value, 1, "composition updates must not reach the provider")
+
+    controller.textDidChange(prefix: "hello日本")
+    await waitUntil {
+      controller.suggestion == " fresh"
+    }
+    XCTAssertEqual(attempts.value, 2)
   }
 
   func testInitEnabledFlagSurvivesToTypingPath() async {
@@ -411,6 +643,28 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertTrue(bounded.hasSuffix("😀"))
   }
 
+  func testBoundedAutocompleteContextPreservesBothSidesOfCaret() {
+    let text = "Przed kursorem?Po kursorze." as NSString
+    let caret = ("Przed kursorem?" as NSString).length
+
+    let context = MarkdownEditorSurface.boundedAutocompleteContext(
+      text, caret: caret, beforeMaxUTF16: 9, afterMaxUTF16: 11)
+
+    XCTAssertEqual(context.beforeCursor, "kursorem?")
+    XCTAssertEqual(context.afterCursor, "Po kursorze")
+  }
+
+  func testBoundedAutocompleteContextDoesNotSplitSuffixEmoji() {
+    let text = "start😀middle" as NSString
+    let caret = ("start" as NSString).length
+
+    let context = MarkdownEditorSurface.boundedAutocompleteContext(
+      text, caret: caret, beforeMaxUTF16: 20, afterMaxUTF16: 1)
+
+    XCTAssertEqual(context.beforeCursor, "start")
+    XCTAssertEqual(context.afterCursor, "😀")
+  }
+
   func testTypingPathSendsBoundedPrefix() async {
     let cap = MarkdownEditorSurface.autocompletePrefixMaxUTF16
     let capturedLength = AttemptCounter()
@@ -486,10 +740,52 @@ final class AutocompleteControllerTests: XCTestCase {
       AutocompleteController.singleLineSuggestion(from: " world\nand more\nlines"), " world")
     XCTAssertEqual(
       AutocompleteController.singleLineSuggestion(from: "\n\nlate start\ntail"), "late start")
+    XCTAssertEqual(
+      AutocompleteController.singleLineSuggestion(from: " \t\n  useful continuation\ntail"),
+      "  useful continuation")
     XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: " world"), " world")
     XCTAssertEqual(AutocompleteController.singleLineSuggestion(from: "hello\n"), "hello")
     XCTAssertNil(AutocompleteController.singleLineSuggestion(from: "\n\n"))
+    XCTAssertNil(AutocompleteController.singleLineSuggestion(from: " \t\n  \n"))
     XCTAssertNil(AutocompleteController.singleLineSuggestion(from: ""))
+  }
+
+  func testUnavailableErrorsUseProviderWordingWithoutKernelDetails() async {
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      throw VistaError.ModelError(
+        msg: "completion LLM unavailable: set LLM_ENDPOINT or LLM_ASSISTIVE_ENDPOINT")
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await waitUntil {
+      controller.lastError != nil
+    }
+
+    XCTAssertEqual(
+      controller.lastError, AutocompleteController.completionProviderUnavailableMessage)
+    XCTAssertFalse(controller.lastError?.localizedCaseInsensitiveContains("vista") == true)
+    XCTAssertFalse(controller.lastError?.contains("LLM_ENDPOINT") == true)
+  }
+
+  func testEditorSurfacePublishesAutocompleteFailureToProductStatusSink() async {
+    let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in
+      throw VistaError.ModelError(msg: "completion request failed: provider offline")
+    })
+    let controller = AutocompleteController(engine: engine, debounceNanoseconds: 1)
+    let surface = MarkdownEditorSurface(
+      text: "hello",
+      fontSize: 14,
+      aiAutocompleteEnabled: true,
+      autocompleteController: controller
+    )
+    var observedError: String?
+    surface.onAutocompleteErrorChanged = { observedError = $0 }
+
+    controller.textDidChange(prefix: "hello")
+    await waitUntil { observedError != nil }
+
+    XCTAssertEqual(observedError, "AI autocomplete failed: provider offline")
   }
 
   func testMultilineCompletionPublishesOnlyFirstLine() async {
@@ -505,9 +801,7 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 
   func testAIAutocompleteSettingDefaultsOffAndPersists() {
-    let suiteName = "AutocompleteControllerTests.\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "AutocompleteControllerTests")
 
     let model = DocumentWindowModel(defaults: defaults)
     XCTAssertFalse(model.aiAutocompleteEnabled)
@@ -546,6 +840,62 @@ private func nonCancellableSleep(nanoseconds: UInt64) async {
     DispatchQueue.global().asyncAfter(deadline: .now() + .nanoseconds(Int(nanoseconds))) {
       continuation.resume()
     }
+  }
+}
+
+private actor AsyncGate {
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var isOpen = false
+
+  func wait() async {
+    if isOpen { return }
+    await withCheckedContinuation { continuation in
+      self.continuation = continuation
+    }
+  }
+
+  func open() {
+    isOpen = true
+    continuation?.resume()
+    continuation = nil
+  }
+}
+
+private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, @unchecked Sendable {
+  private let lock = NSLock()
+  private let output: String
+  private var storedContext: RewriteContext?
+
+  init(output: String) {
+    self.output = output
+  }
+
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
+    output
+  }
+
+  func rewrite(
+    context: RewriteContext,
+    intent: RewriteIntent,
+    session: DocumentAISession
+  ) async throws -> AICandidate {
+    lock.withLock {
+      storedContext = context
+    }
+    return AICandidate(
+      documentID: session.documentID,
+      text: output,
+      providerInput: context.text,
+      providerFingerprint: ProviderFingerprint(
+        shape: .openAIResponses, endpoint: "https://rewrite.test/v1/responses", model: "test"),
+      pendingContinuation: .openAI(previousResponseID: "resp-rewrite"),
+      invalidatedOpaqueContinuation: false,
+      documentRevision: context.documentRevision,
+      replacementRange: NSRange(location: context.rangeLocation, length: context.rangeLength))
+  }
+
+  var context: RewriteContext? {
+    lock.withLock { storedContext }
   }
 }
 

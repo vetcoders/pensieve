@@ -9,7 +9,7 @@ struct TreeFingerprint: Codable, Equatable {
 
   static func compute(rootURL: URL, exclusions: Set<String>) throws -> TreeFingerprint {
     let root = rootURL.standardizedFileURL
-    let scans = WorkspaceScanner.build(rootURLs: [root], exclusions: exclusions)
+    let scans = try WorkspaceScanner.buildCancellable(rootURLs: [root], exclusions: exclusions)
     return try compute(from: scans, root: root)
   }
 
@@ -20,7 +20,8 @@ struct TreeFingerprint: Codable, Equatable {
     }
 
     let sortedRoots = canonicalRootOrder(roots)
-    let scans = WorkspaceScanner.build(rootURLs: sortedRoots, exclusions: exclusions)
+    let scans = try WorkspaceScanner.buildCancellable(
+      rootURLs: sortedRoots, exclusions: exclusions)
     return try compute(from: scans, roots: sortedRoots)
   }
 
@@ -37,6 +38,7 @@ struct TreeFingerprint: Codable, Equatable {
 
     // Fingerprint v1: sorted "relativePath|mtimeSeconds|size" markdown-file tuples from WorkspaceScanner.
     let entries = try documents.map { document in
+      try Task.checkCancellation()
       let relativePath =
         document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
       let values = try document.url.resourceValues(forKeys: [
@@ -53,11 +55,14 @@ struct TreeFingerprint: Codable, Equatable {
       entries
       .map { "\($0.relativePath)|\($0.mtime)|\($0.size)\n" }
       .joined()
+    let folderCount = try scans.reduce(into: 0) { total, scan in
+      total += try visibleFolderCount(in: scan.rootNode)
+    }
 
     return TreeFingerprint(
       treeHash: WorkspaceHash.sha256Hex(payload),
       fileCount: entries.count,
-      folderCount: scans.reduce(0) { $0 + visibleFolderCount(in: $1.rootNode) },
+      folderCount: folderCount,
       computedAt: Date(),
       algorithmVersion: 1
     )
@@ -72,6 +77,7 @@ struct TreeFingerprint: Codable, Equatable {
     let sortedRoots = canonicalRootOrder(roots)
     let documents = scans.flatMap(\.documents)
     let entries = try documents.map { document in
+      try Task.checkCancellation()
       let rootIndex = try rootIndex(for: document, in: sortedRoots)
       let root = sortedRoots[rootIndex]
       let relativePath =
@@ -91,11 +97,14 @@ struct TreeFingerprint: Codable, Equatable {
       entries
       .map { "\($0.relativePath)|\($0.mtime)|\($0.size)\n" }
       .joined()
+    let folderCount = try scans.reduce(into: 0) { total, scan in
+      total += try visibleFolderCount(in: scan.rootNode)
+    }
 
     return TreeFingerprint(
       treeHash: WorkspaceHash.sha256Hex(payload),
       fileCount: entries.count,
-      folderCount: scans.reduce(0) { $0 + visibleFolderCount(in: $1.rootNode) },
+      folderCount: folderCount,
       computedAt: Date(),
       algorithmVersion: 2
     )
@@ -122,11 +131,16 @@ struct TreeFingerprint: Codable, Equatable {
     throw FingerprintError.documentOutsideRoots(documentURL)
   }
 
-  private static func visibleFolderCount(in node: WorkspaceNode) -> Int {
+  private static func visibleFolderCount(in node: WorkspaceNode) throws -> Int {
+    try Task.checkCancellation()
     guard node.kind == .folder, let children = node.children, !children.isEmpty else {
       return 0
     }
-    return 1 + children.reduce(0) { $0 + visibleFolderCount(in: $1) }
+    var count = 1
+    for child in children {
+      count += try visibleFolderCount(in: child)
+    }
+    return count
   }
 
   private struct FingerprintEntry {
@@ -163,7 +177,9 @@ enum BasicCacheVerdict: Equatable {
   }
 }
 
-final class WorkspaceCacheStore {
+/// Immutable cache-root handle safe to share with detached validation jobs. Encoders/decoders are
+/// created per operation below; Foundation coders are not shared across threads.
+final class WorkspaceCacheStore: @unchecked Sendable {
   static let shared = WorkspaceCacheStore()
 
   private static let protectedWriteOptions: Data.WritingOptions = [
@@ -175,8 +191,6 @@ final class WorkspaceCacheStore {
   ]
 
   private let baseDirectory: URL
-  private let encoder = JSONEncoder()
-  private let decoder = JSONDecoder()
 
   convenience init() {
     self.init(baseDirectory: WorkspaceMetadataStore.applicationSupportDirectory())
@@ -184,7 +198,6 @@ final class WorkspaceCacheStore {
 
   init(baseDirectory: URL) {
     self.baseDirectory = baseDirectory
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
   }
 
   func ensureCacheRoot(for identity: WorkspaceIdentity) throws -> URL {
@@ -197,13 +210,13 @@ final class WorkspaceCacheStore {
   func writeTreeFingerprint(_ fingerprint: TreeFingerprint, for identity: WorkspaceIdentity) throws
   {
     let root = try ensureCacheRoot(for: identity)
-    let data = try encoder.encode(fingerprint)
+    let data = try Self.jsonEncoder().encode(fingerprint)
     try Self.writeProtected(data, to: root.appendingPathComponent("tree-fingerprint.json"))
   }
 
   func writeManifest(_ manifest: WorkspaceManifest, for identity: WorkspaceIdentity) throws {
     let root = try ensureCacheRoot(for: identity)
-    let data = try encoder.encode(manifest)
+    let data = try Self.jsonEncoder().encode(manifest)
     try Self.writeProtected(data, to: root.appendingPathComponent("manifest.json"))
   }
 
@@ -216,8 +229,18 @@ final class WorkspaceCacheStore {
     _ signature: WorkspaceSignature, for identity: WorkspaceIdentity
   ) throws {
     let root = try ensureCacheRoot(for: identity)
-    let data = try encoder.encode(signature)
+    let data = try Self.jsonEncoder().encode(signature)
     try Self.writeProtected(data, to: root.appendingPathComponent("search-signature.json"))
+  }
+
+  /// Persists the already-built sidebar/document tree as a compact binary plist. This is the
+  /// presentation cache: a relaunch can publish the last known-good workspace immediately while
+  /// a fresh filesystem walk validates it in the background. Search correctness remains guarded
+  /// independently by the signature + index cache.
+  func writeWorkspaceScans(_ scans: [WorkspaceScan], for identity: WorkspaceIdentity) throws {
+    let root = try ensureCacheRoot(for: identity)
+    let data = try Self.treeEncoder().encode(scans)
+    try Self.writeProtected(data, to: root.appendingPathComponent("workspace-tree.plist"))
   }
 
   func clearCache(for identity: WorkspaceIdentity) throws {
@@ -252,6 +275,11 @@ final class WorkspaceCacheStore {
       .appendingPathComponent("search-signature.json", isDirectory: false)
   }
 
+  func workspaceScansURL(for identity: WorkspaceIdentity) -> URL {
+    cacheRootURL(for: identity)
+      .appendingPathComponent("workspace-tree.plist", isDirectory: false)
+  }
+
   func readTreeFingerprint(for identity: WorkspaceIdentity) throws -> TreeFingerprint? {
     guard existingCacheRoot(for: identity) != nil else {
       return nil
@@ -261,7 +289,7 @@ final class WorkspaceCacheStore {
       return nil
     }
     let data = try Data(contentsOf: url)
-    return try decoder.decode(TreeFingerprint.self, from: data)
+    return try JSONDecoder().decode(TreeFingerprint.self, from: data)
   }
 
   func readManifest(for identity: WorkspaceIdentity) throws -> WorkspaceManifest? {
@@ -273,7 +301,7 @@ final class WorkspaceCacheStore {
       return nil
     }
     let data = try Data(contentsOf: url)
-    return try decoder.decode(WorkspaceManifest.self, from: data)
+    return try JSONDecoder().decode(WorkspaceManifest.self, from: data)
   }
 
   /// Reads the persisted `.md` signature for this workspace identity, or nil when none exists
@@ -289,7 +317,15 @@ final class WorkspaceCacheStore {
     else {
       return nil
     }
-    return try? decoder.decode(WorkspaceSignature.self, from: data)
+    return try? JSONDecoder().decode(WorkspaceSignature.self, from: data)
+  }
+
+  func readWorkspaceScans(for identity: WorkspaceIdentity) throws -> [WorkspaceScan]? {
+    guard existingCacheRoot(for: identity) != nil else { return nil }
+    let url = workspaceScansURL(for: identity)
+    guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    return try PropertyListDecoder().decode([WorkspaceScan].self, from: data)
   }
 
   private func cacheRootURL(for identity: WorkspaceIdentity) -> URL {
@@ -299,11 +335,23 @@ final class WorkspaceCacheStore {
   }
 
   private func writeIdentityIfNeeded(_ identity: WorkspaceIdentity, to url: URL) throws {
-    let data = try encoder.encode(identity)
+    let data = try Self.jsonEncoder().encode(identity)
     if let existing = try? Data(contentsOf: url), existing == data {
       return
     }
     try Self.writeProtected(data, to: url)
+  }
+
+  private static func jsonEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    return encoder
+  }
+
+  private static func treeEncoder() -> PropertyListEncoder {
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+    return encoder
   }
 
   private static func writeProtected(_ data: Data, to url: URL) throws {

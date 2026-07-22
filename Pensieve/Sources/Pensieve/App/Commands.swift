@@ -27,7 +27,8 @@ struct PensieveCommands: Commands {
       ActivePensieveCommands(
         appState: appState,
         controller: controller,
-        themeManager: themeManager
+        themeManager: themeManager,
+        recentDocuments: controller.recentDocuments
       )
     }
   }
@@ -38,6 +39,7 @@ private struct ActivePensieveCommands: Commands {
   var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
+  @ObservedObject var recentDocuments: RecentDocumentsStore
 
   var body: some Commands {
     CommandGroup(replacing: .appInfo) {
@@ -59,6 +61,27 @@ private struct ActivePensieveCommands: Commands {
         openFile()
       }
       .keyboardShortcut("o", modifiers: [.command])
+
+      Menu("Open Recent") {
+        ForEach(recentDocuments.recentDocuments, id: \.self) { url in
+          Button(RecentDocumentsStore.menuTitle(for: url)) {
+            controller.openRecentDocument(url: url)
+          }
+        }
+
+        if !recentDocuments.recentDocuments.isEmpty {
+          Divider()
+        }
+
+        Button("Clear Menu") {
+          recentDocuments.clear()
+        }
+        .disabled(recentDocuments.recentDocuments.isEmpty)
+      }
+
+      Button("Import Word or PDF…") {
+        importDocument()
+      }
 
       Button("Open Folder…") {
         openFolder()
@@ -129,6 +152,16 @@ private struct ActivePensieveCommands: Commands {
       }
       .disabled(!appState.documentHasEditableBuffer)
 
+      Button("Export Word (.docx)…") {
+        DocumentExport.exportDOCX(
+          session: appState.documentSession,
+          theme: themeManager.current,
+          fontSize: appState.fontSize,
+          themeManager: themeManager
+        )
+      }
+      .disabled(!appState.documentHasEditableBuffer)
+
       Divider()
 
       Button("Rename") {
@@ -171,12 +204,6 @@ private struct ActivePensieveCommands: Commands {
     }
 
     CommandGroup(after: .toolbar) {
-      Button(transcriptionTaflaMenuTitle) {
-        controller.toggleTranscriptionTafla()
-      }
-      .keyboardShortcut("t", modifiers: [.command, .option])
-      .accessibilityIdentifier("pensieve.tafla.menu.viewToggle")
-
       Toggle(
         "AI Autocomplete",
         isOn: Binding(
@@ -272,10 +299,11 @@ private struct ActivePensieveCommands: Commands {
 
     // Tab navigation (Quick Win)
     CommandGroup(after: .windowArrangement) {
-      Button(transcriptionTaflaMenuTitle) {
+      Button(dictationMenuTitle) {
         controller.toggleTranscriptionTafla()
       }
-      .accessibilityIdentifier("pensieve.tafla.menu.windowToggle")
+      .keyboardShortcut("d", modifiers: [.command, .option])
+      .accessibilityIdentifier("pensieve.dictation.menu.windowToggle")
 
       Divider()
 
@@ -290,14 +318,15 @@ private struct ActivePensieveCommands: Commands {
       .keyboardShortcut("[", modifiers: [.command, .shift])
     }
 
-    // Agents menu — fast dispatch path for the ACTIVE document: default agent,
-    // workspace root, workflow from the curated deck. The toolbar ✈ sheet stays
-    // the configurable path (agent/root pickers, in-sheet confirmation).
+    // Agents menu — every item opens the SAME configuration sheet as the
+    // toolbar ✈ (one gateway: subject + workflow/agent/root pickers + explicit
+    // Dispatch confirmation). A menu click never launches a run by itself; it
+    // only preselects the clicked workflow for the ACTIVE document.
     // Sandboxed (App Store) build: items stay visible but disabled — dispatch
     // spawns external processes the sandbox forbids (SandboxCapabilities).
     CommandMenu("Agents") {
-      Button("Dispatch Document to Agent") {
-        controller.dispatchCurrentDocumentToAgent(workflow: "implement")
+      Button("Dispatch Document to Agent…") {
+        controller.requestCurrentDocumentDispatch(workflow: "implement", source: .agentsMenu)
       }
       .keyboardShortcut("d", modifiers: [.command, .shift])
       .disabled(
@@ -308,8 +337,9 @@ private struct ActivePensieveCommands: Commands {
 
       Menu("Dispatch Document with Workflow") {
         ForEach(controller.agentWorkflows, id: \.self) { workflow in
-          Button(workflow) {
-            controller.dispatchCurrentDocumentToAgent(workflow: workflow)
+          Button("\(workflow)…") {
+            controller.requestCurrentDocumentDispatch(
+              workflow: workflow, source: .agentsWorkflowMenu)
           }
         }
       }
@@ -442,10 +472,23 @@ private struct ActivePensieveCommands: Commands {
     panel.canChooseFiles = true
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
-    panel.allowedContentTypes = markdownContentTypes
+    panel.allowedContentTypes = openableContentTypes
     panel.prompt = "Open"
     if panel.runModal() == .OK, let url = panel.url {
-      controller.openFile(url: url)
+      controller.openFileInCurrentWindow(url: url)
+    }
+  }
+
+  private func importDocument() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = documentImportContentTypes
+    panel.prompt = "Import"
+    panel.message = "Word and text-based PDF files open as unsaved Markdown drafts."
+    if panel.runModal() == .OK, let url = panel.url {
+      controller.importDocument(url: url)
     }
   }
 
@@ -477,16 +520,7 @@ private struct ActivePensieveCommands: Commands {
 
   private func moveSidebarTargetToTrash() {
     guard let url = sidebarActionTargetURL else { return }
-    if isDirectory(url) {
-      let alert = NSAlert()
-      alert.messageText = "Move \(url.lastPathComponent) to Trash?"
-      alert.informativeText = "This folder and its contents will move to the system Trash."
-      alert.alertStyle = .warning
-      alert.addButton(withTitle: "Move to Trash")
-      alert.addButton(withTitle: "Cancel")
-      guard alert.runModal() == .alertFirstButtonReturn else { return }
-    }
-    controller.moveItemToTrash(url: url)
+    Task { await controller.moveItemToTrash(url: url) }
   }
 
   private func excludeFromWorkspace() {
@@ -509,16 +543,24 @@ private struct ActivePensieveCommands: Commands {
     ].compactMap { $0 }
   }
 
+  private var documentImportContentTypes: [UTType] {
+    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
+  }
+
+  private var openableContentTypes: [UTType] {
+    markdownContentTypes + documentImportContentTypes
+  }
+
   private var sidebarActionTargetURL: URL? {
     appState.sidebarFocusedURL
       ?? appState.documentURL
       ?? appState.selectedDocumentID
   }
 
-  private var transcriptionTaflaMenuTitle: String {
+  private var dictationMenuTitle: String {
     controller.isTranscriptionTaflaVisible
-      ? "Hide Transcription Tafla"
-      : "Show Transcription Tafla"
+      ? "Hide Dictation"
+      : "Show Dictation"
   }
 
   private func isDirectory(_ url: URL) -> Bool {

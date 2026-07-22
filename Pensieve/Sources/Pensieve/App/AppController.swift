@@ -3,17 +3,26 @@ import Combine
 import CoreGraphics
 import Foundation
 
+private enum DocumentImportOutcome: Sendable {
+  case success(ImportedMarkdownDocument)
+  case failure(String)
+}
+
 @MainActor
 final class AppController: ObservableObject {
+  typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+
   private let appState: AppState
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let documentWindowRegistry: DocumentWindowRegistry
+  let recentDocuments: RecentDocumentsStore
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
+  private let confirmFolderTrash: FolderTrashConfirmation
   let agentWorkflows: [String] = [
     "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
     "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
@@ -23,12 +32,20 @@ final class AppController: ObservableObject {
   /// Agents discovered at runtime from `vibecrafted doctor` (agent-stream:<name>).
   /// `discoverAgents()` refines this, but it only overwrites on a NON-empty probe,
   /// and current `vibecrafted doctor` output no longer emits `agent-stream:<name>`
-  /// markers — so this seed is what the picker actually shows. Seed the full
-  /// canonical fleet (matches the `vibecrafted` command deck) instead of a single
-  /// agent, so the operator can pick any of them without waiting on broken probing.
+  /// markers — so this seed is what the picker actually shows. Seed the canonical
+  /// fleet the live CLI actually accepts (gemini was removed from the deployed
+  /// AGENTS set); offering an agent the CLI rejects turns a confirmed dispatch
+  /// into a guaranteed failure.
   @Published var availableAgents: [String] = [
-    "claude", "codex", "gemini", "agy", "junie", "grok",
+    "claude", "codex", "agy", "junie", "grok",
   ]
+  /// Capability truth from `vibecrafted capabilities --json` (W2-C): the ONLY
+  /// authority on whether a workflow runs one agent or a swarm, who the swarm
+  /// members are, and which configured tokens are unsupported. Probed fresh on
+  /// every sheet presentation — never cached across the operator's config edits.
+  @Published private(set) var workflowCapabilitiesState: WorkflowCapabilitiesState = .idle
+  private let workflowCapabilitiesProvider: WorkflowCapabilitiesProviding
+  private var workflowCapabilitiesRefreshTask: Task<Void, Never>?
   let transcriptionService: TranscriptionService
   private lazy var transcriptionTaflaPanel: TranscriptionTaflaPanelController = {
     let panel = TranscriptionTaflaPanelController(
@@ -42,6 +59,7 @@ final class AppController: ObservableObject {
   }()
   private var didStart = false
   private var isAgentDispatchInFlight = false
+  private var documentImportTask: Task<Void, Never>?
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
@@ -63,22 +81,37 @@ final class AppController: ObservableObject {
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
+    recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
+    workflowCapabilitiesProvider: WorkflowCapabilitiesProviding =
+      VibecraftedWorkflowCapabilitiesProvider(),
     agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
-    workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000
+    workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000,
+    confirmFolderTrash: @escaping FolderTrashConfirmation = { url in
+      let alert = NSAlert()
+      alert.messageText = "Move \(url.lastPathComponent) to Trash?"
+      alert.informativeText = "This folder and its contents will move to the system Trash."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Move to Trash")
+      alert.addButton(withTitle: "Cancel")
+      return alert.runModal() == .alertFirstButtonReturn
+    }
   ) {
     self.appState = appState
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
+    self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
+    self.workflowCapabilitiesProvider = workflowCapabilitiesProvider
     self.agentWorkspaceRoot = agentWorkspaceRoot
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
+    self.confirmFolderTrash = confirmFolderTrash
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -93,9 +126,14 @@ final class AppController: ObservableObject {
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
-    let restoredDraft = documentStore.restoreRecoveredDraft(into: appState)
+    // Recovery drafts belong to the plain-launch restore path ONLY. A window
+    // started for a specific document (`restoringWorkspace: false` — a new
+    // document tab, an explicit file launch) must keep its buffer empty:
+    // adopting the pending draft here hijacked every new tab with "Recovered
+    // Untitled", and the dirty untitled session then blocked the load of the
+    // document the window was opened for.
     guard restoringWorkspace else { return }
-    if restoredDraft {
+    if documentStore.restoreRecoveredDraft(into: appState) {
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
@@ -131,7 +169,13 @@ final class AppController: ObservableObject {
       return
     }
 
+    if DocumentTransfer.isImportable(standardizedURL) {
+      importDocument(url: standardizedURL)
+      return
+    }
+
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
+      noteRecentDocumentIfOpened(standardizedURL)
       return
     }
 
@@ -159,10 +203,84 @@ final class AppController: ObservableObject {
     }
     DebugTrace.log("openFile -> load in current window: \(ref.id.lastPathComponent)")
     documentStore.load(ref: ref, into: appState)
+    noteRecentDocumentIfOpened(standardizedURL)
   }
 
   func openFileInCurrentWindow(url: URL) {
+    if DocumentTransfer.isImportable(url) {
+      // Import SOURCE files (Word/PDF) become unsaved drafts; the source is
+      // not a recent document. The draft enters history once saved (saveAs).
+      importDocument(url: url)
+      return
+    }
     folderManager.openFile(url: url, into: appState)
+    noteRecentDocumentIfOpened(url)
+  }
+
+  /// Open Recent menu action: same routing discipline as any explicit open
+  /// (an empty window is reused in place, otherwise the file lands as a native
+  /// tab via the window registry — never a competing window path).
+  func openRecentDocument(url: URL) {
+    let standardizedURL = url.standardizedFileURL
+    guard FileManager.default.fileExists(atPath: standardizedURL.path) else {
+      appState.lastError =
+        "Could not open \(standardizedURL.lastPathComponent): the file has been moved or deleted."
+      recentDocuments.refresh()
+      return
+    }
+    openFile(url: standardizedURL)
+  }
+
+  /// Records `url` into Open Recent only when this window's session actually
+  /// shows it — the one truthful post-condition every synchronous open path
+  /// shares. Failed loads (unreadable, dirty-session cancel) never record.
+  private func noteRecentDocumentIfOpened(_ url: URL) {
+    let standardizedURL = url.standardizedFileURL
+    guard appState.documentSession.url?.standardizedFileURL == standardizedURL else { return }
+    recentDocuments.noteOpened(standardizedURL)
+  }
+
+  /// Converts a Word/PDF source off the main actor and opens the result as an
+  /// unsaved Markdown draft. The source file remains untouched; Save therefore
+  /// follows the normal untitled-document Save As path.
+  func importDocument(url: URL) {
+    let sourceURL = url.standardizedFileURL
+    documentImportTask?.cancel()
+    documentImportTask = Task { [weak self] in
+      let outcome = await Task.detached(priority: .userInitiated) {
+        let scopedAccess = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+          if scopedAccess { sourceURL.stopAccessingSecurityScopedResource() }
+        }
+        do {
+          return DocumentImportOutcome.success(
+            try DocumentTransfer.importMarkdown(from: sourceURL)
+          )
+        } catch {
+          return DocumentImportOutcome.failure(error.localizedDescription)
+        }
+      }.value
+
+      guard !Task.isCancelled, let self else { return }
+      documentImportTask = nil
+      switch outcome {
+      case .success(let imported):
+        guard documentStore.prepareForDocumentSwitch(appState: appState) else { return }
+        appState.selectedDocumentID = nil
+        appState.documentSession.restoreUntitled(
+          title: imported.suggestedFileName,
+          text: imported.markdown,
+          recoveryID: UUID()
+        )
+        // The conversion result has no source-backed autosave target. Persist
+        // the dirty untitled session immediately so a crash cannot erase the handoff.
+        documentStore.savePendingChangesOnClose(appState: appState)
+        appState.lastError = nil
+        DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
+      case .failure(let message):
+        appState.lastError = "Import failed: \(message)"
+      }
+    }
   }
 
   @discardableResult
@@ -233,28 +351,46 @@ final class AppController: ObservableObject {
     folderManager.duplicate(url: url, into: appState)
   }
 
-  @discardableResult
-  func moveItemToTrash(url: URL) -> Bool {
+  func moveItemToTrash(url: URL) async -> Bool {
     let source = url.standardizedFileURL
-    guard closeDocumentsAffectedByTrash(at: source) else { return false }
-    return folderManager.moveToTrash(url: source, into: appState)
-  }
+    DebugTrace.log("trash request path=\(source.path)")
 
-  @discardableResult
-  private func closeDocumentsAffectedByTrash(at source: URL) -> Bool {
-    if let selected = appState.selectedDocumentID,
-      isAffectedByTrash(documentID: selected, source: source)
-    {
-      guard documentStore.select(ref: nil, into: appState) else { return false }
+    guard !isWorkspaceRoot(source) else {
+      appState.lastError =
+        "Workspace roots can’t be moved to Trash. Remove the folder from the workspace first, then move it in Finder."
+      DebugTrace.log("trash request rejected root=\(source.path)")
+      return false
     }
 
+    if isDirectory(source), !confirmFolderTrash(source) {
+      DebugTrace.log("trash request cancelled path=\(source.path)")
+      return false
+    }
+
+    guard await folderManager.moveToTrash(url: source, into: appState) else { return false }
+    closeDocumentWindowsAffectedByTrash(at: source)
+    return true
+  }
+
+  private func closeDocumentWindowsAffectedByTrash(at source: URL) {
     let affectedDocumentIDs = documentWindowRegistry.openTabDocumentIDs.filter {
       isAffectedByTrash(documentID: $0, source: source)
     }
     for documentID in affectedDocumentIDs {
       documentWindowRegistry.closeDocumentWindow(documentID)
     }
-    return true
+  }
+
+  private func isWorkspaceRoot(_ source: URL) -> Bool {
+    appState.workspaceRoots.contains {
+      $0.url.standardizedFileURL == source.standardizedFileURL
+    }
+  }
+
+  private func isDirectory(_ source: URL) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory)
+      && isDirectory.boolValue
   }
 
   private func isAffectedByTrash(documentID: URL, source: URL) -> Bool {
@@ -309,6 +445,14 @@ final class AppController: ObservableObject {
     folderManager.addExcludedURLs(urls, into: appState)
   }
 
+  func excludeFromWorkspace(url: URL) {
+    folderManager.addExcludedURLs([url], into: appState)
+  }
+
+  func removeWorkspaceRoot(url: URL) {
+    folderManager.removeRoot(url, into: appState)
+  }
+
   func clearWorkspaceExclusions() {
     folderManager.clearExclusions(into: appState)
   }
@@ -324,10 +468,14 @@ final class AppController: ObservableObject {
   @discardableResult
   func saveActiveDocument(as url: URL) -> Bool {
     let didSave = documentStore.saveAs(appState: appState, to: url)
-    if didSave, let savedURL = appState.documentSession.url,
-      appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(savedURL, in: $0.url) })
-    {
-      folderManager.refresh(into: appState)
+    if didSave, let savedURL = appState.documentSession.url {
+      // A draft (untitled or imported Word/PDF) becomes a real file document
+      // here — that is the moment it earns its Open Recent entry.
+      recentDocuments.noteOpened(savedURL)
+      if appState.workspaceRoots.contains(where: { WorkspaceScanner.contains(savedURL, in: $0.url) }
+      ) {
+        folderManager.refresh(into: appState)
+      }
     }
     return didSave
   }
@@ -367,6 +515,7 @@ final class AppController: ObservableObject {
     }
 
     _ = documentStore.select(ref: ref, into: appState)
+    noteRecentDocumentIfOpened(ref.id)
   }
 
   /// Resolves a sidebar/search row ID to a `DocumentRef`. Resolves via the
@@ -503,20 +652,22 @@ final class AppController: ObservableObject {
     let text = transcriptionService.rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return false }
     guard appState.documentSession.hasEditableBuffer else {
-      appState.lastError = "Open an editable document before sending from Tafla."
+      appState.lastError = "Open an editable document before inserting Dictation."
       return false
     }
 
     if let textView = activeTextView ?? NSApp.keyWindow?.firstResponder as? MarkdownTextView,
-      textView.insertTextAtSelection(text)
+      textView.insertDictationAtSelection(text)
     {
       transcriptionService.resetTranscript()
+      transcriptionService.updateDispatchStatus("Inserted into the active document.")
       appState.lastError = nil
       return true
     }
 
     appendTranscriptionToDocument(text)
     transcriptionService.resetTranscript()
+    transcriptionService.updateDispatchStatus("Inserted at the end of the active document.")
     appState.lastError = nil
     return true
   }
@@ -537,35 +688,72 @@ final class AppController: ObservableObject {
     )
   }
 
+  // MARK: - Dispatch gateway (request → sheet → confirm)
+
+  /// Gateway entry for the CURRENT document (toolbar ✈, Agents menu, Agents
+  /// workflow submenu). Builds the typed intent and asks THIS window's
+  /// `ContentView` to present the canonical configuration sheet — it never
+  /// launches anything. A saved document dispatches as a file, an unsaved
+  /// buffer as its text; both stay editable in the sheet before Dispatch.
   @discardableResult
-  func dispatchCurrentDocumentToAgent(workflow: String) -> Bool {
+  func requestCurrentDocumentDispatch(
+    workflow: String,
+    source: DispatchIntent.Source,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) -> Bool {
+    guard allowsExternalDispatch else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
     guard appState.documentSession.hasEditableBuffer else {
       appState.lastError = "Open an editable document before dispatching to an agent."
       return false
     }
 
+    let subject: DispatchIntent.Subject
     if let url = appState.documentSession.url {
-      return dispatchFileToAgent(workflow: workflow, url: url)
+      subject = .savedDocument(url)
+    } else {
+      subject = .unsavedBuffer(
+        title: appState.documentSession.displayTitle,
+        text: appState.activeDocumentText
+      )
     }
-
-    return dispatchToAgent(
-      workflow: workflow,
-      payload: .prompt(appState.activeDocumentText),
-      label: appState.documentSession.displayTitle
-    )
+    appState.pendingDispatchIntent = DispatchIntent(
+      subject: subject, workflow: workflow, source: source)
+    return true
   }
 
+  /// Gateway entry for a sidebar file action: same sheet, `.file` subject.
   @discardableResult
-  func dispatchFileToAgent(workflow: String, url: URL) -> Bool {
-    dispatchToAgent(
-      workflow: workflow,
-      payload: .file(url.path),
-      label: url.lastPathComponent
-    )
+  func requestFileDispatch(
+    url: URL,
+    workflow: String,
+    source: DispatchIntent.Source,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) -> Bool {
+    guard allowsExternalDispatch else {
+      appState.lastError = SandboxCapabilities.dispatchUnavailableExplanation
+      return false
+    }
+    appState.pendingDispatchIntent = DispatchIntent(
+      subject: .fileURL(url.standardizedFileURL), workflow: workflow, source: source)
+    return true
   }
 
+  /// Default run root the sheet opens with: the injected override (tests,
+  /// scripted launches) wins, then the W1-B remembered root, then workspace/
+  /// document/home fallbacks — the same chain the launch itself uses.
+  func defaultDispatchRoot() -> URL {
+    appState.resolveDispatchRoot(explicitOverride: agentWorkspaceRoot)
+  }
+
+  /// Transcription tafla's "send to agent" funnel. This is NOT a blind UI
+  /// route: it only fires from the tafla's explicit send control, on the
+  /// dictated text itself. Private so no menu/toolbar/sidebar surface can
+  /// reach a launch without the gateway sheet.
   @discardableResult
-  func dispatchToAgent(
+  private func dispatchToAgent(
     workflow: String,
     payload: AgentDispatchPayload,
     label: String,
@@ -587,10 +775,8 @@ final class AppController: ObservableObject {
       startStatus ?? "Dispatching \(label) to \(workflow)...")
     let launcher = agentPromptLauncher
     let agent = defaultAgent
-    let workingDirectoryURL =
-      agentWorkspaceRoot
-      ?? appState.folderURL
-      ?? FileManager.default.homeDirectoryForCurrentUser
+    let workingDirectoryURL = appState.resolveDispatchRoot(
+      explicitOverride: agentWorkspaceRoot)
     let appState = appState
     let transcriptionService = transcriptionService
 
@@ -598,7 +784,7 @@ final class AppController: ObservableObject {
       do {
         let metadata = try launcher.dispatch(
           workflow: workflow,
-          agent: agent,
+          agents: [agent],
           payload: payload,
           workingDirectoryURL: workingDirectoryURL
         )
@@ -645,6 +831,56 @@ final class AppController: ObservableObject {
     transcriptionService.updateDispatchStatus(message)
     appState.lastError = message
     isAgentDispatchInFlight = false
+  }
+
+  // MARK: - Workflow capability truth (W2-C consumption)
+
+  /// How the sheet may present `workflow` right now, from capability truth.
+  /// Pure derivation over the published state — recomputed on every render.
+  func dispatchPlan(for workflow: String) -> WorkflowDispatchPlan {
+    WorkflowDispatchPlanner.plan(workflow: workflow, state: workflowCapabilitiesState)
+  }
+
+  /// Probe `vibecrafted capabilities --json` OFF the main thread. Called on
+  /// every sheet presentation (`force: true` from the sheet, so a config edit
+  /// between two sheets is always picked up) and from the sheet's Retry
+  /// button. Never blocks presentation: the sheet renders the loading state.
+  func refreshWorkflowCapabilities(force: Bool = false) {
+    guard workflowCapabilitiesRefreshTask == nil else { return }
+    if !force, case .loaded = workflowCapabilitiesState { return }
+    workflowCapabilitiesState = .loading
+    let provider = workflowCapabilitiesProvider
+    workflowCapabilitiesRefreshTask = Task.detached(priority: .utility) { [weak self] in
+      let result: Result<WorkflowCapabilities, Error>
+      do {
+        result = .success(try provider.fetchCapabilities())
+      } catch {
+        result = .failure(error)
+      }
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        self.workflowCapabilitiesRefreshTask = nil
+        switch result {
+        case .success(let capabilities):
+          self.workflowCapabilitiesState = .loaded(capabilities)
+          self.adoptCapabilityAgentUniverse(capabilities.agents)
+        case .failure(let error):
+          self.workflowCapabilitiesState = .failed(error.localizedDescription)
+        }
+      }
+    }
+  }
+
+  /// Fold the capability agent universe into the picker: keep the seed's
+  /// preference order for tokens the CLI still accepts, append newly supported
+  /// ones, drop retired ones. `swarm` is an execution-target token, not a
+  /// pickable single-agent lane.
+  private func adoptCapabilityAgentUniverse(_ universe: [String]) {
+    let lanes = universe.filter { $0 != "swarm" }
+    guard !lanes.isEmpty else { return }
+    let kept = availableAgents.filter { lanes.contains($0) }
+    let added = lanes.filter { !kept.contains($0) }
+    availableAgents = kept + added
   }
 
   // MARK: - Agent discovery + Terminal dispatch
@@ -696,28 +932,69 @@ final class AppController: ObservableObject {
     case failure(message: String)
   }
 
-  /// Headless dispatch of the OPEN document via the canonical uv-core entry,
-  /// which prints a parseable launch receipt (run_id / report path) and detaches.
-  /// Returns the outcome so the sheet can show "Dispatched ✓ run: …". The plan is
-  /// always the open document (--file); `rootURL` is only WHERE the agent runs
-  /// (--root). Terminal observability is a separate, user-triggered affordance
+  /// The ONLY UI → launch path: headless dispatch of a confirmed intent via
+  /// the canonical uv-core entry, which prints a parseable launch receipt
+  /// (run_id / report path) and detaches. Called exclusively by the gateway
+  /// sheet's Dispatch button; the sheet shows "Dispatched ✓ run: …" from the
+  /// returned outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
+  /// values; the payload comes from the intent's subject snapshot. Terminal
+  /// observability is a separate, user-triggered affordance
   /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
-  func dispatchOpenDocument(workflow: String, agent: String, rootURL: URL) async
-    -> DocumentDispatchOutcome
-  {
-    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+  func confirmDispatch(
+    intent: DispatchIntent,
+    workflow: String,
+    agents: [String],
+    rootURL: URL,
+    allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
+  ) async -> DocumentDispatchOutcome {
+    guard allowsExternalDispatch else {
       return .failure(message: SandboxCapabilities.dispatchUnavailableExplanation)
     }
-    guard let docURL = appState.documentSession.url else {
-      return .failure(message: "Save the document before dispatching it to an agent.")
+    let payload = intent.payload
+    guard !payload.isEmpty else {
+      return .failure(message: "There is nothing to dispatch — the document is empty.")
     }
+    // Capability gate: the launch must be a shape the workflow's descriptor
+    // sanctions. A single-agent workflow launches with exactly one agent; a
+    // swarm launches with none (its configured members run) or with one
+    // declared synthesizer choice. Unknown semantics never launch.
+    switch dispatchPlan(for: workflow) {
+    case .singleAgent:
+      guard agents.count == 1 else {
+        return .failure(message: "Pick one agent for \(workflow) before dispatching.")
+      }
+    case .swarm(let plan):
+      guard
+        agents.isEmpty
+          || (agents.count == 1 && plan.synthesizerChoices.contains(agents[0]))
+      else {
+        return .failure(
+          message:
+            "\(agents.joined(separator: ", ")) can't take the \(workflow) run. "
+            + "Available: \(plan.synthesizerChoices.joined(separator: ", ")).")
+      }
+    case .loading:
+      return .failure(
+        message: "Still checking how \(workflow) runs. Try again in a moment.")
+    case .unavailable(let reason):
+      return .failure(message: reason)
+    }
+    // Second line of defense behind the sheet's synchronous phase guard: even
+    // if two confirmations race in, only one may reach the launcher.
+    guard !isAgentDispatchInFlight else {
+      return .failure(message: "A dispatch is already running. Wait for it to finish.")
+    }
+    isAgentDispatchInFlight = true
+    defer { isAgentDispatchInFlight = false }
+
     let launcher = agentPromptLauncher
-    let title = appState.documentSession.displayTitle
+    let title = intent.subjectLabel
+    let agentLabel = agents.isEmpty ? "agent team" : agents.joined(separator: ", ")
     do {
       let metadata = try await Task.detached(priority: .userInitiated) {
         try launcher.dispatch(
-          workflow: workflow, agent: agent,
-          payload: .file(docURL.path), workingDirectoryURL: rootURL)
+          workflow: workflow, agents: agents,
+          payload: payload, workingDirectoryURL: rootURL)
       }.value
       guard metadata.exitCode == 0 else {
         appState.lastError = metadata.statusLine
@@ -725,7 +1002,8 @@ final class AppController: ObservableObject {
         return .failure(message: metadata.statusLine)
       }
       appState.lastError = nil
-      let line = "Dispatched \(title) → \(workflow) (\(agent)) in \(rootURL.lastPathComponent)"
+      let line =
+        "Dispatched \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
       transcriptionService.updateDispatchStatus(
         metadata.runID.map { "\(line) · run: \($0)" } ?? line)
       return .success(

@@ -5,12 +5,20 @@ struct ContentView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
-  @State private var showDispatch = false
+  @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
+  @Binding private var hostWindow: NSWindow?
+  private let providerSettings: ProviderSettings
 
-  private var dispatchRoot: URL {
-    appState.folderURL
-      ?? appState.documentURL?.deletingLastPathComponent()
-      ?? FileManager.default.homeDirectoryForCurrentUser
+  @MainActor
+  init(
+    hostWindow: Binding<NSWindow?> = .constant(nil),
+    providerSettings: ProviderSettings = .shared,
+    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil
+  ) {
+    _hostWindow = hostWindow
+    self.providerSettings = providerSettings
+    _providerOnboardingCoordinator = ObservedObject(
+      wrappedValue: providerOnboardingCoordinator ?? .shared)
   }
 
   var body: some View {
@@ -37,7 +45,7 @@ struct ContentView: View {
         controller: controller,
         themeManager: themeManager,
         onDispatchToAgent: {
-          showDispatch = true
+          controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
         },
         isDispatchDisabled:
           !appState.documentHasEditableBuffer
@@ -47,14 +55,89 @@ struct ContentView: View {
           ? "Dispatch to Agent"
           : SandboxCapabilities.dispatchUnavailableExplanation)
     }
-    .sheet(isPresented: $showDispatch) {
+    // The ONE dispatch surface: every route (toolbar, Agents menu, sidebar)
+    // lands as this window's pendingDispatchIntent and presents here, in the
+    // window that raised it. `.sheet(item:)` keys presentation on the intent
+    // itself, so a fresh request while the sheet is up swaps content instead
+    // of queueing a second sheet (W2-G single-presentation discipline).
+    .sheet(item: dispatchIntentBinding) { intent in
       DispatchPopover(
         controller: controller,
-        isPresented: $showDispatch,
-        documentTitle: appState.documentTitle,
-        defaultRoot: dispatchRoot
+        intent: intent,
+        defaultRoot: controller.defaultDispatchRoot(),
+        onRootSelected: { appState.rememberDispatchRoot($0) },
+        onClose: { appState.pendingDispatchIntent = nil }
       )
     }
+    .sheet(isPresented: onboardingSheetBinding) {
+      ProviderOnboardingView(isPresented: onboardingSheetBinding)
+    }
+    .onAppear {
+      evaluateProviderOnboarding()
+    }
+    .onChange(of: hostWindow?.windowNumber) {
+      evaluateProviderOnboarding()
+    }
+    .onChange(of: appState.aiAutocompleteEnabled) {
+      providerOnboardingCoordinator.setAutocompleteEnabled(appState.aiAutocompleteEnabled)
+      evaluateProviderOnboarding()
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(
+        for: NSWindow.didBecomeKeyNotification)
+    ) { notification in
+      guard let window = notification.object as? NSWindow,
+        window === hostWindow
+      else {
+        return
+      }
+      evaluateProviderOnboarding()
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(
+        for: .completionProviderSettingsDidChange)
+    ) { notification in
+      guard let settings = notification.object as? ProviderSettings,
+        settings === providerSettings
+      else {
+        return
+      }
+      providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
+      evaluateProviderOnboarding()
+    }
+  }
+
+  private var dispatchIntentBinding: Binding<DispatchIntent?> {
+    Binding(
+      get: { appState.pendingDispatchIntent },
+      set: { appState.pendingDispatchIntent = $0 }
+    )
+  }
+
+  private var onboardingSheetBinding: Binding<Bool> {
+    Binding(
+      get: { providerOnboardingCoordinator.isPresented(in: hostWindowID) },
+      set: { isPresented in
+        if !isPresented,
+          providerOnboardingCoordinator.isPresented(in: hostWindowID)
+        {
+          providerOnboardingCoordinator.dismiss()
+        }
+      }
+    )
+  }
+
+  private var hostWindowID: ObjectIdentifier? {
+    hostWindow.map(ObjectIdentifier.init)
+  }
+
+  private func evaluateProviderOnboarding() {
+    providerOnboardingCoordinator.initializeIfNeeded(
+      autocompleteEnabled: appState.aiAutocompleteEnabled,
+      providerConfigured: providerSettings.isConfigured)
+    providerOnboardingCoordinator.evaluate(
+      windowID: hostWindowID,
+      isKeyWindow: hostWindow?.isKeyWindow == true)
   }
 }
 
@@ -81,8 +164,7 @@ struct EditorPreviewSplit: View {
   private func content(forWidth width: CGFloat) -> some View {
     if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView(
-        hasWorkspace: appState.hasWorkspaceContent,
-        activity: appState.workspaceActivity
+        hasWorkspace: appState.hasWorkspaceContent
       )
     } else {
       switch appState.mode {
@@ -99,11 +181,15 @@ struct EditorPreviewSplit: View {
           // see rendered output.
           EditorView()
         } else {
+          // Both panes claim an equal ideal share of the window: NSSplitView
+          // seeds the divider from the subviews' ideal widths, and without an
+          // explicit ideal the editor's and preview's intrinsic sizes fight —
+          // whichever wins collapses the other pane to its minimum.
           HSplitView {
             EditorView(scrollSyncCoordinator: scrollSyncCoordinator)
-              .frame(minWidth: Self.paneMinWidth)
+              .frame(minWidth: Self.paneMinWidth, idealWidth: width / 2, maxWidth: .infinity)
             PreviewView(scrollSyncCoordinator: scrollSyncCoordinator)
-              .frame(minWidth: Self.paneMinWidth)
+              .frame(minWidth: Self.paneMinWidth, idealWidth: width / 2, maxWidth: .infinity)
           }
         }
       }
@@ -151,19 +237,9 @@ private struct FocusModeDimmingOverlay: View {
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
   let hasWorkspace: Bool
-  let activity: WorkspaceActivity?
 
   var body: some View {
     VStack(spacing: 18) {
-      // Only import-class work (real index writes ahead) takes over the center pane.
-      // Subtle open/validate states stay in the sidebar — a cached, unchanged reopen
-      // must never present itself as "Importing Workspace".
-      if let activity, activity.isProminent {
-        WorkspaceActivityView(activity: activity)
-          .frame(maxWidth: 340)
-          .accessibilityIdentifier("pensieve.emptyState.activity")
-      }
-
       VStack(spacing: 12) {
         Image(systemName: "doc.text")
           .font(.system(size: 48, weight: .light))
@@ -197,33 +273,5 @@ struct DocumentEmptyStateView: View {
       return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
     }
     return "Open a Markdown file or folder from the File menu to get started."
-  }
-}
-
-struct WorkspaceActivityView: View {
-  let activity: WorkspaceActivity
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack(spacing: 8) {
-        ProgressView()
-          .controlSize(.small)
-        Text(activity.title)
-          .font(.headline)
-      }
-
-      Text(activity.detail)
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .lineLimit(2)
-
-      ProgressView(value: activity.progress)
-        .progressViewStyle(.linear)
-    }
-    .padding(14)
-    .background {
-      RoundedRectangle(cornerRadius: 8, style: .continuous)
-        .fill(Color(NSColor.controlBackgroundColor))
-    }
   }
 }

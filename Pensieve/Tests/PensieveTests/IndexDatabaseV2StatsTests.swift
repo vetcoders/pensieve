@@ -232,7 +232,8 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     }
 
     let cacheDir = folder.appendingPathComponent("cache", isDirectory: true)
-    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: cacheDir))
+    let cacheStore = WorkspaceCacheStore(baseDirectory: cacheDir)
+    let substrate = WorkspaceSubstrate(store: cacheStore)
     let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
     // ONE IndexDatabase (one pool) across both launches — a real relaunch reopens the same file.
     let indexDatabase = IndexDatabase(databaseURL: databaseURL)
@@ -281,6 +282,13 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     XCTAssertEqual(sessionsAfterFirst, 1, "first launch writes exactly one cold_scan session")
     firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
 
+    // Simulate an upgrade from a release that already has the manifest/fingerprint/index but
+    // predates the instant presentation cache. The unchanged valid-skip launch below must migrate
+    // that cache once; otherwise every future launch keeps walking the entire tree.
+    let presentationCacheURL = cacheStore.workspaceScansURL(for: identity)
+    try FileManager.default.removeItem(at: presentationCacheURL)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: presentationCacheURL.path))
+
     // ---- Second launch: fresh manager + fresh AppState (empty in-memory tree, like a relaunch).
     let secondCalls = BuilderCallCounter()
     let secondBuilder: WorkspaceScanner.Builder = { rootURLs, exclusions in
@@ -299,6 +307,12 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     await secondManager.waitForPendingWorkspaceBuild()
     await secondManager.waitForPendingIndexUpdate()
     await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(
+      try cacheStore.readWorkspaceScans(for: identity)?.flatMap(\.documents).count,
+      32,
+      "a valid-skip launch must migrate legacy cache state to the instant presentation snapshot"
+    )
 
     // (1) NO double walk: the relaunch walks the tree EXACTLY ONCE.
     XCTAssertEqual(
@@ -513,11 +527,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     // workspace in a SINGLE open, exactly like a real app restart. (We deliberately do NOT call
     // `closeWorkspace` — it clears the bookmark store; a relaunch is a fresh process, not a folder
     // close. Fresh manager + fresh AppState already gives the empty in-memory tree / nil baseline.)
-    let suiteName = "PensieveMultiRootSkipTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
-    defaults.removePersistentDomain(forName: suiteName)
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveMultiRootSkipTests")
     let bookmarkStore = BookmarkStore(defaults: defaults)
 
     let rootPaths = [rootA, rootB].map { $0.standardizedFileURL.path }
@@ -682,11 +692,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
     let databaseURL = support.appendingPathComponent("index.db", isDirectory: false)
     let indexDatabase = IndexDatabase(databaseURL: databaseURL)
 
-    let suiteName = "PensieveMultiRootChangeTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName), "Expected UserDefaults suite \(suiteName)")
-    defaults.removePersistentDomain(forName: suiteName)
-    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveMultiRootChangeTests")
     let bookmarkStore = BookmarkStore(defaults: defaults)
 
     // Seed both roots, then open the 2-root workspace in ONE call via restore (see the sibling
@@ -767,12 +773,7 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
   }
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveIndexV2StatsBookmarkTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveIndexV2StatsBookmarkTests"))
   }
 }
 

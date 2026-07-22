@@ -26,19 +26,38 @@ enum WorkspaceBookmarkStatus {
   case expiredButDirectPathAccessible
 }
 
-final class WorkspaceSubstrate {
+enum WorkspaceValidationStage: String, CaseIterable, Hashable, Sendable {
+  case workspaceScan
+  case treeFingerprint
+  case substrateValidation
+  case searchSignature
+}
+
+struct WorkspaceValidationResult: @unchecked Sendable {
+  var scans: [WorkspaceScan]
+  var fingerprint: TreeFingerprint?
+  var verdict: WorkspaceCacheVerdict?
+  var searchSignature: WorkspaceSignature?
+}
+
+/// Immutable validation configuration shared with detached open jobs. The cache store is itself
+/// thread-safe (operation-local coders), and the bookmark callback is explicitly Sendable.
+final class WorkspaceSubstrate: @unchecked Sendable {
+  typealias ValidationProbe = @Sendable (WorkspaceValidationStage) -> Void
+
   static let shared = WorkspaceSubstrate()
 
   let store: WorkspaceCacheStore
   private let scannerVersion: Int
   private let cacheSchemaVersion: Int
-  private let bookmarkStatus: (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus
+  private let bookmarkStatus: @Sendable (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus
 
   init(
     store: WorkspaceCacheStore = .shared,
     scannerVersion: Int = 1,
     cacheSchemaVersion: Int = 1,
-    bookmarkStatus: @escaping (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus = { _, _ in
+    bookmarkStatus: @escaping @Sendable (WorkspaceIdentity, [URL]) -> WorkspaceBookmarkStatus = {
+      _, _ in
       .resolved
     }
   ) {
@@ -46,6 +65,76 @@ final class WorkspaceSubstrate {
     self.scannerVersion = scannerVersion
     self.cacheSchemaVersion = cacheSchemaVersion
     self.bookmarkStatus = bookmarkStatus
+  }
+
+  /// Starts the sole background-open validation path without waiting for a main-actor scheduling
+  /// turn. One detached job owns the real tree walk, derives both cache evidence values from that
+  /// walk, and evaluates the substrate without a fallback traversal. The caller owns/cancels the
+  /// returned task; scanner cancellation is thrown, never converted into a complete result.
+  func startValidation(
+    identity: WorkspaceIdentity,
+    currentRoots: [URL],
+    currentExclusions: Set<String>,
+    workspaceBuilder: @escaping WorkspaceScanner.Builder,
+    persistPresentationCache: Bool,
+    probe: @escaping ValidationProbe = { _ in }
+  ) -> Task<WorkspaceValidationResult, Error> {
+    Task.detached(priority: .userInitiated) { [self] in
+      try Task.checkCancellation()
+      probe(.workspaceScan)
+      let scans = workspaceBuilder(currentRoots, currentExclusions)
+      try Task.checkCancellation()
+      DebugTrace.log("workspace validation walk.count=1 roots=\(currentRoots.count)")
+
+      probe(.treeFingerprint)
+      let fingerprint: TreeFingerprint?
+      do {
+        fingerprint = try TreeFingerprint.compute(from: scans, roots: currentRoots)
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        // A file can disappear between enumeration and stat. Keep the complete scan for the
+        // cold-index fallback, but do not manufacture a cache verdict without file evidence.
+        fingerprint = nil
+      }
+      try Task.checkCancellation()
+
+      let verdict: WorkspaceCacheVerdict?
+      if let fingerprint {
+        probe(.substrateValidation)
+        verdict = try open(
+          identity: identity,
+          currentRoots: currentRoots,
+          currentExclusions: currentExclusions,
+          precomputedFingerprint: fingerprint
+        )
+      } else {
+        verdict = nil
+      }
+      try Task.checkCancellation()
+
+      probe(.searchSignature)
+      let searchSignature =
+        store.readSearchSignature(for: identity)
+        ?? FolderManager.signature(from: scans)
+      try Task.checkCancellation()
+
+      if persistPresentationCache, case .valid = verdict {
+        do {
+          try store.writeWorkspaceScans(scans, for: identity)
+        } catch {
+          // Optional acceleration artifact: the manifest/index verdict remains authoritative.
+          NSLog("%@", "Presentation cache migration failed: \(error)")
+        }
+      }
+
+      return WorkspaceValidationResult(
+        scans: scans,
+        fingerprint: fingerprint,
+        verdict: verdict,
+        searchSignature: searchSignature
+      )
+    }
   }
 
   func validate(

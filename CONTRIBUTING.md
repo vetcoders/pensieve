@@ -1,8 +1,8 @@
 # Contributing to Pensieve
 
-Welcome to the 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. forge. 
+Welcome to the 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. forge.
 
-We build software differently here at Vetcoders. We value *product truth* over local elegance, and *runtime truth* over theoretical correctness. If you want to contribute, please understand our core stance.
+We build software differently here at Vetcoders. We value _product truth_ over local elegance, and _runtime truth_ over theoretical correctness. If you want to contribute, please understand our core stance.
 
 ## Our Core Stance
 
@@ -10,7 +10,7 @@ We build software differently here at Vetcoders. We value *product truth* over l
    - Prefer bold simplification over timid preservation.
    - Clean replacement > patching scar tissue.
 2. **Backward compatibility is optional.**
-   - Do not preserve bad architecture just because it exists. 
+   - Do not preserve bad architecture just because it exists.
    - Keep compatibility only when it creates real user value.
 3. **Vibecrafting is a valid engineering mode.**
    - Coding is art and craftsmanship. Great systems are shaped, not merely assembled.
@@ -26,6 +26,6 @@ We build software differently here at Vetcoders. We value *product truth* over l
 
 ## Development Setup
 
-- **Requirements:** macOS 13.0 (Ventura) or newer, Xcode 15+, Swift 5.9+.
+- **Requirements:** macOS 15.0 (Sequoia) or newer, Xcode 16+, Swift 6.0+ (Swift 5 language mode).
 - Open `Pensieve/Package.swift` in Xcode.
 - No CocoaPods or Carthage. We use Swift Package Manager exclusively.

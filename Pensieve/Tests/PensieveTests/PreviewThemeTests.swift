@@ -116,6 +116,37 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("vc-skin:default"))
   }
 
+  func testAppearanceCSSRendersCodeWithoutFramesAndWithASubtleShadow() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14)
+
+    let inlineCodeRule = cssRule(
+      selector: ".markdown-body tt", containing: "font-family:", in: css)
+    XCTAssertTrue(
+      inlineCodeRule?.contains("border: 0 !important;") == true,
+      inlineCodeRule ?? "missing")
+    XCTAssertTrue(
+      inlineCodeRule?.contains("font-family: ui-monospace") == true,
+      inlineCodeRule ?? "missing")
+    XCTAssertFalse(inlineCodeRule?.contains("1px solid") == true, inlineCodeRule ?? "missing")
+
+    let blockCodeRule = cssRule(
+      selector: ".markdown-body pre", containing: "box-shadow:", in: css)
+    XCTAssertTrue(
+      blockCodeRule?.contains("border: 0 !important;") == true,
+      blockCodeRule ?? "missing")
+    XCTAssertTrue(
+      blockCodeRule?.contains("box-shadow: var(--vc-preview-code-shadow);") == true,
+      blockCodeRule ?? "missing")
+    XCTAssertTrue(
+      blockCodeRule?.contains("font-family: ui-monospace") == true,
+      blockCodeRule ?? "missing")
+    XCTAssertFalse(blockCodeRule?.contains("1px solid") == true, blockCodeRule ?? "missing")
+    XCTAssertTrue(css.contains("--vc-preview-code-shadow:"))
+
+    let raw = PreviewWebView.skinCSS(for: .raw)
+    XCTAssertTrue(raw.contains("box-shadow: none !important"))
+  }
+
   func testAppearanceCSSDefinesRelativeHeadingScaleIndependentOfFlavor() {
     for skin in [ThemeManager.PreviewTheme.default, .vercel, .paper] {
       let css = PreviewWebView.appearanceCSS(fontSize: 16, skin: skin)
@@ -324,9 +355,7 @@ final class PreviewThemeTests: XCTestCase {
   // MARK: - ThemeManager persists the skin
 
   func testThemeManagerPersistsSkinSelection() {
-    let suiteName = "pensieve.preview.skin.tests"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.tests")
 
     let manager = ThemeManager(defaults: defaults)
     XCTAssertEqual(manager.skin, .default)
@@ -334,8 +363,6 @@ final class PreviewThemeTests: XCTestCase {
 
     let reloaded = ThemeManager(defaults: defaults)
     XCTAssertEqual(reloaded.skin, .paper)
-
-    defaults.removePersistentDomain(forName: suiteName)
   }
 }
 

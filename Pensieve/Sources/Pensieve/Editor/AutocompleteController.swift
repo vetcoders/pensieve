@@ -1,8 +1,25 @@
 import Combine
 import Foundation
 
+protocol AutocompleteCompleting: Sendable {
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String
+}
+
+private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked Sendable {
+  private let engine: VistaEngineProtocol
+
+  init(engine: VistaEngineProtocol) {
+    self.engine = engine
+  }
+
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
+    try await engine.complete(prefix: context.beforeCursor, maxTokens: maxTokens)
+  }
+}
+
 final class AutocompleteController: ObservableObject, @unchecked Sendable {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
+  typealias CompletionFactory = @Sendable () -> any AutocompleteCompleting
 
   static let defaultDebounceNanoseconds: UInt64 = 400_000_000
 
@@ -10,7 +27,13 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// Production wires a real factory at the MarkdownEditorSurface init site;
   /// only engine-less test/preview controllers ever report this.
   static let engineUnavailableMessage =
-    "AI autocomplete is not available: no completion engine is configured."
+    "AI autocomplete needs a completion provider. Configure one in Settings."
+
+  /// User-facing copy for a configured engine whose completion provider is
+  /// unavailable. Keep kernel names and environment-variable implementation
+  /// details out of the editor status surface.
+  static let completionProviderUnavailableMessage =
+    "AI autocomplete needs a completion provider. Configure one in Settings."
 
   /// vista-kernel flattens every completion failure into
   /// `VistaError.ModelError`; the unavailable class (LLM endpoint/model env
@@ -22,17 +45,24 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
   @Published private(set) var suggestion: String?
   @Published private(set) var lastError: String?
+  @Published private(set) var rewritePreview: AIRewritePreview?
+  private(set) var candidate: AICandidate?
+  private var rewriteCandidate: AICandidate?
 
-  private let engineFactory: EngineFactory?
+  private let completionFactory: CompletionFactory?
   private let debounceNanoseconds: UInt64
   private let maxTokens: UInt32
-  // Engine resolution happens post-debounce inside the completion task (the
-  // FFI constructor never runs on the typing path), so the cache is guarded
-  // by a lock rather than main-actor isolation.
-  private let engineLock = NSLock()
-  private var engine: VistaEngineProtocol?
+  private let sessionStore: DocumentAISessionStore
+  // Backend resolution happens post-debounce inside the completion task, so
+  // the cache is guarded by a lock rather than main-actor isolation.
+  private let completionLock = NSLock()
+  private var completionBackend: (any AutocompleteCompleting)?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
+  private var rewriteTask: Task<Void, Never>?
+  private var providerSettingsCancellable: AnyCancellable?
+  private var documentSession = DocumentAISession(documentID: "unbound")
+  private var documentRevision: UInt64 = 0
   // Typed-unavailable is engine-global state, deliberately NOT request-scoped:
   // once the kernel reports the completion LLM is not configured, asking again
   // on every keystroke cannot succeed. cancel() clears the latch so the user
@@ -44,35 +74,93 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     engine: VistaEngineProtocol? = nil,
     engineFactory: EngineFactory? = nil,
     debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
-    maxTokens: UInt32 = 32
+    maxTokens: UInt32 = 32,
+    sessionStore: DocumentAISessionStore = .shared
   ) {
-    self.engine = engine
-    self.engineFactory = engineFactory
+    if let engine {
+      self.completionBackend = VistaAutocompleteAdapter(engine: engine)
+    } else {
+      self.completionBackend = nil
+    }
+    if let engineFactory {
+      self.completionFactory = { VistaAutocompleteAdapter(engine: engineFactory()) }
+    } else {
+      self.completionFactory = nil
+    }
     self.debounceNanoseconds = debounceNanoseconds
     self.maxTokens = maxTokens
+    self.sessionStore = sessionStore
+    observeProviderSettings()
+  }
+
+  init(
+    completionFactory: @escaping CompletionFactory,
+    debounceNanoseconds: UInt64 = AutocompleteController.defaultDebounceNanoseconds,
+    maxTokens: UInt32 = 32,
+    sessionStore: DocumentAISessionStore = .shared
+  ) {
+    self.completionBackend = nil
+    self.completionFactory = completionFactory
+    self.debounceNanoseconds = debounceNanoseconds
+    self.maxTokens = maxTokens
+    self.sessionStore = sessionStore
+    observeProviderSettings()
+  }
+
+  private func observeProviderSettings() {
+    self.providerSettingsCancellable = NotificationCenter.default.publisher(
+      for: .completionProviderSettingsDidChange
+    ).sink { [weak self] _ in
+      // The live backend resolves provider env on every request. Saving settings
+      // only needs to clear the permanent-unavailable latch; the next keystroke
+      // immediately observes the new process values.
+      self?.cancel()
+    }
   }
 
   deinit {
     completionTask?.cancel()
+    rewriteTask?.cancel()
+    providerSettingsCancellable?.cancel()
   }
 
   /// True when a suggestion could ever be produced (injected engine or
   /// factory). Checked on the typing path instead of resolving the engine,
   /// so no FFI call happens between keystrokes.
   var hasEngineSource: Bool {
-    engineLock.lock()
-    defer { engineLock.unlock() }
-    return engine != nil || engineFactory != nil
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    return completionBackend != nil || completionFactory != nil
   }
 
-  func textDidChange(prefix: String) {
+  func configureDocument(id: String) {
+    guard documentSession.documentID != id else { return }
+    cancel()
+    documentSession = sessionStore.session(for: id)
+    documentRevision = 0
+  }
+
+  /// Starts a completion request for committed text. Composition updates are
+  /// explicit so an in-flight request cannot publish state while an IME owns
+  /// the caret; the default keeps existing non-IME call sites source-compatible.
+  func textDidChange(
+    context: AutocompleteContext,
+    isComposing: Bool = false,
+    replacementRange: NSRange = NSRange(location: 0, length: 0)
+  ) {
+    cancelRewrite()
+    documentRevision &+= 1
     requestID &+= 1
     let currentRequestID = requestID
     completionTask?.cancel()
+    completionTask = nil
     suggestion = nil
+    candidate = nil
     lastError = nil
 
-    guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    guard !isComposing else { return }
+
+    guard !context.beforeCursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       return
     }
 
@@ -88,41 +176,96 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
 
     let debounceNanoseconds = debounceNanoseconds
     let maxTokens = maxTokens
+    let session = documentSession
+    let revision = documentRevision
     completionTask = Task(priority: .userInitiated) { [weak self] in
       do {
         try await Task.sleep(nanoseconds: debounceNanoseconds)
         try Task.checkCancellation()
-        guard let self, let engine = self.resolveEngine() else { return }
-        let completion = try await engine.complete(prefix: prefix, maxTokens: maxTokens)
+        // Resolve through the weak reference without retaining the controller
+        // across the provider await. This lets deinit cancel a hung request.
+        guard let backend = self?.resolveCompletionBackend() else { return }
+        let produced: AICandidate
+        if let sessionBackend = backend as? any SessionAutocompleteCompleting {
+          produced = try await sessionBackend.complete(
+            context: context,
+            maxTokens: maxTokens,
+            session: session,
+            documentRevision: revision,
+            replacementRange: replacementRange)
+        } else {
+          let completion = try await backend.complete(context: context, maxTokens: maxTokens)
+          produced = AICandidate(
+            documentID: session.documentID,
+            text: completion,
+            providerInput: context.beforeCursor,
+            providerFingerprint: ProviderFingerprint(
+              shape: .openAIResponses, endpoint: "injected", model: "injected"),
+            pendingContinuation: .none,
+            invalidatedOpaqueContinuation: false,
+            documentRevision: revision,
+            replacementRange: replacementRange)
+        }
         try Task.checkCancellation()
 
         await MainActor.run { [weak self] in
           guard let self else { return }
           guard self.requestID == currentRequestID else { return }
-          self.suggestion = Self.singleLineSuggestion(from: completion)
+          self.completionTask = nil
+          if produced.invalidatedOpaqueContinuation {
+            self.documentSession.invalidateOpaqueContinuation()
+            self.sessionStore.save(self.documentSession)
+          }
+          guard let visible = Self.singleLineSuggestion(from: produced.text) else {
+            self.candidate = nil
+            self.suggestion = nil
+            return
+          }
+          self.candidate = AICandidate(
+            documentID: produced.documentID,
+            text: visible,
+            providerInput: produced.providerInput,
+            providerFingerprint: produced.providerFingerprint,
+            pendingContinuation: produced.pendingContinuation,
+            invalidatedOpaqueContinuation: produced.invalidatedOpaqueContinuation,
+            documentRevision: produced.documentRevision,
+            replacementRange: produced.replacementRange)
+          self.suggestion = visible
         }
       } catch is CancellationError {
-        return
+        await MainActor.run { [weak self] in
+          guard let self, self.requestID == currentRequestID else { return }
+          self.completionTask = nil
+        }
       } catch {
         let message = Self.displayMessage(for: error)
         let latchesUnavailable = Self.isTypedUnavailable(error)
-        if latchesUnavailable {
-          DebugTrace.log("autocomplete engine unavailable: \(message)")
-        }
         await MainActor.run { [weak self] in
           guard let self else { return }
+          // Every completion outcome is request-scoped. In particular, a
+          // cancelled request must never silently re-arm the unavailable latch
+          // after cancel() opened the explicit retry path.
+          guard self.requestID == currentRequestID else { return }
+          self.completionTask = nil
           if latchesUnavailable {
-            // Latch even when this request was superseded — unavailability is
-            // a truth about the engine, not about one request.
             self.engineUnavailable = true
             self.engineUnavailableDetail = message
+            DebugTrace.log("autocomplete provider unavailable: \(message)")
           }
-          guard self.requestID == currentRequestID else { return }
           self.suggestion = nil
+          self.candidate = nil
           self.lastError = message
         }
       }
     }
+  }
+
+  /// Compatibility seam for focused tests and non-editor callers that only
+  /// own a prefix. Production editor requests always include suffix context.
+  func textDidChange(prefix: String, isComposing: Bool = false) {
+    textDidChange(
+      context: AutocompleteContext(beforeCursor: prefix, afterCursor: ""),
+      isComposing: isComposing)
   }
 
   func cancel() {
@@ -130,37 +273,131 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
     completionTask?.cancel()
     completionTask = nil
     suggestion = nil
+    candidate = nil
     lastError = nil
     engineUnavailable = false
     engineUnavailableDetail = nil
+    cancelRewrite()
+  }
+
+  func requestRewrite(context: RewriteContext, intent: RewriteIntent) {
+    rewriteTask?.cancel()
+    rewriteTask = nil
+    rewriteCandidate = nil
+    rewritePreview = nil
+    lastError = nil
+    guard hasEngineSource else {
+      lastError = Self.engineUnavailableMessage
+      return
+    }
+    let session = documentSession
+    rewriteTask = Task(priority: .userInitiated) { [weak self] in
+      do {
+        guard let backend = self?.resolveCompletionBackend() as? any AIRewriting else {
+          throw VistaError.ModelError(msg: "completion LLM unavailable: rewrite is unsupported")
+        }
+        let produced = try await backend.rewrite(
+          context: context, intent: intent, session: session)
+        try Task.checkCancellation()
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.rewriteTask = nil
+          self.rewriteCandidate = produced
+          self.rewritePreview = AIRewritePreview(
+            id: UUID(),
+            original: context.text,
+            proposed: produced.text,
+            intent: intent,
+            replacementRange: produced.replacementRange,
+            documentRevision: produced.documentRevision)
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        await MainActor.run { [weak self] in
+          self?.rewriteTask = nil
+          self?.lastError = Self.displayMessage(for: error)
+        }
+      }
+    }
+  }
+
+  func candidateForRewriteAcceptance(_ preview: AIRewritePreview) -> AICandidate? {
+    guard let rewriteCandidate,
+      rewriteCandidate.documentID == documentSession.documentID,
+      rewriteCandidate.text == preview.proposed,
+      rewriteCandidate.documentRevision == preview.documentRevision,
+      rewriteCandidate.replacementRange == preview.replacementRange
+    else { return nil }
+    return rewriteCandidate
+  }
+
+  func commitAppliedRewrite(_ candidate: AICandidate) {
+    commitAppliedCandidate(candidate)
+    rewriteCandidate = nil
+    rewritePreview = nil
+  }
+
+  func cancelRewrite() {
+    rewriteTask?.cancel()
+    rewriteTask = nil
+    rewriteCandidate = nil
+    rewritePreview = nil
+  }
+
+  func candidateForAcceptance(_ text: String, at range: NSRange) -> AICandidate? {
+    guard let candidate,
+      candidate.documentID == documentSession.documentID,
+      candidate.text == text,
+      candidate.documentRevision == documentRevision,
+      candidate.replacementRange == range
+    else {
+      return nil
+    }
+    return candidate
+  }
+
+  func commitAppliedCandidate(_ candidate: AICandidate) {
+    guard candidate.documentID == documentSession.documentID else { return }
+    requestID &+= 1
+    completionTask?.cancel()
+    completionTask = nil
+    documentSession.accept(candidate)
+    sessionStore.save(documentSession)
+    self.candidate = nil
+    suggestion = nil
+  }
+
+  func invalidateContinuation() {
+    documentSession.invalidateOpaqueContinuation()
+    sessionStore.save(documentSession)
   }
 
   /// The ghost renderer is a single-line floating field at the caret
   /// (MarkdownTextView, `lineBreakMode = .byClipping`); publishing a
   /// multi-line completion would paint its tail squeezed to the right of the
   /// caret while Tab inserts the whole block — text the user never saw. Cap
-  /// the suggestion at the first non-empty line so what the ghost shows is
-  /// exactly what accept inserts.
+  /// the suggestion at the first non-blank line so what the ghost shows is
+  /// exactly what accept inserts. Providers occasionally prefix completions
+  /// with blank/whitespace-only lines; those are not useful ghost text.
   static func singleLineSuggestion(from completion: String) -> String? {
-    let cleaned = completion.trimmingCharacters(in: .newlines)
-    let firstLine = cleaned.components(separatedBy: .newlines).first ?? ""
-    return firstLine.isEmpty ? nil : firstLine
+    completion.components(separatedBy: .newlines).first { line in
+      !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
   }
 
-  /// Resolves (and caches) the engine. Runs inside the completion task, after
-  /// the debounce: the `VistaEngine()` FFI constructor — a thin handle; the
-  /// heavy whisper model is a process-global singleton the completion path
-  /// never touches (qube-ffi lib.rs `init_model` vs `complete`) — is paid at
-  /// most once, off the typing path.
-  private func resolveEngine() -> VistaEngineProtocol? {
-    engineLock.lock()
-    defer { engineLock.unlock() }
-    if let engine {
-      return engine
+  /// Resolves and caches the completion backend after the debounce. Production
+  /// uses a small Responses client; the Vista adapter remains for focused tests
+  /// and compatible injected engines without coupling autocomplete to STT.
+  private func resolveCompletionBackend() -> (any AutocompleteCompleting)? {
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    if let completionBackend {
+      return completionBackend
     }
-    guard let engineFactory else { return nil }
-    let created = engineFactory()
-    engine = created
+    guard let completionFactory else { return nil }
+    let created = completionFactory()
+    completionBackend = created
     return created
   }
 
@@ -169,9 +406,24 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// description for non-FFI errors (tests, futures).
   private static func displayMessage(for error: Error) -> String {
     if case VistaError.ModelError(let msg) = error {
-      return msg
+      if msg.hasPrefix(typedUnavailablePrefix) {
+        return completionProviderUnavailableMessage
+      }
+
+      let requestFailurePrefix = "completion request failed: "
+      if msg.hasPrefix(requestFailurePrefix) {
+        return "AI autocomplete failed: \(msg.dropFirst(requestFailurePrefix.count))"
+      }
+
+      let responseFailurePrefix = "completion response parse failed: "
+      if msg.hasPrefix(responseFailurePrefix) {
+        return "AI autocomplete returned an invalid response: "
+          + msg.dropFirst(responseFailurePrefix.count)
+      }
+
+      return "AI autocomplete failed: \(msg)"
     }
-    return error.localizedDescription
+    return "AI autocomplete failed: \(error.localizedDescription)"
   }
 
   private static func isTypedUnavailable(_ error: Error) -> Bool {

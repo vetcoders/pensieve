@@ -361,11 +361,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testPreviewAutoReloadDefaultsOffButPreservesStoredPreference() {
-    let suiteName = "PensievePreviewDefaultsTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensievePreviewDefaultsTests")
 
     XCTAssertFalse(AppState(defaults: defaults).previewAutoReload)
     XCTAssertTrue(AppState(defaults: defaults).tableTidyOnPaste)
@@ -408,11 +404,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testSidebarSortOrderPersistsToDefaults() {
-    let suiteName = "PensieveSidebarSortTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveSidebarSortTests")
 
     let appState = AppState(defaults: defaults)
     appState.sidebarSortOrder = .nameDescending
@@ -637,14 +629,14 @@ final class PensieveSmokeTests: XCTestCase {
     for character in ["a", "b", "c", "d", "e"] {
       appState.activeDocumentText += character
       store.documentDidChange(appState: appState)
-      try await Task.sleep(nanoseconds: 10_000_000)
     }
 
-    try await Task.sleep(nanoseconds: 80_000_000)
-    XCTAssertEqual(saveCount, 1)
-    XCTAssertEqual(indexCount, 0)
-
-    try await Task.sleep(nanoseconds: 110_000_000)
+    try await waitUntil {
+      saveCount == 1 && indexCount == 1
+    }
+    // Give a stale cancelled task enough time to betray duplicate work. The
+    // assertion is about coalescence, not scheduler ordering between two timers.
+    try await Task.sleep(nanoseconds: 180_000_000)
     XCTAssertEqual(saveCount, 1)
     XCTAssertEqual(indexCount, 1)
   }
@@ -679,6 +671,118 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(restoredState.documentSession.isUntitled)
     XCTAssertTrue(restoredState.activeDocumentDirty)
     XCTAssertEqual(restoredState.activeDocumentText, "keep this crash draft")
+  }
+
+  /// A window opened FOR a specific document (`start(restoringWorkspace:
+  /// false)` — new document tab, explicit file launch) must show that
+  /// document. Restoring the pending recovery draft into every such window
+  /// hijacked the fresh buffer, and the now-dirty untitled session then
+  /// blocked the requested file's load — every new tab displayed "Recovered
+  /// Untitled" instead of the opened file.
+  @MainActor
+  func testDocumentWindowStartDoesNotHijackWithPendingRecoveryDraft() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRecoveryHijackTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let documentURL = folder.appendingPathComponent("target.md")
+    try "the requested document".write(to: documentURL, atomically: true, encoding: .utf8)
+
+    // A crash draft is pending in the recovery store.
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let seedState = AppState()
+    let seedStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    seedState.documentSession.createUntitled(title: "Untitled.md")
+    seedState.activeDocumentText = "crash draft"
+    seedStore.documentDidChange(appState: seedState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "crash draft" }
+
+    // A fresh window starts to show a specific document (new tab semantics).
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(
+        autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+        indexDatabase: indexDatabase,
+        recoveryStore: recoveryStore
+      ),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    controller.start(restoringWorkspace: false)
+
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "start(restoringWorkspace: false) adopted the pending recovery draft — "
+        + "the dirty untitled session then blocks the document this window "
+        + "was opened for (and re-prompts on every new tab)")
+
+    controller.openFileInCurrentWindow(url: documentURL)
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, documentURL.standardizedFileURL,
+      "document window shows the recovery draft instead of the document it was opened for")
+    XCTAssertEqual(appState.activeDocumentText, "the requested document")
+  }
+
+  /// One crash draft, MANY restoring windows: state restoration re-creates
+  /// every scene from the previous run and each one starts with
+  /// `restoringWorkspace: true`. All production windows share the same
+  /// recovery store, so without a single-handout rule each of them adopted
+  /// the same draft — one draft multiplied into an "Untitled, Untitled 2, …"
+  /// flood of dirty windows.
+  @MainActor
+  func testPendingRecoveryDraftIsAdoptedByOnlyOneRestoringWindow() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSingleRestoreTests-\(UUID().uuidString)", isDirectory: true)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
+    let seedState = AppState()
+    let seedStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    seedState.documentSession.createUntitled(title: "Untitled.md")
+    seedState.activeDocumentText = "the one crash draft"
+    seedStore.documentDidChange(appState: seedState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "the one crash draft" }
+
+    // Two windows restore (own DocumentStore each, shared recovery store —
+    // the production topology). Only the FIRST may adopt the draft.
+    let firstWindowState = AppState()
+    let firstWindowStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    XCTAssertTrue(firstWindowStore.restoreRecoveredDraft(into: firstWindowState))
+    XCTAssertEqual(firstWindowState.activeDocumentText, "the one crash draft")
+
+    let secondWindowState = AppState()
+    let secondWindowStore = DocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore
+    )
+    XCTAssertFalse(
+      secondWindowStore.restoreRecoveredDraft(into: secondWindowState),
+      "a second restoring window adopted the same crash draft — the Untitled flood")
+    XCTAssertFalse(secondWindowState.documentSession.hasEditableBuffer)
   }
 
   @MainActor
@@ -1017,11 +1121,7 @@ final class PensieveSmokeTests: XCTestCase {
   func testRestoreLastFolderInBackgroundPublishesShellBeforeScanAndEventuallyIndexesSearch()
     async throws
   {
-    let suiteName = "PensieveAsyncRestoreTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveAsyncRestoreTests")
 
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveAsyncRestoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -1127,7 +1227,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testRefreshSkipsRebuildWhenMarkdownUnchanged() throws {
+  func testRefreshSkipsRebuildWhenMarkdownUnchanged() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveReindexGateTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1141,31 +1241,64 @@ final class PensieveSmokeTests: XCTestCase {
       calls.count += 1
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
     let appState = AppState()
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
-      indexDatabase: temporaryIndexDatabase(in: folder),
-      workspaceBuilder: builder
+      indexDatabase: indexDatabase,
+      workspaceBuilder: builder,
+      // Exact scan counts around manually driven reconciles: a live FSEvents stream on the
+      // fixture root would add machine-timing-dependent scans for the same mutations.
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() })
     )
 
     manager.open(url: folder, into: appState)
+    await manager.waitForPendingWorkspaceBuild()
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
     let afterOpen = calls.count
+    let recordsAfterOpen = recorder.values.reduce(0, +)
     XCTAssertGreaterThan(afterOpen, 0, "open must scan once")
     XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
+    let treeAfterOpen = appState.workspaceTree
 
-    // 1) refresh, nothing changed -> must skip rebuild (no new scan)
+    // 1) refresh, nothing changed -> exactly one off-main scan, no tree or FTS delivery
     manager.refresh(into: appState)
-    XCTAssertEqual(calls.count, afterOpen, "refresh with unchanged .md must skip rebuild")
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(calls.count, afterOpen + 1, "refresh reconciles through exactly one scan")
+    XCTAssertEqual(appState.workspaceTree, treeAfterOpen, "unchanged .md must skip tree delivery")
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), recordsAfterOpen, "unchanged .md must skip the FTS write")
 
-    // 2) add a non-markdown file (e.g. screenshot/.DS_Store) -> must still skip
+    // 2) add a non-markdown file (e.g. screenshot/.DS_Store) -> scan runs, still no delivery
     try Data().write(to: folder.appendingPathComponent("shot.png"))
     manager.refresh(into: appState)
-    XCTAssertEqual(calls.count, afterOpen, "non-.md change must skip rebuild")
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(calls.count, afterOpen + 2, "refresh reconciles through exactly one scan")
+    XCTAssertEqual(appState.workspaceTree, treeAfterOpen, "non-.md change must skip tree delivery")
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), recordsAfterOpen, "non-.md change must skip the FTS write")
 
-    // 3) change .md content (size differs -> fingerprint changes even within same second) -> must rebuild
-    try "body changed and noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
+    // 3) change .md content (size differs -> fingerprint changes even within same second)
+    //    -> one incremental FTS row lands while the tree stays untouched
+    try "changed-token body noticeably longer".write(to: noteURL, atomically: true, encoding: .utf8)
     manager.refresh(into: appState)
-    XCTAssertGreaterThan(calls.count, afterOpen, ".md content change must trigger rebuild")
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+    XCTAssertEqual(calls.count, afterOpen + 3, "refresh reconciles through exactly one scan")
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), recordsAfterOpen + 1,
+      ".md content change must write exactly one incremental FTS row")
+    XCTAssertEqual(
+      indexDatabase.search(query: "changed-token", documents: appState.allDocuments)
+        .map(\.document.url.lastPathComponent),
+      ["note.md"], ".md content change must be searchable after the incremental write")
   }
 
   /// Reference-typed call counter so the @Sendable workspace builder closure can tally
@@ -1199,6 +1332,7 @@ final class PensieveSmokeTests: XCTestCase {
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
       workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 10
     )
 
@@ -1215,8 +1349,9 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   /// RC-2 invariant (1): a foreign change to a NON-`.md` file does NOT trigger a rebuild/reindex
-  /// when the `.md` set is unchanged — the off-main signature gate matches and the path returns
-  /// without touching the main-actor rebuild.
+  /// when the `.md` set is unchanged. Under the one-scan/two-signature contract the watcher path
+  /// still reconciles through exactly one off-main scan; both signatures match, so neither the
+  /// tree nor the FTS index is delivered to.
   @MainActor
   func testScheduleWatcherRefreshSkipsRebuildForNonMarkdownChange() async throws {
     let folder = FileManager.default.temporaryDirectory
@@ -1232,23 +1367,40 @@ final class PensieveSmokeTests: XCTestCase {
       calls.count += 1
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
+    let recorder = BatchSizeRecorder()
+    let indexDatabase = IndexDatabase(
+      databaseURL: folder.appendingPathComponent("index.db", isDirectory: false),
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { @Sendable size in recorder.record(size) })
     let appState = AppState()
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
-      indexDatabase: temporaryIndexDatabase(in: folder),
+      indexDatabase: indexDatabase,
       workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 10
     )
 
     manager.open(url: folder, into: appState)
+    await manager.waitForPendingWorkspaceBuild()
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
     let afterOpen = calls.count
+    let recordsAfterOpen = recorder.values.reduce(0, +)
+    let treeAfterOpen = appState.workspaceTree
 
     // Foreign churn: a screenshot / .DS_Store sibling write leaves the .md set untouched.
     try Data().write(to: folder.appendingPathComponent("shot.png"))
     manager.scheduleWatcherRefresh(into: appState)
     await manager.waitForPendingWatcherRefresh()
+    await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
 
-    XCTAssertEqual(calls.count, afterOpen, "non-.md change must not trigger a rebuild")
+    XCTAssertEqual(calls.count, afterOpen + 1, "the watcher reconciles through exactly one scan")
+    XCTAssertEqual(
+      appState.workspaceTree, treeAfterOpen, "non-.md change must not republish the tree")
+    XCTAssertEqual(
+      recorder.values.reduce(0, +), recordsAfterOpen, "non-.md change must not write the FTS index")
   }
 
   /// RC-2 invariant (3): a burst of N rapid watcher events collapses to a single rebuild. Each
@@ -1274,6 +1426,7 @@ final class PensieveSmokeTests: XCTestCase {
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
       workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 30
     )
 
@@ -1308,6 +1461,7 @@ final class PensieveSmokeTests: XCTestCase {
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: temporaryIndexDatabase(in: folder),
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }),
       watcherDebounceMilliseconds: 10
     )
 
@@ -2070,8 +2224,8 @@ final class PensieveSmokeTests: XCTestCase {
       "every cold-indexed doc is searchable")
   }
 
-  /// Invariant 5: the skip-when-unchanged gate still returns early when the `.md` set is
-  /// identical (non-.md churn) — no rebuild, no upsert.
+  /// Invariant 5: when the `.md` set is identical (non-.md churn) the refresh still reconciles
+  /// through exactly one off-main scan, but the matching search signature skips the FTS upsert.
   @MainActor
   func testRefreshSkipsAndDoesNotReindexWhenMarkdownUnchanged() async throws {
     let folder = FileManager.default.temporaryDirectory
@@ -2097,10 +2251,12 @@ final class PensieveSmokeTests: XCTestCase {
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
       bookmarkStore: temporaryBookmarkStore(),
-      workspaceBuilder: builder)
+      workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }))
 
     manager.open(url: folder, into: appState)
     await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
     let scansAfterOpen = calls.count
     let recordsAfterOpen = recorder.values.reduce(0, +)
 
@@ -2108,20 +2264,21 @@ final class PensieveSmokeTests: XCTestCase {
     try Data().write(to: folder.appendingPathComponent("shot.png"))
     manager.refresh(into: appState)
     await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
 
-    XCTAssertEqual(calls.count, scansAfterOpen, "unchanged .md set must skip the rebuild")
+    XCTAssertEqual(
+      calls.count, scansAfterOpen + 1, "the refresh reconciles through exactly one scan")
     XCTAssertEqual(
       recorder.values.reduce(0, +), recordsAfterOpen, "skip path must not touch the FTS index")
   }
 
   // MARK: - Stage A1: off-main index write (rebuildWorkspace)
 
-  /// A watcher-triggered rebuild does NOT block the main actor: after the refresh returns, the
-  /// in-memory document tree (`appState.allDocuments`) already reflects the change synchronously
-  /// (the metadata-only `applyWorkspaceScans` ran on the main actor), while the FTS index write
-  /// is still pending off-main. Only after `waitForPendingReindex()` does the index reflect the
-  /// change. The observable gap between "tree updated" and "index updated" structurally proves
-  /// the index write is OFF the main actor.
+  /// A refresh does NOT block the main actor: `refresh` returns synchronously having scheduled
+  /// ONE off-main scan (no enumeration/stat walk on the main actor — proven by the builder
+  /// thread probe). After awaiting the reconcile the tree reflects the change, and only after
+  /// `waitForPendingIndexUpdate()`/`waitForPendingReindex()` does the FTS index reflect it —
+  /// the index write stays OFF the main actor behind its own sync point.
   @MainActor
   func testRebuildIndexWriteIsOffMainTreeObservableBeforeIndex() async throws {
     let folder = FileManager.default.temporaryDirectory
@@ -2132,31 +2289,50 @@ final class PensieveSmokeTests: XCTestCase {
     try "seed-token original".write(
       to: folder.appendingPathComponent("seed.md"), atomically: true, encoding: .utf8)
 
+    let scanThreads = ScanThreadRecorder()
+    let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
+      scanThreads.record(isMainThread: Thread.isMainThread)
+      return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
+    }
     let indexDatabase = temporaryIndexDatabase(in: folder)
     let appState = AppState()
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore())
+      bookmarkStore: temporaryBookmarkStore(),
+      workspaceBuilder: builder,
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }))
 
     manager.open(url: folder, into: appState)
+    await manager.waitForPendingWorkspaceBuild()
     await manager.waitForPendingIndexUpdate()
+    let scansAfterOpen = scanThreads.count
 
-    // Add a new file, then refresh. The refresh returns synchronously after the tree update;
-    // the index write is launched off-main and is NOT awaited by `refresh`.
+    // Add a new file, then refresh. The refresh returns synchronously; the scan and the index
+    // write are launched off-main and are NOT awaited by `refresh` itself.
     let freshURL = folder.appendingPathComponent("fresh.md")
     try "fresh-token freshly added".write(to: freshURL, atomically: true, encoding: .utf8)
     manager.refresh(into: appState)
+    XCTAssertFalse(
+      appState.allDocuments.contains(where: {
+        $0.url.standardizedFileURL == freshURL.standardizedFileURL
+      }),
+      "refresh must not walk the workspace on the main actor before the off-main reconcile")
 
-    // Tree reflects the new file IMMEDIATELY (sync metadata path) — before the index write.
+    // After the reconcile the tree reflects the new file; the scan ran off the main thread.
+    await manager.waitForPendingForcedRefresh()
     XCTAssertTrue(
       appState.allDocuments.contains(where: {
         $0.url.standardizedFileURL == freshURL.standardizedFileURL
       }),
-      "the document tree sees the new file synchronously, before the off-main index write")
+      "the document tree sees the new file once the off-main reconcile publishes")
+    XCTAssertEqual(
+      scanThreads.samples(after: scansAfterOpen), [false],
+      "the refresh scan must run off the main thread")
 
     // Only after awaiting the off-main write does the FTS index reflect the change.
     await manager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
     XCTAssertEqual(
       indexDatabase.search(query: "fresh-token", documents: appState.allDocuments)
         .map(\.document.url.lastPathComponent),
@@ -2636,7 +2812,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testWorkspaceExclusionsPersistAndFilterImportedPaths() throws {
+  func testWorkspaceExclusionsPersistAndFilterImportedPaths() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveExclusionTests-\(UUID().uuidString)", isDirectory: true)
     let drafts = folder.appendingPathComponent("Drafts", isDirectory: true)
@@ -2658,18 +2834,26 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documents.count, 2)
 
     manager.addExcludedURLs([drafts], into: appState)
+    await manager.waitForPendingForcedRefresh()
+    await manager.waitForPendingIndexUpdate()
+    await manager.waitForPendingWorkspaceIndexWrite()
 
-    XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Drafts"]))
+    let expectedExclusion = try XCTUnwrap(
+      WorkspaceExclusion.scopedKey(for: drafts, roots: [folder])
+    )
+    XCTAssertEqual(appState.excludedWorkspacePaths, Set([expectedExclusion]))
     XCTAssertEqual(
       appState.documents.map { $0.url.resolvingSymlinksInPath() },
       [keepURL.resolvingSymlinksInPath()])
-    XCTAssertEqual(metadataStore.load().excludedPaths, ["Drafts"])
+    XCTAssertEqual(metadataStore.load().excludedPaths, [expectedExclusion])
     XCTAssertFalse(appState.documents.contains(where: { $0.url == skipURL.standardizedFileURL }))
 
     let relaunchedState = AppState()
     let relaunchedManager = FolderManager(
       metadataStore: metadataStore, indexDatabase: indexDatabase)
     relaunchedManager.open(url: folder, into: relaunchedState)
+    await relaunchedManager.waitForPendingIndexUpdate()
+    await relaunchedManager.waitForPendingWorkspaceIndexWrite()
     XCTAssertEqual(
       relaunchedState.documents.map { $0.url.resolvingSymlinksInPath() },
       [keepURL.resolvingSymlinksInPath()])
@@ -2711,11 +2895,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testLaunchFileIntentLoadsBeforeRestoredWorkspaceCanScan() async throws {
-    let suiteName = "PensieveLaunchIntentTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveLaunchIntentTests")
 
     let restoredFolder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRestoredWorkspace-\(UUID().uuidString)", isDirectory: true)
@@ -2771,6 +2951,40 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testDefaultLaunchDecisionDoesNotInsertHumanVisibleDelay() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveInstantLaunchTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+    let coordinator = LaunchIntentCoordinator()
+    let startedAt = ContinuousClock.now
+
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    let elapsed = ContinuousClock.now - startedAt
+    XCTAssertLessThan(
+      elapsed,
+      .milliseconds(50),
+      "a bare launch must settle within one imperceptible UI frame, not an artificial timer"
+    )
+  }
+
+  @MainActor
   func testLaunchFileIntentKeepsFirstMarkdownActiveAndReportsUnsupportedURLs() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
@@ -2814,13 +3028,63 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.workspaceRoots.isEmpty)
   }
 
+  /// System "Prefer tabs when opening documents: Always" contract: a file
+  /// opened from Finder/Dock while this window already shows a document must
+  /// route to the window registry (a native tab), NOT replace the document the
+  /// user is reading in place. The old drain special-cased the first URL into
+  /// `openFileInCurrentWindow`, which is correct only for a cold-start empty
+  /// window — `openFile` itself already makes that distinction.
+  @MainActor
+  func testRuntimeFileOpenRoutesToDocumentWindowInsteadOfReplacingCurrent() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRuntimeOpenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let readingURL = folder.appendingPathComponent("reading.md")
+    let incomingURL = folder.appendingPathComponent("incoming.md")
+    try "the doc being read".write(to: readingURL, atomically: true, encoding: .utf8)
+    try "the doc arriving from Finder".write(to: incomingURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()
+      ),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      importsFoldersInBackground: true
+    )
+
+    // The window is already showing a document (editable buffer)...
+    controller.openFile(url: readingURL)
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, readingURL.standardizedFileURL)
+
+    // ...and document-window routing is wired, as in a real running window.
+    var routedRefs: [URL] = []
+    controller.requestOpenDocumentWindow = { ref in routedRefs.append(ref.id) }
+
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    coordinator.handle(urls: [incomingURL])
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(
+      routedRefs.map(\.standardizedFileURL), [incomingURL.standardizedFileURL],
+      "an external open with a document on screen must go to the registry (native tab)")
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, readingURL.standardizedFileURL,
+      "the document the user is reading was replaced in place by the external open")
+  }
+
   @MainActor
   func testBareLaunchSettlesAndShowsLauncherWhenSavedWorkspaceIsGone() async throws {
-    let suiteName = "PensieveBareLaunchTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveBareLaunchTests")
 
     let removedFolder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRemovedWorkspace-\(UUID().uuidString)", isDirectory: true)
@@ -3025,7 +3289,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testExternalRefreshReloadsCleanSessionButProtectsDirtySession() throws {
+  func testExternalRefreshReloadsCleanSessionButProtectsDirtySession() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRefreshSessionTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3038,19 +3302,24 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let manager = FolderManager(
-      metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder))
+      metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder),
+      watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }))
     manager.open(url: folder, into: appState)
+    await manager.waitForPendingWorkspaceBuild()
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
+    // The reload happens after the scheduled off-main reconcile publishes, not synchronously.
     try "clean external".write(to: noteURL, atomically: true, encoding: .utf8)
     manager.refresh(into: appState)
+    await manager.waitForPendingForcedRefresh()
     XCTAssertEqual(appState.documentSession.text, "clean external")
     XCTAssertFalse(appState.documentSession.isDirty)
 
     appState.activeDocumentText = "dirty local edit"
     appState.activeDocumentDirty = true
-    try "dirty external".write(to: noteURL, atomically: true, encoding: .utf8)
+    try "dirty external replacement is longer".write(to: noteURL, atomically: true, encoding: .utf8)
     manager.refresh(into: appState)
+    await manager.waitForPendingForcedRefresh()
 
     XCTAssertEqual(appState.documentSession.text, "dirty local edit")
     XCTAssertTrue(appState.documentSession.isDirty)
@@ -3249,7 +3518,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testControllerRoutesWorkspaceCommands() throws {
+  func testControllerRoutesWorkspaceCommands() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveWorkspaceCommandTests-\(UUID().uuidString)", isDirectory: true)
@@ -3266,10 +3535,11 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    let folderManager = FolderManager(
+      metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase)
     let controller = AppController(
       appState: appState,
-      folderManager: FolderManager(
-        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      folderManager: folderManager,
       documentStore: DocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
@@ -3278,10 +3548,19 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.documents.count, 2)
 
     controller.excludeFromWorkspace(urls: [hidden])
-    XCTAssertEqual(appState.excludedWorkspacePaths, Set(["Hidden"]))
+    await folderManager.waitForPendingForcedRefresh()
+    await folderManager.waitForPendingIndexUpdate()
+    await folderManager.waitForPendingWorkspaceIndexWrite()
+    let expectedExclusion = try XCTUnwrap(
+      WorkspaceExclusion.scopedKey(for: hidden, roots: [folder])
+    )
+    XCTAssertEqual(appState.excludedWorkspacePaths, Set([expectedExclusion]))
     XCTAssertEqual(appState.documents.count, 1)
 
     controller.clearWorkspaceExclusions()
+    await folderManager.waitForPendingForcedRefresh()
+    await folderManager.waitForPendingIndexUpdate()
+    await folderManager.waitForPendingWorkspaceIndexWrite()
     XCTAssertTrue(appState.excludedWorkspacePaths.isEmpty)
     XCTAssertEqual(appState.documents.count, 2)
   }
@@ -3665,7 +3944,9 @@ final class PensieveSmokeTests: XCTestCase {
     controller.excludeFromWorkspace(urls: [drafts])
     // The exclusion edit refreshes the workspace, which now writes the FTS delta off-main and
     // re-runs the search projection on completion. Await that before asserting on results.
+    await manager.waitForPendingForcedRefresh()
     await manager.waitForPendingIndexUpdate()
+    await manager.waitForPendingWorkspaceIndexWrite()
 
     XCTAssertFalse(appState.documents.contains { $0.url == skipURL.standardizedFileURL })
     XCTAssertTrue(appState.workspaceSearchResults.isEmpty)
@@ -3843,6 +4124,59 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
+  func testOpenWordFileImportsUnsavedMarkdownDraftWithoutRegistryRouting() async throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenWordImportTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let wordURL = folder.appendingPathComponent("Board Brief.docx")
+    let data = try DocumentTransfer.docxData(
+      fromHTML: "<h1>Board Brief</h1><p>Prokurent approval is required.</p>",
+      baseURL: nil
+    )
+    try data.write(to: wordURL, options: .atomic)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    // The import leaves a dirty untitled session; with the shared autosaver and
+    // recovery store its debounced flush fires mid-suite and strands a "Board
+    // Brief" draft in the REAL ~/Library/…/Pensieve/Recovery — which the app
+    // then resurrects as "Recovered Untitled.md" on every launch.
+    let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
+    addTeardownBlock { autosaver.cancel() }
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: indexDatabase,
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: wordURL)
+    for _ in 0..<100 where appState.documentSession.displayTitle != "Board Brief.md" {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    XCTAssertTrue(requestedRefs.isEmpty, "imports are drafts, not source-backed document tabs")
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.displayTitle, "Board Brief.md")
+    XCTAssertTrue(appState.activeDocumentText.contains("# Board Brief"))
+    XCTAssertTrue(appState.activeDocumentText.contains("Prokurent approval is required."))
+    XCTAssertNil(appState.lastError)
+  }
+
+  @MainActor
   func testOpenFileRejectsUnsupportedTypeBeforeRoutingToRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
@@ -3998,6 +4332,41 @@ final class PensieveSmokeTests: XCTestCase {
       appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
       "headless/no-routing opens load into the current window")
     XCTAssertEqual(appState.activeDocumentText, "beta")
+  }
+
+  @MainActor
+  func testExplicitInWindowOpenDoesNotRouteThroughNewDocumentScene() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveExplicitInWindowOpenTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let bookURL = folder.appendingPathComponent("book.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "the book".write(to: bookURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: indexDatabase,
+        bookmarkStore: temporaryBookmarkStore()),
+      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var requestedRefs: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
+
+    controller.openFile(url: alphaURL)
+    controller.openFileInCurrentWindow(url: bookURL)
+
+    XCTAssertTrue(requestedRefs.isEmpty, "explicit in-window open must not spawn a new scene")
+    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, bookURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "the book")
   }
 
   @MainActor
@@ -5146,6 +5515,17 @@ final class PensieveSmokeTests: XCTestCase {
       try? FileManager.default.removeItem(at: folder)
     }
 
+    // Production topology: the index database lives in Application Support, never inside a
+    // watched root. With per-path self-write filtering, SQLite churn inside the watched folder
+    // would otherwise count as an external mutation and break this contract's premise.
+    let support = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSelfWriteWatcherSupport-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: support)
+    }
+
     let noteURL = folder.appendingPathComponent("watched.md")
     try "before save".write(to: noteURL, atomically: true, encoding: .utf8)
 
@@ -5155,7 +5535,7 @@ final class PensieveSmokeTests: XCTestCase {
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let appState = AppState()
-    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: support)
     let manager = FolderManager(
       metadataStore: temporaryMetadataStore(),
       indexDatabase: indexDatabase,
@@ -5266,11 +5646,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testBookmarkRestoreClearsDeletedFolder() throws {
-    let suiteName = "PensieveBookmarkTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defer {
-      defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = makeEphemeralDefaults(prefix: "PensieveBookmarkTests")
 
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveBookmarkTests-\(UUID().uuidString)", isDirectory: true)
@@ -5300,10 +5676,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   private func temporaryBookmarkStore() -> BookmarkStore {
-    let suiteName = "PensieveBookmarkStoreTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suiteName)!
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
+    BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveBookmarkStoreTests"))
   }
 
   private func temporaryApplicationSupportDirectory() -> URL {
@@ -5397,6 +5770,43 @@ private final class RebuildProbe: @unchecked Sendable {
     }
     lock.unlock()
     expectation?.fulfill()
+  }
+}
+
+/// Inert watcher source for tests that assert exact scan counts around manually driven
+/// reconciles: a live FSEvents stream on the fixture root would deliver real events for the
+/// same mutations and add machine-timing-dependent scans (same discipline as
+/// WorkspaceFreshnessTests).
+private final class InertWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
+  func start(
+    paths: [String],
+    onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void
+  ) throws {}
+
+  func stop() {}
+}
+
+/// Thread-placement probe for injected workspace builders (Sendable-safe counter + flags).
+private final class ScanThreadRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var mainThreadFlags: [Bool] = []
+
+  func record(isMainThread: Bool) {
+    lock.lock()
+    mainThreadFlags.append(isMainThread)
+    lock.unlock()
+  }
+
+  var count: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return mainThreadFlags.count
+  }
+
+  func samples(after callCount: Int) -> [Bool] {
+    lock.lock()
+    defer { lock.unlock() }
+    return Array(mainThreadFlags.dropFirst(callCount))
   }
 }
 

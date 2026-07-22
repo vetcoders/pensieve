@@ -1,0 +1,25 @@
+{
+  "accepted_findings": [
+    {
+      "rule_id": "swift.insecure-communication.ats.ats-pinning.ATS-consider-pinning",
+      "path": "Pensieve/Resources/Info.plist",
+      "max_count": 1,
+      "decision": "Use Apple's system trust store instead of certificate pinning.",
+      "rationale": "Pensieve talks to user-selected AI providers. Pinning provider certificates would break endpoint choice and certificate rotation while adding no stable trust boundary for this product."
+    },
+    {
+      "rule_id": "html.security.audit.missing-integrity.missing-integrity",
+      "path": "docs/index.html",
+      "max_count": 1,
+      "decision": "Canonical metadata is not an executable subresource.",
+      "rationale": "The canonical link declares the preferred document URL and neither fetches nor executes third-party content, so subresource integrity does not apply."
+    },
+    {
+      "rule_id": "swift.biometrics-and-auth.missing-user-auth.keychain-without-user-auth",
+      "path": "Pensieve/Sources/Pensieve/App/ProviderSettings.swift",
+      "max_count": 1,
+      "decision": "Store the provider API key in the file-based login keychain without SecAccessControl user-auth gating.",
+      "rationale": "SecAccessControl(.biometryCurrentSet) routes the item to the macOS data-protection keychain, which requires provisioning-profile-backed keychain entitlements the Developer ID release signature does not carry; every save failed with errSecMissingEntitlement (-34018), blocking cloud autocomplete, and biometry gating excluded Macs without Touch ID. Silent access to the login-keychain item remains bound to the app's code signature."
+    }
+  ]
+}

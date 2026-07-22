@@ -60,10 +60,10 @@ struct SidebarView: View {
     .onAppear {
       reconcileWorkspaceRootExpansion()
     }
-    .onChange(of: rootNodeIDs) { _ in
+    .onChange(of: rootNodeIDs) { _, _ in
       reconcileWorkspaceRootExpansion()
     }
-    .onChange(of: appState.pendingSidebarRenameURL) { url in
+    .onChange(of: appState.pendingSidebarRenameURL) { _, url in
       guard let url else { return }
       beginRename(url: url, currentName: url.lastPathComponent)
       appState.pendingSidebarRenameURL = nil
@@ -309,8 +309,9 @@ struct SidebarView: View {
   private var openingPlaceholder: some View {
     VStack(spacing: 10) {
       Spacer()
-      ProgressView()
-        .controlSize(.small)
+      Image(systemName: "folder")
+        .font(.system(size: 28))
+        .foregroundColor(.secondary)
       Text(appState.workspaceActivity?.title ?? "Opening Workspace")
         .font(.subheadline)
         .foregroundColor(.secondary)
@@ -663,7 +664,7 @@ struct SidebarView: View {
     }
 
     Button("Move to Trash") {
-      controller.moveItemToTrash(url: doc.url)
+      Task { await controller.moveItemToTrash(url: doc.url) }
     }
 
     Divider()
@@ -694,6 +695,12 @@ struct SidebarView: View {
         let doc = appState.document(id: documentID)
       {
         documentContextMenu(for: doc)
+
+        Divider()
+
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
+        }
       } else {
         Button("Open") {
           controller.selectWorkspaceNode(node)
@@ -720,7 +727,13 @@ struct SidebarView: View {
         }
 
         Button("Move to Trash") {
-          controller.moveItemToTrash(url: url)
+          Task { await controller.moveItemToTrash(url: url) }
+        }
+
+        Divider()
+
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
         }
 
         Divider()
@@ -746,6 +759,18 @@ struct SidebarView: View {
 
       Divider()
 
+      if isWorkspaceRoot(url) {
+        Button("Remove Folder from Workspace") {
+          controller.removeWorkspaceRoot(url: url)
+        }
+      } else {
+        Button("Exclude from Workspace") {
+          controller.excludeFromWorkspace(url: url)
+        }
+      }
+
+      Divider()
+
       Button("Rename") {
         beginRename(url: url, currentName: url.lastPathComponent)
       }
@@ -754,8 +779,12 @@ struct SidebarView: View {
         controller.duplicateItem(url: url)
       }
 
-      Button("Move to Trash") {
-        confirmMoveFolderToTrash(url)
+      // Workspace roots are detached through "Remove Folder from Workspace";
+      // AppController.moveItemToTrash rejects them, so don't offer the item.
+      if !isWorkspaceRoot(url) {
+        Button("Move to Trash") {
+          Task { await controller.moveItemToTrash(url: url) }
+        }
       }
 
       Divider()
@@ -780,14 +809,18 @@ struct SidebarView: View {
     }
   }
 
+  /// Every workflow row opens the canonical configuration sheet with THIS file
+  /// preselected — the click itself never launches a run. Disabled wholesale in
+  /// the sandboxed (App Store) build, matching the toolbar and Agents menu.
   private func dispatchMenu(for url: URL) -> some View {
     Menu("Dispatch to Agent") {
       ForEach(controller.agentWorkflows, id: \.self) { workflow in
-        Button(workflow) {
-          controller.dispatchFileToAgent(workflow: workflow, url: url)
+        Button("\(workflow)…") {
+          controller.requestFileDispatch(url: url, workflow: workflow, source: .sidebar)
         }
       }
     }
+    .disabled(!SandboxCapabilities.allowsExternalAgentDispatch())
   }
 
   private func openExternally(_ url: URL) {
@@ -796,6 +829,13 @@ struct SidebarView: View {
 
   private var rootCreationURL: URL? {
     appState.workspaceRoots.first?.url.standardizedFileURL ?? appState.folderURL
+  }
+
+  private func isWorkspaceRoot(_ url: URL) -> Bool {
+    let standardizedURL = url.standardizedFileURL
+    return appState.workspaceRoots.contains {
+      $0.url.standardizedFileURL == standardizedURL
+    }
   }
 
   private func createRootDocument() {
@@ -849,18 +889,6 @@ struct SidebarView: View {
   private func cancelRename() {
     renamingURL = nil
     renameText = ""
-  }
-
-  private func confirmMoveFolderToTrash(_ url: URL) {
-    let alert = NSAlert()
-    alert.messageText = "Move \(url.lastPathComponent) to Trash?"
-    alert.informativeText = "This folder and its contents will move to the system Trash."
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "Move to Trash")
-    alert.addButton(withTitle: "Cancel")
-    if alert.runModal() == .alertFirstButtonReturn {
-      controller.moveItemToTrash(url: url)
-    }
   }
 
   private func handleDrop(_ providers: [NSItemProvider], into folderURL: URL?) -> Bool {
@@ -1048,18 +1076,12 @@ private struct WorkspaceActivityMiniView: View {
   let activity: WorkspaceActivity
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      Text(activity.detail)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .lineLimit(2)
-
-      ProgressView(value: activity.progress)
-        .progressViewStyle(.linear)
-        .controlSize(.small)
-    }
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel("\(activity.title): \(activity.detail)")
-    .accessibilityIdentifier("pensieve.sidebar.activity")
+    Text(activity.detail)
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      .lineLimit(2)
+      .accessibilityElement(children: .combine)
+      .accessibilityLabel("\(activity.title): \(activity.detail)")
+      .accessibilityIdentifier("pensieve.sidebar.activity")
   }
 }

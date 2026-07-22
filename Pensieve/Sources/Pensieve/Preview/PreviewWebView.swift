@@ -222,6 +222,7 @@ final class PreviewWebView: NSView {
       --vc-preview-muted: #57606a;
       --vc-preview-border: #d0d7de;
       --vc-preview-code-bg: #f6f8fa;
+      --vc-preview-code-shadow: 0 1px 2px rgba(31, 35, 40, 0.06), 0 8px 24px rgba(31, 35, 40, 0.05);
       --vc-preview-link: #0969da;
       --vc-preview-row-alt: #f6f8fa;
       --vc-preview-mark-bg: #fff8c5;
@@ -240,6 +241,7 @@ final class PreviewWebView: NSView {
         --vc-preview-muted: #a1a1aa;
         --vc-preview-border: #3f3f46;
         --vc-preview-code-bg: #2a2a2d;
+        --vc-preview-code-shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.18);
         --vc-preview-link: #8ab4f8;
         --vc-preview-row-alt: #242428;
         --vc-preview-mark-bg: #4a3f16;
@@ -389,6 +391,8 @@ final class PreviewWebView: NSView {
     .markdown-body tt {
       background: var(--vc-preview-code-bg) !important;
       color: var(--vc-preview-text) !important;
+      border: 0 !important;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
       white-space: normal !important;
       overflow-wrap: anywhere;
       word-break: break-word;
@@ -399,8 +403,9 @@ final class PreviewWebView: NSView {
       color: var(--vc-preview-text) !important;
       max-width: 100%;
       overflow-x: auto;
-      border: 1px solid var(--vc-preview-border);
-      border-radius: 6px;
+      border: 0 !important;
+      border-radius: 8px;
+      box-shadow: var(--vc-preview-code-shadow);
       padding: 12px 14px;
       margin: 1rem 0;
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
@@ -410,6 +415,9 @@ final class PreviewWebView: NSView {
 
     .markdown-body pre code,
     .markdown-body pre tt {
+      background: transparent !important;
+      margin: 0;
+      padding: 0;
       white-space: pre !important;
       overflow-wrap: normal;
       word-break: normal;
@@ -643,6 +651,7 @@ final class PreviewWebView: NSView {
         .markdown-body tt {
           border: 0 !important;
           border-radius: 0 !important;
+          box-shadow: none !important;
           background: transparent !important;
           padding: 0 !important;
         }

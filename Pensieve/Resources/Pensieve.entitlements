@@ -16,6 +16,12 @@
     <key>com.apple.security.cs.debugger</key>
     <false/>
 
+    <!-- Dictation captures microphone audio in the signed Developer ID lane.
+         Info.plist owns the user-facing purpose string; this capability makes
+         the authorized capture reachable after signing. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
     <!-- Non-sandbox app: explicitly NOT sandboxed for MVP file-first model -->
     <!-- (Sandbox + security-scoped bookmarks layer comes in Wave 2 if needed for App Store) -->
 </dict>

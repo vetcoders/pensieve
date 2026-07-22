@@ -4,7 +4,7 @@ import XCTest
 @testable import Pensieve
 
 /// Structural smoke for the toolbelt declutter: the appearance controls are
-/// preview-scoped, and the popover pickers keep auto-populating from the
+/// preview-scoped, and the appearance-menu pickers keep auto-populating from the
 /// `CaseIterable` theme axes.
 final class EditorToolbeltTests: XCTestCase {
   // MARK: - Appearance visibility gate
@@ -30,7 +30,7 @@ final class EditorToolbeltTests: XCTestCase {
     XCTAssertEqual(Set(visible), Set([.preview, .split]))
   }
 
-  // MARK: - Popover pickers stay CaseIterable-driven
+  // MARK: - Appearance-menu pickers stay CaseIterable-driven
 
   func testFlavorAxisAutoPopulates() {
     XCTAssertFalse(ThemeManager.Theme.allCases.isEmpty)
@@ -38,7 +38,7 @@ final class EditorToolbeltTests: XCTestCase {
   }
 
   func testSkinAxisAutoPopulates() {
-    // The popover renders one row per case — every skin needs a display name
+    // The menu renders one row per case — every skin needs a display name
     // and a symbol, and the ids the picker tags on must stay unique.
     let skins = ThemeManager.PreviewTheme.allCases
     XCTAssertFalse(skins.isEmpty)
@@ -106,6 +106,8 @@ final class EditorToolbeltTests: XCTestCase {
       [
         EditorToolbelt.shareIdentifier,
         EditorToolbelt.dispatchIdentifier,
+        EditorToolbelt.undoIdentifier,
+        EditorToolbelt.redoIdentifier,
         EditorToolbelt.richMarkdownToggleIdentifier,
       ]
       + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
@@ -113,7 +115,11 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ]
 
     XCTAssertEqual(
@@ -121,14 +127,14 @@ final class EditorToolbeltTests: XCTestCase {
       expectedOrder)
   }
 
-  func testTitlebarIslandsKeepShareDispatchSeparateFromPrincipalEditRow() {
+  func testTitlebarFamiliesPreserveSemanticOrder() {
     XCTAssertEqual(
-      EditorToolbelt.visibleToolbarIslandOrder(for: .split, hasEditableBuffer: true),
-      [.shareDispatch, .edit, .trailing])
+      EditorToolbelt.visibleToolbarFamilyOrder(for: .split, hasEditableBuffer: true),
+      [.documentDispatch, .history, .editing, .view, .previewRuntime, .assistants])
 
     XCTAssertEqual(
-      EditorToolbelt.visibleToolbarIslandOrder(for: .source, hasEditableBuffer: false),
-      [.shareDispatch, .trailing])
+      EditorToolbelt.visibleToolbarFamilyOrder(for: .source, hasEditableBuffer: false),
+      [.documentDispatch, .view, .previewRuntime, .assistants])
   }
 
   func testTitlebarOrderKeepsModesTrailingWhenEditRowIsUnavailable() {
@@ -140,7 +146,11 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ])
 
     XCTAssertEqual(
@@ -150,8 +160,85 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.dispatchIdentifier,
         EditorToolbelt.modePickerIdentifier,
         EditorToolbelt.reloadIdentifier,
-        EditorToolbelt.overflowIdentifier,
+        EditorToolbelt.autoReloadIdentifier,
+        EditorToolbelt.scrollSyncIdentifier,
+        EditorToolbelt.dictationIdentifier,
+        EditorToolbelt.autocompleteIdentifier,
+        EditorToolbelt.rewriteIdentifier,
       ])
+  }
+}
+
+@MainActor
+final class EditorToolbeltTestsHistory: XCTestCase {
+  @MainActor
+  private final class HistoryProbe: NSObject {
+    let undoManager: UndoManager
+    private(set) var value = 0
+
+    init(undoManager: UndoManager) {
+      self.undoManager = undoManager
+    }
+
+    func setValue(_ newValue: Int) {
+      let previous = value
+      undoManager.registerUndo(withTarget: self) { target in
+        target.setValue(previous)
+      }
+      value = newValue
+    }
+  }
+
+  func testHistoryActionsUseStandardResponderSelectorsAndLabels() {
+    XCTAssertEqual(
+      NSStringFromSelector(ToolbarResponderHistoryState.Action.undo.selector), "undo:")
+    XCTAssertEqual(
+      NSStringFromSelector(ToolbarResponderHistoryState.Action.redo.selector), "redo:")
+
+    for action in ToolbarResponderHistoryState.Action.allCases {
+      XCTAssertFalse(action.label.isEmpty)
+      XCTAssertFalse(action.systemImage.isEmpty)
+      XCTAssertFalse(action.accessibilityIdentifier.isEmpty)
+    }
+  }
+
+  func testHistoryRefreshNotificationsCannotFeedBackThroughUndoCheckpoint() {
+    XCTAssertFalse(
+      ToolbarResponderHistoryState.refreshNotificationNames.contains(.NSUndoManagerCheckpoint),
+      "reading canUndo/canRedo emits a checkpoint, so observing it creates an infinite refresh loop"
+    )
+    XCTAssertTrue(
+      ToolbarResponderHistoryState.refreshNotificationNames.contains(
+        .NSUndoManagerDidCloseUndoGroup),
+      "closed undo groups must still refresh toolbar availability"
+    )
+  }
+
+  func testAvailabilityTracksActiveTextViewUndoManagerWithoutAnotherStack() throws {
+    let surface = MarkdownEditorSurface(text: "history", fontSize: 14)
+    let undoManager = try XCTUnwrap(surface.textView.undoManager)
+    let probe = HistoryProbe(undoManager: undoManager)
+
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: false, canRedo: false))
+
+    probe.setValue(1)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: true, canRedo: false))
+
+    undoManager.undo()
+    XCTAssertEqual(probe.value, 0)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: false, canRedo: true))
+
+    undoManager.redo()
+    XCTAssertEqual(probe.value, 1)
+    XCTAssertEqual(
+      ToolbarResponderHistoryState.availability(for: surface.textView),
+      .init(canUndo: true, canRedo: false))
   }
 }
 
@@ -288,5 +375,64 @@ final class FormattingAccessoryChromeTruthTests: XCTestCase {
 
     let contentTop = textView.convert(window.contentLayoutRect, from: nil).minY
     XCTAssertEqual(allowed.minY, contentTop, accuracy: 0.5)
+  }
+}
+
+/// Regression for the dangling-undo-target SIGSEGV (crash report Pensieve
+/// 2026-07-19-060545): the text view registers undo actions targeting `self`
+/// into the WINDOW's undo manager, which outlives the view. When SwiftUI rebuilds
+/// the editor representable, the freed view is still referenced by those entries
+/// (NSUndoManager holds targets unsafe-unretained), so the first Cmd+Z afterwards
+/// drives `undoNestedGroup → popAndInvoke → objc_msgSend` onto a dangling pointer.
+/// Detaching the view from its window must scrub every entry targeting it from the
+/// outgoing window's undo manager.
+@MainActor
+final class MarkdownTextViewUndoDetachTests: XCTestCase {
+  func testDetachingFromWindowClearsUndoActionsTargetingTextView() throws {
+    let surface = MarkdownEditorSurface(text: "detach", fontSize: 14)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    window.contentView = surface.scrollView
+    surface.scrollView.frame = window.contentView?.bounds ?? .zero
+    surface.scrollView.layoutSubtreeIfNeeded()
+
+    let textView = surface.textView
+    XCTAssertTrue(textView.window === window, "text view must be attached before the test starts")
+
+    // The window's undo manager is the exact instance the text view registers into
+    // while attached (`super.undoManager` resolves to it, no delegate override).
+    let windowUndoManager = try XCTUnwrap(window.undoManager)
+    XCTAssertTrue(
+      textView.undoManager === windowUndoManager,
+      "attached text view must share the window's undo manager")
+
+    // Register an entry targeting the view — same shape as AppKit typing-undo and
+    // `registerSmartPasteUndo` (both use a target of `self`).
+    // Close the group deterministically: `removeAllActions(withTarget:)` scrubs a
+    // block-based entry only once its group is closed, and AppKit's default
+    // `groupsByEvent` closes groups on run-loop turns we do not spin here. Real teardown
+    // happens on a later event with the group already closed — this reproduces that state.
+    windowUndoManager.groupsByEvent = false
+    windowUndoManager.beginUndoGrouping()
+    windowUndoManager.registerUndo(withTarget: textView) { tv in
+      _ = tv  // undo body is irrelevant; the dangling *target* is the crash surface.
+    }
+    windowUndoManager.endUndoGrouping()
+    XCTAssertTrue(
+      windowUndoManager.canUndo, "precondition: the registered entry must be live before detach")
+
+    // Detach the whole editor subtree from the window (the SwiftUI teardown path).
+    surface.scrollView.removeFromSuperview()
+    XCTAssertNil(textView.window, "text view must be detached after removeFromSuperview")
+
+    XCTAssertFalse(
+      windowUndoManager.canUndo,
+      "detaching the text view must clear its entries from the window's undo manager, "
+        + "or the freed view is left as a dangling undo target (SIGSEGV on next Cmd+Z)")
   }
 }

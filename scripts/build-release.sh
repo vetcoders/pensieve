@@ -49,7 +49,10 @@ PKG_DIR="$REPO_ROOT/Pensieve"
 DIST_DIR="$REPO_ROOT/dist"
 APP_NAME="Pensieve"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
-DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+# DMG_PATH is derived later (x.y.z+slug needs VERSION + git HEAD resolved);
+# DMG_STABLE_PATH keeps the fixed name docs/index.html downloads via
+# releases/latest/download/Pensieve.dmg.
+DMG_STABLE_PATH="$DIST_DIR/$APP_NAME.dmg"
 DMG_VOLNAME="Pensieve"
 VERSION_FILE="$REPO_ROOT/VERSION"
 INFO_PLIST_SRC="$PKG_DIR/Resources/Info.plist"
@@ -59,7 +62,11 @@ ICON_RESOURCE="$APP_NAME.icns"
 KEYS_DIR="${HOME}/.keys"
 NOTARY_ENV="$KEYS_DIR/.notary.env"
 SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
-FFI_PROFILE="${FFI_PROFILE:-debug}"
+# Development builds keep Package.swift's debug default. Every release lane
+# defaults to the optimized vendored runtime and exports the choice so the
+# SwiftPM manifest links the same profile that is later embedded in the app.
+FFI_PROFILE="${FFI_PROFILE:-release}"
+export FFI_PROFILE
 
 # ─── Args ─────────────────────────────────────────────────────────────────
 DO_NOTARIZE=1
@@ -107,6 +114,12 @@ case "$FFI_PROFILE" in
     debug|release) ;;
     *) die "FFI_PROFILE must be debug or release, got: $FFI_PROFILE" ;;
 esac
+if (( ! DMG_ONLY )) && [[ "$FFI_PROFILE" != "release" ]]; then
+    if (( DO_NOTARIZE || APPSTORE )); then
+        die "Distributable releases require FFI_PROFILE=release; debug FFI is local-only."
+    fi
+    warn "FFI_PROFILE=debug — local signed app will contain the debug qube-ffi runtime."
+fi
 
 plist_set_string() {
     local plist="$1"
@@ -199,6 +212,7 @@ COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
+DMG_PATH="$DIST_DIR/$APP_NAME-$BUILD_LABEL.dmg"
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
 log "FFI profile: $FFI_PROFILE"
 
@@ -416,12 +430,22 @@ if (( ! DO_DMG )); then
 else
 log "Building DMG"
 rm -f "$DMG_PATH"
-hdiutil create \
-    -volname "$DMG_VOLNAME" \
-    -srcfolder "$APP_BUNDLE" \
-    -ov \
-    -format UDZO \
-    "$DMG_PATH" 2>&1 | tail -3
+# Stage a drag-install layout: the app plus an /Applications symlink, so the
+# mounted image offers the drop target instead of a lone .app.
+DMG_STAGING="$DIST_DIR/dmg-staging"
+rm -rf "$DMG_STAGING"
+(
+    trap 'rm -rf "$DMG_STAGING"' EXIT
+    mkdir -p "$DMG_STAGING"
+    cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+    ln -s /Applications "$DMG_STAGING/Applications"
+    hdiutil create \
+        -volname "$DMG_VOLNAME" \
+        -srcfolder "$DMG_STAGING" \
+        -ov \
+        -format UDZO \
+        "$DMG_PATH" 2>&1 | tail -3
+)
 ok "DMG: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
 
 log "Signing DMG"
@@ -454,6 +478,28 @@ if (( DO_NOTARIZE )); then
                 --password "$NOTARY_PASSWORD" 2>&1 | tail -40
         fi
         die "DMG notarization failed"
+    fi
+fi
+
+# Refresh the stable-named copy AFTER sign/notarize/staple: the staple ticket
+# lives inside the DMG, so the copy stays validated, and the fixed name keeps
+# the releases/latest/download/Pensieve.dmg funnel alive.
+cp -f "$DMG_PATH" "$DMG_STABLE_PATH"
+ok "Stable alias: $DMG_STABLE_PATH"
+
+# Internal release shelf (Codescribe convention: <root>/<App>/<version>/ with
+# the artifact + SHA256SUMS.txt). Notarized lane only — local --no-notarize
+# builds are not releases and must not land on the team shelf.
+INTERNAL_RELEASES_ROOT="${PENSIEVE_INTERNAL_RELEASES:-/Volumes/vc-workspace/_RELEASES}"
+if (( DO_NOTARIZE )); then
+    if [[ -d "$INTERNAL_RELEASES_ROOT" ]]; then
+        INTERNAL_DIR="$INTERNAL_RELEASES_ROOT/$APP_NAME/$APP_VERSION"
+        mkdir -p "$INTERNAL_DIR"
+        cp -f "$DMG_PATH" "$INTERNAL_DIR/"
+        (cd "$INTERNAL_DIR" && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+        ok "Internal release: $INTERNAL_DIR/$(basename "$DMG_PATH")"
+    else
+        warn "Internal releases root missing at $INTERNAL_RELEASES_ROOT — skipped internal publish"
     fi
 fi
 fi  # end: skip DMG build/sign/notarize in --no-dmg mode

@@ -61,9 +61,13 @@ struct AgentDispatchMetadata: Equatable, Sendable {
 }
 
 protocol AgentPromptLaunching: Sendable {
+  /// `agents` are the POSITIONAL agent tokens, in CLI order. One token is a
+  /// single-agent (or synthesizer-override) run; an empty list launches the
+  /// workflow's own default — for a swarm workflow that is the honest
+  /// "no positional agent" invocation, never a fabricated single agent.
   func dispatch(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata
@@ -127,27 +131,27 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
 
   static func arguments(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload
   ) -> [String] {
     switch payload {
     case .prompt(let prompt):
-      return [workflow, agent, "--prompt", prompt]
+      return [workflow] + agents + ["--prompt", prompt]
     case .file(let path):
-      return [workflow, agent, "--file", path]
+      return [workflow] + agents + ["--file", path]
     }
   }
 
   func dispatch(
     workflow: String,
-    agent: String,
+    agents: [String],
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
     let executablePath = try Self.resolveExecutablePath()
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = Self.arguments(workflow: workflow, agent: agent, payload: payload)
+    process.arguments = Self.arguments(workflow: workflow, agents: agents, payload: payload)
     process.currentDirectoryURL = workingDirectoryURL
 
     let stdout = Pipe()

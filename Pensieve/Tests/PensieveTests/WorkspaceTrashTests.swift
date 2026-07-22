@@ -5,220 +5,319 @@ import XCTest
 
 @MainActor
 final class WorkspaceTrashTests: XCTestCase {
-  func testMoveOpenWorkspaceFileToTrashClosesDocumentWindowBeforeRecycle() throws {
-    let fixture = try makeFixture()
-    defer { fixture.cleanup() }
-
-    let fileURL = fixture.root.appendingPathComponent("alpha.md").standardizedFileURL
-    try "# Alpha".write(to: fileURL, atomically: true, encoding: .utf8)
-
-    let harness = try makeHarness(root: fixture.root)
-    let window = Self.makeWindow()
-    defer { window.close() }
-
-    let ref = DocumentRef(id: fileURL)
-    harness.documentStore.load(ref: ref, into: harness.appState)
-    XCTAssertEqual(harness.appState.selectedDocumentID, fileURL)
-    harness.windowDocumentIDs[ObjectIdentifier(window)] = fileURL
-    harness.registry.attach(window, documentID: fileURL)
-
-    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
-
-    XCTAssertEqual(harness.events, ["close:\(fileURL.path)", "recycle:\(fileURL.path)"])
-    XCTAssertNil(harness.appState.selectedDocumentID)
-    XCTAssertFalse(harness.appState.documentSession.hasEditableBuffer)
-    XCTAssertEqual(harness.recycleRequests, [[fileURL]])
-  }
-
-  func testMoveClosedWorkspaceFileToTrashDoesNotCloseAnyDocumentWindow() throws {
-    let fixture = try makeFixture()
-    defer { fixture.cleanup() }
-
-    let fileURL = fixture.root.appendingPathComponent("closed.md").standardizedFileURL
-    try "# Closed".write(to: fileURL, atomically: true, encoding: .utf8)
-
-    let harness = try makeHarness(root: fixture.root)
-
-    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
-
-    XCTAssertEqual(harness.events, ["recycle:\(fileURL.path)"])
-    XCTAssertEqual(harness.recycleRequests, [[fileURL]])
-  }
-
-  func testMoveWorkspaceFolderToTrashClosesDescendantDocumentWindow() throws {
-    let fixture = try makeFixture()
-    defer { fixture.cleanup() }
-
+  func testSuccessfulFolderTrashMutatesOnlyAfterRecycleThenRemovesFTSRow() async throws {
+    let fixture = try TrashTestFixture.make()
     let folderURL = fixture.root.appendingPathComponent("notes", isDirectory: true)
       .standardizedFileURL
     let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-    try "# Nested".write(to: fileURL, atomically: true, encoding: .utf8)
+    try "# Nested unique-trash-token".write(to: fileURL, atomically: true, encoding: .utf8)
+    let harness = try makeTrashHarness(root: fixture.root)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
 
-    let harness = try makeHarness(root: fixture.root)
-    let window = Self.makeWindow()
+    await harness.openWorkspace()
+    let indexedCountBeforeTrash = await indexedCount(in: harness)
+    XCTAssertEqual(indexedCountBeforeTrash, 1)
+    let ref = try XCTUnwrap(harness.appState.documents.first { $0.url == fileURL })
+    harness.documentStore.load(ref: ref, into: harness.appState)
+    let window = TrashTestHarness.makeWindow()
     defer { window.close() }
+    harness.register(window, documentID: fileURL)
 
-    harness.documentStore.load(ref: DocumentRef(id: fileURL), into: harness.appState)
+    let operation = harness.requestTrash(folderURL)
+    await harness.waitForRecycleRequest()
+
+    XCTAssertEqual(harness.confirmationProbe.requests, [folderURL])
     XCTAssertEqual(harness.appState.selectedDocumentID, fileURL)
-    harness.windowDocumentIDs[ObjectIdentifier(window)] = fileURL
-    harness.registry.attach(window, documentID: fileURL)
+    XCTAssertTrue(treeContains(harness.appState.workspaceTree, url: folderURL))
+    XCTAssertEqual(harness.recycleProbe.events, ["request:\(folderURL.path)"])
 
-    XCTAssertTrue(harness.controller.moveItemToTrash(url: folderURL))
+    harness.completeRecycle()
+    let didTrash = await operation.value
+    XCTAssertTrue(didTrash)
 
-    XCTAssertEqual(harness.events, ["close:\(fileURL.path)", "recycle:\(folderURL.path)"])
+    XCTAssertFalse(treeContains(harness.appState.workspaceTree, url: folderURL))
+    XCTAssertTrue(harness.appState.documents.allSatisfy { $0.url != fileURL })
+    XCTAssertTrue(harness.appState.openFiles.allSatisfy { $0.url != fileURL })
     XCTAssertNil(harness.appState.selectedDocumentID)
     XCTAssertFalse(harness.appState.documentSession.hasEditableBuffer)
-    XCTAssertEqual(harness.recycleRequests, [[folderURL]])
+    let indexedCountAfterTrash = await indexedCount(in: harness)
+    XCTAssertEqual(indexedCountAfterTrash, 0)
+    XCTAssertEqual(
+      harness.recycleProbe.events,
+      ["request:\(folderURL.path)", "completion:\(folderURL.path)", "close:\(fileURL.path)"]
+    )
   }
 
-  func testRecycleSuccessCompletionRemovesOpenFileReference() async throws {
-    let fixture = try makeFixture()
-    defer { fixture.cleanup() }
+  func testRecycleFailurePreservesTreeOpenSelectionSessionWindowsAndFTS() async throws {
+    let fixture = try TrashTestFixture.make()
+    let folderURL = fixture.root.appendingPathComponent("notes", isDirectory: true)
+      .standardizedFileURL
+    let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+    try "# Failure preservation".write(to: fileURL, atomically: true, encoding: .utf8)
+    let harness = try makeTrashHarness(root: fixture.root)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
 
-    let fileURL = fixture.root.appendingPathComponent("alpha.md").standardizedFileURL
-    try "# Alpha".write(to: fileURL, atomically: true, encoding: .utf8)
+    await harness.openWorkspace()
+    let ref = try XCTUnwrap(harness.appState.documents.first { $0.url == fileURL })
+    harness.documentStore.load(ref: ref, into: harness.appState)
+    harness.appState.documentSession.text = "unsaved body"
+    harness.appState.documentSession.isDirty = true
+    harness.appState.workspaceSearchResults = harness.indexDatabase.search(
+      query: "preservation",
+      documents: harness.appState.allDocuments,
+      appState: harness.appState
+    )
+    let window = TrashTestHarness.makeWindow()
+    defer { window.close() }
+    harness.register(window, documentID: fileURL)
+    let before = await harness.captureState()
 
-    let harness = try makeHarness(root: fixture.root)
-    harness.appState.openFiles = [DocumentRef(id: fileURL, isAdHoc: true)]
+    let operation = harness.requestTrash(folderURL)
+    await harness.waitForRecycleRequest()
+    harness.completeRecycle(error: CocoaError(.fileWriteNoPermission))
 
-    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
-    XCTAssertEqual(harness.appState.openFiles.map(\.id), [fileURL])
-
-    let completion = try XCTUnwrap(harness.recycleCompletion)
-    completion([:], nil)
-    await Self.drainMainActor(until: { harness.appState.openFiles.isEmpty })
-
-    XCTAssertTrue(harness.appState.openFiles.isEmpty)
-    XCTAssertNil(harness.appState.lastError)
+    let didTrash = await operation.value
+    let after = await harness.captureState()
+    XCTAssertFalse(didTrash)
+    XCTAssertEqual(after, before)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: folderURL.path))
+    XCTAssertEqual(
+      harness.recycleProbe.events,
+      ["request:\(folderURL.path)", "completion:\(folderURL.path)"]
+    )
+    XCTAssertTrue(harness.appState.lastError?.contains("Trash") == true)
   }
 
-  func testRecycleFailureCompletionSurfacesErrorAndKeepsOpenFileReference() async throws {
-    let fixture = try makeFixture()
-    defer { fixture.cleanup() }
+  func testFolderCancellationPreservesFullStateSnapshot() async throws {
+    let fixture = try TrashTestFixture.make()
+    let folderURL = fixture.root.appendingPathComponent("notes", isDirectory: true)
+      .standardizedFileURL
+    let fileURL = folderURL.appendingPathComponent("nested.md").standardizedFileURL
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+    try "# Cancel preservation".write(to: fileURL, atomically: true, encoding: .utf8)
+    let harness = try makeTrashHarness(root: fixture.root, confirmationResult: false)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
 
-    let fileURL = fixture.root.appendingPathComponent("alpha.md").standardizedFileURL
-    try "# Alpha".write(to: fileURL, atomically: true, encoding: .utf8)
+    await harness.openWorkspace()
+    let ref = try XCTUnwrap(harness.appState.documents.first { $0.url == fileURL })
+    harness.documentStore.load(ref: ref, into: harness.appState)
+    harness.appState.documentSession.text = "dirty cancel body"
+    harness.appState.documentSession.isDirty = true
+    harness.appState.lastError = "keep-existing-error"
+    let before = await harness.captureState()
 
-    let harness = try makeHarness(root: fixture.root)
-    harness.appState.openFiles = [DocumentRef(id: fileURL, isAdHoc: true)]
+    let didTrash = await harness.controller.moveItemToTrash(url: folderURL)
+    let after = await harness.captureState()
+    XCTAssertFalse(didTrash)
 
-    XCTAssertTrue(harness.controller.moveItemToTrash(url: fileURL))
-
-    let completion = try XCTUnwrap(harness.recycleCompletion)
-    completion([:], CocoaError(.fileWriteNoPermission))
-    await Self.drainMainActor(until: { harness.appState.lastError != nil })
-
-    let lastError = try XCTUnwrap(harness.appState.lastError)
-    XCTAssertTrue(lastError.contains("alpha.md"), "error names the file: \(lastError)")
-    XCTAssertTrue(lastError.contains("Trash"), "error names the operation: \(lastError)")
-    // The file is still on disk after a failed recycle, so its sidebar reference must survive.
-    XCTAssertEqual(harness.appState.openFiles.map(\.id), [fileURL])
+    XCTAssertEqual(after, before)
+    XCTAssertEqual(harness.appState.lastError, "keep-existing-error")
+    XCTAssertEqual(harness.confirmationProbe.requests, [folderURL])
+    XCTAssertTrue(harness.recycleProbe.requests.isEmpty)
   }
 
-  /// The recycle completion hops through `Task { @MainActor in ... }`; yield the main
-  /// actor until the hop lands (bounded so a regression fails fast instead of hanging).
-  private static func drainMainActor(until condition: @MainActor () -> Bool) async {
-    for _ in 0..<500 {
-      if condition() { return }
-      await Task.yield()
+  func testTreePruneLandsUnder100MillisecondsWhileReconcileIsBlockedOffMain() async throws {
+    let fixture = try TrashTestFixture.make()
+    let folderURL = fixture.root.appendingPathComponent("target", isDirectory: true)
+      .standardizedFileURL
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+    let blocker = BlockingWorkspaceBuilder()
+    let harness = try makeTrashHarness(root: fixture.root, workspaceBuilder: blocker.builder)
+    defer {
+      blocker.releaseScan()
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+
+    let unrelatedNodes = (0..<6_000).map { index in
+      WorkspaceNode(
+        id: "document:\(fixture.root.path)/unrelated-\(index).md",
+        name: "unrelated-\(index)",
+        kind: .document,
+        url: fixture.root.appendingPathComponent("unrelated-\(index).md"),
+        children: nil
+      )
+    }
+    let targetNode = WorkspaceNode(
+      id: "folder:\(folderURL.path)",
+      name: "target",
+      kind: .folder,
+      url: folderURL,
+      children: []
+    )
+    harness.appState.workspaceRoots = [WorkspaceRoot(id: fixture.root)]
+    harness.appState.folderURL = fixture.root
+    harness.appState.workspaceTree = [
+      WorkspaceNode(
+        id: "root:\(fixture.root.path)",
+        name: fixture.root.lastPathComponent,
+        kind: .folder,
+        url: fixture.root,
+        children: [targetNode] + unrelatedNodes
+      )
+    ]
+
+    let operation = harness.requestTrash(folderURL)
+    await harness.waitForRecycleRequest()
+    let completionStartedAt = DispatchTime.now().uptimeNanoseconds
+    harness.completeRecycle()
+    await waitUntil { !self.treeContains(harness.appState.workspaceTree, url: folderURL) }
+    let pruneObservedAt = DispatchTime.now().uptimeNanoseconds
+    let completionToPruneMilliseconds = Double(pruneObservedAt - completionStartedAt) / 1_000_000
+
+    XCTAssertLessThan(completionToPruneMilliseconds, 100)
+    XCTAssertEqual(harness.appState.workspaceTree.first?.children?.count, unrelatedNodes.count)
+
+    var heartbeatRan = false
+    let heartbeat = Task { @MainActor in heartbeatRan = true }
+    await heartbeat.value
+    XCTAssertTrue(
+      heartbeatRan, "The main actor must remain responsive while the scanner is blocked")
+
+    blocker.releaseScan()
+    let didTrash = await operation.value
+    XCTAssertTrue(didTrash)
+  }
+
+  func testEmptyFolderDisappearsWithoutFTSBatchWrite() async throws {
+    try await assertFolderOnlyTrashDoesNotWriteFTS(unsupportedFileName: nil)
+  }
+
+  func testUnsupportedOnlyFolderDisappearsWithoutFTSBatchWrite() async throws {
+    try await assertFolderOnlyTrashDoesNotWriteFTS(unsupportedFileName: "diagram.pdf")
+  }
+
+  func testWorkspaceRootTrashIsRejectedBeforeConfirmationOrRecycle() async throws {
+    let fixture = try TrashTestFixture.make()
+    let harness = try makeTrashHarness(root: fixture.root)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+    await harness.openWorkspace()
+    let before = await harness.captureState()
+
+    let didTrash = await harness.controller.moveItemToTrash(url: fixture.root)
+    let after = await harness.captureState()
+    XCTAssertFalse(didTrash)
+
+    XCTAssertEqual(after, before)
+    XCTAssertTrue(harness.confirmationProbe.requests.isEmpty)
+    XCTAssertTrue(harness.recycleProbe.requests.isEmpty)
+    XCTAssertTrue(harness.appState.lastError?.contains("Workspace roots") == true)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.root.path))
+  }
+
+  func testPureTreePruneRemovesOnlyTargetSubtree() {
+    let root = URL(fileURLWithPath: "/tmp/workspace")
+    let target = root.appendingPathComponent("target")
+    let survivor = root.appendingPathComponent("survivor.md")
+    let tree = [
+      WorkspaceNode(
+        id: "root:\(root.path)",
+        name: "workspace",
+        kind: .folder,
+        url: root,
+        children: [
+          WorkspaceNode(
+            id: "folder:\(target.path)",
+            name: "target",
+            kind: .folder,
+            url: target,
+            children: [
+              WorkspaceNode(
+                id: "document:\(target.path)/nested.md",
+                name: "nested",
+                kind: .document,
+                url: target.appendingPathComponent("nested.md"),
+                children: nil
+              )
+            ]
+          ),
+          WorkspaceNode(
+            id: "document:\(survivor.path)",
+            name: "survivor",
+            kind: .document,
+            url: survivor,
+            children: nil
+          ),
+        ]
+      )
+    ]
+
+    let pruned = FolderManager.prunedWorkspaceTree(tree, removing: target)
+
+    XCTAssertFalse(treeContains(pruned, url: target))
+    XCTAssertTrue(treeContains(pruned, url: survivor))
+    XCTAssertEqual(pruned.first?.children?.count, 1)
+  }
+
+  private func assertFolderOnlyTrashDoesNotWriteFTS(unsupportedFileName: String?) async throws {
+    let fixture = try TrashTestFixture.make()
+    let folderURL = fixture.root.appendingPathComponent("folder", isDirectory: true)
+      .standardizedFileURL
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+    if let unsupportedFileName {
+      try Data("not indexed".utf8).write(to: folderURL.appendingPathComponent(unsupportedFileName))
+    }
+    let harness = try makeTrashHarness(root: fixture.root)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+
+    await harness.openWorkspace()
+    XCTAssertTrue(treeContains(harness.appState.workspaceTree, url: folderURL))
+    harness.indexBatchCounter.reset()
+
+    let operation = harness.requestTrash(folderURL)
+    await harness.waitForRecycleRequest()
+    harness.completeRecycle()
+    let didTrash = await operation.value
+    XCTAssertTrue(didTrash)
+
+    XCTAssertFalse(treeContains(harness.appState.workspaceTree, url: folderURL))
+    XCTAssertEqual(harness.indexBatchCounter.value, 0)
+    let indexedCountAfterTrash = await indexedCount(in: harness)
+    XCTAssertEqual(indexedCountAfterTrash, 0)
+  }
+
+  private func indexedCount(in harness: TrashTestHarness) async -> Int {
+    await harness.indexDatabase.indexedDocumentCountInBackground(
+      forRootPaths: harness.appState.workspaceRoots.map { $0.url.path },
+      appState: harness.appState
+    )
+  }
+
+  // Raw-path comparison keeps this probe cheap enough that the timing window in
+  // the 100 ms test measures the product prune, not the observation walk. Node
+  // URLs are standardized at construction (scanner and fixtures alike).
+  private func treeContains(_ nodes: [WorkspaceNode], url: URL) -> Bool {
+    treeContains(nodes, path: url.standardizedFileURL.path)
+  }
+
+  private func treeContains(_ nodes: [WorkspaceNode], path: String) -> Bool {
+    nodes.contains { node in
+      node.url?.path == path || treeContains(node.children ?? [], path: path)
     }
   }
 
-  private func makeHarness(root: URL) throws -> TrashHarness {
-    let appState = AppState()
-    let indexDatabase = IndexDatabase(databaseURL: root.appendingPathComponent("index.db"))
-    let bookmarkStore = try temporaryBookmarkStore()
-    let metadataStore = WorkspaceMetadataStore(
-      metadataURL: root.appendingPathComponent("workspace.json", isDirectory: false))
-    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: root))
-    let documentStore = DocumentStore(
-      indexDatabase: indexDatabase,
-      bookmarkStore: bookmarkStore
-    )
-    let harness = TrashHarness()
-    let folderManager = FolderManager(
-      metadataStore: metadataStore,
-      indexDatabase: indexDatabase,
-      bookmarkStore: bookmarkStore,
-      workspaceSubstrate: substrate,
-      recycleItems: { urls, completion in
-        harness.recycleRequests.append(urls)
-        harness.recycleCompletion = completion
-        harness.events.append("recycle:\(urls.map(\.path).joined(separator: ","))")
-      }
-    )
-    let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { $0() },
-      scheduleLauncherWindowSweep: { _ in },
-      mergeWindowIntoTabs: { _, _ in },
-      orderAndActivateWindow: { _ in },
-      closeWindow: { window in
-        if let documentID = harness.windowDocumentIDs[ObjectIdentifier(window)] {
-          harness.events.append("close:\(documentID.path)")
-        } else {
-          harness.events.append("close:<unknown>")
-        }
-      }
-    )
-    harness.registry = registry
-    harness.appState = appState
-    harness.documentStore = documentStore
-    harness.controller = AppController(
-      appState: appState,
-      folderManager: folderManager,
-      documentStore: documentStore,
-      indexDatabase: indexDatabase,
-      documentWindowRegistry: registry
-    )
-    return harness
-  }
-
-  private func makeFixture() throws -> TrashFixture {
-    let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveWorkspaceTrashTests-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    return TrashFixture(root: root)
-  }
-
-  private func temporaryBookmarkStore() throws -> BookmarkStore {
-    let suiteName = "PensieveWorkspaceTrashTests-\(UUID().uuidString)"
-    let defaults = try XCTUnwrap(
-      UserDefaults(suiteName: suiteName),
-      "Expected UserDefaults suite \(suiteName) to be creatable")
-    defaults.removePersistentDomain(forName: suiteName)
-    return BookmarkStore(defaults: defaults)
-  }
-
-  private static func makeWindow() -> NSWindow {
-    let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
-      styleMask: [.titled],
-      backing: .buffered,
-      defer: false
-    )
-    window.isReleasedWhenClosed = false
-    return window
-  }
-}
-
-@MainActor
-private final class TrashHarness {
-  var appState: AppState!
-  var documentStore: DocumentStore!
-  var controller: AppController!
-  var registry: DocumentWindowRegistry!
-  var recycleRequests: [[URL]] = []
-  var recycleCompletion: (@Sendable ([URL: URL], Error?) -> Void)?
-  var events: [String] = []
-  var windowDocumentIDs: [ObjectIdentifier: URL] = [:]
-}
-
-private struct TrashFixture {
-  let root: URL
-
-  func cleanup() {
-    try? FileManager.default.removeItem(at: root)
+  private func waitUntil(_ condition: @MainActor () -> Bool) async {
+    for _ in 0..<10_000 {
+      if condition() { return }
+      await Task.yield()
+    }
+    XCTFail("Timed out waiting for main-actor state")
   }
 }

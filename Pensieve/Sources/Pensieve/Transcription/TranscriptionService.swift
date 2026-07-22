@@ -2,27 +2,96 @@ import AVFoundation
 import Combine
 import Foundation
 
-enum TranscriptionFormatMode: String, CaseIterable, Identifiable, Sendable {
+enum TranscriptionLanguageChoice: String, CaseIterable, Identifiable, Sendable {
+  case automatic
   case polish
-  case kurier
+  case english
 
   var id: String { rawValue }
 
   var title: String {
     switch self {
+    case .automatic:
+      return "Auto"
     case .polish:
       return "Polish"
-    case .kurier:
-      return "Kurier"
+    case .english:
+      return "English"
+    }
+  }
+
+  /// Locale identifiers accepted by the native speech engine. `nil` keeps
+  /// provider-side automatic language detection enabled.
+  var engineIdentifier: String? {
+    switch self {
+    case .automatic:
+      return nil
+    case .polish:
+      return "pl-PL"
+    case .english:
+      return "en-US"
+    }
+  }
+}
+
+enum TranscriptionFormatMode: String, CaseIterable, Identifiable, Sendable {
+  case cleanUp
+  case writingAssistant
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .cleanUp:
+      return "Clean Up"
+    case .writingAssistant:
+      return "Writing Assistant"
+    }
+  }
+
+  var detail: String {
+    switch self {
+    case .cleanUp:
+      return "Fix transcription errors without changing your meaning."
+    case .writingAssistant:
+      return "Improve structure and clarity while keeping the message yours."
+    }
+  }
+
+  var actionTitle: String {
+    switch self {
+    case .cleanUp:
+      return "Clean Up Text"
+    case .writingAssistant:
+      return "Run Writing Assistant"
     }
   }
 
   var assistive: Bool {
     switch self {
-    case .polish:
+    case .cleanUp:
       return false
-    case .kurier:
+    case .writingAssistant:
       return true
+    }
+  }
+
+  var providerInstructions: String {
+    switch self {
+    case .cleanUp:
+      return """
+        You are a transcription formatter. Fix punctuation, capitalization, obvious speech-recognition \
+        errors, and accidental repetition. Preserve every fact, name, number, uncertainty, tone, and the \
+        original language. Do not answer the content, add commentary, or invent information. Return only \
+        the cleaned text.
+        """
+    case .writingAssistant:
+      return """
+        You are a voice-native writing assistant. Turn the dictated text into clear, natural writing while \
+        preserving every fact, name, number, constraint, opinion, uncertainty, tone, and the original \
+        language. You may restructure sentences and paragraphs and remove verbal scaffolding, but never \
+        answer the content, invent information, or describe the edit. Return only the rewritten text.
+        """
     }
   }
 }
@@ -38,7 +107,34 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
     case .editor:
       return "Editor"
     case .agent:
-      return "Dispatch to agent"
+      return "Agent"
+    }
+  }
+
+  var actionTitle: String {
+    switch self {
+    case .editor:
+      return "Insert"
+    case .agent:
+      return "Dispatch"
+    }
+  }
+
+  var actionSystemImageName: String {
+    switch self {
+    case .editor:
+      return "arrow.down.doc.fill"
+    case .agent:
+      return "paperplane.fill"
+    }
+  }
+
+  var actionHelp: String {
+    switch self {
+    case .editor:
+      return "Insert transcript into the active editor"
+    case .agent:
+      return "Dispatch transcript to an agent"
     }
   }
 
@@ -73,9 +169,12 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   private let requiresMicrophonePermission: MicrophonePermissionPolicy
   private let microphonePermissionRequester: MicrophonePermissionRequester
   private let cadenceCommitNanoseconds: UInt64
+  private let aiTextResponder: (any AITextResponding)?
   private var engine: VistaEngineProtocol?
   private var cadenceCommitTask: Task<Void, Never>?
+  private var errorCleanupTask: Task<Void, Never>?
   private var startRecordingTask: Task<Void, Never>?
+  private var isStoppingRecording = false
   private var lastRawPreview: String = ""
   private var promotedPreviewPrefix: String?
 
@@ -86,12 +185,19 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     microphonePermissionRequester: @escaping MicrophonePermissionRequester = {
       try await TranscriptionService.ensureMicrophonePermission()
     },
+    aiTextResponder: (any AITextResponding)? = nil,
     cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
     self.engine = engine
     self.engineFactory = engineFactory
     self.requiresMicrophonePermission = requiresMicrophonePermission
     self.microphonePermissionRequester = microphonePermissionRequester
+    // Production keeps speech capture in qube-ffi but routes provider text
+    // through the same provider-neutral runtime as autocomplete. Explicit engine
+    // injection keeps existing unit seams deterministic unless a responder is
+    // also supplied deliberately.
+    self.aiTextResponder =
+      aiTextResponder ?? (engine == nil ? AIProviderRuntime() : nil)
     self.cadenceCommitNanoseconds = cadenceCommitNanoseconds
     self.committed = ""
     self.preview = ""
@@ -102,6 +208,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   deinit {
     cadenceCommitTask?.cancel()
+    errorCleanupTask?.cancel()
     startRecordingTask?.cancel()
   }
 
@@ -112,7 +219,6 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   func startRecording(language: String? = nil) {
     guard !isRecording, !isPreparingRecording else { return }
     let engine = activeEngine()
-    engine.setEventListener(listener: self)
     isPreparingRecording = true
     lastError = nil
     let requiresMicrophonePermission = self.requiresMicrophonePermission
@@ -137,13 +243,44 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
       // teardown-time cancel (deinit) must be bridged explicitly — otherwise
       // the detached work could still start the microphone after the owning
       // service/window is gone, with no visible control left to stop it.
-      let prepareTask = Task.detached(priority: .userInitiated) {
+      let prepareTask = Task.detached(priority: .userInitiated) { [weak self] in
+        // A previous crashed/cancelled owner can leave the shared capture
+        // engine active. Drain that stale session before attaching this
+        // service, so old callbacks cannot leak into a fresh transcript.
+        if engine.isRecording() {
+          var staleStopError: Error?
+          do {
+            _ = try engine.stopRecording()
+          } catch {
+            staleStopError = error
+          }
+          engine.removeEventListener()
+          // Some engines throw while tearing capture down even though their
+          // state has already become idle. That is recoverable. Starting over
+          // a capture that still reports active is not: preserve that error so
+          // two owners never compete for the same microphone session.
+          if engine.isRecording() {
+            throw staleStopError
+              ?? VistaError.ModelError(
+                msg: "dictation unavailable: stale microphone capture is still active")
+          }
+        }
         if !engine.isModelLoaded() {
           try engine.initModel()
         }
         // Owner torn down while the model was loading: never start capture.
         try Task.checkCancellation()
-        try engine.startRecording(language: language)
+        guard let listener = self else { throw CancellationError() }
+        engine.setEventListener(listener: listener)
+        do {
+          try engine.startRecording(language: language)
+        } catch {
+          if engine.isRecording() {
+            _ = try? engine.stopRecording()
+          }
+          engine.removeEventListener()
+          throw error
+        }
       }
       do {
         try await withTaskCancellationHandler {
@@ -154,7 +291,10 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
         guard let self, !Task.isCancelled else {
           // Capture already started but the owner went away mid-await: stop
           // the engine so the microphone is not left running unowned.
-          Task.detached { _ = try? engine.stopRecording() }
+          Task.detached {
+            _ = try? engine.stopRecording()
+            engine.removeEventListener()
+          }
           return
         }
         self.isPreparingRecording = false
@@ -181,10 +321,12 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   @discardableResult
   func stopRecording() throws -> String {
+    isStoppingRecording = true
     // Always clear recording state, even when engine.stopRecording() throws;
     // otherwise the UI stays in "Recording" and the cadence loop never stops.
     defer {
       isRecording = false
+      isStoppingRecording = false
       stopCadenceCommitLoop()
     }
 
@@ -192,8 +334,13 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
       return rendered
     }
 
+    defer { engine.removeEventListener() }
     let finalText = try engine.stopRecording()
-    commitActivePreviewForCadence()
+    if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      commitActivePreviewForCadence()
+    } else {
+      commitFinalText(finalText, language: nil)
+    }
     return finalText
   }
 
@@ -205,6 +352,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     promotedPreviewPrefix = nil
     lastLanguage = nil
     lastError = nil
+    dispatchStatus = nil
   }
 
   var hasComposedText: Bool {
@@ -212,7 +360,10 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   var isFormattingAvailable: Bool {
-    activeEngine().isFormattingAvailable()
+    if let aiTextResponder {
+      return aiTextResponder.isConfigured
+    }
+    return activeEngine().isFormattingAvailable()
   }
 
   func updateDispatchStatus(_ status: String?) {
@@ -220,12 +371,11 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   @discardableResult
-  func formatComposition(mode: TranscriptionFormatMode = .polish) async -> String {
+  func formatComposition(mode: TranscriptionFormatMode = .cleanUp) async -> String {
     let source = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !source.isEmpty else { return "" }
 
-    let engine = activeEngine()
-    guard engine.isFormattingAvailable() else {
+    guard isFormattingAvailable else {
       lastError = nil
       return source
     }
@@ -234,15 +384,32 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     defer { isFormatting = false }
 
     do {
-      let formatted = try await engine.formatText(text: source, assistive: mode.assistive)
+      let formatted: String
+      if let aiTextResponder {
+        formatted = try await aiTextResponder.respond(
+          input: source, instructions: mode.providerInstructions)
+      } else {
+        formatted = try await activeEngine().formatText(text: source, assistive: mode.assistive)
+      }
       let cleaned = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
       replaceComposition(with: cleaned.isEmpty ? source : cleaned)
       lastError = nil
       return rendered
     } catch {
-      lastError = error.localizedDescription
+      lastError = Self.formattingFailureMessage(for: error)
       return source
     }
+  }
+
+  private static func formattingFailureMessage(for error: Error) -> String {
+    if case VistaError.ModelError(let message) = error {
+      for prefix in ["completion request failed: ", "completion response parse failed: "]
+      where message.hasPrefix(prefix) {
+        return "AI action failed: \(message.dropFirst(prefix.count))"
+      }
+      return "AI action failed: \(message)"
+    }
+    return "AI action failed: \(error.localizedDescription)"
   }
 
   func replaceComposition(with text: String) {
@@ -274,7 +441,46 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
 
   nonisolated func onError(msg: String) {
     Task { @MainActor [weak self] in
-      self?.lastError = msg
+      self?.handleEngineError(msg)
+    }
+  }
+
+  private func handleEngineError(_ message: String) {
+    lastError = message
+    guard !isStoppingRecording else { return }
+
+    let wasPreparing = isPreparingRecording
+    let wasRecording = isRecording
+    isPreparingRecording = false
+    isRecording = false
+    stopCadenceCommitLoop()
+
+    if wasPreparing {
+      // The preparation task owns its detached capture attempt. Cancellation
+      // drives its existing rollback path without racing a second stop call.
+      startRecordingTask?.cancel()
+      startRecordingTask = nil
+      return
+    }
+
+    guard wasRecording, let engine else { return }
+    errorCleanupTask?.cancel()
+    errorCleanupTask = Task.detached(priority: .userInitiated) { [weak self] in
+      // Error callbacks can arrive before the engine publishes its final
+      // transcript. Stop is the drain barrier; failure still must detach the
+      // listener and leave the UI idle.
+      let finalText = (try? engine.stopRecording()) ?? ""
+      engine.removeEventListener()
+      await self?.finishEngineErrorCleanup(finalText: finalText)
+    }
+  }
+
+  private func finishEngineErrorCleanup(finalText: String) {
+    errorCleanupTask = nil
+    if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      commitActivePreviewForCadence()
+    } else {
+      commitFinalText(finalText, language: nil)
     }
   }
 
@@ -285,6 +491,10 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   func receiveFinal(_ text: String, language: String) {
+    commitFinalText(text, language: language)
+  }
+
+  private func commitFinalText(_ text: String, language: String?) {
     let finalText = uncommittedTail(from: text)
     guard !finalText.isEmpty else {
       preview = ""
@@ -298,7 +508,9 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     preview = ""
     lastRawPreview = ""
     promotedPreviewPrefix = nil
-    lastLanguage = language
+    if let language, !language.isEmpty {
+      lastLanguage = language
+    }
     refreshRendered()
   }
 
@@ -330,7 +542,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
         } catch {
           return
         }
-        await self?.commitActivePreviewForCadence()
+        self?.commitActivePreviewForCadence()
       }
     }
   }
@@ -341,12 +553,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
   }
 
   private func appendCommitted(_ text: String) {
-    if committed.isEmpty {
-      committed = text
-    } else {
-      committed.append("\n")
-      committed.append(text)
-    }
+    committed = joiningTranscript(committed, text)
   }
 
   private func refreshRendered() {
@@ -355,8 +562,30 @@ final class TranscriptionService: ObservableObject, VistaEventListener, @uncheck
     } else if preview.isEmpty {
       rendered = committed
     } else {
-      rendered = committed + "\n" + preview
+      rendered = joiningTranscript(committed, preview)
     }
+  }
+
+  /// Dictation callbacks describe consecutive pieces of one spoken passage.
+  /// Join them as prose instead of leaking the engine's callback cadence into
+  /// the Markdown document as artificial paragraph breaks.
+  private func joiningTranscript(_ leading: String, _ trailing: String) -> String {
+    guard !leading.isEmpty else { return trailing }
+    guard !trailing.isEmpty else { return leading }
+
+    let punctuationWithoutLeadingSpace = CharacterSet(charactersIn: ".,!?;:)]}»”’…")
+    let openingWithoutTrailingSpace = CharacterSet(charactersIn: "([{«“‘")
+    let trailingStartsWithPunctuation =
+      trailing.unicodeScalars.first.map {
+        punctuationWithoutLeadingSpace.contains($0)
+      } ?? false
+    let leadingEndsWithOpeningPunctuation =
+      leading.unicodeScalars.last.map {
+        openingWithoutTrailingSpace.contains($0)
+      } ?? false
+
+    let separator = trailingStartsWithPunctuation || leadingEndsWithOpeningPunctuation ? "" : " "
+    return leading + separator + trailing
   }
 
   private func uncommittedTail(from text: String) -> String {

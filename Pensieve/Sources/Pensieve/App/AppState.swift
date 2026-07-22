@@ -136,6 +136,23 @@ final class AppState {
     set { workspaceStore.bookmarkData = newValue }
   }
 
+  @discardableResult
+  func rememberDispatchRoot(_ url: URL) -> Bool {
+    workspaceStore.rememberDispatchRoot(url)
+  }
+
+  func resolveDispatchRoot(
+    explicitOverride: URL? = nil,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) -> URL {
+    workspaceStore.resolveDispatchRoot(
+      explicitOverride: explicitOverride,
+      workspaceRoot: folderURL ?? workspaceRoots.first?.url,
+      documentURL: documentURL,
+      homeDirectory: homeDirectory
+    )
+  }
+
   var selectedDocumentID: DocumentRef.ID? {
     get { windowModel.selectedDocumentID }
     set { windowModel.selectedDocumentID = newValue }
@@ -152,6 +169,7 @@ final class AppState {
   var documentHasEditableBuffer: Bool { windowModel.documentHasEditableBuffer }
   var documentURL: URL? { windowModel.documentURL }
   var documentIsDirty: Bool { windowModel.documentIsDirty }
+  var aiDocumentID: String { windowModel.aiDocumentID }
 
   var mode: EditorMode {
     get { windowModel.mode }
@@ -171,6 +189,16 @@ final class AppState {
   var pendingMarkdownFormatCommand: MarkdownFormatCommand? {
     get { windowModel.pendingMarkdownFormatCommand }
     set { windowModel.pendingMarkdownFormatCommand = newValue }
+  }
+
+  var pendingAIRewriteCommand: AIRewriteCommand? {
+    get { windowModel.pendingAIRewriteCommand }
+    set { windowModel.pendingAIRewriteCommand = newValue }
+  }
+
+  var aiRewritePreview: AIRewritePreview? {
+    get { windowModel.aiRewritePreview }
+    set { windowModel.aiRewritePreview = newValue }
   }
 
   var findBarVisible: Bool {
@@ -262,6 +290,13 @@ final class AppState {
     get { windowModel.lastError }
     set { windowModel.lastError = newValue }
   }
+
+  /// The dispatch-gateway request for THIS window. Menu/toolbar/sidebar
+  /// surfaces set it (via `AppController.request…Dispatch`); this window's
+  /// `ContentView` presents the canonical configuration sheet for it and
+  /// clears it on dismissal. Stored per window, so a request raised from the
+  /// focused window can never surface a sheet in another one.
+  var pendingDispatchIntent: DispatchIntent?
 
   var activeDocumentURL: URL? {
     get {
@@ -360,8 +395,8 @@ struct WorkspaceRoot: Identifiable, Hashable, Sendable {
   var name: String { url.lastPathComponent }
 }
 
-struct WorkspaceNode: Identifiable, Hashable, Sendable {
-  enum Kind: String, Sendable {
+struct WorkspaceNode: Identifiable, Hashable, Codable, Sendable {
+  enum Kind: String, Codable, Sendable {
     case folder
     case document
   }

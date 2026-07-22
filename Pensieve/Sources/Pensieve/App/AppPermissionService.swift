@@ -1,6 +1,5 @@
 import AVFoundation
 import AppKit
-import ApplicationServices
 import Foundation
 
 enum AppPermissionSettingsPane: String {
@@ -27,24 +26,6 @@ enum AppPermissionService {
       case .microphoneRestricted:
         return "Microphone access is restricted on this system."
       }
-    }
-  }
-
-  @MainActor
-  static func preflightTaflaPermissions() {
-    requestAccessibilityIfNeeded()
-    Task {
-      try? await ensureMicrophonePermission(openSettingsOnFailure: true)
-    }
-  }
-
-  @MainActor
-  static func requestAccessibilityIfNeeded() {
-    guard !AXIsProcessTrusted() else { return }
-    let options =
-      [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    if !AXIsProcessTrustedWithOptions(options) {
-      openSettings(.accessibility)
     }
   }
 
