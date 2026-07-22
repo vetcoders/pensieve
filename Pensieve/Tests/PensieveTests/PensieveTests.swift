@@ -4140,13 +4140,23 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    // The import leaves a dirty untitled session; with the shared autosaver and
+    // recovery store its debounced flush fires mid-suite and strands a "Board
+    // Brief" draft in the REAL ~/Library/…/Pensieve/Recovery — which the app
+    // then resurrects as "Recovered Untitled.md" on every launch.
+    let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
+    addTeardownBlock { autosaver.cancel() }
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: indexDatabase,
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
