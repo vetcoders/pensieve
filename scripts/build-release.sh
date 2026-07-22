@@ -49,7 +49,10 @@ PKG_DIR="$REPO_ROOT/Pensieve"
 DIST_DIR="$REPO_ROOT/dist"
 APP_NAME="Pensieve"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
-DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+# DMG_PATH is derived later (x.y.z+slug needs VERSION + git HEAD resolved);
+# DMG_STABLE_PATH keeps the fixed name docs/index.html downloads via
+# releases/latest/download/Pensieve.dmg.
+DMG_STABLE_PATH="$DIST_DIR/$APP_NAME.dmg"
 DMG_VOLNAME="Pensieve"
 VERSION_FILE="$REPO_ROOT/VERSION"
 INFO_PLIST_SRC="$PKG_DIR/Resources/Info.plist"
@@ -209,6 +212,7 @@ COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
+DMG_PATH="$DIST_DIR/$APP_NAME-$BUILD_LABEL.dmg"
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
 log "FFI profile: $FFI_PROFILE"
 
@@ -474,6 +478,28 @@ if (( DO_NOTARIZE )); then
                 --password "$NOTARY_PASSWORD" 2>&1 | tail -40
         fi
         die "DMG notarization failed"
+    fi
+fi
+
+# Refresh the stable-named copy AFTER sign/notarize/staple: the staple ticket
+# lives inside the DMG, so the copy stays validated, and the fixed name keeps
+# the releases/latest/download/Pensieve.dmg funnel alive.
+cp -f "$DMG_PATH" "$DMG_STABLE_PATH"
+ok "Stable alias: $DMG_STABLE_PATH"
+
+# Internal release shelf (Codescribe convention: <root>/<App>/<version>/ with
+# the artifact + SHA256SUMS.txt). Notarized lane only — local --no-notarize
+# builds are not releases and must not land on the team shelf.
+INTERNAL_RELEASES_ROOT="${PENSIEVE_INTERNAL_RELEASES:-/Volumes/vc-workspace/_RELEASES}"
+if (( DO_NOTARIZE )); then
+    if [[ -d "$INTERNAL_RELEASES_ROOT" ]]; then
+        INTERNAL_DIR="$INTERNAL_RELEASES_ROOT/$APP_NAME/$APP_VERSION"
+        mkdir -p "$INTERNAL_DIR"
+        cp -f "$DMG_PATH" "$INTERNAL_DIR/"
+        (cd "$INTERNAL_DIR" && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+        ok "Internal release: $INTERNAL_DIR/$(basename "$DMG_PATH")"
+    else
+        warn "Internal releases root missing at $INTERNAL_RELEASES_ROOT — skipped internal publish"
     fi
 fi
 fi  # end: skip DMG build/sign/notarize in --no-dmg mode
