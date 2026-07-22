@@ -604,7 +604,7 @@ struct EditorToolbelt: ToolbarContent {
         }
       }
       Divider()
-      Button("Napisz, co zrobić z tym tekstem…") {
+      Button("Tell Pensieve What to Do…") {
         isCustomRewritePromptPresented = true
       }
     } label: {
@@ -623,14 +623,14 @@ struct EditorToolbelt: ToolbarContent {
     .accessibilityLabel("Rewrite with AI")
     .accessibilityIdentifier(Self.rewriteIdentifier)
     .alert(
-      "Napisz, co zrobić z tym tekstem",
+      "Tell Pensieve what to do with this text",
       isPresented: $isCustomRewritePromptPresented
     ) {
-      TextField("Instrukcja", text: $customRewriteInstruction)
-      Button("Anuluj", role: .cancel) {
+      TextField("Instruction", text: $customRewriteInstruction)
+      Button("Cancel", role: .cancel) {
         customRewriteInstruction = ""
       }
-      Button("Przepisz") {
+      Button("Rewrite") {
         let instruction = customRewriteInstruction.trimmingCharacters(
           in: .whitespacesAndNewlines)
         guard !instruction.isEmpty else { return }
