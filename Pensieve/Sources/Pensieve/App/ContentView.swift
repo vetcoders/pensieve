@@ -181,11 +181,15 @@ struct EditorPreviewSplit: View {
           // see rendered output.
           EditorView()
         } else {
+          // Both panes claim an equal ideal share of the window: NSSplitView
+          // seeds the divider from the subviews' ideal widths, and without an
+          // explicit ideal the editor's and preview's intrinsic sizes fight —
+          // whichever wins collapses the other pane to its minimum.
           HSplitView {
             EditorView(scrollSyncCoordinator: scrollSyncCoordinator)
-              .frame(minWidth: Self.paneMinWidth)
+              .frame(minWidth: Self.paneMinWidth, idealWidth: width / 2, maxWidth: .infinity)
             PreviewView(scrollSyncCoordinator: scrollSyncCoordinator)
-              .frame(minWidth: Self.paneMinWidth)
+              .frame(minWidth: Self.paneMinWidth, idealWidth: width / 2, maxWidth: .infinity)
           }
         }
       }
