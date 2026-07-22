@@ -5,6 +5,149 @@ import XCTest
 
 final class DocumentWindowRegistryTests: XCTestCase {
   @MainActor
+  func testOpeningSameStandardizedFileTwiceFocusesExistingWindow() throws {
+    let window = Self.makeWindow()
+    defer { window.close() }
+    let canonical = URL(fileURLWithPath: "/tmp/pensieve-same-file.md").standardizedFileURL
+    let aliased = URL(fileURLWithPath: "/tmp/identity/../pensieve-same-file.md")
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        factoryCalls += 1
+        return window
+      })
+
+    registry.open(DocumentRef(id: canonical))
+    registry.open(DocumentRef(id: aliased))
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 2)
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [.file(canonical)])
+  }
+
+  @MainActor
+  func testDraftDescriptorsPublishAndSaveAsTransitionsAtomically() throws {
+    let window = Self.makeWindow()
+    let recoveredWindow = Self.makeWindow()
+    defer {
+      window.close()
+      recoveredWindow.close()
+    }
+    let registry = Self.makeIdentityRegistry()
+    let draftID = DocumentIdentity.untitled(UUID())
+    let recoveredID = DocumentIdentity.recovered(UUID())
+    let savedURL = URL(fileURLWithPath: "/tmp/pensieve-descriptor-saved.md").standardizedFileURL
+
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: draftID,
+        documentID: nil,
+        title: "Untitled.md",
+        isDirty: true,
+        hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [draftID])
+    XCTAssertEqual(registry.openDocuments.first?.displayTitle, "Untitled.md")
+    XCTAssertNil(registry.openDocuments.first?.fileURL)
+    XCTAssertTrue(registry.openDocuments.first?.window === window)
+    XCTAssertTrue(
+      registry.attach(
+        recoveredWindow,
+        identity: recoveredID,
+        documentID: nil,
+        title: "Recovered.md",
+        isDirty: true,
+        hasEditableBuffer: true))
+
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: .file(savedURL),
+        documentID: savedURL,
+        title: "saved",
+        representedURL: savedURL,
+        isDirty: false,
+        hasEditableBuffer: true))
+
+    XCTAssertEqual(registry.openDocuments.count, 2)
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [.file(savedURL), recoveredID])
+    XCTAssertEqual(registry.openDocuments.first?.identity, .file(savedURL))
+    XCTAssertEqual(registry.openDocuments.first?.fileURL, savedURL)
+    XCTAssertTrue(registry.openDocuments.first?.window === window)
+  }
+
+  @MainActor
+  func testRecoveredAndIndependentUntitledSessionsNeverCollapse() throws {
+    let firstWindow = Self.makeWindow()
+    let secondWindow = Self.makeWindow()
+    let recoveredWindow = Self.makeWindow()
+    defer {
+      firstWindow.close()
+      secondWindow.close()
+      recoveredWindow.close()
+    }
+    let registry = Self.makeIdentityRegistry()
+    let first = DocumentIdentity.untitled(UUID())
+    let second = DocumentIdentity.untitled(UUID())
+    let recovered = DocumentIdentity.recovered(UUID())
+
+    XCTAssertTrue(
+      registry.attach(
+        firstWindow, identity: first, documentID: nil, title: "Untitled.md",
+        hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        secondWindow, identity: second, documentID: nil, title: "Untitled.md",
+        hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        recoveredWindow, identity: recovered, documentID: nil, title: "Recovered.md",
+        isDirty: true, hasEditableBuffer: true))
+
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [first, second, recovered])
+  }
+
+  @MainActor
+  func testForcedDuplicateIdentityIsRejectedAndCloseRemovesOnlyItsDescriptor() throws {
+    let forcedID = UUID()
+    let forced = DocumentIdentity.untitled(forcedID)
+    let firstSession = DocumentSession.untitled(identityID: forcedID)
+    let duplicateSession = DocumentSession.untitled(identityID: forcedID)
+    let firstWindow = Self.makeWindow()
+    let duplicateWindow = Self.makeWindow()
+    defer {
+      firstWindow.close()
+      duplicateWindow.close()
+    }
+    var closed: [ObjectIdentifier] = []
+    let registry = Self.makeIdentityRegistry { closed.append(ObjectIdentifier($0)) }
+
+    XCTAssertEqual(firstSession.identity, duplicateSession.identity)
+    XCTAssertTrue(
+      registry.attach(
+        firstWindow, identity: firstSession.identity, documentID: nil,
+        title: "First.md", hasEditableBuffer: true))
+    XCTAssertFalse(
+      registry.attach(
+        duplicateWindow, identity: duplicateSession.identity, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.count, 1)
+    XCTAssertTrue(registry.openDocuments.first?.window === firstWindow)
+
+    registry.closeDocument(forced)
+    XCTAssertEqual(closed, [ObjectIdentifier(firstWindow)])
+    registry.reconcileClosedWindow(firstWindow)
+    XCTAssertTrue(registry.openDocuments.isEmpty)
+  }
+
+  @MainActor
   func testOpenTabDocumentIDsRoundTripAcrossOpenAttachSwitchAndWillCloseReconcile() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-alpha.md").standardizedFileURL
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-beta.md").standardizedFileURL
@@ -413,5 +556,19 @@ final class DocumentWindowRegistryTests: XCTestCase {
     window.contentView = NSView(frame: .zero)
     window.title = title
     return window
+  }
+
+  @MainActor
+  private static func makeIdentityRegistry(
+    closeWindow: @escaping @MainActor (NSWindow) -> Void = { _ in }
+  ) -> DocumentWindowRegistry {
+    DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: closeWindow)
   }
 }

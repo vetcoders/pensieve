@@ -11,7 +11,6 @@ final class DocumentWindowModel {
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private static let scrollSyncEnabledKey = "Pensieve.scrollSyncEnabled"
   private let defaults: UserDefaults
-  private var ephemeralAIDocumentID = UUID()
 
   var selectedDocumentID: DocumentRef.ID?
 
@@ -23,11 +22,8 @@ final class DocumentWindowModel {
   /// which only change when the metadata actually changes (guarded didSet).
   var documentSession: DocumentSession = .empty {
     didSet {
-      if oldValue.persistentAIDocumentID != documentSession.persistentAIDocumentID,
-        documentSession.persistentAIDocumentID == nil
-      {
-        ephemeralAIDocumentID = UUID()
-      }
+      let identity = documentSession.identity
+      if documentIdentity != identity { documentIdentity = identity }
       let title = documentSession.displayTitle
       if documentTitle != title { documentTitle = title }
       let editable = documentSession.hasEditableBuffer
@@ -39,14 +35,14 @@ final class DocumentWindowModel {
   }
 
   var aiDocumentID: String {
-    documentSession.persistentAIDocumentID
-      ?? "window:\(ephemeralAIDocumentID.uuidString.lowercased())"
+    documentIdentity?.persistentID ?? "window:empty"
   }
 
   /// Discrete, low-frequency mirrors of `documentSession` metadata. Chrome views
   /// read THESE (not `documentSession`) so a text-only edit never invalidates
   /// them — that is what stops the whole window re-rendering on every keystroke.
   private(set) var documentTitle: String = ""
+  private(set) var documentIdentity: DocumentIdentity?
   private(set) var documentHasEditableBuffer: Bool = false
   private(set) var documentURL: URL?
   private(set) var documentIsDirty: Bool = false
@@ -127,6 +123,7 @@ final class DocumentWindowModel {
     }
     // Seed the metadata mirrors from the initial (empty) session. didSet does
     // not fire during init, so prime them explicitly to stay consistent.
+    self.documentIdentity = documentSession.identity
     self.documentTitle = documentSession.displayTitle
     self.documentHasEditableBuffer = documentSession.hasEditableBuffer
     self.documentURL = documentSession.url
