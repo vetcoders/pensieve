@@ -63,6 +63,44 @@ final class AIProviderRuntimeTests: XCTestCase {
     XCTAssertEqual(payload["rewrite_intent"] as? String, "improve")
     XCTAssertEqual(payload["selection"] as? String, "Rough text.")
   }
+
+  func testCustomRewriteCarriesInstructionInPayloadAndKeepsRuntimeGuard() async throws {
+    let environment = StubProviderEnvironment([
+      "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+      "LLM_ASSISTIVE_MODEL": "gpt-test",
+      "LLM_ASSISTIVE_API_KEY": "key",
+    ])
+    let recorder = RequestRecorder()
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      rewritePromptStore: RewritePromptStore(baseDirectory: FileManager.default.temporaryDirectory)
+    ) { request in
+      recorder.record(request)
+      return (
+        Data(#"{"output_text":"A tiny rhyme."}"#.utf8),
+        Self.response(for: request, statusCode: 200)
+      )
+    }
+
+    _ = try await runtime.rewrite(
+      context: RewriteContext(
+        text: "Plain prose.", rangeLocation: 0, rangeLength: 12, documentRevision: 1),
+      intent: .custom("Turn this into a tiny rhyme."),
+      session: DocumentAISession(documentID: "doc"))
+
+    let body = try requestJSON(try XCTUnwrap(recorder.request))
+    let instructions = try XCTUnwrap(body["instructions"] as? String)
+    XCTAssertTrue(instructions.hasPrefix(RewritePromptStore.guardPrefix))
+    XCTAssertTrue(instructions.contains("Turn this into a tiny rhyme."))
+    let input = try XCTUnwrap(body["input"] as? [[String: Any]])
+    let content = try XCTUnwrap(input.last?["content"] as? [[String: Any]])
+    let payloadText = try XCTUnwrap(content.first?["text"] as? String)
+    let payload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(payloadText.utf8)) as? [String: Any])
+    XCTAssertEqual(payload["rewrite_intent"] as? String, "custom")
+    XCTAssertEqual(payload["custom_instruction"] as? String, "Turn this into a tiny rhyme.")
+    XCTAssertEqual(payload["selection"] as? String, "Plain prose.")
+  }
   func testOpenAIUsesCommittedResponseIDAndFallsBackExactlyOnceOn404() async throws {
     let environment = StubProviderEnvironment([
       "LLM_ASSISTIVE_PROVIDER": "openai-responses",

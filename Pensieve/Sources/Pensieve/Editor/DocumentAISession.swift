@@ -14,11 +14,39 @@ struct RewriteContext: Codable, Equatable, Sendable {
   let documentRevision: UInt64
 }
 
-enum RewriteIntent: String, Codable, CaseIterable, Equatable, Sendable {
+enum RewriteIntent: Codable, CaseIterable, Equatable, Hashable, Sendable {
   case improve
   case shorten
   case expand
   case fixGrammar
+  case custom(String)
+
+  static let allCases: [RewriteIntent] = [.improve, .shorten, .expand, .fixGrammar]
+
+  var rawValue: String {
+    switch self {
+    case .improve: return "improve"
+    case .shorten: return "shorten"
+    case .expand: return "expand"
+    case .fixGrammar: return "fixGrammar"
+    case .custom: return "custom"
+    }
+  }
+
+  init?(rawValue: String) {
+    switch rawValue {
+    case "improve": self = .improve
+    case "shorten": self = .shorten
+    case "expand": self = .expand
+    case "fixGrammar": self = .fixGrammar
+    default: return nil
+    }
+  }
+
+  var customInstruction: String? {
+    guard case .custom(let instruction) = self else { return nil }
+    return instruction
+  }
 
   var label: String {
     switch self {
@@ -26,7 +54,41 @@ enum RewriteIntent: String, Codable, CaseIterable, Equatable, Sendable {
     case .shorten: return "Make Shorter"
     case .expand: return "Expand"
     case .fixGrammar: return "Fix Grammar"
+    case .custom: return "Custom Rewrite"
     }
+  }
+
+  init(from decoder: Decoder) throws {
+    if let rawValue = try? decoder.singleValueContainer().decode(String.self),
+      let intent = Self(rawValue: rawValue)
+    {
+      self = intent
+      return
+    }
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let kind = try container.decode(String.self, forKey: .kind)
+    guard kind == "custom" else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .kind, in: container, debugDescription: "Unknown rewrite intent")
+    }
+    self = .custom(try container.decode(String.self, forKey: .customInstruction))
+  }
+
+  func encode(to encoder: Encoder) throws {
+    switch self {
+    case .custom(let instruction):
+      var container = encoder.container(keyedBy: CodingKeys.self)
+      try container.encode("custom", forKey: .kind)
+      try container.encode(instruction, forKey: .customInstruction)
+    default:
+      var container = encoder.singleValueContainer()
+      try container.encode(rawValue)
+    }
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kind
+    case customInstruction = "custom_instruction"
   }
 }
 
