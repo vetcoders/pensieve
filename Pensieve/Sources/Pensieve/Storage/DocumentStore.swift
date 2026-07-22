@@ -2548,7 +2548,7 @@ final class DocumentStore {
     case cancel
   }
 
-  static let shared = DocumentStore()
+  static let shared = DocumentStore(recoveryStore: .shared)
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
@@ -2564,7 +2564,7 @@ final class DocumentStore {
     autosaver: Autosaver? = nil,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
-    recoveryStore: RecoveryStore? = nil,
+    recoveryStore: RecoveryStore,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
@@ -2575,7 +2575,7 @@ final class DocumentStore {
     self.autosaver = autosaver ?? .shared
     self.indexDatabase = resolvedIndexDatabase
     self.bookmarkStore = bookmarkStore ?? .shared
-    self.recoveryStore = recoveryStore ?? .shared
+    self.recoveryStore = recoveryStore
     self.writeDocument =
       writeDocument ?? { text, url in
         try text.write(to: url, atomically: true, encoding: .utf8)

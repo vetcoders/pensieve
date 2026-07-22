@@ -105,7 +105,10 @@ final class TrashTestHarness {
     let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: root))
     let documentStore = DocumentStore(
       indexDatabase: indexDatabase,
-      bookmarkStore: bookmarkStore
+      bookmarkStore: bookmarkStore,
+      recoveryStore: RecoveryStore(
+        directoryURL: root.appendingPathComponent("Recovery", isDirectory: true)
+      )
     )
     self.documentStore = documentStore
 
