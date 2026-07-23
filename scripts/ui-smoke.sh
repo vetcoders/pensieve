@@ -20,6 +20,33 @@ ok() {
   printf '\033[32m[ ok ]\033[0m %s\n' "$*"
 }
 
+# Terminate every running instance of the app under test and block until the
+# process table is clear. AppleScript targets the app by bare process name
+# ("tell process Pensieve"), and System Events resolves that name to the OLDEST
+# matching process. A run that dies mid-osascript leaves an orphaned, window-
+# less Pensieve alive; the next run's `open -n` then spawns a second instance,
+# and the census locks onto the windowless orphan -> empty `observed:` census.
+# Guaranteeing a single instance (clean before launch, clean on every exit)
+# removes that ambiguity at the source. Graceful quit first, then SIGTERM, then
+# SIGKILL as a last resort, waiting for the process to actually disappear at
+# each stage so `open -n` never races a survivor.
+terminate_app() {
+  osascript -e "with timeout of 2 seconds" \
+    -e "tell application id \"$APP_ID\" to quit" \
+    -e "end timeout" >/dev/null 2>&1 || true
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+  for _ in {1..30}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  pkill -9 -x "$APP_NAME" >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  return 0
+}
+
 if [[ $# -gt 0 && "$1" != --* ]]; then
   APP_PATH="$1"
   shift
@@ -44,10 +71,23 @@ done
 
 [[ -d "$APP_PATH" ]] || die "App bundle not found: $APP_PATH (run make release-local or make release first)"
 
+# Real AX clicks require the display to be awake; a sleeping display
+# (displaysleep) makes popover clicks land randomly, so wake it now and
+# hold it awake for the duration of the smoke to keep this deterministic
+# on an unattended machine.
+caffeinate -u -t 2 || true
+caffeinate -dsu &
+CAFFEINATE_PID=$!
+
 APP_PATH="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
 cleanup() {
+  kill "$CAFFEINATE_PID" 2>/dev/null || true
+  # Every exit path -- success, assertion failure, or an error raised inside
+  # osascript -- must leave zero live Pensieve processes, otherwise the survivor
+  # becomes the orphan that corrupts the next run's census.
+  terminate_app
   rm -f "$SMOKE_DOCUMENT"
   rmdir "$SMOKE_ROOT" 2>/dev/null || true
 }
@@ -87,15 +127,10 @@ EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/Pensieve"
 log "bundle path=$APP_PATH executable=$EXECUTABLE_PATH commit=$BUNDLE_COMMIT version=$BUNDLE_VERSION build=$BUNDLE_BUILD"
 
 log "launching editable cold witness without post-launch activation"
-osascript -e "with timeout of 2 seconds" \
-  -e "tell application id \"$APP_ID\" to quit" \
-  -e "end timeout" >/dev/null 2>&1 || true
-sleep 0.5
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-for _ in {1..20}; do
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
-  sleep 0.1
-done
+# Pre-launch: guarantee no prior/orphaned instance survives, so `open -n` yields
+# exactly one process named Pensieve and the bare-name census cannot lock onto a
+# stale windowless survivor.
+terminate_app
 open -n -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
   # LaunchServices can briefly retain the just-terminated bundle instance
   # and return -600 even after the process is gone. One bounded retry clears it.
