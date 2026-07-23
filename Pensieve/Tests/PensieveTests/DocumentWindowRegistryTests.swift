@@ -153,10 +153,11 @@ final class DocumentWindowRegistryTests: XCTestCase {
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-beta.md").standardizedFileURL
     let window = Self.makeWindow()
     defer { window.close() }
+    var deferredWork: [() -> Void] = []
 
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
@@ -185,6 +186,10 @@ final class DocumentWindowRegistryTests: XCTestCase {
       registry.openTabDocumentIDs,
       [],
       "the process-wide willClose reconciler must remove the closing window's document")
+    XCTAssertEqual(
+      deferredWork.count,
+      1,
+      "the process-wide close route must request one deferred launcher reconciliation")
   }
 
   @MainActor
@@ -210,6 +215,125 @@ final class DocumentWindowRegistryTests: XCTestCase {
       registry.openTabDocumentIDs,
       [betaID],
       "global willClose cleanup must not poison reusable AppKit/scene windows")
+  }
+
+  @MainActor
+  func testGlobalCloseOfLastDocumentSchedulesLauncherReopen() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-global-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    var factoryRefs: [DocumentRef?] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [documentWindow] },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return ref == nil ? launcherWindow : documentWindow
+      })
+
+    registry.open(DocumentRef(id: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertEqual(deferredWork.count, 1, "the process-wide close route must request reopening")
+    guard let reopen = deferredWork.first else {
+      return XCTFail("the process-wide close route did not request reopening")
+    }
+    reopen()
+    XCTAssertEqual(factoryRefs.compactMap { $0 }.map(\.id), [documentID])
+    XCTAssertEqual(factoryRefs.filter { $0 == nil }.count, 1)
+
+    XCTAssertTrue(
+      registry.attach(documentWindow, documentID: documentID),
+      "a reusable scene window must remain eligible to reattach after global close")
+  }
+
+  @MainActor
+  func testGlobalCloseBeforeFactoryWiringKeepsDeferredLauncherRequest() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-early-global-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    var launcherFactoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [documentWindow] })
+
+    XCTAssertTrue(registry.attach(documentWindow, documentID: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertTrue(
+      deferredWork.isEmpty,
+      "the reopen cannot execute until the scene root wires the window factory")
+
+    registry.makeDocumentWindow = { ref in
+      XCTAssertNil(ref)
+      launcherFactoryCalls += 1
+      return launcherWindow
+    }
+    XCTAssertEqual(
+      deferredWork.count,
+      1,
+      "wiring the factory must release the one pending close-lifecycle request")
+    guard let reopen = deferredWork.first else {
+      return XCTFail("the early global close dropped its deferred launcher request")
+    }
+    reopen()
+
+    XCTAssertEqual(launcherFactoryCalls, 1)
+  }
+
+  @MainActor
+  func testDuplicateFactoryAndGlobalCloseSignalsScheduleOneLauncherReopen() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-dual-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [] },
+      makeDocumentWindow: { ref in ref == nil ? launcherWindow : documentWindow })
+
+    registry.open(DocumentRef(id: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .factoryWindow)
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertEqual(
+      deferredWork.count, 1,
+      "factory callback plus willClose must coalesce into one deferred launcher request")
+    XCTAssertFalse(
+      registry.attach(documentWindow, documentID: documentID),
+      "a factory-tombstoned window must reject a late SwiftUI reattach")
   }
 
   @MainActor
@@ -346,6 +470,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     // Closing the LAST document window must not leave the app windowless: it
     // reopens an empty launcher so the user can start a new document (⌘N).
     registry.handleDocumentWindowClosed(docWindow)
+    XCTAssertEqual(deferredWork.count, 1)
     for work in deferredWork { work() }
 
     XCTAssertTrue(
@@ -469,6 +594,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: alphaID))
     registry.open(DocumentRef(id: betaID))
     registry.handleDocumentWindowClosed(alphaWindow)
+    XCTAssertTrue(deferredWork.isEmpty)
     for work in deferredWork { work() }
 
     XCTAssertFalse(
@@ -501,6 +627,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: docID))
     registry.beginTermination()
     registry.handleApplicationWindowClosed(docWindow)
+    XCTAssertTrue(deferredWork.isEmpty)
     for work in deferredWork { work() }
 
     XCTAssertFalse(

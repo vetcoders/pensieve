@@ -107,22 +107,20 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
 
-    // Window-agnostic open-tab reconciliation. Not every document-bearing window
+    // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
     // tabs are not), so they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
-    // row. The process-wide close handler is idempotent and safe for windows it
-    // never tracked, so routing every close through it keeps the list honest.
+    // row. The shared lifecycle is idempotent and also restores one launcher
+    // after the final content window closes.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
       guard let window = note.object as? NSWindow else { return }
       MainActor.assumeIsolated {
-        // Reconcile without tombstoning, then preserve the last-window launcher
-        // contract. This fires for EVERY window, including reusable SwiftUI
-        // scenes; tombstoning them would permanently reject a later re-attach.
-        // DocumentWindow.onClose still tombstones its own factory windows.
-        DocumentWindowRegistry.shared.handleApplicationWindowClosed(window)
+        DocumentWindowRegistry.shared.handleWindowClosed(
+          window,
+          tombstonePolicy: .reusableWindow)
       }
     }
     traceObservers.append(openTabReconciler)

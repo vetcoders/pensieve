@@ -148,14 +148,17 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
-        if sidebarTab == .openFiles, !windowRegistry.openDocuments.isEmpty {
+        if sidebarTab == .openFiles, !windowRegistry.openDocuments.isEmpty,
+          renamingURL == nil
+        {
           Button {
             controller.clearOpenFiles()
           } label: {
             Image(systemName: "xmark.circle")
           }
           .buttonStyle(.borderless)
-          .help("Clear Open Files")
+          .help("Close All Open Files")
+          .accessibilityLabel("Close All Open Files")
           .accessibilityIdentifier("pensieve.sidebar.clearOpenFiles")
         }
 
@@ -623,17 +626,30 @@ struct SidebarView: View {
   @ViewBuilder
   private func renameableTitle(for url: URL?, title: String) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      InlineRenameField(
-        text: $renameText,
-        focusToken: renameFocusToken,
-        accessibilityIdentifier: "pensieve.sidebar.renameField",
-        onCommit: {
-          commitRename(url)
-        },
-        onCancel: {
+      HStack(spacing: 4) {
+        InlineRenameField(
+          text: $renameText,
+          focusToken: renameFocusToken,
+          accessibilityIdentifier: "pensieve.sidebar.renameField",
+          onCommit: {
+            commitRename(url)
+          },
+          onCancel: {
+            cancelRename()
+          }
+        )
+        .frame(maxWidth: .infinity)
+
+        Button {
           cancelRename()
+        } label: {
+          Image(systemName: "xmark.circle.fill")
         }
-      )
+        .buttonStyle(.borderless)
+        .help("Cancel Rename")
+        .accessibilityLabel("Cancel Rename")
+        .accessibilityIdentifier("pensieve.sidebar.cancelRename")
+      }
     } else {
       Text(title)
         .lineLimit(1)

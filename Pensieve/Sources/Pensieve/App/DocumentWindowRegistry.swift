@@ -12,6 +12,11 @@ struct OpenDocumentDescriptor: Identifiable {
   var window: NSWindow? { windowAssociation?.window }
 }
 
+enum WindowCloseTombstonePolicy {
+  case reusableWindow
+  case factoryWindow
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -46,16 +51,25 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  private var launcherReopenPending = false
+  private var launcherReopenAwaitingFactory = false
   /// Set once the app starts quitting so the last document window's close does
   /// not resurrect a launcher mid-termination.
   private var isTerminating = false
   /// Observers and factory bindings.
-  var makeDocumentWindow: DocumentWindowFactoryClosure?
+  var makeDocumentWindow: DocumentWindowFactoryClosure? {
+    didSet {
+      guard makeDocumentWindow != nil, launcherReopenAwaitingFactory else { return }
+      launcherReopenAwaitingFactory = false
+      requestLauncherReopenIfAppWouldBeWindowless()
+    }
+  }
 
   /// Mark the app as terminating (called from `applicationWillTerminate`) so the
   /// last-window-close handler suppresses its launcher reopen.
   func beginTermination() {
     isTerminating = true
+    launcherReopenAwaitingFactory = false
   }
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
@@ -183,36 +197,40 @@ final class DocumentWindowRegistry: ObservableObject {
     closeEmptyLauncherWindows(except: window)
   }
 
-  /// Called from `DocumentWindow.close()` before AppKit tears the window
-  /// down: drops every registry mapping so the document can re-open in a
-  /// fresh window instead of resurrecting the closed (retained) one.
-  func handleDocumentWindowClosed(_ window: NSWindow) {
-    reconcileClosedWindow(window)
-    reopenLauncherIfAppWouldBeWindowless()
-    // Tombstone ONLY on this path (DocumentWindow.onClose): factory windows are
-    // never reused, so rejecting a late re-attach of this exact instance is safe.
-    // The window's SwiftUI accessor may still have an in-flight main-queue pass
-    // that would re-register the closed window (and resurrect it as a phantom
-    // tab); remember the identity while the object is alive so attach() rejects
-    // those late passes. Reusable windows (scenes) must NOT be tombstoned — they
-    // are reconciled via reconcileClosedWindow from the global willClose observer.
-    closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  /// The single close lifecycle for factory callbacks and process-wide AppKit
+  /// notifications. Both routes reconcile registry state and request the same
+  /// coalesced last-window reopen; only never-reused factory windows are
+  /// tombstoned against late SwiftUI attach callbacks.
+  func handleWindowClosed(
+    _ window: NSWindow,
+    tombstonePolicy: WindowCloseTombstonePolicy
+  ) {
+    reconcileClosedWindowState(window)
+    if tombstonePolicy == .factoryWindow {
+      closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+    }
+    requestLauncherReopenIfAppWouldBeWindowless()
   }
 
-  /// Process-wide close handling for reusable SwiftUI/AppKit scene windows.
-  /// Unlike `handleDocumentWindowClosed`, this must not tombstone the window,
-  /// but it still owns the close-vs-quit contract: closing the final scene with
-  /// Command-W leaves a launcher behind.
+  /// Compatibility entry for process-wide reusable SwiftUI/AppKit scene closes.
+  /// Production routes may call the explicit policy API directly; this wrapper
+  /// preserves the merged PR #10 contract without tombstoning reusable scenes.
   func handleApplicationWindowClosed(_ window: NSWindow) {
-    reconcileClosedWindow(window)
-    reopenLauncherIfAppWouldBeWindowless()
+    handleWindowClosed(window, tombstonePolicy: .reusableWindow)
   }
 
-  /// Cleanup WITHOUT tombstoning: forget the window's documents and drop its
-  /// bookkeeping maps. Safe for ANY closing window (the process-wide willClose
-  /// observer routes here), so it never poisons a reusable window instance via a
-  /// closedWindows entry. Idempotent for windows the registry never tracked.
+  /// Compatibility entry for focused window tests and non-factory callers.
+  /// Production close routes call `handleWindowClosed` with an explicit policy.
   func reconcileClosedWindow(_ window: NSWindow) {
+    handleWindowClosed(window, tombstonePolicy: .reusableWindow)
+  }
+
+  /// Compatibility entry for older factory bindings and focused tests.
+  func handleDocumentWindowClosed(_ window: NSWindow) {
+    handleWindowClosed(window, tombstonePolicy: .factoryWindow)
+  }
+
+  private func reconcileClosedWindowState(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
     DebugTrace.log("registry.reconcileClosed '\(window.title)'")
     releaseStaleDocumentMappings(for: window, keeping: nil)
@@ -232,11 +250,30 @@ final class DocumentWindowRegistry: ObservableObject {
   /// finishes the in-progress close; suppressed during termination so Quit is
   /// never fought by a resurrected launcher, and a no-op when any other document
   /// or launcher window is still alive.
-  private func reopenLauncherIfAppWouldBeWindowless() {
-    guard !isTerminating, makeDocumentWindow != nil else { return }
+  private func requestLauncherReopenIfAppWouldBeWindowless() {
+    guard !isTerminating, !launcherReopenPending else { return }
+    guard !hasContentWindow else {
+      launcherReopenAwaitingFactory = false
+      return
+    }
+    guard makeDocumentWindow != nil else {
+      launcherReopenAwaitingFactory = true
+      return
+    }
+    launcherReopenAwaitingFactory = false
+    launcherReopenPending = true
     scheduleDeferredMainWork { [weak self] in
-      guard let self, !self.isTerminating else { return }
-      guard !self.applicationHasLiveWindow() else { return }
+      guard let self else { return }
+      self.launcherReopenPending = false
+      guard !self.isTerminating else { return }
+      self.purgeClosedLauncherWindows()
+      guard !self.hasContentWindow else { return }
+      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
+      guard !hasLauncher else { return }
+      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
+        $0.window?.contentView != nil
+      }
+      guard !hasLiveDocumentWindow else { return }
       self.openLauncherWindow()
     }
   }
@@ -713,11 +750,11 @@ private final class WeakWindow {
 }
 
 struct DocumentWindowAccessor: NSViewRepresentable {
-  @Environment(AppState.self) private var appState
-
   let documentID: URL?
+  let identity: DocumentIdentity?
   let title: String?
   let representedURL: URL?
+  let isDirty: Bool
   let hasEditableBuffer: Bool
   var onWindow: ((NSWindow) -> Void)?
 
@@ -782,10 +819,6 @@ struct DocumentWindowAccessor: NSViewRepresentable {
     DispatchQueue.main.async {
       guard let window = view.window else { return }
       let windowID = ObjectIdentifier(window)
-      let identity =
-        appState.windowModel.documentIdentity
-        ?? documentID.map { DocumentIdentity.file($0.standardizedFileURL) }
-      let isDirty = appState.documentIsDirty
       let unchanged =
         coordinator.lastWindowID == windowID
         && coordinator.lastIdentity == identity
