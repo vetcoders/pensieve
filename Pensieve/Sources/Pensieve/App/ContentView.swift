@@ -236,6 +236,7 @@ private struct FocusModeDimmingOverlay: View {
 /// after the workspace is cleared. The window stays alive; this view is the
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
+  @EnvironmentObject private var controller: AppController
   let hasWorkspace: Bool
 
   var body: some View {
@@ -261,10 +262,16 @@ struct DocumentEmptyStateView: View {
           .foregroundStyle(.tertiary)
           .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
       }
+
+      RecoveredDraftsSection()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
     .ignoresSafeArea(.container, edges: .top)
+    // The launcher is the only place a crash draft can be reached, so it reads
+    // the recovery directory every time it comes back on screen — including
+    // after a Close, which is exactly when a draft may have just been retired.
+    .onAppear { controller.refreshRecoveredDrafts() }
     .accessibilityIdentifier("pensieve.emptyState")
   }
 
@@ -273,5 +280,70 @@ struct DocumentEmptyStateView: View {
       return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
     }
     return "Open a Markdown file or folder from the File menu to get started."
+  }
+}
+
+/// The ONE way a crash-recovery draft reaches a window. Nothing adopts a draft
+/// automatically any more (W2-D): unsaved work from a crash waits here, in the
+/// empty launcher, until the user opens, saves, or discards it.
+///
+/// Deliberately quiet — it is a footnote under the empty state, and it renders
+/// nothing at all when there is no unhandled draft, which is the normal case.
+struct RecoveredDraftsSection: View {
+  @EnvironmentObject private var controller: AppController
+
+  var body: some View {
+    // Nothing to recover renders NOTHING — not even a header. An always-visible
+    // "0 drafts" row would turn the ordinary launcher into a permanent crash
+    // reminder.
+    if !controller.recoveredDrafts.isEmpty {
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Recovered Drafts")
+          .font(.headline)
+          .foregroundStyle(.secondary)
+
+        ForEach(controller.recoveredDrafts) { draft in
+          RecoveredDraftRow(draft: draft)
+        }
+      }
+      .padding(16)
+      .frame(maxWidth: 460)
+      .background(
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .fill(Color(NSColor.controlBackgroundColor))
+      )
+      .accessibilityIdentifier("pensieve.recoveredDrafts")
+    }
+  }
+}
+
+private struct RecoveredDraftRow: View {
+  @EnvironmentObject private var controller: AppController
+  let draft: RecoveryDraft
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 12) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(draft.title)
+          .font(.callout)
+          .lineLimit(1)
+        Text(draft.previewSnippet)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+        Text(draft.updatedAt.formatted(date: .abbreviated, time: .shortened))
+          .font(.caption2)
+          .foregroundStyle(.tertiary)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      HStack(spacing: 6) {
+        Button("Open") { controller.openRecoveredDraft(draft) }
+        Button("Save As…") { controller.saveRecoveredDraftAs(draft) }
+        Button("Discard") { controller.discardRecoveredDraft(draft) }
+      }
+      .controlSize(.small)
+    }
+    .accessibilityIdentifier("pensieve.recoveredDrafts.row")
   }
 }
