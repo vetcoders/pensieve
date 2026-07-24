@@ -12,7 +12,16 @@ final class LaunchIntentCoordinator: ObservableObject {
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
-  private var hasExplicitURLIntent = false
+  /// Set when launch URLs were actually opened into a window and CONSUMED by
+  /// the next start decision.
+  ///
+  /// Its predecessor (`hasExplicitURLIntent`) was never reset: a session that
+  /// had once been launched from the Finder suppressed workspace restore for
+  /// every window it opened afterwards, for the lifetime of the process. Two
+  /// visually identical sessions then behaved differently on Close depending on
+  /// how the app had been started hours earlier. One file open is an intent for
+  /// ONE launch, so it is spent on that launch.
+  private var didOpenLaunchDocuments = false
 
   /// One-way switch set by `quiesceForTermination()`.
   ///
@@ -75,7 +84,7 @@ final class LaunchIntentCoordinator: ObservableObject {
       guard !self.isQuiescedForTermination else { return }
 
       self.drainPendingURLs()
-      controller.start(intent: self.hasExplicitURLIntent ? .explicitDocument : intent)
+      controller.start(intent: self.consumeLaunchDocumentOpen() ? .explicitDocument : intent)
       self.finishStartupDecision()
     }
   }
@@ -87,14 +96,15 @@ final class LaunchIntentCoordinator: ObservableObject {
     guard !isQuiescedForTermination else { return }
     guard !urls.isEmpty else { return }
 
-    hasExplicitURLIntent = true
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
+    guard controller != nil else { return }
+    // The URLs already landed in this window; spend the launch-document intent
+    // here so the NEXT window is judged on its own.
+    _ = consumeLaunchDocumentOpen()
     controller?.start(intent: .explicitDocument)
-    if controller != nil {
-      finishStartupDecision()
-    }
+    finishStartupDecision()
   }
 
   func waitForStartupDecision() async {
@@ -112,11 +122,23 @@ final class LaunchIntentCoordinator: ObservableObject {
     handler?()
   }
 
+  /// Whether launch documents were opened and not yet accounted for, resetting
+  /// the record as it answers.
+  private func consumeLaunchDocumentOpen() -> Bool {
+    let didOpen = didOpenLaunchDocuments
+    didOpenLaunchDocuments = false
+    return didOpen
+  }
+
   private func drainPendingURLs() {
     guard let controller, !pendingURLs.isEmpty else { return }
 
     let urls = pendingURLs
     pendingURLs.removeAll()
+    // Draining is what makes this launch an explicit-document launch. It can
+    // happen the moment a controller attaches — before the settle task runs —
+    // so the fact is recorded here rather than inferred at the start decision.
+    didOpenLaunchDocuments = true
 
     let supportedFileURLs = urls.filter(isSupportedLaunchFile)
     let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }

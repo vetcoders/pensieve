@@ -199,6 +199,75 @@ final class LaunchIntentTests: XCTestCase {
       "the guard is a generation, not a latch — the NEXT flow must restore normally")
   }
 
+  // MARK: - A launch URL belongs to ONE launch
+
+  /// A window that opens a file handed to it at launch shows that file and
+  /// nothing else — no workspace restored around it, no document selected on
+  /// top of it.
+  @MainActor
+  func testAFileLaunchStartsItsOwnWindowAsAnExplicitDocument() async throws {
+    let harness = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let launchURL = harness.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [launchURL])
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: harness.controller, intent: .coldLaunch)
+    await coordinator.waitForStartupDecision()
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(harness.appState.documentSession.url, launchURL)
+    XCTAssertTrue(
+      harness.appState.workspaceRoots.isEmpty,
+      "a window opened for a launch file must not also restore the last workspace")
+  }
+
+  /// The regression the sticky `hasExplicitURLIntent` boolean caused: one
+  /// Finder launch disabled workspace restore for EVERY later window in the
+  /// process, so two identical-looking sessions behaved differently forever.
+  @MainActor
+  func testALaunchFileDoesNotChangeHowLaterWindowsStart() async throws {
+    let launched = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let launchURL = launched.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+
+    coordinator.handle(urls: [launchURL])
+    coordinator.startWhenLaunchIntentsSettle(controller: launched.controller, intent: .coldLaunch)
+    await coordinator.waitForStartupDecision()
+
+    // A LATER window in the same process, started as its own cold launch.
+    let later = try makeRestoreHarness(documentNames: ["beta.md"])
+    coordinator.startWhenLaunchIntentsSettle(controller: later.controller, intent: .coldLaunch)
+    await coordinator.waitForStartupDecision()
+    await later.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      later.appState.workspaceRoots.map(\.url), [later.folder.standardizedFileURL],
+      "an earlier file launch suppressed workspace restore for a later window")
+    XCTAssertNotNil(later.appState.selectedDocumentID)
+  }
+
+  /// And a mid-session launcher keeps its own policy after a file launch: the
+  /// intent it was built with decides, not what happened earlier.
+  @MainActor
+  func testAFileLaunchDoesNotTurnALaterLauncherIntoAColdLaunch() async throws {
+    let launched = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    coordinator.handle(urls: [launched.folder.appendingPathComponent("alpha.md")])
+    coordinator.startWhenLaunchIntentsSettle(controller: launched.controller, intent: .coldLaunch)
+    await coordinator.waitForStartupDecision()
+
+    let reopened = try makeRestoreHarness(documentNames: ["beta.md"])
+    coordinator.startWhenLaunchIntentsSettle(controller: reopened.controller, intent: .dockReopen)
+    await coordinator.waitForStartupDecision()
+    await reopened.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertFalse(reopened.appState.documents.isEmpty)
+    XCTAssertNil(
+      reopened.appState.selectedDocumentID,
+      "the Dock-reopen launcher must stay empty regardless of how the app was launched")
+  }
+
   // MARK: - Which intent each window route asks for
 
   @MainActor
