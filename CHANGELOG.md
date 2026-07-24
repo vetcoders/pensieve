@@ -52,6 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Losing the document you were reading empties the editor, instead of putting a different file in it.** Deleting the open document, or hiding the folder it lives in, replaced it with whatever file the scanner reached first — a document you had not asked to open, in the pane you were just working in. The same fallback also meant that once a workspace was open, any file appearing or changing anywhere in it could open a document in a session where you had nothing open at all. A refresh now only ever keeps you where you were: the document you are reading stays and reloads, renaming or moving it keeps you in it under its new name, and creating or duplicating a file still opens the new one — but when there is nothing to keep you in, you get the empty state.
 - **Start-up hang:** opening a large document (a recovered draft of ~1 MB or more) under a theme with a fixed light/dark appearance — Parchment, Porcelain, Graphite, Ink, Typewriter — pinned the main thread at 100% CPU and left the document window blank at 0×0. The window's appearance is owned by the SwiftUI scene, which puts its own value back after anyone else writes it, so the per-pass chrome check never agreed with the window, re-wrote the appearance on every pass, and each write drove another full editor update — an unbounded loop whose every cycle paid the cost of the whole document. The theme's appearance is now re-asserted from what the app last applied to that window and whenever the titlebar backing was clobbered, so a settled window writes nothing while a toolbar re-bridge or tab-group reshuffle is still healed.
 
+## [0.4.3] - 2026-07-24
+
+### Added
+
+- Per-intent AI rewrite prompts: Improve, Shorten, Expand, and Fix Grammar each carry a dedicated instruction, compiled-in by default and overridable from plain text files in `~/Library/Application Support/Pensieve/prompts/`. A fifth rewrite action accepts a custom instruction telling Pensieve what to do with the selected text; an invariant guard prefix keeps every prompt treating the selection as content and returning only the replacement.
+- Multi-select in workspace search results: ⌘-click extends the selection, and **Copy for Agent** packages the matched snippets with their file paths in `<search_result>` blocks — exactly what the index returned, ready to paste into an AI conversation as context.
+
+### Changed
+
+- The cold launch surface is scene-owned: a dedicated launcher `WindowGroup` presents the first window, the menu bar carries Pensieve's commands from the first build regardless of activation timing, and the cold frame no longer collapses trailing toolbar groups into the overflow chevron.
+- Document session identity unified around `DocumentIdentity` (file / untitled / recovered); the window registry publishes ordering through one `openDocuments` source with `openTabDocumentIDs` kept as a derived file-only projection.
+- The accessibility UI smoke harness keeps the display awake, enforces a single app instance across runs, and pins native toolbar runtime visibility; it also survives macOS's bash 3.2 (`set -u` empty-array expansion).
+
+### Fixed
+
+- **Workspace watcher scan pile-up** — the memory bug behind multi-hundred-gigabyte footprints after long sessions (observed: 154 GB physical-footprint peak on 0.4.2 after a night of agent-driven filesystem churn). The debounced watcher refresh ran its full-tree walk in a detached task that never inherited cancellation, so every event burst stacked another concurrent, uncancellable walk — each holding a complete workspace snapshot. Cancellation is now forwarded into the walk, watcher events during an in-flight walk coalesce into exactly one trailing rescan, and explicit refreshes cancel the superseded walk. Regression tests pin both contracts.
+- Rust `target` build directories are excluded from workspace scanning alongside `.git`, `node_modules`, and `DerivedData`.
+- Test suites can no longer write into the real document recovery store: `RecoveryStore` is an explicit `DocumentStore` dependency and tests route through unique temporary recovery roots.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
