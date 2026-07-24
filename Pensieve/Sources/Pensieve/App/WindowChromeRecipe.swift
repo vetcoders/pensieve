@@ -33,17 +33,46 @@ enum WindowChromeRecipe {
     )
   }
 
+  /// Content rect the factory hands `NSWindow(contentRect:)`, sized and
+  /// centred so the FINAL window frame — the content rect grown by whatever
+  /// titlebar/border `styleMask` contributes — still fits inside
+  /// `visibleFrame`. The clamp is applied to the frame, not the bare content:
+  /// capping only the content height lets the titlebar spill above the work
+  /// area on a low screen. `documentStyleMask` uses `.fullSizeContentView`,
+  /// where the titlebar overlays the content and the frame equals the content
+  /// rect (chrome delta 0), so today this returns the same geometry as a plain
+  /// content clamp; routing through `NSWindow.frameRect(forContentRect:)`
+  /// keeps it correct-by-construction if the mask ever drops
+  /// `.fullSizeContentView`. The `styleMask` parameter exists so the chrome
+  /// accounting is unit-testable with a mask that actually adds a titlebar.
+  @MainActor
+  static func factoryInitialContentRect(
+    in visibleFrame: NSRect,
+    styleMask: NSWindow.StyleMask
+  ) -> NSRect {
+    let desiredContent = NSRect(
+      x: 0,
+      y: 0,
+      width: toolbarFittingContentWidth,
+      height: defaultContentSize.height
+    )
+    let desiredFrame = NSWindow.frameRect(forContentRect: desiredContent, styleMask: styleMask)
+    let frameSize = NSSize(
+      width: min(desiredFrame.width, visibleFrame.width),
+      height: min(desiredFrame.height, visibleFrame.height)
+    )
+    let finalFrame = NSRect(
+      x: visibleFrame.midX - frameSize.width / 2,
+      y: visibleFrame.midY - frameSize.height / 2,
+      width: frameSize.width,
+      height: frameSize.height
+    )
+    return NSWindow.contentRect(forFrameRect: finalFrame, styleMask: styleMask)
+  }
+
+  @MainActor
   static func factoryInitialFrame(in visibleFrame: NSRect) -> NSRect {
-    let size = NSSize(
-      width: min(toolbarFittingContentWidth, visibleFrame.width),
-      height: min(defaultContentSize.height, visibleFrame.height)
-    )
-    return NSRect(
-      x: visibleFrame.midX - size.width / 2,
-      y: visibleFrame.midY - size.height / 2,
-      width: size.width,
-      height: size.height
-    )
+    factoryInitialContentRect(in: visibleFrame, styleMask: documentStyleMask)
   }
 
   static func apply(to window: NSWindow, title: String) {
