@@ -3759,7 +3759,7 @@ final class PensieveSmokeTests: XCTestCase {
     var prompted = false
     let documentStore = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
-      dirtyUntitledPrompt: { session in
+      dirtySessionPrompt: { session in
         prompted = session.isUntitled
         return .cancel
       }
@@ -3954,7 +3954,7 @@ final class PensieveSmokeTests: XCTestCase {
     let cancelController = AppController(
       appState: cancelState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { session in
         cancelPrompted = session.isUntitled
         return .cancel
       }),
@@ -4046,7 +4046,7 @@ final class PensieveSmokeTests: XCTestCase {
     let discardState = AppState()
     let discardStore = makeTestDocumentStore(
       recoveryStore: discardRecovery,
-      dirtyUntitledPrompt: { _ in .discard })
+      dirtySessionPrompt: { _ in .discard })
     let discardController = AppController(
       appState: discardState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
@@ -4068,7 +4068,7 @@ final class PensieveSmokeTests: XCTestCase {
     let cancelController = AppController(
       appState: cancelState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { session in
         cancelPrompted = session.isUntitled
         return .cancel
       }),
@@ -4146,7 +4146,7 @@ final class PensieveSmokeTests: XCTestCase {
     let cancelController = AppController(
       appState: cancelState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { _ in .cancel }),
       documentWindowRegistry: registry
     )
     XCTAssertTrue(cancelController.createUntitledDocument())
@@ -4216,7 +4216,7 @@ final class PensieveSmokeTests: XCTestCase {
     let cancelController = AppController(
       appState: cancelState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { _ in .cancel }),
       documentWindowRegistry: registry
     )
     XCTAssertTrue(cancelController.createUntitledDocument())
@@ -4276,7 +4276,7 @@ final class PensieveSmokeTests: XCTestCase {
     let discardState = AppState()
     let discardStore = makeTestDocumentStore(
       recoveryStore: discardRecovery,
-      dirtyUntitledPrompt: { _ in .discard })
+      dirtySessionPrompt: { _ in .discard })
     let discardController = AppController(
       appState: discardState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
@@ -4363,7 +4363,7 @@ final class PensieveSmokeTests: XCTestCase {
     let discardState = AppState()
     let discardStore = makeTestDocumentStore(
       recoveryStore: discardRecovery,
-      dirtyUntitledPrompt: { _ in .discard })
+      dirtySessionPrompt: { _ in .discard })
     let discardController = AppController(
       appState: discardState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
@@ -4433,6 +4433,178 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(
       discardRecovery.loadDrafts().isEmpty,
       "the recovery draft must survive — a deferred Discard can't leak past an I/O abort")
+  }
+
+  /// Case 6 — the SECOND kind of Discard, introduced with the auto-save setting.
+  /// A file-backed document with auto-save OFF answers "Don't Save"; a later
+  /// window Cancels. Dropping that edit is just as irreversible as dropping an
+  /// untitled draft — the buffer is the only copy, since the whole point of
+  /// auto-save-off is that nothing reached disk — so it must be deferred too.
+  /// The file itself is never written by this path in either direction.
+  @MainActor
+  func testClearOpenFilesPathedDontSaveThenCancelKeepsTheEdit() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearPathedTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let discardWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      discardWindow.close()
+      cancelWindow.close()
+    }
+
+    // Window A: a pathed doc with auto-save OFF, edited in memory only. Its
+    // guard answers Don't Save — recorded, not executed. Attached FIRST.
+    let fileURL = folder.appendingPathComponent("pathed.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    var promptedForPathedDocument = false
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      dirtySessionPrompt: { session in
+        promptedForPathedDocument = !session.isUntitled
+        return .discard
+      })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry
+    )
+    discardStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: discardState)
+    discardState.activeDocumentText = "edited, never written"
+    discardState.activeDocumentDirty = true
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window B: untitled, dirty; its guard Cancels. Attached SECOND.
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { _ in .cancel }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        discardWindow, identity: discardIdentity, documentID: fileURL,
+        title: "pathed.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    discardController.clearOpenFiles()
+
+    XCTAssertTrue(
+      promptedForPathedDocument,
+      "auto-save off must ask before a pathed document is settled")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    XCTAssertTrue(
+      discardState.activeDocumentDirty,
+      "a cancelled pass must leave the pathed edit dirty — Don't Save was only recorded")
+    XCTAssertEqual(
+      discardState.activeDocumentText, "edited, never written",
+      "the in-memory edit is the only copy and must survive the aborted pass")
+    XCTAssertEqual(
+      discardState.windowModel.documentIdentity, discardIdentity,
+      "the pathed window must still own its document")
+    XCTAssertEqual(
+      try String(contentsOf: fileURL, encoding: .utf8), "on disk",
+      "auto-save off means the pass writes nothing to the file, aborted or not")
+  }
+
+  /// Case 7 — the same pathed Don't Save, but nothing cancels: the recorded
+  /// discard IS applied, the windows close, and the file on disk still keeps the
+  /// bytes it had. Guards phase 2 against forgetting the new case, the way case 4
+  /// does for `.discardUntitled`.
+  @MainActor
+  func testClearOpenFilesPathedDontSaveWithoutCancelDropsTheEdit() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearPathedOKTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let discardWindow = Self.makeControllerlessWindow()
+    let cleanWindow = Self.makeControllerlessWindow()
+    defer {
+      discardWindow.close()
+      cleanWindow.close()
+    }
+
+    let fileURL = folder.appendingPathComponent("pathed.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      dirtySessionPrompt: { _ in .discard })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry
+    )
+    discardStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: discardState)
+    discardState.activeDocumentText = "edited, never written"
+    discardState.activeDocumentDirty = true
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window B: a clean file — resolves with no prompt, so the pass succeeds.
+    let cleanURL = folder.appendingPathComponent("clean.md")
+    try "clean on disk".write(to: cleanURL, atomically: true, encoding: .utf8)
+    let cleanState = AppState()
+    let cleanStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    let cleanController = AppController(
+      appState: cleanState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: cleanStore,
+      documentWindowRegistry: registry
+    )
+    cleanStore.load(ref: DocumentRef(id: cleanURL.standardizedFileURL), into: cleanState)
+    let cleanIdentity = try XCTUnwrap(cleanState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        discardWindow, identity: discardIdentity, documentID: fileURL,
+        title: "pathed.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cleanWindow, identity: cleanIdentity, documentID: cleanURL,
+        title: "clean.md", isDirty: false, hasEditableBuffer: true))
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(cleanController, for: cleanWindow)
+
+    discardController.clearOpenFiles()
+
+    XCTAssertEqual(
+      Set(closedWindows.map(ObjectIdentifier.init)),
+      Set([discardWindow, cleanWindow].map(ObjectIdentifier.init)),
+      "a fully resolved pass closes every window")
+    XCTAssertFalse(
+      discardState.activeDocumentDirty,
+      "the recorded pathed discard must be applied on a successful pass")
+    XCTAssertEqual(
+      try String(contentsOf: fileURL, encoding: .utf8), "on disk",
+      "Don't Save drops the edit — it must never write it out on the way past")
   }
 
   @MainActor

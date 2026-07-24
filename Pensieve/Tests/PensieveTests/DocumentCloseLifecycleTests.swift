@@ -252,6 +252,12 @@ final class DocumentCloseLifecycleTests: XCTestCase {
   }
 
   // MARK: - ⌘W on a document that already has a file
+  //
+  // These are the AUTO-SAVE OFF half of the contract (W2-E): a file-backed
+  // document only asks `Save / Don't Save / Cancel` when the user has taken over
+  // saving it. With auto-save on — the shipped default — its close flushes
+  // instead of asking, which `AutoSaveSettingTests` covers. Each test states the
+  // setting it exercises rather than inheriting one.
 
   @MainActor
   func testClosingDirtyFileBackedDocumentSavesInPlace() throws {
@@ -262,7 +268,8 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     let recorder = SaveChangesRecorder()
     recorder.answer = .save
     let appState = AppState()
-    let controller = makeController(appState: appState, in: folder, recorder: recorder)
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
     controller.openFolder(url: folder)
     controller.selectDocument(id: noteURL.standardizedFileURL)
     appState.activeDocumentText = "edited before close"
@@ -287,7 +294,8 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     let recorder = SaveChangesRecorder()
     recorder.answer = .discard
     let appState = AppState()
-    let controller = makeController(appState: appState, in: folder, recorder: recorder)
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
     controller.openFolder(url: folder)
     controller.selectDocument(id: noteURL.standardizedFileURL)
     appState.activeDocumentText = "edited before close"
@@ -312,7 +320,8 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     let recorder = SaveChangesRecorder()
     recorder.answer = .cancel
     let appState = AppState()
-    let controller = makeController(appState: appState, in: folder, recorder: recorder)
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
     controller.openFolder(url: folder)
     controller.selectDocument(id: noteURL.standardizedFileURL)
     appState.activeDocumentText = "edited before close"
@@ -362,7 +371,8 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     let recorder = SaveChangesRecorder()
     recorder.holdsResponse = true
     let appState = AppState()
-    let controller = makeController(appState: appState, in: folder, recorder: recorder)
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
     controller.openFolder(url: folder)
     controller.selectDocument(id: noteURL.standardizedFileURL)
     appState.activeDocumentText = "edited before close"
@@ -453,10 +463,11 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     XCTAssertEqual(harness.appState.openFiles, [reopened])
   }
 
-  /// Cancel means the close did not happen, so nothing leaves the list.
+  /// Cancel means the close did not happen, so nothing leaves the list. There is
+  /// only something to cancel while the user owns saving, hence auto-save off.
   @MainActor
   func testCancellingCloseKeepsTheDocumentInOpenFiles() throws {
-    let harness = try makeOpenFilesHarness()
+    let harness = try makeOpenFilesHarness(autoSaveEnabled: false)
     harness.recorder.answer = .cancel
     let ref = try harness.openAdHocFile(named: "ad-hoc.md", contents: "body")
     harness.appState.activeDocumentText = "edited"
@@ -538,12 +549,17 @@ final class DocumentCloseLifecycleTests: XCTestCase {
   }
 
   @MainActor
+  /// - Parameter autoSaveEnabled: the auto-save state this close is asked under.
+  ///   Stated per test rather than inherited: with auto-save on, a file-backed
+  ///   document closes without a question at all, so a test about the question
+  ///   has to own the setting that produces it.
   private func makeController(
     appState: AppState,
     in folder: URL,
     documentStore: DocumentStore? = nil,
     recoveryStore: RecoveryStore? = nil,
     savePanelURL: URL? = nil,
+    autoSaveEnabled: Bool = true,
     recorder: SaveChangesRecorder
   ) -> AppController {
     let indexDatabase = temporaryIndexDatabase(in: folder)
@@ -553,6 +569,7 @@ final class DocumentCloseLifecycleTests: XCTestCase {
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore(),
         recoveryStore: recoveryStore,
+        savingSettings: makeAutoSaveSettings(enabled: autoSaveEnabled),
         savePanelURLProvider: { _ in savePanelURL })
     return AppController(
       appState: appState,
@@ -585,7 +602,7 @@ final class DocumentCloseLifecycleTests: XCTestCase {
   /// pointed at throwaway state — so the Open Files working set can be driven
   /// through the real open/close routes without touching the shared singletons.
   @MainActor
-  private func makeOpenFilesHarness() throws -> OpenFilesHarness {
+  private func makeOpenFilesHarness(autoSaveEnabled: Bool = true) throws -> OpenFilesHarness {
     let folder = try makeTemporaryFolder()
     let support = folder.appendingPathComponent("Support", isDirectory: true)
     try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
@@ -600,7 +617,8 @@ final class DocumentCloseLifecycleTests: XCTestCase {
           baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true))))
     let documentStore = makeTestDocumentStore(
       indexDatabase: indexDatabase,
-      bookmarkStore: temporaryBookmarkStore())
+      bookmarkStore: temporaryBookmarkStore(),
+      savingSettings: makeAutoSaveSettings(enabled: autoSaveEnabled))
     let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
     let recorder = SaveChangesRecorder()
     let appState = AppState()

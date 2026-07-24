@@ -28,14 +28,17 @@ enum DocumentCloseDecision: Equatable {
   case closeWithoutPrompting
   /// Flush to the existing file and close, without asking. Reached only when
   /// auto-save owns file-backed documents (see `autoSavesPathedDocuments`).
+  /// The flush matters: the last edit may still be inside the autosave debounce,
+  /// so closing without it would drop exactly the change auto-save promised.
   case saveWithoutPrompting
   /// Ask the user before anything is lost.
   case confirm(DocumentClosePrompt)
 
   /// - Parameters:
   ///   - session: the window's active session.
-  ///   - autoSavesPathedDocuments: the auto-save seam (W2-E, not implemented
-  ///     yet — production passes `false`). When auto-save owns documents that
+  ///   - autoSavesPathedDocuments: the auto-save setting
+  ///     (`DocumentSavingSettings`, default ON), read per close so a flip in
+  ///     Settings applies without a restart. When auto-save owns documents that
   ///     already have a location, their edits are on disk already and "Don't
   ///     Save" would be a lie, so those close after a flush instead of asking.
   ///     A dirty UNTITLED buffer still asks even then: it has no file to be

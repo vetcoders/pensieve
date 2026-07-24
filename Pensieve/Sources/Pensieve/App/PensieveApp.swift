@@ -12,12 +12,16 @@ struct PensieveApp: App {
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
   private let providerSettings: ProviderSettings
+  /// The auto-save preference the Settings window edits. The SAME instance the
+  /// document store consults, so a flip reaches every open document immediately.
+  private let savingSettings: DocumentSavingSettings
 
   init() {
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
     providerSettings = ProviderSettings.shared
+    savingSettings = DocumentSavingSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -105,7 +109,10 @@ struct PensieveApp: App {
     .pensieveDocumentWindowChrome()
 
     Settings {
-      ProviderSettingsView(settings: providerSettings)
+      PensieveSettingsView(
+        providerSettings: providerSettings,
+        savingSettings: savingSettings
+      )
     }
   }
 }
