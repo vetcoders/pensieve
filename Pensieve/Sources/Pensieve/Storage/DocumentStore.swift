@@ -3003,10 +3003,32 @@ final class DocumentStore {
     bookmarkStore.removeFile(url: standardizedURL)
   }
 
+  // MARK: - Recovered drafts
+
+  /// Every unhandled crash draft, newest first. The launcher's Recovered Drafts
+  /// section is the ONLY route from here into a window — nothing adopts a draft
+  /// on its own any more.
+  func recoveredDrafts() -> [RecoveryDraft] {
+    recoveryStore.loadDrafts()
+  }
+
+  /// Launch sweep for the recovery directory (age + count retention).
   @discardableResult
-  func restoreRecoveredDraft(into appState: AppState) -> Bool {
+  func pruneRecoveredDrafts(now: Date = Date()) -> [UUID] {
+    recoveryStore.pruneDrafts(now: now)
+  }
+
+  /// Adopts `draft` into an EMPTY window as the untitled document it was.
+  ///
+  /// The draft file stays on disk: it is retired only by a successful save or
+  /// an explicit discard, so a window closed again without deciding leaves the
+  /// draft exactly where the user can find it. Refuses a window that already
+  /// holds a buffer — the section that offers this is only shown in an empty
+  /// one, and silently replacing a document would be the very hijack W2-D
+  /// removes.
+  @discardableResult
+  func openRecoveredDraft(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
-    guard let draft = recoveryStore.claimDraftForRestore() else { return false }
 
     self.appState = appState
     cancelOwnDebouncesOnSessionChange(appState: appState)
@@ -3016,8 +3038,48 @@ final class DocumentStore {
       text: draft.text,
       recoveryID: draft.id
     )
+    recoveryStore.markDraftOpen(id: draft.id)
     appState.lastError = nil
     return true
+  }
+
+  /// Writes `draft` to a location the user picks and retires it. The draft
+  /// survives a cancelled panel and a failed write — it is dropped only once
+  /// its content is safely somewhere else.
+  @discardableResult
+  func saveRecoveredDraftAs(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
+    self.appState = appState
+
+    guard let url = savePanelURLProvider(appState) else { return false }
+
+    // A draft this window already adopted is just an unsaved document: the
+    // ordinary Save As… path owns it (registration, working set, index) and
+    // retires the draft on success.
+    if appState.documentSession.recoveryID == draft.id {
+      return saveAs(appState: appState, to: url)
+    }
+
+    let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
+    do {
+      try FileManager.default.createDirectory(
+        at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try writeDocument(draft.text, targetURL)
+      selfWriteObserver(targetURL)
+      indexDocument(documentRef(for: targetURL, appState: appState), draft.text, appState)
+      recoveryStore.deleteDraft(id: draft.id)
+      appState.lastError = nil
+      return true
+    } catch {
+      let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
+      appState.lastError = message
+      NSLog(message)
+      return false
+    }
+  }
+
+  /// Drops `draft` for good. The caller owns the confirmation.
+  func discardRecoveredDraft(_ draft: RecoveryDraft) {
+    recoveryStore.deleteDraft(id: draft.id)
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -3120,6 +3182,10 @@ final class DocumentStore {
     }
 
     autosaver.cancel()
+    // Whatever the answer was, no buffer is holding this draft any more, so it
+    // stops being exempt from retention. (Discard/Save already removed the file
+    // outright; this only releases the claim when one survived.)
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
     appState.selectedDocumentID = nil
     appState.documentSession.clear()
     // The window is now empty BECAUSE the user asked for it. Any workspace
@@ -3247,6 +3313,10 @@ final class DocumentStore {
     cancelArmedIndexIfOwned(by: appState)
     if appState.documentSession.isUntitled {
       saveRecoveryDraft(appState: appState)
+      // The buffer goes away with the window; the draft it just wrote is a
+      // recovery artifact from here on, not live work, so it re-enters
+      // retention like any other unhandled draft.
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       return true
     }
     return saveExisting(appState: appState, indexNow: true)

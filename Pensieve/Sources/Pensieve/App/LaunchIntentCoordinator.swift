@@ -185,6 +185,11 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
 
+    // Retention sweep for crash drafts, at the one moment nothing holds one
+    // open: drafts nobody came back for within 30 days go, and the rest are
+    // capped. Recovery is a safety net, not an archive.
+    RecoveryStore.shared.pruneDrafts()
+
     // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
     // tabs are not), so they have no onClose hook → their document would linger

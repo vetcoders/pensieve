@@ -2,36 +2,33 @@ import XCTest
 
 @testable import Pensieve
 
-/// The restore matrix: intent × does it rebuild the workspace × does it claim
-/// the crash draft.
+/// The restore matrix: intent × does it rebuild the workspace. Both other axes
+/// are deliberately absent: no intent picks a document (restoration re-selects
+/// only what a window already showed) and no intent claims the crash draft
+/// (W2-D moved recovery to the launcher's Recovered Drafts section).
 ///
 /// The behaviour under test is the end of restoration-absorption. Closing the
 /// last document used to look like a no-op: the app put a launcher back and the
 /// launcher ran the full cold-launch restore. Picking a document is no longer
 /// part of that matrix at all — restoration re-selects only what a window
-/// already showed, on EVERY intent (`selectRestoredDocument`), so the axis that
-/// remains here is workspace vs draft.
+/// already showed, on EVERY intent (`selectRestoredDocument`), and a draft is
+/// only ever opened because the user pointed at it.
 final class LaunchIntentTests: XCTestCase {
 
   // MARK: - Policy matrix (pure)
 
-  func testColdLaunchIsTheOnlyIntentThatRestoresTheWholeSession() {
+  func testColdLaunchRebuildsTheWorkspace() {
     XCTAssertTrue(LaunchIntent.coldLaunch.restoresWorkspace)
-    XCTAssertTrue(LaunchIntent.coldLaunch.adoptsRecoveredDraft)
   }
 
-  func testMidSessionLaunchersRestoreTheWorkspaceButNoDocument() {
+  func testMidSessionLaunchersStillRebuildTheWorkspace() {
     for intent: LaunchIntent in [.dockReopen, .newUntitledTab] {
       XCTAssertTrue(intent.restoresWorkspace, "\(intent) should still rebuild the sidebar")
-      XCTAssertFalse(
-        intent.adoptsRecoveredDraft,
-        "\(intent) must not claim the crash draft — the close already asked about that work")
     }
   }
 
   func testExplicitDocumentLaunchRestoresNothingAroundItsDocument() {
     XCTAssertFalse(LaunchIntent.explicitDocument.restoresWorkspace)
-    XCTAssertFalse(LaunchIntent.explicitDocument.adoptsRecoveredDraft)
   }
 
   // MARK: - start(intent:) — workspace and selection
@@ -98,20 +95,13 @@ final class LaunchIntentTests: XCTestCase {
 
   // MARK: - start(intent:) — crash-recovery draft
 
+  /// No window claims a draft any more — not even a cold launch. Recovery is a
+  /// decision the user makes in the launcher's Recovered Drafts section, so a
+  /// starting window stays empty and the draft stays on disk, whatever the
+  /// intent was.
   @MainActor
-  func testColdLaunchAdoptsThePendingRecoveryDraft() throws {
-    let harness = try makeRestoreHarness(documentNames: [])
-    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
-
-    harness.controller.start(intent: .coldLaunch)
-
-    XCTAssertTrue(harness.appState.documentSession.isUntitled)
-    XCTAssertEqual(harness.appState.activeDocumentText, "crash draft")
-  }
-
-  @MainActor
-  func testMidSessionLaunchersLeaveThePendingRecoveryDraftUnclaimed() throws {
-    for intent: LaunchIntent in [.dockReopen, .newUntitledTab, .explicitDocument] {
+  func testNoLaunchIntentClaimsThePendingRecoveryDraft() throws {
+    for intent: LaunchIntent in [.coldLaunch, .dockReopen, .newUntitledTab, .explicitDocument] {
       let harness = try makeRestoreHarness(documentNames: [])
       _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
 
@@ -121,9 +111,21 @@ final class LaunchIntentTests: XCTestCase {
         harness.appState.documentSession.hasEditableBuffer,
         "\(intent) hijacked the window with the recovery draft")
       XCTAssertEqual(
-        harness.recoveryStore.claimDraftForRestore()?.text, "crash draft",
-        "\(intent) consumed the draft — a later cold launch would find nothing to recover")
+        harness.recoveryStore.loadDrafts().first?.text, "crash draft",
+        "\(intent) consumed the draft — the launcher would have nothing left to offer")
     }
+  }
+
+  /// The launcher must be able to SHOW what it may not adopt: starting a window
+  /// fills the Recovered Drafts model from disk.
+  @MainActor
+  func testStartPublishesPendingDraftsToTheLauncher() throws {
+    let harness = try makeRestoreHarness(documentNames: [])
+    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
+
+    harness.controller.start(intent: .coldLaunch)
+
+    XCTAssertEqual(harness.controller.recoveredDrafts.map(\.text), ["crash draft"])
   }
 
   // MARK: - No restoration may reverse a conscious close
@@ -244,7 +246,9 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertEqual(
       later.appState.workspaceRoots.map(\.url), [later.folder.standardizedFileURL],
       "an earlier file launch suppressed workspace restore for a later window")
-    XCTAssertNotNil(later.appState.selectedDocumentID)
+    XCTAssertFalse(
+      later.appState.documents.isEmpty,
+      "…and its sidebar was rebuilt, which is what the suppressed restore used to cost")
   }
 
   /// And a mid-session launcher keeps its own policy after a file launch: the

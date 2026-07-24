@@ -28,8 +28,10 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     let draftWindow = harness.openLauncherWindow()
 
     // The draft lands in the launcher window through the real adoption path:
-    // real work, no URL behind it, so only the explicit promotion can reclassify
-    // the window out of "launcher".
+    // the user picking it out of the launcher's Recovered Drafts section, which
+    // is the ONLY adoption route left (nothing claims a draft at launch any
+    // more). Real work, no URL behind it, so only the explicit promotion can
+    // reclassify the window out of "launcher".
     harness.stashRecoveryDraft(text: "unsaved crash draft")
     let draft = harness.attachController(to: draftWindow)
     let registry = harness.registry
@@ -37,6 +39,10 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
       registry.markWindowAsContent(draftWindow)
     }
     draft.controller.start(intent: .coldLaunch)
+    let recovered = try XCTUnwrap(
+      draft.controller.recoveredDrafts.first,
+      "the launcher must LIST the stashed draft before the user can open it")
+    XCTAssertTrue(draft.controller.openRecoveredDraft(recovered))
     XCTAssertEqual(
       draft.appState.documentSession.text, "unsaved crash draft",
       "the window under test never adopted the draft, so the pin proves nothing")

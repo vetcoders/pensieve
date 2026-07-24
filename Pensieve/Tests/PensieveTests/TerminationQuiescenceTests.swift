@@ -3047,9 +3047,9 @@ final class TerminationQuiescenceTests: XCTestCase {
   ///
   /// The observable is deliberately the SYNCHRONOUS limb of `controller.start`. Its other two limbs
   /// (the background index warm-up, the workspace restore) are tasks, so asserting on them would be
-  /// asserting on the scheduler; `documentStore.restoreRecoveredDraft` is a plain call inside `start`,
-  /// so a seeded recovery draft that is still unclaimed afterwards is proof the method never ran —
-  /// with no timing in the claim at all.
+  /// asserting on the scheduler; `refreshRecoveredDrafts` is a plain call inside `start`, so a
+  /// seeded recovery draft that the controller has still never listed afterwards is proof the method
+  /// never ran — with no timing in the read at all.
   ///
   /// Note what a bare `cancel()` would NOT have done here, which is why the fix is a one-way latch:
   /// the startup task's only suspension is `try? await Task.sleep(...)`, so cancelling it merely
@@ -3111,10 +3111,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     // Everything that CAN still run gets its chance — this pin asserts that something did NOT happen.
     pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
 
-    XCTAssertNotNil(
-      recoveryStore.claimDraftForRestore(),
-      "the launch-intent startup task must not run after phase Q: the draft it would have claimed is "
-        + "still pending, which is only true if `controller.start` never ran")
+    XCTAssertEqual(recoveryStore.loadDrafts().count, 1, "fixture: the seeded draft is still on disk")
+    XCTAssertTrue(
+      controller.recoveredDrafts.isEmpty,
+      "the launch-intent startup task must not run after phase Q: the draft it would have listed is "
+        + "still unread, which is only true if `controller.start` never ran")
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
       "…so no session was restored into a window the quit has already flushed")
@@ -3174,13 +3175,16 @@ final class TerminationQuiescenceTests: XCTestCase {
     coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
-    XCTAssertTrue(
-      appState.documentSession.hasEditableBuffer,
-      "an ordinary launch must still restore its recovery draft — the termination latch may only be "
+    XCTAssertEqual(
+      controller.recoveredDrafts.count, 1,
+      "an ordinary launch must still list its recovery draft — the termination latch may only be "
         + "set by `quiesceForTermination()`, never by arming")
     XCTAssertEqual(
-      appState.documentSession.text, "settledlaunchneedle from the previous session",
-      "…with the draft's own bytes, not an empty buffer")
+      controller.recoveredDrafts.first?.text, "settledlaunchneedle from the previous session",
+      "…with the draft's own bytes, not an empty entry")
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "listing is not adopting: a draft reaches a window only when the user opens it")
   }
 
   // MARK: - R11: a session change may not disarm another window's index debounce
