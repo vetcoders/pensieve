@@ -36,6 +36,14 @@ final class FolderManager {
   /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
   /// completed refresh from one that was cancel-replaced by a newer event mid-await.
   private var watcherRefreshGeneration: UInt64 = 0
+  /// True while the watcher refresh's detached scanner walk is running. Watcher events in that
+  /// window flip `watcherRescanPending` instead of spawning another walk: under sustained
+  /// filesystem churn concurrent walks pile up without bound, each holding a full workspace
+  /// snapshot (the 154 GB footprint peak on 0.4.2).
+  private var watcherScanInFlight = false
+  /// One-bit coalescer for watcher events that arrive during an in-flight walk; consumed when
+  /// that walk finishes to schedule exactly one trailing rescan.
+  private var watcherRescanPending = false
   /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
   /// task so a filesystem event cannot cancel a user-requested refresh.
   private var forcedRefreshTask: Task<Void, Never>?
@@ -645,8 +653,15 @@ final class FolderManager {
   /// single refresh after a short quiet period, then builds one presentation + search snapshot
   /// on a background task so foreign filesystem churn never blocks the main actor. Only the
   /// independent signature comparisons and required publications hop back to the main actor.
-  /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
+  /// During the debounce a new event cancel-replaces the pending task (extends the quiet
+  /// period); once the walk itself is in flight, new events coalesce into ONE trailing rescan
+  /// instead — cancel-replacing here only cancelled the debounce wrapper while the detached
+  /// walk kept running, so each burst stacked another concurrent full-tree walk.
   func scheduleWatcherRefresh(into appState: AppState) {
+    if watcherScanInFlight {
+      watcherRescanPending = true
+      return
+    }
     watcherRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
@@ -731,13 +746,18 @@ final class FolderManager {
       let exclusions = appState.excludedWorkspacePaths
       let workspaceBuilder = self.workspaceBuilder
 
-      let snapshot = await Task.detached(priority: .userInitiated) {
+      let scanTask = Task.detached(priority: .userInitiated) {
         FolderManager.refreshSnapshot(
           roots: roots,
           exclusions: exclusions,
           builder: workspaceBuilder
         )
-      }.value
+      }
+      let snapshot = await withTaskCancellationHandler {
+        await scanTask.value
+      } onCancel: {
+        scanTask.cancel()
+      }
       guard !Task.isCancelled else { return }
       guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
         appState.excludedWorkspacePaths == exclusions
@@ -756,7 +776,10 @@ final class FolderManager {
   }
 
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
-  /// off-main; only delta decisions and publication touch main-actor state.
+  /// off-main; only delta decisions and publication touch main-actor state. The walk runs in a
+  /// detached task, which does NOT inherit cancellation — the explicit handler forwards it, so
+  /// `WorkspaceScanner.buildCancellable`'s cooperative checks actually fire when this refresh
+  /// is cancel-replaced or superseded by an explicit refresh.
   private func performWatcherRefresh(into appState: AppState) async {
     guard appState.hasWorkspaceContent else { return }
     let roots = appState.workspaceRoots.map(\.url)
@@ -764,13 +787,28 @@ final class FolderManager {
     let exclusions = appState.excludedWorkspacePaths
     let workspaceBuilder = workspaceBuilder
 
-    let snapshot = await Task.detached(priority: .utility) {
+    watcherScanInFlight = true
+    defer {
+      watcherScanInFlight = false
+      let rescanPending = watcherRescanPending
+      watcherRescanPending = false
+      // On cancellation the canceller (explicit refresh / close) owns the next rebuild.
+      if rescanPending, !Task.isCancelled {
+        scheduleWatcherRefresh(into: appState)
+      }
+    }
+    let scanTask = Task.detached(priority: .utility) {
       FolderManager.refreshSnapshot(
         roots: roots,
         exclusions: exclusions,
         builder: workspaceBuilder
       )
-    }.value
+    }
+    let snapshot = await withTaskCancellationHandler {
+      await scanTask.value
+    } onCancel: {
+      scanTask.cancel()
+    }
     guard !Task.isCancelled else { return }
     guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
       appState.excludedWorkspacePaths == exclusions
@@ -1996,6 +2034,7 @@ private enum WorkspaceDefaults {
     "node_modules",
     "dist",
     "DerivedData",
+    "target",
   ]
 }
 
