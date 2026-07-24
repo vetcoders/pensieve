@@ -3408,9 +3408,10 @@ final class PensieveSmokeTests: XCTestCase {
 
     let workspaceDocumentsBefore = appState.documents.map(\.id)
 
-    let didClose = controller.closeActiveDocument()
+    var didClose: Bool?
+    controller.closeActiveDocument { didClose = $0 }
 
-    XCTAssertTrue(didClose)
+    XCTAssertEqual(didClose, true)
     XCTAssertNil(appState.documentSession.document)
     XCTAssertNil(appState.selectedDocumentID)
     XCTAssertEqual(appState.documentSession.text, "")
@@ -3422,7 +3423,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testCloseActiveDocumentSavesDirtySessionBeforeClearing() throws {
+  func testCloseActiveDocumentSavesDirtySessionWhenTheUserConfirms() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveCloseDirtyTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3442,16 +3443,18 @@ final class PensieveSmokeTests: XCTestCase {
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: documentStore,
-      indexDatabase: indexDatabase
+      indexDatabase: indexDatabase,
+      confirmSaveChanges: { _, _, _, respond in respond(.save) }
     )
     documentStore.load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
 
     appState.activeDocumentText = "edited before close"
     appState.activeDocumentDirty = true
 
-    let didClose = controller.closeActiveDocument()
+    var didClose: Bool?
+    controller.closeActiveDocument { didClose = $0 }
 
-    XCTAssertTrue(didClose)
+    XCTAssertEqual(didClose, true)
     XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "edited before close")
     XCTAssertNil(appState.documentSession.document)
     XCTAssertNil(appState.selectedDocumentID)
@@ -3480,7 +3483,8 @@ final class PensieveSmokeTests: XCTestCase {
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: documentStore,
-      indexDatabase: indexDatabase
+      indexDatabase: indexDatabase,
+      confirmSaveChanges: { _, _, _, respond in respond(.save) }
     )
     documentStore.load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
 
@@ -3492,9 +3496,10 @@ final class PensieveSmokeTests: XCTestCase {
     // dropping the user's edits.
     try FileManager.default.removeItem(at: writable)
 
-    let didClose = controller.closeActiveDocument()
+    var didClose: Bool?
+    controller.closeActiveDocument { didClose = $0 }
 
-    XCTAssertFalse(didClose)
+    XCTAssertEqual(didClose, false)
     XCTAssertNotNil(appState.documentSession.document)
     XCTAssertEqual(appState.documentSession.text, "unsaved tail")
     XCTAssertTrue(appState.documentSession.isDirty)
@@ -3801,16 +3806,15 @@ final class PensieveSmokeTests: XCTestCase {
       documentWindowRegistry: registry
     )
 
-    var ownerPrompted = false
+    let ownerRecorder = SaveChangesRecorder()
+    ownerRecorder.answer = .cancel
     let ownerState = AppState()
     let ownerController = AppController(
       appState: ownerState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
-        ownerPrompted = session.isUntitled
-        return .cancel
-      }),
-      documentWindowRegistry: registry
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry,
+      confirmSaveChanges: ownerRecorder.confirmation()
     )
 
     XCTAssertTrue(ownerController.createUntitledDocument())
@@ -3828,15 +3832,17 @@ final class PensieveSmokeTests: XCTestCase {
     // The CALLER closes the OWNER's untitled row from its mirrored Open Files.
     callerController.closeOpenDocument(identity: ownerIdentity)
 
-    XCTAssertTrue(ownerPrompted, "the guard must prompt in the owning window's session")
-    XCTAssertTrue(closedWindows.isEmpty, "a cancelled guard must abort the close")
+    XCTAssertEqual(
+      ownerRecorder.prompts, [.saveAsUntitled],
+      "the close decision must be asked in the owning window's session")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled decision must abort the close")
     XCTAssertTrue(ownerState.documentSession.isUntitled)
     XCTAssertTrue(ownerState.activeDocumentDirty, "the unsaved work must survive intact")
     XCTAssertEqual(ownerState.windowModel.documentIdentity, ownerIdentity)
   }
 
-  /// Same cross-window routing, but the owning session's guard resolves (Discard)
-  /// — so the close proceeds and the owner's window is torn down.
+  /// Same cross-window routing, but the owning session's close decision resolves
+  /// (Don't Save) — so the close proceeds and the owner's window is torn down.
   @MainActor
   func testCrossWindowCloseProceedsWhenOwningGuardResolves() {
     var closedWindows: [NSWindow] = []
@@ -3855,12 +3861,15 @@ final class PensieveSmokeTests: XCTestCase {
       documentWindowRegistry: registry
     )
 
+    let ownerRecorder = SaveChangesRecorder()
+    ownerRecorder.answer = .discard
     let ownerState = AppState()
     let ownerController = AppController(
       appState: ownerState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .discard }),
-      documentWindowRegistry: registry
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry,
+      confirmSaveChanges: ownerRecorder.confirmation()
     )
 
     XCTAssertTrue(ownerController.createUntitledDocument())
@@ -5016,13 +5025,16 @@ final class PensieveSmokeTests: XCTestCase {
     let draft = try XCTUnwrap(recoveryStore.loadDrafts().first)
     XCTAssertEqual(recoveryStore.loadDrafts().count, 1)
     XCTAssertEqual(draft.text, expectedText)
-    XCTAssertEqual(draft.url.deletingLastPathComponent().standardizedFileURL, recoveryDirectory.standardizedFileURL)
+    XCTAssertEqual(
+      draft.url.deletingLastPathComponent().standardizedFileURL,
+      recoveryDirectory.standardizedFileURL)
   }
 
   @MainActor
   func testRecoveryIsolationControlDetectsWrongRecoveryRoot() throws {
     let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveRecoveryControlTests-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent(
+        "PensieveRecoveryControlTests-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let expectedRoot = root.appendingPathComponent("Expected", isDirectory: true)
     let controlRoot = root.appendingPathComponent("Control", isDirectory: true)
@@ -5041,7 +5053,8 @@ final class PensieveSmokeTests: XCTestCase {
     let controlDraft = try XCTUnwrap(controlStore.loadDrafts().first)
     XCTAssertFalse(FileManager.default.fileExists(atPath: expectedRoot.path))
     XCTAssertFalse(
-      controlDraft.url.deletingLastPathComponent().standardizedFileURL == expectedRoot.standardizedFileURL,
+      controlDraft.url.deletingLastPathComponent().standardizedFileURL
+        == expectedRoot.standardizedFileURL,
       "the isolation assertion must fail when a store is bound to the control root"
     )
   }
