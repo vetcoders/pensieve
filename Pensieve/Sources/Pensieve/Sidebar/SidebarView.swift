@@ -435,20 +435,6 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.list.searchResults")
   }
 
-  private func documentRow(_ doc: DocumentRef, isSelected: Bool) -> some View {
-    HStack {
-      Image(systemName: "doc.text")
-        .foregroundColor(.secondary)
-      renameableTitle(for: doc.url, title: doc.title)
-    }
-    .padding(.vertical, 4)
-    .padding(.horizontal, 6)
-    .help(doc.displayPath)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .contentShape(Rectangle())
-    .background(selectionBackground(isSelected))
-  }
-
   private func openDocumentRow(_ descriptor: OpenDocumentDescriptor) -> some View {
     let selected = appState.windowModel.documentIdentity == descriptor.identity
     let hovered = descriptor.fileURL.map { hoveredDocumentID == $0 } ?? false
