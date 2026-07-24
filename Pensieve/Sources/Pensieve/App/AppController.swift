@@ -206,7 +206,11 @@ final class AppController: ObservableObject {
   /// timer and would otherwise win that race on a slow workspace.
   private(set) var isAwaitingLaunchRestore = true
 
-  func start(restoringWorkspace: Bool = true) {
+  /// Boots THIS window according to why it was opened. The intent answers both
+  /// restore questions — rebuild the workspace, claim the crash draft — instead
+  /// of the single `restoringWorkspace` boolean that used to conflate them (and
+  /// treated a launcher reborn mid-session exactly like a cold launch).
+  func start(intent: LaunchIntent = .coldLaunch) {
     guard !didStart else { return }
     didStart = true
     // Whatever this window turns out to be, its launch decision is settled by
@@ -222,18 +226,19 @@ final class AppController: ObservableObject {
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
-    // Recovery drafts belong to the plain-launch restore path ONLY. A window
-    // started for a specific document (`restoringWorkspace: false` — a new
-    // document tab, an explicit file launch) must keep its buffer empty:
-    // adopting the pending draft here hijacked every new tab with "Recovered
-    // Untitled", and the dirty untitled session then blocked the load of the
-    // document the window was opened for.
-    guard restoringWorkspace else { return }
+    // Recovery drafts belong to the cold-launch restore path ONLY. A window
+    // started for a specific document (a new document tab, an explicit file
+    // launch) must keep its buffer empty: adopting the pending draft here
+    // hijacked every new tab with "Recovered Untitled", and the dirty untitled
+    // session then blocked the load of the document the window was opened for.
+    // A launcher reborn mid-session (Dock reopen, last window closed) does not
+    // claim it either — the close already asked what to do with that work.
+    guard intent.restoresWorkspace else { return }
     // Claim the application's one startup restore BEFORE anything else in this
     // branch can return early: whichever window gets here first IS the launch,
     // and every launcher after it must be an empty launcher.
     let isApplicationStartupRestore = startupRestore.claimStartupRestore()
-    if documentStore.restoreRecoveredDraft(into: appState) {
+    if intent.adoptsRecoveredDraft, documentStore.restoreRecoveredDraft(into: appState) {
       // This window now holds unsaved work with no URL behind it, so the
       // registry cannot classify it from the document identity the accessor
       // publishes — it would stay a "launcher" and the sweep would reap it.

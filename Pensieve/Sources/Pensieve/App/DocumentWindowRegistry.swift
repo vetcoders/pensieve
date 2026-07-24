@@ -28,7 +28,12 @@ final class DocumentWindowRegistry: ObservableObject {
   /// attaches the returned window as a native tab BEFORE first presentation,
   /// which makes the legacy standalone-window flash impossible by
   /// construction.
-  typealias DocumentWindowFactoryClosure = @MainActor (DocumentRef?) -> NSWindow?
+  ///
+  /// The `LaunchIntent` travels WITH the build request rather than through a
+  /// registry-wide "current intent" field: the window is built synchronously
+  /// but its SwiftUI root starts up later, so two launchers in flight would
+  /// read a shared field that had already moved on.
+  typealias DocumentWindowFactoryClosure = @MainActor (DocumentRef?, LaunchIntent) -> NSWindow?
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
   private var launcherWindows: [ObjectIdentifier: WeakWindow] = [:]
@@ -80,10 +85,11 @@ final class DocumentWindowRegistry: ObservableObject {
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
   /// the Dock with no visible windows, or during cold start if SwiftUI does not
-  /// provide one automatically.
-  func openLauncherWindow() {
+  /// provide one automatically. The caller states WHICH of those it is; the
+  /// intent decides how much of the previous session the launcher brings back.
+  func openLauncherWindow(intent: LaunchIntent) {
     guard let factory = makeDocumentWindow else { return }
-    if let launcher = factory(nil) {
+    if let launcher = factory(nil, intent) {
       registerLauncher(launcher)
       orderAndActivateWindow(launcher)
     }
@@ -174,7 +180,7 @@ final class DocumentWindowRegistry: ObservableObject {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> no window factory wired")
       return
     }
-    guard let window = makeDocumentWindow(ref) else {
+    guard let window = makeDocumentWindow(ref, .explicitDocument) else {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned nil")
       return
     }
@@ -256,6 +262,12 @@ final class DocumentWindowRegistry: ObservableObject {
   /// finishes the in-progress close; suppressed during termination so Quit is
   /// never fought by a resurrected launcher, and a no-op when any other document
   /// or launcher window is still alive.
+  ///
+  /// The replacement launcher starts with `.dockReopen`: the user emptied the
+  /// app on purpose, so the workspace comes back but no document is picked for
+  /// them. Starting it as a cold launch is what made `Close` on the last
+  /// document look like a no-op — the launcher immediately absorbed
+  /// `documents.first` back in.
   private func requestLauncherReopenIfAppWouldBeWindowless() {
     guard !isTerminating, !launcherReopenPending else { return }
     guard !hasContentWindow else {
@@ -280,7 +292,7 @@ final class DocumentWindowRegistry: ObservableObject {
         $0.window?.contentView != nil
       }
       guard !hasLiveDocumentWindow else { return }
-      self.openLauncherWindow()
+      self.openLauncherWindow(intent: .dockReopen)
     }
   }
 
@@ -311,7 +323,7 @@ final class DocumentWindowRegistry: ObservableObject {
       }
       return
     }
-    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil) else {
+    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil, .newUntitledTab) else {
       DebugTrace.log("newUntitledTab -> no window factory wired")
       return
     }

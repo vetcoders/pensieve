@@ -36,7 +36,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     draft.controller.requestPromoteWindowToContent = {
       registry.markWindowAsContent(draftWindow)
     }
-    draft.controller.start(restoringWorkspace: true)
+    draft.controller.start(intent: .coldLaunch)
     XCTAssertEqual(
       draft.appState.documentSession.text, "unsaved crash draft",
       "the window under test never adopted the draft, so the pin proves nothing")
@@ -82,7 +82,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     // nothing at all.
     let emptyLauncher = harness.openLauncherWindow()
     let launcher = harness.attachController(to: emptyLauncher)
-    launcher.controller.start(restoringWorkspace: true)
+    launcher.controller.start(intent: .coldLaunch)
     XCTAssertFalse(
       launcher.appState.documentSession.hasEditableBuffer,
       "this launcher picked something up, so it is not the empty-launcher control leg")
@@ -113,7 +113,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     XCTAssertFalse(harness.wasClosed(launcherWindow))
 
     // The restore settles with nothing to show and asks for another sweep.
-    launcher.controller.start(restoringWorkspace: true)
+    launcher.controller.start(intent: .coldLaunch)
     harness.fireSweep()
 
     XCTAssertTrue(
@@ -147,7 +147,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     let importing = harness.attachController(to: importWindow)
 
     // What `DocumentWindowRootView.openInitialDocument` does for that tab.
-    importing.controller.start(restoringWorkspace: false)
+    importing.controller.start(intent: .explicitDocument)
     importing.controller.openFileInCurrentWindow(url: sourceURL)
     XCTAssertFalse(
       importing.appState.documentSession.hasEditableBuffer,
@@ -273,8 +273,8 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     func openLauncherWindow() -> NSWindow {
       let window = Self.makeWindow()
       journal.liveWindows.append(window)
-      registry.makeDocumentWindow = { _ in window }
-      registry.openLauncherWindow()
+      registry.makeDocumentWindow = { _, _ in window }
+      registry.openLauncherWindow(intent: .coldLaunch)
       registry.makeDocumentWindow = nil
       return window
     }
@@ -297,7 +297,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
       let window = Self.makeWindow(title: url.lastPathComponent)
       journal.liveWindows.append(window)
       journal.canMutateTabs = true
-      registry.makeDocumentWindow = { _ in window }
+      registry.makeDocumentWindow = { _, _ in window }
       registry.open(DocumentRef(id: url, isAdHoc: true))
       registry.makeDocumentWindow = nil
       journal.canMutateTabs = false

@@ -3094,7 +3094,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     // Armed and NOT settled — the ten-second delay is the launch that is still making up its mind
     // when the user quits. Nothing here sleeps for it; the quit is what runs next.
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 10_000_000_000)
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
       "fixture precondition: the startup decision must still be pending, so nothing has restored yet")
@@ -3171,7 +3171,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     registry.registerController(controller, for: window)
 
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertTrue(

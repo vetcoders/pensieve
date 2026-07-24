@@ -49,8 +49,13 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.removeAll()
   }
 
+  /// Starts `controller` once any launch URLs have settled. `intent` is the one
+  /// the window was BUILT with; a file-open event that arrives before the
+  /// settle upgrades this single launch to `.explicitDocument` — the window is
+  /// showing that file, so it must not also restore a session around it.
   func startWhenLaunchIntentsSettle(
     controller: AppController,
+    intent: LaunchIntent,
     onStartupDecision: @escaping StartupDecisionHandler = {}
   ) {
     guard !isQuiescedForTermination else { return }
@@ -70,7 +75,7 @@ final class LaunchIntentCoordinator: ObservableObject {
       guard !self.isQuiescedForTermination else { return }
 
       self.drainPendingURLs()
-      controller.start(restoringWorkspace: !self.hasExplicitURLIntent)
+      controller.start(intent: self.hasExplicitURLIntent ? .explicitDocument : intent)
       self.finishStartupDecision()
     }
   }
@@ -86,7 +91,7 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
-    controller?.start(restoringWorkspace: false)
+    controller?.start(intent: .explicitDocument)
     if controller != nil {
       finishStartupDecision()
     }
@@ -195,7 +200,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       await Task.yield()
       if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
         if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-          DocumentWindowRegistry.shared.openLauncherWindow()
+          DocumentWindowRegistry.shared.openLauncherWindow(intent: .coldLaunch)
         } else {
           NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
         }
@@ -203,6 +208,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  /// Clicking the Dock icon with no windows open reopens an EMPTY launcher.
+  /// Closing every document is a conscious act; reactivating the app is not a
+  /// request to undo it, so nothing is selected back into the new window.
   func applicationShouldHandleReopen(
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
@@ -210,7 +218,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     guard !flag else { return true }
     Task { @MainActor in
       if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-        DocumentWindowRegistry.shared.openLauncherWindow()
+        DocumentWindowRegistry.shared.openLauncherWindow(intent: .dockReopen)
       } else {
         NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
       }

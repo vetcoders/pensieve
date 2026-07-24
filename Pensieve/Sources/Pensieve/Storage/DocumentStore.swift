@@ -2,6 +2,32 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
+/// What an open/restore flow knew about a window's selection at the moment it
+/// STARTED. Every selection decision at the end of such a flow is made from
+/// this snapshot, never from ambient state — the walk in between runs off the
+/// main actor and the window keeps living while it does.
+@MainActor
+struct WorkspaceSelectionContext {
+  /// The document this window showed when the flow started; restored by name if
+  /// it is still part of the workspace.
+  let previousSelection: DocumentRef.ID?
+  /// The window's conscious-close counter at start. A different value at the
+  /// end means the user closed the document mid-flow.
+  let closeGeneration: Int
+
+  static func capture(from appState: AppState) -> WorkspaceSelectionContext {
+    WorkspaceSelectionContext(
+      previousSelection: appState.selectedDocumentID,
+      closeGeneration: appState.windowModel.documentCloseGeneration)
+  }
+
+  /// False once the user consciously closed this window's document after the
+  /// flow began — restoration must not put it back.
+  func survivesConsciousClose(in appState: AppState) -> Bool {
+    appState.windowModel.documentCloseGeneration == closeGeneration
+  }
+}
+
 @MainActor
 final class FolderManager {
   typealias RecycleItems = ([URL], @escaping @Sendable ([URL: URL], Error?) -> Void) -> Void
@@ -514,6 +540,9 @@ final class FolderManager {
     openResolvedWorkspace(rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
   }
 
+  /// Rebuilds the persisted workspace (roots, tree, sidebar) for a starting
+  /// window. It never picks a document for the user — see
+  /// `selectRestoredDocument`.
   func restoreLastFolderInBackground(into appState: AppState) {
     let restored = bookmarkStore.restoreWorkspace(into: appState)
     DebugTrace.log(
@@ -1238,7 +1267,7 @@ final class FolderManager {
     // the walk below is what decides. `.opening` (subtle) instead of an import claim.
     setOpenActivity(.opening(label), into: appState)
     indexDatabase.open(into: appState)
-    let previousSelection = appState.selectedDocumentID
+    let selection = WorkspaceSelectionContext.capture(from: appState)
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
 
     // ONE tree walk for the whole cold open. Build the sidebar from it, then decide skip vs full.
@@ -1250,7 +1279,7 @@ final class FolderManager {
     if attemptColdStartValidSkip(
       scans: scans, rootURLs: rootURLs, exclusions: scanExclusions, into: appState)
     {
-      selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      selectRestoredDocument(selection, into: appState)
       startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       setOpenActivity(nil, into: appState)
       return
@@ -1271,7 +1300,7 @@ final class FolderManager {
       cachedScans: scans,
       into: appState
     )
-    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    selectRestoredDocument(selection, into: appState)
     startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
     setOpenActivity(nil, into: appState)
   }
@@ -1452,13 +1481,13 @@ final class FolderManager {
     // Preserve the existing/cached tree while ONE detached validation job walks + fingerprints.
     // No substrate validation, scanner build, fingerprint, or signature fallback runs before this
     // method returns to the main actor.
-    let previousSelection = appState.selectedDocumentID
+    let selection = WorkspaceSelectionContext.capture(from: appState)
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     let restoredPresentationCache =
       !isHotReopen
       && restoreCachedWorkspace(
         rootURLs: rootURLs,
-        previousSelection: previousSelection,
+        selection: selection,
         into: appState
       )
     let hasStalePresentation = isHotReopen || restoredPresentationCache
@@ -1478,7 +1507,7 @@ final class FolderManager {
     let scanExclusions = appState.excludedWorkspacePaths
     guard !roots.isEmpty else {
       applyWorkspaceScans([], into: appState)
-      selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      selectRestoredDocument(selection, into: appState)
       setOpenActivity(nil, into: appState)
       return
     }
@@ -1564,7 +1593,7 @@ final class FolderManager {
         self.setOpenActivity(.cacheHit(label), into: appState)
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
-        self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        self.selectRestoredDocument(selection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         return
       }
@@ -1593,7 +1622,7 @@ final class FolderManager {
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
         DebugTrace.log("coldStartValidSkip taken roots=\(roots.count)")
-        self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        self.selectRestoredDocument(selection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         return
       }
@@ -1619,7 +1648,7 @@ final class FolderManager {
         workspaceIndexWriteTask = nil
       }
       self.workspaceIndexWriteTask = workspaceIndexWriteTask
-      self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      self.selectRestoredDocument(selection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       await workspaceIndexWriteTask?.value
       guard !Task.isCancelled, generation == self.openFlowGeneration else { return }
@@ -1751,7 +1780,7 @@ final class FolderManager {
   /// again before use. Fresh scans always replace this state later in the same open flow.
   private func restoreCachedWorkspace(
     rootURLs: [URL],
-    previousSelection: DocumentRef.ID?,
+    selection: WorkspaceSelectionContext,
     into appState: AppState
   ) -> Bool {
     guard !rootURLs.isEmpty else { return false }
@@ -1769,7 +1798,7 @@ final class FolderManager {
 
     applyWorkspaceScans(scans, into: appState)
     lastWorkspaceSignature = cacheStore.readSearchSignature(for: identity)
-    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    selectRestoredDocument(selection, into: appState)
     DebugTrace.log(
       "presentation cache restored roots=\(rootURLs.count) documents=\(appState.documents.count)")
     return true
@@ -2142,8 +2171,10 @@ final class FolderManager {
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
   }
 
-  /// Re-selects the document this window was already on after the workspace
-  /// collection is rebuilt — and NOTHING else.
+  /// Decides what an open/restore flow puts on screen once its walk lands,
+  /// using only what the flow knew when it STARTED (`selection`).
+  ///
+  /// Re-selects the document this window was already on — and NOTHING else.
   ///
   /// It used to fall back to `documents.first` when there was no previous
   /// selection, which on a launch is always. That is how a file the operator had
@@ -2158,8 +2189,22 @@ final class FolderManager {
   /// through the store that actually records it — the file bookmarks behind Open
   /// Files — and a launch with none shows the launcher, which is what "nothing
   /// was open" looks like.
-  private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
+  ///
+  /// Two further guards protect a session the user is responsible for: a dirty
+  /// buffer always wins, and a conscious `Close` that happened while this flow
+  /// was in flight wins too. The second one closes the race the old code had no
+  /// answer for — the validation tail of a workspace opened seconds earlier
+  /// would happily re-select the previous document into a window the user had
+  /// just emptied, making ⌘W look like it did nothing.
+  private func selectRestoredDocument(
+    _ selection: WorkspaceSelectionContext,
+    into appState: AppState
+  ) {
     guard !appState.documentSession.isDirty else { return }
+    guard selection.survivesConsciousClose(in: appState) else {
+      DebugTrace.log("selectRestoredDocument skipped: document closed while the open flow ran")
+      return
+    }
 
     let documents = appState.allDocuments
     if let currentSelection = appState.selectedDocumentID,
@@ -2168,7 +2213,7 @@ final class FolderManager {
       return
     }
 
-    if let previousSelection,
+    if let previousSelection = selection.previousSelection,
       let ref = documents.first(where: { $0.id == previousSelection })
     {
       DocumentStore.shared.select(ref: ref, into: appState)
@@ -3077,6 +3122,10 @@ final class DocumentStore {
     autosaver.cancel()
     appState.selectedDocumentID = nil
     appState.documentSession.clear()
+    // The window is now empty BECAUSE the user asked for it. Any workspace
+    // walk still in flight captured an older generation and will stand down
+    // instead of selecting a document back into this window.
+    appState.windowModel.noteConsciousDocumentClose()
     return true
   }
 

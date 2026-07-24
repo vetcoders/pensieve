@@ -329,9 +329,9 @@ private final class LaunchHarness {
     // The window the app starts in, registered as the launcher exactly the way
     // a cold start does; every LATER window comes from the factory.
     let launcherWindow = makeWindow()
-    registry.makeDocumentWindow = { _ in launcherWindow }
-    registry.openLauncherWindow()
-    registry.makeDocumentWindow = { [weak self] _ in self?.makeWindow() }
+    registry.makeDocumentWindow = { _, _ in launcherWindow }
+    registry.openLauncherWindow(intent: .coldLaunch)
+    registry.makeDocumentWindow = { [weak self] _, _ in self?.makeWindow() }
 
     return adoptRootView(for: launcherWindow)
   }
@@ -377,7 +377,7 @@ private final class LaunchHarness {
     controller.requestOpenDocumentWindow = { registry.open($0) }
     registry.registerController(controller, for: window)
 
-    controller.start(restoringWorkspace: true)
+    controller.start(intent: .coldLaunch)
 
     // What SwiftUI's `DocumentWindowAccessor` publishes for this window,
     // spelled out: a headless test has no render pass, so nothing else would
