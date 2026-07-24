@@ -168,31 +168,39 @@ on waitForWindow(appName, timeoutSeconds)
 end waitForWindow
 
 on toolbarCensus(appName)
-  set bestCensus to {}
+  -- Census the WINDOW UNDER TEST — always `window 1`, the frontmost/key window
+  -- that receives the menu-driven mode changes and whose geometry the geometry
+  -- assertions pin. The rest of this script already operates on `window 1`
+  -- (geometry reads, the Preview Appearance control lookup), so the census must
+  -- follow the same window or it is measuring a different surface than the one
+  -- being driven.
+  --
+  -- The earlier heuristic sampled every window and kept "the one with the most
+  -- identifiers". macOS state restoration can reopen a sibling document window
+  -- from a prior session; that sibling never receives the smoke's menu-driven
+  -- mode change (the menu targets the key window only), so it stays in an
+  -- editing mode. Once the toolbar is wide enough that its editing items no
+  -- longer collapse into the overflow chevron, the sibling exposes undo/redo/
+  -- format in the AX tree and — carrying more identifiers than the slimmed-down
+  -- preview window under test — won the max-count census, so the preview-only
+  -- assertion flagged editing items the tested window had correctly dropped.
+  set census to {}
   try
     tell application "System Events"
       tell process appName
-        repeat with windowRef in windows
-          set candidateCensus to {}
+        set toolbarElements to entire contents of toolbar 1 of window 1
+        repeat with elementRef in toolbarElements
           try
-            set toolbarElements to entire contents of toolbar 1 of windowRef
-            repeat with elementRef in toolbarElements
-              try
-                set identifierValue to value of attribute "AXIdentifier" of elementRef
-                if identifierValue is not missing value and identifierValue is not "" then
-                  set end of candidateCensus to identifierValue as text
-                end if
-              end try
-            end repeat
+            set identifierValue to value of attribute "AXIdentifier" of elementRef
+            if identifierValue is not missing value and identifierValue is not "" then
+              set end of census to identifierValue as text
+            end if
           end try
-          if (count of candidateCensus) > (count of bestCensus) then
-            set bestCensus to candidateCensus
-          end if
         end repeat
       end tell
     end tell
   end try
-  return bestCensus
+  return census
 end toolbarCensus
 
 on missingIdentifiers(census, expectedIdentifiers)
