@@ -458,7 +458,11 @@ EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.aiRewrite
 )
 BASE_EXPECTED_IDENTIFIER_COUNT="${#EXPECTED_TOOLBAR_IDENTIFIERS[@]}"
-EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
+# macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is fatal
+# ("unbound variable"); guard the append on the element count.
+if [[ ${#EXTRA_EXPECTED_IDENTIFIERS[@]} -gt 0 ]]; then
+  EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
+fi
 
 BUNDLE_COMMIT="$(/usr/libexec/PlistBuddy -c 'Print :PensieveBuildCommit' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
