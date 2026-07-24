@@ -148,6 +148,48 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testRejectedDuplicateReattachesAfterOwnerWindowCloses() throws {
+    let forcedID = UUID()
+    let forced = DocumentIdentity.untitled(forcedID)
+    let ownerWindow = Self.makeWindow()
+    let duplicateWindow = Self.makeWindow()
+    defer {
+      ownerWindow.close()
+      duplicateWindow.close()
+    }
+    var closed: [ObjectIdentifier] = []
+    let registry = Self.makeIdentityRegistry { closed.append(ObjectIdentifier($0)) }
+
+    // Owner takes the identity; the duplicate is rejected while the owner holds it.
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: forced, documentID: nil,
+        title: "Owner.md", hasEditableBuffer: true))
+    XCTAssertFalse(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.count, 1)
+    XCTAssertTrue(registry.openDocuments.first?.window === ownerWindow)
+
+    // Owner closes → the identity is freed from the registry.
+    registry.closeDocument(forced)
+    XCTAssertEqual(closed, [ObjectIdentifier(ownerWindow)])
+    registry.reconcileClosedWindow(ownerWindow)
+    XCTAssertTrue(registry.openDocuments.isEmpty)
+
+    // The duplicate's coordinator retries attach (cache was never committed on
+    // rejection): it must now be accepted and land in Open Files, not stay
+    // orphaned outside the registry.
+    XCTAssertTrue(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [forced])
+    XCTAssertTrue(registry.openDocuments.first?.window === duplicateWindow)
+  }
+
+  @MainActor
   func testOpenTabDocumentIDsRoundTripAcrossOpenAttachSwitchAndWillCloseReconcile() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-alpha.md").standardizedFileURL
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-beta.md").standardizedFileURL

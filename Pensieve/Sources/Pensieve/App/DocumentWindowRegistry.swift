@@ -828,16 +828,9 @@ struct DocumentWindowAccessor: NSViewRepresentable {
         && coordinator.lastIsDirty == isDirty
         && coordinator.lastHasEditableBuffer == hasEditableBuffer
       if unchanged { return }
-      coordinator.lastWindowID = windowID
-      coordinator.lastIdentity = identity
-      coordinator.lastDocumentID = documentID
-      coordinator.lastTitle = title
-      coordinator.lastRepresentedURL = representedURL
-      coordinator.lastIsDirty = isDirty
-      coordinator.lastHasEditableBuffer = hasEditableBuffer
 
       onWindow?(window)
-      DocumentWindowRegistry.shared.attach(
+      let attached = DocumentWindowRegistry.shared.attach(
         window,
         identity: identity,
         documentID: documentID,
@@ -845,6 +838,19 @@ struct DocumentWindowAccessor: NSViewRepresentable {
         representedURL: representedURL,
         isDirty: isDirty,
         hasEditableBuffer: hasEditableBuffer)
+      // Commit the coalescing cache ONLY after the registry accepted this pass.
+      // A rejected attach (e.g. a duplicate identity whose owner window still
+      // holds the mapping) must stay "changed" so a later render pass — after
+      // the owner closes and frees the identity — retries and lands the window
+      // in Open Files, instead of being cached as done and left orphaned.
+      guard attached else { return }
+      coordinator.lastWindowID = windowID
+      coordinator.lastIdentity = identity
+      coordinator.lastDocumentID = documentID
+      coordinator.lastTitle = title
+      coordinator.lastRepresentedURL = representedURL
+      coordinator.lastIsDirty = isDirty
+      coordinator.lastHasEditableBuffer = hasEditableBuffer
     }
   }
 }
