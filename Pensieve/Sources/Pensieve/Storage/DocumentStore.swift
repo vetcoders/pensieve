@@ -2722,10 +2722,31 @@ final class DocumentStore {
       return false
     }
 
+    // Read the URL AFTER the save branches: a draft that went through
+    // "Save As…" only earns its location there, and it is that final location
+    // that leaves the working set.
+    let closedURL = appState.documentSession.url
+
     autosaver.cancel()
     appState.selectedDocumentID = nil
     appState.documentSession.clear()
+    if let closedURL {
+      forgetOpenFile(url: closedURL, appState: appState)
+    }
     return true
+  }
+
+  /// Drops `url` from the Open Files working set.
+  ///
+  /// Open Files means "open right now", not "opened at some point": a closed
+  /// document leaves the list and comes back only when it is opened again.
+  /// Nothing about the file itself changes — it keeps its place in the
+  /// workspace tree and can be reopened from there. Idempotent, so every close
+  /// route may call it without checking whether some other route got there
+  /// first.
+  func forgetOpenFile(url: URL, appState: AppState) {
+    let standardizedPath = url.standardizedFileURL.path
+    appState.openFiles.removeAll { $0.id.standardizedFileURL.path == standardizedPath }
   }
 
   func save(appState: AppState) {

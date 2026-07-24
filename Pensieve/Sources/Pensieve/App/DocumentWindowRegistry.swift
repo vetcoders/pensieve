@@ -78,6 +78,12 @@ final class DocumentWindowRegistry: ObservableObject {
     launcherReopenAwaitingFactory = false
   }
 
+  /// Whether the app is on its way out. Window teardown during termination is
+  /// process shutdown, not a user closing documents — close routes that carry
+  /// user intent (dropping a document from the Open Files working set) must
+  /// stand down once this is true.
+  var isApplicationTerminating: Bool { isTerminating }
+
   /// Opens a new empty launcher window. Used when the app is reactivated from
   /// the Dock with no visible windows, or during cold start if SwiftUI does not
   /// provide one automatically.

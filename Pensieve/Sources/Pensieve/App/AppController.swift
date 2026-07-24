@@ -608,6 +608,22 @@ final class AppController: ObservableObject {
     documentStore.savePendingChangesOnClose(appState: appState)
   }
 
+  /// Teardown of THIS window/tab: the red close button, the tab's "×", the
+  /// sidebar closing another window's document, or ⌘W falling through to a
+  /// native window close. Flushes the pending edit exactly as before, then
+  /// drops the document from the Open Files working set — a tab closing is a
+  /// close like any other, and the list means "open right now".
+  ///
+  /// Suppressed while the app is terminating: quit tears every window down at
+  /// once, and reading that as "the user closed all of these" would erase the
+  /// very working set the next launch is supposed to bring back.
+  func documentWindowWillClose() {
+    savePendingChangesOnClose()
+    guard !documentWindowRegistry.isApplicationTerminating else { return }
+    guard let url = appState.documentSession.url else { return }
+    documentStore.forgetOpenFile(url: url, appState: appState)
+  }
+
   /// Closes the active document session without exiting Pensieve — the window
   /// stays alive and reverts to its empty state.
   ///

@@ -214,14 +214,15 @@ struct DocumentWindowRootView: View {
         }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
-      // App-wide save-on-close guard. Every window (factory-built document tab AND
+      // App-wide close guard. Every window (factory-built document tab AND
       // state-restored WindowGroup scene) shares this root, and every close
       // trigger — red close button, the tab's "×", the sidebar "Close from Open
       // Files", or ⌘W falling through to a native window close — posts
       // `willCloseNotification` for the closing window. Filtering to THIS window's
       // `currentWindow` flushes only its own session, synchronously, before the
       // window/`AppState` tears down — closing the ≤1.5s autosave-debounce data
-      // loss without touching the window delegate SwiftUI owns.
+      // loss without touching the window delegate SwiftUI owns — and retires the
+      // document from the Open Files working set.
       .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
         notification in
         guard let closingWindow = notification.object as? NSWindow,
@@ -229,7 +230,7 @@ struct DocumentWindowRootView: View {
         else {
           return
         }
-        controller.savePendingChangesOnClose()
+        controller.documentWindowWillClose()
         CommandSurfaceContext.shared.release(controller: controller)
         DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
