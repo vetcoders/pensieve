@@ -2553,12 +2553,6 @@ private struct WorkspaceDirectoryEntry: Sendable {
 
 @MainActor
 final class DocumentStore {
-  enum DirtyUntitledResponse {
-    case save
-    case discard
-    case cancel
-  }
-
   static let shared = DocumentStore(recoveryStore: .shared)
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
@@ -2566,7 +2560,7 @@ final class DocumentStore {
   private let recoveryStore: RecoveryStore
   private let writeDocument: (String, URL) throws -> Void
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
-  private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> DirtyUntitledResponse
+  private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
   private var selfWriteObserver: @MainActor (URL) -> Void
   private weak var appState: AppState?
@@ -2578,7 +2572,7 @@ final class DocumentStore {
     recoveryStore: RecoveryStore,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
-    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
+    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) {
@@ -2670,6 +2664,67 @@ final class DocumentStore {
     }
 
     loadClean(ref: ref, into: appState)
+    return true
+  }
+
+  /// What `File > Close` must do with this window's session. Pure — call it
+  /// before showing anything, then feed the user's answer to `finishClose`.
+  ///
+  /// W2-E seam: when the auto-save setting lands it feeds
+  /// `autoSavesPathedDocuments` here, and file-backed documents stop asking.
+  func closeDecision(appState: AppState) -> DocumentCloseDecision {
+    DocumentCloseDecision.resolve(for: appState.documentSession)
+  }
+
+  /// Second half of the conscious close: applies the user's answer (`nil` when
+  /// `decision` needed no prompt) and clears the session when the answer
+  /// allows it. Returns whether the document actually closed — `false` means
+  /// the close was cancelled or its save failed, and the session stays exactly
+  /// as it was so the user can retry.
+  ///
+  /// Unlike `savePendingChangesOnClose` (the window/tab teardown guard, which
+  /// has no veto point left and therefore persists silently), this path is
+  /// allowed to refuse: nothing has been torn down yet.
+  @discardableResult
+  func finishClose(
+    decision: DocumentCloseDecision,
+    response: SaveChangesResponse?,
+    appState: AppState
+  ) -> Bool {
+    self.appState = appState
+
+    switch (decision, response) {
+    case (.closeWithoutPrompting, _):
+      break
+
+    case (.saveWithoutPrompting, _), (.confirm(.savePathed), .save):
+      let openSessionID = appState.documentSession.id
+      guard saveExisting(appState: appState, indexNow: true) else {
+        appState.selectedDocumentID = openSessionID
+        return false
+      }
+
+    case (.confirm(.saveAsUntitled), .save):
+      guard let url = savePanelURLProvider(appState) else { return false }
+      guard saveAs(appState: appState, to: url) else { return false }
+
+    case (.confirm(.saveAsUntitled), .discard):
+      // "Don't Save" on a draft is a conscious throw-away, so the crash-recovery
+      // copy goes with it — leaving it behind would resurrect the very text the
+      // user just declined to keep.
+      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+
+    case (.confirm(.savePathed), .discard):
+      // The buffer is dropped; whatever is already on disk stays as it is.
+      break
+
+    case (.confirm, .cancel), (.confirm, nil):
+      return false
+    }
+
+    autosaver.cancel()
+    appState.selectedDocumentID = nil
+    appState.documentSession.clear()
     return true
   }
 
@@ -2970,7 +3025,7 @@ final class DocumentStore {
 
   private static func promptForDirtyUntitledSession(
     _ session: DocumentSession
-  ) -> DirtyUntitledResponse {
+  ) -> SaveChangesResponse {
     let alert = NSAlert()
     alert.messageText = "Do you want to save changes to \(session.displayTitle)?"
     alert.informativeText = "Your changes will be lost if you don't save them."

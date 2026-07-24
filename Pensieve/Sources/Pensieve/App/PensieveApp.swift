@@ -239,6 +239,9 @@ struct DocumentWindowRootView: View {
     controller.requestOpenDocumentWindow = { ref in
       DocumentWindowRegistry.shared.open(ref)
     }
+    // The close confirmation is a sheet on THIS window, not an app-modal
+    // alert: ⌘W on one document tab must leave every other document usable.
+    controller.hostWindowProvider = { currentWindow }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)

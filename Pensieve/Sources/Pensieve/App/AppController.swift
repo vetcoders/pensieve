@@ -11,6 +11,14 @@ private enum DocumentImportOutcome: Sendable {
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+  /// Asks the save question for a close and reports the answer back. Async by
+  /// construction: the production surface is a window-modal sheet, which can
+  /// only answer later. Tests inject a closure that answers immediately.
+  typealias SaveChangesConfirmation =
+    @MainActor (
+      DocumentClosePrompt, DocumentSession, NSWindow?,
+      @escaping @MainActor (SaveChangesResponse) -> Void
+    ) -> Void
 
   private let appState: AppState
   private let folderManager: FolderManager
@@ -23,6 +31,14 @@ final class AppController: ObservableObject {
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   private let confirmFolderTrash: FolderTrashConfirmation
+  private let confirmSaveChanges: SaveChangesConfirmation
+  /// Resolves the window the close sheet must hang off. Wired per window by
+  /// the document root view; `NSApp.keyWindow` is the fallback for scenes that
+  /// never reported one.
+  var hostWindowProvider: (@MainActor () -> NSWindow?)?
+  /// One close question at a time per window — a second ⌘W while the sheet is
+  /// up must not stack another sheet on the same document.
+  private var isConfirmingClose = false
   let agentWorkflows: [String] = [
     "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
     "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
@@ -97,6 +113,13 @@ final class AppController: ObservableObject {
       alert.addButton(withTitle: "Move to Trash")
       alert.addButton(withTitle: "Cancel")
       return alert.runModal() == .alertFirstButtonReturn
+    },
+    confirmSaveChanges: @escaping SaveChangesConfirmation = { prompt, session, window, respond in
+      SaveChangesSheet.present(
+        prompt: prompt,
+        session: session,
+        in: window,
+        completion: respond)
     }
   ) {
     self.appState = appState
@@ -112,6 +135,7 @@ final class AppController: ObservableObject {
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
     self.confirmFolderTrash = confirmFolderTrash
+    self.confirmSaveChanges = confirmSaveChanges
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -407,29 +431,28 @@ final class AppController: ObservableObject {
 
   func closeOpenFile(id: DocumentRef.ID) {
     // Open Files mirrors the live tab group, so closing from the list closes the
-    // tab/window. If it is THIS window's active doc, run the dirty-session guard
-    // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
-    // force-save) so the sidebar close never silently drops unsaved edits.
+    // tab/window. If it is THIS window's active doc it goes through the same
+    // conscious close as ⌘W — one lifecycle, whichever gesture triggers it.
     closeOpenDocument(identity: .file(id.standardizedFileURL))
   }
 
   func closeOpenDocument(identity: DocumentIdentity) {
     // Open Files mirrors EVERY window's documents, so this close may target a
-    // document owned by another window. Run the dirty guard in the OWNING
-    // window's session — guarding only the caller's would force-close the
+    // document owned by another window. Route the close DECISION to the OWNING
+    // window's session — prompting only the caller's would force-close the
     // target, letting its close hook stash a recovery draft and skip the
-    // Save/Discard/Cancel prompt. Fall back to self when no owner is registered.
+    // Save / Don't Save / Cancel prompt. Fall back to self when no owner is
+    // registered. When the identity is not any window's active document there
+    // is no live dirty session to guard, so the tab is torn down directly.
     let owner = documentWindowRegistry.controller(for: identity) ?? self
-    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
-    documentWindowRegistry.closeDocument(identity)
-  }
-
-  /// Runs this window's dirty-session guard when `identity` is its active
-  /// document. Returns `false` only when the untitled Save/Discard/Cancel
-  /// prompt was cancelled, so the caller aborts the close.
-  func confirmDirtySessionClearBeforeExternalClose(identity: DocumentIdentity) -> Bool {
-    guard appState.windowModel.documentIdentity == identity.standardized else { return true }
-    return documentStore.select(ref: nil, into: appState)
+    guard owner.appState.windowModel.documentIdentity == identity.standardized else {
+      documentWindowRegistry.closeDocument(identity)
+      return
+    }
+    owner.closeActiveDocument { [weak self] didClose in
+      guard let self, didClose else { return }
+      self.documentWindowRegistry.closeDocument(identity)
+    }
   }
 
   /// Phase-1 confirm sibling of `confirmDirtySessionClearBeforeExternalClose`,
@@ -477,6 +500,21 @@ final class AppController: ObservableObject {
     //   resurrects and no stale `isDirty` trips the teardown save hook, THEN
     //   close the windows. No explicit per-window clear is needed: closing a
     //   window discards its `AppState` (and thus its session) outright.
+    //
+    // DELIBERATE DIVERGENCE from the conscious-close work landing in this same
+    // stack: the Save/Don't Save/Cancel SHEET (`closeActiveDocument`,
+    // `DocumentCloseDecision`, `SaveChangesSheet`) is NOT used here. That path is
+    // asynchronous and asks about ONE window; this pass has to resolve EVERY
+    // owning window and stay atomic, which the callback form cannot express
+    // today. Routing Clear Open Files through the sheet would have reinstated the
+    // single-window guard and with it the silent-loss bug this collect/apply
+    // shape exists to prevent.
+    //
+    // FOLLOW-UP, required rather than optional: compose the two — a multi-window
+    // atomic pass driven by the sheet — on primitives shared with the quit path,
+    // which carries the identical non-atomic defect. Until that lands, Clear Open
+    // Files is safe and atomic but visually inconsistent with the rest of the
+    // close surface.
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
@@ -570,13 +608,54 @@ final class AppController: ObservableObject {
     documentStore.savePendingChangesOnClose(appState: appState)
   }
 
-  /// Closes the active document session without exiting Pensieve.
-  /// Dirty sessions are routed through the existing save semantics in
-  /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
-  /// so the window stays alive and reverts to its empty state.
-  @discardableResult
-  func closeActiveDocument() -> Bool {
-    documentStore.select(ref: nil, into: appState)
+  /// Closes the active document session without exiting Pensieve — the window
+  /// stays alive and reverts to its empty state.
+  ///
+  /// A normal close is a CONSCIOUS lifecycle: unsaved work asks
+  /// `Save / Don't Save / Cancel` (`Save As…` for a draft that has no file
+  /// yet) instead of being silently written, silently dropped, or left for
+  /// crash recovery to guess at. Nothing untouched or already-saved asks
+  /// anything. `completion` reports whether the document actually closed; it
+  /// fires after the sheet is answered, so it is asynchronous whenever the
+  /// close needs a decision.
+  func closeActiveDocument(completion: (@MainActor (Bool) -> Void)? = nil) {
+    let decision = documentStore.closeDecision(appState: appState)
+
+    guard let prompt = decision.prompt else {
+      // Bind the result FIRST: `completion?(finishClose(…))` would skip the
+      // close entirely whenever the caller passed no completion, because
+      // optional chaining never evaluates the argument of a nil call.
+      let didClose = documentStore.finishClose(
+        decision: decision, response: nil, appState: appState)
+      completion?(didClose)
+      return
+    }
+
+    // A sheet is already asking about this very document — treat the extra ⌘W
+    // as a no-op rather than stacking a second question on the same buffer.
+    guard !isConfirmingClose else {
+      completion?(false)
+      return
+    }
+
+    isConfirmingClose = true
+    let session = appState.documentSession
+    confirmSaveChanges(prompt, session, hostWindowProvider?() ?? Self.currentKeyWindow()) {
+      [weak self] response in
+      guard let self else { return }
+      self.isConfirmingClose = false
+      let didClose = self.documentStore.finishClose(
+        decision: decision, response: response, appState: self.appState)
+      completion?(didClose)
+    }
+  }
+
+  /// `NSApp` is an implicitly unwrapped global that stays nil until something
+  /// instantiates the application — reading `.keyWindow` off it traps in a
+  /// headless test process. Ask only once the app object exists.
+  private static func currentKeyWindow() -> NSWindow? {
+    guard let app = NSApp else { return nil }
+    return app.keyWindow
   }
 
   func selectDocument(id: DocumentRef.ID?) {

@@ -11,7 +11,7 @@ extension XCTestCase {
     recoveryStore: RecoveryStore? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
-    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DocumentStore.DirtyUntitledResponse)? = nil,
+    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) -> DocumentStore {
