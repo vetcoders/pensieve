@@ -225,7 +225,7 @@ struct SidebarView: View {
       } else {
         List {
           ForEach(windowRegistry.openDocuments) { descriptor in
-            Button {
+            let row = Button {
               if let url = descriptor.fileURL {
                 appState.sidebarFocusedURL = url
               }
@@ -250,9 +250,13 @@ struct SidebarView: View {
                 }
               }
             }
-            .onDrag {
-              descriptor.fileURL.map { NSItemProvider(object: $0 as NSURL) }
-                ?? NSItemProvider()
+
+            // Untitled rows have no URL to hand off — do not advertise a drag
+            // that can never be dropped anywhere (P3-03).
+            if let url = descriptor.fileURL {
+              row.onDrag { NSItemProvider(object: url as NSURL) }
+            } else {
+              row
             }
           }
         }
