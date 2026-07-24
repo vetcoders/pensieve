@@ -3,7 +3,9 @@ import XCTest
 @testable import Pensieve
 
 /// The restore matrix: intent × does it rebuild the workspace × does it select
-/// a document × does it claim the crash draft.
+/// a document. Claiming the crash draft is deliberately absent — no intent does
+/// that any more (W2-D moved recovery to the launcher's Recovered Drafts
+/// section).
 ///
 /// The behaviour under test is the end of restoration-absorption. Closing the
 /// last document used to look like a no-op: the app put a launcher back, the
@@ -17,7 +19,6 @@ final class LaunchIntentTests: XCTestCase {
   func testColdLaunchIsTheOnlyIntentThatRestoresTheWholeSession() {
     XCTAssertTrue(LaunchIntent.coldLaunch.restoresWorkspace)
     XCTAssertTrue(LaunchIntent.coldLaunch.selectsRestoredDocument)
-    XCTAssertTrue(LaunchIntent.coldLaunch.adoptsRecoveredDraft)
   }
 
   func testMidSessionLaunchersRestoreTheWorkspaceButNoDocument() {
@@ -26,16 +27,12 @@ final class LaunchIntentTests: XCTestCase {
       XCTAssertFalse(
         intent.selectsRestoredDocument,
         "\(intent) must not pick a document — that is restoration reversing a conscious close")
-      XCTAssertFalse(
-        intent.adoptsRecoveredDraft,
-        "\(intent) must not claim the crash draft — the close already asked about that work")
     }
   }
 
   func testExplicitDocumentLaunchRestoresNothingAroundItsDocument() {
     XCTAssertFalse(LaunchIntent.explicitDocument.restoresWorkspace)
     XCTAssertFalse(LaunchIntent.explicitDocument.selectsRestoredDocument)
-    XCTAssertFalse(LaunchIntent.explicitDocument.adoptsRecoveredDraft)
   }
 
   // MARK: - start(intent:) — workspace and selection
@@ -100,20 +97,13 @@ final class LaunchIntentTests: XCTestCase {
 
   // MARK: - start(intent:) — crash-recovery draft
 
+  /// No window claims a draft any more — not even a cold launch. Recovery is a
+  /// decision the user makes in the launcher's Recovered Drafts section, so a
+  /// starting window stays empty and the draft stays on disk, whatever the
+  /// intent was.
   @MainActor
-  func testColdLaunchAdoptsThePendingRecoveryDraft() throws {
-    let harness = try makeRestoreHarness(documentNames: [])
-    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
-
-    harness.controller.start(intent: .coldLaunch)
-
-    XCTAssertTrue(harness.appState.documentSession.isUntitled)
-    XCTAssertEqual(harness.appState.activeDocumentText, "crash draft")
-  }
-
-  @MainActor
-  func testMidSessionLaunchersLeaveThePendingRecoveryDraftUnclaimed() throws {
-    for intent: LaunchIntent in [.dockReopen, .newUntitledTab, .explicitDocument] {
+  func testNoLaunchIntentClaimsThePendingRecoveryDraft() throws {
+    for intent: LaunchIntent in [.coldLaunch, .dockReopen, .newUntitledTab, .explicitDocument] {
       let harness = try makeRestoreHarness(documentNames: [])
       _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
 
@@ -123,9 +113,21 @@ final class LaunchIntentTests: XCTestCase {
         harness.appState.documentSession.hasEditableBuffer,
         "\(intent) hijacked the window with the recovery draft")
       XCTAssertEqual(
-        harness.recoveryStore.claimDraftForRestore()?.text, "crash draft",
-        "\(intent) consumed the draft — a later cold launch would find nothing to recover")
+        harness.recoveryStore.loadDrafts().first?.text, "crash draft",
+        "\(intent) consumed the draft — the launcher would have nothing left to offer")
     }
+  }
+
+  /// The launcher must be able to SHOW what it may not adopt: starting a window
+  /// fills the Recovered Drafts model from disk.
+  @MainActor
+  func testStartPublishesPendingDraftsToTheLauncher() throws {
+    let harness = try makeRestoreHarness(documentNames: [])
+    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
+
+    harness.controller.start(intent: .coldLaunch)
+
+    XCTAssertEqual(harness.controller.recoveredDrafts.map(\.text), ["crash draft"])
   }
 
   // MARK: - No restoration may reverse a conscious close

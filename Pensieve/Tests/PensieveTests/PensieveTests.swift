@@ -666,8 +666,9 @@ final class PensieveSmokeTests: XCTestCase {
       recoveryStore.loadDrafts().first?.text == "keep this crash draft"
     }
 
+    let draft = try XCTUnwrap(recoveryStore.loadDrafts().first)
     let restoredState = AppState()
-    XCTAssertTrue(documentStore.restoreRecoveredDraft(into: restoredState))
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: restoredState))
     XCTAssertTrue(restoredState.documentSession.isUntitled)
     XCTAssertTrue(restoredState.activeDocumentDirty)
     XCTAssertEqual(restoredState.activeDocumentText, "keep this crash draft")
@@ -737,13 +738,12 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   /// One crash draft, MANY restoring windows: state restoration re-creates
-  /// every scene from the previous run and each one starts with an intent that
-  /// adopts the draft. All production windows share the same
-  /// recovery store, so without a single-handout rule each of them adopted
-  /// the same draft — one draft multiplied into an "Untitled, Untitled 2, …"
-  /// flood of dirty windows.
+  /// every scene from the previous run. Their startup must leave the draft
+  /// alone — the "Untitled, Untitled 2, …" flood came from windows adopting it
+  /// on their own, and W2-D removed that route entirely. The draft survives
+  /// every restoring window and waits in the launcher instead.
   @MainActor
-  func testPendingRecoveryDraftIsAdoptedByOnlyOneRestoringWindow() async throws {
+  func testRestoringWindowsLeaveThePendingRecoveryDraftOnDisk() async throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveSingleRestoreTests-\(UUID().uuidString)", isDirectory: true)
     let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
@@ -763,26 +763,36 @@ final class PensieveSmokeTests: XCTestCase {
     try await waitUntil { recoveryStore.loadDrafts().first?.text == "the one crash draft" }
 
     // Two windows restore (own DocumentStore each, shared recovery store —
-    // the production topology). Only the FIRST may adopt the draft.
-    let firstWindowState = AppState()
-    let firstWindowStore = makeTestDocumentStore(
-      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
-      indexDatabase: temporaryIndexDatabase(in: folder),
-      recoveryStore: recoveryStore
-    )
-    XCTAssertTrue(firstWindowStore.restoreRecoveredDraft(into: firstWindowState))
-    XCTAssertEqual(firstWindowState.activeDocumentText, "the one crash draft")
+    // the production topology). NEITHER may take the draft.
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    for intent: LaunchIntent in [.coldLaunch, .dockReopen] {
+      let windowState = AppState()
+      let controller = AppController(
+        appState: windowState,
+        folderManager: FolderManager(
+          metadataStore: temporaryMetadataStore(),
+          indexDatabase: indexDatabase,
+          bookmarkStore: temporaryBookmarkStore()
+        ),
+        documentStore: makeTestDocumentStore(
+          autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
+          indexDatabase: indexDatabase,
+          recoveryStore: recoveryStore
+        ),
+        indexDatabase: indexDatabase,
+        importsFoldersInBackground: true
+      )
 
-    let secondWindowState = AppState()
-    let secondWindowStore = makeTestDocumentStore(
-      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
-      indexDatabase: temporaryIndexDatabase(in: folder),
-      recoveryStore: recoveryStore
-    )
-    XCTAssertFalse(
-      secondWindowStore.restoreRecoveredDraft(into: secondWindowState),
-      "a second restoring window adopted the same crash draft — the Untitled flood")
-    XCTAssertFalse(secondWindowState.documentSession.hasEditableBuffer)
+      controller.start(intent: intent)
+
+      XCTAssertFalse(
+        windowState.documentSession.hasEditableBuffer,
+        "\(intent) adopted the crash draft — that is the Untitled flood coming back")
+    }
+
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().map(\.text), ["the one crash draft"],
+      "a restoring window consumed the draft the launcher is supposed to offer")
   }
 
   @MainActor

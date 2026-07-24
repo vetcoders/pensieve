@@ -10,8 +10,13 @@ import Foundation
 /// is a property of ONE launch, so it lives on the launch.
 ///
 /// The four cases are the four ways a window with no document of its own comes
-/// into existence; each one answers the three restore questions below
+/// into existence; each one answers the two restore questions below
 /// differently.
+///
+/// Crash-recovery drafts are deliberately NOT one of those questions any more:
+/// no intent adopts a draft. W2-D moved recovery to the launcher's explicit
+/// "Recovered Drafts" section, so a draft is only ever opened because the user
+/// pointed at it.
 enum LaunchIntent: Equatable, Sendable {
   /// The process just started with no explicit document — the only intent that
   /// brings the previous session back in full.
@@ -48,20 +53,6 @@ enum LaunchIntent: Equatable, Sendable {
   /// auto-select and pull in `documents.first` — which is not even the document
   /// the user just closed — so `Close` on the last document looked like a no-op.
   var selectsRestoredDocument: Bool {
-    switch self {
-    case .coldLaunch: return true
-    case .dockReopen, .newUntitledTab, .explicitDocument: return false
-    }
-  }
-
-  /// Whether this launch may claim the pending crash-recovery draft.
-  ///
-  /// A conscious close already asked what to do with unsaved work (W2-A), so a
-  /// mid-session launcher claiming the draft would resurrect exactly what the
-  /// user just decided about. Only a cold launch — the process boundary a crash
-  /// leaves behind — adopts it. (W2-D replaces this automatic claim with an
-  /// explicit Recovered Drafts surface in the launcher.)
-  var adoptsRecoveredDraft: Bool {
     switch self {
     case .coldLaunch: return true
     case .dockReopen, .newUntitledTab, .explicitDocument: return false

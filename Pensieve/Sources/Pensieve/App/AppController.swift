@@ -11,6 +11,9 @@ private enum DocumentImportOutcome: Sendable {
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+  /// Confirms dropping a crash draft for good. Synchronous like the folder
+  /// trash question: nothing is being torn down, so a plain alert is enough.
+  typealias DraftDiscardConfirmation = @MainActor (RecoveryDraft) -> Bool
   /// Asks the save question for a close and reports the answer back. Async by
   /// construction: the production surface is a window-modal sheet, which can
   /// only answer later. Tests inject a closure that answers immediately.
@@ -32,6 +35,10 @@ final class AppController: ObservableObject {
   private let workspaceSearchDebounceNanoseconds: UInt64
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
+  private let confirmDiscardDraft: DraftDiscardConfirmation
+  /// Unhandled crash drafts, newest first — the model behind the launcher's
+  /// "Recovered Drafts" section. Empty means the section is not shown at all.
+  @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
   /// Resolves the window the close sheet must hang off. Wired per window by
   /// the document root view; `NSApp.keyWindow` is the fallback for scenes that
   /// never reported one.
@@ -120,6 +127,17 @@ final class AppController: ObservableObject {
         session: session,
         in: window,
         completion: respond)
+    },
+    confirmDiscardDraft: @escaping DraftDiscardConfirmation = { draft in
+      let alert = NSAlert()
+      alert.messageText = "Discard this recovered draft?"
+      alert.informativeText =
+        "\"\(draft.previewSnippet)\" has never been saved to a file. Discarding it cannot be undone."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Discard")
+      alert.addButton(withTitle: "Cancel")
+      alert.buttons[1].keyEquivalent = "\u{1b}"
+      return alert.runModal() == .alertFirstButtonReturn
     }
   ) {
     self.appState = appState
@@ -136,36 +154,30 @@ final class AppController: ObservableObject {
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
     self.confirmFolderTrash = confirmFolderTrash
     self.confirmSaveChanges = confirmSaveChanges
+    self.confirmDiscardDraft = confirmDiscardDraft
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
   }
 
-  /// Boots THIS window according to why it was opened. The intent answers all
-  /// three restore questions — rebuild the workspace, pick a document, claim the
-  /// crash draft — instead of the single `restoringWorkspace` boolean that used
-  /// to conflate them (and treated a launcher reborn mid-session exactly like a
-  /// cold launch).
+  /// Boots THIS window according to why it was opened. The intent answers both
+  /// restore questions — rebuild the workspace, pick a document — instead of the
+  /// single `restoringWorkspace` boolean that used to conflate them (and treated
+  /// a launcher reborn mid-session exactly like a cold launch).
   func start(intent: LaunchIntent = .coldLaunch) {
     guard !didStart else { return }
     didStart = true
+
+    // Crash drafts are surfaced, never adopted: this only fills the launcher's
+    // Recovered Drafts list.
+    refreshRecoveredDrafts()
 
     // Warm the index OFF the main thread. Opening the GRDB pool + running migrations (incl. the FTS5
     // content-link rebuild) on main here was the launch-time beachball; the workspace-restore path
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
-    // Recovery drafts belong to the cold-launch restore path ONLY. A window
-    // started for a specific document (a new document tab, an explicit file
-    // launch) must keep its buffer empty: adopting the pending draft here
-    // hijacked every new tab with "Recovered Untitled", and the dirty untitled
-    // session then blocked the load of the document the window was opened for.
-    // A launcher reborn mid-session (Dock reopen, last window closed) does not
-    // claim it either — the close already asked what to do with that work.
     guard intent.restoresWorkspace else { return }
-    if intent.adoptsRecoveredDraft, documentStore.restoreRecoveredDraft(into: appState) {
-      appState.lastError = nil
-    }
     folderManager.restoreLastFolderInBackground(
       into: appState, selectsRestoredDocument: intent.selectsRestoredDocument)
   }
@@ -650,6 +662,7 @@ final class AppController: ObservableObject {
       // optional chaining never evaluates the argument of a nil call.
       let didClose = documentStore.finishClose(
         decision: decision, response: nil, appState: appState)
+      refreshRecoveredDrafts()
       completion?(didClose)
       return
     }
@@ -669,8 +682,46 @@ final class AppController: ObservableObject {
       self.isConfirmingClose = false
       let didClose = self.documentStore.finishClose(
         decision: decision, response: response, appState: self.appState)
+      self.refreshRecoveredDrafts()
       completion?(didClose)
     }
+  }
+
+  // MARK: - Recovered drafts (launcher surface)
+
+  /// Re-reads the recovery directory. Called whenever the launcher section
+  /// appears and after every action that can change the list, so the view never
+  /// shows a draft that is already gone.
+  func refreshRecoveredDrafts() {
+    recoveredDrafts = documentStore.recoveredDrafts()
+  }
+
+  /// `Open`: adopt the draft into this (empty) window. The draft stays on disk
+  /// until it is saved or discarded — opening is not deciding.
+  @discardableResult
+  func openRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
+    let didOpen = documentStore.openRecoveredDraft(draft, into: appState)
+    refreshRecoveredDrafts()
+    return didOpen
+  }
+
+  /// `Save As…`: pick a location, write the draft there, retire it. A cancelled
+  /// panel leaves everything untouched.
+  @discardableResult
+  func saveRecoveredDraftAs(_ draft: RecoveryDraft) -> Bool {
+    let didSave = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    refreshRecoveredDrafts()
+    return didSave
+  }
+
+  /// `Discard`: drop the draft after the user confirms. Returns whether it was
+  /// actually discarded.
+  @discardableResult
+  func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
+    guard confirmDiscardDraft(draft) else { return false }
+    documentStore.discardRecoveredDraft(draft)
+    refreshRecoveredDrafts()
+    return true
   }
 
   /// `NSApp` is an implicitly unwrapped global that stays nil until something
