@@ -786,7 +786,8 @@ final class FolderManager {
   /// ones already burning a core, and nothing bounded the pile except the event rate. A workspace
   /// whose event source is faster than one walk — an iCloud Drive root materialising placeholders,
   /// a sync client, a build directory — therefore saturated every core while converging on
-  /// nothing, since each superseded pass discarded its own result.
+  /// nothing, since each superseded pass discarded its own result. Each stacked walk also holds a
+  /// full workspace snapshot, which is what the 154 GB footprint peak on 0.4.2 was made of.
   func scheduleWatcherRefresh(into appState: AppState) {
     // The arming site itself, so "no watcher refresh is armed after the quiescence" holds for every
     // caller rather than for the one hop that is known to reach here today. A cancel covers the task
@@ -979,7 +980,9 @@ final class FolderManager {
   }
 
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
-  /// off-main; only delta decisions and publication touch main-actor state.
+  /// off-main; only delta decisions and publication touch main-actor state. The walk goes through
+  /// `cancellableRefreshSnapshot`, so `WorkspaceScanner.buildCancellable`'s cooperative checks
+  /// actually fire when this refresh is cancel-replaced or superseded by an explicit refresh.
   private func performWatcherRefresh(into appState: AppState) async {
     guard appState.hasWorkspaceContent else { return }
     let roots = appState.workspaceRoots.map(\.url)
@@ -2595,6 +2598,7 @@ private enum WorkspaceDefaults {
     "node_modules",
     "dist",
     "DerivedData",
+    "target",
   ]
 }
 
