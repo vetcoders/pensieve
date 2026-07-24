@@ -62,6 +62,19 @@ struct PensieveApp: App {
     // `openWindow(value:)`: DocumentWindowRegistry builds document windows
     // directly in AppKit (DocumentWindowFactory) and attaches them as native
     // tabs before first presentation.
+    //
+    // No `.commands` here on purpose. SwiftUI assembles ONE app-wide menu bar
+    // from the whole scene tree at launch; the `.commands` attached to the
+    // primary launcher WindowGroup above already own that single menu bar, so
+    // a window restored into THIS group inherits the full Mode/Format/Agents
+    // surface — its enabled/disabled state and target follow focus through
+    // `CommandSurfaceContext` (Commands.swift), not scene ownership. The
+    // menu structure is built from the declaration, so it never depends on a
+    // launcher window being open. Re-declaring `PensieveCommands` on this
+    // second scene would NOT merge idempotently: `CommandsBuilder` appends
+    // per scene, so every `CommandMenu` (Mode/Format/Agents) — and the
+    // replaced File groups — would appear TWICE. The single declaration above
+    // IS the app-global level that covers both scenes.
     WindowGroup("Pensieve", for: DocumentRef.self) { document in
       DocumentWindowRootView(
         workspaceStore: workspaceStore,
