@@ -114,6 +114,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Released app binaries no longer carry absolute `LC_RPATH` entries. The linker baked the builder's `Vendor/qube-ffi/<profile>` checkout path (plus the Xcode toolchain path) into every shipped binary, and dyld searched those _before_ `@executable_path/../Frameworks` — so on a machine where the builder's path happened to exist, the app loaded a qube-ffi dylib from outside its own bundle. The release pipeline now strips every absolute rpath before signing, refuses to sign or package a bundle where one survives, and verifies that each remaining `@rpath` dependency still resolves inside the bundle.
 - **Renaming a file in the sidebar no longer drops its extension.** The inline-rename field prefilled with the full filename, extension included; retyping just the base name and committing silently dropped the `.md`/`.txt` suffix, which then fell out of the workspace scanner's markdown filter and made the file look deleted even though it was still on disk. The field now prefills without the extension for files (folders are unaffected), and a typed name that ends up with no extension — or with a fragment that isn't a real one, like the "5" in "ver 2.5" — has the source file's original extension reinstated.
 
+## [0.4.3] - 2026-07-24
+
+### Added
+
+- Per-intent AI rewrite prompts: Improve, Shorten, Expand, and Fix Grammar each carry a dedicated instruction, compiled-in by default and overridable from plain text files in `~/Library/Application Support/Pensieve/prompts/`. A fifth rewrite action accepts a custom instruction telling Pensieve what to do with the selected text; an invariant guard prefix keeps every prompt treating the selection as content and returning only the replacement.
+- Multi-select in workspace search results: ⌘-click extends the selection, and **Copy for Agent** packages the matched snippets with their file paths in `<search_result>` blocks — exactly what the index returned, ready to paste into an AI conversation as context.
+
+### Changed
+
+- The cold launch surface is scene-owned: a dedicated launcher `WindowGroup` presents the first window, the menu bar carries Pensieve's commands from the first build regardless of activation timing, and the cold frame no longer collapses trailing toolbar groups into the overflow chevron.
+- Document session identity unified around `DocumentIdentity` (file / untitled / recovered); the window registry publishes ordering through one `openDocuments` source with `openTabDocumentIDs` kept as a derived file-only projection.
+- The accessibility UI smoke harness keeps the display awake, enforces a single app instance across runs, and pins native toolbar runtime visibility; it also survives macOS's bash 3.2 (`set -u` empty-array expansion).
+
+### Fixed
+
+- **Workspace watcher scan pile-up** — the memory bug behind multi-hundred-gigabyte footprints after long sessions (observed: 154 GB physical-footprint peak on 0.4.2 after a night of agent-driven filesystem churn). The debounced watcher refresh ran its full-tree walk in a detached task that never inherited cancellation, so every event burst stacked another concurrent, uncancellable walk — each holding a complete workspace snapshot. Cancellation is now forwarded into the walk, watcher events during an in-flight walk coalesce into exactly one trailing rescan, and explicit refreshes cancel the superseded walk. Regression tests pin both contracts.
+- Rust `target` build directories are excluded from workspace scanning alongside `.git`, `node_modules`, and `DerivedData`.
+- Test suites can no longer write into the real document recovery store: `RecoveryStore` is an explicit `DocumentStore` dependency and tests route through unique temporary recovery roots.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
