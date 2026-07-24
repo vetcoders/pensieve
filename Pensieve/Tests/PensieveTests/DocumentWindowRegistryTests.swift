@@ -19,7 +19,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in activations += 1 },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         factoryCalls += 1
         return window
       })
@@ -204,7 +204,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         XCTAssertEqual(ref?.id, alphaID)
         return window
       }
@@ -279,7 +279,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [documentWindow] },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return ref == nil ? launcherWindow : documentWindow
       })
@@ -328,7 +328,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       deferredWork.isEmpty,
       "the reopen cannot execute until the scene root wires the window factory")
 
-    registry.makeDocumentWindow = { ref in
+    registry.makeDocumentWindow = { ref, _ in
       XCTAssertNil(ref)
       launcherFactoryCalls += 1
       return launcherWindow
@@ -364,7 +364,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [] },
-      makeDocumentWindow: { ref in ref == nil ? launcherWindow : documentWindow })
+      makeDocumentWindow: { ref, _ in ref == nil ? launcherWindow : documentWindow })
 
     registry.open(DocumentRef(id: documentID))
     registry.handleWindowClosed(documentWindow, tombstonePolicy: .factoryWindow)
@@ -461,13 +461,13 @@ final class DocumentWindowRegistryTests: XCTestCase {
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { activatedWindows.append($0) },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return launcherWindow
       }
     )
 
-    registry.openLauncherWindow()
+    registry.openLauncherWindow(intent: .coldLaunch)
 
     XCTAssertEqual(factoryRefs.count, 1)
     XCTAssertNil(factoryRefs[0], "cold start must request an untitled launcher window")
@@ -499,7 +499,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [] },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return ref == nil ? launcherWindow : docWindow
       }
@@ -545,7 +545,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       currentMergeTarget: { nil },
       applicationWindows: { [phantomScene, launcherWindow] },
       closeWindow: { closedIDs.append(ObjectIdentifier($0)) },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return ref == nil ? launcherWindow : docWindow
       }
@@ -592,14 +592,14 @@ final class DocumentWindowRegistryTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       applicationWindows: { [phantomScene, launcherWindow] },
-      makeDocumentWindow: { _ in launcherWindow }
+      makeDocumentWindow: { _, _ in launcherWindow }
     )
 
     XCTAssertFalse(
       registry.applicationHasLiveWindow(),
       "an invisible untracked SwiftUI placeholder must not suppress the cold-start launcher")
 
-    registry.openLauncherWindow()
+    registry.openLauncherWindow(intent: .coldLaunch)
 
     XCTAssertTrue(
       registry.applicationHasLiveWindow(),
@@ -627,7 +627,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [alphaWindow, betaWindow] },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return ref?.id == alphaID ? alphaWindow : betaWindow
       }
@@ -660,7 +660,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [] },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return docWindow
       }

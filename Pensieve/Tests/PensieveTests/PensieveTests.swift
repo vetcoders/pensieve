@@ -673,9 +673,9 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(restoredState.activeDocumentText, "keep this crash draft")
   }
 
-  /// A window opened FOR a specific document (`start(restoringWorkspace:
-  /// false)` — new document tab, explicit file launch) must show that
-  /// document. Restoring the pending recovery draft into every such window
+  /// A window opened FOR a specific document (`start(intent:
+  /// .explicitDocument)` — new document tab, explicit file launch) must show
+  /// that document. Restoring the pending recovery draft into every such window
   /// hijacked the fresh buffer, and the now-dirty untitled session then
   /// blocked the requested file's load — every new tab displayed "Recovered
   /// Untitled" instead of the opened file.
@@ -721,11 +721,11 @@ final class PensieveSmokeTests: XCTestCase {
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
-    controller.start(restoringWorkspace: false)
+    controller.start(intent: .explicitDocument)
 
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
-      "start(restoringWorkspace: false) adopted the pending recovery draft — "
+      "start(intent: .explicitDocument) adopted the pending recovery draft — "
         + "the dirty untitled session then blocks the document this window "
         + "was opened for (and re-prompts on every new tab)")
 
@@ -2941,7 +2941,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
 
     coordinator.handle(urls: [launchURL])
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(scanStarted.wait(timeout: .now() + 0.1), .timedOut)
@@ -2975,7 +2975,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator()
     let startedAt = ContinuousClock.now
 
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     let elapsed = ContinuousClock.now - startedAt
@@ -3018,7 +3018,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
 
     coordinator.handle(urls: [firstURL, secondURL, plainURL, unsupportedURL])
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(
@@ -3073,7 +3073,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
     coordinator.handle(urls: [incomingURL])
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(
@@ -3123,7 +3123,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
     var startupDecisionCount = 0
 
-    coordinator.startWhenLaunchIntentsSettle(controller: controller) {
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch) {
       startupDecisionCount += 1
     }
     await coordinator.waitForStartupDecision()
@@ -3161,7 +3161,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 10_000_000_000)
     var startupDecisionCount = 0
 
-    coordinator.startWhenLaunchIntentsSettle(controller: controller) {
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch) {
       startupDecisionCount += 1
     }
     XCTAssertEqual(startupDecisionCount, 0)
@@ -5016,7 +5016,7 @@ final class PensieveSmokeTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
 
     coordinator.handle(urls: [folder])
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(
@@ -5224,7 +5224,7 @@ final class PensieveSmokeTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return documentWindow
       }
@@ -5340,7 +5340,7 @@ final class PensieveSmokeTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         let window = DocumentWindow(
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
@@ -5386,7 +5386,7 @@ final class PensieveSmokeTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         let window = DocumentWindow(
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
@@ -5437,7 +5437,7 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertFalse(window.contentView == nil, "a torn-down window must never be activated")
       },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         createdCount += 1
         let window = NSWindow(
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
@@ -5496,7 +5496,7 @@ final class PensieveSmokeTests: XCTestCase {
         XCTAssertTrue(window === documentWindow)
       },
       currentMergeTarget: { mergeTarget },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         events.append("create")
         factoryRefs.append(ref)
         return documentWindow
@@ -5546,7 +5546,7 @@ final class PensieveSmokeTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { activations.append($0) },
       currentMergeTarget: { nil },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         createCount += 1
         return documentWindow
       }
@@ -5591,7 +5591,7 @@ final class PensieveSmokeTests: XCTestCase {
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { window },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return spawnedWindow
       }
@@ -5646,7 +5646,7 @@ final class PensieveSmokeTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { targetWindow },
       applicationWindows: { [targetWindow, documentWindow] },
-      makeDocumentWindow: { _ in documentWindow }
+      makeDocumentWindow: { _, _ in documentWindow }
     )
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-merged-tab.md").standardizedFileURL
 
@@ -5699,7 +5699,7 @@ final class PensieveSmokeTests: XCTestCase {
       currentMergeTarget: { sourceWindow },
       applicationWindows: { [sourceWindow, untitledWindow] },
       closeWindow: { closedWindows.append($0) },
-      makeDocumentWindow: { ref in
+      makeDocumentWindow: { ref, _ in
         factoryRefs.append(ref)
         return untitledWindow
       }
@@ -5773,7 +5773,7 @@ final class PensieveSmokeTests: XCTestCase {
       currentMergeTarget: { launcherWindow },
       applicationWindows: { [launcherWindow, documentWindow] },
       closeWindow: { closedWindows.append($0) },
-      makeDocumentWindow: { _ in
+      makeDocumentWindow: { _, _ in
         factoryCallCount += 1
         return nil
       }

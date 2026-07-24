@@ -30,8 +30,8 @@ struct PensieveApp: App {
       launchIntentCoordinator: launchIntentCoordinator,
       themeManager: themeManager
     )
-    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
-      return factory.makeWindow(for: ref)
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref, intent in
+      return factory.makeWindow(for: ref, intent: intent)
     }
   }
 
@@ -49,7 +49,10 @@ struct PensieveApp: App {
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
-        initialDocument: nil
+        initialDocument: nil,
+        // The scene SwiftUI auto-presents at process start IS the cold launch —
+        // the one intent that brings the previous session back whole.
+        launchIntent: .coldLaunch
       )
     }
     // Opt OUT of external events here too, not just on the value-based group
@@ -88,7 +91,9 @@ struct PensieveApp: App {
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
-        initialDocument: document.wrappedValue
+        initialDocument: document.wrappedValue,
+        // A scene in this group exists FOR its document, restored or not.
+        launchIntent: .explicitDocument
       )
     }
     // Never let SwiftUI spawn a fresh WindowGroup scene per external event:
@@ -110,6 +115,10 @@ struct DocumentWindowRootView: View {
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
+  /// Why THIS window came into existence. Fixed at construction and never
+  /// re-read from shared state, so a second window born a moment later cannot
+  /// change what this one restores.
+  let launchIntent: LaunchIntent
 
   // AppState is @Observable now → @State, not @StateObject.
   @State private var appState: AppState
@@ -122,12 +131,14 @@ struct DocumentWindowRootView: View {
     workspaceStore: WorkspaceStore,
     launchIntentCoordinator: LaunchIntentCoordinator,
     themeManager: ThemeManager,
-    initialDocument: DocumentRef?
+    initialDocument: DocumentRef?,
+    launchIntent: LaunchIntent
   ) {
     self.workspaceStore = workspaceStore
     self.launchIntentCoordinator = launchIntentCoordinator
     self.themeManager = themeManager
     self.initialDocument = initialDocument
+    self.launchIntent = launchIntent
 
     let appState = AppState(workspaceStore: workspaceStore)
     _appState = State(wrappedValue: appState)
@@ -188,7 +199,8 @@ struct DocumentWindowRootView: View {
         if let initialDocument {
           openInitialDocument(initialDocument)
         } else {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
+          launchIntentCoordinator.startWhenLaunchIntentsSettle(
+            controller: controller, intent: launchIntent)
         }
       }
       .onChange(of: initialDocument?.id) { _, _ in
@@ -268,7 +280,7 @@ struct DocumentWindowRootView: View {
       return
     }
     loadedInitialDocumentID = ref.id.standardizedFileURL
-    controller.start(restoringWorkspace: false)
+    controller.start(intent: .explicitDocument)
     controller.openFileInCurrentWindow(url: ref.url)
     // openFileInCurrentWindow loads synchronously: on success
     // selectedDocumentID is set, on failure it stays nil. Either way the

@@ -50,8 +50,11 @@ struct DocumentWindowFactory {
   let themeManager: ThemeManager
 
   /// `document == nil` builds an untitled (launcher-mode) tab — the root view
-  /// supports that the same way the WindowGroup scene does.
-  func makeWindow(for document: DocumentRef?) -> NSWindow {
+  /// supports that the same way the WindowGroup scene does. `intent` is baked
+  /// into the root view here, at the moment the window is created, so the
+  /// window's later (async) startup restores exactly what THIS launch asked
+  /// for.
+  func makeWindow(for document: DocumentRef?, intent: LaunchIntent) -> NSWindow {
     let visibleFrame = NSScreen.main?.visibleFrame
     let contentRect =
       visibleFrame.map { WindowChromeRecipe.factoryInitialFrame(in: $0) }
@@ -75,7 +78,8 @@ struct DocumentWindowFactory {
       workspaceStore: workspaceStore,
       launchIntentCoordinator: launchIntentCoordinator,
       themeManager: themeManager,
-      initialDocument: document
+      initialDocument: document,
+      launchIntent: intent
     )
     let hostingView = NSHostingView(rootView: rootView)
     if #available(macOS 14.0, *) {

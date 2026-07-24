@@ -141,7 +141,12 @@ final class AppController: ObservableObject {
     }
   }
 
-  func start(restoringWorkspace: Bool = true) {
+  /// Boots THIS window according to why it was opened. The intent answers all
+  /// three restore questions — rebuild the workspace, pick a document, claim the
+  /// crash draft — instead of the single `restoringWorkspace` boolean that used
+  /// to conflate them (and treated a launcher reborn mid-session exactly like a
+  /// cold launch).
+  func start(intent: LaunchIntent = .coldLaunch) {
     guard !didStart else { return }
     didStart = true
 
@@ -150,17 +155,19 @@ final class AppController: ObservableObject {
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
-    // Recovery drafts belong to the plain-launch restore path ONLY. A window
-    // started for a specific document (`restoringWorkspace: false` — a new
-    // document tab, an explicit file launch) must keep its buffer empty:
-    // adopting the pending draft here hijacked every new tab with "Recovered
-    // Untitled", and the dirty untitled session then blocked the load of the
-    // document the window was opened for.
-    guard restoringWorkspace else { return }
-    if documentStore.restoreRecoveredDraft(into: appState) {
+    // Recovery drafts belong to the cold-launch restore path ONLY. A window
+    // started for a specific document (a new document tab, an explicit file
+    // launch) must keep its buffer empty: adopting the pending draft here
+    // hijacked every new tab with "Recovered Untitled", and the dirty untitled
+    // session then blocked the load of the document the window was opened for.
+    // A launcher reborn mid-session (Dock reopen, last window closed) does not
+    // claim it either — the close already asked what to do with that work.
+    guard intent.restoresWorkspace else { return }
+    if intent.adoptsRecoveredDraft, documentStore.restoreRecoveredDraft(into: appState) {
       appState.lastError = nil
     }
-    folderManager.restoreLastFolderInBackground(into: appState)
+    folderManager.restoreLastFolderInBackground(
+      into: appState, selectsRestoredDocument: intent.selectsRestoredDocument)
   }
 
   func openFolder(url: URL) {
