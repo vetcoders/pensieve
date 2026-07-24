@@ -44,6 +44,7 @@ terminate_app() {
     pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
     sleep 0.1
   done
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 && die "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census"
   return 0
 }
 
@@ -223,13 +224,15 @@ on identifiersExcluding(allIdentifiers, excludedIdentifiers)
   return includedIdentifiers
 end identifiersExcluding
 
-on assertIdentifiersAbsent(census, excludedIdentifiers, stateName)
+on presentExcludedIdentifiers(census, excludedIdentifiers)
+  set presentItems to {}
   repeat with excludedIdentifier in excludedIdentifiers
     if census contains (excludedIdentifier as text) then
-      error stateName & " unexpectedly exposes " & (excludedIdentifier as text)
+      set end of presentItems to excludedIdentifier as text
     end if
   end repeat
-end assertIdentifiersAbsent
+  return presentItems
+end presentExcludedIdentifiers
 
 on assertWindowGeometry(appName, expectedPosition, expectedSize, stateName)
   tell application "System Events" to tell process appName
@@ -249,15 +252,37 @@ on joined(itemsList, delimiter)
   return joinedText
 end joined
 
-on settledToolbarCensus(appName, expectedIdentifiers, timeoutTenths)
+-- Settlement requires expected identifiers present AND excluded identifiers
+-- absent SIMULTANEOUSLY, holding across at least two consecutive reads. A
+-- single matching read is not enough: an asynchronous mode transition can
+-- hand back a stale census that happens to satisfy presence one tick before
+-- the excluded (e.g. editing) controls actually tear down, which let a
+-- later, separate absence check race a still-settling toolbar and either
+-- false-pass on a stale-but-matching read or false-fail on a torn-down-but-
+-- not-yet-observed one. Pass an empty excludedIdentifiers list when a state
+-- has nothing to exclude.
+on settledToolbarCensus(appName, expectedIdentifiers, excludedIdentifiers, timeoutTenths)
+  set stableCount to 0
   set latestCensus to {}
+  set latestMissing to {}
+  set latestUnexpected to {}
   repeat with i from 1 to timeoutTenths
     set latestCensus to my toolbarCensus(appName)
-    if (my missingIdentifiers(latestCensus, expectedIdentifiers)) is {} then return latestCensus
+    set latestMissing to my missingIdentifiers(latestCensus, expectedIdentifiers)
+    set latestUnexpected to my presentExcludedIdentifiers(latestCensus, excludedIdentifiers)
+    if (latestMissing is {}) and (latestUnexpected is {}) then
+      set stableCount to stableCount + 1
+      if stableCount >= 2 then return latestCensus
+    else
+      set stableCount to 0
+    end if
     delay 0.1
   end repeat
-  set missingItems to my missingIdentifiers(latestCensus, expectedIdentifiers)
-  error "Cold toolbar census missing identifiers: " & my joined(missingItems, ", ") & ¬
+  if (count of latestUnexpected) > 0 then
+    error "Toolbar census unexpectedly exposes: " & my joined(latestUnexpected, ", ") & ¬
+      "; observed: " & my joined(latestCensus, ", ")
+  end if
+  error "Cold toolbar census missing identifiers: " & my joined(latestMissing, ", ") & ¬
     "; observed: " & my joined(latestCensus, ", ")
 end settledToolbarCensus
 
@@ -300,10 +325,17 @@ set baseExpectedIdentifiers to items 4 thru (3 + baseExpectedCount) of argv
 my waitForProcess(appName, 12)
 my waitForWindow(appName, 12)
 
+-- Resolve the exact running instance's PID once, up front, via System
+-- Events process identity (not an app-name activate). Reused below so every
+-- later re-activation targets this specific process instead of letting
+-- LaunchServices resolve "Pensieve" by name, which could pick a different
+-- installed copy (dist/ vs /Applications) sharing that display name.
+tell application "System Events" to set targetPID to unix id of process appName
+
 -- NO-STIMULUS BOUNDARY: from process discovery through this census, the
 -- harness only reads AX state and waits. It does not activate/focus the app,
 -- click, move the pointer, resize, raise a menu, or mutate window geometry.
-set coldCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, 80)
+set coldCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 80)
 set missingItems to my missingIdentifiers(coldCensus, expectedIdentifiers)
 if (count of missingItems) > 0 then
   error "Cold toolbar census missing identifiers: " & my joined(missingItems, ", ") & ¬
@@ -321,8 +353,12 @@ if coldOnly then return "cold toolbar AX census passed"
 -- SwiftUI command groups publish focused-scene values only after the newly
 -- launched window becomes active. A second bundle with the same identifier
 -- may have been frontmost before the smoke killed it, so make focus explicit.
-tell application "Pensieve" to activate
-tell application "System Events" to tell process appName to set frontmost to true
+-- Activate the resolved PID directly rather than "tell application ... to
+-- activate", which resolves the app by name through LaunchServices and can
+-- target a different installed bundle than the one under test.
+tell application "System Events"
+  set frontmost of (first process whose unix id is targetPID) to true
+end tell
 delay 0.5
 
 assertMenuItem(appName, "File", "New File…")
@@ -364,7 +400,7 @@ tell application "System Events"
     end tell
     delay 0.5
 
-    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, 40)
+    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "split transition")
     log "AX_CENSUS_SPLIT=" & my joined(splitCensus, ",")
 
@@ -376,8 +412,7 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set previewCensus to my settledToolbarCensus(appName, previewExpectedIdentifiers, 40)
-    my assertIdentifiersAbsent(previewCensus, editingIdentifiers, "preview-only")
+    set previewCensus to my settledToolbarCensus(appName, previewExpectedIdentifiers, editingIdentifiers, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "preview transition")
     log "AX_CENSUS_PREVIEW=" & my joined(previewCensus, ",")
 
@@ -389,7 +424,7 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, 40)
+    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "split restore")
 
     set appearanceControl to my toolbarElementByDescription(appName, "Preview Appearance")
@@ -451,7 +486,7 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set untitledCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, 40)
+    set untitledCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "file-backed to untitled transition")
     log "AX_CENSUS_UNTITLED=" & my joined(untitledCensus, ",")
 
@@ -462,13 +497,16 @@ end tell
 
 tell application "Finder" to activate
 delay 0.3
-tell application "Pensieve" to activate
-tell application "System Events" to tell process appName
-  set frontmost to true
-  perform action "AXRaise" of window 1
+-- Reactivate the exact resolved PID (see targetPID above), not the app name,
+-- so this regain step re-focuses the process under test unambiguously.
+tell application "System Events"
+  set frontmost of (first process whose unix id is targetPID) to true
+  tell process appName
+    perform action "AXRaise" of window 1
+  end tell
 end tell
 delay 0.5
-set regainCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, 40)
+set regainCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
 my assertWindowGeometry(appName, coldPosition, coldSize, "key-window regain/redraw")
 log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
