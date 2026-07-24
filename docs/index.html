@@ -26,9 +26,11 @@
     />
     <meta
       property="og:image"
-      content="https://pensieve.vetcoders.io/pensieve-icon.png"
+      content="https://pensieve.vetcoders.io/Pensieve.png"
     />
-    <meta name="twitter:card" content="summary" />
+    <meta property="og:image:width" content="2020" />
+    <meta property="og:image:height" content="1368" />
+    <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Pensieve — Markdown Editor for macOS" />
     <meta
       name="twitter:description"
@@ -36,10 +38,25 @@
     />
     <meta
       name="twitter:image"
-      content="https://pensieve.vetcoders.io/pensieve-icon.png"
+      content="https://pensieve.vetcoders.io/Pensieve.png"
     />
     <link rel="canonical" href="https://pensieve.vetcoders.io/" />
     <link rel="icon" href="./pensieve-icon-128.png" />
+    <link rel="apple-touch-icon" href="./pensieve-icon-512.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Pensieve",
+        "operatingSystem": "macOS 15+",
+        "applicationCategory": "Productivity",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "downloadUrl": "https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg",
+        "softwareVersion": "0.4.3",
+        "author": { "@type": "Organization", "name": "Vetcoders", "url": "https://github.com/vetcoders" },
+        "description": "Markdown editor for macOS: live preview, workspace search, backlinks, a table formatter, reading themes, Word DOCX export, and DOCX/PDF import back to Markdown."
+      }
+    </script>
     <style>
       :root {
         --paper: #f7f7f2;
@@ -74,7 +91,22 @@
       }
 
       * { box-sizing: border-box; }
-      html { scroll-behavior: smooth; }
+      html { scroll-behavior: smooth; color-scheme: light dark; }
+
+      .skip-link {
+        position: absolute;
+        top: -48px;
+        left: 16px;
+        z-index: 100;
+        padding: 10px 16px;
+        border-radius: 0 0 10px 10px;
+        background: var(--ink);
+        color: var(--paper);
+        font-weight: 700;
+        text-decoration: none;
+        transition: top 0.18s;
+      }
+      .skip-link:focus { top: 0; }
 
       body {
         margin: 0;
@@ -147,6 +179,17 @@
       .hero {
         padding: 84px 0 72px;
         overflow: hidden;
+        background:
+          radial-gradient(
+            900px 480px at 82% 8%,
+            color-mix(in srgb, var(--blue) 7%, transparent),
+            transparent 70%
+          ),
+          radial-gradient(
+            700px 420px at 8% 92%,
+            color-mix(in srgb, var(--red) 5%, transparent),
+            transparent 70%
+          );
       }
 
       .hero-inner {
@@ -464,6 +507,7 @@
     </style>
   </head>
   <body>
+    <a class="skip-link" href="#surface">Skip to content</a>
     <nav class="site-nav" aria-label="Primary">
       <a class="brand" href="#top">
         <img src="./pensieve-icon-128.png" alt="" width="30" height="30" />
@@ -500,7 +544,7 @@
             >
           </div>
           <p class="release-note">
-            Version <code>0.4.2</code> · macOS 15+ · Apple silicon
+            Version <code>0.4.3</code> · macOS 15+ · Apple silicon
           </p>
         </div>
 
@@ -518,6 +562,7 @@
               width="2020"
               height="1368"
               decoding="async"
+              fetchpriority="high"
             />
           </button>
         </figure>
@@ -583,24 +628,24 @@
       <section class="whatsnew" id="whatsnew">
         <div class="section-inner">
           <div class="reveal">
-            <div class="section-label">Release 0.4.2</div>
+            <div class="section-label">Release 0.4.3</div>
             <h2>What’s new.</h2>
           </div>
           <div class="new-grid">
             <div class="new-card reveal">
-              <span class="tagchip">Voice</span>
-              <h3>Dictation, on your Mac</h3>
-              <p>A local dictation panel with automatic, Polish, and English recognition. The transcript assembles as you speak and lands at your cursor, aware of the current selection.</p>
-            </div>
-            <div class="new-card reveal">
               <span class="tagchip">AI</span>
-              <h3>Autocomplete from your provider</h3>
-              <p>Inline completion backed by your own OpenAI or Anthropic endpoint: pick a model from live discovery, bring an API key, and it stays in the macOS Keychain. The completion continues your document — it doesn’t answer it like chat.</p>
+              <h3>Rewrite, with intent</h3>
+              <p>Improve, Shorten, Expand, and Fix Grammar each carry their own dedicated prompt now — and a fifth action lets you tell Pensieve exactly what to do with the selected text. Every prompt is a plain text file on disk you can edit.</p>
             </div>
             <div class="new-card reveal">
-              <span class="tagchip">Workspace</span>
-              <h3>Big workspaces stay fluid</h3>
-              <p>Scans run off the main thread, deep folder changes reach the sidebar the moment they happen, and Trash is immediate — the tree changes only after the file is actually recycled.</p>
+              <span class="tagchip">Search</span>
+              <h3>Results you can hand to an agent</h3>
+              <p>⌘-click selects multiple search results; Copy for Agent packages the matched snippets with their file paths — exactly what the index returned, ready to paste into any AI conversation as context.</p>
+            </div>
+            <div class="new-card reveal">
+              <span class="tagchip">Stability</span>
+              <h3>Built for long sessions</h3>
+              <p>Workspace scans no longer stack up under heavy filesystem churn — one walk at a time, cancelled cleanly when outdated. Window handling owns the cold launch, and an empty workspace keeps the launcher alive instead of quitting.</p>
             </div>
           </div>
         </div>
@@ -620,7 +665,7 @@
           </div>
           <aside class="download-panel reveal" aria-label="Download details">
             <dl>
-              <div><dt>Version</dt><dd>0.4.2</dd></div>
+              <div><dt>Version</dt><dd>0.4.3</dd></div>
               <div><dt>Platform</dt><dd>macOS 15+</dd></div>
               <div><dt>CPU</dt><dd>Apple silicon</dd></div>
               <div><dt>Gatekeeper</dt><dd>Notarized DMG</dd></div>
@@ -630,7 +675,7 @@
               href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
               >Download Pensieve.dmg</a
             >
-            <div class="sha"><b>SHA-256</b><br />9911c7362d24210916800f99e0dbdb09ba1d0b1f1f3a7432094c807d6c14378b</div>
+            <div class="sha"><b>SHA-256</b><br />RELEASE-0-4-3-SHA256-FILLED-AT-PUBLISH-DO-NOT-SHIP-THIS-LINE</div>
           </aside>
         </div>
       </section>
@@ -638,9 +683,10 @@
 
     <footer class="footer">
       <div class="section-inner">
-        <span>© 2026 Vetcoders</span>
+        <span>© 2026 Vetcoders · 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI</span>
         <span>
           <a href="https://github.com/vetcoders/pensieve">Source</a> ·
+          <a href="https://github.com/vetcoders/pensieve/releases">Releases</a> ·
           <a href="https://github.com/vetcoders/pensieve/security">Security</a>
         </span>
       </div>
