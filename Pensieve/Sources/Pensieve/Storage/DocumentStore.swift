@@ -2929,9 +2929,10 @@ final class DocumentStore {
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
   private let recoveryStore: RecoveryStore
+  private let savingSettings: DocumentSavingSettings
   private let writeDocument: (String, URL) throws -> Void
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
-  private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
+  private let dirtySessionPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
   private var selfWriteObserver: @MainActor (URL) -> Void
   private weak var appState: AppState?
@@ -2941,14 +2942,16 @@ final class DocumentStore {
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
     recoveryStore: RecoveryStore,
+    savingSettings: DocumentSavingSettings? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
-    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
+    dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) {
     let resolvedIndexDatabase = indexDatabase ?? .shared
     self.autosaver = autosaver ?? .shared
+    self.savingSettings = savingSettings ?? .shared
     self.indexDatabase = resolvedIndexDatabase
     self.bookmarkStore = bookmarkStore ?? .shared
     self.recoveryStore = recoveryStore
@@ -2973,7 +2976,7 @@ final class DocumentStore {
             document: ref, body: body, appState: appState)
         }
       }
-    self.dirtyUntitledPrompt = dirtyUntitledPrompt ?? Self.promptForDirtyUntitledSession
+    self.dirtySessionPrompt = dirtySessionPrompt ?? Self.promptForDirtySession
     self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL
     self.selfWriteObserver = selfWriteObserver ?? { _ in }
   }
@@ -3129,10 +3132,15 @@ final class DocumentStore {
   /// What `File > Close` must do with this window's session. Pure — call it
   /// before showing anything, then feed the user's answer to `finishClose`.
   ///
-  /// W2-E seam: when the auto-save setting lands it feeds
-  /// `autoSavesPathedDocuments` here, and file-backed documents stop asking.
+  /// The auto-save setting is read HERE, per close, so a flip in Settings
+  /// changes the very next ⌘W without a restart: with auto-save on, a
+  /// file-backed document flushes and closes (asking would offer a "Don't Save"
+  /// that cannot undo the writes already on disk); with it off, every dirty
+  /// document asks.
   func closeDecision(appState: AppState) -> DocumentCloseDecision {
-    DocumentCloseDecision.resolve(for: appState.documentSession)
+    DocumentCloseDecision.resolve(
+      for: appState.documentSession,
+      autoSavesPathedDocuments: savingSettings.autoSavesPathedDocuments)
   }
 
   /// Second half of the conscious close: applies the user's answer (`nil` when
@@ -3418,6 +3426,18 @@ final class DocumentStore {
     return saveDirtySessionIfNeeded(appState: appState)
   }
 
+  /// Debounced persistence for the live buffer (1.5s after the last edit, the
+  /// interval this path has always used — the setting decides WHETHER a
+  /// file-backed document is written, it does not introduce a new cadence).
+  ///
+  /// The auto-save setting is checked when the timer FIRES, not when it is
+  /// scheduled: turning auto-save off must also stop the write that was already
+  /// pending from the keystroke before the flip, instead of letting one last
+  /// edit slip onto disk under the old setting.
+  ///
+  /// An untitled draft is never gated by the setting — its write target is the
+  /// recovery store, not a file the user owns, and crash recovery works the same
+  /// in both states.
   private func scheduleAutosave(appState: AppState) {
     guard appState.documentSession.isDirty else {
       return
@@ -3431,7 +3451,7 @@ final class DocumentStore {
       guard let self, let appState else { return }
       if appState.documentSession.isUntitled {
         self.saveRecoveryDraft(appState: appState)
-      } else {
+      } else if self.savingSettings.autoSavesPathedDocuments {
         self.saveExisting(appState: appState, indexNow: false)
       }
     }
@@ -3502,27 +3522,51 @@ final class DocumentStore {
     /// `applyDirtySessionResolution`, so a Cancel later in a multi-window pass
     /// leaves the draft recoverable.
     case discardUntitled
+    /// The user chose Don't Save on a FILE-BACKED document while auto-save is
+    /// off. The DESTRUCTIVE part — cancelling the pending debounced write and
+    /// marking the buffer clean, which lets the in-memory edit go — is deferred
+    /// for the same reason as `.discardUntitled`: a Cancel later in a
+    /// multi-window pass must leave the edit intact and still dirty. The file on
+    /// disk is never touched by this case, in either half.
+    case discardPathedEdit
   }
 
-  /// Non-destructive DECIDE half of the dirty-session guard. Force-saves a
-  /// pathed doc, or prompts Save/Discard/Cancel for an untitled draft, but
-  /// performs NO irreversible drop: a Discard is only RECORDED as
-  /// `.discardUntitled`. Returns `nil` when the user cancelled (or a forced save
-  /// failed). A Save DOES write bytes here — that write is the only step where a
-  /// failed I/O can still abort the pass, so it must stay in decide, never move
-  /// to apply.
+  /// Non-destructive DECIDE half of the dirty-session guard. Prompts
+  /// Save/Discard/Cancel for an untitled draft, and — when auto-save is off —
+  /// for a file-backed document too; otherwise it force-saves the pathed doc.
+  /// It performs NO irreversible drop: a Discard is only RECORDED, as
+  /// `.discardUntitled` or `.discardPathedEdit`. Returns `nil` when the user
+  /// cancelled (or a forced save failed). A Save DOES write bytes here — that
+  /// write is the only step where a failed I/O can still abort the pass, so it
+  /// must stay in decide, never move to apply.
   private func decideDirtySessionResolution(appState: AppState) -> DirtySessionResolution? {
     guard appState.documentSession.isDirty else {
       return .settled
     }
 
     if appState.documentSession.isUntitled {
-      switch dirtyUntitledPrompt(appState.documentSession) {
+      switch dirtySessionPrompt(appState.documentSession) {
       case .save:
         guard let url = savePanelURLProvider(appState) else { return nil }
         return saveAs(appState: appState, to: url) ? .settled : nil
       case .discard:
         return .discardUntitled
+      case .cancel:
+        return nil
+      }
+    }
+
+    if !savingSettings.autoSavesPathedDocuments {
+      switch dirtySessionPrompt(appState.documentSession) {
+      case .save:
+        // Falls through to the save below — the one write path for this branch.
+        break
+      case .discard:
+        // RECORD ONLY. The buffer is being replaced and whatever is on disk
+        // stays as it is, but cancelling the pending debounced write and
+        // clearing `isDirty` lets the in-memory edit go — so both wait for the
+        // apply half, where a Cancel in a later window can no longer intervene.
+        return .discardPathedEdit
       case .cancel:
         return nil
       }
@@ -3537,9 +3581,10 @@ final class DocumentStore {
     return .settled
   }
 
-  /// APPLY half: performs the deferred destructive step recorded by decide. Only
-  /// `.discardUntitled` carries one — drop the untitled recovery draft and mark
-  /// the buffer clean. `.settled` is a no-op.
+  /// APPLY half: performs the deferred destructive step recorded by decide.
+  /// `.settled` is a no-op; the two Discard cases each drop what makes their
+  /// edit recoverable. Neither clears the session, the identity or the buffer —
+  /// the caller tears the window down separately.
   private func applyDirtySessionResolution(
     _ resolution: DirtySessionResolution, appState: AppState
   ) {
@@ -3548,6 +3593,13 @@ final class DocumentStore {
       break
     case .discardUntitled:
       recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      appState.documentSession.isDirty = false
+    case .discardPathedEdit:
+      // The pending debounced write must not resurrect the dropped edit; the
+      // file on disk keeps the bytes it already had. Scoped to THIS window's
+      // session — a blanket cancel would also disarm another window's armed
+      // save, which is a data-loss path of its own.
+      autosaver.cancelSave(ownedBy: appState)
       appState.documentSession.isDirty = false
     }
   }
@@ -3573,6 +3625,18 @@ final class DocumentStore {
     applyDirtySessionResolution(resolution, appState: appState)
   }
 
+  /// Settles the current buffer before something replaces it: a document switch,
+  /// a new document, or app termination. Single-window path — decide and apply
+  /// run back to back, because there is no later window whose Cancel could
+  /// abort the pass.
+  ///
+  /// Auto-save decides who owns a file-backed buffer here as well. With auto-save
+  /// on, the switch flushes silently — keeping that file current is Pensieve's
+  /// job. With it off, the Close rule applies to this lifecycle too: nothing
+  /// reaches disk, and nothing is dropped, until the user answers
+  /// `Save / Don't Save / Cancel`. Otherwise "auto-save off" would still write
+  /// the file the moment the user clicked another document in the sidebar.
+  /// An untitled draft asks in both states — it has no file to be saved into.
   private func saveDirtySessionIfNeeded(appState: AppState) -> Bool {
     guard let resolution = decideDirtySessionResolution(appState: appState) else {
       return false
@@ -3679,7 +3743,11 @@ final class DocumentStore {
     bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 
-  private static func promptForDirtyUntitledSession(
+  /// The switch/termination save question. Asked for a dirty untitled draft in
+  /// both auto-save states, and for a dirty file-backed document when auto-save
+  /// is off. App-modal on purpose: this is not a per-window close but a buffer
+  /// about to be replaced everywhere the caller is heading.
+  private static func promptForDirtySession(
     _ session: DocumentSession
   ) -> SaveChangesResponse {
     let alert = NSAlert()
