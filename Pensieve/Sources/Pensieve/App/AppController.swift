@@ -410,16 +410,19 @@ final class AppController: ObservableObject {
     // tab/window. If it is THIS window's active doc, run the dirty-session guard
     // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
     // force-save) so the sidebar close never silently drops unsaved edits.
-    let standardizedID = id.standardizedFileURL
-    if appState.selectedDocumentID?.standardizedFileURL == standardizedID {
+    closeOpenDocument(identity: .file(id.standardizedFileURL))
+  }
+
+  func closeOpenDocument(identity: DocumentIdentity) {
+    if appState.windowModel.documentIdentity == identity.standardized {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
-    documentWindowRegistry.closeDocumentWindow(standardizedID)
+    documentWindowRegistry.closeDocument(identity)
   }
 
   func clearOpenFiles() {
     // Guard this window's active doc before tearing every tab down.
-    if appState.selectedDocumentID != nil {
+    if appState.windowModel.documentIdentity != nil {
       guard documentStore.select(ref: nil, into: appState) else { return }
     }
     documentWindowRegistry.closeAllDocumentWindows()

@@ -45,7 +45,7 @@ struct SidebarView: View {
     VStack(spacing: 0) {
       header
 
-      if !appState.hasWorkspaceContent {
+      if !appState.hasWorkspaceContent, windowRegistry.openDocuments.isEmpty {
         if Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
           emptyState
         } else {
@@ -154,14 +154,17 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
-        if sidebarTab == .openFiles, !openTabDocuments.isEmpty {
+        if sidebarTab == .openFiles, !windowRegistry.openDocuments.isEmpty,
+          renamingURL == nil
+        {
           Button {
             controller.clearOpenFiles()
           } label: {
             Image(systemName: "xmark.circle")
           }
           .buttonStyle(.borderless)
-          .help("Clear Open Files")
+          .help("Close All Open Files")
+          .accessibilityLabel("Close All Open Files")
           .accessibilityIdentifier("pensieve.sidebar.clearOpenFiles")
         }
 
@@ -218,47 +221,44 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.tab.\(tab.rawValue)")
   }
 
-  /// The live open-tab documents (registry order) resolved to refs via the shared
-  /// store. Never drops a live tab: a URL absent from the workspace scan / working
-  /// set (e.g. an ad-hoc file evicted past the open-files cap) is synthesized as an
-  /// ad-hoc ref so the row always mirrors the open tab.
-  private var openTabDocuments: [DocumentRef] {
-    windowRegistry.openTabDocumentIDs.map {
-      appState.document(id: $0) ?? DocumentRef(id: $0, isAdHoc: true)
-    }
-  }
-
   private var openFilesList: some View {
     Group {
-      if openTabDocuments.isEmpty {
+      if windowRegistry.openDocuments.isEmpty {
         sidebarEmptyTab(
           icon: "doc.text",
           message: "No open files",
           hint: "⌘O opens a file · ⌘N new file")
       } else {
         List {
-          ForEach(openTabDocuments) { doc in
+          ForEach(windowRegistry.openDocuments) { descriptor in
             Button {
-              appState.sidebarFocusedURL = doc.url.standardizedFileURL
-              controller.openDocumentWindow(id: doc.id)
+              if let url = descriptor.fileURL {
+                appState.sidebarFocusedURL = url
+              }
+              windowRegistry.activate(descriptor.identity)
             } label: {
-              documentRow(
-                doc,
-                isSelected: isSelectedOrHovered(doc.id)
-              )
+              openDocumentRow(descriptor)
             }
             .buttonStyle(.plain)
             .onHover {
-              updateHoveredDocument(doc.id, isHovered: $0)
-              if $0 {
-                appState.sidebarFocusedURL = doc.url.standardizedFileURL
+              if let url = descriptor.fileURL {
+                updateHoveredDocument(url, isHovered: $0)
+                if $0 { appState.sidebarFocusedURL = url }
               }
             }
             .contextMenu {
-              documentContextMenu(for: doc)
+              if let url = descriptor.fileURL {
+                documentContextMenu(
+                  for: appState.document(id: url) ?? DocumentRef(id: url, isAdHoc: true))
+              } else {
+                Button("Close from Open Files") {
+                  controller.closeOpenDocument(identity: descriptor.identity)
+                }
+              }
             }
             .onDrag {
-              NSItemProvider(object: doc.url as NSURL)
+              descriptor.fileURL.map { NSItemProvider(object: $0 as NSURL) }
+                ?? NSItemProvider()
             }
           }
         }
@@ -489,6 +489,30 @@ struct SidebarView: View {
     .background(selectionBackground(isSelected))
   }
 
+  private func openDocumentRow(_ descriptor: OpenDocumentDescriptor) -> some View {
+    let selected = appState.windowModel.documentIdentity == descriptor.identity
+    let hovered = descriptor.fileURL.map { hoveredDocumentID == $0 } ?? false
+    return HStack {
+      Image(systemName: "doc.text")
+        .foregroundColor(.secondary)
+      Text(descriptor.displayTitle)
+        .lineLimit(1)
+      Spacer(minLength: 4)
+      if descriptor.isDirty {
+        Circle()
+          .fill(Color.secondary)
+          .frame(width: 6, height: 6)
+          .accessibilityLabel("Edited")
+      }
+    }
+    .padding(.vertical, 4)
+    .padding(.horizontal, 6)
+    .help(descriptor.fileURL?.path ?? descriptor.displayTitle)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .contentShape(Rectangle())
+    .background(selectionBackground(selected || hovered))
+  }
+
   /// Currently-visible workspace rows, flattened so the `List` only materializes
   /// on-screen rows instead of eagerly building the entire expanded subtree.
   /// Walks only expanded branches (O(visible)).
@@ -659,17 +683,30 @@ struct SidebarView: View {
   @ViewBuilder
   private func renameableTitle(for url: URL?, title: String) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      InlineRenameField(
-        text: $renameText,
-        focusToken: renameFocusToken,
-        accessibilityIdentifier: "pensieve.sidebar.renameField",
-        onCommit: {
-          commitRename(url)
-        },
-        onCancel: {
+      HStack(spacing: 4) {
+        InlineRenameField(
+          text: $renameText,
+          focusToken: renameFocusToken,
+          accessibilityIdentifier: "pensieve.sidebar.renameField",
+          onCommit: {
+            commitRename(url)
+          },
+          onCancel: {
+            cancelRename()
+          }
+        )
+        .frame(maxWidth: .infinity)
+
+        Button {
           cancelRename()
+        } label: {
+          Image(systemName: "xmark.circle.fill")
         }
-      )
+        .buttonStyle(.borderless)
+        .help("Cancel Rename")
+        .accessibilityLabel("Cancel Rename")
+        .accessibilityIdentifier("pensieve.sidebar.cancelRename")
+      }
     } else {
       Text(title)
         .lineLimit(1)

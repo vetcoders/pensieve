@@ -1,6 +1,22 @@
 import AppKit
 import SwiftUI
 
+struct OpenDocumentDescriptor: Identifiable {
+  let identity: DocumentIdentity
+  var displayTitle: String
+  var fileURL: URL?
+  var isDirty: Bool
+  fileprivate var windowAssociation: WeakWindow?
+
+  var id: DocumentIdentity { identity }
+  var window: NSWindow? { windowAssociation?.window }
+}
+
+enum WindowCloseTombstonePolicy {
+  case reusableWindow
+  case factoryWindow
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -21,11 +37,12 @@ final class DocumentWindowRegistry: ObservableObject {
   private var deferredOpenDocumentIDs: Set<URL> = []
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
-  /// The live tab-group documents in open order — the actual open tabs, NOT the
-  /// WorkspaceStore historical/capped working set. The ONLY observed member;
-  /// maintained in lockstep with windowsByDocumentID (one window per document)
-  /// at the exact same mutation sites, so the sidebar "Open Files" == the tabs.
-  @Published private(set) var openTabDocumentIDs: [URL] = []
+  private var windowsByIdentity: [DocumentIdentity: WeakWindow] = [:]
+  private var fallbackUntitledIdentities: [ObjectIdentifier: DocumentIdentity] = [:]
+  /// The sole ordered publication authority for Open Files. File-only callers
+  /// get a derived compatibility projection via `openTabDocumentIDs`.
+  @Published private(set) var openDocuments: [OpenDocumentDescriptor] = []
+  var openTabDocumentIDs: [URL] { openDocuments.compactMap(\.fileURL) }
   /// Windows born from the tab bar's "+" button: launcher-mode content living
   /// as a document tab. They report no document and no editable buffer on
   /// first attach, which would otherwise classify them as empty launchers and
@@ -34,16 +51,25 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  private var launcherReopenPending = false
+  private var launcherReopenAwaitingFactory = false
   /// Set once the app starts quitting so the last document window's close does
   /// not resurrect a launcher mid-termination.
   private var isTerminating = false
   /// Observers and factory bindings.
-  var makeDocumentWindow: DocumentWindowFactoryClosure?
+  var makeDocumentWindow: DocumentWindowFactoryClosure? {
+    didSet {
+      guard makeDocumentWindow != nil, launcherReopenAwaitingFactory else { return }
+      launcherReopenAwaitingFactory = false
+      requestLauncherReopenIfAppWouldBeWindowless()
+    }
+  }
 
   /// Mark the app as terminating (called from `applicationWillTerminate`) so the
   /// last-window-close handler suppresses its launcher reopen.
   func beginTermination() {
     isTerminating = true
+    launcherReopenAwaitingFactory = false
   }
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
@@ -113,12 +139,13 @@ final class DocumentWindowRegistry: ObservableObject {
   /// presentation, inside the tab, behind the in-tab startup spinner.
   func open(_ ref: DocumentRef) {
     let documentID = ref.id.standardizedFileURL
+    let identity = DocumentIdentity.file(documentID).standardized
     guard canMutateWindowTabs() else {
       deferOpen(ref, documentID: documentID)
       return
     }
 
-    if let existing = windowsByDocumentID[documentID]?.window {
+    if let existing = windowsByIdentity[identity]?.window {
       // Belt to handleDocumentWindowClosed's braces: a closed DocumentWindow
       // has its contentView torn down — never resurrect it; drop the dead
       // mapping and fall through to creating a fresh window.
@@ -132,8 +159,9 @@ final class DocumentWindowRegistry: ObservableObject {
       }
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
       windowsByDocumentID.removeValue(forKey: documentID)
+      windowsByIdentity.removeValue(forKey: identity)
       orderedDocumentIDs.remove(documentID)
-      forgetOpenDocument(documentID)
+      forgetOpenDocument(identity)
     }
 
     guard let makeDocumentWindow else {
@@ -152,7 +180,12 @@ final class DocumentWindowRegistry: ObservableObject {
     markContentWindow(window)
     windowsByDocumentID[documentID] = WeakWindow(window)
     orderedDocumentIDs.insert(documentID)
-    recordOpenDocument(documentID)
+    _ = publish(
+      identity: identity,
+      displayTitle: ref.title,
+      fileURL: documentID,
+      isDirty: false,
+      window: window)
 
     if let target = currentMergeTarget(), target !== window {
       prepareTabbedWindow(target)
@@ -164,42 +197,48 @@ final class DocumentWindowRegistry: ObservableObject {
     closeEmptyLauncherWindows(except: window)
   }
 
-  /// Called from `DocumentWindow.close()` before AppKit tears the window
-  /// down: drops every registry mapping so the document can re-open in a
-  /// fresh window instead of resurrecting the closed (retained) one.
-  func handleDocumentWindowClosed(_ window: NSWindow) {
-    reconcileClosedWindow(window)
-    reopenLauncherIfAppWouldBeWindowless()
-    // Tombstone ONLY on this path (DocumentWindow.onClose): factory windows are
-    // never reused, so rejecting a late re-attach of this exact instance is safe.
-    // The window's SwiftUI accessor may still have an in-flight main-queue pass
-    // that would re-register the closed window (and resurrect it as a phantom
-    // tab); remember the identity while the object is alive so attach() rejects
-    // those late passes. Reusable windows (scenes) must NOT be tombstoned — they
-    // are reconciled via reconcileClosedWindow from the global willClose observer.
-    closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  /// The single close lifecycle for factory callbacks and process-wide AppKit
+  /// notifications. Both routes reconcile registry state and request the same
+  /// coalesced last-window reopen; only never-reused factory windows are
+  /// tombstoned against late SwiftUI attach callbacks.
+  func handleWindowClosed(
+    _ window: NSWindow,
+    tombstonePolicy: WindowCloseTombstonePolicy
+  ) {
+    reconcileClosedWindowState(window)
+    if tombstonePolicy == .factoryWindow {
+      closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
+    }
+    requestLauncherReopenIfAppWouldBeWindowless()
   }
 
-  /// Process-wide close handling for reusable SwiftUI/AppKit scene windows.
-  /// Unlike `handleDocumentWindowClosed`, this must not tombstone the window,
-  /// but it still owns the close-vs-quit contract: closing the final scene with
-  /// Command-W leaves a launcher behind.
+  /// Compatibility entry for process-wide reusable SwiftUI/AppKit scene closes.
+  /// Production routes may call the explicit policy API directly; this wrapper
+  /// preserves the merged PR #10 contract without tombstoning reusable scenes.
   func handleApplicationWindowClosed(_ window: NSWindow) {
-    reconcileClosedWindow(window)
-    reopenLauncherIfAppWouldBeWindowless()
+    handleWindowClosed(window, tombstonePolicy: .reusableWindow)
   }
 
-  /// Cleanup WITHOUT tombstoning: forget the window's documents and drop its
-  /// bookkeeping maps. Safe for ANY closing window (the process-wide willClose
-  /// observer routes here), so it never poisons a reusable window instance via a
-  /// closedWindows entry. Idempotent for windows the registry never tracked.
+  /// Compatibility entry for focused window tests and non-factory callers.
+  /// Production close routes call `handleWindowClosed` with an explicit policy.
   func reconcileClosedWindow(_ window: NSWindow) {
+    handleWindowClosed(window, tombstonePolicy: .reusableWindow)
+  }
+
+  /// Compatibility entry for older factory bindings and focused tests.
+  func handleDocumentWindowClosed(_ window: NSWindow) {
+    handleWindowClosed(window, tombstonePolicy: .factoryWindow)
+  }
+
+  private func reconcileClosedWindowState(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
     DebugTrace.log("registry.reconcileClosed '\(window.title)'")
     releaseStaleDocumentMappings(for: window, keeping: nil)
+    removeDescriptors(for: window, keeping: nil)
     contentWindows.removeValue(forKey: windowID)
     launcherWindows.removeValue(forKey: windowID)
     untitledTabWindows.removeValue(forKey: windowID)
+    fallbackUntitledIdentities.removeValue(forKey: windowID)
   }
 
   /// After the last document window closes the app is left with no window and
@@ -211,11 +250,30 @@ final class DocumentWindowRegistry: ObservableObject {
   /// finishes the in-progress close; suppressed during termination so Quit is
   /// never fought by a resurrected launcher, and a no-op when any other document
   /// or launcher window is still alive.
-  private func reopenLauncherIfAppWouldBeWindowless() {
-    guard !isTerminating, makeDocumentWindow != nil else { return }
+  private func requestLauncherReopenIfAppWouldBeWindowless() {
+    guard !isTerminating, !launcherReopenPending else { return }
+    guard !hasContentWindow else {
+      launcherReopenAwaitingFactory = false
+      return
+    }
+    guard makeDocumentWindow != nil else {
+      launcherReopenAwaitingFactory = true
+      return
+    }
+    launcherReopenAwaitingFactory = false
+    launcherReopenPending = true
     scheduleDeferredMainWork { [weak self] in
-      guard let self, !self.isTerminating else { return }
-      guard !self.applicationHasLiveWindow() else { return }
+      guard let self else { return }
+      self.launcherReopenPending = false
+      guard !self.isTerminating else { return }
+      self.purgeClosedLauncherWindows()
+      guard !self.hasContentWindow else { return }
+      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
+      guard !hasLauncher else { return }
+      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
+        $0.window?.contentView != nil
+      }
+      guard !hasLiveDocumentWindow else { return }
       self.openLauncherWindow()
     }
   }
@@ -260,13 +318,16 @@ final class DocumentWindowRegistry: ObservableObject {
     orderAndActivateWindow(newWindow)
   }
 
+  @discardableResult
   func attach(
     _ window: NSWindow,
+    identity: DocumentIdentity? = nil,
     documentID: URL?,
     title: String? = nil,
     representedURL: URL? = nil,
+    isDirty: Bool = false,
     hasEditableBuffer: Bool = false
-  ) {
+  ) -> Bool {
     DebugTrace.log(
       "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)'"
     )
@@ -275,7 +336,7 @@ final class DocumentWindowRegistry: ObservableObject {
     // phantom tab that is visible but half-dead.
     if closedWindows[ObjectIdentifier(window)]?.window === window {
       DebugTrace.log("registry.attach rejected: window already closed")
-      return
+      return false
     }
     // Every document window — factory-built, restored, or launcher-promoted —
     // shares the document tabbing identifier so the system keeps grouping them
@@ -286,48 +347,80 @@ final class DocumentWindowRegistry: ObservableObject {
       prepareTabbedWindow(window)
     }
 
-    guard let documentID = documentID?.standardizedFileURL else {
+    let windowID = ObjectIdentifier(window)
+    var resolvedIdentity =
+      identity?.standardized
+      ?? documentID.map { DocumentIdentity.file($0.standardizedFileURL) }
+    if resolvedIdentity == nil, hasEditableBuffer {
+      resolvedIdentity = fallbackUntitledIdentities[windowID] ?? .untitled(UUID())
+      fallbackUntitledIdentities[windowID] = resolvedIdentity
+    }
+
+    guard let resolvedIdentity else {
       releaseStaleDocumentMappings(for: window, keeping: nil)
+      removeDescriptors(for: window, keeping: nil)
       if hasEditableBuffer {
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
         window.representedURL = representedURL
         closeEmptyLauncherWindows(except: window)
-        return
+        return true
       }
       if untitledTabWindows[ObjectIdentifier(window)]?.window === window {
         // A "+" tab in its launcher-mode state: content by fiat, never reaped.
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
         window.representedURL = nil
-        return
+        return true
       }
       registerLauncher(window)
       closeEmptyLauncherWindowIfDocumentTabsExist(window)
-      return
+      return true
     }
+
+    if let existing = windowsByIdentity[resolvedIdentity]?.window, existing !== window {
+      DebugTrace.log("registry.attach rejected duplicate identity \(resolvedIdentity.persistentID)")
+      return false
+    }
+
     markContentWindow(window)
-    let fallbackTitle = documentID.deletingPathExtension().lastPathComponent
+    let documentID = resolvedIdentity.fileURL
+    let fallbackTitle = documentID?.deletingPathExtension().lastPathComponent ?? "Untitled"
     window.title = normalizedTitle(title, fallback: fallbackTitle)
     window.representedURL = representedURL ?? documentID
+
+    guard
+      publish(
+        identity: resolvedIdentity,
+        displayTitle: window.title,
+        fileURL: documentID,
+        isDirty: isDirty,
+        window: window)
+    else { return false }
 
     // A window displays exactly one document: switching documents in place
     // (the default in-window click routing) must release the previous
     // mapping, or `open()` keeps "activating" this window for documents it no
     // longer shows and Open in New Window becomes a silent no-op.
     releaseStaleDocumentMappings(for: window, keeping: documentID)
-    if windowsByDocumentID[documentID]?.window !== window {
-      orderedDocumentIDs.remove(documentID)
+    if let documentID {
+      if windowsByDocumentID[documentID]?.window !== window {
+        orderedDocumentIDs.remove(documentID)
+      }
+      windowsByDocumentID[documentID] = WeakWindow(window)
     }
-    windowsByDocumentID[documentID] = WeakWindow(window)
-    recordOpenDocument(documentID)
 
     guard canMutateWindowTabs() else {
-      deferAttach(window, documentID: documentID)
-      return
+      if let documentID { deferAttach(window, documentID: documentID) }
+      return true
     }
 
-    completeAttach(window, documentID: documentID)
+    if let documentID {
+      completeAttach(window, documentID: documentID)
+    } else {
+      closeEmptyLauncherWindows(except: window)
+    }
+    return true
   }
 
   func closeWindowIfEmptyLauncher(_ window: NSWindow?) {
@@ -370,38 +463,87 @@ final class DocumentWindowRegistry: ObservableObject {
       DebugTrace.log("release stale mapping \(staleID.lastPathComponent) from '\(window.title)'")
       windowsByDocumentID.removeValue(forKey: staleID)
       orderedDocumentIDs.remove(staleID)
-      forgetOpenDocument(staleID)
     }
   }
 
-  /// Publish a document into the observed open-tab list. Idempotent: open() and a
-  /// later attach() both fire for the same doc, and re-attaches on window moves
-  /// must not duplicate or reorder an already-tracked document.
-  private func recordOpenDocument(_ documentID: URL) {
-    guard !openTabDocumentIDs.contains(documentID) else { return }
-    openTabDocumentIDs.append(documentID)
+  @discardableResult
+  private func publish(
+    identity: DocumentIdentity,
+    displayTitle: String,
+    fileURL: URL?,
+    isDirty: Bool,
+    window: NSWindow
+  ) -> Bool {
+    let identity = identity.standardized
+    if let existing = windowsByIdentity[identity]?.window, existing !== window {
+      return false
+    }
+
+    let association = WeakWindow(window)
+    let descriptor = OpenDocumentDescriptor(
+      identity: identity,
+      displayTitle: displayTitle,
+      fileURL: fileURL?.standardizedFileURL,
+      isDirty: isDirty,
+      windowAssociation: association)
+
+    if let index = openDocuments.firstIndex(where: { $0.window === window }) {
+      let previousIdentity = openDocuments[index].identity
+      if previousIdentity != identity {
+        windowsByIdentity.removeValue(forKey: previousIdentity)
+        if let previousURL = openDocuments[index].fileURL {
+          windowsByDocumentID.removeValue(forKey: previousURL)
+          orderedDocumentIDs.remove(previousURL)
+        }
+      }
+      openDocuments[index] = descriptor
+    } else if let index = openDocuments.firstIndex(where: { $0.identity == identity }) {
+      openDocuments[index] = descriptor
+    } else {
+      openDocuments.append(descriptor)
+    }
+    windowsByIdentity[identity] = association
+    return true
   }
 
-  /// Drop a document from the observed open-tab list when its last window goes
-  /// away (close) or it is swapped out of a window (in-place document switch).
-  /// Guarded so a forget for an untracked doc emits no spurious objectWillChange.
-  private func forgetOpenDocument(_ documentID: URL) {
-    guard openTabDocumentIDs.contains(documentID) else { return }
-    openTabDocumentIDs.removeAll { $0 == documentID }
+  private func removeDescriptors(for window: NSWindow, keeping identity: DocumentIdentity?) {
+    let removed = openDocuments.filter { $0.window === window && $0.identity != identity }
+    guard !removed.isEmpty else { return }
+    for descriptor in removed {
+      windowsByIdentity.removeValue(forKey: descriptor.identity)
+    }
+    openDocuments.removeAll { $0.window === window && $0.identity != identity }
+  }
+
+  private func forgetOpenDocument(_ identity: DocumentIdentity) {
+    windowsByIdentity.removeValue(forKey: identity.standardized)
+    openDocuments.removeAll { $0.identity == identity.standardized }
   }
 
   /// Close the window/tab currently showing `documentID` (sidebar "Close from
   /// Open Files"). The close drives the normal teardown → forgetOpenDocument, so
   /// the published list updates itself; no direct list mutation here.
   func closeDocumentWindow(_ documentID: URL) {
-    guard let window = windowsByDocumentID[documentID.standardizedFileURL]?.window else { return }
+    closeDocument(.file(documentID.standardizedFileURL))
+  }
+
+  func closeDocument(_ identity: DocumentIdentity) {
+    guard let window = windowsByIdentity[identity.standardized]?.window else { return }
     closeWindow(window)
+  }
+
+  func activate(_ identity: DocumentIdentity) {
+    guard let window = windowsByIdentity[identity.standardized]?.window else { return }
+    orderAndActivateWindow(window)
   }
 
   /// Close every open document tab (sidebar "Clear Open Files"). Snapshot first:
   /// closeWindow mutates the maps the list is derived from.
   func closeAllDocumentWindows() {
-    let windows = openTabDocumentIDs.compactMap { windowsByDocumentID[$0]?.window }
+    var seen: Set<ObjectIdentifier> = []
+    let windows = openDocuments.compactMap(\.window).filter {
+      seen.insert(ObjectIdentifier($0)).inserted
+    }
     for window in windows { closeWindow(window) }
   }
 
@@ -609,8 +751,10 @@ private final class WeakWindow {
 
 struct DocumentWindowAccessor: NSViewRepresentable {
   let documentID: URL?
+  let identity: DocumentIdentity?
   let title: String?
   let representedURL: URL?
+  let isDirty: Bool
   let hasEditableBuffer: Bool
   var onWindow: ((NSWindow) -> Void)?
 
@@ -623,9 +767,11 @@ struct DocumentWindowAccessor: NSViewRepresentable {
   /// actually changed.
   final class Coordinator {
     var lastWindowID: ObjectIdentifier?
+    var lastIdentity: DocumentIdentity?
     var lastDocumentID: URL?
     var lastTitle: String?
     var lastRepresentedURL: URL?
+    var lastIsDirty: Bool?
     var lastHasEditableBuffer: Bool?
   }
 
@@ -675,23 +821,29 @@ struct DocumentWindowAccessor: NSViewRepresentable {
       let windowID = ObjectIdentifier(window)
       let unchanged =
         coordinator.lastWindowID == windowID
+        && coordinator.lastIdentity == identity
         && coordinator.lastDocumentID == documentID
         && coordinator.lastTitle == title
         && coordinator.lastRepresentedURL == representedURL
+        && coordinator.lastIsDirty == isDirty
         && coordinator.lastHasEditableBuffer == hasEditableBuffer
       if unchanged { return }
       coordinator.lastWindowID = windowID
+      coordinator.lastIdentity = identity
       coordinator.lastDocumentID = documentID
       coordinator.lastTitle = title
       coordinator.lastRepresentedURL = representedURL
+      coordinator.lastIsDirty = isDirty
       coordinator.lastHasEditableBuffer = hasEditableBuffer
 
       onWindow?(window)
       DocumentWindowRegistry.shared.attach(
         window,
+        identity: identity,
         documentID: documentID,
         title: title,
         representedURL: representedURL,
+        isDirty: isDirty,
         hasEditableBuffer: hasEditableBuffer)
     }
   }

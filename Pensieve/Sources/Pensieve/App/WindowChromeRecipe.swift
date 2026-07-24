@@ -5,6 +5,14 @@ enum WindowChromeRecipe {
   static let documentTabbingIdentifier = "Pensieve.DocumentWindow"
   static let defaultContentSize = NSSize(width: 1180, height: 760)
   static let minimumContentSize = NSSize(width: 720, height: 480)
+  /// Initial content width both window paths present at. `defaultContentSize`
+  /// is the narrower geometry the recipe pins for resize/minimum purposes; the
+  /// unified toolbar needs more room than that or its trailing groups (preview
+  /// runtime + assistants) collapse into the overflow chevron and disappear
+  /// from the accessibility tree. Factory windows and the scene-owned launcher
+  /// must agree here, otherwise the cold frame a user (or `make ui-smoke`)
+  /// meets depends on which path happened to build it.
+  static let toolbarFittingContentWidth: CGFloat = 1300
   static let toolbarStyle: NSWindow.ToolbarStyle = .unified
   static let documentContentTopInset: CGFloat = 10
   static var previewContentTopInset: CGFloat { max(0, documentContentTopInset - 2) }
@@ -22,6 +30,19 @@ enum WindowChromeRecipe {
       y: 0,
       width: defaultContentSize.width,
       height: defaultContentSize.height
+    )
+  }
+
+  static func factoryInitialFrame(in visibleFrame: NSRect) -> NSRect {
+    let size = NSSize(
+      width: min(toolbarFittingContentWidth, visibleFrame.width),
+      height: min(defaultContentSize.height, visibleFrame.height)
+    )
+    return NSRect(
+      x: visibleFrame.midX - size.width / 2,
+      y: visibleFrame.midY - size.height / 2,
+      width: size.width,
+      height: size.height
     )
   }
 
@@ -78,7 +99,7 @@ extension Scene {
       .windowStyle(.titleBar)
       .windowToolbarStyle(.unified(showsTitle: true))
       .defaultSize(
-        width: WindowChromeRecipe.defaultContentSize.width,
+        width: WindowChromeRecipe.toolbarFittingContentWidth,
         height: WindowChromeRecipe.defaultContentSize.height
       )
       .windowResizability(.contentMinSize)

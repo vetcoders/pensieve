@@ -37,6 +37,32 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(WindowChromeRecipe.previewContentTopInset, 8)
   }
 
+  /// The scene-owned launcher presents the cold frame on launch while the
+  /// AppKit factory presents every later document tab. Both read the same
+  /// toolbar-fitting width, so a cold window never exposes fewer toolbar
+  /// controls than a factory one just because SwiftUI built it.
+  func testToolbarFittingWidthIsWiderThanThePinnedDefaultContentWidth() {
+    XCTAssertEqual(WindowChromeRecipe.toolbarFittingContentWidth, 1300)
+    XCTAssertGreaterThan(
+      WindowChromeRecipe.toolbarFittingContentWidth,
+      WindowChromeRecipe.defaultContentSize.width)
+    XCTAssertEqual(
+      WindowChromeRecipe.factoryInitialFrame(
+        in: NSRect(x: 0, y: 0, width: 3000, height: 2000)
+      ).width,
+      WindowChromeRecipe.toolbarFittingContentWidth)
+  }
+
+  func testFactoryInitialFramePrefersToolbarWidthWithinVisibleScreen() {
+    let roomyVisibleFrame = NSRect(x: 0, y: 67, width: 1512, height: 881)
+    let roomyFrame = WindowChromeRecipe.factoryInitialFrame(in: roomyVisibleFrame)
+    XCTAssertEqual(roomyFrame, NSRect(x: 106, y: 127.5, width: 1300, height: 760))
+
+    let constrainedVisibleFrame = NSRect(x: 40, y: 80, width: 1000, height: 700)
+    let constrainedFrame = WindowChromeRecipe.factoryInitialFrame(in: constrainedVisibleFrame)
+    XCTAssertEqual(constrainedFrame, constrainedVisibleFrame)
+  }
+
   func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {
     XCTAssertEqual(
       WindowChromeRecipe.titlebarGlassHeight(
