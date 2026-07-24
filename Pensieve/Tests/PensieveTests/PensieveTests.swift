@@ -737,8 +737,8 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   /// One crash draft, MANY restoring windows: state restoration re-creates
-  /// every scene from the previous run and each one starts with
-  /// `restoringWorkspace: true`. All production windows share the same
+  /// every scene from the previous run and each one starts with an intent that
+  /// adopts the draft. All production windows share the same
   /// recovery store, so without a single-handout rule each of them adopted
   /// the same draft — one draft multiplied into an "Untitled, Untitled 2, …"
   /// flood of dirty windows.
