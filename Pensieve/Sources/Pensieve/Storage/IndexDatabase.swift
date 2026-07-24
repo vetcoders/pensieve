@@ -88,6 +88,31 @@ final class IndexDatabase {
     }
   }
 
+  /// Pool configuration carrying the storage-hygiene pragmas.
+  ///
+  /// `auto_vacuum` decides whether freed pages can ever be handed back to the filesystem, and SQLite
+  /// only accepts a mode change while the database file is still EMPTY — afterwards it silently
+  /// ignores the pragma until a full `VACUUM` rewrites the file. "Empty" is stricter than it looks:
+  /// flipping the journal into WAL already materializes the header, so ordering matters. Verified on
+  /// SQLite 3.51: `journal_mode=WAL` → `auto_vacuum=INCREMENTAL` → `CREATE TABLE` still reports
+  /// `auto_vacuum = 0`, while the reverse order reports `2`. GRDB runs `prepareDatabase` when it
+  /// opens each connection and only afterwards calls `setUpWALMode()` on the writer, so setting the
+  /// pragma here is the one hook that lands before the header exists — every FRESH index.db is born
+  /// INCREMENTAL and can be compacted by `PRAGMA incremental_vacuum` alone (no whole-file rewrite).
+  ///
+  /// Pool readers are read-only connections (`DatabasePool.readerConfiguration`); the pragma would be
+  /// meaningless there, so it is skipped explicitly rather than left to SQLite's tolerance.
+  /// Databases created BEFORE this change stay `auto_vacuum = 0` — see
+  /// `convertToIncrementalAutoVacuumIfNeeded` for the one-shot migration path.
+  private nonisolated static func makeConfiguration() -> Configuration {
+    var configuration = Configuration()
+    configuration.prepareDatabase { db in
+      guard !db.configuration.readonly else { return }
+      try db.execute(sql: "PRAGMA auto_vacuum = INCREMENTAL")
+    }
+    return configuration
+  }
+
   private func resolveDatabaseURL() throws -> URL {
     if let configuredDatabaseURL {
       return configuredDatabaseURL
@@ -109,7 +134,7 @@ final class IndexDatabase {
     let directory = url.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-    let pool = try DatabasePool(path: url.path)
+    let pool = try DatabasePool(path: url.path, configuration: makeConfiguration())
 
     var migrator = DatabaseMigrator()
     migrator.registerMigration("mvp_workspace_search_fts") { db in
@@ -529,6 +554,10 @@ final class IndexDatabase {
           )
         }.value
         await self?.refreshSearchResultsInBackground(in: appState)
+        // A full reindex is the single biggest WAL producer in the app; bound the log while we are
+        // still off-main and no other index write can start (this call is inside the supersede
+        // chain, so `waitForPendingReindex()` covers it too).
+        await self?.performMaintenanceInBackground(reason: .indexBatch)
         return true
       } catch {
         self?.report(error, appState: appState, action: "rebuild Pensieve search index")
@@ -637,6 +666,9 @@ final class IndexDatabase {
           )
         }.value
         await self?.refreshSearchResultsInBackground(in: appState)
+        // Watcher deltas are small individually but relentless in aggregate; the WAL-size throttle
+        // inside `performMaintenanceInBackground` keeps this to a no-op until the log actually grows.
+        await self?.performMaintenanceInBackground(reason: .indexBatch)
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")
@@ -646,6 +678,143 @@ final class IndexDatabase {
     // Supersede chain stays `Void`-typed (see `reindexInBackground`).
     pendingIndexUpdateTask = Task { _ = await write.value }
     return await write.value
+  }
+
+  // MARK: - Storage hygiene (WAL bound + compaction)
+
+  /// Named lifecycle points at which the index is allowed to reclaim disk space. The index is a
+  /// WAL database (`DatabasePool` implies WAL): SQLite's own auto-checkpoint is PASSIVE, so it
+  /// recycles WAL frames but NEVER shrinks the `-wal` file — under a reindex storm the log keeps its
+  /// high-water mark for the rest of the process (measured on this project: 3.7 GB index.db next to
+  /// a 2.2 GB index.db-wal). Only an explicit TRUNCATE checkpoint gives the space back, and it must
+  /// run when nothing is mid-write, hence the named points instead of a timer.
+  enum MaintenanceReason: Sendable {
+    /// A background index write (full reindex or incremental delta) just committed. Throttled by
+    /// WAL size so the watcher's small deltas do not pay for a barrier checkpoint each time.
+    case indexBatch
+    /// The workspace is being closed (also covers "last root removed"). Nothing is being indexed,
+    /// so this is the one point where the heavier compaction work is allowed to run.
+    case workspaceClose
+  }
+
+  /// A background batch only triggers a checkpoint once the log is worth truncating. 16 MiB is ~4×
+  /// SQLite's default 1000-page auto-checkpoint threshold: small enough that the WAL can never creep
+  /// towards the gigabytes we measured, large enough that a save or a two-file watcher delta does
+  /// not take the barrier lock.
+  private nonisolated static let walCheckpointThresholdBytes: Int64 = 16 * 1024 * 1024
+
+  /// Below this much slack (256 pages ≈ 1 MiB at the default 4 KiB page size) compaction is not
+  /// worth the write amplification — freed pages are reused by the next indexing pass anyway.
+  private nonisolated static let freelistCompactionThresholdPages = 256
+
+  /// Per-pass page budget for `incremental_vacuum` on the hot-ish batch path (≈16 MiB at 4 KiB
+  /// pages), so a single maintenance pass cannot turn into an unbounded file rewrite. Workspace
+  /// close reclaims everything.
+  private nonisolated static let incrementalVacuumPageBudget = 4096
+
+  /// Ceiling for the ONE-SHOT `auto_vacuum` conversion of a pre-existing database. The conversion is
+  /// a full `VACUUM` (whole-file rewrite + peak disk usage of roughly 2× the file), so it is only
+  /// attempted on databases where that cost is seconds, not minutes. Larger legacy files keep
+  /// `auto_vacuum = 0` and are still WAL-bounded by the checkpoints; compacting those is an operator
+  /// decision (delete-and-reindex is cheaper), deliberately out of this scope.
+  private nonisolated static let autoVacuumConversionByteLimit: Int64 = 256 * 1024 * 1024
+
+  /// The legacy-database conversion is attempted at most once per process — a failed or skipped
+  /// conversion must not re-run a multi-second VACUUM on every workspace close.
+  private var didAttemptAutoVacuumConversion = false
+
+  /// Reclaims index disk space off the main actor. No-op when the pool was never opened: maintenance
+  /// must never be the thing that CREATES/migrates a database.
+  ///
+  /// Order is deliberate — compact first, checkpoint second: `incremental_vacuum` writes its page
+  /// moves into the WAL, so truncating afterwards is what actually returns the bytes to the
+  /// filesystem. Both run inside `barrierWriteWithoutTransaction`, which is the only GRDB entry
+  /// point that also excludes the pool's READER connections; a plain write would leave readers
+  /// holding WAL snapshots and SQLite would silently downgrade the truncate to a no-op.
+  func performMaintenanceInBackground(reason: MaintenanceReason) async {
+    guard let pool = databasePool, let databaseURL else { return }
+    if reason == .indexBatch,
+      Self.walFileSize(for: databaseURL) < Self.walCheckpointThresholdBytes
+    {
+      return
+    }
+
+    let attemptConversion = reason == .workspaceClose && !didAttemptAutoVacuumConversion
+    if attemptConversion { didAttemptAutoVacuumConversion = true }
+    let pageBudget = reason == .indexBatch ? Self.incrementalVacuumPageBudget : nil
+
+    await Task.detached(priority: .utility) {
+      if attemptConversion {
+        Self.convertToIncrementalAutoVacuumIfNeeded(pool: pool, databaseURL: databaseURL)
+      }
+      do {
+        try pool.barrierWriteWithoutTransaction { db in
+          try Self.reclaimFreePages(in: db, pageBudget: pageBudget)
+          try db.checkpoint(.truncate)
+        }
+      } catch {
+        NSLog("Pensieve index maintenance failed: %@", error.localizedDescription)
+      }
+    }.value
+  }
+
+  /// Synchronous truncating checkpoint for the quit path. `applicationShouldTerminate` cannot await
+  /// a detached task — the process may be gone before it runs — so this one blocks, deliberately: at
+  /// that point there is no UI left to stall, and the WAL is already bounded by the batch/close
+  /// checkpoints, so the truncate has little left to flush. No-op when the index was never opened.
+  func checkpointOnTerminate() {
+    guard let pool = databasePool else { return }
+    do {
+      try pool.barrierWriteWithoutTransaction { db in
+        _ = try db.checkpoint(.truncate)
+      }
+    } catch {
+      NSLog("Pensieve index checkpoint on terminate failed: %@", error.localizedDescription)
+    }
+  }
+
+  /// Hands freed pages back to the filesystem. Only meaningful in `auto_vacuum = INCREMENTAL` (mode
+  /// 2); in mode 0 SQLite keeps free pages inside the file for reuse and `incremental_vacuum` is a
+  /// no-op, so the mode is checked rather than assumed.
+  private nonisolated static func reclaimFreePages(in db: Database, pageBudget: Int?) throws {
+    guard try Int.fetchOne(db, sql: "PRAGMA auto_vacuum") == 2 else { return }
+    let freePages = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
+    guard freePages >= freelistCompactionThresholdPages else { return }
+    let pages = pageBudget.map { min($0, freePages) } ?? freePages
+    try db.execute(sql: "PRAGMA incremental_vacuum(\(pages))")
+  }
+
+  /// Migration path for databases created before the `auto_vacuum` pragma existed here. SQLite only
+  /// switches modes through a full `VACUUM`, and the pragma has to be in force on the connection
+  /// running it — `makeConfiguration`'s `prepareDatabase` guarantees that for every writer, so the
+  /// conversion is literally "VACUUM once". Best-effort by design: a failure (no disk space, busy
+  /// database) leaves the database perfectly usable, just uncompacted.
+  private nonisolated static func convertToIncrementalAutoVacuumIfNeeded(
+    pool: DatabasePool, databaseURL: URL
+  ) {
+    do {
+      let mode = try pool.read { db in try Int.fetchOne(db, sql: "PRAGMA auto_vacuum") ?? 0 }
+      guard mode != 2 else { return }
+      guard fileSize(at: databaseURL) <= autoVacuumConversionByteLimit else {
+        NSLog("Pensieve index too large for auto_vacuum conversion; keeping WAL checkpoints only")
+        return
+      }
+      try pool.vacuum()
+    } catch {
+      NSLog("Pensieve index auto_vacuum conversion failed: %@", error.localizedDescription)
+    }
+  }
+
+  private nonisolated static func walFileSize(for databaseURL: URL) -> Int64 {
+    fileSize(at: URL(fileURLWithPath: databaseURL.path + "-wal"))
+  }
+
+  private nonisolated static func fileSize(at url: URL) -> Int64 {
+    guard
+      let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+      let size = attributes[.size] as? Int64
+    else { return 0 }
+    return size
   }
 
   /// Cheap content guard for the cold-open skip decision: how many indexed

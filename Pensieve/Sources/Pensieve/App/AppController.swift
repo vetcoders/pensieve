@@ -551,7 +551,13 @@ final class AppController: ObservableObject {
 
   @discardableResult
   func applicationShouldTerminate() -> Bool {
-    documentStore.prepareForDocumentSwitch(appState: appState)
+    let canTerminate = documentStore.prepareForDocumentSwitch(appState: appState)
+    // Only truncate the WAL once quitting is actually going through — a cancelled quit (unsaved
+    // work) must leave the index exactly as the still-running session expects it.
+    if canTerminate {
+      indexDatabase.checkpointOnTerminate()
+    }
+    return canTerminate
   }
 
   /// Save-on-close guard for THIS window's session. Routed from the shared

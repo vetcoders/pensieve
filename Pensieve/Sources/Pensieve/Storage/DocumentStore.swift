@@ -49,6 +49,10 @@ final class FolderManager {
   /// Synchronous open and forced-refresh paths previously launched this work unowned, which
   /// made close and deterministic tests race an otherwise valid database transaction.
   private var workspaceIndexWriteTask: Task<Void, Never>?
+  /// Tracks the off-main index housekeeping (WAL truncate + page compaction) fired on close. Held
+  /// separately from `indexUpdateTask` on purpose: close CANCELS the pending index write, and the
+  /// whole point of this task is to run right after that, not to be cancelled with it.
+  private var indexMaintenanceTask: Task<Void, Never>?
   private var recentSelfWritePaths: [String: Date] = [:]
   /// Last applied `.md` signature (structured `path -> FileSignature` map). The
   /// baseline the next watcher/refresh diffs against. `nil` means "no baseline"
@@ -963,6 +967,13 @@ final class FolderManager {
     // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
     indexUpdateTask?.cancel()
     workspaceIndexWriteTask?.cancel()
+    // Closing a workspace is the quietest moment the index ever gets: no watcher, no pending write.
+    // Bound the WAL and reclaim freed pages here so the storm of a workspace's lifetime does not
+    // survive into the next one.
+    let indexDatabase = indexDatabase
+    indexMaintenanceTask = Task {
+      await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
+    }
     watcher.stop()
     bookmarkStore.clear(into: appState)
     // Clearing the baseline means the next open of any workspace cold-starts with a FULL
