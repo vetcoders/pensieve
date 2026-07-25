@@ -441,8 +441,11 @@ struct SidebarView: View {
     return HStack {
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
-      Text(descriptor.displayTitle)
-        .lineLimit(1)
+      // File-backed rows expose a context-menu Rename that sets `renamingURL`;
+      // route the title through `renameableTitle` so that selection actually
+      // surfaces the inline field. File-less descriptors (untitled drafts) fall
+      // back to plain text inside the helper.
+      renameableTitle(for: descriptor.fileURL, title: descriptor.displayTitle)
       Spacer(minLength: 4)
       if descriptor.isDirty {
         Circle()
