@@ -3765,6 +3765,135 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentDirty)
   }
 
+  /// Open Files mirrors EVERY window's documents into EVERY window's sidebar, so
+  /// closing a row can target a document owned by ANOTHER window. The dirty
+  /// guard must run in the target's OWN session — cancelling it there must abort
+  /// the close instead of force-closing the target and dropping unsaved edits
+  /// into a silent recovery draft.
+  @MainActor
+  func testCrossWindowCloseRoutesDirtyGuardToOwningSessionAndCancelAborts() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    var ownerPrompted = false
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+        ownerPrompted = session.isUntitled
+        return .cancel
+      }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "unsaved work living in another window"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    // The CALLER closes the OWNER's untitled row from its mirrored Open Files.
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertTrue(ownerPrompted, "the guard must prompt in the owning window's session")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled guard must abort the close")
+    XCTAssertTrue(ownerState.documentSession.isUntitled)
+    XCTAssertTrue(ownerState.activeDocumentDirty, "the unsaved work must survive intact")
+    XCTAssertEqual(ownerState.windowModel.documentIdentity, ownerIdentity)
+  }
+
+  /// Same cross-window routing, but the owning session's guard resolves (Discard)
+  /// — so the close proceeds and the owner's window is torn down.
+  @MainActor
+  func testCrossWindowCloseProceedsWhenOwningGuardResolves() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .discard }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "discardable"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertEqual(closedWindows, [ownerWindow], "a resolved guard must close the owner's window")
+    XCTAssertFalse(ownerState.documentSession.isDirty)
+  }
+
+  @MainActor
+  private static func makeCrossWindowRegistry(
+    closeWindow: @escaping @MainActor (NSWindow) -> Void
+  ) -> DocumentWindowRegistry {
+    DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: closeWindow)
+  }
+
+  @MainActor
+  private static func makeControllerlessWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
+  }
+
   @MainActor
   func testSaveAsRegularDocumentCreatesCopyAndSwitchesSession() throws {
     let folder = FileManager.default.temporaryDirectory

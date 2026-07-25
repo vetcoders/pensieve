@@ -38,6 +38,12 @@ final class DocumentWindowRegistry: ObservableObject {
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
   private var windowsByIdentity: [DocumentIdentity: WeakWindow] = [:]
+  /// Each document window's owning controller, keyed by the window. Open Files
+  /// mirrors EVERY window's documents into EVERY window's sidebar, so a close
+  /// invoked from one window can target a document living in another. The dirty
+  /// guard must run in the target's OWN session, so `closeOpenDocument` resolves
+  /// the owner through this map instead of guarding only the caller's session.
+  private var controllersByWindow: [ObjectIdentifier: WeakController] = [:]
   private var fallbackUntitledIdentities: [ObjectIdentifier: DocumentIdentity] = [:]
   /// The sole ordered publication authority for Open Files. File-only callers
   /// get a derived compatibility projection via `openTabDocumentIDs`.
@@ -549,6 +555,24 @@ final class DocumentWindowRegistry: ObservableObject {
     closeWindow(window)
   }
 
+  /// Associates a document window with the controller driving its session. The
+  /// window's SwiftUI root registers here once its window resolves and drops the
+  /// association when the window closes; stale weak entries clear lazily.
+  func registerController(_ controller: AppController, for window: NSWindow) {
+    controllersByWindow[ObjectIdentifier(window)] = WeakController(controller)
+  }
+
+  func unregisterController(for window: NSWindow) {
+    controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
+  }
+
+  /// The controller owning the window that currently shows `identity`, so a
+  /// cross-window close routes its dirty guard through the target's own session.
+  func controller(for identity: DocumentIdentity) -> AppController? {
+    guard let window = windowsByIdentity[identity.standardized]?.window else { return nil }
+    return controllersByWindow[ObjectIdentifier(window)]?.controller
+  }
+
   func activate(_ identity: DocumentIdentity) {
     guard let window = windowsByIdentity[identity.standardized]?.window else { return }
     orderAndActivateWindow(window)
@@ -782,6 +806,14 @@ private final class WeakWindow {
 
   init(_ window: NSWindow) {
     self.window = window
+  }
+}
+
+private final class WeakController {
+  weak var controller: AppController?
+
+  init(_ controller: AppController) {
+    self.controller = controller
   }
 }
 

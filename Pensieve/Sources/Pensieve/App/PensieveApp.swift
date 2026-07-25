@@ -160,6 +160,9 @@ struct DocumentWindowRootView: View {
           hasEditableBuffer: appState.documentHasEditableBuffer
         ) { window in
           currentWindow = window
+          // Publish this window's owning controller so a cross-window "Close
+          // from Open Files" routes its dirty guard through this session.
+          DocumentWindowRegistry.shared.registerController(controller, for: window)
         }
       )
       .frame(
@@ -220,6 +223,7 @@ struct DocumentWindowRootView: View {
         }
         controller.savePendingChangesOnClose()
         CommandSurfaceContext.shared.release(controller: controller)
+        DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
   }
 

@@ -414,10 +414,22 @@ final class AppController: ObservableObject {
   }
 
   func closeOpenDocument(identity: DocumentIdentity) {
-    if appState.windowModel.documentIdentity == identity.standardized {
-      guard documentStore.select(ref: nil, into: appState) else { return }
-    }
+    // Open Files mirrors EVERY window's documents, so this close may target a
+    // document owned by another window. Run the dirty guard in the OWNING
+    // window's session — guarding only the caller's would force-close the
+    // target, letting its close hook stash a recovery draft and skip the
+    // Save/Discard/Cancel prompt. Fall back to self when no owner is registered.
+    let owner = documentWindowRegistry.controller(for: identity) ?? self
+    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
     documentWindowRegistry.closeDocument(identity)
+  }
+
+  /// Runs this window's dirty-session guard when `identity` is its active
+  /// document. Returns `false` only when the untitled Save/Discard/Cancel
+  /// prompt was cancelled, so the caller aborts the close.
+  func confirmDirtySessionClearBeforeExternalClose(identity: DocumentIdentity) -> Bool {
+    guard appState.windowModel.documentIdentity == identity.standardized else { return true }
+    return documentStore.select(ref: nil, into: appState)
   }
 
   func clearOpenFiles() {
