@@ -52,6 +52,14 @@ struct PensieveApp: App {
         initialDocument: nil
       )
     }
+    // Opt OUT of external events here too, not just on the value-based group
+    // below. A launcher scene that still claimed Finder/Dock/`open` URL events
+    // would let SwiftUI materialize a fresh scene-owned launcher window per
+    // event — reviving the detached one-window-per-file path the registry's
+    // native-tab merge exists to prevent. With neither scene claiming them,
+    // external opens fall through to `application(_:open:)` →
+    // LaunchIntentCoordinator → registry tabs.
+    .handlesExternalEvents(matching: [])
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
