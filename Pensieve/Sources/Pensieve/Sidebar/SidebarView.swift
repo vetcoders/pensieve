@@ -65,7 +65,7 @@ struct SidebarView: View {
     }
     .onChange(of: appState.pendingSidebarRenameURL) { _, url in
       guard let url else { return }
-      beginRename(url: url, currentName: url.lastPathComponent)
+      beginRename(url: url, currentName: WorkspaceScanner.renamePrefill(for: url))
       appState.pendingSidebarRenameURL = nil
     }
   }
@@ -686,7 +686,7 @@ struct SidebarView: View {
     Divider()
 
     Button("Rename") {
-      beginRename(url: doc.url, currentName: doc.url.lastPathComponent)
+      beginRename(url: doc.url, currentName: WorkspaceScanner.renamePrefill(for: doc.url))
     }
 
     Button("Duplicate") {
@@ -749,7 +749,7 @@ struct SidebarView: View {
         Divider()
 
         Button("Rename") {
-          beginRename(url: url, currentName: url.lastPathComponent)
+          beginRename(url: url, currentName: WorkspaceScanner.renamePrefill(for: url))
         }
 
         Button("Duplicate") {

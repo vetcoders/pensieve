@@ -264,13 +264,41 @@ final class FolderManager {
     guard !trimmed.isEmpty else { return false }
 
     let source = url.standardizedFileURL
+
+    var isDirectoryObjC: ObjCBool = false
+    let sourceExists = FileManager.default.fileExists(
+      atPath: source.path, isDirectory: &isDirectoryObjC)
+    let sourceIsDirectory = sourceExists && isDirectoryObjC.boolValue
+
+    // Sidebar inline-rename prefills the field with the full filename,
+    // extension included. If the user retypes just the base name and drops
+    // the extension, silently reinstate it (Finder-style) so the file
+    // doesn't fall out of the workspace scanner's markdown filter and
+    // appear to have vanished. `URL.pathExtension` alone is not a reliable
+    // "did they type an extension?" signal here: a name like "ver 2.5" reports
+    // a pathExtension of "5" (a decimal fragment, not an extension). Requiring
+    // at least one letter filters those out while still honoring real,
+    // explicit extensions ("b.txt") — in doubt, keep the source extension:
+    // a visible file beats an invisible one.
+    var resolvedName = trimmed
+    if !sourceIsDirectory {
+      let sourceExtension = source.pathExtension
+      let typedExtension = URL(fileURLWithPath: trimmed).pathExtension
+      let typedExtensionLooksReal =
+        !typedExtension.isEmpty && typedExtension.count <= 5
+        && typedExtension.allSatisfy(\.isLetter)
+      if !sourceExtension.isEmpty, !typedExtensionLooksReal {
+        resolvedName = "\(trimmed).\(sourceExtension)"
+      }
+    }
+
     let target =
       source.deletingLastPathComponent()
-      .appendingPathComponent(trimmed)
+      .appendingPathComponent(resolvedName)
       .standardizedFileURL
     guard source != target else { return true }
     guard !FileManager.default.fileExists(atPath: target.path) else {
-      appState.lastError = "A file or folder named \(trimmed) already exists."
+      appState.lastError = "A file or folder named \(resolvedName) already exists."
       return false
     }
 
@@ -2269,6 +2297,15 @@ enum WorkspaceScanner {
 
   static func isMarkdownFile(_ url: URL) -> Bool {
     ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
+  }
+
+  /// Sidebar inline-rename prefill (Finder-style): a name with a real extension
+  /// prefills without it, so retyping the base name and committing doesn't
+  /// silently drop the extension. Names with no extension (directories, or
+  /// extensionless files) are returned unchanged.
+  static func renamePrefill(for url: URL) -> String {
+    guard !url.pathExtension.isEmpty else { return url.lastPathComponent }
+    return url.deletingPathExtension().lastPathComponent
   }
 
   static func normalizedMarkdownFileURL(for url: URL) -> URL {
