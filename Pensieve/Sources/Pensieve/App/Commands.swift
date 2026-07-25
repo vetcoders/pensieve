@@ -49,6 +49,19 @@ final class CommandSurfaceContext: ObservableObject {
     self.controller = controller
   }
 
+  /// Seeds the fallback ONLY when nothing has adopted yet. The cold menu bar
+  /// needs *a* root before any window is key, so the first root's early
+  /// build-time `.task` adopts here. But a later BACKGROUND root's `.task` can
+  /// run after the actual key window has already adopted — with unconditional
+  /// adoption it would steal the surface, and during the focus-silent periods
+  /// this fallback covers, menu actions would target that background document
+  /// instead of the visible key one. Restricting early adoption to the
+  /// no-fallback case keeps the key window (via `didBecomeKey`) authoritative.
+  func adoptIfUnset(appState: AppState, controller: AppController) {
+    guard self.controller == nil else { return }
+    adopt(appState: appState, controller: controller)
+  }
+
   /// Drops the adopted pair when its window closes, so a dead root neither
   /// leaks nor keeps serving menu actions. A no-op when a different root has
   /// already taken over.

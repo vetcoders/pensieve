@@ -167,9 +167,12 @@ struct DocumentWindowRootView: View {
         minHeight: WindowChromeRecipe.minimumContentSize.height
       )
       .task {
-        // Adopt BEFORE any load work: the menu bar must carry Pensieve's
+        // Seed BEFORE any load work: the menu bar must carry Pensieve's
         // commands from the first build, not from the first scene activation.
-        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+        // Only seed when nothing has adopted yet — a background root building
+        // after the key window must not steal the fallback (the key window owns
+        // it via `didBecomeKey` below).
+        CommandSurfaceContext.shared.adoptIfUnset(appState: appState, controller: controller)
         configureDocumentRouting()
         if let initialDocument {
           openInitialDocument(initialDocument)

@@ -71,6 +71,41 @@ final class CommandSurfaceContextTests: XCTestCase {
     XCTAssertTrue(context.controller === liveController)
   }
 
+  /// Cold launch: with nothing adopted, the first root's early build-time
+  /// `.task` must seed the fallback so the menu bar has content before any
+  /// window is key.
+  @MainActor
+  func testEarlySeedAdoptsWhenNothingHasAdoptedYet() {
+    let context = CommandSurfaceContext()
+    let appState = AppState()
+    let controller = AppController(appState: appState)
+
+    context.adoptIfUnset(appState: appState, controller: controller)
+
+    XCTAssertTrue(context.appState === appState)
+    XCTAssertTrue(context.controller === controller)
+  }
+
+  /// A background root building AFTER the key window already adopted must not
+  /// steal the fallback via its early `.task`; otherwise menu actions during
+  /// focus-silent periods target the background document.
+  @MainActor
+  func testEarlySeedDoesNotStealFromAnAlreadyAdoptedRoot() {
+    let context = CommandSurfaceContext()
+    let keyState = AppState()
+    let keyController = AppController(appState: keyState)
+    let backgroundState = AppState()
+    let backgroundController = AppController(appState: backgroundState)
+
+    // The key window adopted (e.g. via `didBecomeKey`).
+    context.adopt(appState: keyState, controller: keyController)
+    // A late-building background root's `.task` seeds — must be a no-op.
+    context.adoptIfUnset(appState: backgroundState, controller: backgroundController)
+
+    XCTAssertTrue(context.appState === keyState)
+    XCTAssertTrue(context.controller === keyController)
+  }
+
   func testFocusedPairWinsOverTheFallback() {
     let focusedState = NSObject()
     let focusedController = NSObject()
