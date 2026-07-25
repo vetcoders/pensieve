@@ -61,4 +61,20 @@ final class DocumentSessionIdentityTests: XCTestCase {
 
     XCTAssertEqual(beforeClose, afterRestore)
   }
+
+  @MainActor
+  func testEmptyWindowsGetDistinctStableAIFallbackIdentity() {
+    // Two windows with no document must NOT collapse onto one shared AI-session
+    // key. `DocumentAISessionStore` keys sessions by `aiDocumentID`, so a shared
+    // constant would let empty windows share and overwrite each other's
+    // continuation. Each empty window gets its own stable per-window fallback.
+    let first = DocumentWindowModel()
+    let second = DocumentWindowModel()
+
+    XCTAssertNil(first.documentIdentity)
+    XCTAssertNil(second.documentIdentity)
+    XCTAssertNotEqual(first.aiDocumentID, second.aiDocumentID)
+    // Stable across reads for the same window (not regenerated per access).
+    XCTAssertEqual(first.aiDocumentID, first.aiDocumentID)
+  }
 }
