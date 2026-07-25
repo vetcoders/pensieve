@@ -715,6 +715,47 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testDeferredAttachPreservesDirtyMetadataThroughModalTurn() throws {
+    let docID = URL(fileURLWithPath: "/tmp/pensieve-deferred-dirty.md").standardizedFileURL
+    let window = Self.makeWindow()
+    defer { window.close() }
+
+    var canMutate = false
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { canMutate },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // A dirty file-backed attach arrives while a modal panel blocks tab
+    // mutation: the descriptor publishes dirty, and the tab work is deferred.
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: .file(docID),
+        documentID: docID,
+        title: "dirty",
+        representedURL: docID,
+        isDirty: true,
+        hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.first?.isDirty, true)
+    XCTAssertEqual(deferredWork.count, 1)
+
+    // Modal closes; the deferred attach runs. It must NOT re-publish the
+    // descriptor as clean.
+    canMutate = true
+    for work in deferredWork { work() }
+
+    XCTAssertEqual(
+      registry.openDocuments.first?.isDirty,
+      true,
+      "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state")
+  }
+
+  @MainActor
   private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),

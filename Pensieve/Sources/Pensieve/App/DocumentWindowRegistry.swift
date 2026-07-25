@@ -411,7 +411,16 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     guard canMutateWindowTabs() else {
-      if let documentID { deferAttach(window, documentID: documentID) }
+      if let documentID {
+        deferAttach(
+          window,
+          identity: resolvedIdentity,
+          documentID: documentID,
+          title: title,
+          representedURL: representedURL,
+          isDirty: isDirty,
+          hasEditableBuffer: hasEditableBuffer)
+      }
       return true
     }
 
@@ -574,13 +583,32 @@ final class DocumentWindowRegistry: ObservableObject {
     }
   }
 
-  private func deferAttach(_ window: NSWindow, documentID: URL) {
+  private func deferAttach(
+    _ window: NSWindow,
+    identity: DocumentIdentity?,
+    documentID: URL,
+    title: String?,
+    representedURL: URL?,
+    isDirty: Bool,
+    hasEditableBuffer: Bool
+  ) {
     guard deferredAttachDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self, weak window] in
       guard let self else { return }
       deferredAttachDocumentIDs.remove(documentID)
       guard let window else { return }
-      attach(window, documentID: documentID)
+      // Carry the FULL attach metadata: a bare re-attach would re-publish the
+      // descriptor with the default `isDirty: false`, clobbering a dirty
+      // window's unsaved indicator once the modal turn that forced the defer
+      // clears.
+      attach(
+        window,
+        identity: identity,
+        documentID: documentID,
+        title: title,
+        representedURL: representedURL,
+        isDirty: isDirty,
+        hasEditableBuffer: hasEditableBuffer)
     }
   }
 
