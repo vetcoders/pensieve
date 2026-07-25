@@ -380,6 +380,14 @@ final class DocumentWindowRegistry: ObservableObject {
 
     if let existing = windowsByIdentity[resolvedIdentity]?.window, existing !== window {
       DebugTrace.log("registry.attach rejected duplicate identity \(resolvedIdentity.persistentID)")
+      // The window switched in place onto a document another window already
+      // owns. It no longer legitimately shows its PREVIOUS document, so drop
+      // this window's stale descriptor/mapping before rejecting — otherwise
+      // Open Files and `open(previous)` keep targeting this window as if it
+      // still showed the old document, sending later activation/close actions
+      // to the wrong tab. `existing`'s ownership of the duplicate is untouched.
+      releaseStaleDocumentMappings(for: window, keeping: nil)
+      removeDescriptors(for: window, keeping: nil)
       return false
     }
 

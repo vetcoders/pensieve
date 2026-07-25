@@ -715,6 +715,42 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testInPlaceSwitchToDuplicateReleasesStaleMappingOnRejection() throws {
+    let alphaID = URL(fileURLWithPath: "/tmp/pensieve-stale-alpha.md").standardizedFileURL
+    let betaID = URL(fileURLWithPath: "/tmp/pensieve-stale-beta.md").standardizedFileURL
+    let switchingWindow = Self.makeWindow()
+    let betaOwner = Self.makeWindow()
+    defer {
+      switchingWindow.close()
+      betaOwner.close()
+    }
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // switchingWindow shows alpha; betaOwner owns beta.
+    XCTAssertTrue(registry.attach(switchingWindow, documentID: alphaID))
+    XCTAssertTrue(registry.attach(betaOwner, documentID: betaID))
+    XCTAssertEqual(Set(registry.openTabDocumentIDs), [alphaID, betaID])
+
+    // switchingWindow switches in place onto beta, which betaOwner already owns.
+    XCTAssertFalse(
+      registry.attach(switchingWindow, documentID: betaID),
+      "an in-place switch onto an already-owned document must be rejected")
+
+    // The rejection must release switchingWindow's stale alpha mapping: only
+    // betaOwner's beta remains, so `open(alpha)` no longer targets this window.
+    XCTAssertEqual(
+      registry.openTabDocumentIDs,
+      [betaID],
+      "the rejected in-place switch must drop the window's stale previous-document mapping")
+  }
+
+  @MainActor
   func testDeferredAttachPreservesDirtyMetadataThroughModalTurn() throws {
     let docID = URL(fileURLWithPath: "/tmp/pensieve-deferred-dirty.md").standardizedFileURL
     let window = Self.makeWindow()
