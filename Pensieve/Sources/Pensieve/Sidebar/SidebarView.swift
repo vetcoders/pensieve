@@ -845,8 +845,7 @@ struct SidebarView: View {
       }
     } else if let url = node.url {
       Button("New File") {
-        expandedNodeIDs.insert(node.id)
-        _ = controller.createDocument(in: url)
+        controller.createUntitledDocument(in: url)
       }
 
       Button("New Folder") {
@@ -936,11 +935,9 @@ struct SidebarView: View {
   }
 
   private func createRootDocument() {
-    if rootCreationURL != nil {
-      _ = controller.createDocument(in: nil)
-    } else {
-      controller.createUntitledDocument()
-    }
+    // A draft needs no workspace to live in — with no root open it simply has
+    // no starting directory to offer the Save panel yet.
+    controller.createUntitledDocument(in: rootCreationURL)
   }
 
   private func createRootFolder() {

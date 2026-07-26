@@ -347,33 +347,6 @@ final class AppController: ObservableObject {
   }
 
   @discardableResult
-  func createDocument(in folderURL: URL?) -> URL? {
-    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
-      return nil
-    }
-    guard let directoryURL = documentCreationDirectory(folderURL) else {
-      appState.lastError = "Open a workspace folder before creating a workspace file."
-      return nil
-    }
-
-    let targetURL = availableSiblingURL(
-      for: directoryURL.appendingPathComponent("Untitled").appendingPathExtension("md")
-    )
-    appState.documentSession.createUntitled(title: targetURL.lastPathComponent)
-    appState.selectedDocumentID = nil
-    appState.lastError = nil
-
-    guard saveActiveDocument(as: targetURL) else {
-      return nil
-    }
-
-    let standardizedURL = targetURL.standardizedFileURL
-    appState.pendingSidebarRenameURL = standardizedURL
-    reindexCreatedDocument(at: standardizedURL)
-    return standardizedURL
-  }
-
-  @discardableResult
   func createFolder(url: URL) -> Bool {
     folderManager.createFolder(at: url, into: appState)
   }
@@ -562,12 +535,32 @@ final class AppController: ObservableObject {
     documentWindowRegistry.closeAllDocumentWindows()
   }
 
+  /// The New File gesture, from every surface that offers it: ⌘N, the sidebar
+  /// header "+", the empty-state button, and a folder's "New File" context menu.
+  ///
+  /// A new document is a DRAFT — it lives in this session and NOWHERE else.
+  /// Creating one writes nothing into the user's workspace: opening a note and
+  /// walking away must leave the folder exactly as it was, instead of leaving
+  /// `Untitled.md`, `Untitled 3.md`, … behind. The draft reaches disk only when
+  /// the user names it (Save panel / Save As…), which is the one gesture that
+  /// says where it belongs.
+  ///
+  /// Unsaved content is not at risk in the meantime: a dirty draft is persisted
+  /// into the recovery store by autosave and again on close — the same
+  /// crash-safe path an imported Word/PDF draft already uses.
+  ///
+  /// `folderURL` is only where the gesture happened. It steers the Save panel's
+  /// starting directory through the sidebar focus the File menu already reads;
+  /// it is never created, written to, or scanned for a free file name.
   @discardableResult
-  func createUntitledDocument() -> Bool {
+  func createUntitledDocument(in folderURL: URL? = nil) -> Bool {
     guard documentStore.prepareForDocumentSwitch(appState: appState) else {
       return false
     }
 
+    if let folderURL {
+      appState.sidebarFocusedURL = folderURL.standardizedFileURL
+    }
     appState.documentSession.createUntitled(title: nextUntitledTitle())
     appState.selectedDocumentID = nil
     appState.lastError = nil
@@ -1355,15 +1348,6 @@ final class AppController: ObservableObject {
         return candidate.standardizedFileURL
       }
       index += 1
-    }
-  }
-
-  private func reindexCreatedDocument(at url: URL) {
-    let ref = appState.documentRef(for: url.standardizedFileURL)
-    let indexDatabase = indexDatabase
-    let appState = appState
-    Task {
-      _ = await indexDatabase.reindexInBackground(documents: [ref], appState: appState)
     }
   }
 

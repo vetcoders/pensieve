@@ -3640,8 +3640,16 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.workspaceTree.first?.children?.first?.name, "Fresh Note")
   }
 
+  /// A new document is a DRAFT, not a file. "New File" inside a folder that
+  /// already holds `Untitled.md` must neither adopt that file nor write a
+  /// second one beside it — the workspace is left byte-for-byte alone, and the
+  /// draft's title is picked by the session, never by scanning the directory.
+  /// Folders are unchanged: a folder carries no unsaved state, so it still
+  /// materializes immediately under a free name.
   @MainActor
-  func testControllerCreatesDocumentAndFolderWithCollisionNames() async throws {
+  func testControllerCreatesDraftWithoutTouchingTheFolderAndFolderWithCollisionName()
+    async throws
+  {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveCreateCollisionTests-\(UUID().uuidString)", isDirectory: true)
@@ -3670,21 +3678,34 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.openFolder(url: folder)
 
-    let createdDocumentURL = try XCTUnwrap(controller.createDocument(in: nil))
+    func markdownNames() throws -> [String] {
+      try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        .filter { $0.hasSuffix(".md") }
+        .sorted()
+    }
+    XCTAssertEqual(try markdownNames(), ["Untitled.md"])
+
+    XCTAssertTrue(controller.createUntitledDocument(in: folder))
     await indexDatabase.waitForPendingReindex()
 
-    XCTAssertEqual(
-      createdDocumentURL.standardizedFileURL,
-      folder.appendingPathComponent("Untitled 2.md").standardizedFileURL)
-    XCTAssertTrue(FileManager.default.fileExists(atPath: createdDocumentURL.path))
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, createdDocumentURL)
-    XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, createdDocumentURL)
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertNil(appState.documentSession.url)
+    XCTAssertNil(appState.selectedDocumentID)
     XCTAssertFalse(appState.activeDocumentDirty)
-    XCTAssertEqual(appState.pendingSidebarRenameURL?.standardizedFileURL, createdDocumentURL)
-    XCTAssertTrue(
-      appState.documents.contains {
-        $0.url.standardizedFileURL == createdDocumentURL.standardizedFileURL
-      })
+    // Session numbering, not a directory scan: the `Untitled.md` already on
+    // disk is none of the draft's business.
+    XCTAssertEqual(appState.documentSession.displayTitle, "Untitled.md")
+    XCTAssertNil(appState.pendingSidebarRenameURL)
+    XCTAssertEqual(try markdownNames(), ["Untitled.md"])
+    XCTAssertEqual(try String(contentsOf: existingDocumentURL, encoding: .utf8), "keep existing")
+    // The gesture's folder is remembered only as the Save panel's starting
+    // point.
+    XCTAssertEqual(
+      appState.sidebarFocusedURL?.standardizedFileURL, folder.standardizedFileURL)
+    // The workspace listing still shows exactly the one file that was there.
+    XCTAssertEqual(
+      appState.documents.map { $0.url.standardizedFileURL },
+      [existingDocumentURL.standardizedFileURL])
 
     let createdFolderURL = try XCTUnwrap(controller.createFolder(in: nil))
 
@@ -3763,9 +3784,14 @@ final class PensieveSmokeTests: XCTestCase {
         bookmarkStore: temporaryBookmarkStore()
       )
     )
-    XCTAssertTrue(controller.createUntitledDocument())
+    XCTAssertTrue(controller.createUntitledDocument(in: folder))
     appState.activeDocumentText = "untitled body"
     appState.activeDocumentDirty = true
+    // Naming it is the FIRST thing that puts a document in the folder.
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        .filter { $0.hasSuffix(".md") },
+      [])
 
     let savedURL = folder.appendingPathComponent("saved-untitled.md")
 
