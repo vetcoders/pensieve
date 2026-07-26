@@ -488,7 +488,11 @@ EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.aiRewrite
 )
 BASE_EXPECTED_IDENTIFIER_COUNT="${#EXPECTED_TOOLBAR_IDENTIFIERS[@]}"
-EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
+# macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is fatal
+# ("unbound variable"); guard the append on the element count.
+if [[ ${#EXTRA_EXPECTED_IDENTIFIERS[@]} -gt 0 ]]; then
+  EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
+fi
 
 BUNDLE_COMMIT="$(/usr/libexec/PlistBuddy -c 'Print :PensieveBuildCommit' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
@@ -522,8 +526,15 @@ if command -v gtimeout >/dev/null 2>&1; then
   ax_runner=(gtimeout --signal=TERM 60)
 fi
 ax_census_status=0
-ax_census_output=$("${ax_runner[@]}" osascript - "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
-  "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1 <<'APPLESCRIPT'
+# The AppleScript body is written to a temp file BEFORE the osascript call
+# rather than piped in via a heredoc inside this command substitution: bash
+# 3.2 (the macOS system bash) cannot parse a heredoc containing an apostrophe
+# (see "AppleScript's text item delimiters" below) when it sits inside
+# $(...) -- it dies with "unexpected EOF while looking for matching `''" long
+# before this script ever runs. Writing to a file first keeps the
+# substitution itself heredoc-free.
+ax_census_script="$(mktemp "${TMPDIR:-/tmp}/pensieve-ax-census.XXXXXX")"
+cat >"$ax_census_script" <<'APPLESCRIPT'
 on waitForProcess(appName, timeoutSeconds)
   tell application "System Events"
     repeat with i from 1 to (timeoutSeconds * 10)
@@ -896,7 +907,10 @@ my assertWindowGeometry(appName, coldPosition, coldSize, "key-window regain/redr
 log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
-) || ax_census_status=$?
+
+ax_census_output=$("${ax_runner[@]}" osascript "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+  "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1) || ax_census_status=$?
+rm -f "$ax_census_script"
 printf '%s\n' "$ax_census_output"
 
 if [[ $ax_census_status -ne 0 ]]; then
