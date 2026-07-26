@@ -3377,6 +3377,14 @@ final class DocumentStore {
     if let activeURL = appState.documentSession.url {
       return activeURL.deletingLastPathComponent()
     }
+    // A draft has no file of its own, so the panel opens where the user was
+    // working — the same sidebar focus File ▸ Save As… already reads, which is
+    // also what a folder's "New File" gesture sets. Without it, naming a note
+    // created inside a subfolder would default to the workspace root instead.
+    if let focusedURL = appState.sidebarFocusedURL {
+      return isExistingDirectory(focusedURL)
+        ? focusedURL : focusedURL.deletingLastPathComponent()
+    }
     if let rootURL = appState.workspaceRoots.first?.url {
       return rootURL
     }
@@ -3384,6 +3392,12 @@ final class DocumentStore {
       return openFileURL.deletingLastPathComponent()
     }
     return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+  }
+
+  private static func isExistingDirectory(_ url: URL) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+      && isDirectory.boolValue
   }
 }
 
