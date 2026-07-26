@@ -166,6 +166,45 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(fileExists(draft.url))
   }
 
+  /// The safety net that lets a new document stay off disk entirely: a draft
+  /// the user never named still survives the window closing on it. Its content
+  /// goes to the recovery store — never into the workspace folder — and comes
+  /// back verbatim.
+  @MainActor
+  func testUnsavedUntitledContentRoundTripsThroughTheRecoveryStore() throws {
+    let folder = try makeTemporaryFolder()
+    let workspace = folder.appendingPathComponent("Workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    let store = try makeRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: indexDatabase, recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    XCTAssertTrue(controller.createUntitledDocument(in: workspace))
+    appState.activeDocumentText = "notes nobody named yet"
+    appState.activeDocumentDirty = true
+
+    XCTAssertTrue(controller.savePendingChangesOnClose())
+
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: workspace.path), [],
+      "closing an unnamed draft wrote into the workspace folder")
+    let drafts = store.loadDrafts()
+    XCTAssertEqual(drafts.map(\.text), ["notes nobody named yet"])
+
+    let reopened = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(try XCTUnwrap(drafts.first), into: reopened))
+    XCTAssertEqual(reopened.activeDocumentText, "notes nobody named yet")
+    XCTAssertTrue(reopened.documentSession.isUntitled)
+  }
+
   // MARK: - Save As…
 
   @MainActor

@@ -45,6 +45,38 @@ final class TrashConfirmationTests: XCTestCase {
     XCTAssertEqual(harness.confirmationProbe.requests, [folderURL])
   }
 
+  /// Deleting the file a window is showing leaves that window on the empty
+  /// state. Conjuring a replacement draft would hijack the window AND restart
+  /// the very `Untitled N` flood that keeping drafts off disk exists to stop.
+  func testTrashingTheShownDocumentLeavesTheEmptyStateWithoutSpawningAnUntitled() async throws {
+    let fixture = try TrashTestFixture.make()
+    let fileURL = fixture.root.appendingPathComponent("note.md").standardizedFileURL
+    try "# Note".write(to: fileURL, atomically: true, encoding: .utf8)
+    let harness = try makeTrashHarness(root: fixture.root)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+    await harness.openWorkspace()
+    harness.controller.openFileInCurrentWindow(url: fileURL)
+    XCTAssertEqual(harness.appState.documentSession.url?.standardizedFileURL, fileURL)
+
+    let operation = harness.requestTrash(fileURL)
+    await harness.waitForRecycleRequest()
+    harness.completeRecycle()
+    let didTrash = await operation.value
+
+    XCTAssertTrue(didTrash)
+    XCTAssertFalse(harness.appState.documentSession.hasEditableBuffer)
+    XCTAssertFalse(harness.appState.documentSession.isUntitled)
+    XCTAssertNil(harness.appState.selectedDocumentID)
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+        .filter { $0.hasSuffix(".md") },
+      [],
+      "the deleted document was replaced by a freshly materialized untitled file")
+  }
+
   func testFolderCancellationConfirmsOnceAndNeverRequestsRecycle() async throws {
     let fixture = try TrashTestFixture.make()
     let folderURL = fixture.root.appendingPathComponent("folder", isDirectory: true)
