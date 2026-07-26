@@ -399,6 +399,10 @@ struct WorkspaceNode: Identifiable, Hashable, Codable, Sendable {
   enum Kind: String, Codable, Sendable {
     case folder
     case document
+    /// A regular file whose extension falls outside `WorkspaceScanner.isMarkdownFile`'s
+    /// allow-list. Sidebar-visible only, by construction: it never enters `documents`,
+    /// so FTS indexing, Open Files, and the open-document guards never see it.
+    case foreignFile
   }
 
   let id: String

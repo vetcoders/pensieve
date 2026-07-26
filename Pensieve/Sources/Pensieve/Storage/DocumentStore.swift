@@ -718,7 +718,12 @@ final class FolderManager {
     _ lhs: WorkspaceNode,
     _ rhs: WorkspaceNode
   ) -> Bool {
-    if lhs.kind != rhs.kind { return lhs.kind == .folder }
+    // Folders always sort first; documents and foreign files share the same non-folder
+    // bucket and fall through to the name compare together (three kinds now exist, so
+    // "differs" alone no longer implies "one of them is a folder").
+    if lhs.kind != rhs.kind, lhs.kind == .folder || rhs.kind == .folder {
+      return lhs.kind == .folder
+    }
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
@@ -2087,9 +2092,10 @@ struct WorkspaceScan: Codable, Sendable {
   var rootNode: WorkspaceNode
 }
 
-/// Deterministic identity of the sidebar's visible universe. Every root, folder, and supported
-/// document contributes its standardized path and semantic kind; unsupported files never enter
-/// the scanner tree and therefore cannot perturb presentation freshness.
+/// Deterministic identity of the sidebar's visible universe. Every root, folder, document,
+/// and foreign (non-markdown) file contributes its standardized path and semantic kind, so
+/// adding/renaming/removing any of them perturbs presentation freshness and triggers a
+/// re-render.
 struct WorkspacePresentationSignature: Equatable, Sendable {
   struct Entry: Equatable, Sendable {
     var path: String
@@ -2442,6 +2448,21 @@ enum WorkspaceScanner {
             id: "document:\(entry.standardizedURL.path)",
             name: entry.url.deletingPathExtension().lastPathComponent,
             kind: .document,
+            url: entry.standardizedURL,
+            children: nil
+          )
+        )
+      } else if entry.isRegularFile {
+        // Outside the markdown allow-list, but still on disk: surface it as an inert
+        // sidebar node instead of silently dropping it (that silence is how a rename
+        // that loses its extension used to look like data loss). It never joins
+        // `documents`, so FTS indexing, Open Files, and the open-document guards
+        // stay untouched.
+        nodes.append(
+          WorkspaceNode(
+            id: "foreign:\(entry.standardizedURL.path)",
+            name: entry.url.lastPathComponent,
+            kind: .foreignFile,
             url: entry.standardizedURL,
             children: nil
           )

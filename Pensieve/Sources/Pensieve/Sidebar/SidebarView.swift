@@ -502,6 +502,11 @@ struct SidebarView: View {
         }
         return NSItemProvider()
       }
+    } else if node.kind == .foreignFile {
+      foreignFileRow(node, depth: row.depth)
+        .contextMenu {
+          nodeContextMenu(for: node)
+        }
     } else {
       Button {
         if let url = node.url {
@@ -571,6 +576,26 @@ struct SidebarView: View {
     .frame(maxWidth: .infinity, alignment: .leading)
     .contentShape(Rectangle())
     .background(selectionBackground(isSelected))
+  }
+
+  /// A regular file outside the markdown allow-list: visible so it never looks deleted,
+  /// but greyed-out and inert — no open-on-click, no expand/collapse chevron. The full
+  /// filename (extension included) is shown, unlike a document row which shows the stem.
+  private func foreignFileRow(_ node: WorkspaceNode, depth: Int) -> some View {
+    HStack {
+      Image(systemName: "doc.text")
+        .foregroundColor(.secondary)
+      Text(node.name)
+        .lineLimit(1)
+        .foregroundColor(.secondary)
+    }
+    .padding(.leading, CGFloat(depth) * 14 + 15)
+    .padding(.vertical, 4)
+    .padding(.horizontal, 6)
+    .help(node.url?.path ?? node.name)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .contentShape(Rectangle())
+    .opacity(0.6)
   }
 
   private var searchText: Binding<String> {
@@ -775,6 +800,22 @@ struct SidebarView: View {
         Button("Copy Path") {
           copyPath(url.path)
         }
+      }
+    } else if node.kind == .foreignFile, let url = node.url {
+      if url.pathExtension.isEmpty {
+        Button("Add .md Extension") {
+          _ = controller.renameItem(url: url, to: url.lastPathComponent + ".md")
+        }
+
+        Divider()
+      }
+
+      Button("Reveal in Finder") {
+        revealInFinder(url)
+      }
+
+      Button("Copy Path") {
+        copyPath(url.path)
       }
     } else if let url = node.url {
       Button("New File") {
