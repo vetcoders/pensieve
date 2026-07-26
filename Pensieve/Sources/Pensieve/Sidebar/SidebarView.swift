@@ -552,7 +552,7 @@ struct SidebarView: View {
       Image(systemName: "folder")
         .foregroundColor(.secondary)
 
-      renameableTitle(for: node.url, title: node.name)
+      renameableTitle(for: node.url, title: node.name, isFolder: true)
     }
     .padding(.leading, CGFloat(depth) * 14)
     .padding(.vertical, 4)
@@ -642,31 +642,39 @@ struct SidebarView: View {
   }
 
   @ViewBuilder
-  private func renameableTitle(for url: URL?, title: String) -> some View {
+  private func renameableTitle(for url: URL?, title: String, isFolder: Bool = false) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      HStack(spacing: 4) {
-        InlineRenameField(
-          text: $renameText,
-          focusToken: renameFocusToken,
-          accessibilityIdentifier: "pensieve.sidebar.renameField",
-          onCommit: {
-            commitRename(url)
-          },
-          onCancel: {
-            cancelRename()
-          }
-        )
-        .frame(maxWidth: .infinity)
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 4) {
+          InlineRenameField(
+            text: $renameText,
+            focusToken: renameFocusToken,
+            accessibilityIdentifier: "pensieve.sidebar.renameField",
+            onCommit: {
+              commitRename(url)
+            },
+            onCancel: {
+              cancelRename()
+            }
+          )
+          .frame(maxWidth: .infinity)
 
-        Button {
-          cancelRename()
-        } label: {
-          Image(systemName: "xmark.circle.fill")
+          Button {
+            cancelRename()
+          } label: {
+            Image(systemName: "xmark.circle.fill")
+          }
+          .buttonStyle(.borderless)
+          .help("Cancel Rename")
+          .accessibilityLabel("Cancel Rename")
+          .accessibilityIdentifier("pensieve.sidebar.cancelRename")
         }
-        .buttonStyle(.borderless)
-        .help("Cancel Rename")
-        .accessibilityLabel("Cancel Rename")
-        .accessibilityIdentifier("pensieve.sidebar.cancelRename")
+
+        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: renameText, isFolder: isFolder) {
+          Text("Will be shown as non-markdown")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+        }
       }
     } else {
       Text(title)

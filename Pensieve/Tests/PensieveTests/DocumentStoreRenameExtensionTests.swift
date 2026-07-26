@@ -100,6 +100,43 @@ final class DocumentStoreRenameExtensionTests: XCTestCase {
       WorkspaceScanner.renamePrefill(for: URL(fileURLWithPath: "/tmp/README")), "README")
   }
 
+  // MARK: - Sidebar rename-field inline hint (pure, view-side helper)
+
+  func testWarnsAboutLeavingMarkdownFamilyForARealNonMarkdownExtension() {
+    XCTAssertTrue(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "a.xyz", isFolder: false))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyDoesNotWarnForMarkdownExtension() {
+    XCTAssertFalse(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "a.md", isFolder: false))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyDoesNotWarnWithoutARealExtension() {
+    XCTAssertFalse(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "a", isFolder: false))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyDoesNotWarnForADecimalFragment() {
+    XCTAssertFalse(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "ver 2.5", isFolder: false))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyNeverWarnsForFolders() {
+    XCTAssertFalse(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "a.xyz", isFolder: true))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyDoesNotWarnForTxtExtension() {
+    XCTAssertFalse(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "notatki.txt", isFolder: false))
+  }
+
+  func testWarnsAboutLeavingMarkdownFamilyWarnsForPdfExtension() {
+    XCTAssertTrue(
+      WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: "plik.pdf", isFolder: false))
+  }
+
   private func makeTemporaryFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveRenameExtensionTests-\(UUID().uuidString)", isDirectory: true)

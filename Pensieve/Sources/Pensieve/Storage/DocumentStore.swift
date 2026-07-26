@@ -283,10 +283,7 @@ final class FolderManager {
     var resolvedName = trimmed
     if !sourceIsDirectory {
       let sourceExtension = source.pathExtension
-      let typedExtension = URL(fileURLWithPath: trimmed).pathExtension
-      let typedExtensionLooksReal =
-        !typedExtension.isEmpty && typedExtension.count <= 5
-        && typedExtension.allSatisfy(\.isLetter)
+      let typedExtensionLooksReal = WorkspaceScanner.hasRealExtension(forTypedName: trimmed)
       if !sourceExtension.isEmpty, !typedExtensionLooksReal {
         resolvedName = "\(trimmed).\(sourceExtension)"
       }
@@ -2302,7 +2299,25 @@ enum WorkspaceScanner {
     "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
 
   static func isMarkdownFile(_ url: URL) -> Bool {
-    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
+    isMarkdownExtension(url.pathExtension)
+  }
+
+  static func isMarkdownExtension(_ ext: String) -> Bool {
+    ["md", "markdown", "txt"].contains(ext.lowercased())
+  }
+
+  static func hasRealExtension(forTypedName name: String) -> Bool {
+    let ext = URL(fileURLWithPath: name).pathExtension
+    return !ext.isEmpty && ext.count <= 5 && ext.allSatisfy(\.isLetter)
+  }
+
+  /// Sidebar inline-rename hint: true when the typed name has a real
+  /// extension that falls outside the markdown family (md/markdown/txt).
+  /// Folders never warn — this only applies to file renames.
+  static func warnsAboutLeavingMarkdownFamily(typedName: String, isFolder: Bool) -> Bool {
+    guard !isFolder else { return false }
+    guard hasRealExtension(forTypedName: typedName) else { return false }
+    return !isMarkdownExtension(URL(fileURLWithPath: typedName).pathExtension)
   }
 
   /// Sidebar inline-rename prefill (Finder-style): a name with a real extension
