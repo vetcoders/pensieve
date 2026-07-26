@@ -27,7 +27,7 @@ if [[ ! -d "$VISTA_KERNEL_ROOT/crates/qube-ffi" ]]; then
 fi
 
 LIB_DIR="$VISTA_KERNEL_ROOT/target/$FFI_PROFILE"
-BRIDGE_DIR="$VISTA_KERNEL_ROOT/app/CodeScribe/Bridge"
+BRIDGE_DIR="$VISTA_KERNEL_ROOT/app/Codescribe/Bridge"
 VENDOR_DIR="$PENSIEVE_ROOT/Vendor/qube-ffi/$FFI_PROFILE"
 GENERATED_SWIFT="$PENSIEVE_ROOT/Sources/Pensieve/VistaBridge/qube_ffi.swift"
 PROVENANCE="$PENSIEVE_ROOT/Vendor/qube-ffi/PROVENANCE.txt"
