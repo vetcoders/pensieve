@@ -263,6 +263,113 @@ final class LaunchIntentTests: XCTestCase {
       "the Dock-reopen launcher must stay empty regardless of how the app was launched")
   }
 
+  // MARK: - Restore session on launch (S2-A)
+
+  /// An absent key is a first launch, not "off" — the setting must default to
+  /// today's behavior for every existing install.
+  @MainActor
+  func testRestoreSessionOnLaunchDefaultsToTrueWhenKeyAbsent() {
+    let settings = LaunchSettings(
+      defaults: makeEphemeralDefaults(prefix: "PensieveRestoreSessionDefaultTests"))
+
+    XCTAssertTrue(settings.restoreSessionOnLaunch)
+    XCTAssertTrue(LaunchSettings.restoreSessionOnLaunchDefault)
+  }
+
+  @MainActor
+  func testRestoreSessionOnLaunchChoiceSurvivesRelaunch() {
+    let defaults = makeEphemeralDefaults(prefix: "PensieveRestoreSessionPersistenceTests")
+
+    LaunchSettings(defaults: defaults).restoreSessionOnLaunch = false
+    XCTAssertFalse(LaunchSettings(defaults: defaults).restoreSessionOnLaunch)
+
+    LaunchSettings(defaults: defaults).restoreSessionOnLaunch = true
+    XCTAssertTrue(LaunchSettings(defaults: defaults).restoreSessionOnLaunch)
+  }
+
+  /// The toggle's OFF state: a cold launch must land on the clean launcher —
+  /// no workspace roots, no documents, nothing selected.
+  @MainActor
+  func testColdLaunchWithRestoreSessionOffLandsOnTheCleanLauncher() async throws {
+    let harness = try makeRestoreHarness(
+      documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
+
+    harness.controller.start(intent: .coldLaunch)
+    await Task.yield()
+
+    XCTAssertTrue(
+      harness.appState.workspaceRoots.isEmpty,
+      "restore-session-on-launch off must skip the cold-launch workspace restore")
+    XCTAssertTrue(harness.appState.documents.isEmpty)
+    XCTAssertNil(harness.appState.selectedDocumentID)
+  }
+
+  /// The toggle governs LAUNCH only — Dock reopen (and, by the same
+  /// `intent.restoresWorkspace` gate, the tab bar's "+") must keep rebuilding
+  /// the workspace they always did, whatever the setting says.
+  @MainActor
+  func testDockReopenIgnoresTheRestoreSessionOnLaunchSetting() async throws {
+    let harness = try makeRestoreHarness(
+      documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
+
+    harness.controller.start(intent: .dockReopen)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "Dock reopen must restore the workspace regardless of the launch-restore toggle")
+    XCTAssertNil(harness.appState.selectedDocumentID)
+  }
+
+  /// A skipped cold-launch restore must not touch the persisted bookmark: an
+  /// explicit/manual restore right afterwards still finds the workspace.
+  @MainActor
+  func testRestoreSessionOffDoesNotClearThePersistedBookmark() async throws {
+    let harness = try makeRestoreHarness(
+      documentNames: ["alpha.md"], restoreSessionOnLaunch: false)
+
+    harness.controller.start(intent: .coldLaunch)
+    await Task.yield()
+    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+
+    harness.folderManager.restoreLastFolderInBackground(into: harness.appState)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "the bookmark must survive a skipped auto-restore — only the auto-invoke was skipped")
+  }
+
+  /// Turning the toggle back ON restores the previous working set on the next
+  /// cold launch (a fresh `AppController`, modeling the next process launch).
+  @MainActor
+  func testRestoreSessionBackOnRestoresOnTheNextColdLaunch() async throws {
+    let harness = try makeRestoreHarness(
+      documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
+    harness.controller.start(intent: .coldLaunch)
+    await Task.yield()
+    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+
+    harness.launchSettings.restoreSessionOnLaunch = true
+    let nextAppState = AppState()
+    let nextController = AppController(
+      appState: nextAppState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      launchSettings: harness.launchSettings,
+      documentWindowRegistry: DocumentWindowRegistry(canMutateWindowTabs: { true }),
+      importsFoldersInBackground: true
+    )
+
+    nextController.start(intent: .coldLaunch)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      nextAppState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "flipping the setting back on must restore the workspace on the next cold launch")
+    XCTAssertNotNil(nextAppState.selectedDocumentID)
+  }
+
   // MARK: - Which intent each window route asks for
 
   @MainActor
@@ -337,7 +444,8 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   private func makeRestoreHarness(
     documentNames: [String],
-    workspaceBuilder: WorkspaceScanner.Builder? = nil
+    workspaceBuilder: WorkspaceScanner.Builder? = nil,
+    restoreSessionOnLaunch: Bool = true
   ) throws -> RestoreHarness {
     let folder = try makeTemporaryFolder("workspace")
     for name in documentNames {
@@ -369,12 +477,17 @@ final class LaunchIntentTests: XCTestCase {
       bookmarkStore: bookmarkStore,
       recoveryStore: recoveryStore)
 
+    let launchSettings = LaunchSettings(
+      defaults: makeEphemeralDefaults(prefix: "PensieveLaunchIntentTestsLaunchSettings"))
+    launchSettings.restoreSessionOnLaunch = restoreSessionOnLaunch
+
     let appState = AppState()
     let controller = AppController(
       appState: appState,
       folderManager: folderManager,
       documentStore: documentStore,
       indexDatabase: indexDatabase,
+      launchSettings: launchSettings,
       documentWindowRegistry: DocumentWindowRegistry(canMutateWindowTabs: { true }),
       importsFoldersInBackground: true
     )
@@ -388,6 +501,7 @@ final class LaunchIntentTests: XCTestCase {
       folderManager: folderManager,
       documentStore: documentStore,
       recoveryStore: recoveryStore,
+      launchSettings: launchSettings,
       controller: controller)
   }
 }
@@ -399,5 +513,6 @@ private struct RestoreHarness {
   let folderManager: FolderManager
   let documentStore: DocumentStore
   let recoveryStore: RecoveryStore
+  let launchSettings: LaunchSettings
   let controller: AppController
 }

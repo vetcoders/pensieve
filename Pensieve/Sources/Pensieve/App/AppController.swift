@@ -27,6 +27,7 @@ final class AppController: ObservableObject {
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let launchSettings: LaunchSettings
   private let documentWindowRegistry: DocumentWindowRegistry
   let recentDocuments: RecentDocumentsStore
   private let agentPromptLauncher: AgentPromptLaunching
@@ -103,6 +104,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    launchSettings: LaunchSettings? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
     recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
@@ -144,6 +146,7 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.launchSettings = launchSettings ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
@@ -178,6 +181,14 @@ final class AppController: ObservableObject {
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
     guard intent.restoresWorkspace else { return }
+
+    // The toggle governs LAUNCH only: a cold launch with it off lands on the
+    // clean launcher, but Dock reopen / the tab bar's "+" still rebuild the
+    // workspace they always did — those never asked to restore a whole
+    // session, only to put a launcher back. Persisted bookmarks are untouched
+    // either way; only this auto-invoke is skipped.
+    if intent == .coldLaunch, !launchSettings.restoreSessionOnLaunch { return }
+
     folderManager.restoreLastFolderInBackground(
       into: appState, selectsRestoredDocument: intent.selectsRestoredDocument)
   }

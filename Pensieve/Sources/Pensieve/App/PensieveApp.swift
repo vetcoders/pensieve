@@ -15,6 +15,9 @@ struct PensieveApp: App {
   /// The auto-save preference the Settings window edits. The SAME instance the
   /// document store consults, so a flip reaches every open document immediately.
   private let savingSettings: DocumentSavingSettings
+  /// The restore-on-launch preference the Settings window edits. The SAME
+  /// instance `AppController.start(intent:)` consults on the next cold launch.
+  private let launchSettings: LaunchSettings
 
   init() {
     let workspaceStore = WorkspaceStore()
@@ -22,6 +25,7 @@ struct PensieveApp: App {
     let themeManager = ThemeManager()
     providerSettings = ProviderSettings.shared
     savingSettings = DocumentSavingSettings.shared
+    launchSettings = LaunchSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -111,7 +115,8 @@ struct PensieveApp: App {
     Settings {
       PensieveSettingsView(
         providerSettings: providerSettings,
-        savingSettings: savingSettings
+        savingSettings: savingSettings,
+        launchSettings: launchSettings
       )
     }
   }

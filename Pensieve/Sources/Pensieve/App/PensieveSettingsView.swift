@@ -8,10 +8,11 @@ import SwiftUI
 struct PensieveSettingsView: View {
   let providerSettings: ProviderSettings
   let savingSettings: DocumentSavingSettings
+  let launchSettings: LaunchSettings
 
   var body: some View {
     TabView {
-      GeneralSettingsView(settings: savingSettings)
+      GeneralSettingsView(settings: savingSettings, launchSettings: launchSettings)
         .tabItem {
           Label("General", systemImage: "gearshape")
         }
@@ -24,10 +25,12 @@ struct PensieveSettingsView: View {
   }
 }
 
-/// Document-lifecycle preferences. One toggle today: who owns writing an edit to
-/// a file that already exists — Pensieve, or the user's explicit Save.
+/// Document-lifecycle and startup preferences: who owns writing an edit to a
+/// file that already exists — Pensieve, or the user's explicit Save — and
+/// whether a cold launch brings the previous session back.
 struct GeneralSettingsView: View {
   @Bindable var settings: DocumentSavingSettings
+  @Bindable var launchSettings: LaunchSettings
 
   var body: some View {
     VStack(alignment: .leading, spacing: 20) {
@@ -55,6 +58,30 @@ struct GeneralSettingsView: View {
         Text("A new draft has no location yet, so closing one always asks where to save it.")
         Text("Recovered drafts protect unsaved work after a crash either way.")
         Text("Changes take effect immediately — no restart needed.")
+      }
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      .fixedSize(horizontal: false, vertical: true)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Startup")
+          .font(.title2.weight(.semibold))
+        Text("What a cold launch brings back.")
+          .foregroundStyle(.secondary)
+      }
+
+      Form {
+        Toggle(
+          "Restore session on launch",
+          isOn: $launchSettings.restoreSessionOnLaunch
+        )
+        .accessibilityIdentifier("pensieve.startup.restoreSessionOnLaunch")
+      }
+      .formStyle(.grouped)
+
+      VStack(alignment: .leading, spacing: 5) {
+        Text("When off, Pensieve starts with an empty launcher — no workspace, no open files.")
+        Text("Your workspace folders stay remembered either way; turn this back on to bring them back.")
       }
       .font(.caption)
       .foregroundStyle(.secondary)
