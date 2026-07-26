@@ -118,4 +118,71 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
     let restored = BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
     XCTAssertEqual(restored.rootURLs.map(\.standardizedFileURL), [folder.standardizedFileURL])
   }
+
+  /// A consciously-closed ad-hoc file must not resurrect: `forgetFile` removes
+  /// its persisted bookmark, so a relaunch-style restore no longer yields it.
+  func testForgetFileRemovesTheBookmarkFromRestore() throws {
+    let noteURL = folder.appendingPathComponent("ad-hoc.md")
+    try "body".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let store = BookmarkStore(defaults: defaults)
+    try store.persistFile(url: noteURL, into: AppState())
+    XCTAssertEqual(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+        .fileURLs.map(\.standardizedFileURL),
+      [noteURL.standardizedFileURL],
+      "precondition: the bookmark is persisted before the close")
+
+    store.forgetFile(url: noteURL)
+
+    XCTAssertTrue(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState()).fileURLs.isEmpty,
+      "forgetting a file must drop its bookmark so relaunch cannot reopen it")
+  }
+
+  /// Closing one of several ad-hoc files removes ONLY its bookmark — the others
+  /// still restore.
+  func testForgetFileRemovesOnlyTheMatchingBookmark() throws {
+    let keepURL = folder.appendingPathComponent("keep.md")
+    let dropURL = folder.appendingPathComponent("drop.md")
+    try "keep".write(to: keepURL, atomically: true, encoding: .utf8)
+    try "drop".write(to: dropURL, atomically: true, encoding: .utf8)
+
+    let store = BookmarkStore(defaults: defaults)
+    try store.persistFile(url: keepURL, into: AppState())
+    try store.persistFile(url: dropURL, into: AppState())
+
+    store.forgetFile(url: dropURL)
+
+    XCTAssertEqual(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+        .fileURLs.map(\.standardizedFileURL),
+      [keepURL.standardizedFileURL],
+      "only the closed file's bookmark leaves; the rest of the working set stays")
+  }
+
+  /// A file deleted on disk must be handled on the forget-rewrite, not crash it.
+  /// The vanished entry is gone from the restore result either way (pruned as
+  /// unresolvable, or dropped by restore's own existence guard).
+  func testForgetFileHandlesADeletedTargetWithoutCrashing() throws {
+    let survivorURL = folder.appendingPathComponent("survivor.md")
+    let ghostURL = folder.appendingPathComponent("ghost.md")
+    try "survivor".write(to: survivorURL, atomically: true, encoding: .utf8)
+    try "ghost".write(to: ghostURL, atomically: true, encoding: .utf8)
+
+    let store = BookmarkStore(defaults: defaults)
+    try store.persistFile(url: survivorURL, into: AppState())
+    try store.persistFile(url: ghostURL, into: AppState())
+
+    // The ghost's target disappears out from under the persisted bookmark.
+    try FileManager.default.removeItem(at: ghostURL)
+
+    // Forgetting an unrelated file must not choke on the dangling ghost entry.
+    XCTAssertNoThrow(store.forgetFile(url: survivorURL))
+
+    let restored = BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+    XCTAssertTrue(
+      restored.fileURLs.isEmpty,
+      "the forgotten survivor is removed and the deleted ghost never restores")
+  }
 }

@@ -2967,6 +2967,16 @@ final class DocumentStore {
   func forgetOpenFile(url: URL, appState: AppState) {
     let standardizedPath = url.standardizedFileURL.path
     appState.openFiles.removeAll { $0.id.standardizedFileURL.path == standardizedPath }
+    // The in-memory list is only half the truth. A file opened from OUTSIDE the
+    // workspace also persisted a security-scoped bookmark so it could survive a
+    // relaunch. A conscious close means "stay closed", so drop that bookmark too
+    // — otherwise launch restore resolves it and resurrects the file forever.
+    // This is the single choke point for every close route; window teardown
+    // during app termination never reaches here (it is suppressed in
+    // AppController.documentWindowWillClose), so quit still preserves the
+    // working set. Files with no persisted bookmark (workspace members, drafts)
+    // simply have nothing to remove.
+    bookmarkStore.forgetFile(url: url)
   }
 
   func save(appState: AppState) {

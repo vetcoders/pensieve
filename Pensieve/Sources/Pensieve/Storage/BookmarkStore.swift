@@ -53,6 +53,47 @@ final class BookmarkStore {
     appState.lastError = nil
   }
 
+  /// Drops the persisted file bookmark whose resolved target matches `url`.
+  ///
+  /// A file opened from OUTSIDE the workspace persists a security-scoped
+  /// bookmark (via `persistFile`) so it survives a relaunch. When such a file
+  /// is consciously closed it must STAY closed — leaving the bookmark behind
+  /// lets launch restore resolve it and resurrect the file on every launch.
+  /// Only `fileBookmarksKey` is touched; workspace roots are never affected.
+  ///
+  /// Each stored bookmark is resolved just to compare paths — the list is
+  /// small (`maxOpenFiles`-bounded). Entries that no longer resolve (target
+  /// deleted, stale beyond repair) are pruned in the same pass rather than
+  /// left to fail again on the next restore. Security-scoped access this store
+  /// opened for the removed URL is released.
+  func forgetFile(url: URL) {
+    let targetPath = url.standardizedFileURL.path
+    var survivors: [Data] = []
+    for data in fileBookmarkData {
+      var bookmarkIsStale = false
+      guard
+        let resolved = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        )
+      else {
+        // Unresolvable blob: prune it (stale-bookmark hygiene) instead of
+        // carrying a dead entry forward to fail again next restore.
+        continue
+      }
+      if resolved.standardizedFileURL.path == targetPath {
+        // The file being closed. Drop the bookmark and release the scope this
+        // store opened for it, if any.
+        stopAccess(matching: resolved)
+        continue
+      }
+      survivors.append(data)
+    }
+    defaults.set(survivors, forKey: fileBookmarksKey)
+  }
+
   /// Replaces the complete persisted workspace only after every new bookmark has been created.
   /// This preserves the previous relaunch state if one of the requested URLs cannot produce a
   /// security-scoped bookmark; callers can still update their live in-memory workspace and surface
@@ -185,6 +226,20 @@ final class BookmarkStore {
       url.stopAccessingSecurityScopedResource()
     }
     activeAccess.removeAll()
+  }
+
+  /// Releases security-scoped access for a single tracked URL, matched by
+  /// standardized path so it finds the entry regardless of whether it was
+  /// activated with the raw or the resolved URL form.
+  private func stopAccess(matching url: URL) {
+    let targetPath = url.standardizedFileURL.path
+    for (key, accessWasGranted) in activeAccess
+    where key.standardizedFileURL.path == targetPath {
+      if accessWasGranted {
+        key.stopAccessingSecurityScopedResource()
+      }
+      activeAccess.removeValue(forKey: key)
+    }
   }
 
   private func isExistingDirectory(_ url: URL) -> Bool {

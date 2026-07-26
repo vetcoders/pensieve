@@ -536,6 +536,81 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     XCTAssertTrue(appState.openFiles.isEmpty)
   }
 
+  // MARK: - Persisted bookmark lifecycle
+  //
+  // Closing an ad-hoc file (opened from OUTSIDE the workspace) must also drop
+  // the security-scoped bookmark that let it survive a relaunch — otherwise
+  // launch restore resurrects it forever. Quit is the exception: it preserves
+  // the whole working set for the next launch.
+
+  @MainActor
+  func testConsciousCloseForgetsThePersistedFileBookmark() throws {
+    let folder = try makeTemporaryFolder()
+    let fileURL = folder.appendingPathComponent("ad-hoc.md")
+    try "body".write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let defaults = makeEphemeralDefaults(prefix: "PensieveForgetBookmarkTests")
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let appState = AppState()
+    try bookmarkStore.persistFile(url: fileURL, into: appState)
+    XCTAssertEqual(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+        .fileURLs.map(\.standardizedFileURL),
+      [fileURL.standardizedFileURL],
+      "precondition: opening the ad-hoc file persisted its bookmark")
+
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore)
+    // The single choke point every conscious close funnels through.
+    documentStore.forgetOpenFile(url: fileURL, appState: appState)
+
+    XCTAssertTrue(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState()).fileURLs.isEmpty,
+      "a conscious close must remove the bookmark so relaunch cannot reopen the file")
+  }
+
+  @MainActor
+  func testTerminationTeardownKeepsThePersistedFileBookmark() throws {
+    let folder = try makeTemporaryFolder()
+    let fileURL = folder.appendingPathComponent("ad-hoc.md")
+    try "body".write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let defaults = makeEphemeralDefaults(prefix: "PensieveForgetBookmarkTerminationTests")
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let appState = AppState()
+    try bookmarkStore.persistFile(url: fileURL, into: appState)
+
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore)
+    documentStore.load(
+      ref: DocumentRef(id: fileURL.standardizedFileURL, isAdHoc: true), into: appState)
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let recorder = SaveChangesRecorder()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(),
+        indexDatabase: temporaryIndexDatabase(in: folder)),
+      documentStore: documentStore,
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      documentWindowRegistry: registry,
+      confirmSaveChanges: recorder.confirmation())
+
+    // Quit tears every window down at once; that is process shutdown, not the
+    // user closing documents, so the bookmark must survive for the next launch.
+    registry.beginTermination()
+    controller.documentWindowWillClose()
+
+    XCTAssertEqual(
+      BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+        .fileURLs.map(\.standardizedFileURL),
+      [fileURL.standardizedFileURL],
+      "app termination must preserve the working set's bookmarks for relaunch")
+  }
+
   // MARK: - Helpers
 
   private func makeTemporaryFolder() throws -> URL {
