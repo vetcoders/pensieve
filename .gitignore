@@ -102,6 +102,11 @@ dist/
 !SECURITY.md
 !AGENTS.md
 !THIRD_PARTY_THEMES.md
+# ...and docs/, which is the one directory where markdown is project
+# documentation rather than an internal draft. Without this exception every new
+# doc is silently untracked, which is why this repo had none. The rsync-only
+# rule above still covers specs, plans and agent prompts elsewhere in the tree.
+!/docs/**/*.md
 /tmp
 /dist
 /docs/superpowers
