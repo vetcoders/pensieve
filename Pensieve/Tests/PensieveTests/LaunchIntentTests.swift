@@ -349,21 +349,54 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertTrue(LaunchSettings(defaults: defaults).restoreSessionOnLaunch)
   }
 
-  /// The toggle's OFF state: a cold launch must land on the clean launcher —
-  /// no workspace roots, no documents, nothing selected.
+  /// The split contract (W9). The toggle OFF gates ONLY the open-files working
+  /// set: a cold launch still restores the workspace roots (configuration, not
+  /// session) and shows the tree, but reopens NO files and displays NO document.
+  /// Proves acceptance #1 — workspace restored AND open files not restored.
   @MainActor
-  func testColdLaunchWithRestoreSessionOffLandsOnTheCleanLauncher() async throws {
+  func testColdLaunchWithRestoreSessionOffRestoresWorkspaceButNotOpenFiles() async throws {
     let harness = try makeRestoreHarness(
-      documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
+      documentNames: ["alpha.md", "zebra.md"],
+      persistsOpenFiles: ["outside.md"],
+      restoreSessionOnLaunch: false)
 
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
+    await harness.folderManager.waitForPendingWorkspaceBuild()
 
+    XCTAssertEqual(
+      harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "the workspace roots are configuration — they restore on every cold launch")
+    XCTAssertFalse(
+      harness.appState.documents.isEmpty,
+      "the workspace tree must be visible even with the session toggle off")
     XCTAssertTrue(
-      harness.appState.workspaceRoots.isEmpty,
-      "restore-session-on-launch off must skip the cold-launch workspace restore")
-    XCTAssertTrue(harness.appState.documents.isEmpty)
-    XCTAssertNil(harness.appState.selectedDocumentID)
+      harness.appState.openFiles.isEmpty,
+      "the toggle is off — the open-files working set must NOT be restored")
+    XCTAssertNil(
+      harness.appState.selectedDocumentID,
+      "no document may be auto-selected or displayed when the toggle is off")
+    XCTAssertFalse(harness.appState.documentSession.hasEditableBuffer)
+  }
+
+  /// The mirror of the split: with the toggle ON the persisted open-files
+  /// working set comes back alongside the workspace roots, and a document is
+  /// displayed — the pre-W9 cold-launch behavior, unchanged.
+  @MainActor
+  func testColdLaunchWithRestoreSessionOnRestoresTheOpenFilesWorkingSet() async throws {
+    let harness = try makeRestoreHarness(
+      documentNames: ["alpha.md", "zebra.md"],
+      persistsOpenFiles: ["outside.md"],
+      restoreSessionOnLaunch: true)
+
+    harness.controller.start(intent: .coldLaunch)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      harness.appState.openFiles.map { $0.url.standardizedFileURL }, harness.openFileURLs,
+      "toggle on must bring the open-files working set back")
+    XCTAssertNotNil(
+      harness.appState.selectedDocumentID,
+      "toggle on still displays a restored document — cold-launch policy is unchanged")
   }
 
   /// The toggle governs LAUNCH only — Dock reopen (and, by the same
@@ -383,34 +416,47 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertNil(harness.appState.selectedDocumentID)
   }
 
-  /// A skipped cold-launch restore must not touch the persisted bookmark: an
-  /// explicit/manual restore right afterwards still finds the workspace.
+  /// Acceptance #5: the toggle never clears persisted bookmarks. A cold launch
+  /// with it off skips ONLY the open-files working set — the file bookmark
+  /// survives, so a subsequent explicit full restore still finds it.
   @MainActor
-  func testRestoreSessionOffDoesNotClearThePersistedBookmark() async throws {
+  func testRestoreSessionOffDoesNotClearThePersistedBookmarks() async throws {
     let harness = try makeRestoreHarness(
-      documentNames: ["alpha.md"], restoreSessionOnLaunch: false)
+      documentNames: ["alpha.md"],
+      persistsOpenFiles: ["outside.md"],
+      restoreSessionOnLaunch: false)
 
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
-    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+    XCTAssertTrue(
+      harness.appState.openFiles.isEmpty,
+      "the working set is skipped while the toggle is off")
 
+    // An explicit full restore (restoresOpenFiles defaults to true) still finds
+    // both bookmarks — the skipped cold-launch working-set restore cleared none.
     harness.folderManager.restoreLastFolderInBackground(into: harness.appState)
     await harness.folderManager.waitForPendingWorkspaceBuild()
 
     XCTAssertEqual(
       harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
-      "the bookmark must survive a skipped auto-restore — only the auto-invoke was skipped")
+      "the root bookmark must survive a skipped working-set restore")
+    XCTAssertEqual(
+      harness.appState.openFiles.map { $0.url.standardizedFileURL }, harness.openFileURLs,
+      "the file bookmark must survive too — the toggle only skipped the auto-invoke")
   }
 
-  /// Turning the toggle back ON restores the previous working set on the next
+  /// Turning the toggle back ON restores the displayed document on the next
   /// cold launch (a fresh `AppController`, modeling the next process launch).
+  /// The first launch (off) already shows the tree but no document.
   @MainActor
   func testRestoreSessionBackOnRestoresOnTheNextColdLaunch() async throws {
     let harness = try makeRestoreHarness(
       documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
-    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+    XCTAssertNil(
+      harness.appState.selectedDocumentID,
+      "toggle off displays no document on this launch")
 
     harness.launchSettings.restoreSessionOnLaunch = true
     let nextAppState = AppState()
@@ -506,6 +552,7 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   private func makeRestoreHarness(
     documentNames: [String],
+    persistsOpenFiles: [String] = [],
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     restoreSessionOnLaunch: Bool = true
   ) throws -> RestoreHarness {
@@ -521,6 +568,22 @@ final class LaunchIntentTests: XCTestCase {
     let bookmarkStore = BookmarkStore(
       defaults: makeEphemeralDefaults(prefix: "PensieveLaunchIntentTests"))
     try bookmarkStore.persistRoot(url: folder, into: AppState())
+    // Persist an open-files working set so its restore can be observed
+    // independently of the workspace-roots restore (the launch toggle splits
+    // these two: roots always come back, the working set is gated). The files
+    // live OUTSIDE the workspace root — an in-workspace file is dropped from the
+    // working set by the scan tail (it is already the tree's row), so only an
+    // ad-hoc external file survives to prove the working-set restore either way.
+    var openFileURLs: [URL] = []
+    if !persistsOpenFiles.isEmpty {
+      let externalFolder = try makeTemporaryFolder("external-open-files")
+      for name in persistsOpenFiles {
+        let url = externalFolder.appendingPathComponent(name).standardizedFileURL
+        try "body of \(name)".write(to: url, atomically: true, encoding: .utf8)
+        try bookmarkStore.persistFile(url: url, into: AppState())
+        openFileURLs.append(url)
+      }
+    }
 
     let folderManager = FolderManager(
       metadataStore: WorkspaceMetadataStore(
@@ -559,9 +622,11 @@ final class LaunchIntentTests: XCTestCase {
 
     return RestoreHarness(
       folder: folder,
+      openFileURLs: openFileURLs,
       appState: appState,
       folderManager: folderManager,
       documentStore: documentStore,
+      bookmarkStore: bookmarkStore,
       recoveryStore: recoveryStore,
       launchSettings: launchSettings,
       controller: controller)
@@ -571,9 +636,11 @@ final class LaunchIntentTests: XCTestCase {
 @MainActor
 private struct RestoreHarness {
   let folder: URL
+  let openFileURLs: [URL]
   let appState: AppState
   let folderManager: FolderManager
   let documentStore: DocumentStore
+  let bookmarkStore: BookmarkStore
   let recoveryStore: RecoveryStore
   let launchSettings: LaunchSettings
   let controller: AppController

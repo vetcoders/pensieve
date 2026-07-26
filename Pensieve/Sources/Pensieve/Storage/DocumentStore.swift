@@ -563,20 +563,28 @@ final class FolderManager {
   /// converges to an empty launcher instead of being absorbed back in.
   func restoreLastFolderInBackground(
     into appState: AppState,
+    restoresOpenFiles: Bool = true,
     selectsRestoredDocument: Bool = true
   ) {
     let restored = bookmarkStore.restoreWorkspace(into: appState)
+    // The open-files working set is session state gated by the launch toggle;
+    // the workspace roots are always restored. Dropping the file URLs also
+    // stands the auto-selection down — with nothing in the working set there is
+    // no restored document to display. The persisted bookmarks are read but
+    // never cleared here, so flipping the toggle back on restores them again.
+    let restoredFileURLs = restoresOpenFiles ? restored.fileURLs : []
+    let selectsDocument = selectsRestoredDocument && restoresOpenFiles
     DebugTrace.log(
-      "open restore roots=\(restored.rootURLs.count) files=\(restored.fileURLs.count) "
-        + "autoSelect=\(selectsRestoredDocument)")
-    guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
+      "open restore roots=\(restored.rootURLs.count) files=\(restoredFileURLs.count) "
+        + "autoSelect=\(selectsDocument)")
+    guard !restored.rootURLs.isEmpty || !restoredFileURLs.isEmpty else {
       return
     }
 
     openResolvedWorkspaceInBackground(
       rootURLs: restored.rootURLs,
-      fileURLs: restored.fileURLs,
-      selectsRestoredDocument: selectsRestoredDocument,
+      fileURLs: restoredFileURLs,
+      selectsRestoredDocument: selectsDocument,
       into: appState)
   }
 

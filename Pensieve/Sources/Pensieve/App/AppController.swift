@@ -182,15 +182,21 @@ final class AppController: ObservableObject {
     Task { await indexDatabase.openInBackground(into: appState) }
     guard intent.restoresWorkspace else { return }
 
-    // The toggle governs LAUNCH only: a cold launch with it off lands on the
-    // clean launcher, but Dock reopen / the tab bar's "+" still rebuild the
-    // workspace they always did — those never asked to restore a whole
-    // session, only to put a launcher back. Persisted bookmarks are untouched
-    // either way; only this auto-invoke is skipped.
-    if intent == .coldLaunch, !launchSettings.restoreSessionOnLaunch { return }
+    // The workspace roots are configuration, not session state: they come back
+    // on EVERY cold launch so the tree is never empty. The restore-session
+    // toggle governs ONLY the open-files working set (and the auto-selected
+    // document it would display) — a cold launch with it off lands on the
+    // restored workspace tree with nothing open and nothing selected. Dock
+    // reopen / the tab bar's "+" restore their files as they always did.
+    // Persisted bookmarks are untouched either way; only the open-files
+    // auto-invoke is gated.
+    let restoresOpenFiles =
+      intent != .coldLaunch || launchSettings.restoreSessionOnLaunch
 
     folderManager.restoreLastFolderInBackground(
-      into: appState, selectsRestoredDocument: intent.selectsRestoredDocument)
+      into: appState,
+      restoresOpenFiles: restoresOpenFiles,
+      selectsRestoredDocument: intent.selectsRestoredDocument)
   }
 
   func openFolder(url: URL) {

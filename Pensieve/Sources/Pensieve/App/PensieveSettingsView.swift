@@ -72,7 +72,7 @@ struct GeneralSettingsView: View {
 
       Form {
         Toggle(
-          "Restore session on launch",
+          "Reopen last session's files on launch",
           isOn: $launchSettings.restoreSessionOnLaunch
         )
         .accessibilityIdentifier("pensieve.startup.restoreSessionOnLaunch")
@@ -80,8 +80,11 @@ struct GeneralSettingsView: View {
       .formStyle(.grouped)
 
       VStack(alignment: .leading, spacing: 5) {
-        Text("When off, Pensieve starts with an empty launcher — no workspace, no open files.")
-        Text("Your workspace folders stay remembered either way; turn this back on to bring them back.")
+        Text("Your workspace folders always come back — this only controls the files you had open.")
+        Text(
+          "When off, Pensieve starts on your workspace with nothing open. "
+            + "Turn it back on to reopen last session's files."
+        )
       }
       .font(.caption)
       .foregroundStyle(.secondary)
