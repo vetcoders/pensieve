@@ -101,6 +101,7 @@ dist/
 !CONTRIBUTING.md
 !SECURITY.md
 !AGENTS.md
+!docs/keyboard-shortcuts-and-file-lifecycle-contract.md
 # ...and docs/, which is the one directory where markdown is project
 # documentation rather than an internal draft. Without this exception every new
 # doc is silently untracked, which is why this repo had none. The rsync-only
