@@ -767,27 +767,16 @@ final class AppController: ObservableObject {
         ? appState.makeDocumentRef(for: id) : nil)
   }
 
-  /// Default click (Open Files list, workspace tree, search result, context-menu
-  /// "Open"): load the document in the current window, reusing the active editor
-  /// pane. This is the VS Code / Zed model — a single click never spawns a window
-  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
-  /// gesture. Clicking the currently displayed document is a no-op.
-  func openDocumentWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = resolveDocumentRef(for: id) else { return }
-
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
-      return
-    }
-
-    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
-    selectDocument(id: ref.id)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture: route through the window
-  /// registry to open the document in a native tab (or activate the window
-  /// already showing it). Clicking the currently displayed document is a no-op.
+  /// Single click (Open Files list, workspace tree, search result, context-menu
+  /// "Open"): open the document as a native window tab through the window
+  /// registry — the same route a Finder "Open with Pensieve" takes. A click is
+  /// an explicit open, so it never replaces the document in the current pane:
+  /// files stay visible in parallel and switching between them is switching
+  /// tabs. A document already open elsewhere activates its existing tab instead
+  /// of spawning a second one, and clicking the document this window already
+  /// shows is a no-op.
   /// Falls back to in-window selection when no routing is wired (tests, headless).
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
+  func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
     if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
@@ -796,13 +785,13 @@ final class AppController: ObservableObject {
 
     guard let requestOpenDocumentWindow else {
       DebugTrace.log(
-        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
+        "openDocumentWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
       )
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
   }
 
