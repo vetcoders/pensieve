@@ -1991,6 +1991,13 @@ final class FolderManager {
     }
   }
 
+  /// Makes the saved workspace durable NOW rather than whenever cfprefsd feels
+  /// like it. Called on the way out of the process: see `BookmarkStore.flush()`
+  /// for the write-back race this closes.
+  func flushWorkingSet() {
+    bookmarkStore.flush()
+  }
+
   /// Decides what an open/restore flow puts on screen once its walk lands,
   /// using only what the flow knew when it STARTED (`selection`).
   ///

@@ -29,6 +29,17 @@ final class BookmarkStore {
     trashMembership(url)
   }
 
+  /// Forces every pending write in this domain onto disk.
+  ///
+  /// `UserDefaults` hands writes to cfprefsd, which decides when the backing
+  /// plist is updated — measured on this machine, up to ~14 s AFTER the writing
+  /// process has already exited. That late flush silently overwrote external
+  /// edits made to a quit app's saved workspace, resurrecting state the user had
+  /// cleared. Nothing about WHAT is saved changes here, only when it is durable.
+  func flush() {
+    defaults.synchronize()
+  }
+
   var bookmarkData: Data? {
     rootBookmarkData.first ?? defaults.data(forKey: legacyFolderBookmarkKey)
   }

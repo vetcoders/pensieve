@@ -239,6 +239,13 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // down.
     MainActor.assumeIsolated {
       DocumentWindowRegistry.shared.beginTermination()
+
+      // Last writable moment in the process. Until now the saved working set was
+      // only handed to cfprefsd, which writes it back on its own schedule —
+      // measured here at up to ~14 s after exit, long enough to overwrite
+      // whatever touched those defaults in the meantime. Flushing here makes the
+      // state on disk final by the time the process is gone.
+      FolderManager.shared.flushWorkingSet()
     }
   }
 }

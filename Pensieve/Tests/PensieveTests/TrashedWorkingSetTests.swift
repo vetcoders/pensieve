@@ -249,6 +249,43 @@ final class TrashedWorkingSetTests: XCTestCase {
     XCTAssertEqual(harness.appState.lastError, "shown.md is in the Trash.")
   }
 
+  // MARK: - (c) Flush at quit
+
+  /// The quit seam: the working set must be handed to disk synchronously, not
+  /// left to cfprefsd's own schedule (measured on this machine at up to ~14 s
+  /// AFTER the process exits — long enough to overwrite an external edit made to
+  /// a quit app's saved state).
+  func testFlushingTheWorkingSetSynchronizesTheDefaultsDomain() throws {
+    let suiteName = EphemeralDefaults.suiteName(prefix: "PensieveFlushSeamTests")
+    let counting = try XCTUnwrap(FlushCountingDefaults(suiteName: suiteName))
+    addTeardownBlock { EphemeralDefaults.destroy(suiteName: counting.trackedSuiteName) }
+    let harness = try makeHarness(bookmarkStore: BookmarkStore(defaults: counting))
+
+    XCTAssertEqual(counting.synchronizeCount, 0, "nothing flushes until the process is leaving")
+
+    harness.folderManager.flushWorkingSet()
+
+    XCTAssertEqual(
+      counting.synchronizeCount, 1,
+      "quit must flush the saved workspace exactly once, synchronously")
+  }
+
+  /// The flush is about WHEN state is durable, never about what it contains.
+  func testFlushingTheWorkingSetDoesNotChangeWhatIsSaved() async throws {
+    _ = try writeNote("root-note.md", in: workspace)
+    let adHocURL = try writeNote("ad-hoc.md", in: outside)
+    let harness = try makeHarness()
+
+    await harness.openWorkspace()
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: adHocURL, into: harness.appState))
+    let before = restoredFileURLs()
+
+    harness.folderManager.flushWorkingSet()
+
+    XCTAssertEqual(restoredFileURLs(), before)
+    XCTAssertEqual(before, [adHocURL])
+  }
+
   // MARK: - Harness
 
   private func makeHarness(bookmarkStore: BookmarkStore? = nil) throws -> TrashedWorkingSetHarness {
@@ -258,6 +295,25 @@ final class TrashedWorkingSetTests: XCTestCase {
       bookmarkStore: bookmarkStore ?? makeBookmarkStore(),
       trashDirectory: fakeTrash
     )
+  }
+}
+
+/// `UserDefaults` that counts `synchronize()` calls, so the quit flush can be
+/// asserted as a seam instead of inferred from a plist whose write timing is
+/// cfprefsd's business. Backed by an absolute-path suite, so it strands nothing
+/// in `~/Library/Preferences`.
+final class FlushCountingDefaults: UserDefaults {
+  let trackedSuiteName: String
+  private(set) nonisolated(unsafe) var synchronizeCount = 0
+
+  override init?(suiteName suitename: String?) {
+    self.trackedSuiteName = suitename ?? ""
+    super.init(suiteName: suitename)
+  }
+
+  override func synchronize() -> Bool {
+    synchronizeCount += 1
+    return super.synchronize()
   }
 }
 
