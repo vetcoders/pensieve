@@ -182,6 +182,17 @@ final class FolderManager {
 
     let standardizedURL = standardizeFileURL(url)
     let standardizedPath = standardizedURL.path
+
+    // Nothing in the Trash is an open document. Refusing here is what keeps the
+    // guard honest end to end: without it a trashed file could be re-added to
+    // the working set — and given a fresh bookmark — through any open route that
+    // still had its URL lying around.
+    if bookmarkStore.isTrashed(standardizedURL) {
+      appState.lastError =
+        "\(standardizedURL.lastPathComponent) is in the Trash. Put it back to open it."
+      return nil
+    }
+
     if let ref = appState.allDocuments.first(where: {
       $0.url.path == standardizedPath
     }) {
@@ -371,6 +382,11 @@ final class FolderManager {
     )
 
     removeReferences(for: source, into: appState)
+    // `removeReferences` clears the in-memory rows; the persisted bookmarks are
+    // the other half. They cannot be matched by the path just trashed — each one
+    // now resolves into the Trash — so they are dropped by where they LAND,
+    // which also covers every document inside a trashed folder.
+    bookmarkStore.pruneTrashedFiles()
     noteSelfWrite(at: source)
     appState.lastError = nil
 
@@ -1923,6 +1939,56 @@ final class FolderManager {
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
+    reconcileTrashedOpenFiles(into: appState)
+  }
+
+  /// Retires open files that have been thrown away since the last scan.
+  ///
+  /// Every scan commit passes through here — the explicit refresh after
+  /// Pensieve's own `Move to Trash` and the debounced watcher refresh that
+  /// follows a trashing done in Finder — so this is the one seam where a live
+  /// working set learns about it, instead of the app carrying a dead row until
+  /// the next launch.
+  ///
+  /// Two shapes, because trashing hides the same event behind two different
+  /// symptoms:
+  ///
+  /// - the row points INTO the Trash already (it was restored from a bookmark
+  ///   that followed its file there), which is exact and decides on its own;
+  /// - the row's file vanished from the path it was opened at, AND a bookmark of
+  ///   that same name has just turned up in the Trash. Neither half is proof
+  ///   alone — a missing file may be mid-replacement, and a trashed namesake may
+  ///   be a different document — but together they cannot describe a document
+  ///   that is still open, and if two namesakes really were trashed at once both
+  ///   are dead anyway.
+  ///
+  /// The cheap existence/membership survey runs first so a healthy working set
+  /// never pays for resolving bookmarks on the refresh path.
+  private func reconcileTrashedOpenFiles(into appState: AppState) {
+    guard !appState.openFiles.isEmpty else { return }
+
+    let fileManager = FileManager.default
+    var vanishedNames = Set<String>()
+    var trashedRowPaths = Set<String>()
+    for ref in appState.openFiles {
+      let url = ref.url.standardizedFileURL
+      if !fileManager.fileExists(atPath: url.path) {
+        vanishedNames.insert(url.lastPathComponent)
+      } else if bookmarkStore.isTrashed(url) {
+        trashedRowPaths.insert(url.path)
+      }
+    }
+    guard !vanishedNames.isEmpty || !trashedRowPaths.isEmpty else { return }
+
+    let trashedNames = Set(bookmarkStore.pruneTrashedFiles().map(\.lastPathComponent))
+    appState.openFiles.removeAll { ref in
+      let url = ref.url.standardizedFileURL
+      if trashedRowPaths.contains(url.path) {
+        return true
+      }
+      let name = url.lastPathComponent
+      return vanishedNames.contains(name) && trashedNames.contains(name)
+    }
   }
 
   /// Decides what an open/restore flow puts on screen once its walk lands,
@@ -2842,6 +2908,18 @@ final class DocumentStore {
 
   private func loadClean(ref: DocumentRef, into appState: AppState) {
     autosaver.cancel()
+
+    // Last line of the Trash guard, and the only one that covers a document
+    // whose file was thrown away between being listed and being asked for. A
+    // trashed file still reads perfectly, so without this check the app would
+    // present it as an ordinary editable document — the very thing that made a
+    // deleted note look alive. It leaves the working set here instead.
+    if bookmarkStore.isTrashed(ref.url) {
+      forgetOpenFile(url: ref.url, appState: appState)
+      appState.lastError = "\(ref.url.lastPathComponent) is in the Trash."
+      appState.selectedDocumentID = appState.documentSession.id
+      return
+    }
 
     do {
       let text = try String(contentsOf: ref.url, encoding: .utf8)

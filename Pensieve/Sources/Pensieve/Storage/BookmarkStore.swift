@@ -9,9 +9,24 @@ final class BookmarkStore {
   private let rootBookmarksKey = "Pensieve.workspace.rootBookmarks"
   private let fileBookmarksKey = "Pensieve.workspace.fileBookmarks"
   private var activeAccess: [URL: Bool] = [:]
+  private let trashMembership: (URL) -> Bool
 
-  init(defaults: UserDefaults = .standard) {
+  init(
+    defaults: UserDefaults = .standard,
+    trashMembership: @escaping (URL) -> Bool = TrashLocation.contains
+  ) {
     self.defaults = defaults
+    self.trashMembership = trashMembership
+  }
+
+  /// Whether `url` names a document that has been thrown away.
+  ///
+  /// Exposed from the bookmark store on purpose: this store is what makes a file
+  /// outlive its path, so it is also what has to say when that survival stopped
+  /// meaning "still open". Every caller then shares one answer — and one
+  /// injection point for tests, which must not depend on the real Trash.
+  func isTrashed(_ url: URL) -> Bool {
+    trashMembership(url)
   }
 
   var bookmarkData: Data? {
@@ -92,6 +107,46 @@ final class BookmarkStore {
       survivors.append(data)
     }
     defaults.set(survivors, forKey: fileBookmarksKey)
+  }
+
+  /// Drops every persisted file bookmark whose target now sits in the Trash, and
+  /// reports those targets.
+  ///
+  /// This is the half of trashing that `forgetFile` cannot do: it matches on the
+  /// path a bookmark RESOLVES TO, and a trashed file resolves to its new home
+  /// under a Trash folder — never to the path it was closed at. Left alone, the
+  /// blob stays valid forever and every launch restores the thrown-away document
+  /// again.
+  ///
+  /// Unresolvable blobs are deliberately kept: this runs on live refreshes, and
+  /// a file that is merely missing is dropped by the existing restore-time
+  /// resolution failure instead. Defaults are only written when something
+  /// actually died, so a healthy working set costs no write at all.
+  @discardableResult
+  func pruneTrashedFiles() -> [URL] {
+    var survivors: [Data] = []
+    var trashed: [URL] = []
+    for data in fileBookmarkData {
+      var bookmarkIsStale = false
+      guard
+        let resolved = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        ),
+        isTrashed(resolved)
+      else {
+        survivors.append(data)
+        continue
+      }
+      stopAccess(matching: resolved)
+      trashed.append(resolved.standardizedFileURL)
+    }
+
+    guard !trashed.isEmpty else { return [] }
+    defaults.set(survivors, forKey: fileBookmarksKey)
+    return trashed
   }
 
   /// Replaces the complete persisted workspace only after every new bookmark has been created.
@@ -288,6 +343,16 @@ final class BookmarkStore {
           ? isExistingDirectory(url)
           : isExistingFile(url)
         guard exists else {
+          return nil
+        }
+
+        // A trashed document still EXISTS — the bookmark followed it into the
+        // Trash — so existence alone let launch restore resurrect it as a live,
+        // editable open file. Treat it exactly like a bookmark that no longer
+        // resolves: dropped here, and dropped from the persisted set with every
+        // other casualty when the surviving workspace is written back. Roots are
+        // left to their own lifecycle; only the open-files working set is ours.
+        if expectedKind == .file, isTrashed(url) {
           return nil
         }
 
