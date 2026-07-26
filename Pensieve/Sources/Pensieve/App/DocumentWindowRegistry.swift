@@ -50,6 +50,15 @@ final class DocumentWindowRegistry: ObservableObject {
   /// the owner through this map instead of guarding only the caller's session.
   private var controllersByWindow: [ObjectIdentifier: WeakController] = [:]
   private var fallbackUntitledIdentities: [ObjectIdentifier: DocumentIdentity] = [:]
+  /// The window a user's EXPLICIT document open (`open(_:)`) last brought to the
+  /// front. A working-set restore auto-selects a document into the cold-launch
+  /// launcher scene, whose SwiftUI root cold-starts ~1s later and first registers
+  /// through `attach` → `completeAttach`. Without this marker that late
+  /// first-attach would `orderAndActivateWindow` and STEAL key from the file the
+  /// user explicitly opened this launch (observed ~230ms after the explicit window
+  /// became key). Restore never routes through `open(_:)`, so on a restore-only
+  /// launch this stays nil and the restored window activates exactly as before.
+  private var explicitlyOpenedWindow: WeakWindow?
   /// The sole ordered publication authority for Open Files. File-only callers
   /// get a derived compatibility projection via `openTabDocumentIDs`.
   @Published private(set) var openDocuments: [OpenDocumentDescriptor] = []
@@ -171,6 +180,7 @@ final class DocumentWindowRegistry: ObservableObject {
         DebugTrace.log(
           "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
         mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
+        explicitlyOpenedWindow = WeakWindow(existing)
         orderAndActivateWindow(existing)
         closeEmptyLauncherWindows(except: existing)
         return
@@ -211,6 +221,7 @@ final class DocumentWindowRegistry: ObservableObject {
       mergeWindowIntoTabs(target, window)
       DebugTrace.log("merged '\(window.title)' into '\(target.title)' before first presentation")
     }
+    explicitlyOpenedWindow = WeakWindow(window)
     orderAndActivateWindow(window)
     closeEmptyLauncherWindows(except: window)
   }
@@ -490,10 +501,29 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
-    if orderedDocumentIDs.insert(documentID).inserted {
-      orderAndActivateWindow(window)
+    let isFirstOrdering = orderedDocumentIDs.insert(documentID).inserted
+    if isFirstOrdering {
+      if explicitOpenHoldsFocus(besides: window) {
+        // A working-set restore auto-selects a document into a launcher scene
+        // whose SwiftUI root cold-starts after the explicit open already took
+        // key. Record the ordering but withhold activation so the restored
+        // window never steals key from the file the user explicitly opened.
+        DebugTrace.log(
+          "completeAttach kept restored '\(window.title)' behind explicit open")
+      } else {
+        orderAndActivateWindow(window)
+      }
     }
     closeEmptyLauncherWindows(except: window)
+  }
+
+  /// Whether an explicit `open(_:)` currently owns key focus on a DIFFERENT
+  /// window than `window`. Used to stop a late restore first-attach from
+  /// activating over an explicitly opened document. The marker is a weak ref, so
+  /// once the explicit window closes this reverts to normal activation.
+  private func explicitOpenHoldsFocus(besides window: NSWindow) -> Bool {
+    guard let owner = explicitlyOpenedWindow?.window else { return false }
+    return owner !== window
   }
 
   private func releaseStaleDocumentMappings(for window: NSWindow, keeping documentID: URL?) {

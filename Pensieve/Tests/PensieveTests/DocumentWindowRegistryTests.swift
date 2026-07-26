@@ -792,6 +792,86 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testExplicitOpenKeepsKeyWhenRestoredWindowAttachesAfterward() throws {
+    let explicitWindow = Self.makeWindow(title: "toolbar-cold")
+    let restoredWindow = Self.makeWindow(title: "DPA_Zalacznik")
+    defer {
+      explicitWindow.close()
+      restoredWindow.close()
+    }
+    let explicitURL = URL(fileURLWithPath: "/tmp/pensieve-explicit-open.md").standardizedFileURL
+    let restoredURL = URL(fileURLWithPath: "/tmp/pensieve-restored-doc.md").standardizedFileURL
+    var activatedWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { activatedWindows.append($0) },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in explicitWindow })
+
+    // The explicit launch file opens and claims key.
+    registry.open(DocumentRef(id: explicitURL))
+    XCTAssertEqual(
+      activatedWindows.map(ObjectIdentifier.init),
+      [ObjectIdentifier(explicitWindow)])
+
+    // The working-set restore's document window cold-starts and registers ~1s
+    // later. It must NOT steal activation from the explicitly opened window.
+    XCTAssertTrue(
+      registry.attach(
+        restoredWindow,
+        identity: .file(restoredURL),
+        documentID: restoredURL,
+        title: "DPA_Zalacznik",
+        representedURL: restoredURL,
+        isDirty: false,
+        hasEditableBuffer: true))
+
+    XCTAssertEqual(
+      activatedWindows.map(ObjectIdentifier.init),
+      [ObjectIdentifier(explicitWindow)],
+      "a restored working-set window must never take key from an explicit open")
+    XCTAssertEqual(
+      registry.openTabDocumentIDs,
+      [explicitURL, restoredURL],
+      "both documents are still tracked; only the restored window's activation is withheld")
+  }
+
+  @MainActor
+  func testRestoredWindowActivatesWhenNoExplicitOpenIsInFlight() throws {
+    let restoredWindow = Self.makeWindow(title: "DPA_Zalacznik")
+    defer { restoredWindow.close() }
+    let restoredURL = URL(fileURLWithPath: "/tmp/pensieve-restore-only.md").standardizedFileURL
+    var activatedWindows: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { activatedWindows.append($0) },
+      currentMergeTarget: { nil })
+
+    // Restore alone (no explicit open) must keep current behaviour: the restored
+    // document window becomes key when its SwiftUI root first registers.
+    XCTAssertTrue(
+      registry.attach(
+        restoredWindow,
+        identity: .file(restoredURL),
+        documentID: restoredURL,
+        title: "DPA_Zalacznik",
+        representedURL: restoredURL,
+        isDirty: false,
+        hasEditableBuffer: true))
+
+    XCTAssertEqual(
+      activatedWindows.map(ObjectIdentifier.init),
+      [ObjectIdentifier(restoredWindow)],
+      "with no explicit open in flight, a restored document window still becomes key")
+  }
+
+  @MainActor
   private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
