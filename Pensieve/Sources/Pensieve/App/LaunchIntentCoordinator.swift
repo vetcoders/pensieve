@@ -9,6 +9,17 @@ final class LaunchIntentCoordinator: ObservableObject {
 
   private let settleDelayNanoseconds: UInt64
   private weak var controller: AppController?
+  /// Resolves the controller a file open should target when the cold-start
+  /// launcher controller above is gone. ⌘O / File ▸ Open File act on the
+  /// window the user is actually looking at, resolved through
+  /// `CommandSurfaceContext`; a Finder/`open`/Dock file drop must land in that
+  /// SAME window, not vanish. `controller` is only ever set by the cold-start
+  /// settle path (launcher windows), never by a document window, so once the
+  /// original launcher closed a later external open was routed at a released
+  /// weak-ref and SILENTLY DROPPED — the app just kept showing the previously
+  /// opened document. Falling back to the focused controller closes that hole
+  /// while leaving cold launch (launcher attached, no window key yet) unchanged.
+  private let focusedControllerProvider: @MainActor () -> AppController?
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
@@ -23,8 +34,22 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// ONE launch, so it is spent on that launch.
   private var didOpenLaunchDocuments = false
 
-  init(settleDelayNanoseconds: UInt64 = 0) {
+  init(
+    settleDelayNanoseconds: UInt64 = 0,
+    focusedControllerProvider: @escaping @MainActor () -> AppController? = {
+      CommandSurfaceContext.shared.controller
+    }
+  ) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
+    self.focusedControllerProvider = focusedControllerProvider
+  }
+
+  /// The controller an incoming file open should be routed to: the cold-start
+  /// launcher controller while it is alive (keeps the launch-document settle
+  /// path intact), otherwise the window the user is currently focused on. Never
+  /// resolves to a released weak-ref, so an external open is never dropped.
+  private var openTargetController: AppController? {
+    controller ?? focusedControllerProvider()
   }
 
   /// Starts `controller` once any launch URLs have settled. `intent` is the one
@@ -57,11 +82,11 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
-    guard controller != nil else { return }
+    guard let target = openTargetController else { return }
     // The URLs already landed in this window; spend the launch-document intent
     // here so the NEXT window is judged on its own.
     _ = consumeLaunchDocumentOpen()
-    controller?.start(intent: .explicitDocument)
+    target.start(intent: .explicitDocument)
     finishStartupDecision()
   }
 
@@ -89,7 +114,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 
   private func drainPendingURLs() {
-    guard let controller, !pendingURLs.isEmpty else { return }
+    guard let controller = openTargetController, !pendingURLs.isEmpty else { return }
 
     let urls = pendingURLs
     pendingURLs.removeAll()

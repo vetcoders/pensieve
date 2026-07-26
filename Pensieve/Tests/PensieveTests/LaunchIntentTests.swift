@@ -263,6 +263,68 @@ final class LaunchIntentTests: XCTestCase {
       "the Dock-reopen launcher must stay empty regardless of how the app was launched")
   }
 
+  // MARK: - An external open reaches the focused window, never a dead ref
+
+  /// W4-A. A Finder/`open`/Dock file open funnels through
+  /// `application(_:open:)` → `LaunchIntentCoordinator.handle`. The coordinator's
+  /// own `controller` is set ONLY by the cold-start settle path (launcher
+  /// windows) and is a weak ref: once the original launcher window closed it
+  /// went nil, and the open was routed at a released ref and SILENTLY DROPPED —
+  /// the front window just kept showing the previously opened document. The
+  /// open must instead land in the window the user is focused on (the same
+  /// authority ⌘O resolves through), so the requested file is always shown.
+  @MainActor
+  func testExternalOpenReachesTheFocusedWindowWhenNoLauncherIsAttached() async throws {
+    let focused = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let requested = focused.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    // No launcher controller is ever attached (its window closed): the
+    // coordinator has only the focused document window to fall back on.
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { focused.controller })
+
+    coordinator.handle(urls: [requested])
+    await focused.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      focused.appState.selectedDocumentID, requested,
+      "an external open with no launcher attached must still open into the focused window")
+    XCTAssertEqual(focused.appState.documentSession.url, requested)
+  }
+
+  /// The attached launcher controller keeps priority while it is alive, so the
+  /// focused fallback never diverts an open away from the window that is
+  /// legitimately handling this launch. Here the launcher is attached FIRST
+  /// (its own workspace empty, so its cold start selects nothing), then a file
+  /// open arrives: it must land in the launcher, not in the unrelated focused
+  /// window the provider points at.
+  @MainActor
+  func testAttachedLauncherKeepsPriorityOverTheFocusedFallback() async throws {
+    let launcher = try makeRestoreHarness(documentNames: [])
+    let other = try makeRestoreHarness(documentNames: ["beta.md"])
+    let requested = launcher.folder.appendingPathComponent("gamma.md").standardizedFileURL
+    try "# gamma".write(to: requested, atomically: true, encoding: .utf8)
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { other.controller })
+
+    // Launcher attaches first (empty workspace → cold start selects nothing).
+    coordinator.startWhenLaunchIntentsSettle(controller: launcher.controller, intent: .coldLaunch)
+    await coordinator.waitForStartupDecision()
+
+    // The file open arrives while the launcher is still the attached target.
+    coordinator.handle(urls: [requested])
+    await launcher.folderManager.waitForPendingWorkspaceBuild()
+    await other.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      launcher.appState.selectedDocumentID, requested,
+      "the attached launcher must be the window that opens the file")
+    XCTAssertNil(
+      other.appState.selectedDocumentID,
+      "the file must not leak into an unrelated focused window while the launcher is attached")
+  }
+
   // MARK: - Restore session on launch (S2-A)
 
   /// An absent key is a first launch, not "off" — the setting must default to
