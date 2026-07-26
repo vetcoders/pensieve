@@ -985,7 +985,8 @@ final class IndexDatabase {
   }
 
   private func applicationSupportDirectory() throws -> URL {
-    try FileManager.default
+    if let overrideRoot = AppSupportLocation.overrideRoot() { return overrideRoot }
+    return try FileManager.default
       .url(
         for: .applicationSupportDirectory,
         in: .userDomainMask,

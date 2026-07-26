@@ -48,6 +48,7 @@ final class WorkspaceMetadataStore {
   }
 
   static func applicationSupportDirectory() -> URL {
+    if let overrideRoot = AppSupportLocation.overrideRoot() { return overrideRoot }
     do {
       return try FileManager.default
         .url(
