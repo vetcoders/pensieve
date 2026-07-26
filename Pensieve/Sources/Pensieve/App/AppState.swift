@@ -286,6 +286,11 @@ final class AppState {
     set { windowModel.sidebarVisible = newValue }
   }
 
+  var showAllFilesInSidebar: Bool {
+    get { windowModel.showAllFilesInSidebar }
+    set { windowModel.showAllFilesInSidebar = newValue }
+  }
+
   var lastError: String? {
     get { windowModel.lastError }
     set { windowModel.lastError = newValue }

@@ -466,7 +466,11 @@ struct SidebarView: View {
   /// on-screen rows instead of eagerly building the entire expanded subtree.
   /// Walks only expanded branches (O(visible)).
   private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
-    flattenWorkspaceTree(appState.sortedWorkspaceTree, expandedNodeIDs: expandedNodeIDs)
+    flattenWorkspaceTree(
+      appState.sortedWorkspaceTree,
+      expandedNodeIDs: expandedNodeIDs,
+      includeForeignFiles: appState.showAllFilesInSidebar
+    )
   }
 
   @ViewBuilder

@@ -10,6 +10,7 @@ final class DocumentWindowModel {
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private static let scrollSyncEnabledKey = "Pensieve.scrollSyncEnabled"
+  private static let showAllFilesInSidebarKey = "Pensieve.showAllFilesInSidebar"
   private let defaults: UserDefaults
 
   var selectedDocumentID: DocumentRef.ID?
@@ -117,6 +118,14 @@ final class DocumentWindowModel {
   }
   var previewRefreshToken: Int = 0
   var sidebarVisible: Bool = true
+  /// Whether non-markdown ("foreign") files show up greyed-out in the sidebar.
+  /// Off by default: on a real vault the scanner-emitted `.foreignFile` nodes
+  /// are visual noise at scale, so they stay hidden until explicitly requested.
+  var showAllFilesInSidebar: Bool {
+    didSet {
+      defaults.set(showAllFilesInSidebar, forKey: Self.showAllFilesInSidebarKey)
+    }
+  }
   var lastError: String?
 
   init(defaults: UserDefaults = .standard) {
@@ -145,6 +154,11 @@ final class DocumentWindowModel {
       self.scrollSyncEnabled = false
     } else {
       self.scrollSyncEnabled = defaults.bool(forKey: Self.scrollSyncEnabledKey)
+    }
+    if defaults.object(forKey: Self.showAllFilesInSidebarKey) == nil {
+      self.showAllFilesInSidebar = false
+    } else {
+      self.showAllFilesInSidebar = defaults.bool(forKey: Self.showAllFilesInSidebarKey)
     }
     // Seed the metadata mirrors from the initial (empty) session. didSet does
     // not fire during init, so prime them explicitly to stay consistent.

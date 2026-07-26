@@ -26,6 +26,16 @@ final class WorkspaceTreeFlattenerTests: XCTestCase {
     )
   }
 
+  private func foreignFile(_ id: String, _ name: String) -> WorkspaceNode {
+    WorkspaceNode(
+      id: id,
+      name: name,
+      kind: .foreignFile,
+      url: URL(fileURLWithPath: "/\(id)"),
+      children: nil
+    )
+  }
+
   /// Tree:
   /// root (folder)
   ///   childDoc (doc)
@@ -106,5 +116,53 @@ final class WorkspaceTreeFlattenerTests: XCTestCase {
 
     XCTAssertEqual(rows.map(\.id), ["empty"])
     XCTAssertEqual(rows.first?.isExpanded, true)
+  }
+
+  // MARK: - Show All Files toggle (foreign-file visibility)
+
+  private func forestWithForeignFile() -> [WorkspaceNode] {
+    let root = folder(
+      "root", "Root",
+      children: [
+        document("childDoc", "Child.md"),
+        foreignFile("foreignChild", "notes.xyz"),
+      ]
+    )
+    return [root, foreignFile("siblingForeign", "loose.bin")]
+  }
+
+  func testForeignFilesAreExcludedByDefault() {
+    let rows = flattenWorkspaceTree(forestWithForeignFile(), expandedNodeIDs: ["root"])
+
+    XCTAssertEqual(rows.map(\.id), ["root", "childDoc"])
+  }
+
+  func testForeignFilesAreExcludedWhenIncludeForeignFilesIsFalse() {
+    let rows = flattenWorkspaceTree(
+      forestWithForeignFile(), expandedNodeIDs: ["root"], includeForeignFiles: false)
+
+    XCTAssertEqual(rows.map(\.id), ["root", "childDoc"])
+    XCTAssertFalse(rows.contains { $0.id == "foreignChild" })
+    XCTAssertFalse(rows.contains { $0.id == "siblingForeign" })
+  }
+
+  func testForeignFilesAppearWhenIncludeForeignFilesIsTrue() {
+    let rows = flattenWorkspaceTree(
+      forestWithForeignFile(), expandedNodeIDs: ["root"], includeForeignFiles: true)
+
+    XCTAssertEqual(rows.map(\.id), ["root", "childDoc", "foreignChild", "siblingForeign"])
+  }
+
+  func testToggleDoesNotAffectMarkdownDocumentRows() {
+    let withForeign = flattenWorkspaceTree(
+      forestWithForeignFile(), expandedNodeIDs: ["root"], includeForeignFiles: true)
+    let withoutForeign = flattenWorkspaceTree(
+      forestWithForeignFile(), expandedNodeIDs: ["root"], includeForeignFiles: false)
+
+    let documentRows = { (rows: [FlattenedWorkspaceRow]) in
+      rows.filter { $0.node.kind == .document }
+    }
+    XCTAssertEqual(documentRows(withForeign).map(\.id), documentRows(withoutForeign).map(\.id))
+    XCTAssertEqual(documentRows(withForeign).map(\.id), ["childDoc"])
   }
 }
