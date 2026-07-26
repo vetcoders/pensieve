@@ -30,6 +30,7 @@ final class IndexDatabaseV2WriterTests: XCTestCase {
 
     manager.openInBackground(url: folder, into: appState)
     await manager.waitForPendingWorkspaceBuild()
+    await manager.waitForPendingWorkspaceIndexWrite()
 
     let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: appState.bookmarkData)
     let workspaces = try readWorkspaces(at: databaseURL)
