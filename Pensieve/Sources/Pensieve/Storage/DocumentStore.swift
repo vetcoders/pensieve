@@ -3327,7 +3327,23 @@ final class DocumentStore {
       recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       return true
     }
-    return saveExisting(appState: appState, indexNow: true)
+    // A file-backed buffer. Auto-save owns the file only when it is ON: then the
+    // teardown flush keeps that file current, as designed. With auto-save OFF,
+    // writing the file here would be exactly the silent write the setting
+    // forbids — and this teardown path has no veto point left (a raw
+    // `window.close()`, or a SwiftUI-scene close that never reached the
+    // shouldClose sheet). Either way — auto-save off, OR an auto-save write that
+    // FAILED — the buffer must not die with the window: stash it as a recovery
+    // draft and leave the file exactly as it is. Nothing is written behind the
+    // user's back, and nothing is lost.
+    if savingSettings.autoSavesPathedDocuments,
+      saveExisting(appState: appState, indexNow: true)
+    {
+      return true
+    }
+    stashClosingBufferAsRecoveryDraft(appState: appState)
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    return true
   }
 
   /// The `Autosaver.cancel()` a session change used to call, with the SAVE half narrowed to this
@@ -3468,6 +3484,27 @@ final class DocumentStore {
       )
       appState.documentSession.recoveryID = draft.id
       appState.lastError = nil
+    } catch {
+      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+    }
+  }
+
+  /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
+  /// tearing down without reaching disk — auto-save is off, or an auto-save write
+  /// just failed. Unlike `saveRecoveryDraft` (untitled), this never clears
+  /// `appState.lastError`: when the stash follows a FAILED save that error must
+  /// stay surfaced (a recovery draft AND a visible error), so the user learns the
+  /// file on disk is stale rather than believing the close saved it.
+  private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
+    guard appState.documentSession.isDirty else { return }
+
+    do {
+      let draft = try recoveryStore.saveDraft(
+        id: appState.documentSession.recoveryID,
+        title: appState.documentSession.displayTitle,
+        text: appState.documentSession.text
+      )
+      appState.documentSession.recoveryID = draft.id
     } catch {
       appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
     }

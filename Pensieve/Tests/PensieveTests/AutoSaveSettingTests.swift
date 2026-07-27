@@ -255,6 +255,79 @@ final class AutoSaveSettingTests: XCTestCase {
     }
   }
 
+  // MARK: - Teardown close never writes behind the user's back (#15 P1-01/03)
+
+  /// P1-01: a file-backed buffer whose WINDOW tears down with auto-save OFF (a
+  /// raw close with no veto point left) must not have its file written behind the
+  /// user's back. The edit is preserved as a recovery draft instead — zero bytes
+  /// reach the file, and nothing is lost.
+  @MainActor
+  func testTeardownCloseWithAutoSaveOffWritesNoBytesAndKeepsARecoveryDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("untouched.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+
+    var writeCount = 0
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      writeDocument: { text, url in
+        writeCount += 1
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      })
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "edited but never told to save"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      writeCount, 0, "auto-save off must not write the user's file on a teardown close")
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "on disk",
+      "the file must be byte-for-byte what it was before the close")
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().map(\.text), ["edited but never told to save"],
+      "the unsaved edit must survive as a recovery draft")
+  }
+
+  /// P1-03: when the close-path save of a FILE-BACKED document FAILS (auto-save
+  /// on, but the write throws), the buffer must not die with the window — it is
+  /// stashed as a recovery draft AND the write error stays surfaced, so a named
+  /// file whose save fails on close is never silently lost.
+  @MainActor
+  func testFailedCloseSaveOfAPathedDocumentLeavesARecoveryDraftAndSurfacesTheError() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("fails.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: true),
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "edit that cannot reach disk"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().map(\.text), ["edit that cannot reach disk"],
+      "a failed close-save must fall back to a recovery draft, not lose the edit")
+    XCTAssertNotNil(
+      appState.lastError, "the save failure must stay surfaced, not be masked by the draft write")
+  }
+
   // MARK: - Closing through the real controller (disk proof)
 
   /// ON: the close writes the pending edit to the file and asks nothing. The
