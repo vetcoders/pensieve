@@ -279,7 +279,7 @@ run_restored_menu_probe() {
   done
   pgrep -x "$APP_NAME" >/dev/null 2>&1 || die "restored-probe: relaunch never started $APP_NAME"
 
-  "${restored_ax_runner[@]}" osascript - "$APP_NAME" <<'APPLESCRIPT'
+  ${restored_ax_runner[@]+"${restored_ax_runner[@]}"} osascript - "$APP_NAME" <<'APPLESCRIPT'
 on run argv
   set appName to item 1 of argv
   my waitForProcess(appName, 15)
@@ -918,7 +918,7 @@ log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
 
-ax_census_output=$("${ax_runner[@]}" osascript "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+ax_census_output=$(${ax_runner[@]+"${ax_runner[@]}"} osascript "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
   "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1) || ax_census_status=$?
 rm -f "$ax_census_script"
 printf '%s\n' "$ax_census_output"
