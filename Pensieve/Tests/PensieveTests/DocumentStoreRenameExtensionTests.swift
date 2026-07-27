@@ -44,6 +44,26 @@ final class DocumentStoreRenameExtensionTests: XCTestCase {
   }
 
   @MainActor
+  func testRenamingAFileToAnExplicitMarkdownExtensionKeepsExactlyMarkdown() throws {
+    let folder = try makeTemporaryFolder()
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(), indexDatabase: temporaryIndexDatabase(in: folder))
+    let appState = AppState()
+
+    let source = folder.appendingPathComponent("a.md")
+    try "body".write(to: source, atomically: true, encoding: .utf8)
+
+    XCTAssertTrue(manager.rename(url: source, to: "b.markdown", into: appState))
+
+    let expected = folder.appendingPathComponent("b.markdown")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: expected.path))
+    XCTAssertFalse(
+      FileManager.default.fileExists(
+        atPath: folder.appendingPathComponent("b.markdown.md").path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+  }
+
+  @MainActor
   func testRenamingAFolderNeverAppendsAnExtension() throws {
     let folder = try makeTemporaryFolder()
     let manager = FolderManager(
