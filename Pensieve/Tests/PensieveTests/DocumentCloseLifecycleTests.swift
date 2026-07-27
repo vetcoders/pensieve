@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 @testable import Pensieve
@@ -397,6 +398,131 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     controller.closeActiveDocument { _ in }
     XCTAssertEqual(recorder.promptCount, 2)
     recorder.answerPending(.cancel)
+  }
+
+  // MARK: - windowShouldClose: the red button / tab × (#15 P1-01)
+
+  /// The red close button routes through `windowShouldClose`. With auto-save off
+  /// and a dirty file-backed document it asks Save / Don't Save / Cancel and
+  /// vetoes the immediate AppKit teardown (returns false). Cancel keeps the
+  /// window and the buffer; not one byte reaches the file before the answer.
+  @MainActor
+  func testWindowShouldCloseAsksAndCancelKeepsTheWindow() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let recorder = SaveChangesRecorder()
+    recorder.answer = .cancel
+    let appState = AppState()
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: noteURL.standardizedFileURL)
+    appState.activeDocumentText = "edited before the close button"
+    appState.activeDocumentDirty = true
+
+    let window = Self.makeTestWindow()
+    defer { window.close() }
+    let proceed = controller.windowShouldClose(window)
+
+    XCTAssertFalse(proceed, "a dirty auto-save-off close must veto the immediate teardown")
+    XCTAssertEqual(recorder.prompts, [.savePathed])
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "original",
+      "no bytes may hit the file before the user's choice")
+    XCTAssertTrue(appState.documentSession.isDirty, "Cancel keeps the buffer")
+    XCTAssertEqual(appState.documentSession.text, "edited before the close button")
+  }
+
+  /// Don't Save on the close button settles the session without writing and lets
+  /// the window go — the veto is only momentary, to run the sheet.
+  @MainActor
+  func testWindowShouldCloseSettlesAndClosesOnDontSave() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let recorder = SaveChangesRecorder()
+    recorder.answer = .discard
+    let appState = AppState()
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: noteURL.standardizedFileURL)
+    appState.activeDocumentText = "dropped on purpose"
+    appState.activeDocumentDirty = true
+
+    let window = Self.makeTestWindow()
+    defer { window.close() }
+    let proceed = controller.windowShouldClose(window)
+
+    XCTAssertFalse(proceed, "the sheet vetoes the immediate close; the window closes on the answer")
+    XCTAssertEqual(recorder.prompts, [.savePathed])
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "original", "Don't Save writes nothing")
+    XCTAssertNil(appState.documentSession.document)
+    XCTAssertFalse(appState.documentSession.hasEditableBuffer)
+  }
+
+  /// Auto-save owns the file, so the close button asks nothing and AppKit may
+  /// tear the window down immediately — the willCloseNotification teardown
+  /// flushes the pending edit.
+  @MainActor
+  func testWindowShouldCloseAllowsImmediateCloseWhenAutoSaveOwnsTheFile() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let recorder = SaveChangesRecorder()
+    let appState = AppState()
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: true, recorder: recorder)
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: noteURL.standardizedFileURL)
+    appState.activeDocumentText = "edited with auto-save on"
+    appState.activeDocumentDirty = true
+
+    let window = Self.makeTestWindow()
+    defer { window.close() }
+
+    XCTAssertTrue(
+      controller.windowShouldClose(window),
+      "auto-save owns the file, so nothing is asked and the window may close now")
+    XCTAssertEqual(recorder.promptCount, 0)
+  }
+
+  /// A pristine document's close button never asks — nothing is at stake.
+  @MainActor
+  func testWindowShouldCloseAllowsImmediateCloseForACleanDocument() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("note.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let recorder = SaveChangesRecorder()
+    let appState = AppState()
+    let controller = makeController(
+      appState: appState, in: folder, autoSaveEnabled: false, recorder: recorder)
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: noteURL.standardizedFileURL)
+
+    let window = Self.makeTestWindow()
+    defer { window.close() }
+
+    XCTAssertTrue(controller.windowShouldClose(window))
+    XCTAssertEqual(recorder.promptCount, 0)
+  }
+
+  @MainActor
+  private static func makeTestWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
   }
 
   // MARK: - Store layer, auto-save seam

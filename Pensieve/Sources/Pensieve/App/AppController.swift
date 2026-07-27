@@ -842,6 +842,24 @@ final class AppController: ObservableObject {
   /// window saves, which is precisely the ordering the sequence exists to prevent.
   @discardableResult
   func applicationShouldTerminate() -> Bool {
+    // ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
+    // from. Other windows would otherwise exit through their teardown path,
+    // which has no veto point left and can only stash a recovery draft, never
+    // ask. Resolve each live window's session through the same synchronous
+    // Save / Don't Save / Cancel guard a document switch uses; a Cancel anywhere
+    // aborts the whole quit and leaves every window exactly as it was.
+    let others = documentWindowRegistry.liveDocumentControllers().filter { $0 !== self }
+    for controller in others where !controller.resolveSessionForTermination() {
+      return false
+    }
+    return resolveSessionForTermination()
+  }
+
+  /// Settles THIS window's unsaved session for a quit: the same synchronous
+  /// Save / Don't Save / Cancel guard `prepareForDocumentSwitch` runs before a
+  /// buffer is replaced. Returns false when the user cancels, which aborts the
+  /// quit.
+  func resolveSessionForTermination() -> Bool {
     documentStore.prepareForDocumentSwitch(appState: appState)
   }
 
@@ -904,6 +922,47 @@ final class AppController: ObservableObject {
       self.refreshRecoveredDrafts()
       completion?(didClose)
     }
+  }
+
+  /// Whether THIS window may close on the red close button or a tab's "×".
+  /// Mirrors the ⌘W conscious lifecycle (`closeActiveDocument`) but ends by
+  /// closing the WINDOW instead of reverting it to the empty state — the red
+  /// button means "this window goes away". Returns true when AppKit may tear the
+  /// window down immediately (nothing unsaved, or auto-save owns the file, in
+  /// which case the `willCloseNotification` teardown flushes it). Returns false
+  /// when a Save / Don't Save / Cancel sheet is now up: on Save or Don't Save the
+  /// window is closed programmatically once the answer lands; on Cancel — or a
+  /// failed save — it stays exactly as it was, so no unsaved work is lost to a
+  /// close the user did not confirm.
+  @discardableResult
+  func windowShouldClose(_ window: NSWindow) -> Bool {
+    let decision = documentStore.closeDecision(appState: appState)
+    guard let prompt = decision.prompt else {
+      // closeWithoutPrompting / saveWithoutPrompting: nothing to ask. Let the
+      // normal teardown run — for an auto-save-owned file it flushes on close.
+      return true
+    }
+
+    // A sheet is already asking about this very document — treat the extra close
+    // as a no-op rather than stacking a second question on the same buffer.
+    guard !isConfirmingClose else { return false }
+
+    isConfirmingClose = true
+    let session = appState.documentSession
+    confirmSaveChanges(prompt, session, hostWindowProvider?() ?? Self.currentKeyWindow()) {
+      [weak self, weak window] response in
+      guard let self else { return }
+      self.isConfirmingClose = false
+      let didClose = self.documentStore.finishClose(
+        decision: decision, response: response, appState: self.appState)
+      self.refreshRecoveredDrafts()
+      // Only a settled close (saved or discarded) tears the window down; its
+      // `willCloseNotification` guard is a no-op on the now-clean session. Cancel
+      // or a failed save leaves the window — and its buffer — intact.
+      guard didClose else { return }
+      window?.close()
+    }
+    return false
   }
 
   // MARK: - Recovered drafts (launcher surface)

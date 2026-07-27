@@ -2235,9 +2235,12 @@ final class TerminationQuiescenceTests: XCTestCase {
       try indexHits(matching: "faileddsaveneedle", at: databaseURL), 0,
       "fixture precondition: the debounce must still be asleep")
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the close-time file write must genuinely fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the close-time file write must genuinely fail — a successful one "
+        + "clears isDirty. The teardown reports success either way now: with the write refused it "
+        + "stashes the buffer as a recovery draft rather than losing it")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2323,9 +2326,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     appState.documentSession.load(document: closingRef, text: "before the doomed edit")
     appState.documentSession.isDirty = true
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the closing window's own save must fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the closing window's own save must fail — a successful one clears "
+        + "isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2403,9 +2408,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     appState.documentSession.load(document: closingRef, text: "before the doomed edit")
     appState.documentSession.isDirty = true
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the closing window's own save must fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the closing window's own save must fail — a successful one clears "
+        + "isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2419,9 +2426,11 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "cancel rule exists to prevent")
 
     // Now the owner itself closes — and its save fails too. Still nothing may reach FTS.
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: otherState),
-      "fixture precondition: the owner's own close-time write must genuinely fail")
+    store.savePendingChangesOnClose(appState: otherState)
+    XCTAssertTrue(
+      otherState.documentSession.isDirty,
+      "fixture precondition: the owner's own close-time write must genuinely fail — a successful "
+        + "one clears isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(

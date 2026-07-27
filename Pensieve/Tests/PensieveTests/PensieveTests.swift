@@ -3793,6 +3793,114 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentDirty)
   }
 
+  /// ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
+  /// from — otherwise other windows exit through their teardown path, which has
+  /// no veto point and can never ask. With every window's guard resolving, the
+  /// quit proceeds and each dirty session was asked.
+  @MainActor
+  func testQuitResolvesEveryWindowsUnsavedWork() {
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let windowA = Self.makeControllerlessWindow()
+    let windowB = Self.makeControllerlessWindow()
+    defer {
+      windowA.close()
+      windowB.close()
+    }
+
+    var promptedA = false
+    let stateA = AppState()
+    let controllerA = AppController(
+      appState: stateA,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+        dirtySessionPrompt: { _ in
+          promptedA = true
+          return .discard
+        }),
+      indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(controllerA.createUntitledDocument())
+    stateA.activeDocumentText = "window A unsaved"
+    stateA.activeDocumentDirty = true
+
+    var promptedB = false
+    let stateB = AppState()
+    let controllerB = AppController(
+      appState: stateB,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+        dirtySessionPrompt: { _ in
+          promptedB = true
+          return .discard
+        }),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(controllerB.createUntitledDocument())
+    stateB.activeDocumentText = "window B unsaved"
+    stateB.activeDocumentDirty = true
+
+    registry.registerController(controllerA, for: windowA)
+    registry.registerController(controllerB, for: windowB)
+
+    XCTAssertTrue(controllerA.applicationShouldTerminate())
+    XCTAssertTrue(promptedA, "the firing window's dirty session must be asked about")
+    XCTAssertTrue(promptedB, "the OTHER window's dirty session must be asked about too")
+    XCTAssertFalse(stateA.documentSession.isDirty)
+    XCTAssertFalse(stateB.documentSession.isDirty)
+  }
+
+  /// A Cancel in ANY window aborts the whole quit; every window keeps its work.
+  @MainActor
+  func testQuitCancelledInAnotherWindowAbortsTheWholeQuit() {
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let otherWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      otherWindow.close()
+    }
+
+    let firingState = AppState()
+    let firingController = AppController(
+      appState: firingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+        dirtySessionPrompt: { _ in .discard }),
+      indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(firingController.createUntitledDocument())
+    firingState.activeDocumentText = "firing window work"
+    firingState.activeDocumentDirty = true
+
+    var promptedOther = false
+    let otherState = AppState()
+    let otherController = AppController(
+      appState: otherState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
+        dirtySessionPrompt: { _ in
+          promptedOther = true
+          return .cancel
+        }),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(otherController.createUntitledDocument())
+    otherState.activeDocumentText = "please keep this"
+    otherState.activeDocumentDirty = true
+
+    registry.registerController(firingController, for: firingWindow)
+    registry.registerController(otherController, for: otherWindow)
+
+    XCTAssertFalse(
+      firingController.applicationShouldTerminate(),
+      "a Cancel in another window must abort the whole quit")
+    XCTAssertTrue(promptedOther, "the cancelling window must have been asked")
+    XCTAssertTrue(
+      otherState.documentSession.isDirty, "the cancelled window keeps its unsaved work intact")
+  }
+
   /// Open Files mirrors EVERY window's documents into EVERY window's sidebar, so
   /// closing a row can target a document owned by ANOTHER window. The dirty
   /// guard must run in the target's OWN session — cancelling it there must abort
