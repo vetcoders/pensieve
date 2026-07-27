@@ -758,19 +758,51 @@ final class IndexDatabase {
     }.value
   }
 
-  /// Synchronous truncating checkpoint for the quit path. `applicationShouldTerminate` cannot await
-  /// a detached task — the process may be gone before it runs — so this one blocks, deliberately: at
-  /// that point there is no UI left to stall, and the WAL is already bounded by the batch/close
-  /// checkpoints, so the truncate has little left to flush. No-op when the index was never opened.
-  func checkpointOnTerminate() {
+  /// How long the quit-path checkpoint may wait for the writer before it gives
+  /// up. A long reindex transaction can hold the write barrier for minutes; the
+  /// WAL is already bounded by the batch/close checkpoints and the index is
+  /// rebuildable, so a skipped truncate is recoverable — a beachballed quit is
+  /// not. Kept short so Quit stays responsive.
+  nonisolated static let terminateCheckpointTimeout: TimeInterval = 2.0
+
+  /// Best-effort truncating checkpoint for the quit path. `applicationShouldTerminate` cannot await a
+  /// detached task — the process may be gone before it runs — so the checkpoint runs synchronously,
+  /// but BOUNDED: an in-flight reindex holds `barrierWriteWithoutTransaction` for the whole
+  /// transaction, and blocking on it unconditionally beachballs the quit for minutes. Wait at most
+  /// `timeout`; past that, let the process go. The WAL is already bounded by the batch/close
+  /// checkpoints and the index is rebuildable, so a skipped truncate is recoverable. No-op when the
+  /// index was never opened.
+  func checkpointOnTerminate(timeout: TimeInterval = IndexDatabase.terminateCheckpointTimeout) {
     guard let pool = databasePool else { return }
-    do {
-      try pool.barrierWriteWithoutTransaction { db in
-        _ = try db.checkpoint(.truncate)
+    let completed = Self.runBounded(timeout: timeout) {
+      do {
+        try pool.barrierWriteWithoutTransaction { db in
+          _ = try db.checkpoint(.truncate)
+        }
+      } catch {
+        NSLog("Pensieve index checkpoint on terminate failed: %@", error.localizedDescription)
       }
-    } catch {
-      NSLog("Pensieve index checkpoint on terminate failed: %@", error.localizedDescription)
     }
+    if !completed {
+      NSLog(
+        "Pensieve index checkpoint on terminate skipped: a long write is in flight; "
+          + "the WAL stays bounded and the index is rebuildable")
+    }
+  }
+
+  /// Runs `work` on a utility queue and waits at most `timeout` for it to finish. Returns true when it
+  /// completed in time, false when it timed out — in which case `work` keeps running to completion, it
+  /// simply no longer gates the caller. Extracted so the quit-path bound is unit-testable without a
+  /// live database writer holding the pool.
+  nonisolated static func runBounded(
+    timeout: TimeInterval, work: @escaping @Sendable () -> Void
+  ) -> Bool {
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+      work()
+      done.signal()
+    }
+    return done.wait(timeout: .now() + timeout) != .timedOut
   }
 
   /// Hands freed pages back to the filesystem. Only meaningful in `auto_vacuum = INCREMENTAL` (mode

@@ -246,4 +246,49 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   /// the production constant is private and the test asserts the OBSERVABLE
   /// contract (enough slack exists to be worth reclaiming), not the constant.
   private static let compactionThresholdPages = 256
+
+  // MARK: - Bounded quit-path checkpoint (#14 P1-01)
+
+  /// The quit-path checkpoint must NOT wait unboundedly on a long in-flight index
+  /// write: a beachballed quit is worse than a skipped truncate (the WAL is
+  /// bounded and the index is rebuildable). `runBounded` is the seam that
+  /// enforces the bound, so it returns `false` and hands control back within the
+  /// timeout even when the work outlasts it.
+  func testRunBoundedGivesUpWhenWorkOutlastsTheTimeout() {
+    let stillRunning = DispatchSemaphore(value: 0)
+    let start = Date()
+
+    let completed = IndexDatabase.runBounded(timeout: 0.2) {
+      // Stand in for a reindex transaction holding the writer far past the bound.
+      stillRunning.wait()
+    }
+
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertFalse(completed, "work that outlasts the timeout must report as not completed")
+    XCTAssertLessThan(
+      elapsed, 1.0, "the caller must be released near the timeout, not held for the whole write")
+    // Release the parked work so its queue slot is not leaked past the test.
+    stillRunning.signal()
+  }
+
+  /// The common case: the checkpoint finishes well inside the bound, so
+  /// `runBounded` reports completion and the quit path logs nothing.
+  func testRunBoundedReportsCompletionWhenWorkFinishesInTime() {
+    let completed = IndexDatabase.runBounded(timeout: 2.0) {
+      // Trivial, well under the bound.
+    }
+    XCTAssertTrue(completed)
+  }
+
+  /// A never-opened index must make the quit-path checkpoint an instant no-op —
+  /// there is no pool to checkpoint, so it returns immediately regardless of the
+  /// timeout.
+  func testCheckpointOnTerminateIsAnInstantNoOpWithoutAnOpenIndex() {
+    let database = IndexDatabase(
+      databaseURL: FileManager.default.temporaryDirectory
+        .appendingPathComponent("PensieveNeverOpened-\(UUID().uuidString).db"))
+    let start = Date()
+    database.checkpointOnTerminate(timeout: 60)
+    XCTAssertLessThan(Date().timeIntervalSince(start), 1.0)
+  }
 }
