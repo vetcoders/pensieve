@@ -2389,7 +2389,9 @@ enum WorkspaceScanner {
 
   static func hasRealExtension(forTypedName name: String) -> Bool {
     let ext = URL(fileURLWithPath: name).pathExtension
-    return !ext.isEmpty && ext.count <= 5 && ext.allSatisfy(\.isLetter)
+    guard !ext.isEmpty else { return false }
+    if isMarkdownExtension(ext) { return true }
+    return ext.count <= 5 && ext.allSatisfy(\.isLetter)
   }
 
   /// Sidebar inline-rename hint: true when the typed name has a real
