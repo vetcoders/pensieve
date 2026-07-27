@@ -614,6 +614,14 @@ final class DocumentWindowRegistry: ObservableObject {
     controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
   }
 
+  /// Every live document-window controller. The quit path needs this because ⌘Q
+  /// must resolve the unsaved session in EVERY window, not only the one it fired
+  /// from — otherwise the other windows exit through their teardown path, which
+  /// has no veto point and can never ask the user.
+  func registeredControllers() -> [AppController] {
+    controllersByWindow.values.compactMap(\.controller)
+  }
+
   /// The controller owning the window that currently shows `identity`, so a
   /// cross-window close routes its dirty guard through the target's own session.
   func controller(for identity: DocumentIdentity) -> AppController? {
