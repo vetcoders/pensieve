@@ -141,6 +141,15 @@ sign_code() {
     fi
 }
 
+# bundle_identity_matches() — guards the lanes that REUSE an existing .app.
+# Kept in a sourceable lib so scripts/test-bundle-identity.sh can exercise it
+# without a build (see `make test-scripts`).
+# The source= directive lets `shellcheck -x` follow the lib; the plain hook run
+# has no -x, hence the SC1091 pair (same idiom as the .notary.env source below).
+# shellcheck source=scripts/lib/bundle-identity.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/bundle-identity.sh"
+
 # ─── Pre-flight ───────────────────────────────────────────────────────────
 log "Pre-flight checks"
 [[ -d "$PKG_DIR" ]] || die "Pensieve/ not found at $PKG_DIR"
@@ -225,7 +234,18 @@ if (( DMG_ONLY )); then
     if ! codesign --verify --strict "$APP_BUNDLE" >/dev/null 2>&1; then
         die "--dmg-only: $APP_BUNDLE signature is invalid — rebuild it before packaging a DMG."
     fi
-    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (skipping build/sign/notarize-app)"
+    # A valid signature proves the bundle was not modified after signing. It is
+    # NOT proof of identity: a perfectly signed .app from an older VERSION/HEAD
+    # verifies clean, and everything downstream here (DMG filename, the stable
+    # Pensieve.dmg download alias, the checksum, the release notes) would then
+    # advertise $BUILD_LABEL while shipping that older app. Compare the identity
+    # stamped into the bundle at build time before reusing it.
+    if ! bundle_identity_matches "$APP_BUNDLE" "$APP_VERSION" "$COMMIT_FULL"; then
+        die "--dmg-only: $APP_BUNDLE was built from a different source than this tree.
+       Packaging it would ship that older app under the label $BUILD_LABEL.
+       Run a full build first: make release-clean (or ./scripts/build-release.sh --clean)."
+    fi
+    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, skipping build/sign/notarize-app)"
 fi
 
 if (( ! DMG_ONLY )); then
