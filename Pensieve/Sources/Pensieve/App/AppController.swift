@@ -432,6 +432,27 @@ final class AppController: ObservableObject {
     return documentStore.select(ref: nil, into: appState)
   }
 
+  /// Phase-1 confirm sibling of `confirmDirtySessionClearBeforeExternalClose`,
+  /// used by the multi-window "Clear Open Files" pass. When `identity` is this
+  /// window's active document it runs the NON-DESTRUCTIVE decide half and hands
+  /// back the resolution — a Discard is only RECORDED, not applied — so a Cancel
+  /// raised on a LATER window can abort with nothing lost. Returns `nil` when
+  /// the user cancelled. When `identity` is not this window's active doc it is a
+  /// no-op reporting `.settled`.
+  func confirmDirtySessionForExternalClose(
+    identity: DocumentIdentity
+  ) -> DocumentStore.DirtySessionResolution? {
+    guard appState.windowModel.documentIdentity == identity.standardized else { return .settled }
+    return documentStore.confirmDirtySessionForExternalClose(appState: appState)
+  }
+
+  /// Phase-2 apply for the "Clear Open Files" pass: performs the destructive
+  /// step phase 1 deferred for this window — dropping an untitled draft the user
+  /// chose to Discard and marking it clean. `.settled` is a no-op.
+  func applyDeferredDirtySessionResolution(_ resolution: DocumentStore.DirtySessionResolution) {
+    documentStore.applyDeferredDirtySessionResolution(resolution, appState: appState)
+  }
+
   func clearOpenFiles() {
     // Open Files mirrors EVERY window's documents, so "Clear Open Files" tears
     // down tabs owned by other windows too. Guarding only this window's active
@@ -439,17 +460,36 @@ final class AppController: ObservableObject {
     // window's unsaved edits with no prompt. Run each document's dirty guard in
     // its OWNING window's session, mirroring closeOpenDocument.
     //
-    // ABORT-ALL: if ANY guard is cancelled, close NOTHING and return.
+    // ATOMIC COLLECT-THEN-APPLY over ONE identity snapshot, so a Cancel can
+    // never leave a partially-mutated UI — not even a window silently emptied of
+    // its recoverable draft:
     //
-    // Cancel aborts the operation: no window is closed. It does NOT roll back
-    // decisions already made in this pass — a window where the user chose Save
-    // has its file written; one where they chose Discard has its buffer
-    // dropped. What is reversible is the closing of windows, not the decisions
-    // about content.
+    //   Phase 1 (COLLECT) — ask every owner and RECORD its resolution without
+    //   performing any deferred destruction. A Save (or force-save) does write
+    //   bytes — that is not a loss and is the only step where a failed I/O can
+    //   still abort — but a Discard is only remembered, its recovery draft left
+    //   intact. If ANY owner cancels, apply nothing and close nothing: every
+    //   window keeps its content, and an untitled Discard is still recoverable.
+    //   The one thing NOT rolled back is a Save already committed in this pass.
+    //
+    //   Phase 2 (APPLY) — only once EVERY owner resolved, apply the deferred
+    //   Discards FIRST (drop the draft, mark clean) so no abandoned draft
+    //   resurrects and no stale `isDirty` trips the teardown save hook, THEN
+    //   close the windows. No explicit per-window clear is needed: closing a
+    //   window discards its `AppState` (and thus its session) outright.
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
+
+    var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
     for identity in identities {
       let owner = documentWindowRegistry.controller(for: identity) ?? self
-      guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
+      guard let resolution = owner.confirmDirtySessionForExternalClose(identity: identity) else {
+        return
+      }
+      deferred.append((owner, resolution))
+    }
+
+    for (owner, resolution) in deferred {
+      owner.applyDeferredDirtySessionResolution(resolution)
     }
     documentWindowRegistry.closeAllDocumentWindows()
   }

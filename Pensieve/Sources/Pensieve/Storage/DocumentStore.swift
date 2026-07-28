@@ -2735,6 +2735,14 @@ final class DocumentStore {
     return saveExisting(appState: appState, indexNow: true)
   }
 
+  /// Single-window "settle the dirty session, report whether the user
+  /// cancelled" primitive: decides AND immediately applies the dirty-session
+  /// guard — force-save a pathed doc, or Save/Discard/Cancel an untitled draft —
+  /// without clearing the session, returning `false` only when the untitled
+  /// prompt was cancelled. Correct for switching the document within one window,
+  /// where there is no later step that could still abort. A multi-window close
+  /// that CAN be cancelled late must instead split decide from apply via
+  /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`.
   @discardableResult
   func prepareForDocumentSwitch(appState: AppState) -> Bool {
     self.appState = appState
@@ -2784,22 +2792,41 @@ final class DocumentStore {
     }
   }
 
-  private func saveDirtySessionIfNeeded(appState: AppState) -> Bool {
+  /// The user's resolution of a dirty session, split so a multi-window pass can
+  /// DECIDE without yet performing the irreversible part.
+  enum DirtySessionResolution {
+    /// Nothing remains to apply: the session was clean, or a Save / force-save
+    /// already wrote its bytes in the decide step. A write is not a loss — the
+    /// content is on disk and the buffer lives on — so it stays in decide.
+    case settled
+    /// The user chose Discard on an untitled draft. The DESTRUCTIVE part —
+    /// dropping the recovery draft and marking the buffer clean — is deferred to
+    /// `applyDirtySessionResolution`, so a Cancel later in a multi-window pass
+    /// leaves the draft recoverable.
+    case discardUntitled
+  }
+
+  /// Non-destructive DECIDE half of the dirty-session guard. Force-saves a
+  /// pathed doc, or prompts Save/Discard/Cancel for an untitled draft, but
+  /// performs NO irreversible drop: a Discard is only RECORDED as
+  /// `.discardUntitled`. Returns `nil` when the user cancelled (or a forced save
+  /// failed). A Save DOES write bytes here — that write is the only step where a
+  /// failed I/O can still abort the pass, so it must stay in decide, never move
+  /// to apply.
+  private func decideDirtySessionResolution(appState: AppState) -> DirtySessionResolution? {
     guard appState.documentSession.isDirty else {
-      return true
+      return .settled
     }
 
     if appState.documentSession.isUntitled {
       switch dirtyUntitledPrompt(appState.documentSession) {
       case .save:
-        guard let url = savePanelURLProvider(appState) else { return false }
-        return saveAs(appState: appState, to: url)
+        guard let url = savePanelURLProvider(appState) else { return nil }
+        return saveAs(appState: appState, to: url) ? .settled : nil
       case .discard:
-        recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
-        appState.documentSession.isDirty = false
-        return true
+        return .discardUntitled
       case .cancel:
-        return false
+        return nil
       }
     }
 
@@ -2807,8 +2834,52 @@ final class DocumentStore {
     _ = saveExisting(appState: appState, indexNow: true)
     guard !appState.documentSession.isDirty else {
       appState.selectedDocumentID = openSessionID
+      return nil
+    }
+    return .settled
+  }
+
+  /// APPLY half: performs the deferred destructive step recorded by decide. Only
+  /// `.discardUntitled` carries one — drop the untitled recovery draft and mark
+  /// the buffer clean. `.settled` is a no-op.
+  private func applyDirtySessionResolution(
+    _ resolution: DirtySessionResolution, appState: AppState
+  ) {
+    switch resolution {
+    case .settled:
+      break
+    case .discardUntitled:
+      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      appState.documentSession.isDirty = false
+    }
+  }
+
+  /// Phase-1 confirm for a multi-window external close ("Clear Open Files").
+  /// Runs the non-destructive DECIDE half and hands back the resolution so the
+  /// caller can defer the destructive part until every window has confirmed.
+  /// Returns `nil` when the user cancelled — the caller must then apply nothing
+  /// and close nothing.
+  func confirmDirtySessionForExternalClose(appState: AppState) -> DirtySessionResolution? {
+    self.appState = appState
+    return decideDirtySessionResolution(appState: appState)
+  }
+
+  /// Phase-2 apply for a multi-window external close: performs the destructive
+  /// step deferred in phase 1. Called only once every window confirmed without a
+  /// Cancel, and BEFORE the windows are torn down, so a dropped draft can't
+  /// resurrect and a stale `isDirty` can't trip the teardown save hook.
+  func applyDeferredDirtySessionResolution(
+    _ resolution: DirtySessionResolution, appState: AppState
+  ) {
+    self.appState = appState
+    applyDirtySessionResolution(resolution, appState: appState)
+  }
+
+  private func saveDirtySessionIfNeeded(appState: AppState) -> Bool {
+    guard let resolution = decideDirtySessionResolution(appState: appState) else {
       return false
     }
+    applyDirtySessionResolution(resolution, appState: appState)
     return true
   }
 
