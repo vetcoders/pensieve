@@ -433,9 +433,23 @@ final class AppController: ObservableObject {
   }
 
   func clearOpenFiles() {
-    // Guard this window's active doc before tearing every tab down.
-    if appState.windowModel.documentIdentity != nil {
-      guard documentStore.select(ref: nil, into: appState) else { return }
+    // Open Files mirrors EVERY window's documents, so "Clear Open Files" tears
+    // down tabs owned by other windows too. Guarding only this window's active
+    // doc (the old behavior) let closeAllDocumentWindows discard another
+    // window's unsaved edits with no prompt. Run each document's dirty guard in
+    // its OWNING window's session, mirroring closeOpenDocument.
+    //
+    // ABORT-ALL: if ANY guard is cancelled, close NOTHING and return.
+    //
+    // Cancel aborts the operation: no window is closed. It does NOT roll back
+    // decisions already made in this pass — a window where the user chose Save
+    // has its file written; one where they chose Discard has its buffer
+    // dropped. What is reversible is the closing of windows, not the decisions
+    // about content.
+    let identities = documentWindowRegistry.openDocuments.map(\.identity)
+    for identity in identities {
+      let owner = documentWindowRegistry.controller(for: identity) ?? self
+      guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
     }
     documentWindowRegistry.closeAllDocumentWindows()
   }

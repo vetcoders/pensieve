@@ -88,6 +88,9 @@ final class RecoveryStore {
   }
 
   private static func defaultDirectoryURL(fileManager: FileManager) -> URL {
+    if let overrideRoot = AppSupportLocation.overrideRoot(fileManager: fileManager) {
+      return overrideRoot.appendingPathComponent("Recovery", isDirectory: true)
+    }
     let appSupport =
       fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
       ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(

@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_PATH="dist/Pensieve.app"
-APP_NAME="Pensieve"
-APP_ID="io.vetcoders.pensieve"
+# The harness never drives the bundle the operator actually uses. It stages a
+# renamed, re-signed copy under $SMOKE_ROOT and drives that instead, so the two
+# identities the run touches -- the process name every pkill/System Events call
+# resolves, and the defaults domain cfprefsd scopes reads and writes to -- both
+# belong to the smoke alone. Before this, `pkill -x Pensieve` killed the
+# operator's live app by name, and every harness launch wrote its temp-file
+# bookmarks into the operator's io.vetcoders.pensieve domain until her real Open
+# Files entries were evicted.
+SOURCE_APP_PATH="dist/Pensieve.app"
+APP_PATH=""
+APP_NAME="PensieveSmoke"
+APP_ID="io.vetcoders.pensieve.smoke"
+SMOKE_SIGNING_MODE=""
 COLD_ONLY=0
 MENU_RESTORED_ONLY=0
 EXTRA_EXPECTED_IDENTIFIERS=()
@@ -32,9 +42,9 @@ ok() {
 
 # Terminate every running instance of the app under test and block until the
 # process table is clear. AppleScript targets the app by bare process name
-# ("tell process Pensieve"), and System Events resolves that name to the OLDEST
-# matching process. A run that dies mid-osascript leaves an orphaned, window-
-# less Pensieve alive; the next run's `open -n` then spawns a second instance,
+# ("tell process PensieveSmoke"), and System Events resolves that name to the
+# OLDEST matching process. A run that dies mid-osascript leaves an orphaned,
+# windowless instance alive; the next run's `open -n` then spawns a second one,
 # and the census locks onto the windowless orphan -> empty `observed:` census.
 # Guaranteeing a single instance (clean before launch, clean on every exit)
 # removes that ambiguity at the source. Graceful quit first, then SIGTERM, then
@@ -84,6 +94,92 @@ disarm_restoration_default() {
   RESTORATION_DEFAULT_ARMED=0
 }
 
+# Single launch funnel. The staged Info.plist already carries the override in
+# LSEnvironment; repeating it here means a launch stays isolated even if
+# LaunchServices ever declines to honor LSEnvironment for a staged bundle.
+open_smoke_app() {
+  open --env "PENSIEVE_SUPPORT_DIR=$SMOKE_SUPPORT" "$@"
+}
+
+plist_set_string() {
+  local plist="$1" key="$2" value="$3"
+  /usr/libexec/PlistBuddy -c "Set :$key $value" "$plist" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist" >/dev/null \
+    || die "could not set $key in $plist"
+}
+
+# Build the isolated bundle the whole run drives: a copy of the app under test
+# with a smoke-only identity.
+#
+# Three things have to change together, because each one closes a different
+# leak. The EXECUTABLE name is what the kernel reports as the process name, so
+# `pkill -x` / `pgrep -x` / `tell process` resolve the smoke and can never reach
+# the operator's running app. The BUNDLE IDENTIFIER is what cfprefsd keys
+# preferences on, so every default the app reads or writes -- including the
+# workspace file bookmarks that a harness run kept appending -- lands in
+# io.vetcoders.pensieve.smoke. And PENSIEVE_SUPPORT_DIR redirects the four
+# Application Support derivations, which the other two cannot reach:
+# NSHomeDirectory() reads getpwuid, so FileManager resolves the operator's real
+# ~/Library/Application Support no matter what identity the bundle carries.
+#
+# The override is written into the staged Info.plist as LSEnvironment (the app
+# gets it however LaunchServices starts it) and passed again on each `open
+# --env` (belt and braces if a staged bundle's LSEnvironment is ever ignored).
+stage_smoke_app() {
+  local source="$1" staged="$2" support="$3"
+  local contents="$staged/Contents"
+  local plist="$contents/Info.plist"
+
+  rm -rf "$staged"
+  # ditto, not cp -R: it is the tool that copies a bundle's extended attributes
+  # and resource forks intact, which a code-signed bundle depends on.
+  ditto "$source" "$staged" || die "could not stage a smoke copy of $source"
+  [[ -f "$plist" ]] || die "staged bundle has no Info.plist: $plist"
+
+  local source_executable
+  source_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null)"
+  [[ -n "$source_executable" ]] || die "source bundle declares no CFBundleExecutable: $source"
+  if [[ "$source_executable" != "$APP_NAME" ]]; then
+    mv "$contents/MacOS/$source_executable" "$contents/MacOS/$APP_NAME" \
+      || die "could not rename the staged executable to $APP_NAME"
+  fi
+
+  plist_set_string "$plist" CFBundleExecutable "$APP_NAME"
+  plist_set_string "$plist" CFBundleIdentifier "$APP_ID"
+  plist_set_string "$plist" CFBundleName "$APP_NAME"
+  plist_set_string "$plist" CFBundleDisplayName "$APP_NAME"
+  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist" >/dev/null \
+    || die "could not add LSEnvironment to $plist"
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PENSIEVE_SUPPORT_DIR string $support" "$plist" \
+    >/dev/null || die "could not set PENSIEVE_SUPPORT_DIR in $plist"
+
+  # Every edit above broke the inherited seal, so the copy has to be signed
+  # again or macOS refuses to launch it. Developer ID when the same identity
+  # build-release.sh uses is in the keychain, ad-hoc otherwise -- this is a
+  # locally staged copy that never leaves the machine, so either is enough.
+  rm -rf "$contents/_CodeSignature"
+  local identity="" identity_file="$HOME/.keys/signing-identity.txt"
+  if [[ -f "$identity_file" ]]; then
+    identity="$(head -n1 "$identity_file" | sed -e 's/[[:space:]]*$//')"
+    if [[ -n "$identity" ]] \
+      && ! security find-identity -v -p codesigning | grep -qF -- "$identity"; then
+      identity=""
+    fi
+  fi
+  if [[ -n "$identity" ]] && codesign --force --deep --sign "$identity" "$staged" >/dev/null 2>&1
+  then
+    SMOKE_SIGNING_MODE="Developer ID ($identity)"
+  else
+    [[ -n "$identity" ]] && log "Developer ID re-sign failed; falling back to ad-hoc"
+    codesign --force --deep --sign - "$staged" >/dev/null 2>&1 \
+      || die "could not sign the staged smoke bundle"
+    SMOKE_SIGNING_MODE="ad-hoc"
+  fi
+  codesign --verify --strict "$staged" >/dev/null 2>&1 \
+    || die "staged smoke bundle failed codesign --verify; it would not launch"
+}
+
 # P1-02 arbiter. The value-based `WindowGroup(for: DocumentRef.self)` in
 # PensieveApp.swift carries no `.commands` of its own; review feared a window
 # restored INTO that group would surface a default menu bar without our custom
@@ -119,9 +215,9 @@ run_restored_menu_probe() {
   # WindowGroup scene. A LaunchServices race can return -600 right after the
   # prior terminate; one bounded retry clears it.
   log "restored-probe: launch #1 (no document) to open the restorable scene"
-  open -a "$APP_PATH" || {
+  open_smoke_app -a "$APP_PATH" || {
     sleep 0.5
-    open -a "$APP_PATH"
+    open_smoke_app -a "$APP_PATH"
   }
   local _
   for _ in {1..120}; do
@@ -147,9 +243,9 @@ run_restored_menu_probe() {
 
   # Relaunch: macOS reopens the persisted scene as the RESTORED window under test.
   log "restored-probe: relaunch and assert restored-window menu bar"
-  open -a "$APP_PATH" || {
+  open_smoke_app -a "$APP_PATH" || {
     sleep 0.5
-    open -a "$APP_PATH"
+    open_smoke_app -a "$APP_PATH"
   }
   for _ in {1..120}; do
     pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
@@ -196,7 +292,11 @@ on run argv
   -- Classify the restored key window. A launcher / empty scene carries no
   -- document filename title; a value-based restored DOCUMENT scene does. Only
   -- the latter is the surface the P1-02 dispute is about.
-  set isRestoredDoc to (keyTitle is not "") and (keyTitle is not "Pensieve") and (keyTitle is not "Untitled")
+  -- The launcher window is titled after the running app, which is the staged
+  -- smoke bundle's name here and "Pensieve" in any bundle staged from a
+  -- differently-named source; neither is a document scene.
+  set isRestoredDoc to (keyTitle is not "") and (keyTitle is not appName) ¬
+    and (keyTitle is not "Pensieve") and (keyTitle is not "Untitled")
 
   set missingMenus to {}
   repeat with m in {"Mode", "Format", "Agents"}
@@ -272,7 +372,7 @@ end joined
 APPLESCRIPT
 }
 if [[ $# -gt 0 && "$1" != --* ]]; then
-  APP_PATH="$1"
+  SOURCE_APP_PATH="$1"
   shift
 fi
 
@@ -297,7 +397,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -d "$APP_PATH" ]] || die "App bundle not found: $APP_PATH (run make release-local or make release first)"
+[[ -d "$SOURCE_APP_PATH" ]] || die "App bundle not found: $SOURCE_APP_PATH (run make release-local or make release first)"
 
 # Real AX clicks require the display to be awake; a sleeping display
 # (displaysleep) makes popover clicks land randomly, so wake it now and
@@ -307,22 +407,31 @@ caffeinate -u -t 2 || true
 caffeinate -dsu &
 CAFFEINATE_PID=$!
 
-APP_PATH="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
+SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURCE_APP_PATH")"
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
+SMOKE_SUPPORT="$SMOKE_ROOT/support"
 cleanup() {
   kill "$CAFFEINATE_PID" 2>/dev/null || true
   # Every exit path -- success, assertion failure, or an error raised inside
-  # osascript -- must leave zero live Pensieve processes, otherwise the survivor
+  # osascript -- must leave zero live smoke processes, otherwise the survivor
   # becomes the orphan that corrupts the next run's census.
   terminate_app
-  # Revert any test-domain default the restored-window probe armed, so the
-  # operator's real preferences survive the run unchanged.
+  # Revert any smoke-domain default the restored-window probe armed. It was
+  # never written to the operator's domain, but leaving it set would make the
+  # next run's restoration state depend on the previous one.
   disarm_restoration_default
-  rm -f "$SMOKE_DOCUMENT"
-  rmdir "$SMOKE_ROOT" 2>/dev/null || true
+  # The staged bundle, its Application Support tree and the witness document
+  # all live under SMOKE_ROOT; the run owns that directory outright.
+  if [[ -n "${SMOKE_ROOT:-}" && "$SMOKE_ROOT" == */pensieve-toolbar-smoke.* ]]; then
+    rm -rf "$SMOKE_ROOT"
+  fi
 }
 trap cleanup EXIT
+
+mkdir -p "$SMOKE_SUPPORT"
+APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
+stage_smoke_app "$SOURCE_APP_PATH" "$APP_PATH" "$SMOKE_SUPPORT"
 printf '# Toolbar cold-frame witness\n\nEditable staged document.\n' >"$SMOKE_DOCUMENT"
 
 EXPECTED_TOOLBAR_IDENTIFIERS=(
@@ -354,8 +463,10 @@ EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
 BUNDLE_COMMIT="$(/usr/libexec/PlistBuddy -c 'Print :PensieveBuildCommit' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")"
-EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/Pensieve"
-log "bundle path=$APP_PATH executable=$EXECUTABLE_PATH commit=$BUNDLE_COMMIT version=$BUNDLE_VERSION build=$BUNDLE_BUILD"
+EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$APP_NAME"
+log "source bundle=$SOURCE_APP_PATH commit=$BUNDLE_COMMIT version=$BUNDLE_VERSION build=$BUNDLE_BUILD"
+log "staged bundle=$APP_PATH executable=$EXECUTABLE_PATH id=$APP_ID signature=$SMOKE_SIGNING_MODE"
+log "isolated support dir=$SMOKE_SUPPORT (PENSIEVE_SUPPORT_DIR)"
 
 if [[ $MENU_RESTORED_ONLY -eq 1 ]]; then
   run_restored_menu_probe
@@ -368,11 +479,11 @@ log "launching editable cold witness without post-launch activation"
 # exactly one process named Pensieve and the bare-name census cannot lock onto a
 # stale windowless survivor.
 terminate_app
-open -n -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
+open_smoke_app -n -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
   # LaunchServices can briefly retain the just-terminated bundle instance
   # and return -600 even after the process is gone. One bounded retry clears it.
   sleep 0.5
-  open -n -a "$APP_PATH" "$SMOKE_DOCUMENT"
+  open_smoke_app -n -a "$APP_PATH" "$SMOKE_DOCUMENT"
 }
 
 log "probing Accessibility surface"
@@ -726,7 +837,7 @@ tell application "System Events"
     my assertWindowGeometry(appName, coldPosition, coldSize, "file-backed to untitled transition")
     log "AX_CENSUS_UNTITLED=" & my joined(untitledCensus, ",")
 
-    if (count of windows) is 0 then error "Pensieve has no windows after menu probing"
+    if (count of windows) is 0 then error appName & " has no windows after menu probing"
   end tell
 end tell
 
