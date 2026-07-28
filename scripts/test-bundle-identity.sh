@@ -27,10 +27,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-VERSION_A="0.4.3"
-VERSION_B="0.4.2"
-COMMIT_A="a64d9e4af3c9d0de72e24298ff1e4d2b7a50eb5e"
-COMMIT_B="f1a739d699de6e6452fb3949a90c8583ddba680e"
+# Deliberately synthetic: these are two arbitrary, distinguishable identities,
+# NOT any real release of this repo. Using real-looking version/SHA pairs here
+# would invite a reader to think the suite encodes some branch's actual state.
+VERSION_A="9.9.1"
+VERSION_B="9.9.2"
+COMMIT_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+COMMIT_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 PASS_COUNT=0
 FAIL_COUNT=0
