@@ -4,6 +4,8 @@ import SwiftUI
 
 @main
 struct PensieveApp: App {
+  // RII-B: identifier for the scene-owned cold launcher WindowGroup.
+  static let launcherWindowGroupID = "pensieve.launcher"
   @NSApplicationDelegateAdaptor(PensieveAppDelegate.self) private var appDelegate
   // WorkspaceStore is @Observable now → @State, not @StateObject.
   @State private var workspaceStore: WorkspaceStore
@@ -12,18 +14,75 @@ struct PensieveApp: App {
   private let providerSettings: ProviderSettings
 
   init() {
+    let workspaceStore = WorkspaceStore()
+    let launchIntentCoordinator = LaunchIntentCoordinator.shared
+    let themeManager = ThemeManager()
     providerSettings = ProviderSettings.shared
-    _workspaceStore = State(wrappedValue: WorkspaceStore())
-    _launchIntentCoordinator = StateObject(wrappedValue: LaunchIntentCoordinator.shared)
-    _themeManager = StateObject(wrappedValue: ThemeManager())
+    _workspaceStore = State(wrappedValue: workspaceStore)
+    _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
+    _themeManager = StateObject(wrappedValue: themeManager)
+
+    // External-file launches deliberately bypass the value-based WindowGroup.
+    // Wire the AppKit factory before AppDelegate's launch fallback so it can
+    // materialize the root that will attach a controller and drain those URLs.
+    let factory = DocumentWindowFactory(
+      workspaceStore: workspaceStore,
+      launchIntentCoordinator: launchIntentCoordinator,
+      themeManager: themeManager
+    )
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
+      return factory.makeWindow(for: ref)
+    }
   }
 
   var body: some Scene {
-    // The WindowGroup scene serves the launcher window and any state-restored
-    // legacy document scenes (`initialDocument`). Document opens do NOT go
-    // through `openWindow(value:)` anymore: DocumentWindowRegistry builds
-    // document windows directly in AppKit (DocumentWindowFactory) and attaches
-    // them as native tabs before first presentation.
+    // RII-B — Scene-owned cold launcher (bridge #1). SwiftUI auto-presents the
+    // FIRST scene's window at launch, so this id-based (value-less) WindowGroup
+    // gives us a launcher window that is scene-owned BY CONSTRUCTION: its root's
+    // `focusedSceneValue`/`focusedSceneObject` publish into the owning scene, so
+    // `PensieveCommands` (attached here via `.commands`) resolves the exact root
+    // AppState/AppController on the first key/main transition — no factory
+    // launcher, no manual NSHostingView shell. It carries no `initialDocument`;
+    // restoration loads the recovered draft into this same window in place.
+    WindowGroup(id: Self.launcherWindowGroupID) {
+      DocumentWindowRootView(
+        workspaceStore: workspaceStore,
+        launchIntentCoordinator: launchIntentCoordinator,
+        themeManager: themeManager,
+        initialDocument: nil
+      )
+    }
+    // Opt OUT of external events here too, not just on the value-based group
+    // below. A launcher scene that still claimed Finder/Dock/`open` URL events
+    // would let SwiftUI materialize a fresh scene-owned launcher window per
+    // event — reviving the detached one-window-per-file path the registry's
+    // native-tab merge exists to prevent. With neither scene claiming them,
+    // external opens fall through to `application(_:open:)` →
+    // LaunchIntentCoordinator → registry tabs.
+    .handlesExternalEvents(matching: [])
+    .pensieveDocumentWindowChrome()
+    .commands {
+      PensieveCommands(themeManager: themeManager)
+    }
+
+    // The value-based WindowGroup serves any state-restored legacy document
+    // scenes (`initialDocument`). Document opens do NOT go through
+    // `openWindow(value:)`: DocumentWindowRegistry builds document windows
+    // directly in AppKit (DocumentWindowFactory) and attaches them as native
+    // tabs before first presentation.
+    //
+    // No `.commands` here on purpose. SwiftUI assembles ONE app-wide menu bar
+    // from the whole scene tree at launch; the `.commands` attached to the
+    // primary launcher WindowGroup above already own that single menu bar, so
+    // a window restored into THIS group inherits the full Mode/Format/Agents
+    // surface — its enabled/disabled state and target follow focus through
+    // `CommandSurfaceContext` (Commands.swift), not scene ownership. The
+    // menu structure is built from the declaration, so it never depends on a
+    // launcher window being open. Re-declaring `PensieveCommands` on this
+    // second scene would NOT merge idempotently: `CommandsBuilder` appends
+    // per scene, so every `CommandMenu` (Mode/Format/Agents) — and the
+    // replaced File groups — would appear TWICE. The single declaration above
+    // IS the app-global level that covers both scenes.
     WindowGroup("Pensieve", for: DocumentRef.self) { document in
       DocumentWindowRootView(
         workspaceStore: workspaceStore,
@@ -39,9 +98,6 @@ struct PensieveApp: App {
     // `application(_:open:)` → LaunchIntentCoordinator → registry tabs.
     .handlesExternalEvents(matching: [])
     .pensieveDocumentWindowChrome()
-    .commands {
-      PensieveCommands(themeManager: themeManager)
-    }
 
     Settings {
       ProviderSettingsView(settings: providerSettings)
@@ -100,11 +156,21 @@ struct DocumentWindowRootView: View {
             selected: appState.selectedDocumentID,
             initialDocument: initialDocument,
             loadResolved: initialDocumentLoadResolved),
+          identity: appState.windowModel.documentIdentity
+            ?? DocumentWindowRootView.accessorDocumentID(
+              selected: appState.selectedDocumentID,
+              initialDocument: initialDocument,
+              loadResolved: initialDocumentLoadResolved
+            ).map { DocumentIdentity.file($0.standardizedFileURL) },
           title: appState.documentTitle,
           representedURL: appState.documentURL,
+          isDirty: appState.documentIsDirty,
           hasEditableBuffer: appState.documentHasEditableBuffer
         ) { window in
           currentWindow = window
+          // Publish this window's owning controller so a cross-window "Close
+          // from Open Files" routes its dirty guard through this session.
+          DocumentWindowRegistry.shared.registerController(controller, for: window)
         }
       )
       .frame(
@@ -112,6 +178,12 @@ struct DocumentWindowRootView: View {
         minHeight: WindowChromeRecipe.minimumContentSize.height
       )
       .task {
+        // Seed BEFORE any load work: the menu bar must carry Pensieve's
+        // commands from the first build, not from the first scene activation.
+        // Only seed when nothing has adopted yet — a background root building
+        // after the key window must not steal the fallback (the key window owns
+        // it via `didBecomeKey` below).
+        CommandSurfaceContext.shared.adoptIfUnset(appState: appState, controller: controller)
         configureDocumentRouting()
         if let initialDocument {
           openInitialDocument(initialDocument)
@@ -127,6 +199,20 @@ struct DocumentWindowRootView: View {
       }
       .onOpenURL { url in
         controller.openFile(url: url)
+      }
+      // Keep the command-surface fallback pointed at the root the user is
+      // actually on. `.task` adopts early so the cold menu bar has content
+      // before anything is focusable; from the first key transition onwards
+      // the fallback mirrors what `focusedSceneValue` would publish, so the
+      // menu never binds to a different window's session during the moments
+      // AppKit drops key status (menu tracking, activation churn) and the
+      // focused values go silent.
+      .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) {
+        notification in
+        guard let keyWindow = notification.object as? NSWindow, keyWindow === currentWindow else {
+          return
+        }
+        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
       // App-wide save-on-close guard. Every window (factory-built document tab AND
       // state-restored WindowGroup scene) shares this root, and every close
@@ -144,18 +230,12 @@ struct DocumentWindowRootView: View {
           return
         }
         controller.savePendingChangesOnClose()
+        CommandSurfaceContext.shared.release(controller: controller)
+        DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
   }
 
   private func configureDocumentRouting() {
-    let factory = DocumentWindowFactory(
-      workspaceStore: workspaceStore,
-      launchIntentCoordinator: launchIntentCoordinator,
-      themeManager: themeManager
-    )
-    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
-      factory.makeWindow(for: ref)
-    }
     controller.requestOpenDocumentWindow = { ref in
       DocumentWindowRegistry.shared.open(ref)
     }

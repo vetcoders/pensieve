@@ -44,7 +44,7 @@ struct SidebarView: View {
     VStack(spacing: 0) {
       header
 
-      if !appState.hasWorkspaceContent {
+      if !appState.hasWorkspaceContent, windowRegistry.openDocuments.isEmpty {
         if Self.showsEmptyPlaceholder(isEmpty: true, activity: appState.workspaceActivity) {
           emptyState
         } else {
@@ -148,14 +148,17 @@ struct SidebarView: View {
       sidebarTabStrip
 
       HStack {
-        if sidebarTab == .openFiles, !openTabDocuments.isEmpty {
+        if sidebarTab == .openFiles, !windowRegistry.openDocuments.isEmpty,
+          renamingURL == nil
+        {
           Button {
             controller.clearOpenFiles()
           } label: {
             Image(systemName: "xmark.circle")
           }
           .buttonStyle(.borderless)
-          .help("Clear Open Files")
+          .help("Close All Open Files")
+          .accessibilityLabel("Close All Open Files")
           .accessibilityIdentifier("pensieve.sidebar.clearOpenFiles")
         }
 
@@ -212,47 +215,48 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.tab.\(tab.rawValue)")
   }
 
-  /// The live open-tab documents (registry order) resolved to refs via the shared
-  /// store. Never drops a live tab: a URL absent from the workspace scan / working
-  /// set (e.g. an ad-hoc file evicted past the open-files cap) is synthesized as an
-  /// ad-hoc ref so the row always mirrors the open tab.
-  private var openTabDocuments: [DocumentRef] {
-    windowRegistry.openTabDocumentIDs.map {
-      appState.document(id: $0) ?? DocumentRef(id: $0, isAdHoc: true)
-    }
-  }
-
   private var openFilesList: some View {
     Group {
-      if openTabDocuments.isEmpty {
+      if windowRegistry.openDocuments.isEmpty {
         sidebarEmptyTab(
           icon: "doc.text",
           message: "No open files",
           hint: "⌘O opens a file · ⌘N new file")
       } else {
         List {
-          ForEach(openTabDocuments) { doc in
-            Button {
-              appState.sidebarFocusedURL = doc.url.standardizedFileURL
-              controller.openDocumentWindow(id: doc.id)
+          ForEach(windowRegistry.openDocuments) { descriptor in
+            let row = Button {
+              if let url = descriptor.fileURL {
+                appState.sidebarFocusedURL = url
+              }
+              windowRegistry.activate(descriptor.identity)
             } label: {
-              documentRow(
-                doc,
-                isSelected: isSelectedOrHovered(doc.id)
-              )
+              openDocumentRow(descriptor)
             }
             .buttonStyle(.plain)
             .onHover {
-              updateHoveredDocument(doc.id, isHovered: $0)
-              if $0 {
-                appState.sidebarFocusedURL = doc.url.standardizedFileURL
+              if let url = descriptor.fileURL {
+                updateHoveredDocument(url, isHovered: $0)
+                if $0 { appState.sidebarFocusedURL = url }
               }
             }
             .contextMenu {
-              documentContextMenu(for: doc)
+              if let url = descriptor.fileURL {
+                documentContextMenu(
+                  for: appState.document(id: url) ?? DocumentRef(id: url, isAdHoc: true))
+              } else {
+                Button("Close from Open Files") {
+                  controller.closeOpenDocument(identity: descriptor.identity)
+                }
+              }
             }
-            .onDrag {
-              NSItemProvider(object: doc.url as NSURL)
+
+            // Untitled rows have no URL to hand off — do not advertise a drag
+            // that can never be dropped anywhere (P3-03).
+            if let url = descriptor.fileURL {
+              row.onDrag { NSItemProvider(object: url as NSURL) }
+            } else {
+              row
             }
           }
         }
@@ -431,18 +435,31 @@ struct SidebarView: View {
     .accessibilityIdentifier("pensieve.sidebar.list.searchResults")
   }
 
-  private func documentRow(_ doc: DocumentRef, isSelected: Bool) -> some View {
-    HStack {
+  private func openDocumentRow(_ descriptor: OpenDocumentDescriptor) -> some View {
+    let selected = appState.windowModel.documentIdentity == descriptor.identity
+    let hovered = descriptor.fileURL.map { hoveredDocumentID == $0 } ?? false
+    return HStack {
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
-      renameableTitle(for: doc.url, title: doc.title)
+      // File-backed rows expose a context-menu Rename that sets `renamingURL`;
+      // route the title through `renameableTitle` so that selection actually
+      // surfaces the inline field. File-less descriptors (untitled drafts) fall
+      // back to plain text inside the helper.
+      renameableTitle(for: descriptor.fileURL, title: descriptor.displayTitle)
+      Spacer(minLength: 4)
+      if descriptor.isDirty {
+        Circle()
+          .fill(Color.secondary)
+          .frame(width: 6, height: 6)
+          .accessibilityLabel("Edited")
+      }
     }
     .padding(.vertical, 4)
     .padding(.horizontal, 6)
-    .help(doc.displayPath)
+    .help(descriptor.fileURL?.path ?? descriptor.displayTitle)
     .frame(maxWidth: .infinity, alignment: .leading)
     .contentShape(Rectangle())
-    .background(selectionBackground(isSelected))
+    .background(selectionBackground(selected || hovered))
   }
 
   /// Currently-visible workspace rows, flattened so the `List` only materializes
@@ -602,17 +619,30 @@ struct SidebarView: View {
   @ViewBuilder
   private func renameableTitle(for url: URL?, title: String) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      InlineRenameField(
-        text: $renameText,
-        focusToken: renameFocusToken,
-        accessibilityIdentifier: "pensieve.sidebar.renameField",
-        onCommit: {
-          commitRename(url)
-        },
-        onCancel: {
+      HStack(spacing: 4) {
+        InlineRenameField(
+          text: $renameText,
+          focusToken: renameFocusToken,
+          accessibilityIdentifier: "pensieve.sidebar.renameField",
+          onCommit: {
+            commitRename(url)
+          },
+          onCancel: {
+            cancelRename()
+          }
+        )
+        .frame(maxWidth: .infinity)
+
+        Button {
           cancelRename()
+        } label: {
+          Image(systemName: "xmark.circle.fill")
         }
-      )
+        .buttonStyle(.borderless)
+        .help("Cancel Rename")
+        .accessibilityLabel("Cancel Rename")
+        .accessibilityIdentifier("pensieve.sidebar.cancelRename")
+      }
     } else {
       Text(title)
         .lineLimit(1)

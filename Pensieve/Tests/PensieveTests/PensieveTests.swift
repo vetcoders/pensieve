@@ -558,7 +558,7 @@ final class PensieveSmokeTests: XCTestCase {
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(autosaver: autosaver, indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(autosaver: autosaver, indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     controller.openFolder(url: folder)
@@ -614,7 +614,7 @@ final class PensieveSmokeTests: XCTestCase {
     var saveCount = 0
     var indexCount = 0
     let autosaver = Autosaver(saveDelayMilliseconds: 50, indexDelayMilliseconds: 140)
-    let store = DocumentStore(
+    let store = makeTestDocumentStore(
       autosaver: autosaver,
       indexDatabase: temporaryIndexDatabase(in: folder),
       writeDocument: { text, url in
@@ -652,7 +652,7 @@ final class PensieveSmokeTests: XCTestCase {
     let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
     let appState = AppState()
-    let documentStore = DocumentStore(
+    let documentStore = makeTestDocumentStore(
       autosaver: autosaver,
       indexDatabase: temporaryIndexDatabase(in: recoveryDirectory),
       recoveryStore: recoveryStore
@@ -693,7 +693,7 @@ final class PensieveSmokeTests: XCTestCase {
     // A crash draft is pending in the recovery store.
     let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let seedState = AppState()
-    let seedStore = DocumentStore(
+    let seedStore = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore
@@ -713,7 +713,7 @@ final class PensieveSmokeTests: XCTestCase {
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()
       ),
-      documentStore: DocumentStore(
+      documentStore: makeTestDocumentStore(
         autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
         indexDatabase: indexDatabase,
         recoveryStore: recoveryStore
@@ -752,7 +752,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let seedState = AppState()
-    let seedStore = DocumentStore(
+    let seedStore = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore
@@ -765,7 +765,7 @@ final class PensieveSmokeTests: XCTestCase {
     // Two windows restore (own DocumentStore each, shared recovery store —
     // the production topology). Only the FIRST may adopt the draft.
     let firstWindowState = AppState()
-    let firstWindowStore = DocumentStore(
+    let firstWindowStore = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore
@@ -774,7 +774,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(firstWindowState.activeDocumentText, "the one crash draft")
 
     let secondWindowState = AppState()
-    let secondWindowStore = DocumentStore(
+    let secondWindowStore = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100),
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore
@@ -798,7 +798,7 @@ final class PensieveSmokeTests: XCTestCase {
     let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 100)
     let appState = AppState()
-    let documentStore = DocumentStore(
+    let documentStore = makeTestDocumentStore(
       autosaver: autosaver,
       indexDatabase: temporaryIndexDatabase(in: folder),
       bookmarkStore: temporaryBookmarkStore(),
@@ -839,7 +839,7 @@ final class PensieveSmokeTests: XCTestCase {
     appState.documentSession.load(document: ref, text: "initial")
 
     let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
-    let store = DocumentStore(
+    let store = makeTestDocumentStore(
       autosaver: autosaver,
       indexDatabase: temporaryIndexDatabase(in: folder)
     )
@@ -873,7 +873,7 @@ final class PensieveSmokeTests: XCTestCase {
     let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
     let appState = AppState()
-    let store = DocumentStore(
+    let store = makeTestDocumentStore(
       autosaver: autosaver,
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore
@@ -912,7 +912,7 @@ final class PensieveSmokeTests: XCTestCase {
     appState.documentSession.load(document: ref, text: "pristine")
 
     var writeCount = 0
-    let store = DocumentStore(
+    let store = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: folder),
       writeDocument: { text, url in
         writeCount += 1
@@ -1204,7 +1204,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -2873,11 +2873,13 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: DocumentStore(indexDatabase: indexDatabase, recoveryStore: recoveryStore),
       indexDatabase: indexDatabase
     )
     controller.openFile(url: noteURL)
@@ -2932,7 +2934,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -2966,7 +2968,7 @@ final class PensieveSmokeTests: XCTestCase {
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()
       ),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -3009,7 +3011,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -3055,7 +3057,7 @@ final class PensieveSmokeTests: XCTestCase {
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()
       ),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -3114,7 +3116,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -3152,7 +3154,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       importsFoldersInBackground: true
     )
@@ -3194,7 +3196,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     controller.selectDocument(id: alphaURL)
@@ -3229,7 +3231,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
-    DocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+    makeTestDocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
       .load(ref: DocumentRef(id: noteURL.standardizedFileURL), into: appState)
 
     XCTAssertEqual(
@@ -3267,7 +3269,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: DocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+      documentStore: makeTestDocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
     )
     controller.selectDocument(id: alphaURL.standardizedFileURL)
 
@@ -3342,7 +3344,7 @@ final class PensieveSmokeTests: XCTestCase {
     let appState = AppState()
     appState.documents = [DocumentRef(id: alphaURL), DocumentRef(id: betaURL)]
     let indexDatabase = temporaryIndexDatabase(in: folder)
-    let documentStore = DocumentStore(indexDatabase: indexDatabase)
+    let documentStore = makeTestDocumentStore(indexDatabase: indexDatabase)
     documentStore.load(ref: DocumentRef(id: alphaURL), into: appState)
     let controller = AppController(
       appState: appState,
@@ -3383,7 +3385,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3421,7 +3423,7 @@ final class PensieveSmokeTests: XCTestCase {
     let appState = AppState()
     appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
     let indexDatabase = temporaryIndexDatabase(in: folder)
-    let documentStore = DocumentStore(indexDatabase: indexDatabase)
+    let documentStore = makeTestDocumentStore(indexDatabase: indexDatabase)
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
@@ -3459,7 +3461,7 @@ final class PensieveSmokeTests: XCTestCase {
     let appState = AppState()
     appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
     let indexDatabase = temporaryIndexDatabase(in: folder)
-    let documentStore = DocumentStore(indexDatabase: indexDatabase)
+    let documentStore = makeTestDocumentStore(indexDatabase: indexDatabase)
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
@@ -3497,7 +3499,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3540,7 +3542,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: folderManager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3581,7 +3583,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3622,7 +3624,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3669,7 +3671,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: DocumentStore(
+      documentStore: makeTestDocumentStore(
         indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory))
     )
 
@@ -3689,7 +3691,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: DocumentStore(
+      documentStore: makeTestDocumentStore(
         indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory))
     )
 
@@ -3716,7 +3718,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: DocumentStore(
+      documentStore: makeTestDocumentStore(
         indexDatabase: temporaryIndexDatabase(in: folder),
         bookmarkStore: temporaryBookmarkStore()
       )
@@ -3740,7 +3742,7 @@ final class PensieveSmokeTests: XCTestCase {
   func testDirtyUntitledDocumentCanCancelTerminationPrompt() {
     let appState = AppState()
     var prompted = false
-    let documentStore = DocumentStore(
+    let documentStore = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: FileManager.default.temporaryDirectory),
       dirtyUntitledPrompt: { session in
         prompted = session.isUntitled
@@ -3763,6 +3765,135 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentDirty)
   }
 
+  /// Open Files mirrors EVERY window's documents into EVERY window's sidebar, so
+  /// closing a row can target a document owned by ANOTHER window. The dirty
+  /// guard must run in the target's OWN session — cancelling it there must abort
+  /// the close instead of force-closing the target and dropping unsaved edits
+  /// into a silent recovery draft.
+  @MainActor
+  func testCrossWindowCloseRoutesDirtyGuardToOwningSessionAndCancelAborts() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    var ownerPrompted = false
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+        ownerPrompted = session.isUntitled
+        return .cancel
+      }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "unsaved work living in another window"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    // The CALLER closes the OWNER's untitled row from its mirrored Open Files.
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertTrue(ownerPrompted, "the guard must prompt in the owning window's session")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled guard must abort the close")
+    XCTAssertTrue(ownerState.documentSession.isUntitled)
+    XCTAssertTrue(ownerState.activeDocumentDirty, "the unsaved work must survive intact")
+    XCTAssertEqual(ownerState.windowModel.documentIdentity, ownerIdentity)
+  }
+
+  /// Same cross-window routing, but the owning session's guard resolves (Discard)
+  /// — so the close proceeds and the owner's window is torn down.
+  @MainActor
+  func testCrossWindowCloseProceedsWhenOwningGuardResolves() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .discard }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "discardable"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertEqual(closedWindows, [ownerWindow], "a resolved guard must close the owner's window")
+    XCTAssertFalse(ownerState.documentSession.isDirty)
+  }
+
+  @MainActor
+  private static func makeCrossWindowRegistry(
+    closeWindow: @escaping @MainActor (NSWindow) -> Void
+  ) -> DocumentWindowRegistry {
+    DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: closeWindow)
+  }
+
+  @MainActor
+  private static func makeControllerlessWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
+  }
+
   @MainActor
   func testSaveAsRegularDocumentCreatesCopyAndSwitchesSession() throws {
     let folder = FileManager.default.temporaryDirectory
@@ -3777,7 +3908,7 @@ final class PensieveSmokeTests: XCTestCase {
     try "original body".write(to: originalURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
-    let documentStore = DocumentStore(
+    let documentStore = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: folder),
       bookmarkStore: temporaryBookmarkStore()
     )
@@ -3821,7 +3952,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3865,7 +3996,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3930,7 +4061,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -3973,7 +4104,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -4008,7 +4139,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -4045,7 +4176,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -4080,7 +4211,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
@@ -4131,6 +4262,8 @@ final class PensieveSmokeTests: XCTestCase {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: folder) }
 
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let recoveryStore = RecoveryStore(directoryURL: recoveryDirectory)
     let wordURL = folder.appendingPathComponent("Board Brief.docx")
     let data = try DocumentTransfer.docxData(
       fromHTML: "<h1>Board Brief</h1><p>Prokurent approval is required.</p>",
@@ -4174,6 +4307,40 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentText.contains("# Board Brief"))
     XCTAssertTrue(appState.activeDocumentText.contains("Prokurent approval is required."))
     XCTAssertNil(appState.lastError)
+
+    let expectedText = appState.activeDocumentText
+    XCTAssertTrue(controller.savePendingChangesOnClose())
+    let draft = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recoveryStore.loadDrafts().count, 1)
+    XCTAssertEqual(draft.text, expectedText)
+    XCTAssertEqual(draft.url.deletingLastPathComponent().standardizedFileURL, recoveryDirectory.standardizedFileURL)
+  }
+
+  @MainActor
+  func testRecoveryIsolationControlDetectsWrongRecoveryRoot() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveRecoveryControlTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let expectedRoot = root.appendingPathComponent("Expected", isDirectory: true)
+    let controlRoot = root.appendingPathComponent("Control", isDirectory: true)
+    let controlStore = RecoveryStore(directoryURL: controlRoot)
+    let appState = AppState()
+    appState.documentSession.createUntitled()
+    appState.documentSession.text = "control draft"
+    appState.documentSession.isDirty = true
+
+    let store = DocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: root),
+      recoveryStore: controlStore
+    )
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    let controlDraft = try XCTUnwrap(controlStore.loadDrafts().first)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: expectedRoot.path))
+    XCTAssertFalse(
+      controlDraft.url.deletingLastPathComponent().standardizedFileURL == expectedRoot.standardizedFileURL,
+      "the isolation assertion must fail when a store is bound to the control root"
+    )
   }
 
   @MainActor
@@ -4199,7 +4366,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
@@ -4237,7 +4404,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
@@ -4282,7 +4449,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
@@ -4321,7 +4488,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -4355,7 +4522,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(),
         indexDatabase: indexDatabase,
         bookmarkStore: temporaryBookmarkStore()),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
@@ -4390,7 +4557,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
     var requestedRefs: [DocumentRef] = []
@@ -4460,7 +4627,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -5308,7 +5475,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -5344,7 +5511,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -5380,7 +5547,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 
@@ -5451,7 +5618,7 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
       workspaceSearchDebounceNanoseconds: 0
     )
@@ -5544,7 +5711,7 @@ final class PensieveSmokeTests: XCTestCase {
     let controller = AppController(
       appState: appState,
       folderManager: manager,
-      documentStore: DocumentStore(indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase
     )
 

@@ -5,6 +5,14 @@ enum WindowChromeRecipe {
   static let documentTabbingIdentifier = "Pensieve.DocumentWindow"
   static let defaultContentSize = NSSize(width: 1180, height: 760)
   static let minimumContentSize = NSSize(width: 720, height: 480)
+  /// Initial content width both window paths present at. `defaultContentSize`
+  /// is the narrower geometry the recipe pins for resize/minimum purposes; the
+  /// unified toolbar needs more room than that or its trailing groups (preview
+  /// runtime + assistants) collapse into the overflow chevron and disappear
+  /// from the accessibility tree. Factory windows and the scene-owned launcher
+  /// must agree here, otherwise the cold frame a user (or `make ui-smoke`)
+  /// meets depends on which path happened to build it.
+  static let toolbarFittingContentWidth: CGFloat = 1300
   static let toolbarStyle: NSWindow.ToolbarStyle = .unified
   static let documentContentTopInset: CGFloat = 10
   static var previewContentTopInset: CGFloat { max(0, documentContentTopInset - 2) }
@@ -23,6 +31,48 @@ enum WindowChromeRecipe {
       width: defaultContentSize.width,
       height: defaultContentSize.height
     )
+  }
+
+  /// Content rect the factory hands `NSWindow(contentRect:)`, sized and
+  /// centred so the FINAL window frame — the content rect grown by whatever
+  /// titlebar/border `styleMask` contributes — still fits inside
+  /// `visibleFrame`. The clamp is applied to the frame, not the bare content:
+  /// capping only the content height lets the titlebar spill above the work
+  /// area on a low screen. `documentStyleMask` uses `.fullSizeContentView`,
+  /// where the titlebar overlays the content and the frame equals the content
+  /// rect (chrome delta 0), so today this returns the same geometry as a plain
+  /// content clamp; routing through `NSWindow.frameRect(forContentRect:)`
+  /// keeps it correct-by-construction if the mask ever drops
+  /// `.fullSizeContentView`. The `styleMask` parameter exists so the chrome
+  /// accounting is unit-testable with a mask that actually adds a titlebar.
+  @MainActor
+  static func factoryInitialContentRect(
+    in visibleFrame: NSRect,
+    styleMask: NSWindow.StyleMask
+  ) -> NSRect {
+    let desiredContent = NSRect(
+      x: 0,
+      y: 0,
+      width: toolbarFittingContentWidth,
+      height: defaultContentSize.height
+    )
+    let desiredFrame = NSWindow.frameRect(forContentRect: desiredContent, styleMask: styleMask)
+    let frameSize = NSSize(
+      width: min(desiredFrame.width, visibleFrame.width),
+      height: min(desiredFrame.height, visibleFrame.height)
+    )
+    let finalFrame = NSRect(
+      x: visibleFrame.midX - frameSize.width / 2,
+      y: visibleFrame.midY - frameSize.height / 2,
+      width: frameSize.width,
+      height: frameSize.height
+    )
+    return NSWindow.contentRect(forFrameRect: finalFrame, styleMask: styleMask)
+  }
+
+  @MainActor
+  static func factoryInitialFrame(in visibleFrame: NSRect) -> NSRect {
+    factoryInitialContentRect(in: visibleFrame, styleMask: documentStyleMask)
   }
 
   static func apply(to window: NSWindow, title: String) {
@@ -78,7 +128,7 @@ extension Scene {
       .windowStyle(.titleBar)
       .windowToolbarStyle(.unified(showsTitle: true))
       .defaultSize(
-        width: WindowChromeRecipe.defaultContentSize.width,
+        width: WindowChromeRecipe.toolbarFittingContentWidth,
         height: WindowChromeRecipe.defaultContentSize.height
       )
       .windowResizability(.contentMinSize)

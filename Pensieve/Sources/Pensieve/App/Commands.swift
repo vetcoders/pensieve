@@ -17,18 +17,96 @@ extension FocusedValues {
   }
 }
 
+/// App-level fallback owner of the command surface.
+///
+/// `focusedSceneValue`/`focusedSceneObject` publish only while a scene is
+/// ACTIVE. A cold launch that has not been activated yet — and the gap between
+/// activation and SwiftUI's next menu rebuild while the main thread is still
+/// busy with startup — therefore evaluates `PensieveCommands` with nil focus,
+/// which yields an EMPTY command set: SwiftUI installs its default menu bar and
+/// `Mode`/`Format`/`Agents` plus every app File item are absent entirely.
+/// Measured: no menu rebuild happens at all until `didBecomeActive`.
+///
+/// Menu-bar structure must not depend on activation timing, so every document
+/// root adopts itself here and the commands fall back to the most recently
+/// adopted root while focus is silent. Focus still wins whenever it resolves,
+/// so the multi-window contract (commands act on the FOCUSED window's state)
+/// is unchanged — the fallback only fills the window in which no scene is
+/// focused and therefore no menu click can reach the app anyway.
+@MainActor
+final class CommandSurfaceContext: ObservableObject {
+  static let shared = CommandSurfaceContext()
+
+  @Published private(set) var appState: AppState?
+  @Published private(set) var controller: AppController?
+
+  /// Adopts a document root as the fallback command target. Always adopted as
+  /// a PAIR: a mixed state/controller pair would let a menu action mutate one
+  /// window's state through another window's controller.
+  func adopt(appState: AppState, controller: AppController) {
+    guard self.appState !== appState || self.controller !== controller else { return }
+    self.appState = appState
+    self.controller = controller
+  }
+
+  /// Seeds the fallback ONLY when nothing has adopted yet. The cold menu bar
+  /// needs *a* root before any window is key, so the first root's early
+  /// build-time `.task` adopts here. But a later BACKGROUND root's `.task` can
+  /// run after the actual key window has already adopted — with unconditional
+  /// adoption it would steal the surface, and during the focus-silent periods
+  /// this fallback covers, menu actions would target that background document
+  /// instead of the visible key one. Restricting early adoption to the
+  /// no-fallback case keeps the key window (via `didBecomeKey`) authoritative.
+  func adoptIfUnset(appState: AppState, controller: AppController) {
+    guard self.controller == nil else { return }
+    adopt(appState: appState, controller: controller)
+  }
+
+  /// Drops the adopted pair when its window closes, so a dead root neither
+  /// leaks nor keeps serving menu actions. A no-op when a different root has
+  /// already taken over.
+  func release(controller: AppController) {
+    guard self.controller === controller else { return }
+    appState = nil
+    self.controller = nil
+  }
+}
+
+/// Which root the menu bar acts on. Extracted so the pair-consistency rule is
+/// pinned by tests rather than by reading the `if let` chain below.
+enum CommandTargetResolution {
+  static func resolve<State: AnyObject, Controller: AnyObject>(
+    focusedState: State?,
+    focusedController: Controller?,
+    fallbackState: State?,
+    fallbackController: Controller?
+  ) -> (state: State, controller: Controller)? {
+    if let focusedState, let focusedController {
+      return (focusedState, focusedController)
+    }
+    guard let fallbackState, let fallbackController else { return nil }
+    return (fallbackState, fallbackController)
+  }
+}
+
 struct PensieveCommands: Commands {
-  @FocusedValue(\.appState) private var appState: AppState?
-  @FocusedObject private var controller: AppController?
+  @FocusedValue(\.appState) private var focusedAppState: AppState?
+  @FocusedObject private var focusedController: AppController?
   @ObservedObject var themeManager: ThemeManager
+  @ObservedObject private var surface = CommandSurfaceContext.shared
 
   var body: some Commands {
-    if let appState, let controller {
+    if let target = CommandTargetResolution.resolve(
+      focusedState: focusedAppState,
+      focusedController: focusedController,
+      fallbackState: surface.appState,
+      fallbackController: surface.controller
+    ) {
       ActivePensieveCommands(
-        appState: appState,
-        controller: controller,
+        appState: target.state,
+        controller: target.controller,
         themeManager: themeManager,
-        recentDocuments: controller.recentDocuments
+        recentDocuments: target.controller.recentDocuments
       )
     }
   }

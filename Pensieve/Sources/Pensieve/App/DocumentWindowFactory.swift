@@ -52,8 +52,12 @@ struct DocumentWindowFactory {
   /// `document == nil` builds an untitled (launcher-mode) tab — the root view
   /// supports that the same way the WindowGroup scene does.
   func makeWindow(for document: DocumentRef?) -> NSWindow {
+    let visibleFrame = NSScreen.main?.visibleFrame
+    let contentRect =
+      visibleFrame.map { WindowChromeRecipe.factoryInitialFrame(in: $0) }
+      ?? WindowChromeRecipe.defaultContentRect
     let window = DocumentWindow(
-      contentRect: WindowChromeRecipe.defaultContentRect,
+      contentRect: contentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
       defer: false)
@@ -62,7 +66,9 @@ struct DocumentWindowFactory {
       DocumentWindowRegistry.shared.newUntitledTab(from: sourceWindow)
     }
     window.onClose = { closedWindow in
-      DocumentWindowRegistry.shared.handleDocumentWindowClosed(closedWindow)
+      DocumentWindowRegistry.shared.handleWindowClosed(
+        closedWindow,
+        tombstonePolicy: .factoryWindow)
     }
 
     let rootView = DocumentWindowRootView(
@@ -79,7 +85,9 @@ struct DocumentWindowFactory {
       hostingView.sceneBridgingOptions = [.toolbars, .title]
     }
     window.contentView = hostingView
-    window.center()
+    if visibleFrame == nil {
+      window.center()
+    }
     DebugTrace.log("factory created window for \(document?.id.lastPathComponent ?? "untitled")")
     return window
   }

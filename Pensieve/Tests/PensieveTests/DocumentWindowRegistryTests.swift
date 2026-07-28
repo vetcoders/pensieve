@@ -5,15 +5,201 @@ import XCTest
 
 final class DocumentWindowRegistryTests: XCTestCase {
   @MainActor
+  func testOpeningSameStandardizedFileTwiceFocusesExistingWindow() throws {
+    let window = Self.makeWindow()
+    defer { window.close() }
+    let canonical = URL(fileURLWithPath: "/tmp/pensieve-same-file.md").standardizedFileURL
+    let aliased = URL(fileURLWithPath: "/tmp/identity/../pensieve-same-file.md")
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("open should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _ in
+        factoryCalls += 1
+        return window
+      })
+
+    registry.open(DocumentRef(id: canonical))
+    registry.open(DocumentRef(id: aliased))
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 2)
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [.file(canonical)])
+  }
+
+  @MainActor
+  func testDraftDescriptorsPublishAndSaveAsTransitionsAtomically() throws {
+    let window = Self.makeWindow()
+    let recoveredWindow = Self.makeWindow()
+    defer {
+      window.close()
+      recoveredWindow.close()
+    }
+    let registry = Self.makeIdentityRegistry()
+    let draftID = DocumentIdentity.untitled(UUID())
+    let recoveredID = DocumentIdentity.recovered(UUID())
+    let savedURL = URL(fileURLWithPath: "/tmp/pensieve-descriptor-saved.md").standardizedFileURL
+
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: draftID,
+        documentID: nil,
+        title: "Untitled.md",
+        isDirty: true,
+        hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [draftID])
+    XCTAssertEqual(registry.openDocuments.first?.displayTitle, "Untitled.md")
+    XCTAssertNil(registry.openDocuments.first?.fileURL)
+    XCTAssertTrue(registry.openDocuments.first?.window === window)
+    XCTAssertTrue(
+      registry.attach(
+        recoveredWindow,
+        identity: recoveredID,
+        documentID: nil,
+        title: "Recovered.md",
+        isDirty: true,
+        hasEditableBuffer: true))
+
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: .file(savedURL),
+        documentID: savedURL,
+        title: "saved",
+        representedURL: savedURL,
+        isDirty: false,
+        hasEditableBuffer: true))
+
+    XCTAssertEqual(registry.openDocuments.count, 2)
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [.file(savedURL), recoveredID])
+    XCTAssertEqual(registry.openDocuments.first?.identity, .file(savedURL))
+    XCTAssertEqual(registry.openDocuments.first?.fileURL, savedURL)
+    XCTAssertTrue(registry.openDocuments.first?.window === window)
+  }
+
+  @MainActor
+  func testRecoveredAndIndependentUntitledSessionsNeverCollapse() throws {
+    let firstWindow = Self.makeWindow()
+    let secondWindow = Self.makeWindow()
+    let recoveredWindow = Self.makeWindow()
+    defer {
+      firstWindow.close()
+      secondWindow.close()
+      recoveredWindow.close()
+    }
+    let registry = Self.makeIdentityRegistry()
+    let first = DocumentIdentity.untitled(UUID())
+    let second = DocumentIdentity.untitled(UUID())
+    let recovered = DocumentIdentity.recovered(UUID())
+
+    XCTAssertTrue(
+      registry.attach(
+        firstWindow, identity: first, documentID: nil, title: "Untitled.md",
+        hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        secondWindow, identity: second, documentID: nil, title: "Untitled.md",
+        hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        recoveredWindow, identity: recovered, documentID: nil, title: "Recovered.md",
+        isDirty: true, hasEditableBuffer: true))
+
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [first, second, recovered])
+  }
+
+  @MainActor
+  func testForcedDuplicateIdentityIsRejectedAndCloseRemovesOnlyItsDescriptor() throws {
+    let forcedID = UUID()
+    let forced = DocumentIdentity.untitled(forcedID)
+    let firstSession = DocumentSession.untitled(identityID: forcedID)
+    let duplicateSession = DocumentSession.untitled(identityID: forcedID)
+    let firstWindow = Self.makeWindow()
+    let duplicateWindow = Self.makeWindow()
+    defer {
+      firstWindow.close()
+      duplicateWindow.close()
+    }
+    var closed: [ObjectIdentifier] = []
+    let registry = Self.makeIdentityRegistry { closed.append(ObjectIdentifier($0)) }
+
+    XCTAssertEqual(firstSession.identity, duplicateSession.identity)
+    XCTAssertTrue(
+      registry.attach(
+        firstWindow, identity: firstSession.identity, documentID: nil,
+        title: "First.md", hasEditableBuffer: true))
+    XCTAssertFalse(
+      registry.attach(
+        duplicateWindow, identity: duplicateSession.identity, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.count, 1)
+    XCTAssertTrue(registry.openDocuments.first?.window === firstWindow)
+
+    registry.closeDocument(forced)
+    XCTAssertEqual(closed, [ObjectIdentifier(firstWindow)])
+    registry.reconcileClosedWindow(firstWindow)
+    XCTAssertTrue(registry.openDocuments.isEmpty)
+  }
+
+  @MainActor
+  func testRejectedDuplicateReattachesAfterOwnerWindowCloses() throws {
+    let forcedID = UUID()
+    let forced = DocumentIdentity.untitled(forcedID)
+    let ownerWindow = Self.makeWindow()
+    let duplicateWindow = Self.makeWindow()
+    defer {
+      ownerWindow.close()
+      duplicateWindow.close()
+    }
+    var closed: [ObjectIdentifier] = []
+    let registry = Self.makeIdentityRegistry { closed.append(ObjectIdentifier($0)) }
+
+    // Owner takes the identity; the duplicate is rejected while the owner holds it.
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: forced, documentID: nil,
+        title: "Owner.md", hasEditableBuffer: true))
+    XCTAssertFalse(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.count, 1)
+    XCTAssertTrue(registry.openDocuments.first?.window === ownerWindow)
+
+    // Owner closes → the identity is freed from the registry.
+    registry.closeDocument(forced)
+    XCTAssertEqual(closed, [ObjectIdentifier(ownerWindow)])
+    registry.reconcileClosedWindow(ownerWindow)
+    XCTAssertTrue(registry.openDocuments.isEmpty)
+
+    // The duplicate's coordinator retries attach (cache was never committed on
+    // rejection): it must now be accepted and land in Open Files, not stay
+    // orphaned outside the registry.
+    XCTAssertTrue(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [forced])
+    XCTAssertTrue(registry.openDocuments.first?.window === duplicateWindow)
+  }
+
+  @MainActor
   func testOpenTabDocumentIDsRoundTripAcrossOpenAttachSwitchAndWillCloseReconcile() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-alpha.md").standardizedFileURL
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-beta.md").standardizedFileURL
     let window = Self.makeWindow()
     defer { window.close() }
+    var deferredWork: [() -> Void] = []
 
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
@@ -42,6 +228,10 @@ final class DocumentWindowRegistryTests: XCTestCase {
       registry.openTabDocumentIDs,
       [],
       "the process-wide willClose reconciler must remove the closing window's document")
+    XCTAssertEqual(
+      deferredWork.count,
+      1,
+      "the process-wide close route must request one deferred launcher reconciliation")
   }
 
   @MainActor
@@ -67,6 +257,125 @@ final class DocumentWindowRegistryTests: XCTestCase {
       registry.openTabDocumentIDs,
       [betaID],
       "global willClose cleanup must not poison reusable AppKit/scene windows")
+  }
+
+  @MainActor
+  func testGlobalCloseOfLastDocumentSchedulesLauncherReopen() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-global-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    var factoryRefs: [DocumentRef?] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [documentWindow] },
+      makeDocumentWindow: { ref in
+        factoryRefs.append(ref)
+        return ref == nil ? launcherWindow : documentWindow
+      })
+
+    registry.open(DocumentRef(id: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertEqual(deferredWork.count, 1, "the process-wide close route must request reopening")
+    guard let reopen = deferredWork.first else {
+      return XCTFail("the process-wide close route did not request reopening")
+    }
+    reopen()
+    XCTAssertEqual(factoryRefs.compactMap { $0 }.map(\.id), [documentID])
+    XCTAssertEqual(factoryRefs.filter { $0 == nil }.count, 1)
+
+    XCTAssertTrue(
+      registry.attach(documentWindow, documentID: documentID),
+      "a reusable scene window must remain eligible to reattach after global close")
+  }
+
+  @MainActor
+  func testGlobalCloseBeforeFactoryWiringKeepsDeferredLauncherRequest() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-early-global-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    var launcherFactoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [documentWindow] })
+
+    XCTAssertTrue(registry.attach(documentWindow, documentID: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertTrue(
+      deferredWork.isEmpty,
+      "the reopen cannot execute until the scene root wires the window factory")
+
+    registry.makeDocumentWindow = { ref in
+      XCTAssertNil(ref)
+      launcherFactoryCalls += 1
+      return launcherWindow
+    }
+    XCTAssertEqual(
+      deferredWork.count,
+      1,
+      "wiring the factory must release the one pending close-lifecycle request")
+    guard let reopen = deferredWork.first else {
+      return XCTFail("the early global close dropped its deferred launcher request")
+    }
+    reopen()
+
+    XCTAssertEqual(launcherFactoryCalls, 1)
+  }
+
+  @MainActor
+  func testDuplicateFactoryAndGlobalCloseSignalsScheduleOneLauncherReopen() throws {
+    let documentID = URL(fileURLWithPath: "/tmp/pensieve-dual-close.md").standardizedFileURL
+    let documentWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      documentWindow.close()
+      launcherWindow.close()
+    }
+
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [] },
+      makeDocumentWindow: { ref in ref == nil ? launcherWindow : documentWindow })
+
+    registry.open(DocumentRef(id: documentID))
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .factoryWindow)
+    registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
+
+    XCTAssertEqual(
+      deferredWork.count, 1,
+      "factory callback plus willClose must coalesce into one deferred launcher request")
+    XCTAssertFalse(
+      registry.attach(documentWindow, documentID: documentID),
+      "a factory-tombstoned window must reject a late SwiftUI reattach")
   }
 
   @MainActor
@@ -203,6 +512,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     // Closing the LAST document window must not leave the app windowless: it
     // reopens an empty launcher so the user can start a new document (⌘N).
     registry.handleDocumentWindowClosed(docWindow)
+    XCTAssertEqual(deferredWork.count, 1)
     for work in deferredWork { work() }
 
     XCTAssertTrue(
@@ -326,6 +636,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: alphaID))
     registry.open(DocumentRef(id: betaID))
     registry.handleDocumentWindowClosed(alphaWindow)
+    XCTAssertTrue(deferredWork.isEmpty)
     for work in deferredWork { work() }
 
     XCTAssertFalse(
@@ -358,6 +669,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: docID))
     registry.beginTermination()
     registry.handleApplicationWindowClosed(docWindow)
+    XCTAssertTrue(deferredWork.isEmpty)
     for work in deferredWork { work() }
 
     XCTAssertFalse(
@@ -403,6 +715,83 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testInPlaceSwitchToDuplicateReleasesStaleMappingOnRejection() throws {
+    let alphaID = URL(fileURLWithPath: "/tmp/pensieve-stale-alpha.md").standardizedFileURL
+    let betaID = URL(fileURLWithPath: "/tmp/pensieve-stale-beta.md").standardizedFileURL
+    let switchingWindow = Self.makeWindow()
+    let betaOwner = Self.makeWindow()
+    defer {
+      switchingWindow.close()
+      betaOwner.close()
+    }
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // switchingWindow shows alpha; betaOwner owns beta.
+    XCTAssertTrue(registry.attach(switchingWindow, documentID: alphaID))
+    XCTAssertTrue(registry.attach(betaOwner, documentID: betaID))
+    XCTAssertEqual(Set(registry.openTabDocumentIDs), [alphaID, betaID])
+
+    // switchingWindow switches in place onto beta, which betaOwner already owns.
+    XCTAssertFalse(
+      registry.attach(switchingWindow, documentID: betaID),
+      "an in-place switch onto an already-owned document must be rejected")
+
+    // The rejection must release switchingWindow's stale alpha mapping: only
+    // betaOwner's beta remains, so `open(alpha)` no longer targets this window.
+    XCTAssertEqual(
+      registry.openTabDocumentIDs,
+      [betaID],
+      "the rejected in-place switch must drop the window's stale previous-document mapping")
+  }
+
+  @MainActor
+  func testDeferredAttachPreservesDirtyMetadataThroughModalTurn() throws {
+    let docID = URL(fileURLWithPath: "/tmp/pensieve-deferred-dirty.md").standardizedFileURL
+    let window = Self.makeWindow()
+    defer { window.close() }
+
+    var canMutate = false
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { canMutate },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // A dirty file-backed attach arrives while a modal panel blocks tab
+    // mutation: the descriptor publishes dirty, and the tab work is deferred.
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: .file(docID),
+        documentID: docID,
+        title: "dirty",
+        representedURL: docID,
+        isDirty: true,
+        hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.first?.isDirty, true)
+    XCTAssertEqual(deferredWork.count, 1)
+
+    // Modal closes; the deferred attach runs. It must NOT re-publish the
+    // descriptor as clean.
+    canMutate = true
+    for work in deferredWork { work() }
+
+    XCTAssertEqual(
+      registry.openDocuments.first?.isDirty,
+      true,
+      "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state")
+  }
+
+  @MainActor
   private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
@@ -413,5 +802,19 @@ final class DocumentWindowRegistryTests: XCTestCase {
     window.contentView = NSView(frame: .zero)
     window.title = title
     return window
+  }
+
+  @MainActor
+  private static func makeIdentityRegistry(
+    closeWindow: @escaping @MainActor (NSWindow) -> Void = { _ in }
+  ) -> DocumentWindowRegistry {
+    DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: closeWindow)
   }
 }

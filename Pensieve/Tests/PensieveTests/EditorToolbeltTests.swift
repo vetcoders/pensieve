@@ -137,6 +137,61 @@ final class EditorToolbeltTests: XCTestCase {
       [.documentDispatch, .view, .previewRuntime, .assistants])
   }
 
+  func testEveryModeAndEditabilityStatePinsFamilyAndIdentifierOrderWithoutDuplicates() {
+    let documentDispatch = [
+      EditorToolbelt.shareIdentifier,
+      EditorToolbelt.dispatchIdentifier,
+    ]
+    let historyAndEditing =
+      [
+        EditorToolbelt.undoIdentifier,
+        EditorToolbelt.redoIdentifier,
+        EditorToolbelt.richMarkdownToggleIdentifier,
+      ] + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
+    let previewRuntimeAndAssistants = [
+      EditorToolbelt.reloadIdentifier,
+      EditorToolbelt.autoReloadIdentifier,
+      EditorToolbelt.scrollSyncIdentifier,
+      EditorToolbelt.dictationIdentifier,
+      EditorToolbelt.autocompleteIdentifier,
+      EditorToolbelt.rewriteIdentifier,
+    ]
+
+    for mode in EditorMode.allCases {
+      for hasEditableBuffer in [false, true] {
+        let showsEditing =
+          hasEditableBuffer && mode != .preview
+        let expectedFamilies: [EditorToolbelt.ToolbarFamilyIdentifier] =
+          showsEditing
+          ? [.documentDispatch, .history, .editing, .view, .previewRuntime, .assistants]
+          : [.documentDispatch, .view, .previewRuntime, .assistants]
+        var expectedIdentifiers = documentDispatch
+        if showsEditing {
+          expectedIdentifiers.append(contentsOf: historyAndEditing)
+        }
+        expectedIdentifiers.append(EditorToolbelt.modePickerIdentifier)
+        if mode == .split || mode == .preview {
+          expectedIdentifiers.append(EditorToolbelt.appearanceIdentifier)
+        }
+        expectedIdentifiers.append(contentsOf: previewRuntimeAndAssistants)
+
+        let families = EditorToolbelt.visibleToolbarFamilyOrder(
+          for: mode, hasEditableBuffer: hasEditableBuffer)
+        let identifiers = EditorToolbelt.visibleToolbarIdentifierOrder(
+          for: mode, hasEditableBuffer: hasEditableBuffer)
+
+        XCTAssertEqual(
+          families, expectedFamilies, "family order for \(mode), editable=\(hasEditableBuffer)")
+        XCTAssertEqual(
+          identifiers, expectedIdentifiers,
+          "identifier order for \(mode), editable=\(hasEditableBuffer)")
+        XCTAssertEqual(Set(families).count, families.count, "duplicate family for \(mode)")
+        XCTAssertEqual(
+          Set(identifiers).count, identifiers.count, "duplicate identifier for \(mode)")
+      }
+    }
+  }
+
   func testTitlebarOrderKeepsModesTrailingWhenEditRowIsUnavailable() {
     XCTAssertEqual(
       EditorToolbelt.visibleToolbarIdentifierOrder(for: .preview, hasEditableBuffer: true),

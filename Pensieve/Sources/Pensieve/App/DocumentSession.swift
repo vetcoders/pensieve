@@ -1,9 +1,36 @@
 import Foundation
 
+enum DocumentIdentity: Hashable {
+  case file(URL)
+  case untitled(UUID)
+  case recovered(UUID)
+
+  var standardized: DocumentIdentity {
+    guard case .file(let url) = self else { return self }
+    return .file(url.standardizedFileURL)
+  }
+
+  var fileURL: URL? {
+    guard case .file(let url) = standardized else { return nil }
+    return url
+  }
+
+  var persistentID: String {
+    switch standardized {
+    case .file(let url):
+      return "file:\(url.absoluteString)"
+    case .untitled(let id):
+      return "untitled:\(id.uuidString.lowercased())"
+    case .recovered(let id):
+      return "recovery:\(id.uuidString.lowercased())"
+    }
+  }
+}
+
 struct DocumentSession: Equatable {
   enum Kind: Equatable {
     case empty
-    case untitled(title: String, recoveryID: UUID?)
+    case untitled(title: String, identity: DocumentIdentity, recoveryID: UUID?)
     case fileBacked(DocumentRef)
   }
 
@@ -13,8 +40,14 @@ struct DocumentSession: Equatable {
 
   static let empty = DocumentSession(kind: .empty, text: "", isDirty: false)
 
-  static func untitled(title: String = "Untitled.md") -> DocumentSession {
-    DocumentSession(kind: .untitled(title: title, recoveryID: nil), text: "", isDirty: false)
+  static func untitled(
+    title: String = "Untitled.md",
+    identityID: UUID = UUID()
+  ) -> DocumentSession {
+    DocumentSession(
+      kind: .untitled(title: title, identity: .untitled(identityID), recoveryID: nil),
+      text: "",
+      isDirty: false)
   }
 
   var document: DocumentRef? {
@@ -35,14 +68,15 @@ struct DocumentSession: Equatable {
     document?.id
   }
 
-  var persistentAIDocumentID: String? {
-    if let url {
-      return "file:\(url.standardizedFileURL.absoluteString)"
+  var identity: DocumentIdentity? {
+    switch kind {
+    case .empty:
+      return nil
+    case .untitled(_, let identity, _):
+      return identity.standardized
+    case .fileBacked(let document):
+      return .file(document.url.standardizedFileURL)
     }
-    if let recoveryID {
-      return "recovery:\(recoveryID.uuidString.lowercased())"
-    }
-    return nil
   }
 
   var isUntitled: Bool {
@@ -52,12 +86,19 @@ struct DocumentSession: Equatable {
 
   var recoveryID: UUID? {
     get {
-      guard case .untitled(_, let recoveryID) = kind else { return nil }
+      guard case .untitled(_, _, let recoveryID) = kind else { return nil }
       return recoveryID
     }
     set {
-      guard case .untitled(let title, _) = kind else { return }
-      kind = .untitled(title: title, recoveryID: newValue)
+      guard case .untitled(let title, let identity, _) = kind else { return }
+      // Once a draft is backed by a recovery record its persistent identity must
+      // become `.recovered(recoveryID)` — the SAME key a post-relaunch restore
+      // rebuilds via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)`
+      // key here would derive the AI session store key `untitled:<uuid>` before
+      // close but `recovery:<recoveryID>` after restore, silently dropping the
+      // AI continuation saved for this draft. Nil clears (discard) keep identity.
+      let resolvedIdentity = newValue.map(DocumentIdentity.recovered) ?? identity
+      kind = .untitled(title: title, identity: resolvedIdentity, recoveryID: newValue)
     }
   }
 
@@ -74,7 +115,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return ""
-    case .untitled(let title, _):
+    case .untitled(let title, _, _):
       return title
     case .fileBacked(let document):
       return document.title
@@ -100,13 +141,16 @@ struct DocumentSession: Equatable {
   }
 
   mutating func createUntitled(title: String = "Untitled.md") {
-    self.kind = .untitled(title: title, recoveryID: nil)
+    self.kind = .untitled(title: title, identity: .untitled(UUID()), recoveryID: nil)
     self.text = ""
     self.isDirty = false
   }
 
   mutating func restoreUntitled(title: String, text: String, recoveryID: UUID) {
-    self.kind = .untitled(title: title, recoveryID: recoveryID)
+    self.kind = .untitled(
+      title: title,
+      identity: .recovered(recoveryID),
+      recoveryID: recoveryID)
     self.text = text
     self.isDirty = true
   }
