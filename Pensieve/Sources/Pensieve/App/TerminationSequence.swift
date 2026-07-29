@@ -36,6 +36,11 @@ final class TerminationSequence {
   private let pumpRunLoop: (Date) -> Void
   private var didFinish = false
 
+  /// Whether `run()` got as far as starting the terminal checkpoint. Read by the post-deadline
+  /// fallback so a budget that expires while the checkpoint is ALREADY running (a wedged pool reader)
+  /// does not start a second, redundant barrier. Both sides are main-actor, so this needs no lock.
+  private var didStartTerminalCheckpoint = false
+
   init(
     registry: DocumentWindowRegistry,
     indexDatabase: IndexDatabase,
@@ -57,7 +62,11 @@ final class TerminationSequence {
     registry.beginTermination()
     flushPendingWindowSaves()
     await indexDatabase.drainPendingIndexWrites()
-    indexDatabase.checkpointOnTerminate()
+    // Started off-main and AWAITED, not taken on this thread. The order is unchanged — the checkpoint
+    // still happens here, after the drain, before this returns — but the wait is now a suspension
+    // point, which is what keeps it inside the budget: see `runBlockingMainRunLoop()`.
+    didStartTerminalCheckpoint = true
+    await indexDatabase.startCheckpointOnTerminate()?.value
   }
 
   /// Synchronous entry for `applicationWillTerminate`, which cannot await — and which is the ONLY
@@ -69,6 +78,11 @@ final class TerminationSequence {
   /// main-actor jobs dispatched to this very thread. Pumping the run loop instead keeps servicing
   /// them while the quit waits. `RunLoop.run(mode:before:)` drains the main queue without pulling
   /// `NSEvent`s (`NSApplication`'s own loop owns those), so this waits without re-entering the UI.
+  ///
+  /// The pump is also what makes the deadline real, and that cuts both ways: control only comes back
+  /// here when the main-actor task SUSPENDS. Anything `run()` does synchronously is therefore outside
+  /// the budget no matter what this loop says — which is why the terminal checkpoint is started
+  /// off-main and awaited rather than taken inline. Every wait in `run()` must be an `await`.
   func runBlockingMainRunLoop() {
     didFinish = false
     // Strongly captured on purpose. The caller typically builds this object inline and drops it the
@@ -86,12 +100,11 @@ final class TerminationSequence {
     }
     guard !didFinish else { return }
 
-    // Budget spent. Stop waiting for the drain — and do NOT then call the blocking
-    // `checkpointOnTerminate()`, which is what this used to do. The budget only ever expires because
-    // an index write is stuck inside the pool, and the checkpoint takes the SAME barrier that write
-    // is holding, synchronously, on this thread: the escape hatch would have parked the quit on the
-    // exact stall it exists to escape, so quitting during a wedged reindex could hang indefinitely
-    // despite the timeout.
+    // Budget spent. Stop waiting and return — and do NOT take the checkpoint's barrier on this
+    // thread, which is what this used to do. The budget expires because something is stuck inside the
+    // pool, and the checkpoint takes the barrier that excludes exactly that: the escape hatch would
+    // have parked the quit on the very stall it exists to escape, so quitting during a wedged reindex
+    // could hang indefinitely despite the timeout.
     //
     // So past the deadline the checkpoint is best-effort and unwaited. It still truncates the WAL if
     // the pool frees up while the process is alive, and it can never delay the quit again. A WAL left
@@ -99,9 +112,15 @@ final class TerminationSequence {
     // that never returns is not recoverable at all.
     sequence.cancel()
     NSLog(
-      "Pensieve quit: index drain exceeded its %.1f s budget; leaving the checkpoint best-effort",
+      "Pensieve quit: the index drain and checkpoint exceeded their %.1f s budget; leaving the "
+        + "checkpoint best-effort",
       drainTimeout)
-    indexDatabase.checkpointOnTerminateWithoutWaiting()
+    // Only when the sequence never reached it. A budget spent WAITING for the checkpoint (a wedged
+    // pool reader, not a wedged writer) already has one running; a second barrier would queue behind
+    // the first for nothing.
+    if !didStartTerminalCheckpoint {
+      indexDatabase.startCheckpointOnTerminate()
+    }
   }
 
   private func flushPendingWindowSaves() {

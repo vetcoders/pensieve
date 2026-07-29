@@ -343,7 +343,7 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   /// shutdown — everything that goes straight to `terminate:` — skipped it.
   ///
   /// This drives the REAL delegate entry point AppKit calls, not a helper: the
-  /// bug was never in `checkpointOnTerminate()` (which had its own passing
+  /// bug was never in the terminal checkpoint itself (which had its own passing
   /// tests), it was in nothing calling it. Note the delegate hook deliberately
   /// is NOT `applicationShouldTerminate(_:)`: under
   /// `@NSApplicationDelegateAdaptor` that method is never invoked at all
@@ -892,7 +892,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   }
 
   /// The post-timeout fallback used to deadlock on the very stall it exists to escape. When the drain
-  /// budget expired the old code ran `checkpointOnTerminate()`, whose `barrierWriteWithoutTransaction`
+  /// budget expired the old code took the terminal checkpoint inline, and its
+  /// `barrierWriteWithoutTransaction`
   /// queues behind the wedged writer SYNCHRONOUSLY on the calling thread — so quitting during a stuck
   /// reindex could hang indefinitely despite the timeout. The timeout has to be an escape, not a
   /// detour into the same lock.
@@ -976,6 +977,94 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
 
     released.signal()
     pumpMainRunLoop(until: { writeFinished.isSet }, timeout: 10)
+  }
+
+  /// The sibling above bounds the quit when a WRITER is stuck; this one bounds it when a READER is,
+  /// and that used to be a hole the budget never covered. `TerminationSequence.run()` took the
+  /// terminal checkpoint SYNCHRONOUSLY on the main actor, and `barrierWriteWithoutTransaction`
+  /// excludes the pool's reader connections as well as its writer — which is precisely why the
+  /// truncate needs that barrier. The pump in `runBlockingMainRunLoop()` only regains control when
+  /// the main-actor task SUSPENDS, so a synchronous barrier parked the pump: the deadline stopped
+  /// being re-checked, and a slow backlink query could hang the quit for as long as it held its
+  /// reader. `drainPendingIndexWrites()` does not help — it tracks writes, and never claimed
+  /// otherwise. The budget only ever covered the drain.
+  ///
+  /// The wedge is a genuine pool READER, not a writer and not a simulation: `didOpenBacklinkRead`
+  /// fires from INSIDE `fetchBacklinkRecords`' `pool.read`, with the reader connection already
+  /// checked out. Nothing here schedules an index write, and the churn goes through the synchronous
+  /// `index(document:body:)`, so the drain has nothing to wait for and the ONLY thing the quit can be
+  /// blocked on is the reader. That is what separates this pin from the writer one.
+  ///
+  /// The bound is deliberately loose for the same reason as its sibling — this suite already carries
+  /// wall-clock flakes — and the same safety valve frees the wedge so a regressed build FAILS the
+  /// assertion instead of hanging the suite.
+  func testQuitReturnsWithinItsBudgetWhenAPoolReaderIsWedged() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.wedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // Give the terminal checkpoint something it would visibly reclaim, so "the WAL survived" below
+    // cannot be an artefact of an empty log.
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBeforeQuit = walSize(for: databaseURL)
+    XCTAssertGreaterThanOrEqual(
+      walBeforeQuit, 512 * 1024,
+      "fixture precondition: the churn must actually grow the WAL")
+
+    let documents = (0..<3).map { documentRef(root: root, name: "churn-\($0).md") }
+    let backlinksFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: documents[0], documents: documents)
+      backlinksFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { wedge.isReached }, timeout: 10)
+    XCTAssertTrue(
+      wedge.isReached,
+      "fixture precondition: the backlink query must actually be holding one of the pool's readers")
+
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      drainTimeout: Self.shrunkDrainBudget)
+
+    let startedAt = Date()
+    sequence.runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+    // Sampled before the wedge is released, so it reports what the QUIT left behind rather than what
+    // the abandoned best-effort checkpoint does once the reader lets go.
+    let walAfterQuit = walSize(for: databaseURL)
+
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "the quit must stay inside its budget while a pool reader is wedged; it waited \(elapsed) s, "
+        + "which means the terminal checkpoint's barrier ran without suspending and the pump could "
+        + "never re-check the deadline")
+    XCTAssertGreaterThanOrEqual(
+      walAfterQuit, walBeforeQuit,
+      "a truncated WAL here means the quit sat on the barrier until the reader released it, rather "
+        + "than returning when its budget expired")
+
+    released.signal()
+    pumpMainRunLoop(until: { backlinksFinished.isSet }, timeout: 10)
   }
 
   // MARK: - Ordering fixtures

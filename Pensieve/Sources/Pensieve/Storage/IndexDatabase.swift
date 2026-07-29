@@ -11,6 +11,14 @@ final class IndexDatabase {
   private let searchIndexBatchSize: Int
   private let didInsertSearchIndexBatch: (@Sendable (Int) -> Void)?
 
+  /// Narrow test seam, the READ-side sibling of `didInsertSearchIndexBatch`: fired from INSIDE a
+  /// background backlink query's `pool.read`, on the reading connection's own thread. It exists so a
+  /// test can hold a GENUINE pool reader open and prove the quit stays bounded while
+  /// `barrierWriteWithoutTransaction` — which excludes the pool's readers, not just its writer —
+  /// waits for it. A gate parked before the read would prove nothing: the block has to hold while the
+  /// reader is inside the pool. `nil` in production.
+  private let didOpenBacklinkRead: (@Sendable () -> Void)?
+
   /// Tracks the in-flight background index write (full reindex OR incremental
   /// delta apply). Each new background update chains onto this task before
   /// starting its own `pool.write`, so writes are serialized in submission
@@ -42,11 +50,13 @@ final class IndexDatabase {
   init(
     databaseURL: URL? = nil,
     searchIndexBatchSize: Int = 32,
-    didInsertSearchIndexBatch: (@Sendable (Int) -> Void)? = nil
+    didInsertSearchIndexBatch: (@Sendable (Int) -> Void)? = nil,
+    didOpenBacklinkRead: (@Sendable () -> Void)? = nil
   ) {
     self.configuredDatabaseURL = databaseURL
     self.searchIndexBatchSize = max(1, searchIndexBatchSize)
     self.didInsertSearchIndexBatch = didInsertSearchIndexBatch
+    self.didOpenBacklinkRead = didOpenBacklinkRead
   }
 
   /// Synchronous open — retained for the legacy synchronous workspace path and for tests that drive
@@ -837,34 +847,30 @@ final class IndexDatabase {
     }.value
   }
 
-  /// Synchronous truncating checkpoint for the quit path — the LAST step of `TerminationSequence`,
-  /// which is the only thing allowed to call it. Deliberately blocking: the process may be gone
-  /// before a detached task runs, at that point there is no UI left to stall, and the WAL is already
-  /// bounded by the batch/close checkpoints, so the truncate has little left to flush. Ordering the
-  /// window flushes and the index drain BEFORE it is the sequence's job, not this method's. No-op
-  /// when the index was never opened.
-  func checkpointOnTerminate() {
-    guard let pool = databasePool else { return }
-    do {
-      try pool.barrierWriteWithoutTransaction { db in
-        _ = try db.checkpoint(.truncate)
-      }
-    } catch {
-      NSLog("Pensieve index checkpoint on terminate failed: %@", error.localizedDescription)
-    }
-  }
-
-  /// Best-effort twin of `checkpointOnTerminate()`, for the ONE situation where the blocking version
-  /// is unsafe: the quit's drain budget expired. That budget only ever expires because a writer is
-  /// stuck, and `barrierWriteWithoutTransaction` queues behind exactly that writer — so taking it on
-  /// the calling thread would park the quit on the very stall the timeout exists to escape, turning a
-  /// bounded wait into an unbounded hang. Here the checkpoint is handed to a detached task and
-  /// deliberately NOT awaited: it still truncates the WAL if the pool frees up while the process is
-  /// alive, and the process exit reaps the thread if it never does. A WAL left at its high-water mark
-  /// is reclaimed by the next launch's workspace-close maintenance; a quit that never returns is not
-  /// recoverable at all. Returns the task so a test can prove one was started; production ignores it.
+  /// STARTS the truncating checkpoint for the quit path — the LAST step of `TerminationSequence`,
+  /// which is the only thing allowed to call it. Ordering the window flushes and the index drain
+  /// BEFORE it is the sequence's job, not this method's. No-op when the index was never opened.
+  ///
+  /// The checkpoint runs on a detached task and this method returns its handle instead of running the
+  /// barrier on the caller's thread. That is the whole point, and it is not an optimisation:
+  /// `barrierWriteWithoutTransaction` is the only GRDB entry point that excludes the pool's READER
+  /// connections too (which is exactly why the truncate needs it — see
+  /// `performMaintenanceInBackground`), so it waits for a slow background search or backlink query
+  /// just as it waits for a stuck writer. Taken synchronously from the quit's main-actor task, that
+  /// wait can never yield: the run-loop pump in `TerminationSequence.runBlockingMainRunLoop()` only
+  /// regains control when that task SUSPENDS, so a synchronous barrier parks the pump, the drain
+  /// deadline stops being checked, and the quit hangs for as long as the reader holds the pool. A
+  /// returned task turns the wait into an `await` — a suspension point — so the pump keeps running
+  /// and the same deadline that bounds the drain also bounds the checkpoint.
+  ///
+  /// The caller therefore chooses how long to wait, and both callers are in `TerminationSequence`:
+  /// the happy path awaits the handle under the drain budget, while the post-deadline fallback starts
+  /// it and deliberately does NOT await. Unawaited it is still worth starting: it truncates the WAL if
+  /// the pool frees up while the process is alive, and the process exit reaps the thread if it never
+  /// does. A WAL left at its high-water mark is reclaimed by the next launch's workspace-close
+  /// maintenance; a quit that never returns is not recoverable at all.
   @discardableResult
-  func checkpointOnTerminateWithoutWaiting() -> Task<Void, Never>? {
+  func startCheckpointOnTerminate() -> Task<Void, Never>? {
     guard let pool = databasePool else { return nil }
     return Task.detached(priority: .utility) {
       do {
@@ -872,8 +878,7 @@ final class IndexDatabase {
           _ = try db.checkpoint(.truncate)
         }
       } catch {
-        NSLog(
-          "Pensieve index checkpoint after a timed-out quit failed: %@", error.localizedDescription)
+        NSLog("Pensieve index checkpoint on terminate failed: %@", error.localizedDescription)
       }
     }
   }
@@ -1111,6 +1116,7 @@ final class IndexDatabase {
     appState: AppState? = nil
   ) async -> [WorkspaceBacklinkResult] {
     guard let pool = await ensureOpenInBackground(into: appState) else { return [] }
+    let didOpenRead = didOpenBacklinkRead
 
     do {
       return try await Task.detached(priority: .userInitiated) {
@@ -1118,7 +1124,8 @@ final class IndexDatabase {
           to: target,
           documents: documents,
           limit: limit,
-          pool: pool
+          pool: pool,
+          didOpenRead: didOpenRead
         )
       }.value
     } catch {
@@ -1790,7 +1797,8 @@ final class IndexDatabase {
     to target: DocumentRef,
     documents: [DocumentRef],
     limit: Int,
-    pool: DatabasePool
+    pool: DatabasePool,
+    didOpenRead: (@Sendable () -> Void)? = nil
   ) throws -> [WorkspaceBacklinkResult] {
     let documentsByPath = Dictionary(
       uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
@@ -1805,7 +1813,8 @@ final class IndexDatabase {
       rootScopes: Array(scope.rootScopes),
       includeAdHoc: scope.includeAdHoc,
       targetPath: targetPath,
-      pool: pool
+      pool: pool,
+      didOpenRead: didOpenRead
     )
     let targetRecord = records.first(where: { $0.path == targetPath })
     let targetSlugs = backlinkTargetSlugs(for: target, indexedRecord: targetRecord)
@@ -1933,7 +1942,8 @@ final class IndexDatabase {
     rootScopes: [String],
     includeAdHoc: Bool,
     targetPath: String,
-    pool: DatabasePool
+    pool: DatabasePool,
+    didOpenRead: (@Sendable () -> Void)? = nil
   ) throws -> [BacklinkDocumentRecord] {
     let selectClause = """
       SELECT
@@ -1953,7 +1963,11 @@ final class IndexDatabase {
     arguments += [targetPath]
 
     return try pool.read { db in
-      try BacklinkDocumentRecord.fetchAll(
+      // Fires with the reader connection already checked out of the pool, so a test blocking here
+      // holds the pool the way a slow backlink query does — which is precisely what the terminal
+      // checkpoint's barrier has to wait for.
+      didOpenRead?()
+      return try BacklinkDocumentRecord.fetchAll(
         db,
         sql: """
           \(selectClause)
