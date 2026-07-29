@@ -464,6 +464,311 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       "a small save must not take the barrier checkpoint — the 16 MiB throttle is the point")
   }
 
+  /// Ordinary `Close Folder` used to compact against whatever the index happened to have finished.
+  /// `closeWorkspace` cancels `FolderManager`'s `indexUpdateTask` — which by its own contract
+  /// abandons only the WAIT, never the write underneath, that one belongs to `IndexDatabase`'s
+  /// supersede chain — and then armed the housekeeping with nothing to await. A write still queued
+  /// behind a predecessor therefore landed AFTER the TRUNCATE, and its frames stayed on disk: the
+  /// workspace is gone, so no later close is coming to notice them.
+  ///
+  /// Sibling `testCloseWorkspaceDefersMaintenanceOnlyWhenTheCallerOwnsAFinalIndexWrite` covers the
+  /// last-root special case. This is the general one, and it is deterministic where the older
+  /// last-root pin is not: the first write is BLOCKED at an injection seam so a second write is
+  /// genuinely still queued when the close runs. That matters because GRDB's
+  /// `barrierWriteWithoutTransaction` usually queues behind an already submitted `pool.write`, which
+  /// is exactly how the unordered version passes a settle-first test by accident.
+  ///
+  /// The ordering is asserted directly — the housekeeping must NOT be able to complete while the
+  /// queue is still parked — and then corroborated by the after-effects: both queued documents are
+  /// in the index and the WAL is back at zero, which can only be true if the truncate went last.
+  func testCloseWorkspaceMaintenanceWaitsForTheWholePendingIndexChain() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let body = String(repeating: "pensieve pending chain payload ", count: 600)
+    for index in 0..<60 {
+      try "\(body) \(index)".write(
+        to: root.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let harness = try makeWorkspaceHarness(in: sandbox.support)
+    let appState = AppState()
+    harness.manager.open(url: root, into: appState)
+    await settle(harness)
+
+    let databaseURL = sandbox.support.appendingPathComponent("index.db", isDirectory: false)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 64 * 1024,
+      "fixture precondition: indexing the workspace must leave a WAL worth truncating")
+
+    // Deliberately OUTSIDE the workspace root: nothing but the two queued writes below can put
+    // these documents in the index, so finding them afterwards proves those writes committed.
+    let outside = sandbox.root.appendingPathComponent("Outside", isDirectory: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    let firstRef = documentRef(root: outside, name: "queued-first.md")
+    let secondRef = documentRef(root: outside, name: "queued-second.md")
+    try "\(body) firstqueuedmarker".write(to: firstRef.url, atomically: true, encoding: .utf8)
+    try "\(body) secondqueuedmarker".write(to: secondRef.url, atomically: true, encoding: .utf8)
+
+    let gate = FirstWriteGate()
+    let indexDatabase = harness.indexDatabase
+    indexDatabase.backgroundWriteGateOverride = { await gate.arrive() }
+
+    // Write #1 parks at the gate holding the chain open; write #2 passes the gate and queues behind
+    // #1. Each is only submitted once the previous one has ARRIVED, because arrival happens after
+    // the write took its place in the supersede chain — that is what makes the queue real.
+    Task {
+      await indexDatabase.updateSearchIndexInBackground(
+        upserting: [firstRef], deletingPaths: [], appState: nil)
+    }
+    try await waitUntil("the first index write to park at the gate") { await gate.arrivals >= 1 }
+    Task {
+      await indexDatabase.updateSearchIndexInBackground(
+        upserting: [secondRef], deletingPaths: [], appState: nil)
+    }
+    try await waitUntil("the second index write to queue behind it") { await gate.arrivals >= 2 }
+
+    harness.manager.closeWorkspace(into: appState)
+
+    let maintenanceFinished = CompletionFlag()
+    let maintenance = Task { @MainActor in
+      await harness.manager.waitForPendingIndexMaintenance()
+      maintenanceFinished.isSet = true
+    }
+    // The ordering assertion. A close that waits for the chain CANNOT finish its housekeeping while
+    // both writes are still parked; the unordered version truncates within milliseconds.
+    try await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      maintenanceFinished.isSet,
+      "close-time maintenance completed while two index writes were still queued — the truncate "
+        + "would land before their frames")
+
+    await gate.open()
+    await maintenance.value
+    // Sampled before any assertion touches the pool, so the reading is the state maintenance left.
+    let walAfterMaintenance = walSize(for: databaseURL)
+
+    XCTAssertFalse(
+      indexDatabase.search(query: "firstqueuedmarker", documents: [firstRef], appState: nil)
+        .isEmpty,
+      "the first queued write must have committed before maintenance finished")
+    XCTAssertFalse(
+      indexDatabase.search(query: "secondqueuedmarker", documents: [secondRef], appState: nil)
+        .isEmpty,
+      "the second queued write must have committed before maintenance finished")
+    XCTAssertLessThanOrEqual(
+      walAfterMaintenance, 64 * 1024,
+      "the truncating checkpoint must run AFTER the whole queue drains, otherwise the queued writes' "
+        + "WAL frames survive the workspace that would have checkpointed them (WAL is "
+        + "\(walAfterMaintenance) bytes)")
+  }
+
+  // MARK: - Production wiring: quit flushes windows and drains the index before it checkpoints
+
+  /// Quit used to checkpoint the index and only THEN let the windows tear down. That is backwards:
+  /// `applicationWillTerminate` fires BEFORE `NSWindow.willCloseNotification`, so a dirty window's
+  /// final save ran after the truncate — and the save's index write is a background hand-off, so it
+  /// landed after that again, if the process lived long enough to run it at all. On a Dock quit or a
+  /// logout the last edit's FTS row was simply lost.
+  ///
+  /// This drives the REAL delegate entry point, not a helper, and asserts the whole contract in one
+  /// go: the file on disk carries the edit (the sequence flushed the window itself), the index
+  /// carries it (the write was drained), and the WAL is empty (the checkpoint went last). The final
+  /// write is deliberately tiny, so it is BELOW the 16 MiB batch threshold and cannot have
+  /// checkpointed itself — see `testSingleDocumentSaveIsThrottledBelowTheWalThreshold`, which pins
+  /// exactly that. The pre-existing WAL-only test above cannot see any of this: it quits with no
+  /// dirty window, so nothing writes after the checkpoint.
+  func testTerminationFlushesTheFinalWindowSaveIntoTheIndexBeforeCheckpointing() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let noteURL = root.appendingPathComponent("quit-note.md")
+    try "before the quit".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // Give the terminal truncate something to reclaim, so "WAL is empty afterwards" cannot be an
+    // artefact of nothing ever having been written.
+    churn(database: database, root: root, count: 300, deleting: 0)
+    XCTAssertGreaterThanOrEqual(
+      walSize(for: databaseURL), 512 * 1024,
+      "fixture precondition: the churn must actually grow the WAL")
+
+    // A minute-long debounce: the only thing that can reach disk before the process exits is the
+    // termination flush itself, never a scheduled autosave.
+    let autosaver = Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveTerminationFlushBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+    let registry = DocumentWindowRegistry()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: WorkspaceMetadataStore(
+          metadataURL: folder.appendingPathComponent("workspace.json")),
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveTerminationFlushWorkspace"))),
+      documentStore: store,
+      indexDatabase: database,
+      documentWindowRegistry: registry
+    )
+
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    registry.registerController(controller, for: window)
+
+    let ref = DocumentRef(id: noteURL.standardizedFileURL)
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "before the quit")
+    appState.activeDocumentText = "edited moments before the quit"
+    store.documentDidChange(appState: appState)
+    XCTAssertTrue(appState.activeDocumentDirty)
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "before the quit",
+      "fixture precondition: the debounced write must not have fired yet")
+
+    let delegate = PensieveAppDelegate()
+    delegate.terminationWindowRegistryOverride = registry
+    delegate.terminationIndexDatabaseOverride = database
+    delegate.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+
+    // Sampled before the search below opens anything against the pool.
+    let walAfterQuit = walSize(for: databaseURL)
+
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "edited moments before the quit",
+      "the quit must flush the window's pending edit itself — willCloseNotification fires after "
+        + "applicationWillTerminate, far too late to be the app's final save")
+    XCTAssertFalse(
+      database.search(query: "moments", documents: [ref], appState: appState).isEmpty,
+      "the final save's index write must be drained before the process is allowed to go")
+    XCTAssertLessThanOrEqual(
+      walAfterQuit, 64 * 1024,
+      "the truncating checkpoint must be the LAST step of the quit (WAL is \(walAfterQuit) bytes)")
+  }
+
+  /// "Exactly one owner" is a testable claim, so it is tested. The custom ⌘Q item used to take its
+  /// own checkpoint before calling `terminate:` — a SECOND checkpoint, and the earlier one, so it ran
+  /// before the final window saves it was supposed to protect. It must now be a pure dirty-session
+  /// guard that leaves storage alone; the shared `applicationWillTerminate` path that ⌘Q also goes
+  /// through is what truncates.
+  func testQuitMenuGuardLeavesTheCheckpointToTheTerminationSequence() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBefore = walSize(for: databaseURL)
+    XCTAssertGreaterThanOrEqual(
+      walBefore, 512 * 1024,
+      "fixture precondition: the churn must actually grow the WAL")
+
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: WorkspaceMetadataStore(
+          metadataURL: folder.appendingPathComponent("workspace.json")),
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveQuitGuardWorkspace"))),
+      documentStore: DocumentStore(
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveQuitGuardBookmarks")),
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))),
+      indexDatabase: database,
+      documentWindowRegistry: DocumentWindowRegistry()
+    )
+
+    XCTAssertTrue(controller.applicationShouldTerminate(), "a clean session must let the quit pass")
+    XCTAssertEqual(
+      walSize(for: databaseURL), walBefore,
+      "the quit menu guard must not checkpoint: the termination sequence owns the ordering, and a "
+        + "checkpoint fired here runs BEFORE the final window saves")
+
+    let delegate = PensieveAppDelegate()
+    delegate.terminationWindowRegistryOverride = DocumentWindowRegistry()
+    delegate.terminationIndexDatabaseOverride = database
+    delegate.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+
+    XCTAssertLessThanOrEqual(
+      walSize(for: databaseURL), 64 * 1024,
+      "…and the one owner still truncates on the very same ⌘Q path (was \(walBefore) bytes)")
+  }
+
+  // MARK: - Ordering fixtures
+
+  /// One-shot release valve behind `IndexDatabase.backgroundWriteGateOverride`. The FIRST background
+  /// index write parks here until the test opens the gate; every later write passes straight through
+  /// so it queues on the supersede chain — behind write #1 — rather than on this gate. `arrivals` is
+  /// how the test knows a write has genuinely taken its place in that chain: the gate sits at the
+  /// head of the write task, which cannot start before the write registered itself.
+  private actor FirstWriteGate {
+    private(set) var arrivals = 0
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func arrive() async {
+      arrivals += 1
+      guard arrivals == 1, !isOpen else { return }
+      await withCheckedContinuation { continuation in
+        waiters.append(continuation)
+      }
+    }
+
+    func open() {
+      isOpen = true
+      for waiter in waiters { waiter.resume() }
+      waiters.removeAll()
+    }
+  }
+
+  /// Main-actor flag a probe task can set, so a test can observe "did this finish yet?" without
+  /// awaiting the thing it is trying to prove has NOT finished.
+  @MainActor private final class CompletionFlag {
+    var isSet = false
+  }
+
+  /// Polls a monotone condition instead of sleeping a fixed amount: a correct build waits only as
+  /// long as it actually needs, and a wrong one fails the assertion rather than a guessed duration.
+  private func waitUntil(
+    _ description: String,
+    timeout: TimeInterval = 10,
+    _ condition: () async -> Bool
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if await condition() { return }
+      try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    XCTFail("timed out waiting for \(description)")
+  }
+
   // MARK: - Workspace fixtures (last-root removal)
 
   private struct WorkspaceSandbox {

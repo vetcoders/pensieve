@@ -19,6 +19,21 @@ final class IndexDatabase {
   /// Tests await it via `waitForPendingReindex()` instead of sleeping.
   private var pendingIndexUpdateTask: Task<Void, Never>?
 
+  /// Index writes that are SCHEDULED but have not joined `pendingIndexUpdateTask` yet. A save must
+  /// not stall on SQLite, so it hands its index write to an unstructured task that only chains
+  /// itself onto the supersede queue once it starts running. Anything that has to establish "no
+  /// index write is still owed" — the quit sequence, the workspace-close housekeeping — therefore
+  /// cannot read the chain alone: at that instant the write it just caused may still be sitting
+  /// here, invisible to `waitForPendingReindex()`.
+  private var scheduledIndexWrites: [UUID: Task<Void, Never>] = [:]
+
+  /// Narrow test seam: awaited at the head of every background index write, before it waits for its
+  /// predecessor and long before it touches the pool. It exists so a test can hold write #1 open and
+  /// prove write #2 is GENUINELY still queued when a close or a quit runs — GRDB's
+  /// `barrierWriteWithoutTransaction` usually queues behind an already submitted `pool.write`, so an
+  /// unordered close passes a settle-first test by accident. `nil` in production.
+  var backgroundWriteGateOverride: (@Sendable () async -> Void)?
+
   /// Coalesces concurrent off-main opens: the first `ensureOpenInBackground` that finds no pool
   /// starts the migration on a detached executor and parks this task; later callers await the SAME
   /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
@@ -543,6 +558,7 @@ final class IndexDatabase {
     let didInsertBatch = didInsertSearchIndexBatch
 
     let write = Task { [weak self] () -> Bool in
+      await self?.awaitBackgroundWriteGate()
       await previous?.value
       do {
         try await Task.detached(priority: .utility) {
@@ -589,6 +605,46 @@ final class IndexDatabase {
   /// `reindexInBackground` deterministically without sleeping. Returns
   /// immediately when nothing is pending.
   func waitForPendingReindex() async {
+    await pendingIndexUpdateTask?.value
+  }
+
+  private func awaitBackgroundWriteGate() async {
+    guard let gate = backgroundWriteGateOverride else { return }
+    await gate()
+  }
+
+  /// Hands an index write to a background task WITHOUT losing track of it. Same shape as the bare
+  /// `Task` the save tail used to spawn inline — the save still returns before the write commits —
+  /// except the task is recorded here, so `drainPendingIndexWrites()` can await work that is
+  /// scheduled but has not reached the supersede chain yet. The task removes itself when it
+  /// finishes, so an editing session does not accumulate handles.
+  @discardableResult
+  func scheduleIndexWrite(_ work: @escaping @MainActor @Sendable () async -> Void) -> Task<
+    Void, Never
+  > {
+    let id = UUID()
+    let task = Task { @MainActor [weak self] in
+      await work()
+      self?.scheduledIndexWrites.removeValue(forKey: id)
+    }
+    scheduledIndexWrites[id] = task
+    return task
+  }
+
+  /// Awaits EVERY index write this database currently owes: first the scheduled hand-offs (which
+  /// join the supersede chain only once they start running), then the chain itself. Awaiting
+  /// `pendingIndexUpdateTask` alone is not enough — it reads a tail that a just-scheduled save has
+  /// not joined yet, which is exactly how a final save's write ended up landing after the quit
+  /// checkpoint. The loop covers hand-offs scheduled BY the drain (a write can schedule a refresh
+  /// of its own); it terminates because nothing re-arms once the workspace/app is going away.
+  func drainPendingIndexWrites() async {
+    while !scheduledIndexWrites.isEmpty {
+      let scheduled = Array(scheduledIndexWrites.values)
+      scheduledIndexWrites.removeAll()
+      for task in scheduled {
+        await task.value
+      }
+    }
     await pendingIndexUpdateTask?.value
   }
 
@@ -654,6 +710,7 @@ final class IndexDatabase {
     let didInsertBatch = didInsertSearchIndexBatch
 
     let write = Task { [weak self] () -> Bool in
+      await self?.awaitBackgroundWriteGate()
       await previous?.value
       do {
         try await Task.detached(priority: .utility) {
@@ -768,10 +825,12 @@ final class IndexDatabase {
     }.value
   }
 
-  /// Synchronous truncating checkpoint for the quit path. `applicationShouldTerminate` cannot await
-  /// a detached task — the process may be gone before it runs — so this one blocks, deliberately: at
-  /// that point there is no UI left to stall, and the WAL is already bounded by the batch/close
-  /// checkpoints, so the truncate has little left to flush. No-op when the index was never opened.
+  /// Synchronous truncating checkpoint for the quit path — the LAST step of `TerminationSequence`,
+  /// which is the only thing allowed to call it. Deliberately blocking: the process may be gone
+  /// before a detached task runs, at that point there is no UI left to stall, and the WAL is already
+  /// bounded by the batch/close checkpoints, so the truncate has little left to flush. Ordering the
+  /// window flushes and the index drain BEFORE it is the sequence's job, not this method's. No-op
+  /// when the index was never opened.
   func checkpointOnTerminate() {
     guard let pool = databasePool else { return }
     do {
@@ -951,6 +1010,7 @@ final class IndexDatabase {
     let record = Self.documentWriteRecord(from: document, body: body)
 
     let write = Task { [weak self] () -> Bool in
+      await self?.awaitBackgroundWriteGate()
       await previous?.value
       do {
         try await Task.detached(priority: .utility) {

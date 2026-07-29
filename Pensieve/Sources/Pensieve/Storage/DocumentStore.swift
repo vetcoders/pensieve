@@ -957,16 +957,25 @@ final class FolderManager {
 
   /// Arms the off-main index housekeeping (WAL truncate + page compaction) that follows a close.
   ///
-  /// `pendingIndexWork` exists because the close is not always the last thing to touch the index:
-  /// `removeRoot` still has to delete the vanished root's paths. Compaction is not order-agnostic —
-  /// it truncates the WAL and hands free pages back, so running it BEFORE that delete truncates a
-  /// log the delete immediately grows again, and the resulting frames and free pages then sit there
-  /// unclaimed: the workspace is gone, so no further batch checkpoint is coming to notice them.
-  /// Chaining on the write instead of firing alongside it makes the order deterministic.
+  /// Compaction is not order-agnostic — it truncates the WAL and hands free pages back, so running
+  /// it BEFORE a still-outstanding index write truncates a log that write immediately grows again,
+  /// and the resulting frames and free pages then sit there unclaimed: the workspace is gone, so no
+  /// further batch checkpoint is coming to notice them.
+  ///
+  /// Two things can still be owed at that moment, and BOTH are waited for:
+  ///
+  /// - `pendingIndexWork` — a final write this close's CALLER owns and has not handed to the index
+  ///   yet (only `removeRoot`'s last-root delete does this).
+  /// - the index's own queue — `closeWorkspace` cancels `indexUpdateTask`, but that handle is only
+  ///   the WAIT: the write underneath belongs to `IndexDatabase`'s supersede chain and survives the
+  ///   cancellation, and a save's write may not even have joined that chain yet. Ordinary
+  ///   `Close Folder` used to arm this task with nothing to await and compacted straight through
+  ///   a queue that was still moving.
   private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
     let indexDatabase = indexDatabase
     indexMaintenanceTask = Task {
       await pendingIndexWork?.value
+      await indexDatabase.drainPendingIndexWrites()
       await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
     }
   }
@@ -994,13 +1003,16 @@ final class FolderManager {
     openFlowGeneration &+= 1
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
-    // Cancel any still-awaiting off-main index update. The underlying single-transaction
-    // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
+    // Cancel any still-awaiting off-main index update. Only the WAIT is abandoned — the write
+    // itself belongs to `IndexDatabase`'s supersede chain and still runs — but the underlying
+    // single-transaction `pool.write` commits wholly or not at all, so this never leaves the index
+    // half-written. The housekeeping armed below waits for that chain; see
+    // `scheduleIndexMaintenance(after:)`.
     indexUpdateTask?.cancel()
     workspaceIndexWriteTask?.cancel()
-    // Closing a workspace is the quietest moment the index ever gets: no watcher, no pending write.
-    // Bound the WAL and reclaim freed pages here so the storm of a workspace's lifetime does not
-    // survive into the next one.
+    // Closing a workspace is the quietest moment the index ever gets: no watcher, and whatever
+    // writes are still queued are drained before the compaction runs. Bound the WAL and reclaim
+    // freed pages here so the storm of a workspace's lifetime does not survive into the next one.
     if !deferringIndexMaintenance {
       scheduleIndexMaintenance()
     }
@@ -2628,7 +2640,12 @@ final class DocumentStore {
         // synchronously on the main actor on every persisted edit (a per-save SQLite stall). Routing
         // it through the off-main `indexInBackground` twin keeps the file write synchronous while the
         // FTS update commits in the background; tests sync on it via `waitForPendingReindex()`.
-        Task {
+        //
+        // Handed over through `scheduleIndexWrite` rather than a bare `Task` so the write stays
+        // TRACKABLE. A bare task joins the supersede chain several suspensions later, which is
+        // invisible to anyone asking "does the index still owe me anything?" — and the quit
+        // sequence has to answer exactly that before it checkpoints the WAL.
+        resolvedIndexDatabase.scheduleIndexWrite {
           await resolvedIndexDatabase.indexInBackground(
             document: ref, body: body, appState: appState)
         }

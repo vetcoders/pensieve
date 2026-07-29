@@ -549,15 +549,15 @@ final class AppController: ObservableObject {
     return didSave
   }
 
+  /// The custom "Quit Pensieve" menu item's guard: settle THIS window's dirty session and report
+  /// whether the quit may proceed. Storage hygiene is deliberately NOT here any more — this item is
+  /// one of several quit paths, and the one it shares with all the others
+  /// (`applicationWillTerminate` → `TerminationSequence`) owns the save → index drain → checkpoint
+  /// ordering for every one of them. A second checkpoint fired from here would run BEFORE the final
+  /// window saves, which is precisely the ordering the sequence exists to prevent.
   @discardableResult
   func applicationShouldTerminate() -> Bool {
-    let canTerminate = documentStore.prepareForDocumentSwitch(appState: appState)
-    // Only truncate the WAL once quitting is actually going through — a cancelled quit (unsaved
-    // work) must leave the index exactly as the still-running session expects it.
-    if canTerminate {
-      indexDatabase.checkpointOnTerminate()
-    }
-    return canTerminate
+    documentStore.prepareForDocumentSwitch(appState: appState)
   }
 
   /// Save-on-close guard for THIS window's session. Routed from the shared

@@ -181,22 +181,17 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     MainActor.assumeIsolated {
-      // The last document window closing during Quit must not resurrect a
-      // launcher; tell the registry the app is going away before its windows tear
-      // down.
-      (terminationWindowRegistryOverride ?? .shared).beginTermination()
-      // The index's truncating checkpoint used to hang off the custom "Quit Pensieve" menu item
-      // alone (`AppController.applicationShouldTerminate()`), so Dock quit, logout and shutdown —
-      // every path that goes straight to `terminate:` — left the WAL at its high-water mark until
-      // some later session happened to close a workspace. This notification is the one termination
-      // hook the app actually receives: `applicationShouldTerminate(_:)` on THIS delegate is never
-      // invoked under `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so
-      // wiring it there would have looked right and done nothing.
-      //
-      // Cheap by construction rather than by timeout: the batch and workspace-close checkpoints
-      // keep the WAL bounded while the app runs, so by the time we get here the truncate has
-      // little left to flush — the same assumption `applicationShouldTerminate()` already makes.
-      (terminationIndexDatabaseOverride ?? .shared).checkpointOnTerminate()
+      // This notification is the one termination hook the app actually receives:
+      // `applicationShouldTerminate(_:)` on THIS delegate is never invoked under
+      // `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so wiring anything
+      // there would have looked right and done nothing. Every quit path — Dock, logout, shutdown,
+      // the custom ⌘Q item — arrives here, which is why the whole termination contract (final
+      // window saves → index drain → truncating checkpoint) has exactly one owner and it hangs off
+      // this call. See `TerminationSequence`.
+      TerminationSequence(
+        registry: terminationWindowRegistryOverride ?? .shared,
+        indexDatabase: terminationIndexDatabaseOverride ?? .shared
+      ).runBlockingMainRunLoop()
     }
   }
 }

@@ -566,6 +566,19 @@ final class DocumentWindowRegistry: ObservableObject {
     controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
   }
 
+  /// Every window controller still alive, deduplicated. `TerminationSequence` flushes each window's
+  /// pending edit through these directly instead of waiting for `NSWindow.willCloseNotification`:
+  /// `applicationWillTerminate` runs BEFORE window teardown, so on a Dock quit or a logout that
+  /// per-window hook fires after the app has already decided it is done — far too late to be the
+  /// app's final save. Dead weak entries are dropped here rather than left to accumulate.
+  func liveDocumentControllers() -> [AppController] {
+    controllersByWindow = controllersByWindow.filter { $0.value.controller != nil }
+    var seen: Set<ObjectIdentifier> = []
+    return controllersByWindow.values.compactMap(\.controller).filter {
+      seen.insert(ObjectIdentifier($0)).inserted
+    }
+  }
+
   /// The controller owning the window that currently shows `identity`, so a
   /// cross-window close routes its dirty guard through the target's own session.
   func controller(for identity: DocumentIdentity) -> AppController? {
