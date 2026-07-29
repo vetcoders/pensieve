@@ -30,6 +30,13 @@ import Foundation
 /// keeps a termination flag of its own, they execute commands (`quiesceForTermination`) or are
 /// switched by this one (`IndexDatabase.closeForTermination`).
 ///
+/// The order above is one thing; WHICH of it the `drainTimeout` bounds is another, and the two are
+/// not the same question. Steps 1–2 are the user's own bytes; steps 3–5 are index bookkeeping. Only
+/// the latter can wedge (SQLite, a background pool), only the latter is what the budget was built
+/// for, and a buffer that misses the disk is gone for good while a WAL left long is reclaimed by the
+/// next launch. So the split is: `runUserFlushPhases()` runs OUTSIDE any task and outside the
+/// deadline, `runIndexPhases()` runs inside both. Phase order is unchanged — Q → F → D → L → C.
+///
 /// Deliberately prompt-free and non-destructive: nothing here asks the user anything and nothing
 /// discards a buffer. A dirty untitled session is persisted as a recovery draft by the same
 /// `savePendingChangesOnClose` an ordinary window close uses.
@@ -76,10 +83,24 @@ final class TerminationSequence {
     self.pumpRunLoop = pumpRunLoop
   }
 
-  /// The termination contract itself. Every wait here is an `await` — see
-  /// `runBlockingMainRunLoop()`: a synchronous wait would park the pump and make the deadline dead.
-  /// Phases Q and F introduce none: they are O(1) cancels plus one already-owed index write.
+  /// The whole contract, for callers that can await it — tests, and any future async quit hook.
+  /// `runBlockingMainRunLoop()` runs these same two halves; what it adds is the budget, and it puts
+  /// the budget around the second half only.
   func run() async {
+    runUserFlushPhases()
+    await runIndexPhases()
+  }
+
+  /// Phases Q and F — the half that owns the user's bytes, and synchronous on purpose.
+  ///
+  /// Quiescence is a handful of O(1) cancels and the flush is the app's ordinary save primitive,
+  /// which is itself synchronous: `String.write(_:atomically:)` on the main actor, the very same call
+  /// ⌘S and every window close make. Nothing here needs the pump, so nothing here needs to be inside
+  /// the budgeted task — and it must not be. A cancelled task's continuation is not guaranteed to
+  /// resume before AppKit tears the process down, so a save loop parked behind a suspension point at
+  /// the moment the deadline expires can lose the windows it had not reached yet. User bytes are not
+  /// budgeted work.
+  func runUserFlushPhases() {
     // ---- Q: quiescence. Producers first, before anything is flushed or drained, so the drain below
     // waits for a FINITE set of work rather than a target the watcher and the debounces keep moving.
     let controllers = registry.liveDocumentControllers()
@@ -93,9 +114,15 @@ final class TerminationSequence {
 
     // ---- F: flush. Everything the user already owns lands now, not when a timer says so. Both
     // steps PRODUCE index writes, which is precisely why the latch cannot be armed yet.
-    await flushPendingWindowSaves(controllers)
+    flushPendingWindowSaves(controllers)
     autosaver.quiesceForTermination()
+  }
 
+  /// Phases D, L and C — the half `drainTimeout` was actually built to bound, and the only half that
+  /// can wedge: SQLite, a background pool, a producer that outlived its owner. Every wait here is an
+  /// `await` — see `runBlockingMainRunLoop()`: a synchronous wait would park the pump and make the
+  /// deadline dead.
+  func runIndexPhases() async {
     // ---- D: drain. The accepted work first, then the post-close index housekeeping — which is a
     // barrier vacuum + truncate and, until now, was awaited only by tests. `Close Folder` followed by
     // a fast ⌘Q raced that vacuum against this quit's own checkpoint, and GRDB serializes the two
@@ -127,17 +154,28 @@ final class TerminationSequence {
   /// `NSEvent`s (`NSApplication`'s own loop owns those), so this waits without re-entering the UI.
   ///
   /// The pump is also what makes the deadline real, and that cuts both ways: control only comes back
-  /// here when the main-actor task SUSPENDS. Anything `run()` does synchronously is therefore outside
-  /// the budget no matter what this loop says — which is why the terminal checkpoint is started
-  /// off-main and awaited rather than taken inline. Every wait in `run()` must be an `await`.
+  /// here when the main-actor task SUSPENDS. Anything the task does synchronously is therefore
+  /// outside the budget no matter what this loop says — which is why the terminal checkpoint is
+  /// started off-main and awaited rather than taken inline. Every wait in `runIndexPhases()` must be
+  /// an `await`.
+  ///
+  /// Phases Q and F run BEFORE the task and before the deadline, on this thread. They are the user's
+  /// own bytes and they are all synchronous, so there is nothing for the pump to service and nothing
+  /// a cancellation could usefully stop — it could only strand the windows the loop had not reached.
+  /// The named consequence, and it is deliberate: a pile of dirty windows on a slow volume delays the
+  /// quit by however long those writes take, unbudgeted. That is the priority this contract keeps —
+  /// bytes first, the deadline second — and it is the reason the deadline can never cost a save.
   func runBlockingMainRunLoop() {
     didFinish = false
+    // Outside the task and outside the budget. See `runUserFlushPhases()`.
+    runUserFlushPhases()
+
     // Strongly captured on purpose. The caller typically builds this object inline and drops it the
     // moment this method returns, so a weak capture is resolved against an object ARC is already
     // free to release — the sequence would silently do nothing. Nothing here stores the task on
     // `self`, so there is no cycle to break.
     let sequence = Task { @MainActor in
-      await self.run()
+      await self.runIndexPhases()
       self.didFinish = true
     }
 
@@ -174,27 +212,28 @@ final class TerminationSequence {
     }
   }
 
-  /// Lands every window's pending edit, yielding BETWEEN windows.
+  /// Lands every window's pending edit, in one uninterrupted synchronous loop.
   ///
   /// Each save is the app's ordinary save primitive and it is synchronous: `String.write(_:atomically:)`
   /// on the main actor, the very same call ⌘S and every window close make. Moving document and
   /// session state off the main actor is a save-path refactor this termination contract does not own,
-  /// so the synchronous write stays — but a LOOP of them was invisible to the budget: control could
-  /// not return to `runBlockingMainRunLoop()`'s pump until the last window had finished writing, so
-  /// N dirty windows on a slow volume could consume the whole deadline in one uninterruptible block.
+  /// so the synchronous write stays.
   ///
-  /// The `Task.yield()` makes the budget enforceable at FILE granularity: the pump regains control
-  /// between windows and re-checks the deadline there. If it expires mid-loop the sequence is
-  /// cancelled but the remaining saves still run — user bytes outrank the deadline — and the fallback
-  /// has by then closed the latch, so nothing they schedule can land behind the checkpoint.
+  /// Round 6 briefly put an `await Task.yield()` between windows to make the budget enforceable at
+  /// file granularity. That trade is off: the pump did regain control between files, but the price
+  /// was that the deadline could now expire mid-loop, `runBlockingMainRunLoop()` would cancel and
+  /// return, and the continuation holding the REMAINING windows would sit on a main actor nobody
+  /// pumps again — the process exits and those buffers are gone. Observability of the budget is not
+  /// worth a lost file, so the loop is uninterruptible again and the whole phase now runs outside the
+  /// budget instead (see `runUserFlushPhases()`).
   ///
-  /// Named residual, and it is deliberate: a SINGLE large file's synchronous write can still overrun
-  /// the budget on its own. Bounding that needs the save path itself to become suspending, which is
-  /// out of scope here.
-  private func flushPendingWindowSaves(_ controllers: [AppController]) async {
+  /// Named residual, unchanged and deliberate: N dirty windows, or a single large one, on a slow
+  /// volume delay the quit for as long as their writes take. Bounding that safely needs the save path
+  /// itself to become suspending — a refactor this contract does not own — and until then a slow quit
+  /// beats a lost buffer.
+  private func flushPendingWindowSaves(_ controllers: [AppController]) {
     for controller in controllers {
       controller.savePendingChangesOnClose()
-      await Task.yield()
     }
   }
 }

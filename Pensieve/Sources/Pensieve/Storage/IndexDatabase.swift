@@ -804,11 +804,24 @@ final class IndexDatabase {
   /// not joined yet, which is exactly how a final save's write ended up landing after the quit
   /// checkpoint. The loop covers hand-offs scheduled BY the drain (a write can schedule a refresh
   /// of its own); it terminates because nothing re-arms once the workspace/app is going away.
+  ///
+  /// All three are read until they are SIMULTANEOUSLY stable, and the tail is no exception. It used
+  /// to be a single snapshot taken after the loop, and that snapshot has the same hole the other two
+  /// were looped for: two background updates parked on the initial open both get admitted, one
+  /// installs its tail before this drain reads it and the other installs its tail while the drain is
+  /// already awaiting the first. A snapshot returns as soon as the first finishes, the quit latches
+  /// and checkpoints, and the second — already accepted, so the funnel will not refuse it — adds WAL
+  /// frames behind that checkpoint. These background entry points do not re-check cancellation after
+  /// the open, so quiescence cannot cover it either. Awaiting by identity until the tail stops moving
+  /// can, and it still terminates for the same reason the rest of the loop does: nothing re-arms once
+  /// quiescence has run, and the latch that follows this drain refuses whatever tries.
   func drainPendingIndexWrites() async {
     // Each distinct open is awaited exactly once, tracked by identity rather than by clearing
     // `openTask` — clearing it here would break the coalescing contract and let a later joiner start
-    // a second `DatabasePool` over the same file.
+    // a second `DatabasePool` over the same file. The supersede tail is tracked the same way: it is
+    // never cleared, so identity is what tells "already awaited" from "moved while I waited".
     var awaitedOpen: Task<DatabasePool, Error>?
+    var awaitedTail: Task<Void, Never>?
     while true {
       // An in-flight OPEN is work this drain can see nowhere else. It registers in neither collection
       // below, so without this the drain could report "nothing owed", the latch could close, and the
@@ -821,14 +834,22 @@ final class IndexDatabase {
         _ = try? await openTask.value
         continue
       }
-      guard !scheduledIndexWrites.isEmpty else { break }
-      let scheduled = Array(scheduledIndexWrites.values)
-      scheduledIndexWrites.removeAll()
-      for task in scheduled {
-        await task.value
+      if !scheduledIndexWrites.isEmpty {
+        let scheduled = Array(scheduledIndexWrites.values)
+        scheduledIndexWrites.removeAll()
+        for task in scheduled {
+          await task.value
+        }
+        continue
       }
+      // Last, because a scheduled hand-off joins the chain only once it runs: reading the tail before
+      // the collection above is empty would read a tail that is still growing. Re-read on every pass
+      // — a tail that changed while this drain was parked on the previous one is a write the drain
+      // accepted and has not waited for yet.
+      guard let tail = pendingIndexUpdateTask, tail != awaitedTail else { break }
+      awaitedTail = tail
+      await tail.value
     }
-    await pendingIndexUpdateTask?.value
   }
 
   /// Synchronous incremental index update: re-upsert each `upserting` doc

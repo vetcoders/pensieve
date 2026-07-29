@@ -1511,32 +1511,66 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "ever throw away a neighbour's — and on an ad-hoc document nothing would ever repair it")
   }
 
-  // MARK: - R6: the flush loop is deadline-aware between windows
+  // MARK: - R10: the deadline cannot cost a window its bytes
 
-  /// Round 6, finding 2 — the budget could be consumed invisibly.
+  /// Round 10, finding 1 (P1, user-data loss) — and the pin that SUPERSEDES round 6's
+  /// `testTheFinalWindowSavesLetTheDeadlinePumpRunBetweenFiles`.
   ///
-  /// Every per-window save is the app's ordinary synchronous save primitive, and phase F ran them in
-  /// one uninterrupted loop on the main actor. Control could therefore not return to the pump in
-  /// `runBlockingMainRunLoop()` until the LAST window had finished writing, so N dirty windows on a
-  /// slow volume could burn the whole deadline in a single block the timeout could not observe.
+  /// Round 6 put an `await Task.yield()` between the per-window saves so the pump could re-check the
+  /// deadline at file granularity, and round 6's pin locked exactly that interleaving. The mechanism
+  /// was real and the trade was wrong: with a suspension point inside phase F, the deadline can now
+  /// expire WHILE the loop is parked between two windows. `runBlockingMainRunLoop()` then cancels the
+  /// sequence and returns from `applicationWillTerminate`, and the continuation holding the remaining
+  /// saves is queued on a main actor nobody pumps again — AppKit tears the process down and those
+  /// buffers are gone. Budget observability is not worth a lost file.
   ///
-  /// This is a bounded mitigation, not a redesign: the write itself stays synchronous (making it
-  /// suspending means moving document state off the main actor, a save-path refactor outside this
-  /// contract), so a SINGLE large file can still overrun the budget. What is pinned here is the
-  /// granularity — the pump regains control BETWEEN windows — observed through the sequence's own
-  /// `pumpRunLoop` seam interleaved with the stores' `writeDocument` seam.
-  func testTheFinalWindowSavesLetTheDeadlinePumpRunBetweenFiles() throws {
+  /// So phases Q and F moved OUT of the cancellable task entirely: they run synchronously on the
+  /// calling thread, before the deadline exists.
+  ///
+  /// The pump seam is driven at its WORST here, and that is the honest way to pin this. The real
+  /// failure ends outside any run loop — `applicationWillTerminate` returns and AppKit exits the
+  /// process — so the state to reproduce is "the main actor is never serviced again", not "the run
+  /// loop happened to slice between two files". A pump that services nothing is exactly that state,
+  /// and it is the only shape in which the assertion is a contract rather than a scheduling
+  /// observation: a real `RunLoop.run(mode:before:)` drains a freshly enqueued continuation within
+  /// the SAME pass, so a build that loses window-b in production can still save it under test.
+  ///
+  /// Two dirty windows, a budget so small it is spent immediately, a drain that can never be
+  /// satisfied (a background write parked at the write gate) and a pump that gives the sequence
+  /// nothing. Both windows' bytes must be on disk when the quit returns, both saves must have
+  /// happened BEFORE the budget started, and the quit must still be bounded.
+  func testTheDeadlineCannotExpireBeforeEveryWindowHasWrittenItsBytes() throws {
     let folder = try makeTemporaryFolder()
     let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
     let appState = AppState()
     let database = IndexDatabase(databaseURL: databaseURL)
     database.open(into: appState)
     XCTAssertNil(appState.lastError)
 
+    // The budget must be SPENT for this pin to mean anything: a parked background write gives the
+    // drain something real to wait for, exactly as `testASpentDrainBudgetStillClosesTheFunnel` does.
+    let gate = ParkingGate()
+    database.backgroundWriteGateOverride = { await gate.arrive() }
+    let parkedRef = documentRef(root: root, name: "parked-write.md")
+    try "the write that never gets there".write(to: parkedRef.url, atomically: true, encoding: .utf8)
+    let parkedWriteFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.updateSearchIndexInBackground(
+        upserting: [parkedRef], deletingPaths: [], appState: nil)
+      parkedWriteFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the drain must have something it genuinely cannot finish, or the "
+        + "deadline never expires and this pin proves nothing")
+
     let log = EventLog()
     let registry = DocumentWindowRegistry()
-    let folderManager = makeIsolatedFolderManager(in: folder, database: database, prefix: "PumpLoop")
+    let folderManager = makeIsolatedFolderManager(in: folder, database: database, prefix: "SaveFirst")
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
 
     var windows: [NSWindow] = []
@@ -1553,22 +1587,27 @@ final class TerminationQuiescenceTests: XCTestCase {
       noteURLs.append(noteURL)
       let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
 
+      // The slow volume, injected: the FIRST window's write alone outlasts the whole budget, which
+      // is the premise of the finding — a save loop that runs longer than the deadline it used to
+      // live inside. The bytes must land anyway.
+      let isSlow = name == "window-a"
       let windowState = AppState()
       let store = DocumentStore(
         autosaver: autosaver,
         indexDatabase: database,
         bookmarkStore: BookmarkStore(
-          defaults: makeEphemeralDefaults(prefix: "PensievePumpLoop\(name)Bookmarks")),
+          defaults: makeEphemeralDefaults(prefix: "PensieveSaveFirst\(name)Bookmarks")),
         recoveryStore: RecoveryStore(
           directoryURL: folder.appendingPathComponent("Recovery-\(name)", isDirectory: true)),
         writeDocument: { text, url in
+          if isSlow { Thread.sleep(forTimeInterval: Self.slowVolumeWriteSeconds) }
           log.append("save:\(url.deletingPathExtension().lastPathComponent)")
           try text.write(to: url, atomically: true, encoding: .utf8)
         }
       )
       windowState.documents = [ref]
       windowState.documentSession.load(document: ref, text: "before the quit")
-      windowState.activeDocumentText = "pumploopneedle in \(name)"
+      windowState.activeDocumentText = "savefirstneedle in \(name)"
       windowState.documentSession.isDirty = true
 
       let controller = AppController(
@@ -1593,38 +1632,170 @@ final class TerminationQuiescenceTests: XCTestCase {
       indexDatabase: database,
       folderManager: folderManager,
       autosaver: autosaver,
-      drainTimeout: Self.shrunkDrainBudget,
-      pumpRunLoop: { limit in
-        log.append("pump")
-        RunLoop.current.run(mode: .default, before: limit)
-      }
+      drainTimeout: Self.spentInstantlyDrainBudget,
+      pumpRunLoop: { _ in log.append("pump") }
     ).runBlockingMainRunLoop()
     let elapsed = Date().timeIntervalSince(startedAt)
 
     let events = log.events
-    let saveIndices = events.indices.filter { events[$0].hasPrefix("save:") }
-    XCTAssertEqual(
-      saveIndices.count, 2,
-      "fixture precondition: both windows must have saved (events: \(events))")
-    XCTAssertTrue(
-      events[saveIndices[0]..<saveIndices[1]].contains("pump"),
-      "the deadline pump must regain control BETWEEN the two window saves; without a suspension "
-        + "point there the whole loop is one uninterruptible block and the five-second budget cannot "
-        + "be enforced until the last file has been written (events: \(events))")
-
     for noteURL in noteURLs {
       XCTAssertEqual(
         try String(contentsOf: noteURL, encoding: .utf8),
-        "pumploopneedle in \(noteURL.deletingPathExtension().lastPathComponent)",
-        "…and every window's bytes must still land: yielding buys deadline granularity, it must not "
-          + "cost a save")
+        "savefirstneedle in \(noteURL.deletingPathExtension().lastPathComponent)",
+        "every window's bytes must be on disk by the time the quit returns, with a pump that never "
+          + "serviced anything. The drain budget bounds the INDEX phases; it must never be able to "
+          + "abandon a save loop half-way, because a cancelled task's continuation is not guaranteed "
+          + "to resume before AppKit exits the process (events: \(events))")
     }
+    let saveIndices = events.indices.filter { events[$0].hasPrefix("save:") }
+    XCTAssertEqual(
+      saveIndices.count, 2, "…which means both saves actually ran (events: \(events))")
+    XCTAssertGreaterThanOrEqual(
+      events.filter { $0 == "pump" }.count, 1,
+      "fixture precondition: the budget must genuinely have been waited on (events: \(events))")
+    XCTAssertTrue(
+      events.prefix(while: { $0 != "pump" }).filter { $0.hasPrefix("save:") }.count == 2,
+      "…and both of them BEFORE the budget started: the user flush is not budgeted work, so no "
+        + "window may be waiting on the deadline's pump for its bytes (events: \(events))")
     XCTAssertLessThan(
       elapsed, Self.boundedQuitSeconds,
       "…and the quit must stay bounded; it took \(elapsed) s")
     XCTAssertTrue(
       database.isClosedForTermination,
       "…and the funnel must end up closed, whichever path the sequence took")
+
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { parkedWriteFinished.isSet }, timeout: 10)
+  }
+
+  // MARK: - R10: the drain re-reads the write tail until it stops moving
+
+  /// Round 10, finding 2 — the last unlooped await in the drain.
+  ///
+  /// `drainPendingIndexWrites()` loops over the open handle and over the scheduled hand-offs, both by
+  /// identity, and then took ONE snapshot of the supersede tail. Two background updates admitted
+  /// around the same open can install their tails on either side of that snapshot: the first before
+  /// the drain reads it, the second while the drain is already parked on the first. The snapshot
+  /// returns as soon as the first finishes, the quit latches and checkpoints, and the second — long
+  /// since past the funnel gate, and these entry points never re-check cancellation after the open —
+  /// commits WAL frames behind the terminal checkpoint.
+  ///
+  /// Honesty about the driving (round 9's lesson): which continuation parked on a completed open
+  /// resumes first is the scheduler's business, so the two tails are not RACED here, they are placed.
+  /// The first update is parked on the real `databaseOpenGateOverride` wedge, released, and caught at
+  /// the write gate — which proves its tail is installed, because the write task can only reach that
+  /// gate after the main-actor step that assigned the tail has finished. The drain is then started
+  /// and given the run loop until it can only be parked on that tail. Only then is the second update
+  /// admitted. That is the state the finding describes, reached deterministically instead of hoped
+  /// for.
+  ///
+  /// The assertion that cannot pass by luck is the negative one: with the second tail installed and
+  /// its write still held, a drain that returns has walked past a write it accepted.
+  func testTheDrainWaitsForAWriteTailInstalledWhileItWasAlreadyDraining() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let database = IndexDatabase(databaseURL: databaseURL)
+    XCTAssertNil(
+      database.databaseURL,
+      "fixture precondition: the first update must genuinely park on the initial open, which is the "
+        + "state the finding is about")
+
+    let openGate = ParkingGate()
+    let writeGate = OrderedParkingGate()
+    database.databaseOpenGateOverride = { await openGate.arrive() }
+    database.backgroundWriteGateOverride = { await writeGate.arrive() }
+
+    let firstRef = documentRef(root: root, name: "first-update.md")
+    try "tailfirstneedle".write(to: firstRef.url, atomically: true, encoding: .utf8)
+    let secondRef = documentRef(root: root, name: "second-update.md")
+    try "tailsecondneedle".write(to: secondRef.url, atomically: true, encoding: .utf8)
+
+    let firstFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.updateSearchIndexInBackground(
+        upserting: [firstRef], deletingPaths: [], appState: nil)
+      firstFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { openGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      openGate.arrivalCount, 1,
+      "fixture precondition: the first update must be parked INSIDE the open, past the funnel gate")
+
+    Task { await openGate.open() }
+    pumpMainRunLoop(until: { writeGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      writeGate.arrivalCount, 1,
+      "fixture precondition: the first update's write must be parked at the write gate, which is "
+        + "only reachable after the main-actor step that installed its tail")
+    XCTAssertEqual(
+      database.databaseURL, databaseURL,
+      "…and the pool must be published, so the second update below is admitted without parking")
+
+    let drainFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.drainPendingIndexWrites()
+      drainFinished.isSet = true
+    }
+    // Nothing else is owed at this point — no open in flight, no scheduled hand-off — so once the
+    // drain has had the run loop it can only be parked on the first tail.
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    XCTAssertFalse(
+      drainFinished.isSet,
+      "fixture precondition: the drain must be parked on the first tail, not finished")
+
+    // The second update, admitted WHILE the drain is already awaiting the first: it chains onto the
+    // first, installs itself as the new tail, and parks at the write gate behind it.
+    let secondFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.updateSearchIndexInBackground(
+        upserting: [secondRef], deletingPaths: [], appState: nil)
+      secondFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { writeGate.arrivalCount >= 2 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      writeGate.arrivalCount, 2,
+      "fixture precondition: the second update must have installed its tail while the drain was "
+        + "parked on the first")
+
+    // Only the FIRST write is released. The second stays held, so "the drain returned" and "the
+    // second write landed" cannot be confused for one another.
+    Task { await writeGate.open(through: 1) }
+    pumpMainRunLoop(until: { firstFinished.isSet }, timeout: 10)
+    XCTAssertTrue(firstFinished.isSet, "fixture precondition: the first update must have completed")
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+
+    XCTAssertFalse(
+      drainFinished.isSet,
+      "the drain returned as soon as the tail it had SNAPSHOTTED finished, while a second write it "
+        + "had already accepted was still owed. The quit would latch and checkpoint here, and that "
+        + "write — past the funnel gate, and never re-checking cancellation after the open — would "
+        + "add WAL frames behind the terminal checkpoint")
+    XCTAssertFalse(
+      secondFinished.isSet, "fixture precondition: …with the second write demonstrably still held")
+
+    Task { await writeGate.open(through: 2) }
+    pumpMainRunLoop(until: { drainFinished.isSet }, timeout: 10)
+    XCTAssertTrue(
+      drainFinished.isSet, "…and the drain must complete once the moving tail finally stops")
+
+    // The latch is what the drain protects; after a correct drain it has nothing left to refuse.
+    database.closeForTermination()
+    XCTAssertTrue(
+      secondFinished.isSet,
+      "…with every accepted write landed BEFORE the latch, not after it")
+    XCTAssertEqual(
+      try indexHits(matching: "tailfirstneedle", at: databaseURL), 1,
+      "…and both writes must be in the index the terminal checkpoint is about to truncate")
+    XCTAssertEqual(
+      try indexHits(matching: "tailsecondneedle", at: databaseURL), 1,
+      "…including the one that installed its tail mid-drain")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "…and a drain that waited for everything leaves the latch with nothing to refuse. Got "
+        + "\(database.terminationRejectedEntryPoints)")
   }
 
   // MARK: - Fixtures
@@ -1632,6 +1803,21 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own
   /// init seam. The contract is "returns once it expires", not "expires after exactly 5 s".
   private static let shrunkDrainBudget: TimeInterval = 0.4
+
+  /// A budget so small that any real work outlasts it. Used where the assertion is "the deadline
+  /// expired and the user's bytes were on disk anyway", so the expiry must be certain rather than
+  /// probable.
+  private static let spentInstantlyDrainBudget: TimeInterval = 0.05
+
+  /// The injected slow volume: one window's synchronous write, on its own, outlasting the budget
+  /// above by 3×. A duration, not a sleep-then-assert — the assertion is about which bytes reached
+  /// the disk, never about how long anything took.
+  private static let slowVolumeWriteSeconds: TimeInterval = 0.15
+
+  /// How long a pin gives the run loop when it needs "everything that CAN run has run" before
+  /// asserting that something has NOT happened. Generous on purpose: this suite already carries
+  /// wall-clock flakes and a settle window must not become the next one.
+  private static let settleSeconds: TimeInterval = 0.25
 
   /// The bound a bounded quit must respect: ~12× the shrunk budget, loose on purpose because this
   /// suite already carries wall-clock flakes and this assertion must not become the next one.
@@ -1864,6 +2050,37 @@ final class TerminationQuiescenceTests: XCTestCase {
       isOpen = true
       for waiter in waiters { waiter.resume() }
       waiters.removeAll()
+    }
+  }
+
+  /// A `ParkingGate` whose waiters are released INDIVIDUALLY, in arrival order, instead of all at
+  /// once. Needed wherever two writes must be told apart while both are held: releasing them together
+  /// would make "the drain returned" and "the second write landed" two outcomes of the same instant,
+  /// and the pin could then pass on scheduling luck rather than on the contract.
+  private actor OrderedParkingGate {
+    private var openedThrough = 0
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    /// Readable from a synchronous pump without awaiting the actor.
+    private let arrivalCounter = Counter()
+
+    nonisolated var arrivalCount: Int { arrivalCounter.value }
+
+    func arrive() async {
+      // Assigned inside the actor, so arrival order and index order are the same order.
+      let index = arrivalCounter.next()
+      guard index > openedThrough else { return }
+      await withCheckedContinuation { continuation in
+        waiters[index] = continuation
+      }
+    }
+
+    func open(through index: Int) {
+      openedThrough = max(openedThrough, index)
+      let released = waiters.filter { $0.key <= openedThrough }
+      for (waiterIndex, continuation) in released {
+        waiters.removeValue(forKey: waiterIndex)
+        continuation.resume()
+      }
     }
   }
 
