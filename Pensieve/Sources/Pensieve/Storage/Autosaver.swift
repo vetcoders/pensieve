@@ -8,6 +8,25 @@ final class Autosaver {
   private let indexDelayNanoseconds: UInt64
   private var saveTask: Task<Void, Never>?
   private var indexTask: Task<Void, Never>?
+  /// Which session armed the save debounce, or `nil` when nothing is armed.
+  ///
+  /// Same singleton problem as `armedIndexOwner`, one debounce over: this object holds at most ONE
+  /// save debounce and it belongs to the LAST edited session, not necessarily the one asking. A close
+  /// that cancels whatever happens to be armed therefore deletes ANOTHER window's pending 1.5 s
+  /// autosave — and since round 7 that window's 5 s index debounce is deliberately left armed to wait
+  /// for exactly that save, it would then fire over text whose write was just taken away: FTS ahead
+  /// of disk in a RUNNING app, with no recovery draft behind a file-backed document. So a caller may
+  /// cancel only its OWN armed save; a foreign one stays armed and fires on its own schedule.
+  ///
+  /// The session object itself rather than its URL, because the question is "is this the same
+  /// window?": two untitled windows have no URL at all, and two windows on one file share theirs.
+  /// Held WEAKLY, so an owner that is gone reads as owned-by-nobody and cannot be impersonated by a
+  /// later allocation at the same address — and nothing is lost by leaving that orphan armed, since
+  /// the body captures its session weakly too and no-ops.
+  private weak var armedSaveOwner: AnyObject?
+  /// Bumped by every arm/cancel so a save timer that already slipped past its cancellation check can
+  /// neither run its body nor clear the ownership a newer schedule has since recorded.
+  private var saveGeneration: UInt64 = 0
   /// The armed index-debounce BODY, kept next to its timer so the work can be run NOW instead of
   /// only when the sleep elapses. Cleared the instant the body runs — by the timer or by a flush —
   /// so "flush the index debounce" means exactly once, never twice and never never.
@@ -43,19 +62,33 @@ final class Autosaver {
   /// armed, when the owner has since been saved, or when the owning session is gone.
   var armedIndexOwnerIsDirty: Bool { armedIndexOwnerDirtiness?() ?? false }
 
+  /// Whether the armed save debounce belongs to `session`. `false` when nothing is armed, when the
+  /// debounce belongs to another window, or when its owner is already gone — the three cases in which
+  /// a caller must NOT cancel it. See `armedSaveOwner`.
+  func armedSaveIsOwned(by session: AnyObject) -> Bool {
+    armedSaveOwner === session
+  }
+
   init(saveDelayMilliseconds: UInt64 = 1_500, indexDelayMilliseconds: UInt64 = 5_000) {
     self.saveDelayNanoseconds = saveDelayMilliseconds * 1_000_000
     self.indexDelayNanoseconds = indexDelayMilliseconds * 1_000_000
   }
 
-  func scheduleSave(_ save: @escaping @MainActor () -> Void) {
+  /// `owner` is the session whose text this debounce would write — pass the window's `AppState`. It
+  /// is required rather than defaulted for the same reason `scheduleIndex`'s `ownerIsDirty` is: an
+  /// arm site that forgot it would leave an ownerless debounce that every close feels free to cancel,
+  /// which is exactly the defect ownership exists to close.
+  func scheduleSave(owner: AnyObject, _ save: @escaping @MainActor () -> Void) {
     guard !isQuiescedForTermination else { return }
     saveTask?.cancel()
-    saveTask = Task { [saveDelayNanoseconds] in
+    saveGeneration &+= 1
+    let generation = saveGeneration
+    armedSaveOwner = owner
+    saveTask = Task { [saveDelayNanoseconds, weak self] in
       try? await Task.sleep(nanoseconds: saveDelayNanoseconds)
       guard !Task.isCancelled else { return }
       await MainActor.run {
-        save()
+        self?.runPendingSave(generation: generation, save)
       }
     }
   }
@@ -107,6 +140,12 @@ final class Autosaver {
   /// Termination command, issued by `TerminationSequence` in the flush phase: land the armed index
   /// write, then stop both debounces for good. After this returns nothing can re-arm — which is what
   /// makes the drain that follows a wait for a FINITE set of work rather than a moving target.
+  ///
+  /// The `cancel()` here stays UNCONDITIONAL, unlike the ownership-scoped cancels on the close path:
+  /// `TerminationSequence` has already run `flushPendingWindowSaves` over every live controller, so
+  /// each window's bytes are on disk and no armed save — whoever owns it — has anything left to
+  /// contribute. Nothing may re-arm afterwards either, which is what makes the drain that follows a
+  /// wait for a finite set of work.
   func quiesceForTermination() {
     flushIndex()
     isQuiescedForTermination = true
@@ -116,6 +155,8 @@ final class Autosaver {
   func cancelSave() {
     saveTask?.cancel()
     saveTask = nil
+    armedSaveOwner = nil
+    saveGeneration &+= 1
   }
 
   func cancelIndex() {
@@ -130,6 +171,17 @@ final class Autosaver {
   func cancel() {
     cancelSave()
     cancelIndex()
+  }
+
+  /// Disarms the save bookkeeping BEFORE running the body, so the write that follows sees "nothing
+  /// armed" rather than an ownership record its own timer has already consumed. Generation-guarded
+  /// for the same reason the index side is: a timer that slipped past its cancellation check must not
+  /// clear ownership a newer schedule has since recorded.
+  private func runPendingSave(generation: UInt64, _ save: @MainActor () -> Void) {
+    guard generation == saveGeneration else { return }
+    saveTask = nil
+    armedSaveOwner = nil
+    save()
   }
 
   private func runPendingIndex(generation: UInt64) {

@@ -40,6 +40,9 @@ final class TerminationQuiescenceTests: XCTestCase {
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
     let runs = Counter()
     let owner = URL(fileURLWithPath: "/tmp/pensieve-autosaver-pin.md").standardizedFileURL
+    // The save debounce is owned by a SESSION object; held for the whole test because the autosaver
+    // keeps that ownership weakly.
+    let savingSession = AppState()
 
     // A CLEAN owner: this pin is about flush mechanics, and a clean owner is the case that flushes.
     autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
@@ -67,7 +70,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     XCTAssertTrue(autosaver.isQuiescedForTermination)
 
     autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
-    autosaver.scheduleSave { runs.increment() }
+    autosaver.scheduleSave(owner: savingSession) { runs.increment() }
     autosaver.flushIndex()
     XCTAssertEqual(
       runs.value, 1,
@@ -1102,6 +1105,211 @@ final class TerminationQuiescenceTests: XCTestCase {
       try indexHits(matching: "deferredneedle", at: databaseURL), 1,
       "index only after bytes land — but then it MUST land, or the deferral would be a silent loss "
         + "of searchability")
+  }
+
+  // MARK: - R8: the SAVE debounce has an owner too
+
+  /// Round 8 — the residual round 7 named in its own report, fixed before a reviewer asked for it.
+  ///
+  /// `Autosaver` holds one armed SAVE as well as one armed index write, and the save had no owner:
+  /// `savePendingChangesOnClose` cancelled whatever happened to be armed. With two dirty windows both
+  /// debounces belong to the one that edited last, so closing the OTHER window deleted the owner's
+  /// pending 1.5 s autosave — the very write round 7 deliberately left that owner's index debounce
+  /// ARMED to wait for. The index write then fired on its own 5 s schedule over text with nothing
+  /// left to put it on disk: FTS ahead of disk in a RUNNING app, and a file-backed document has no
+  /// recovery draft behind it if the process dies before the next save.
+  ///
+  /// The fix is the same minimal ownership round 7 gave the index side: cancel only what is yours. A
+  /// foreign armed save stays armed and fires on its own schedule, which is what restores the order —
+  /// so this is the end-to-end pin of the combined round 7 + round 8 behaviour, from the close to the
+  /// index row. Both delays are shrunk through `Autosaver`'s init seam; the assertion is the ORDER,
+  /// not the production timings.
+  func testAClosingWindowLeavesAnotherWindowsArmedSaveToLandBeforeItsDeferredIndexWrite()
+    async throws
+  {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let ownerURL = folder.appendingPathComponent("debounce-owner.md")
+    try "the owner's OLD body".write(to: ownerURL, atomically: true, encoding: .utf8)
+    let ownerRef = DocumentRef(id: ownerURL.standardizedFileURL, isAdHoc: true)
+
+    let closingURL = folder.appendingPathComponent("closing-window.md")
+    try "the closing window's body".write(to: closingURL, atomically: true, encoding: .utf8)
+    let closingRef = DocumentRef(id: closingURL.standardizedFileURL, isAdHoc: true)
+
+    // Real writes on both sides: unlike the round 6/7 pins this one is about a save HAPPENING.
+    let autosaver = Autosaver(saveDelayMilliseconds: 60, indexDelayMilliseconds: 400)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveForeignArmedSaveBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    // The owner window edits last, so it owns BOTH debounces, and its text exists only in memory.
+    let ownerBody = "survivingneedle that must reach the disk before it reaches FTS"
+    let ownerState = AppState()
+    ownerState.documents = [ownerRef]
+    ownerState.documentSession.load(document: ownerRef, text: "the owner's OLD body")
+    ownerState.activeDocumentText = ownerBody
+    store.documentDidChange(appState: ownerState)
+
+    XCTAssertTrue(
+      autosaver.armedSaveIsOwned(by: ownerState),
+      "fixture precondition: the window that edited last must own the singleton's armed SAVE")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, ownerRef.id,
+      "fixture precondition: …and its armed index write, which round 7 defers to that save")
+
+    // Everything from here to the close is synchronous on purpose: no suspension point, so neither
+    // debounce can fire between arming and the assertions about what the close did to them.
+    let closingState = AppState()
+    closingState.documents = [closingRef]
+    closingState.documentSession.load(document: closingRef, text: "the closing window's body")
+    closingState.documentSession.isDirty = true
+    XCTAssertFalse(
+      autosaver.armedSaveIsOwned(by: closingState),
+      "fixture precondition: the closing window must NOT own the armed save")
+
+    XCTAssertTrue(
+      store.savePendingChangesOnClose(appState: closingState),
+      "fixture precondition: the closing window's own save must succeed")
+
+    XCTAssertTrue(
+      autosaver.armedSaveIsOwned(by: ownerState),
+      "a close must not cancel a save it does not own: that write is precisely the one the owner's "
+        + "deferred index debounce is waiting for, and deleting it leaves the index free to publish "
+        + "text that no longer has anything scheduled to write it")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, ownerRef.id,
+      "…and round 7's deferral must still be in place, or this pin would prove nothing about the "
+        + "order of the two")
+
+    try await waitUntil("the foreign window's surviving autosave to land its bytes") {
+      (try? String(contentsOf: ownerURL, encoding: .utf8)) == ownerBody
+    }
+    XCTAssertFalse(
+      ownerState.documentSession.isDirty,
+      "…and it is the OWNER's own debounce that cleaned its buffer, exactly as the deferral assumes")
+
+    try await waitUntil("the deferred index write to fire over the saved bytes") {
+      await database.drainPendingIndexWrites()
+      return ((try? indexHits(matching: "survivingneedle", at: databaseURL)) ?? 0) == 1
+    }
+    XCTAssertEqual(
+      try String(contentsOf: ownerURL, encoding: .utf8), ownerBody,
+      "the whole ordering in one assertion: by the moment FTS advertises this text, the file on disk "
+        + "already holds it")
+  }
+
+  /// The other half of the same rule, and the reason ownership is not simply "never cancel": a window
+  /// closing over its OWN armed save must still cancel it. `savePendingChangesOnClose` writes those
+  /// exact bytes synchronously, so a survivor would write the same file a second time — after the
+  /// window is gone, and outside every ordering the close just established.
+  func testAClosingWindowStillCancelsItsOwnArmedSaveSoTheCloseWritesExactlyOnce() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("own-armed-save.md")
+    try "before the edit".write(to: noteURL, atomically: true, encoding: .utf8)
+    let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
+
+    let writes = Counter()
+    let autosaver = Autosaver(saveDelayMilliseconds: 50, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: IndexDatabase(
+        databaseURL: folder.appendingPathComponent("index.db", isDirectory: false)),
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveOwnArmedSaveBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true)),
+      writeDocument: { text, url in
+        if url.standardizedFileURL == ref.id { writes.increment() }
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      },
+      // Stubbed: this pin counts FILE writes, and the index path is round 7's subject, not this one's.
+      indexDocument: { _, _, _ in }
+    )
+
+    let appState = AppState()
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "before the edit")
+    appState.activeDocumentText = "the edit the close itself writes"
+    store.documentDidChange(appState: appState)
+    XCTAssertTrue(
+      autosaver.armedSaveIsOwned(by: appState),
+      "fixture precondition: this window must own its own armed save")
+
+    XCTAssertTrue(
+      store.savePendingChangesOnClose(appState: appState),
+      "fixture precondition: the close must persist the buffer itself")
+    XCTAssertEqual(writes.value, 1, "…in exactly one write")
+    XCTAssertFalse(
+      autosaver.armedSaveIsOwned(by: appState),
+      "ownership SCOPES the cancel, it does not remove it: the close just wrote these bytes, so its "
+        + "own debounce is redundant and must not survive the window")
+
+    // Well past the shrunk debounce: a survivor would have fired by now.
+    try await Task.sleep(nanoseconds: 600_000_000)
+    XCTAssertEqual(
+      writes.value, 1,
+      "no second write may follow the close — that would be the file being written again by a "
+        + "session that is already gone")
+  }
+
+  /// The third ownerless cancel the same sweep found, this one on the ARMING path.
+  ///
+  /// `scheduleIndexUpdate` bailed out of a session with no document by calling `cancelIndex()` — but
+  /// an untitled session can never own the armed index debounce: `scheduleIndex` is only ever called
+  /// WITH a document, and every path that drops a session's document (`loadClean`, `select(nil)`,
+  /// `restoreRecoveredDraft`) already cancels this window's debounce on the way out. So the only
+  /// debounce that call could reach belonged to somebody else, and typing one character into an
+  /// untitled draft dropped a neighbouring window's pending index write. For an ad-hoc document that
+  /// is permanent: no workspace signature ⇒ no cold-open self-heal, so the stale row is never
+  /// revisited.
+  func testTypingInAnUntitledWindowDoesNotDropAnotherWindowsArmedIndexDebounce() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("neighbour-note.md")
+    try "before the neighbour's edit".write(to: noteURL, atomically: true, encoding: .utf8)
+    let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: IndexDatabase(
+        databaseURL: folder.appendingPathComponent("index.db", isDirectory: false)),
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveUntitledNeighbourBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true)),
+      indexDocument: { _, _, _ in }
+    )
+
+    let neighbourState = AppState()
+    neighbourState.documents = [ref]
+    neighbourState.documentSession.load(document: ref, text: "before the neighbour's edit")
+    neighbourState.activeDocumentText = "neighbourneedle waiting out its index debounce"
+    store.documentDidChange(appState: neighbourState)
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, ref.id,
+      "fixture precondition: the neighbour must own the singleton's armed index debounce")
+
+    let untitledState = AppState()
+    untitledState.documentSession.createUntitled()
+    untitledState.activeDocumentText = "a draft that has never been saved anywhere"
+    store.documentDidChange(appState: untitledState)
+
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, ref.id,
+      "an untitled window has no index debounce of its own to cancel, so cancelling here could only "
+        + "ever throw away a neighbour's — and on an ad-hoc document nothing would ever repair it")
   }
 
   // MARK: - R6: the flush loop is deadline-aware between windows

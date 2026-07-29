@@ -2695,7 +2695,7 @@ final class DocumentStore {
     guard let draft = recoveryStore.claimDraftForRestore() else { return false }
 
     self.appState = appState
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
     appState.selectedDocumentID = nil
     appState.documentSession.restoreUntitled(
       title: draft.title,
@@ -2717,7 +2717,7 @@ final class DocumentStore {
   }
 
   private func loadClean(ref: DocumentRef, into appState: AppState) {
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
 
     do {
       let text = try String(contentsOf: ref.url, encoding: .utf8)
@@ -2740,7 +2740,7 @@ final class DocumentStore {
     }
 
     guard let ref else {
-      autosaver.cancel()
+      cancelOwnDebouncesOnSessionChange(appState: appState)
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
       return true
@@ -2757,7 +2757,7 @@ final class DocumentStore {
   @discardableResult
   func saveAs(appState: AppState, to url: URL) -> Bool {
     self.appState = appState
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
 
     guard appState.documentSession.hasEditableBuffer else { return false }
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
@@ -2837,7 +2837,14 @@ final class DocumentStore {
       return false
     }
 
-    autosaver.cancelSave()
+    // Only OUR armed save. The same singleton reasoning as the index debounce above, one debounce
+    // over: cancelling a foreign 1.5 s autosave here deletes the write that the branch above just
+    // deferred that window's index debounce to — its bytes would then stay in memory while its index
+    // write fires at 5 s over them, which is the FTS-ahead-of-disk ordering this guard exists to
+    // forbid, this time in a RUNNING app. Left armed, a foreign save simply fires on its own
+    // schedule; ours is redundant because `saveExisting(indexNow: true)` below writes the same bytes
+    // now, and cancelling it is what keeps that from becoming a second write.
+    cancelArmedSaveIfOwned(by: appState)
     // Cancelling the index debounce is right when it is OURS — `saveExisting(indexNow: true)` below
     // re-issues that write after the bytes land — and wrong when it belongs to another dirty window:
     // dropping it there would be the cancel this whole guard exists to avoid. Deferred means LEFT
@@ -2893,6 +2900,32 @@ final class DocumentStore {
     return .awaitOtherSessionSave
   }
 
+  /// The `Autosaver.cancel()` a session change used to call, with the SAVE half narrowed to this
+  /// window's own debounce.
+  ///
+  /// `Autosaver` holds at most ONE armed save, belonging to the LAST edited session — so loading a
+  /// different document, clearing the session, restoring a draft or saving under a new name would all
+  /// cancel a debounce that may belong to a completely different window. That window's bytes would
+  /// then sit in memory with nothing scheduled to write them, while its index debounce (left armed
+  /// since round 7 precisely to wait for that save) fires at 5 s over text that is not on disk.
+  ///
+  /// The INDEX half stays unconditional here on purpose: narrowing it is a flush-vs-cancel decision
+  /// per call site, which round 7 made for the close path only, and changing it here would alter
+  /// index behaviour on paths this cut did not review.
+  private func cancelOwnDebouncesOnSessionChange(appState: AppState) {
+    cancelArmedSaveIfOwned(by: appState)
+    autosaver.cancelIndex()
+  }
+
+  /// Cancels the armed 1.5 s save debounce ONLY when it belongs to `appState`. A no-op when nothing
+  /// is armed, when the debounce belongs to another window, or when its owner is already gone — an
+  /// orphaned body captures its session weakly and no-ops when it fires, so there is nothing to
+  /// cancel on its behalf.
+  private func cancelArmedSaveIfOwned(by appState: AppState) {
+    guard autosaver.armedSaveIsOwned(by: appState) else { return }
+    autosaver.cancelSave()
+  }
+
   /// Single-window "settle the dirty session, report whether the user
   /// cancelled" primitive: decides AND immediately applies the dirty-session
   /// guard — force-save a pathed doc, or Save/Discard/Cancel an untitled draft —
@@ -2912,7 +2945,11 @@ final class DocumentStore {
       return
     }
 
-    autosaver.scheduleSave { [weak self, weak appState] in
+    // The owner is the session itself, so any other window can tell "this armed save is mine to
+    // cancel" from "this one belongs to somebody who is still counting on it". The body captures the
+    // same session weakly, so an owner whose window is gone leaves a debounce that owns nothing and
+    // writes nothing. See `Autosaver.armedSaveOwner`.
+    autosaver.scheduleSave(owner: appState) { [weak self, weak appState] in
       guard let self, let appState else { return }
       if appState.documentSession.isUntitled {
         self.saveRecoveryDraft(appState: appState)
@@ -2940,7 +2977,12 @@ final class DocumentStore {
 
   private func scheduleIndexUpdate(appState: AppState) {
     guard let armedDocument = appState.documentSession.document else {
-      autosaver.cancelIndex()
+      // An UNTITLED session has nothing of its own armed here: `scheduleIndex` is only ever called
+      // with a document, and every path that drops a session's document (`loadClean`, `select(nil)`,
+      // `restoreRecoveredDraft`) already cancelled this window's debounce on the way. So the only
+      // debounce this branch could ever cancel belongs to ANOTHER window — typing in an untitled
+      // draft would drop a neighbour's pending index write, which for an ad-hoc document is the
+      // permanent loss of searchability the flush-over-cancel rule exists to prevent.
       return
     }
 
@@ -3066,7 +3108,10 @@ final class DocumentStore {
   @discardableResult
   private func saveExisting(appState: AppState, indexNow: Bool) -> Bool {
     self.appState = appState
-    autosaver.cancelSave()
+    // This write makes THIS session's armed autosave redundant and nobody else's: an ordinary ⌘S in
+    // one window must not delete another window's pending autosave. When this runs as the debounce's
+    // own body the autosaver has already disarmed itself, so the call is simply skipped.
+    cancelArmedSaveIfOwned(by: appState)
 
     guard let url = appState.documentSession.url else { return false }
     let ref = documentRef(for: url, appState: appState)
@@ -3079,7 +3124,15 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
       appState.lastError = nil
       if indexNow {
-        autosaver.cancelIndex()
+        // Only the debounce armed for THIS document: the write below supersedes it, so leaving it
+        // would duplicate the same row. A debounce armed for ANOTHER document is superseded by
+        // nothing here, and dropping it is the silent loss of freshness the flush-over-cancel rule
+        // forbids — worse, `savePendingChangesOnClose` may have just DEFERRED exactly that debounce
+        // to its owner's own save, and an unconditional cancel here undid that deferral the moment
+        // the closing window's save succeeded.
+        if autosaver.armedIndexOwner == ref.id {
+          autosaver.cancelIndex()
+        }
         indexDocument(ref, appState.documentSession.text, appState)
       }
       return true
