@@ -41,7 +41,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     let runs = Counter()
     let owner = URL(fileURLWithPath: "/tmp/pensieve-autosaver-pin.md").standardizedFileURL
 
-    autosaver.scheduleIndex(owner: owner) { runs.increment() }
+    // A CLEAN owner: this pin is about flush mechanics, and a clean owner is the case that flushes.
+    autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
     XCTAssertEqual(
       runs.value, 0,
       "fixture precondition: with a ten-minute debounce the body must still be asleep")
@@ -65,7 +66,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     autosaver.quiesceForTermination()
     XCTAssertTrue(autosaver.isQuiescedForTermination)
 
-    autosaver.scheduleIndex(owner: owner) { runs.increment() }
+    autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
     autosaver.scheduleSave { runs.increment() }
     autosaver.flushIndex()
     XCTAssertEqual(
@@ -908,12 +909,20 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and the user must be told the save failed")
   }
 
-  /// The other side of the same guard, and the reason it is scoped to the OWNING document rather
-  /// than to dirtiness alone: `Autosaver` is a process-wide singleton, so the armed debounce
-  /// routinely belongs to a window other than the one closing. That debounce is owed unconditionally
-  /// — the closing session's save cannot speak for it, and for an ad-hoc document nothing else ever
-  /// will — so a dirty close must still flush it even when its own save is doomed.
-  func testAFailedCloseSaveStillFlushesAnotherDocumentsArmedDebounce() async throws {
+  /// The other side of the same guard, and the reason it is scoped to the OWNER's state rather than
+  /// to "is it mine": `Autosaver` is a process-wide singleton, so the armed debounce routinely
+  /// belongs to a window other than the one closing. When that owner is CLEAN — its 1.5 s autosave
+  /// already wrote the bytes and marked the buffer clean while the 5 s index write was still asleep
+  /// — the debounce owes a write for text that is already on disk. It is owed unconditionally: the
+  /// closing session's save cannot speak for it, and for an ad-hoc document nothing else ever will
+  /// (no workspace signature ⇒ no cold-open self-heal). So a dirty close must still flush it even
+  /// when its own save is doomed.
+  ///
+  /// R7 renamed this from `…StillFlushesAnotherDocumentsArmedDebounce` and made the other window
+  /// explicitly CLEAN. The old fixture left it dirty and asserted the flush, which pinned the very
+  /// defect its sibling below now forbids; the R5 argument this pin defends was always about a clean
+  /// owner.
+  func testAFailedCloseSaveStillFlushesACleanOwnersArmedDebounce() async throws {
     let folder = try makeTemporaryFolder()
     let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
 
@@ -956,6 +965,15 @@ final class TerminationQuiescenceTests: XCTestCase {
       autosaver.armedIndexOwner, otherRef.id,
       "fixture precondition: the singleton's debounce must belong to the OTHER document")
 
+    // …and then its own autosave lands: bytes on disk, buffer clean, index debounce still asleep.
+    // This is the R5 window, and the reason the flush must not be withheld here.
+    try otherState.documentSession.text.write(to: otherURL, atomically: true, encoding: .utf8)
+    otherState.documentSession.isDirty = false
+    XCTAssertFalse(
+      autosaver.armedIndexOwnerIsDirty,
+      "fixture precondition: the debounce's owner must read as CLEAN — that is the half of the rule "
+        + "this pin defends")
+
     appState.documents = [closingRef]
     appState.documentSession.load(document: closingRef, text: "before the doomed edit")
     appState.documentSession.isDirty = true
@@ -967,9 +985,123 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     XCTAssertEqual(
       try indexHits(matching: "otherwindowneedle", at: databaseURL), 1,
-      "another document's armed debounce is owed regardless of what happens to this close: "
-        + "withholding it would drop that window's freshness for good on an ad-hoc document, which "
-        + "has no cold-open self-heal")
+      "a CLEAN owner's armed debounce is owed regardless of what happens to this close: its bytes "
+        + "are already on disk, and withholding the write would drop that window's freshness for "
+        + "good on an ad-hoc document, which has no cold-open self-heal")
+  }
+
+  /// Round 7 — the same defect class as the dirty-session pin above, one window over.
+  ///
+  /// Two dirty file-backed windows, the debounce owned by the one processed SECOND. The first
+  /// controller to close is not the owner, so the R6 check ("is this debounce mine and am I dirty?")
+  /// said `false` and flushed — publishing the OTHER window's still-unsaved text to FTS before that
+  /// window had even attempted its own file write. When that write then fails, the index advertises
+  /// content absent from disk, which is exactly what the owner-scoped guard was introduced to stop.
+  ///
+  /// The rule the fix generalises to: a debounce whose OWNER is dirty anywhere in the process waits
+  /// for that owner's own SUCCESSFUL save. Deferred means left ARMED — not flushed, not cancelled —
+  /// so the owner's own close still decides, and its buffer stays dirty until a save actually lands.
+  func testACloseDefersAnotherDirtyWindowsDebounceUntilThatWindowSavesSuccessfully() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let otherURL = folder.appendingPathComponent("other-dirty-window.md")
+    try "the other window's OLD body".write(to: otherURL, atomically: true, encoding: .utf8)
+    let otherRef = DocumentRef(id: otherURL.standardizedFileURL, isAdHoc: true)
+
+    let closingURL = folder.appendingPathComponent("closing-dirty-window.md")
+    try "before the doomed edit".write(to: closingURL, atomically: true, encoding: .utf8)
+    let closingRef = DocumentRef(id: closingURL.standardizedFileURL, isAdHoc: true)
+
+    // Both windows' writes fail at first — the closing one because its own save is doomed, the owner
+    // because the whole point is a debounce whose owner's save does NOT succeed. The gate is flipped
+    // open at the end to prove the deferral lost nothing.
+    let writes = WriteFailureGate(failing: [closingRef.id, otherRef.id])
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveDeferredDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true)),
+      writeDocument: { text, url in
+        guard !writes.fails(url) else {
+          throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    )
+
+    // The OTHER window edits last and stays DIRTY, so it owns the singleton's armed debounce and its
+    // text exists nowhere but memory.
+    let otherState = AppState()
+    otherState.documents = [otherRef]
+    otherState.documentSession.load(document: otherRef, text: "the other window's OLD body")
+    otherState.activeDocumentText = "deferredneedle that is only in the other window's buffer"
+    store.documentDidChange(appState: otherState)
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, otherRef.id,
+      "fixture precondition: the singleton's debounce must belong to the OTHER document")
+    XCTAssertTrue(
+      otherState.documentSession.isDirty,
+      "fixture precondition: the debounce's owner must be DIRTY — that is the case the R6 check "
+        + "still flushed")
+
+    appState.documents = [closingRef]
+    appState.documentSession.load(document: closingRef, text: "before the doomed edit")
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      store.savePendingChangesOnClose(appState: appState),
+      "fixture precondition: the closing window's own save must fail")
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "deferredneedle", at: databaseURL), 0,
+      "a dirty owner's index write must follow its OWN successful save: this close does not speak "
+        + "for another window's unsaved buffer, and once the write is scheduled nothing can take it "
+        + "back")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, otherRef.id,
+      "…and deferred means LEFT ARMED, not cancelled: dropping it would be the loss the flush-over-"
+        + "cancel rule exists to prevent")
+
+    // Now the owner itself closes — and its save fails too. Still nothing may reach FTS.
+    XCTAssertFalse(
+      store.savePendingChangesOnClose(appState: otherState),
+      "fixture precondition: the owner's own close-time write must genuinely fail")
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "deferredneedle", at: databaseURL), 0,
+      "the owner's own failed save must not publish its text either — that is the R6 guarantee, "
+        + "reached here through the deferral instead of an early flush")
+    XCTAssertEqual(
+      try String(contentsOf: otherURL, encoding: .utf8), "the other window's OLD body",
+      "…and the file on disk must still hold the pre-edit body, which is what would make an index "
+        + "row a lie rather than a race")
+    XCTAssertTrue(
+      otherState.documentSession.isDirty,
+      "…and the owner's buffer must stay DIRTY, so the text is still recoverable by a later save")
+
+    // The deferral cost nothing: once a save actually lands, the text is indexed.
+    writes.stopFailing(otherRef.id)
+    XCTAssertTrue(
+      store.savePendingChangesOnClose(appState: otherState),
+      "fixture precondition: the retried save must succeed")
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "deferredneedle", at: databaseURL), 1,
+      "index only after bytes land — but then it MUST land, or the deferral would be a silent loss "
+        + "of searchability")
   }
 
   // MARK: - R6: the flush loop is deadline-aware between windows
@@ -1262,6 +1394,30 @@ final class TerminationQuiescenceTests: XCTestCase {
     func increment() {
       lock.lock()
       count += 1
+      lock.unlock()
+    }
+  }
+
+  /// Which file writes the `writeDocument` seam should reject, mutable mid-test so a pin can show
+  /// the SAME buffer failing and then succeeding. Locked because the seam is a plain closure the
+  /// store may call from wherever it saves.
+  private final class WriteFailureGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failing: Set<URL>
+
+    init(failing: Set<URL>) {
+      self.failing = failing
+    }
+
+    func fails(_ url: URL) -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return failing.contains(url.standardizedFileURL)
+    }
+
+    func stopFailing(_ url: URL) {
+      lock.lock()
+      failing.remove(url.standardizedFileURL)
       lock.unlock()
     }
   }

@@ -2820,16 +2820,15 @@ final class DocumentStore {
     // freshness for good on an ad-hoc document (no workspace signature ⇒ no cold-open self-heal).
     // See `Autosaver.flushIndex()`.
     //
-    // With ONE exception, which is why this is not the unconditional flush it used to be: when the
-    // armed debounce belongs to THIS session and this session is still dirty, the body it would run
-    // carries the in-memory edit that the close is about to try to write. Flushing here submits that
-    // text to SQLite BEFORE `saveExisting` attempts the file write, and the `autosaver.cancel()`
-    // below cannot retract an already-scheduled database task — so a write that fails (full volume,
-    // revoked permissions) would leave FTS advertising content that never reached the disk. For that
-    // one case the index write is deferred to `saveExisting(indexNow: true)`, which runs it only
-    // AFTER the bytes have landed. Every other case still flushes: another document's debounce is
-    // owed regardless of what happens to this one.
-    if !armedIndexDebounceCarriesUnsavedTextOf(appState) {
+    // …with ONE exception, which is why this is not the unconditional flush it used to be: a debounce
+    // whose OWNER is still dirty carries an in-memory edit whose bytes are not on disk yet. Flushing
+    // it here submits that text to SQLite BEFORE that owner's file write is even attempted, and no
+    // later cancel can retract an already-scheduled database task — so a write that fails (full
+    // volume, revoked permissions) would leave FTS advertising content that never reached the disk.
+    // The rule is therefore about the OWNER, not about who is closing: a dirty owner's debounce waits
+    // for that owner's own successful save; a clean (or vanished) owner's debounce is owed NOW.
+    let disposition = armedIndexDebounceDisposition(for: appState)
+    if disposition == .flushNow {
       autosaver.flushIndex()
     }
     guard appState.documentSession.hasEditableBuffer,
@@ -2838,7 +2837,17 @@ final class DocumentStore {
       return false
     }
 
-    autosaver.cancel()
+    autosaver.cancelSave()
+    // Cancelling the index debounce is right when it is OURS — `saveExisting(indexNow: true)` below
+    // re-issues that write after the bytes land — and wrong when it belongs to another dirty window:
+    // dropping it there would be the cancel this whole guard exists to avoid. Deferred means LEFT
+    // ARMED, not cancelled; that owner's own close still hits the branch above, and if its window
+    // simply stays open the debounce fires on its own schedule. On quit nothing is stranded either:
+    // `TerminationSequence` runs `savePendingChangesOnClose` for EVERY live controller and only then
+    // calls `Autosaver.quiesceForTermination()`, which flushes whatever survived.
+    if disposition != .awaitOtherSessionSave {
+      autosaver.cancelIndex()
+    }
     if appState.documentSession.isUntitled {
       saveRecoveryDraft(appState: appState)
       return true
@@ -2846,19 +2855,42 @@ final class DocumentStore {
     return saveExisting(appState: appState, indexNow: true)
   }
 
-  /// Whether the singleton's armed index debounce would index THIS session's still-unsaved text.
+  /// What a close should do with the singleton's armed index debounce.
+  private enum ArmedIndexDebounceDisposition {
+    /// Run the body NOW. Nothing is armed, or its owner has no unsaved text — because it was already
+    /// autosaved clean, or because its session is gone and there is no save left to wait for. The
+    /// bytes are on disk, so the index write is owed unconditionally, and for an AD-HOC document it
+    /// must not be dropped: with no workspace signature there is no cold-open self-heal to repair a
+    /// stale FTS row.
+    case flushNow
+    /// Withhold: the debounce belongs to THIS still-dirty session, so its text reaches the index only
+    /// through `saveExisting(indexNow: true)` below — after the file write has succeeded.
+    case awaitThisSessionSave
+    /// Withhold and leave ARMED: the debounce belongs to ANOTHER session that is still dirty. Same
+    /// rule, one window over — that owner's own save is what may publish its text, not this close.
+    case awaitOtherSessionSave
+  }
+
+  /// Classifies the armed debounce by the state of its OWNER, which is the only thing that decides
+  /// whether its body would publish text that is not on disk yet.
   ///
-  /// True only when both halves hold: the debounce is owned by the very document the session has
-  /// loaded, and that session is dirty — i.e. the body on disk is older than the body the debounce
-  /// would publish to FTS. Anything else (nothing armed, a different document's debounce, a clean
-  /// session whose bytes are already on disk) is safe to flush immediately, and must be, because for
-  /// an ad-hoc document a dropped debounce is permanent loss of searchability.
-  private func armedIndexDebounceCarriesUnsavedTextOf(_ appState: AppState) -> Bool {
-    guard let armedOwner = autosaver.armedIndexOwner,
-      let sessionDocument = appState.documentSession.document,
-      armedOwner == sessionDocument.id
-    else { return false }
-    return appState.documentSession.hasEditableBuffer && appState.documentSession.isDirty
+  /// The owner's dirtiness is read LIVE through the provider recorded at arm time (see
+  /// `Autosaver.armedIndexOwnerIsDirty`) rather than kept as a second copy inside `Autosaver` that
+  /// could drift from the session it describes. A missing owner reads as clean and therefore flushes.
+  private func armedIndexDebounceDisposition(for appState: AppState)
+    -> ArmedIndexDebounceDisposition
+  {
+    guard let armedOwner = autosaver.armedIndexOwner, autosaver.armedIndexOwnerIsDirty else {
+      return .flushNow
+    }
+    if let sessionDocument = appState.documentSession.document,
+      armedOwner == sessionDocument.id,
+      appState.documentSession.hasEditableBuffer,
+      appState.documentSession.isDirty
+    {
+      return .awaitThisSessionSave
+    }
+    return .awaitOtherSessionSave
   }
 
   /// Single-window "settle the dirty session, report whether the user
@@ -2912,9 +2944,18 @@ final class DocumentStore {
       return
     }
 
-    // The owner is recorded alongside the body so a close can tell "this debounce is my own unsaved
-    // text" from "this debounce belongs to another window" — see `savePendingChangesOnClose`.
-    autosaver.scheduleIndex(owner: armedDocument.id) { [weak self, weak appState] in
+    // The owner is recorded alongside the body — together with a LIVE read of that owner's dirtiness
+    // — so any close can tell "this debounce would publish text that is not on disk yet" from "this
+    // debounce owes an already-saved write" without caring which window is asking. Both closures
+    // capture the same session weakly, so an owner whose window is gone answers "not dirty" and its
+    // orphaned body flushes. See `savePendingChangesOnClose`.
+    autosaver.scheduleIndex(
+      owner: armedDocument.id,
+      ownerIsDirty: { [weak appState] in
+        guard let appState else { return false }
+        return appState.documentSession.hasEditableBuffer && appState.documentSession.isDirty
+      }
+    ) { [weak self, weak appState] in
       guard let self, let appState, let ref = appState.documentSession.document else { return }
       self.indexDocument(ref, appState.documentSession.text, appState)
     }

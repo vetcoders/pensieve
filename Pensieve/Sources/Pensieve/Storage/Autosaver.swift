@@ -16,11 +16,21 @@ final class Autosaver {
   ///
   /// This object is a process-wide SINGLETON holding at most one index debounce, and that debounce
   /// belongs to the LAST edited session — not necessarily the one asking. A closing window therefore
-  /// cannot tell from `flushIndex()` alone whether it is landing its OWN unsaved text or somebody
-  /// else's already-saved text, and the two need opposite treatment: another document's write is owed
-  /// unconditionally, while its own must not reach the index until its file write has succeeded.
-  /// `DocumentStore.savePendingChangesOnClose` reads this to tell the two apart.
+  /// cannot tell from `flushIndex()` alone whether it is landing already-saved text or text that is
+  /// still only in some window's buffer, and the two need opposite treatment: a debounce whose owner
+  /// has nothing unsaved is owed unconditionally, while one whose owner is still dirty must not reach
+  /// the index until THAT owner's file write has succeeded — whether the owner is the window closing
+  /// or another one. `DocumentStore.savePendingChangesOnClose` reads this to tell the two apart.
   private(set) var armedIndexOwner: URL?
+  /// Live read of whether the armed debounce's OWNER still holds unsaved text.
+  ///
+  /// A closure recorded at arm time, not a stored flag, on purpose: the answer must be the owner's
+  /// state at the moment somebody asks — a close, a quit — not a snapshot from arming. The owner may
+  /// have autosaved itself clean in between, and a stale `true` would defer a debounce that nothing
+  /// is going to run. It captures the owning session weakly, exactly as the body does, so an owner
+  /// whose window is already gone reads as NOT dirty: there is no save left to wait for, and running
+  /// an orphaned body is the pre-existing semantics for orphaned debounces.
+  private var armedIndexOwnerDirtiness: (@MainActor () -> Bool)?
   /// Bumped by every arm/cancel/flush so a timer that already slipped past its cancellation check
   /// cannot run a body a newer schedule has since replaced.
   private var indexGeneration: UInt64 = 0
@@ -28,6 +38,10 @@ final class Autosaver {
   /// that point could only fire during the quit's pumped run loop — after the drain has taken its
   /// snapshot — so arming is refused rather than raced.
   private(set) var isQuiescedForTermination = false
+
+  /// Whether the armed debounce's owner is holding unsaved text RIGHT NOW. `false` when nothing is
+  /// armed, when the owner has since been saved, or when the owning session is gone.
+  var armedIndexOwnerIsDirty: Bool { armedIndexOwnerDirtiness?() ?? false }
 
   init(saveDelayMilliseconds: UInt64 = 1_500, indexDelayMilliseconds: UInt64 = 5_000) {
     self.saveDelayNanoseconds = saveDelayMilliseconds * 1_000_000
@@ -46,13 +60,20 @@ final class Autosaver {
     }
   }
 
-  func scheduleIndex(owner: URL?, _ index: @escaping @MainActor () -> Void) {
+  /// `ownerIsDirty` is required rather than defaulted: an arm site that forgot to supply it would
+  /// silently declare its owner clean, which is exactly the "flush somebody's unsaved text early"
+  /// defect this parameter exists to close.
+  func scheduleIndex(
+    owner: URL?, ownerIsDirty: @escaping @MainActor () -> Bool,
+    _ index: @escaping @MainActor () -> Void
+  ) {
     guard !isQuiescedForTermination else { return }
     indexTask?.cancel()
     indexGeneration &+= 1
     let generation = indexGeneration
     pendingIndex = index
     armedIndexOwner = owner
+    armedIndexOwnerDirtiness = ownerIsDirty
     indexTask = Task { [indexDelayNanoseconds, weak self] in
       try? await Task.sleep(nanoseconds: indexDelayNanoseconds)
       guard !Task.isCancelled else { return }
@@ -76,6 +97,7 @@ final class Autosaver {
     let index = pendingIndex
     pendingIndex = nil
     armedIndexOwner = nil
+    armedIndexOwnerDirtiness = nil
     indexGeneration &+= 1
     indexTask?.cancel()
     indexTask = nil
@@ -101,6 +123,7 @@ final class Autosaver {
     indexTask = nil
     pendingIndex = nil
     armedIndexOwner = nil
+    armedIndexOwnerDirtiness = nil
     indexGeneration &+= 1
   }
 
@@ -113,6 +136,7 @@ final class Autosaver {
     guard generation == indexGeneration, let index = pendingIndex else { return }
     pendingIndex = nil
     armedIndexOwner = nil
+    armedIndexOwnerDirtiness = nil
     index()
   }
 }
