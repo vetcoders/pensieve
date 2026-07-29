@@ -16,7 +16,6 @@ struct SidebarView: View {
   @State private var renamingURL: URL?
   @State private var renameText: String = ""
   @State private var renameFocusToken: Int = 0
-  @State private var selectedSearchResultIDs: Set<URL> = []
   @AppStorage("pensieve.sidebar.tab") private var sidebarTab: SidebarTab = .openFiles
 
   /// Sidebar segments: open working set vs the workspace folder tree.
@@ -68,11 +67,6 @@ struct SidebarView: View {
       guard let url else { return }
       beginRename(url: url, currentName: url.lastPathComponent)
       appState.pendingSidebarRenameURL = nil
-    }
-    .onChange(of: appState.workspaceSearchQuery) { _, newQuery in
-      if newQuery.isEmpty || !appState.isSearchingWorkspace {
-        selectedSearchResultIDs.removeAll()
-      }
     }
   }
 
@@ -231,7 +225,7 @@ struct SidebarView: View {
       } else {
         List {
           ForEach(windowRegistry.openDocuments) { descriptor in
-            Button {
+            let row = Button {
               if let url = descriptor.fileURL {
                 appState.sidebarFocusedURL = url
               }
@@ -256,9 +250,13 @@ struct SidebarView: View {
                 }
               }
             }
-            .onDrag {
-              descriptor.fileURL.map { NSItemProvider(object: $0 as NSURL) }
-                ?? NSItemProvider()
+
+            // Untitled rows have no URL to hand off — do not advertise a drag
+            // that can never be dropped anywhere (P3-03).
+            if let url = descriptor.fileURL {
+              row.onDrag { NSItemProvider(object: url as NSURL) }
+            } else {
+              row
             }
           }
         }
@@ -384,7 +382,25 @@ struct SidebarView: View {
       if !workspaceResults.isEmpty {
         Section("Workspace Results") {
           ForEach(workspaceResults) { result in
-            searchResultRowView(result)
+            Button {
+              appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              controller.selectSearchResult(result)
+            } label: {
+              searchResultRow(
+                result,
+                isSelected: isSelectedOrHovered(result.document.id)
+              )
+            }
+            .buttonStyle(.plain)
+            .onHover {
+              updateHoveredDocument(result.document.id, isHovered: $0)
+              if $0 {
+                appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              }
+            }
+            .contextMenu {
+              documentContextMenu(for: result.document)
+            }
           }
         }
       }
@@ -392,101 +408,31 @@ struct SidebarView: View {
       if !openFileResults.isEmpty {
         Section("Open Files") {
           ForEach(openFileResults) { result in
-            searchResultRowView(result)
+            Button {
+              appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              controller.selectSearchResult(result)
+            } label: {
+              searchResultRow(
+                result,
+                isSelected: isSelectedOrHovered(result.document.id)
+              )
+            }
+            .buttonStyle(.plain)
+            .onHover {
+              updateHoveredDocument(result.document.id, isHovered: $0)
+              if $0 {
+                appState.sidebarFocusedURL = result.document.url.standardizedFileURL
+              }
+            }
+            .contextMenu {
+              documentContextMenu(for: result.document)
+            }
           }
         }
       }
     }
     .listStyle(.sidebar)
     .accessibilityIdentifier("pensieve.sidebar.list.searchResults")
-    .onCopyCommand {
-      let selectedResults = SearchResultSelectionState.filterSelected(
-        from: appState.workspaceSearchResults,
-        selectedIDs: selectedSearchResultIDs
-      )
-      guard !selectedResults.isEmpty else { return [] }
-      let formatted = SearchResultAgentCopyFormatter.format(selectedResults)
-      return [NSItemProvider(object: formatted as NSString)]
-    }
-  }
-
-  @ViewBuilder
-  private func searchResultRowView(_ result: WorkspaceSearchResult) -> some View {
-    let isExplicitlySelected = selectedSearchResultIDs.contains(result.document.id)
-    let isHovered = hoveredDocumentID == result.document.id
-    let isSelected =
-      isExplicitlySelected
-      || (selectedSearchResultIDs.isEmpty && isSelectedOrHovered(result.document.id))
-
-    Button {
-      let isCommandPressed = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
-      if isCommandPressed {
-        selectedSearchResultIDs = SearchResultSelectionState.toggleSelection(
-          id: result.document.id,
-          in: selectedSearchResultIDs
-        )
-      } else {
-        selectedSearchResultIDs = [result.document.id]
-        appState.sidebarFocusedURL = result.document.url.standardizedFileURL
-        controller.selectSearchResult(result)
-      }
-    } label: {
-      searchResultRow(
-        result,
-        isSelected: isSelected,
-        isHovered: isHovered
-      )
-    }
-    .buttonStyle(.plain)
-    .onHover { isHovered in
-      updateHoveredDocument(result.document.id, isHovered: isHovered)
-      if isHovered {
-        appState.sidebarFocusedURL = result.document.url.standardizedFileURL
-      }
-    }
-    .contextMenu {
-      Button("Copy for Agent") {
-        copySearchResultForAgent(result)
-      }
-      .accessibilityLabel("Copy for Agent")
-
-      Divider()
-
-      documentContextMenu(for: result.document)
-    }
-  }
-
-  private func copySearchResultForAgent(_ clickedResult: WorkspaceSearchResult) {
-    let targetIDs: Set<URL> =
-      selectedSearchResultIDs.contains(clickedResult.document.id)
-      ? selectedSearchResultIDs
-      : [clickedResult.document.id]
-
-    let selectedResults = SearchResultSelectionState.filterSelected(
-      from: appState.workspaceSearchResults,
-      selectedIDs: targetIDs
-    )
-
-    let formatted = SearchResultAgentCopyFormatter.format(
-      selectedResults.isEmpty ? [clickedResult] : selectedResults
-    )
-
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(formatted, forType: .string)
-  }
-
-  private func documentRow(_ doc: DocumentRef, isSelected: Bool) -> some View {
-    HStack {
-      Image(systemName: "doc.text")
-        .foregroundColor(.secondary)
-      renameableTitle(for: doc.url, title: doc.title)
-    }
-    .padding(.vertical, 4)
-    .padding(.horizontal, 6)
-    .help(doc.displayPath)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .contentShape(Rectangle())
-    .background(selectionBackground(isSelected))
   }
 
   private func openDocumentRow(_ descriptor: OpenDocumentDescriptor) -> some View {
@@ -495,8 +441,11 @@ struct SidebarView: View {
     return HStack {
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
-      Text(descriptor.displayTitle)
-        .lineLimit(1)
+      // File-backed rows expose a context-menu Rename that sets `renamingURL`;
+      // route the title through `renameableTitle` so that selection actually
+      // surfaces the inline field. File-less descriptors (untitled drafts) fall
+      // back to plain text inside the helper.
+      renameableTitle(for: descriptor.fileURL, title: descriptor.displayTitle)
       Spacer(minLength: 4)
       if descriptor.isDirty {
         Circle()
@@ -633,11 +582,7 @@ struct SidebarView: View {
     )
   }
 
-  private func searchResultRow(
-    _ result: WorkspaceSearchResult,
-    isSelected: Bool,
-    isHovered: Bool = false
-  ) -> some View {
+  private func searchResultRow(_ result: WorkspaceSearchResult, isSelected: Bool) -> some View {
     VStack(alignment: .leading, spacing: 3) {
       HStack(spacing: 6) {
         Image(systemName: "doc.text")
@@ -663,16 +608,7 @@ struct SidebarView: View {
     .help(result.displayPath)
     .frame(maxWidth: .infinity, alignment: .leading)
     .contentShape(Rectangle())
-    .background(searchResultSelectionBackground(isSelected: isSelected, isHovered: isHovered))
-  }
-
-  private func searchResultSelectionBackground(isSelected: Bool, isHovered: Bool) -> some View {
-    RoundedRectangle(cornerRadius: 6, style: .continuous)
-      .fill(
-        isSelected
-          ? Color.accentColor.opacity(0.24)
-          : (isHovered ? Color.primary.opacity(0.06) : Color.clear)
-      )
+    .background(selectionBackground(isSelected))
   }
 
   private func selectionBackground(_ isSelected: Bool) -> some View {

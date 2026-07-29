@@ -52,6 +52,14 @@ struct PensieveApp: App {
         initialDocument: nil
       )
     }
+    // Opt OUT of external events here too, not just on the value-based group
+    // below. A launcher scene that still claimed Finder/Dock/`open` URL events
+    // would let SwiftUI materialize a fresh scene-owned launcher window per
+    // event — reviving the detached one-window-per-file path the registry's
+    // native-tab merge exists to prevent. With neither scene claiming them,
+    // external opens fall through to `application(_:open:)` →
+    // LaunchIntentCoordinator → registry tabs.
+    .handlesExternalEvents(matching: [])
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
@@ -62,6 +70,19 @@ struct PensieveApp: App {
     // `openWindow(value:)`: DocumentWindowRegistry builds document windows
     // directly in AppKit (DocumentWindowFactory) and attaches them as native
     // tabs before first presentation.
+    //
+    // No `.commands` here on purpose. SwiftUI assembles ONE app-wide menu bar
+    // from the whole scene tree at launch; the `.commands` attached to the
+    // primary launcher WindowGroup above already own that single menu bar, so
+    // a window restored into THIS group inherits the full Mode/Format/Agents
+    // surface — its enabled/disabled state and target follow focus through
+    // `CommandSurfaceContext` (Commands.swift), not scene ownership. The
+    // menu structure is built from the declaration, so it never depends on a
+    // launcher window being open. Re-declaring `PensieveCommands` on this
+    // second scene would NOT merge idempotently: `CommandsBuilder` appends
+    // per scene, so every `CommandMenu` (Mode/Format/Agents) — and the
+    // replaced File groups — would appear TWICE. The single declaration above
+    // IS the app-global level that covers both scenes.
     WindowGroup("Pensieve", for: DocumentRef.self) { document in
       DocumentWindowRootView(
         workspaceStore: workspaceStore,
@@ -147,6 +168,9 @@ struct DocumentWindowRootView: View {
           hasEditableBuffer: appState.documentHasEditableBuffer
         ) { window in
           currentWindow = window
+          // Publish this window's owning controller so a cross-window "Close
+          // from Open Files" routes its dirty guard through this session.
+          DocumentWindowRegistry.shared.registerController(controller, for: window)
         }
       )
       .frame(
@@ -154,9 +178,12 @@ struct DocumentWindowRootView: View {
         minHeight: WindowChromeRecipe.minimumContentSize.height
       )
       .task {
-        // Adopt BEFORE any load work: the menu bar must carry Pensieve's
+        // Seed BEFORE any load work: the menu bar must carry Pensieve's
         // commands from the first build, not from the first scene activation.
-        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+        // Only seed when nothing has adopted yet — a background root building
+        // after the key window must not steal the fallback (the key window owns
+        // it via `didBecomeKey` below).
+        CommandSurfaceContext.shared.adoptIfUnset(appState: appState, controller: controller)
         configureDocumentRouting()
         if let initialDocument {
           openInitialDocument(initialDocument)
@@ -204,6 +231,7 @@ struct DocumentWindowRootView: View {
         }
         controller.savePendingChangesOnClose()
         CommandSurfaceContext.shared.release(controller: controller)
+        DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
   }
 

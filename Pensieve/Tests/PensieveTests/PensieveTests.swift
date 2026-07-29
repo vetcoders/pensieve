@@ -3765,6 +3765,683 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentDirty)
   }
 
+  /// Open Files mirrors EVERY window's documents into EVERY window's sidebar, so
+  /// closing a row can target a document owned by ANOTHER window. The dirty
+  /// guard must run in the target's OWN session — cancelling it there must abort
+  /// the close instead of force-closing the target and dropping unsaved edits
+  /// into a silent recovery draft.
+  @MainActor
+  func testCrossWindowCloseRoutesDirtyGuardToOwningSessionAndCancelAborts() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    var ownerPrompted = false
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+        ownerPrompted = session.isUntitled
+        return .cancel
+      }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "unsaved work living in another window"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    // The CALLER closes the OWNER's untitled row from its mirrored Open Files.
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertTrue(ownerPrompted, "the guard must prompt in the owning window's session")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled guard must abort the close")
+    XCTAssertTrue(ownerState.documentSession.isUntitled)
+    XCTAssertTrue(ownerState.activeDocumentDirty, "the unsaved work must survive intact")
+    XCTAssertEqual(ownerState.windowModel.documentIdentity, ownerIdentity)
+  }
+
+  /// Same cross-window routing, but the owning session's guard resolves (Discard)
+  /// — so the close proceeds and the owner's window is torn down.
+  @MainActor
+  func testCrossWindowCloseProceedsWhenOwningGuardResolves() {
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let callerWindow = Self.makeControllerlessWindow()
+    let ownerWindow = Self.makeControllerlessWindow()
+    defer {
+      callerWindow.close()
+      ownerWindow.close()
+    }
+
+    let callerController = AppController(
+      appState: AppState(),
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry
+    )
+
+    let ownerState = AppState()
+    let ownerController = AppController(
+      appState: ownerState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .discard }),
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(ownerController.createUntitledDocument())
+    ownerState.activeDocumentText = "discardable"
+    ownerState.activeDocumentDirty = true
+    let ownerIdentity = try! XCTUnwrap(ownerState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: ownerIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(ownerController, for: ownerWindow)
+    registry.registerController(callerController, for: callerWindow)
+
+    callerController.closeOpenDocument(identity: ownerIdentity)
+
+    XCTAssertEqual(closedWindows, [ownerWindow], "a resolved guard must close the owner's window")
+    XCTAssertFalse(ownerState.documentSession.isDirty)
+  }
+
+  /// "Clear Open Files" mirrors EVERY window's documents, so it tears down tabs
+  /// owned by other windows. It must guard each document in its OWNING window's
+  /// session and abort the WHOLE pass if any guard is cancelled — close NOTHING.
+  /// But the abort rolls back only the CLOSING of windows, not content decisions
+  /// already made earlier in the pass: a window that force-saved keeps its bytes
+  /// on disk even though the overall operation is cancelled.
+  @MainActor
+  func testClearOpenFilesCancelledInAnotherWindowClosesNothing() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearOpenFilesTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let saveWindow = Self.makeControllerlessWindow()
+    let cleanWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      saveWindow.close()
+      cleanWindow.close()
+      cancelWindow.close()
+    }
+
+    // Window A ("this" window): a real file, dirtied, whose owning guard
+    // force-saves EARLIER in the pass (existing file → write, no prompt).
+    let fileURL = folder.appendingPathComponent("saved.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let saveState = AppState()
+    let saveStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore())
+    let saveController = AppController(
+      appState: saveState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: saveStore,
+      documentWindowRegistry: registry
+    )
+    saveStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: saveState)
+    saveState.activeDocumentText = "edited in memory"
+    saveState.activeDocumentDirty = true
+    let saveIdentity = try XCTUnwrap(saveState.windowModel.documentIdentity)
+
+    // Window C (ANOTHER window): a real file, CLEAN (not dirty). Its guard is a
+    // no-op that must neither prompt nor clear — the pre-fix pass blanked it
+    // anyway via select(ref: nil), so it exercises the clean-window hole.
+    let cleanURL = folder.appendingPathComponent("clean.md")
+    try "clean on disk".write(to: cleanURL, atomically: true, encoding: .utf8)
+    let cleanState = AppState()
+    let cleanStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore())
+    let cleanController = AppController(
+      appState: cleanState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: cleanStore,
+      documentWindowRegistry: registry
+    )
+    cleanStore.load(ref: DocumentRef(id: cleanURL.standardizedFileURL), into: cleanState)
+    let cleanIdentity = try XCTUnwrap(cleanState.windowModel.documentIdentity)
+
+    // Window B (ANOTHER window): untitled, dirty; its guard is CANCELLED.
+    var cancelPrompted = false
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+        cancelPrompted = session.isUntitled
+        return .cancel
+      }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved work in another window"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    // Attach the Save and Clean windows FIRST so they resolve EARLIER in the
+    // pass, the Cancel window LAST so the abort trips only after the earlier
+    // windows have already been asked.
+    XCTAssertTrue(
+      registry.attach(
+        saveWindow, identity: saveIdentity, documentID: fileURL,
+        title: "saved.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cleanWindow, identity: cleanIdentity, documentID: cleanURL,
+        title: "clean.md", isDirty: false, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(saveController, for: saveWindow)
+    registry.registerController(cleanController, for: cleanWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    // "Clear Open Files" invoked from window A.
+    saveController.clearOpenFiles()
+
+    // (1) Cancel in another window aborts: zero windows closed, buffer intact.
+    XCTAssertTrue(cancelPrompted, "the abort must originate in the owning window's guard")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled guard must close NOTHING")
+    XCTAssertTrue(cancelState.documentSession.isUntitled)
+    XCTAssertTrue(cancelState.activeDocumentDirty, "the cancelled window's unsaved work survives")
+    XCTAssertEqual(cancelState.windowModel.documentIdentity, cancelIdentity)
+
+    // (2) Documented non-rollback: the Save resolved earlier in the SAME pass is
+    // NOT undone — its bytes are on disk even though the pass was cancelled.
+    XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "edited in memory")
+    XCTAssertFalse(saveState.activeDocumentDirty, "the force-saved window is clean on disk")
+
+    // (3) Partial-state hole: a Cancel raised on a LATER window must NOT blank
+    // the windows asked earlier. The force-saved (dirty) window keeps its
+    // document, and so does the clean (no-op guard) window — both stay
+    // open-with-content, never blanked-but-open.
+    XCTAssertEqual(
+      saveState.windowModel.documentIdentity, saveIdentity,
+      "the earlier force-saved window must still own its document after the abort")
+    XCTAssertTrue(
+      saveState.documentSession.hasEditableBuffer,
+      "the earlier force-saved window's session must not be cleared")
+    XCTAssertEqual(
+      cleanState.windowModel.documentIdentity, cleanIdentity,
+      "the earlier clean window must still own its document after the abort")
+    XCTAssertTrue(
+      cleanState.documentSession.hasEditableBuffer,
+      "the earlier clean window's session must not be cleared")
+  }
+
+  /// Case 1 — the guarantee this rework adds. Window A chose Discard on an
+  /// untitled draft; window B then Cancels. The whole pass aborts, so A's
+  /// Discard must NOT have been applied: its buffer is still dirty and — the
+  /// load-bearing bit — its recovery draft is still on disk, recoverable. The
+  /// pre-rework code applied the Discard eagerly in the ASK phase, dropping the
+  /// draft before the Cancel could abort.
+  @MainActor
+  func testClearOpenFilesDiscardThenCancelKeepsRecoveryDraft() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearDiscardTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let discardWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      discardWindow.close()
+      cancelWindow.close()
+    }
+
+    // Window A: untitled, dirty, with a recovery draft already on disk. Its
+    // guard chooses Discard.
+    let discardRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryA", isDirectory: true))
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      recoveryStore: discardRecovery,
+      dirtyUntitledPrompt: { _ in .discard })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(discardController.createUntitledDocument())
+    discardState.activeDocumentText = "unsaved untitled work"
+    discardState.activeDocumentDirty = true
+    // Flush a recovery draft the way the close/autosave path would, so a later
+    // Discard has something to drop. This also stamps the recovered identity.
+    XCTAssertTrue(discardStore.savePendingChangesOnClose(appState: discardState))
+    XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window B: untitled, dirty; its guard Cancels.
+    var cancelPrompted = false
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { session in
+        cancelPrompted = session.isUntitled
+        return .cancel
+      }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved work in another window"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    // Discard window FIRST (resolves earlier), Cancel window SECOND.
+    XCTAssertTrue(
+      registry.attach(
+        discardWindow, identity: discardIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    discardController.clearOpenFiles()
+
+    XCTAssertTrue(cancelPrompted, "the abort must originate in the owning window's guard")
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    // The deferred Discard was NEVER applied because the pass aborted.
+    XCTAssertTrue(
+      discardState.activeDocumentDirty,
+      "the discarded window's buffer must stay dirty when the pass is cancelled")
+    XCTAssertEqual(
+      discardState.activeDocumentText, "unsaved untitled work",
+      "the buffer text must survive the aborted pass")
+    XCTAssertEqual(
+      discardState.windowModel.documentIdentity, discardIdentity,
+      "the discarded window must still own its document")
+    XCTAssertFalse(
+      discardRecovery.loadDrafts().isEmpty,
+      "the recovery draft must still exist — a cancelled Discard is recoverable")
+  }
+
+  /// Case 2 — a clean earlier window is untouched when a later window Cancels.
+  @MainActor
+  func testClearOpenFilesCleanWindowSurvivesLaterCancel() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearCleanTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let cleanWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      cleanWindow.close()
+      cancelWindow.close()
+    }
+
+    let cleanURL = folder.appendingPathComponent("clean.md")
+    try "clean on disk".write(to: cleanURL, atomically: true, encoding: .utf8)
+    let cleanState = AppState()
+    let cleanStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore())
+    let cleanController = AppController(
+      appState: cleanState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: cleanStore,
+      documentWindowRegistry: registry
+    )
+    cleanStore.load(ref: DocumentRef(id: cleanURL.standardizedFileURL), into: cleanState)
+    let cleanIdentity = try XCTUnwrap(cleanState.windowModel.documentIdentity)
+
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        cleanWindow, identity: cleanIdentity, documentID: cleanURL,
+        title: "clean.md", isDirty: false, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(cleanController, for: cleanWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    cleanController.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    XCTAssertEqual(
+      cleanState.windowModel.documentIdentity, cleanIdentity,
+      "the clean window must still own its document")
+    XCTAssertTrue(
+      cleanState.documentSession.hasEditableBuffer,
+      "the clean window's session must not be cleared")
+  }
+
+  /// Case 3 — a force-saved earlier window keeps its bytes and its session when
+  /// a later window Cancels. The Save is the one content decision NOT rolled
+  /// back (the bytes are already on disk), but the window is not torn down.
+  @MainActor
+  func testClearOpenFilesSaveThenCancelKeepsBytesAndSession() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSaveTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let saveWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      saveWindow.close()
+      cancelWindow.close()
+    }
+
+    let fileURL = folder.appendingPathComponent("saved.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let saveState = AppState()
+    let saveStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore())
+    let saveController = AppController(
+      appState: saveState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: saveStore,
+      documentWindowRegistry: registry
+    )
+    saveStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: saveState)
+    saveState.activeDocumentText = "edited in memory"
+    saveState.activeDocumentDirty = true
+    let saveIdentity = try XCTUnwrap(saveState.windowModel.documentIdentity)
+
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        saveWindow, identity: saveIdentity, documentID: fileURL,
+        title: "saved.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(saveController, for: saveWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    saveController.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    XCTAssertEqual(
+      try String(contentsOf: fileURL, encoding: .utf8), "edited in memory",
+      "the force-saved bytes are on disk and NOT rolled back")
+    XCTAssertFalse(saveState.activeDocumentDirty, "the force-saved window is clean")
+    XCTAssertEqual(
+      saveState.windowModel.documentIdentity, saveIdentity,
+      "the force-saved window must still own its document")
+    XCTAssertTrue(
+      saveState.documentSession.hasEditableBuffer,
+      "the force-saved window's session must not be cleared")
+  }
+
+  /// Case 4 — the happy path. Every window resolves without a Cancel, so the
+  /// deferred Discard IS applied (draft dropped, buffer clean) and every window
+  /// is torn down. Guards phase 2 against forgetting to apply what phase 1 only
+  /// recorded.
+  @MainActor
+  func testClearOpenFilesFullSuccessAppliesDeferredDiscardAndClosesAll() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSuccessTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let discardWindow = Self.makeControllerlessWindow()
+    let cleanWindow = Self.makeControllerlessWindow()
+    defer {
+      discardWindow.close()
+      cleanWindow.close()
+    }
+
+    // Window A: untitled, dirty, with a recovery draft; guard chooses Discard.
+    let discardRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryA", isDirectory: true))
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      recoveryStore: discardRecovery,
+      dirtyUntitledPrompt: { _ in .discard })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(discardController.createUntitledDocument())
+    discardState.activeDocumentText = "unsaved untitled work"
+    discardState.activeDocumentDirty = true
+    XCTAssertTrue(discardStore.savePendingChangesOnClose(appState: discardState))
+    XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window B: a clean file — resolves with no prompt, so the pass succeeds.
+    let cleanURL = folder.appendingPathComponent("clean.md")
+    try "clean on disk".write(to: cleanURL, atomically: true, encoding: .utf8)
+    let cleanState = AppState()
+    let cleanStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore())
+    let cleanController = AppController(
+      appState: cleanState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: cleanStore,
+      documentWindowRegistry: registry
+    )
+    cleanStore.load(ref: DocumentRef(id: cleanURL.standardizedFileURL), into: cleanState)
+    let cleanIdentity = try XCTUnwrap(cleanState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        discardWindow, identity: discardIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cleanWindow, identity: cleanIdentity, documentID: cleanURL,
+        title: "clean.md", isDirty: false, hasEditableBuffer: true))
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(cleanController, for: cleanWindow)
+
+    discardController.clearOpenFiles()
+
+    XCTAssertEqual(
+      Set(closedWindows.map(ObjectIdentifier.init)),
+      Set([discardWindow, cleanWindow].map(ObjectIdentifier.init)),
+      "a fully resolved pass closes every window")
+    XCTAssertFalse(
+      discardState.activeDocumentDirty,
+      "the deferred Discard must be applied on a successful pass")
+    XCTAssertTrue(
+      discardRecovery.loadDrafts().isEmpty,
+      "the deferred Discard must drop the recovery draft on a successful pass")
+  }
+
+  /// Case 5 — the test the "keep Save in phase 1" decision rests on. A Discard
+  /// window is confirmed FIRST (its Discard deferred), then a pathed window's
+  /// force-save FAILS with an I/O error. That failure is the only thing left
+  /// that can abort the pass — and it must, WITHOUT the earlier deferred Discard
+  /// leaking to execution. If the abort path (decide's
+  /// `guard !isDirty else { return nil }`) did not fire, phase 2 would run and
+  /// the Discard window's draft would be dropped; asserting the draft survives
+  /// proves the save genuinely failed and aborted rather than silently
+  /// succeeding.
+  @MainActor
+  func testClearOpenFilesSaveIOFailureAbortsPassAndSparesDeferredDiscard() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSaveFailTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let discardWindow = Self.makeControllerlessWindow()
+    let failWindow = Self.makeControllerlessWindow()
+    defer {
+      discardWindow.close()
+      failWindow.close()
+    }
+
+    // Window B: untitled, dirty, with a seeded recovery draft; guard Discards.
+    // Attached FIRST so phase 1 records its deferred Discard BEFORE the failure.
+    let discardRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryB", isDirectory: true))
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      recoveryStore: discardRecovery,
+      dirtyUntitledPrompt: { _ in .discard })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(discardController.createUntitledDocument())
+    discardState.activeDocumentText = "unsaved untitled work"
+    discardState.activeDocumentDirty = true
+    XCTAssertTrue(discardStore.savePendingChangesOnClose(appState: discardState))
+    XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window A: a pathed doc, dirtied, whose write throws. saveExisting catches
+    // the throw and returns false, leaving the session dirty — the decide guard
+    // then returns nil (abort). Attached SECOND so the failure trips after B.
+    let fileURL = folder.appendingPathComponent("cannot-write.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let failState = AppState()
+    let failStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      writeDocument: { _, _ in throw NSError(domain: "PensieveTestWriteFailure", code: 1) })
+    let failController = AppController(
+      appState: failState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: failStore,
+      documentWindowRegistry: registry
+    )
+    failStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: failState)
+    failState.activeDocumentText = "edited but the write will fail"
+    failState.activeDocumentDirty = true
+    let failIdentity = try XCTUnwrap(failState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        discardWindow, identity: discardIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        failWindow, identity: failIdentity, documentID: fileURL,
+        title: "cannot-write.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(failController, for: failWindow)
+
+    discardController.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "an I/O-aborted pass must close NOTHING")
+    // The failed save is what aborted the pass — prove it propagated, not swallowed.
+    XCTAssertTrue(failState.activeDocumentDirty, "the failed-write window stays dirty")
+    XCTAssertEqual(
+      try String(contentsOf: fileURL, encoding: .utf8), "on disk",
+      "no new bytes reached disk when the write threw")
+    XCTAssertEqual(
+      failState.activeDocumentText, "edited but the write will fail",
+      "the failed-write window keeps its buffer")
+    XCTAssertEqual(
+      failState.windowModel.documentIdentity, failIdentity,
+      "the failed-write window still owns its document")
+    // The core: the earlier-recorded Discard must NOT have leaked to execution.
+    XCTAssertTrue(
+      discardState.activeDocumentDirty,
+      "the deferred Discard must stay unapplied when a later save aborts the pass")
+    XCTAssertEqual(
+      discardState.windowModel.documentIdentity, discardIdentity,
+      "the Discard window still owns its document")
+    XCTAssertFalse(
+      discardRecovery.loadDrafts().isEmpty,
+      "the recovery draft must survive — a deferred Discard can't leak past an I/O abort")
+  }
+
+  @MainActor
+  private static func makeCrossWindowRegistry(
+    closeWindow: @escaping @MainActor (NSWindow) -> Void
+  ) -> DocumentWindowRegistry {
+    DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: closeWindow)
+  }
+
+  @MainActor
+  private static func makeControllerlessWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
+  }
+
   @MainActor
   func testSaveAsRegularDocumentCreatesCopyAndSwitchesSession() throws {
     let folder = FileManager.default.temporaryDirectory

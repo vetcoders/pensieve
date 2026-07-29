@@ -53,9 +53,11 @@ struct DocumentWindowFactory {
   /// supports that the same way the WindowGroup scene does.
   func makeWindow(for document: DocumentRef?) -> NSWindow {
     let visibleFrame = NSScreen.main?.visibleFrame
+    let contentRect =
+      visibleFrame.map { WindowChromeRecipe.factoryInitialFrame(in: $0) }
+      ?? WindowChromeRecipe.defaultContentRect
     let window = DocumentWindow(
-      contentRect: visibleFrame.map(WindowChromeRecipe.factoryInitialFrame(in:))
-        ?? WindowChromeRecipe.defaultContentRect,
+      contentRect: contentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
       defer: false)

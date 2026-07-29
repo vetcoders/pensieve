@@ -41,6 +41,7 @@ final class WindowChromeRecipeTests: XCTestCase {
   /// AppKit factory presents every later document tab. Both read the same
   /// toolbar-fitting width, so a cold window never exposes fewer toolbar
   /// controls than a factory one just because SwiftUI built it.
+  @MainActor
   func testToolbarFittingWidthIsWiderThanThePinnedDefaultContentWidth() {
     XCTAssertEqual(WindowChromeRecipe.toolbarFittingContentWidth, 1300)
     XCTAssertGreaterThan(
@@ -53,6 +54,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       WindowChromeRecipe.toolbarFittingContentWidth)
   }
 
+  @MainActor
   func testFactoryInitialFramePrefersToolbarWidthWithinVisibleScreen() {
     let roomyVisibleFrame = NSRect(x: 0, y: 67, width: 1512, height: 881)
     let roomyFrame = WindowChromeRecipe.factoryInitialFrame(in: roomyVisibleFrame)
@@ -61,6 +63,48 @@ final class WindowChromeRecipeTests: XCTestCase {
     let constrainedVisibleFrame = NSRect(x: 40, y: 80, width: 1000, height: 700)
     let constrainedFrame = WindowChromeRecipe.factoryInitialFrame(in: constrainedVisibleFrame)
     XCTAssertEqual(constrainedFrame, constrainedVisibleFrame)
+  }
+
+  /// P2-03: the factory feeds `factoryInitialFrame` straight into
+  /// `NSWindow(contentRect:)`, so the returned rect must leave room for the
+  /// titlebar — the FINAL frame (content grown by chrome) must never spill
+  /// above a low screen's work area. Exercised with a mask that actually adds
+  /// a titlebar (the document mask's `.fullSizeContentView` overlays it, so
+  /// the frame equals the content rect and would not surface the regression).
+  @MainActor
+  func testFactoryContentRectKeepsFinalFrameWithinVisibleAreaWithTitlebarChrome() {
+    let titlebarMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+    let lowVisibleFrame = NSRect(x: 0, y: 25, width: 1440, height: 500)
+
+    let content = WindowChromeRecipe.factoryInitialContentRect(
+      in: lowVisibleFrame, styleMask: titlebarMask)
+    let finalFrame = NSWindow.frameRect(forContentRect: content, styleMask: titlebarMask)
+
+    XCTAssertGreaterThanOrEqual(finalFrame.minX, lowVisibleFrame.minX - 0.5)
+    XCTAssertGreaterThanOrEqual(finalFrame.minY, lowVisibleFrame.minY - 0.5)
+    XCTAssertLessThanOrEqual(finalFrame.maxX, lowVisibleFrame.maxX + 0.5)
+    XCTAssertLessThanOrEqual(finalFrame.maxY, lowVisibleFrame.maxY + 0.5)
+
+    // Premise guard: this mask really adds titlebar chrome, so the content rect
+    // had to shrink below the raw visible height to keep the frame in bounds.
+    XCTAssertGreaterThan(finalFrame.height, content.height)
+    XCTAssertLessThan(content.height, lowVisibleFrame.height)
+  }
+
+  /// The same invariant on the REAL document mask: even where
+  /// `.fullSizeContentView` makes the frame equal the content rect, a low
+  /// screen must not produce a frame that reaches past the work area.
+  @MainActor
+  func testFactoryFrameFitsVisibleAreaOnALowScreenWithTheDocumentMask() {
+    let lowVisibleFrame = NSRect(x: 0, y: 25, width: 1440, height: 520)
+    let content = WindowChromeRecipe.factoryInitialFrame(in: lowVisibleFrame)
+    let finalFrame = NSWindow.frameRect(
+      forContentRect: content, styleMask: WindowChromeRecipe.documentStyleMask)
+
+    XCTAssertGreaterThanOrEqual(finalFrame.minX, lowVisibleFrame.minX - 0.5)
+    XCTAssertGreaterThanOrEqual(finalFrame.minY, lowVisibleFrame.minY - 0.5)
+    XCTAssertLessThanOrEqual(finalFrame.maxX, lowVisibleFrame.maxX + 0.5)
+    XCTAssertLessThanOrEqual(finalFrame.maxY, lowVisibleFrame.maxY + 0.5)
   }
 
   func testTitlebarGlassHeightComesFromWindowContentLayoutDelta() {

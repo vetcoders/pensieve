@@ -79,10 +79,6 @@ struct DocumentSession: Equatable {
     }
   }
 
-  var persistentAIDocumentID: String? {
-    identity?.persistentID
-  }
-
   var isUntitled: Bool {
     guard case .untitled = kind else { return false }
     return true
@@ -95,7 +91,14 @@ struct DocumentSession: Equatable {
     }
     set {
       guard case .untitled(let title, let identity, _) = kind else { return }
-      kind = .untitled(title: title, identity: identity, recoveryID: newValue)
+      // Once a draft is backed by a recovery record its persistent identity must
+      // become `.recovered(recoveryID)` — the SAME key a post-relaunch restore
+      // rebuilds via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)`
+      // key here would derive the AI session store key `untitled:<uuid>` before
+      // close but `recovery:<recoveryID>` after restore, silently dropping the
+      // AI continuation saved for this draft. Nil clears (discard) keep identity.
+      let resolvedIdentity = newValue.map(DocumentIdentity.recovered) ?? identity
+      kind = .untitled(title: title, identity: resolvedIdentity, recoveryID: newValue)
     }
   }
 

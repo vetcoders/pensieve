@@ -306,6 +306,9 @@ final class DocumentAISessionStore: @unchecked Sendable {
   }
 
   private static func defaultFileURL() -> URL {
+    if let overrideRoot = AppSupportLocation.overrideRoot() {
+      return overrideRoot.appendingPathComponent("document-ai-sessions.json")
+    }
     let root =
       FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
       .first ?? FileManager.default.temporaryDirectory

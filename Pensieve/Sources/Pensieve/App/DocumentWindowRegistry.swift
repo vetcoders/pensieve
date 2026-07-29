@@ -38,6 +38,12 @@ final class DocumentWindowRegistry: ObservableObject {
   private var deferredAttachDocumentIDs: Set<URL> = []
   private var orderedDocumentIDs: Set<URL> = []
   private var windowsByIdentity: [DocumentIdentity: WeakWindow] = [:]
+  /// Each document window's owning controller, keyed by the window. Open Files
+  /// mirrors EVERY window's documents into EVERY window's sidebar, so a close
+  /// invoked from one window can target a document living in another. The dirty
+  /// guard must run in the target's OWN session, so `closeOpenDocument` resolves
+  /// the owner through this map instead of guarding only the caller's session.
+  private var controllersByWindow: [ObjectIdentifier: WeakController] = [:]
   private var fallbackUntitledIdentities: [ObjectIdentifier: DocumentIdentity] = [:]
   /// The sole ordered publication authority for Open Files. File-only callers
   /// get a derived compatibility projection via `openTabDocumentIDs`.
@@ -380,6 +386,14 @@ final class DocumentWindowRegistry: ObservableObject {
 
     if let existing = windowsByIdentity[resolvedIdentity]?.window, existing !== window {
       DebugTrace.log("registry.attach rejected duplicate identity \(resolvedIdentity.persistentID)")
+      // The window switched in place onto a document another window already
+      // owns. It no longer legitimately shows its PREVIOUS document, so drop
+      // this window's stale descriptor/mapping before rejecting — otherwise
+      // Open Files and `open(previous)` keep targeting this window as if it
+      // still showed the old document, sending later activation/close actions
+      // to the wrong tab. `existing`'s ownership of the duplicate is untouched.
+      releaseStaleDocumentMappings(for: window, keeping: nil)
+      removeDescriptors(for: window, keeping: nil)
       return false
     }
 
@@ -411,7 +425,16 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     guard canMutateWindowTabs() else {
-      if let documentID { deferAttach(window, documentID: documentID) }
+      if let documentID {
+        deferAttach(
+          window,
+          identity: resolvedIdentity,
+          documentID: documentID,
+          title: title,
+          representedURL: representedURL,
+          isDirty: isDirty,
+          hasEditableBuffer: hasEditableBuffer)
+      }
       return true
     }
 
@@ -532,6 +555,24 @@ final class DocumentWindowRegistry: ObservableObject {
     closeWindow(window)
   }
 
+  /// Associates a document window with the controller driving its session. The
+  /// window's SwiftUI root registers here once its window resolves and drops the
+  /// association when the window closes; stale weak entries clear lazily.
+  func registerController(_ controller: AppController, for window: NSWindow) {
+    controllersByWindow[ObjectIdentifier(window)] = WeakController(controller)
+  }
+
+  func unregisterController(for window: NSWindow) {
+    controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
+  }
+
+  /// The controller owning the window that currently shows `identity`, so a
+  /// cross-window close routes its dirty guard through the target's own session.
+  func controller(for identity: DocumentIdentity) -> AppController? {
+    guard let window = windowsByIdentity[identity.standardized]?.window else { return nil }
+    return controllersByWindow[ObjectIdentifier(window)]?.controller
+  }
+
   func activate(_ identity: DocumentIdentity) {
     guard let window = windowsByIdentity[identity.standardized]?.window else { return }
     orderAndActivateWindow(window)
@@ -574,13 +615,32 @@ final class DocumentWindowRegistry: ObservableObject {
     }
   }
 
-  private func deferAttach(_ window: NSWindow, documentID: URL) {
+  private func deferAttach(
+    _ window: NSWindow,
+    identity: DocumentIdentity?,
+    documentID: URL,
+    title: String?,
+    representedURL: URL?,
+    isDirty: Bool,
+    hasEditableBuffer: Bool
+  ) {
     guard deferredAttachDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self, weak window] in
       guard let self else { return }
       deferredAttachDocumentIDs.remove(documentID)
       guard let window else { return }
-      attach(window, documentID: documentID)
+      // Carry the FULL attach metadata: a bare re-attach would re-publish the
+      // descriptor with the default `isDirty: false`, clobbering a dirty
+      // window's unsaved indicator once the modal turn that forced the defer
+      // clears.
+      attach(
+        window,
+        identity: identity,
+        documentID: documentID,
+        title: title,
+        representedURL: representedURL,
+        isDirty: isDirty,
+        hasEditableBuffer: hasEditableBuffer)
     }
   }
 
@@ -749,6 +809,14 @@ private final class WeakWindow {
   }
 }
 
+private final class WeakController {
+  weak var controller: AppController?
+
+  init(_ controller: AppController) {
+    self.controller = controller
+  }
+}
+
 struct DocumentWindowAccessor: NSViewRepresentable {
   let documentID: URL?
   let identity: DocumentIdentity?
@@ -828,16 +896,9 @@ struct DocumentWindowAccessor: NSViewRepresentable {
         && coordinator.lastIsDirty == isDirty
         && coordinator.lastHasEditableBuffer == hasEditableBuffer
       if unchanged { return }
-      coordinator.lastWindowID = windowID
-      coordinator.lastIdentity = identity
-      coordinator.lastDocumentID = documentID
-      coordinator.lastTitle = title
-      coordinator.lastRepresentedURL = representedURL
-      coordinator.lastIsDirty = isDirty
-      coordinator.lastHasEditableBuffer = hasEditableBuffer
 
       onWindow?(window)
-      DocumentWindowRegistry.shared.attach(
+      let attached = DocumentWindowRegistry.shared.attach(
         window,
         identity: identity,
         documentID: documentID,
@@ -845,6 +906,19 @@ struct DocumentWindowAccessor: NSViewRepresentable {
         representedURL: representedURL,
         isDirty: isDirty,
         hasEditableBuffer: hasEditableBuffer)
+      // Commit the coalescing cache ONLY after the registry accepted this pass.
+      // A rejected attach (e.g. a duplicate identity whose owner window still
+      // holds the mapping) must stay "changed" so a later render pass — after
+      // the owner closes and frees the identity — retries and lands the window
+      // in Open Files, instead of being cached as done and left orphaned.
+      guard attached else { return }
+      coordinator.lastWindowID = windowID
+      coordinator.lastIdentity = identity
+      coordinator.lastDocumentID = documentID
+      coordinator.lastTitle = title
+      coordinator.lastRepresentedURL = representedURL
+      coordinator.lastIsDirty = isDirty
+      coordinator.lastHasEditableBuffer = hasEditableBuffer
     }
   }
 }

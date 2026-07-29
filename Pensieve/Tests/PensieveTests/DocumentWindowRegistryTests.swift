@@ -148,6 +148,48 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
+  func testRejectedDuplicateReattachesAfterOwnerWindowCloses() throws {
+    let forcedID = UUID()
+    let forced = DocumentIdentity.untitled(forcedID)
+    let ownerWindow = Self.makeWindow()
+    let duplicateWindow = Self.makeWindow()
+    defer {
+      ownerWindow.close()
+      duplicateWindow.close()
+    }
+    var closed: [ObjectIdentifier] = []
+    let registry = Self.makeIdentityRegistry { closed.append(ObjectIdentifier($0)) }
+
+    // Owner takes the identity; the duplicate is rejected while the owner holds it.
+    XCTAssertTrue(
+      registry.attach(
+        ownerWindow, identity: forced, documentID: nil,
+        title: "Owner.md", hasEditableBuffer: true))
+    XCTAssertFalse(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.count, 1)
+    XCTAssertTrue(registry.openDocuments.first?.window === ownerWindow)
+
+    // Owner closes → the identity is freed from the registry.
+    registry.closeDocument(forced)
+    XCTAssertEqual(closed, [ObjectIdentifier(ownerWindow)])
+    registry.reconcileClosedWindow(ownerWindow)
+    XCTAssertTrue(registry.openDocuments.isEmpty)
+
+    // The duplicate's coordinator retries attach (cache was never committed on
+    // rejection): it must now be accepted and land in Open Files, not stay
+    // orphaned outside the registry.
+    XCTAssertTrue(
+      registry.attach(
+        duplicateWindow, identity: forced, documentID: nil,
+        title: "Duplicate.md", hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.map(\.identity), [forced])
+    XCTAssertTrue(registry.openDocuments.first?.window === duplicateWindow)
+  }
+
+  @MainActor
   func testOpenTabDocumentIDsRoundTripAcrossOpenAttachSwitchAndWillCloseReconcile() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-alpha.md").standardizedFileURL
     let betaID = URL(fileURLWithPath: "/tmp/pensieve-open-tabs-beta.md").standardizedFileURL
@@ -670,6 +712,83 @@ final class DocumentWindowRegistryTests: XCTestCase {
     XCTAssertEqual(
       closedIDs, [ObjectIdentifier(launcherB)],
       "a redundant launcher must still be reaped when another window survives")
+  }
+
+  @MainActor
+  func testInPlaceSwitchToDuplicateReleasesStaleMappingOnRejection() throws {
+    let alphaID = URL(fileURLWithPath: "/tmp/pensieve-stale-alpha.md").standardizedFileURL
+    let betaID = URL(fileURLWithPath: "/tmp/pensieve-stale-beta.md").standardizedFileURL
+    let switchingWindow = Self.makeWindow()
+    let betaOwner = Self.makeWindow()
+    defer {
+      switchingWindow.close()
+      betaOwner.close()
+    }
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("attach should not defer outside modal UI") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // switchingWindow shows alpha; betaOwner owns beta.
+    XCTAssertTrue(registry.attach(switchingWindow, documentID: alphaID))
+    XCTAssertTrue(registry.attach(betaOwner, documentID: betaID))
+    XCTAssertEqual(Set(registry.openTabDocumentIDs), [alphaID, betaID])
+
+    // switchingWindow switches in place onto beta, which betaOwner already owns.
+    XCTAssertFalse(
+      registry.attach(switchingWindow, documentID: betaID),
+      "an in-place switch onto an already-owned document must be rejected")
+
+    // The rejection must release switchingWindow's stale alpha mapping: only
+    // betaOwner's beta remains, so `open(alpha)` no longer targets this window.
+    XCTAssertEqual(
+      registry.openTabDocumentIDs,
+      [betaID],
+      "the rejected in-place switch must drop the window's stale previous-document mapping")
+  }
+
+  @MainActor
+  func testDeferredAttachPreservesDirtyMetadataThroughModalTurn() throws {
+    let docID = URL(fileURLWithPath: "/tmp/pensieve-deferred-dirty.md").standardizedFileURL
+    let window = Self.makeWindow()
+    defer { window.close() }
+
+    var canMutate = false
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { canMutate },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil })
+
+    // A dirty file-backed attach arrives while a modal panel blocks tab
+    // mutation: the descriptor publishes dirty, and the tab work is deferred.
+    XCTAssertTrue(
+      registry.attach(
+        window,
+        identity: .file(docID),
+        documentID: docID,
+        title: "dirty",
+        representedURL: docID,
+        isDirty: true,
+        hasEditableBuffer: true))
+    XCTAssertEqual(registry.openDocuments.first?.isDirty, true)
+    XCTAssertEqual(deferredWork.count, 1)
+
+    // Modal closes; the deferred attach runs. It must NOT re-publish the
+    // descriptor as clean.
+    canMutate = true
+    for work in deferredWork { work() }
+
+    XCTAssertEqual(
+      registry.openDocuments.first?.isDirty,
+      true,
+      "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state")
   }
 
   @MainActor

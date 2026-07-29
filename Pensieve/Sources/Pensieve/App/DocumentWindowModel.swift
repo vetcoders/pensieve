@@ -34,8 +34,19 @@ final class DocumentWindowModel {
     }
   }
 
+  /// Stable per-window identity used only as the AI-session fallback while the
+  /// window has no document. `DocumentAISessionStore` keys sessions by this
+  /// string; a shared constant ("window:empty") would collapse every empty
+  /// window onto ONE session, so multiple empty windows would share — and
+  /// overwrite — each other's continuation. A per-instance UUID keeps them
+  /// isolated. It is never persisted across launches: an empty window has no
+  /// document, so autocomplete produces no continuation to store under this key
+  /// (the moment a document loads, `documentIdentity` is non-nil and the real
+  /// `persistentID` takes over), so no unbounded empty-window records accrue.
+  private let windowInstanceID = UUID()
+
   var aiDocumentID: String {
-    documentIdentity?.persistentID ?? "window:empty"
+    documentIdentity?.persistentID ?? "window:\(windowInstanceID.uuidString.lowercased())"
   }
 
   /// Discrete, low-frequency mirrors of `documentSession` metadata. Chrome views
