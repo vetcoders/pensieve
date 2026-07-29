@@ -786,6 +786,16 @@ final class IndexDatabase {
   /// decision (delete-and-reindex is cheaper), deliberately out of this scope.
   private nonisolated static let autoVacuumConversionByteLimit: Int64 = 256 * 1024 * 1024
 
+  /// Narrow test seam for the ceiling above, in the same instance-level shape as
+  /// `walCheckpointThresholdBytesOverride`: a test that had to build a genuinely 256 MiB database to
+  /// reach the decline branch would be a minute-long disk-bound test, so the bar is lowered instead.
+  /// `nil` everywhere in production.
+  var autoVacuumConversionByteLimitOverride: Int64?
+
+  private var effectiveAutoVacuumConversionByteLimit: Int64 {
+    autoVacuumConversionByteLimitOverride ?? Self.autoVacuumConversionByteLimit
+  }
+
   /// The legacy-database conversion is attempted at most once per process — a failed or skipped
   /// conversion must not re-run a multi-second VACUUM on every workspace close.
   private var didAttemptAutoVacuumConversion = false
@@ -809,10 +819,12 @@ final class IndexDatabase {
     let attemptConversion = reason == .workspaceClose && !didAttemptAutoVacuumConversion
     if attemptConversion { didAttemptAutoVacuumConversion = true }
     let pageBudget = reason == .indexBatch ? Self.incrementalVacuumPageBudget : nil
+    let conversionByteLimit = effectiveAutoVacuumConversionByteLimit
 
     await Task.detached(priority: .utility) {
       if attemptConversion {
-        Self.convertToIncrementalAutoVacuumIfNeeded(pool: pool, databaseURL: databaseURL)
+        Self.convertToIncrementalAutoVacuumIfNeeded(
+          pool: pool, databaseURL: databaseURL, byteLimit: conversionByteLimit)
       }
       do {
         try pool.barrierWriteWithoutTransaction { db in
@@ -842,6 +854,30 @@ final class IndexDatabase {
     }
   }
 
+  /// Best-effort twin of `checkpointOnTerminate()`, for the ONE situation where the blocking version
+  /// is unsafe: the quit's drain budget expired. That budget only ever expires because a writer is
+  /// stuck, and `barrierWriteWithoutTransaction` queues behind exactly that writer — so taking it on
+  /// the calling thread would park the quit on the very stall the timeout exists to escape, turning a
+  /// bounded wait into an unbounded hang. Here the checkpoint is handed to a detached task and
+  /// deliberately NOT awaited: it still truncates the WAL if the pool frees up while the process is
+  /// alive, and the process exit reaps the thread if it never does. A WAL left at its high-water mark
+  /// is reclaimed by the next launch's workspace-close maintenance; a quit that never returns is not
+  /// recoverable at all. Returns the task so a test can prove one was started; production ignores it.
+  @discardableResult
+  func checkpointOnTerminateWithoutWaiting() -> Task<Void, Never>? {
+    guard let pool = databasePool else { return nil }
+    return Task.detached(priority: .utility) {
+      do {
+        try pool.barrierWriteWithoutTransaction { db in
+          _ = try db.checkpoint(.truncate)
+        }
+      } catch {
+        NSLog(
+          "Pensieve index checkpoint after a timed-out quit failed: %@", error.localizedDescription)
+      }
+    }
+  }
+
   /// Hands freed pages back to the filesystem. Only meaningful in `auto_vacuum = INCREMENTAL` (mode
   /// 2); in mode 0 SQLite keeps free pages inside the file for reuse and `incremental_vacuum` is a
   /// no-op, so the mode is checked rather than assumed.
@@ -859,12 +895,18 @@ final class IndexDatabase {
   /// conversion is literally "VACUUM once". Best-effort by design: a failure (no disk space, busy
   /// database) leaves the database perfectly usable, just uncompacted.
   private nonisolated static func convertToIncrementalAutoVacuumIfNeeded(
-    pool: DatabasePool, databaseURL: URL
+    pool: DatabasePool, databaseURL: URL, byteLimit: Int64
   ) {
     do {
       let mode = try pool.read { db in try Int.fetchOne(db, sql: "PRAGMA auto_vacuum") ?? 0 }
       guard mode != 2 else { return }
-      guard fileSize(at: databaseURL) <= autoVacuumConversionByteLimit else {
+      // The bound has to be the LOGICAL database, not the main file. `VACUUM` rewrites everything
+      // SQLite considers committed, and in WAL mode a large slice of that can still be sitting in
+      // `index.db-wal` — a reader holding a snapshot is enough to keep checkpoints from moving it
+      // back. Measuring `index.db` alone let a small main file next to a multi-gigabyte WAL sail
+      // past a limit that exists precisely to bound the rewrite cost and the ~2× peak disk usage.
+      let logicalSize = fileSize(at: databaseURL) + walFileSize(for: databaseURL)
+      guard logicalSize <= byteLimit else {
         NSLog("Pensieve index too large for auto_vacuum conversion; keeping WAL checkpoints only")
         return
       }
@@ -1157,6 +1199,10 @@ final class IndexDatabase {
     documents: [DocumentRef],
     appState: AppState? = nil
   ) async {
+    // Same seam, same position, same reason as in the reindex/delta twins: the workspace-metadata
+    // write is an index write like any other, and a test proving it is genuinely still owed at close
+    // time needs to hold it here, before it touches the pool.
+    await awaitBackgroundWriteGate()
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
     let didInsertBatch = didInsertSearchIndexBatch
     let batchSize = searchIndexBatchSize

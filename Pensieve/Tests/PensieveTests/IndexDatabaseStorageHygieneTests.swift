@@ -46,6 +46,13 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     return try queue.read { db in try Int.fetchOne(db, sql: "PRAGMA \(pragma)") ?? 0 }
   }
 
+  /// Counts rows through an INDEPENDENT connection, so "this write committed" is read from the
+  /// on-disk database rather than from the pool that is under test.
+  private func rowCount(_ table: String, at databaseURL: URL) throws -> Int {
+    let queue = try DatabaseQueue(path: databaseURL.path)
+    return try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(table)") ?? 0 }
+  }
+
   private func documentRef(root: URL, name: String) -> DocumentRef {
     DocumentRef(
       id: root.appendingPathComponent(name).standardizedFileURL,
@@ -135,6 +142,92 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     XCTAssertEqual(
       try pragmaValue("auto_vacuum", at: databaseURL), 2,
       "workspace-close maintenance must convert a legacy database to INCREMENTAL auto_vacuum")
+  }
+
+  /// Stands up a database the pre-hygiene way — WAL first, so the header exists and `auto_vacuum` can
+  /// no longer be set by a pragma alone — and releases the fixture connection, so a later conversion
+  /// VACUUM meets the same single-writer situation the app has at workspace close.
+  private func makeLegacyDatabase(at databaseURL: URL) async throws {
+    let legacyPool = try DatabasePool(path: databaseURL.path)
+    try await legacyPool.write { db in
+      try db.execute(sql: "CREATE TABLE legacy_marker(id INTEGER PRIMARY KEY)")
+    }
+    try legacyPool.close()
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 0,
+      "fixture precondition: the legacy database must start in auto_vacuum = NONE")
+  }
+
+  /// The conversion's cost ceiling used to be read off `index.db` alone. `VACUUM` rewrites the whole
+  /// LOGICAL database, and in WAL mode a large part of that can still be sitting in `index.db-wal`
+  /// (a reader holding a snapshot is enough to stop checkpoints moving it back) — so a small main
+  /// file next to a multi-gigabyte WAL sailed past the very limit that exists to bound the rewrite
+  /// cost and the roughly 2× peak disk usage.
+  ///
+  /// The limit is placed BETWEEN the two measurements rather than at a guessed byte count: the main
+  /// file alone fits comfortably under it, main + WAL does not. That is the reviewer's scenario
+  /// exactly, and it cannot drift with the fixture's size.
+  func testLegacyConversionDeclinesWhenTheWalPushesTheLogicalSizeOverTheLimit() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try await makeLegacyDatabase(at: databaseURL)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+    churn(database: database, root: root, count: 300, deleting: 0)
+
+    let mainSize = fileSize(at: databaseURL)
+    let walBytes = walSize(for: databaseURL)
+    XCTAssertGreaterThan(
+      walBytes, 1,
+      "fixture precondition: the churn must leave pages in the WAL for the guard to have to count")
+    let limit = mainSize + walBytes / 2
+    XCTAssertLessThanOrEqual(
+      mainSize, limit, "fixture precondition: the main file alone must fit under the limit")
+    XCTAssertGreaterThan(
+      mainSize + walBytes, limit,
+      "fixture precondition: main + WAL must exceed it, or the guard is not being exercised")
+    database.autoVacuumConversionByteLimitOverride = limit
+
+    await database.performMaintenanceInBackground(reason: .workspaceClose)
+
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 0,
+      "the one-shot conversion must be bounded by the LOGICAL database: a \(mainSize)-byte index.db "
+        + "next to a \(walBytes)-byte WAL still costs a full rewrite of both")
+  }
+
+  /// The control for the guard above: the same legacy-plus-WAL shape converts as soon as the logical
+  /// size genuinely fits, so the decline is the WAL being counted rather than a guard that now
+  /// refuses everything with a non-empty log.
+  func testLegacyConversionStillRunsWhenMainAndWalTogetherFitTheLimit() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try await makeLegacyDatabase(at: databaseURL)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+    churn(database: database, root: root, count: 300, deleting: 0)
+
+    let walBytes = walSize(for: databaseURL)
+    XCTAssertGreaterThan(
+      walBytes, 1, "fixture precondition: this control must carry a WAL too, or it proves nothing")
+    database.autoVacuumConversionByteLimitOverride =
+      fileSize(at: databaseURL) + walBytes + 1024 * 1024
+
+    await database.performMaintenanceInBackground(reason: .workspaceClose)
+
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 2,
+      "a legacy database whose main file AND WAL fit the ceiling must still be converted")
   }
 
   // MARK: - WAL bound
@@ -563,6 +656,83 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
         + "\(walAfterMaintenance) bytes)")
   }
 
+  /// The drain has to see EVERY writer, and the workspace-metadata writer was invisible to it.
+  /// `commitWorkspaceManifest` handed its `upsertWorkspace` / scan-session / stats writes to a bare
+  /// detached task held as `workspaceIndexWriteTask` — represented by neither `scheduledIndexWrites`
+  /// nor `pendingIndexUpdateTask`. Close Folder cancels that handle, but cancelling abandons the WAIT,
+  /// not the record build underneath: the drain returned, maintenance truncated the WAL, and the
+  /// manifest writes then landed and recreated the frames the checkpoint had just reclaimed.
+  ///
+  /// A FORCED refresh is the trigger on purpose. It re-commits the manifest while provably writing no
+  /// search index at all — `applyRefresh` authorizes presentation and FTS from two independent
+  /// signatures, and the search signature is derived from the `.md` documents, none of which change
+  /// here. So the only thing that can be parked at the gate below is a manifest write, which is what
+  /// makes the "maintenance has not finished" assertion mean what it says.
+  func testCloseWorkspaceMaintenanceWaitsForTheWorkspaceManifestWrite() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let body = String(repeating: "pensieve manifest drain payload ", count: 600)
+    for index in 0..<40 {
+      try "\(body) \(index)".write(
+        to: root.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let harness = try makeWorkspaceHarness(in: sandbox.support)
+    let appState = AppState()
+    harness.manager.open(url: root, into: appState)
+    await settle(harness)
+
+    let databaseURL = sandbox.support.appendingPathComponent("index.db", isDirectory: false)
+    let scanSessionsAfterOpen = try rowCount("scan_sessions", at: databaseURL)
+    XCTAssertGreaterThan(
+      scanSessionsAfterOpen, 0,
+      "fixture precondition: the cold open must have committed a manifest of its own")
+
+    // Parks EVERY arrival, unlike `FirstWriteGate`: the point here is to hold the manifest write
+    // itself, and a watcher-driven refresh may legitimately queue a second one behind it.
+    let gate = ParkingGate()
+    let indexDatabase = harness.indexDatabase
+    indexDatabase.backgroundWriteGateOverride = { await gate.arrive() }
+
+    harness.manager.refresh(into: appState, force: true)
+    try await waitUntil("the workspace manifest write to park at the gate") {
+      await gate.arrivals >= 1
+    }
+    XCTAssertEqual(
+      try rowCount("scan_sessions", at: databaseURL), scanSessionsAfterOpen,
+      "fixture precondition: the refresh's manifest write must still be parked, not committed")
+
+    harness.manager.closeWorkspace(into: appState)
+
+    let maintenanceFinished = CompletionFlag()
+    let maintenance = Task { @MainActor in
+      await harness.manager.waitForPendingIndexMaintenance()
+      maintenanceFinished.isSet = true
+    }
+    // The ordering assertion. With the manifest write invisible to the drain, the close finds
+    // nothing owed and checkpoints within milliseconds — while the writes are still coming.
+    try await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertFalse(
+      maintenanceFinished.isSet,
+      "close-time maintenance completed while the workspace manifest write was still queued — the "
+        + "truncate would land before its frames")
+
+    await gate.open()
+    await maintenance.value
+    // Sampled before any assertion touches the pool, so the reading is the state maintenance left.
+    let walAfterMaintenance = walSize(for: databaseURL)
+
+    XCTAssertGreaterThan(
+      try rowCount("scan_sessions", at: databaseURL), scanSessionsAfterOpen,
+      "the manifest write must have committed before maintenance finished")
+    XCTAssertLessThanOrEqual(
+      walAfterMaintenance, 64 * 1024,
+      "the truncating checkpoint must run AFTER the manifest write drains, otherwise its frames "
+        + "survive the workspace that would have checkpointed them (WAL is \(walAfterMaintenance) "
+        + "bytes)")
+  }
+
   // MARK: - Production wiring: quit flushes windows and drains the index before it checkpoints
 
   /// Quit used to checkpoint the index and only THEN let the windows tear down. That is backwards:
@@ -721,7 +891,137 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       "…and the one owner still truncates on the very same ⌘Q path (was \(walBefore) bytes)")
   }
 
+  /// The post-timeout fallback used to deadlock on the very stall it exists to escape. When the drain
+  /// budget expired the old code ran `checkpointOnTerminate()`, whose `barrierWriteWithoutTransaction`
+  /// queues behind the wedged writer SYNCHRONOUSLY on the calling thread — so quitting during a stuck
+  /// reindex could hang indefinitely despite the timeout. The timeout has to be an escape, not a
+  /// detour into the same lock.
+  ///
+  /// The wedge is real, not simulated: `didInsertSearchIndexBatch` fires INSIDE the index write's
+  /// `pool.write` transaction, so blocking it holds a genuine writer inside the pool — exactly what a
+  /// checkpoint has to queue behind. Nothing else in this test calls that hook (`churn` uses the sync
+  /// `index(document:body:)`, which never batches), so the only thing parked is the write under test.
+  ///
+  /// A safety valve releases the wedge after `wedgeReleaseSeconds` so a regressed build FAILS the
+  /// bound instead of hanging the suite. The bound itself is deliberately loose — a whole order of
+  /// magnitude above the shrunk budget and far below the release valve — because this suite already
+  /// carries wall-clock flakes and this assertion must never become the next one.
+  func testQuitReturnsWithinItsBudgetWhenAnIndexWriteIsWedgedInsideThePool() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    // Belt and braces: released here on every exit path, and by the timer below even if the test
+    // aborts on an assertion before reaching this line.
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.wedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didInsertSearchIndexBatch: { _ in
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // Give the terminal checkpoint something it would visibly reclaim, so "the WAL survived" below
+    // cannot be an artefact of an empty log.
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBeforeQuit = walSize(for: databaseURL)
+    XCTAssertGreaterThanOrEqual(
+      walBeforeQuit, 512 * 1024,
+      "fixture precondition: the churn must actually grow the WAL")
+
+    let wedgedRef = documentRef(root: root, name: "wedged-write.md")
+    try "the write that never finishes".write(to: wedgedRef.url, atomically: true, encoding: .utf8)
+    let writeFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.updateSearchIndexInBackground(
+        upserting: [wedgedRef], deletingPaths: [], appState: nil)
+      writeFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { wedge.isReached }, timeout: 10)
+    XCTAssertTrue(
+      wedge.isReached,
+      "fixture precondition: the scheduled index write must actually be holding the pool's writer")
+
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      drainTimeout: Self.shrunkDrainBudget)
+
+    let startedAt = Date()
+    sequence.runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+    // Sampled before the wedge is released, so it reports what the QUIT left behind rather than what
+    // the abandoned best-effort checkpoint does once the pool frees up.
+    let walAfterQuit = walSize(for: databaseURL)
+
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "the quit must return once its drain budget expires; it waited \(elapsed) s, which means it "
+        + "queued behind the wedged writer instead of escaping it")
+    XCTAssertGreaterThanOrEqual(
+      walAfterQuit, walBeforeQuit,
+      "past the deadline the checkpoint must NOT run on the calling thread — a truncated WAL here "
+        + "means the quit took the barrier the stuck writer is holding")
+
+    released.signal()
+    pumpMainRunLoop(until: { writeFinished.isSet }, timeout: 10)
+  }
+
   // MARK: - Ordering fixtures
+
+  /// How long the wedged writer is held before a safety valve frees it. Generously above the bound
+  /// the test asserts, so a build that reintroduces the deadlock fails on the assertion (having
+  /// waited this long) instead of hanging the whole suite.
+  private static let wedgeReleaseSeconds: TimeInterval = 20
+
+  /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own
+  /// init seam. Nothing in this test needs the real budget — the contract is "returns once it
+  /// expires", not "expires after exactly 5 s".
+  private static let shrunkDrainBudget: TimeInterval = 0.4
+
+  /// The bound the quit must respect. ~12× the shrunk budget and ~4× below the release valve, so
+  /// neither a slow machine nor a busy CI runner can push a correct build over it.
+  private static let boundedQuitSeconds: TimeInterval = 5
+
+  /// Thread-safe "the writer got inside the transaction" latch. The hook that sets it runs on GRDB's
+  /// writer thread while the test reads it from the main thread, so the flag cannot be a plain `var`.
+  private final class WedgeSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reached = false
+
+    var isReached: Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return reached
+    }
+
+    func markReached() {
+      lock.lock()
+      reached = true
+      lock.unlock()
+    }
+  }
+
+  /// Synchronous sibling of `waitUntil` for the tests that must stay non-async because they drive
+  /// `runBlockingMainRunLoop()`. Pumps the run loop exactly the way production does, so main-actor
+  /// work (the scheduled index write, the drain) keeps making progress while the test waits.
+  private func pumpMainRunLoop(until condition: () -> Bool, timeout: TimeInterval) {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+      RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.005))
+    }
+  }
 
   /// One-shot release valve behind `IndexDatabase.backgroundWriteGateOverride`. The FIRST background
   /// index write parks here until the test opens the gate; every later write passes straight through
@@ -736,6 +1036,30 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     func arrive() async {
       arrivals += 1
       guard arrivals == 1, !isOpen else { return }
+      await withCheckedContinuation { continuation in
+        waiters.append(continuation)
+      }
+    }
+
+    func open() {
+      isOpen = true
+      for waiter in waiters { waiter.resume() }
+      waiters.removeAll()
+    }
+  }
+
+  /// Holds EVERY background index write until the test opens it, where `FirstWriteGate` holds only
+  /// the first. Used when the write under test is not the first one to arrive, or when a second
+  /// arrival (a watcher-driven refresh, say) must not be allowed to slip past while the test is
+  /// asserting that nothing has been allowed through yet.
+  private actor ParkingGate {
+    private(set) var arrivals = 0
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func arrive() async {
+      arrivals += 1
+      guard !isOpen else { return }
       await withCheckedContinuation { continuation in
         waiters.append(continuation)
       }

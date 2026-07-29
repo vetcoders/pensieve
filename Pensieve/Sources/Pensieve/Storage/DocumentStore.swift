@@ -1836,7 +1836,14 @@ final class FolderManager {
         try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
       }
       let documents = appState.documents
-      return Task {
+      // Handed over through `scheduleIndexWrite` rather than a bare `Task` for the same reason the
+      // save tail is: these three calls are `IndexDatabase` WRITES, and a bare task is invisible to
+      // `drainPendingIndexWrites()`. It is not enough that the close path cancels this task —
+      // cancellation abandons the WAIT, not the record build underneath, so a Close Folder or a quit
+      // landing mid-manifest used to drain, checkpoint, and only THEN take these writes' frames,
+      // recreating the WAL the maintenance had just truncated. One mechanism for every writer.
+      let indexDatabase = self.indexDatabase
+      return indexDatabase.scheduleIndexWrite {
         await indexDatabase.upsertWorkspace(
           identity: identity,
           roots: rootURLs,

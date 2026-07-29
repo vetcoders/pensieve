@@ -86,11 +86,22 @@ final class TerminationSequence {
     }
     guard !didFinish else { return }
 
-    // Budget spent. Stop waiting for the drain, but do not leave the WAL at its high-water mark
-    // because one write got stuck: a checkpoint the user's disk actually gets is worth more than an
-    // ordering we could not finish.
+    // Budget spent. Stop waiting for the drain — and do NOT then call the blocking
+    // `checkpointOnTerminate()`, which is what this used to do. The budget only ever expires because
+    // an index write is stuck inside the pool, and the checkpoint takes the SAME barrier that write
+    // is holding, synchronously, on this thread: the escape hatch would have parked the quit on the
+    // exact stall it exists to escape, so quitting during a wedged reindex could hang indefinitely
+    // despite the timeout.
+    //
+    // So past the deadline the checkpoint is best-effort and unwaited. It still truncates the WAL if
+    // the pool frees up while the process is alive, and it can never delay the quit again. A WAL left
+    // at its high-water mark is reclaimed by the next launch's workspace-close maintenance; a quit
+    // that never returns is not recoverable at all.
     sequence.cancel()
-    indexDatabase.checkpointOnTerminate()
+    NSLog(
+      "Pensieve quit: index drain exceeded its %.1f s budget; leaving the checkpoint best-effort",
+      drainTimeout)
+    indexDatabase.checkpointOnTerminateWithoutWaiting()
   }
 
   private func flushPendingWindowSaves() {
