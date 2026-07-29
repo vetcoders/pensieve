@@ -909,16 +909,20 @@ final class FolderManager {
 
     if appState.workspaceRoots.count == 1 {
       let indexedPaths = appState.allDocuments.map { $0.url.standardizedFileURL.path }
-      closeWorkspace(into: appState)
+      // The close still has ONE index write coming after it — the delete below. Let it skip its own
+      // maintenance arming so the two cannot race; this path re-arms maintenance behind the delete.
+      closeWorkspace(into: appState, deferringIndexMaintenance: !indexedPaths.isEmpty)
       if !indexedPaths.isEmpty {
         let indexDatabase = indexDatabase
-        indexUpdateTask = Task { [weak appState] in
+        let deleteTask = Task { [weak appState] in
           _ = await indexDatabase.updateSearchIndexInBackground(
             upserting: [],
             deletingPaths: indexedPaths,
             appState: appState
           )
         }
+        indexUpdateTask = deleteTask
+        scheduleIndexMaintenance(after: deleteTask)
       }
       return
     }
@@ -951,11 +955,38 @@ final class FolderManager {
     }
   }
 
+  /// Arms the off-main index housekeeping (WAL truncate + page compaction) that follows a close.
+  ///
+  /// `pendingIndexWork` exists because the close is not always the last thing to touch the index:
+  /// `removeRoot` still has to delete the vanished root's paths. Compaction is not order-agnostic —
+  /// it truncates the WAL and hands free pages back, so running it BEFORE that delete truncates a
+  /// log the delete immediately grows again, and the resulting frames and free pages then sit there
+  /// unclaimed: the workspace is gone, so no further batch checkpoint is coming to notice them.
+  /// Chaining on the write instead of firing alongside it makes the order deterministic.
+  private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
+    let indexDatabase = indexDatabase
+    indexMaintenanceTask = Task {
+      await pendingIndexWork?.value
+      await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
+    }
+  }
+
+  /// Deterministic sync point for the post-close index housekeeping. Because the maintenance task
+  /// chains on whatever final index write it was armed behind, awaiting this also awaits that
+  /// write — which is exactly the ordering `removeRoot`'s last-root path depends on.
+  func waitForPendingIndexMaintenance() async {
+    await indexMaintenanceTask?.value
+  }
+
   /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
   /// persisted bookmarks and all workspace state, returning to the "No folder open" state.
   /// Protects unsaved work — if the active document has unsaved edits it stays open in the
   /// editor; otherwise the editor is cleared too.
-  func closeWorkspace(into appState: AppState) {
+  ///
+  /// - Parameter deferringIndexMaintenance: pass `true` when the CALLER still owns a final index
+  ///   write and will re-arm the housekeeping behind it via `scheduleIndexMaintenance(after:)`.
+  ///   Only `removeRoot`'s last-root path does this.
+  func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     // Take ownership of the activity display so the cancelled build's terminal clear
@@ -970,9 +1001,8 @@ final class FolderManager {
     // Closing a workspace is the quietest moment the index ever gets: no watcher, no pending write.
     // Bound the WAL and reclaim freed pages here so the storm of a workspace's lifetime does not
     // survive into the next one.
-    let indexDatabase = indexDatabase
-    indexMaintenanceTask = Task {
-      await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
+    if !deferringIndexMaintenance {
+      scheduleIndexMaintenance()
     }
     watcher.stop()
     bookmarkStore.clear(into: appState)

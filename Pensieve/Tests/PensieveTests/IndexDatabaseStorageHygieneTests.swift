@@ -288,5 +288,165 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     )
   }
 
+  // MARK: - Production wiring: last-root removal orders its delete before maintenance
+
+  /// `removeRoot` on the LAST root closes the workspace and then deletes that
+  /// root's paths from the index. Close arms the compaction/checkpoint, so the
+  /// two used to be independent tasks with no ordering between them: maintenance
+  /// could truncate the WAL and reclaim pages BEFORE the delete, and the delete's
+  /// own frames and free pages then stayed on disk — with the workspace gone,
+  /// no further batch checkpoint was coming to notice them.
+  ///
+  /// The assertion is the ordering, not "maintenance ran": awaiting ONLY the
+  /// maintenance handle must already imply the delete landed (it is chained
+  /// behind it), and the WAL must be back at zero — which can only be true if
+  /// the truncate was strictly last.
+  ///
+  /// Sibling pin:
+  /// `testCloseWorkspaceDefersMaintenanceOnlyWhenTheCallerOwnsAFinalIndexWrite`
+  /// covers the other half of the fix (close must not fire its own maintenance
+  /// alongside the delete). Removing the fix makes THAT one fail deterministically;
+  /// this one is a race, and GRDB's write barrier happens to queue behind an
+  /// in-flight write often enough that the unordered version still passes it
+  /// most of the time — measured, not assumed.
+  func testLastRootRemovalDeletesFromTheIndexBeforeMaintenanceCompacts() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // Sized so the DELETE alone writes well past the post-truncate ceiling asserted
+    // below: that is what makes the ordering observable rather than merely likely.
+    let body = String(repeating: "pensieve last root removal payload ", count: 600)
+    for index in 0..<120 {
+      try "\(body) \(index)".write(
+        to: root.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let harness = try makeWorkspaceHarness(in: sandbox.support)
+    let appState = AppState()
+    harness.manager.open(url: root, into: appState)
+    await settle(harness)
+
+    let indexedDocument = try XCTUnwrap(appState.documents.first)
+    XCTAssertFalse(
+      harness.indexDatabase.search(
+        query: "payload", documents: [indexedDocument], appState: appState
+      ).isEmpty,
+      "fixture precondition: the workspace must actually be indexed before it is removed")
+    XCTAssertEqual(appState.workspaceRoots.count, 1)
+
+    harness.manager.removeRoot(root, into: appState)
+    // ONLY the maintenance handle — deliberately not the index-update handle.
+    // Under the unordered version this returns while the delete is still in
+    // flight, which is precisely the defect.
+    await harness.manager.waitForPendingIndexMaintenance()
+    // Sampled before any assertion touches the pool, so the reading is the state
+    // the maintenance left behind and nothing else.
+    let databaseURL = sandbox.support.appendingPathComponent("index.db", isDirectory: false)
+    let walAfterMaintenance = walSize(for: databaseURL)
+
+    XCTAssertTrue(
+      harness.indexDatabase.search(
+        query: "payload", documents: [indexedDocument], appState: appState
+      ).isEmpty,
+      "close-time maintenance must not complete before the last root's rows are deleted")
+    XCTAssertLessThanOrEqual(
+      walAfterMaintenance, 64 * 1024,
+      "the truncating checkpoint must run AFTER the delete, otherwise the delete's WAL frames "
+        + "survive the workspace that would have checkpointed them (WAL is \(walAfterMaintenance) bytes)"
+    )
+  }
+
+  /// The half of the last-root fix that does not depend on scheduling: a close
+  /// whose CALLER still owes the index a write must not arm its own maintenance,
+  /// because that is the task that could otherwise compact ahead of the write.
+  /// Both directions are asserted, so neither "never runs maintenance" nor
+  /// "always runs it" can pass.
+  func testCloseWorkspaceDefersMaintenanceOnlyWhenTheCallerOwnsAFinalIndexWrite() async throws {
+    for deferring in [true, false] {
+      let sandbox = try makeWorkspaceSandbox()
+      let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+      try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+      let body = String(repeating: "pensieve close maintenance payload ", count: 600)
+      for index in 0..<120 {
+        try "\(body) \(index)".write(
+          to: root.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+      }
+
+      let harness = try makeWorkspaceHarness(in: sandbox.support)
+      let appState = AppState()
+      harness.manager.open(url: root, into: appState)
+      await settle(harness)
+
+      let databaseURL = sandbox.support.appendingPathComponent("index.db", isDirectory: false)
+      XCTAssertGreaterThan(
+        walSize(for: databaseURL), 64 * 1024,
+        "fixture precondition: indexing the workspace must leave a WAL worth truncating")
+
+      harness.manager.closeWorkspace(into: appState, deferringIndexMaintenance: deferring)
+      await harness.manager.waitForPendingIndexMaintenance()
+      let wal = walSize(for: databaseURL)
+
+      if deferring {
+        XCTAssertGreaterThan(
+          wal, 64 * 1024,
+          "a deferring close must leave the housekeeping to its caller — firing it here is the "
+            + "task that races the caller's final delete (WAL is \(wal) bytes)")
+      } else {
+        XCTAssertLessThanOrEqual(
+          wal, 64 * 1024,
+          "an ordinary close is still the point where the WAL gets truncated (WAL is \(wal) bytes)")
+      }
+    }
+  }
+
+  // MARK: - Workspace fixtures (last-root removal)
+
+  private struct WorkspaceSandbox {
+    let root: URL
+    let support: URL
+  }
+
+  private struct WorkspaceHarness {
+    let manager: FolderManager
+    let indexDatabase: IndexDatabase
+  }
+
+  private func makeWorkspaceSandbox() throws -> WorkspaceSandbox {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveStorageHygieneWorkspace-\(UUID().uuidString)", isDirectory: true)
+    let support = root.appendingPathComponent("Support", isDirectory: true)
+    try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    return WorkspaceSandbox(root: root, support: support)
+  }
+
+  private func makeWorkspaceHarness(in support: URL) throws -> WorkspaceHarness {
+    let indexDatabase = IndexDatabase(
+      databaseURL: support.appendingPathComponent("index.db", isDirectory: false))
+    let manager = FolderManager(
+      metadataStore: WorkspaceMetadataStore(
+        metadataURL: support.appendingPathComponent("workspace.json")),
+      indexDatabase: indexDatabase,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveStorageHygieneBookmarks")),
+      workspaceSubstrate: WorkspaceSubstrate(
+        store: WorkspaceCacheStore(
+          baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true)))
+    )
+    return WorkspaceHarness(manager: manager, indexDatabase: indexDatabase)
+  }
+
+  private func settle(_ harness: WorkspaceHarness) async {
+    await harness.manager.waitForPendingWorkspaceBuild()
+    await harness.manager.waitForPendingForcedRefresh()
+    await harness.manager.waitForPendingIndexUpdate()
+    await harness.manager.waitForPendingWorkspaceIndexWrite()
+    await harness.indexDatabase.waitForPendingReindex()
+  }
+
+  /// Mirrors `IndexDatabase.freelistCompactionThresholdPages`; kept local because
+  /// the production constant is private and the test asserts the OBSERVABLE
+  /// contract (enough slack exists to be worth reclaiming), not the constant.
   private static let compactionThresholdPages = 256
 }
