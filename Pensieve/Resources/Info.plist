@@ -60,8 +60,16 @@
     <true/>
     <key>NSSupportsAutomaticTermination</key>
     <true/>
+    <!-- Sudden termination is a promise to the OS that this process can be killed with
+         `exit()` at any instant, skipping `applicationShouldTerminate:` and
+         `applicationWillTerminate:` entirely. Pensieve cannot keep that promise: it carries a
+         SQLite WAL that only a truncating checkpoint returns to disk, and the checkpoint hangs
+         off `applicationWillTerminate`. Falsified at runtime on 2026-07-29 — with this key
+         `true`, a packaged build quit by Apple Event (Dock / logout) *and* by
+         `NSApp.terminate(nil)` exited without ever entering the delegate hook, while the
+         unbundled binary (no Info.plist, so no such promise) entered it every time. -->
     <key>NSSupportsSuddenTermination</key>
-    <true/>
+    <false/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Pensieve needs access to your microphone to transcribe your speech into text.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
