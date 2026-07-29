@@ -93,7 +93,7 @@ final class TerminationSequence {
 
     // ---- F: flush. Everything the user already owns lands now, not when a timer says so. Both
     // steps PRODUCE index writes, which is precisely why the latch cannot be armed yet.
-    flushPendingWindowSaves(controllers)
+    await flushPendingWindowSaves(controllers)
     autosaver.quiesceForTermination()
 
     // ---- D: drain. The accepted work first, then the post-close index housekeeping — which is a
@@ -174,9 +174,27 @@ final class TerminationSequence {
     }
   }
 
-  private func flushPendingWindowSaves(_ controllers: [AppController]) {
+  /// Lands every window's pending edit, yielding BETWEEN windows.
+  ///
+  /// Each save is the app's ordinary save primitive and it is synchronous: `String.write(_:atomically:)`
+  /// on the main actor, the very same call ⌘S and every window close make. Moving document and
+  /// session state off the main actor is a save-path refactor this termination contract does not own,
+  /// so the synchronous write stays — but a LOOP of them was invisible to the budget: control could
+  /// not return to `runBlockingMainRunLoop()`'s pump until the last window had finished writing, so
+  /// N dirty windows on a slow volume could consume the whole deadline in one uninterruptible block.
+  ///
+  /// The `Task.yield()` makes the budget enforceable at FILE granularity: the pump regains control
+  /// between windows and re-checks the deadline there. If it expires mid-loop the sequence is
+  /// cancelled but the remaining saves still run — user bytes outrank the deadline — and the fallback
+  /// has by then closed the latch, so nothing they schedule can land behind the checkpoint.
+  ///
+  /// Named residual, and it is deliberate: a SINGLE large file's synchronous write can still overrun
+  /// the budget on its own. Bounding that needs the save path itself to become suspending, which is
+  /// out of scope here.
+  private func flushPendingWindowSaves(_ controllers: [AppController]) async {
     for controller in controllers {
       controller.savePendingChangesOnClose()
+      await Task.yield()
     }
   }
 }

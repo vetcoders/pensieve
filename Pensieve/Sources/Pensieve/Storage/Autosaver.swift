@@ -12,6 +12,15 @@ final class Autosaver {
   /// only when the sleep elapses. Cleared the instant the body runs — by the timer or by a flush —
   /// so "flush the index debounce" means exactly once, never twice and never never.
   private var pendingIndex: (@MainActor () -> Void)?
+  /// Which document the armed body would index, or `nil` when nothing is armed.
+  ///
+  /// This object is a process-wide SINGLETON holding at most one index debounce, and that debounce
+  /// belongs to the LAST edited session — not necessarily the one asking. A closing window therefore
+  /// cannot tell from `flushIndex()` alone whether it is landing its OWN unsaved text or somebody
+  /// else's already-saved text, and the two need opposite treatment: another document's write is owed
+  /// unconditionally, while its own must not reach the index until its file write has succeeded.
+  /// `DocumentStore.savePendingChangesOnClose` reads this to tell the two apart.
+  private(set) var armedIndexOwner: URL?
   /// Bumped by every arm/cancel/flush so a timer that already slipped past its cancellation check
   /// cannot run a body a newer schedule has since replaced.
   private var indexGeneration: UInt64 = 0
@@ -37,12 +46,13 @@ final class Autosaver {
     }
   }
 
-  func scheduleIndex(_ index: @escaping @MainActor () -> Void) {
+  func scheduleIndex(owner: URL?, _ index: @escaping @MainActor () -> Void) {
     guard !isQuiescedForTermination else { return }
     indexTask?.cancel()
     indexGeneration &+= 1
     let generation = indexGeneration
     pendingIndex = index
+    armedIndexOwner = owner
     indexTask = Task { [indexDelayNanoseconds, weak self] in
       try? await Task.sleep(nanoseconds: indexDelayNanoseconds)
       guard !Task.isCancelled else { return }
@@ -65,6 +75,7 @@ final class Autosaver {
   func flushIndex() {
     let index = pendingIndex
     pendingIndex = nil
+    armedIndexOwner = nil
     indexGeneration &+= 1
     indexTask?.cancel()
     indexTask = nil
@@ -89,6 +100,7 @@ final class Autosaver {
     indexTask?.cancel()
     indexTask = nil
     pendingIndex = nil
+    armedIndexOwner = nil
     indexGeneration &+= 1
   }
 
@@ -100,6 +112,7 @@ final class Autosaver {
   private func runPendingIndex(generation: UInt64) {
     guard generation == indexGeneration, let index = pendingIndex else { return }
     pendingIndex = nil
+    armedIndexOwner = nil
     index()
   }
 }

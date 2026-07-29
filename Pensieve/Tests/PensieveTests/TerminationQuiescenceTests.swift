@@ -39,11 +39,16 @@ final class TerminationQuiescenceTests: XCTestCase {
   func testAutosaverFlushRunsTheArmedIndexWriteExactlyOnceAndCannotReArmAfterQuiescence() {
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
     let runs = Counter()
+    let owner = URL(fileURLWithPath: "/tmp/pensieve-autosaver-pin.md").standardizedFileURL
 
-    autosaver.scheduleIndex { runs.increment() }
+    autosaver.scheduleIndex(owner: owner) { runs.increment() }
     XCTAssertEqual(
       runs.value, 0,
       "fixture precondition: with a ten-minute debounce the body must still be asleep")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, owner,
+      "…and the armed body must name the document it would index, so a close can tell its own "
+        + "unsaved text from another window's")
 
     autosaver.flushIndex()
     XCTAssertEqual(
@@ -60,7 +65,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     autosaver.quiesceForTermination()
     XCTAssertTrue(autosaver.isQuiescedForTermination)
 
-    autosaver.scheduleIndex { runs.increment() }
+    autosaver.scheduleIndex(owner: owner) { runs.increment() }
     autosaver.scheduleSave { runs.increment() }
     autosaver.flushIndex()
     XCTAssertEqual(
@@ -699,6 +704,390 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "flush phase")
   }
 
+  // MARK: - R6: the open that passed the latch
+
+  /// Round 6, finding 1 — the hand-off gap one floor above the one round 5 closed.
+  ///
+  /// `ensureOpenInBackground` consults the funnel gate on ENTRY and then parks on
+  /// `makeDatabasePool`, which builds the pool and runs every migration. Between those two moments
+  /// the open is owed work that registers in neither drain collection: not in `scheduledIndexWrites`,
+  /// not on the supersede chain. A drain that cannot see it reports "nothing owed", the latch closes,
+  /// and `startCheckpointOnTerminate()` skips outright because `databasePool` is still nil — after
+  /// which the open publishes a pool whose caller writes to a database the quit believes it has
+  /// already finished with.
+  ///
+  /// The wedge sits INSIDE the open, after the gate and after `openTask` is registered, because that
+  /// is the only state that proves anything: parked before the gate an open is simply refused. With
+  /// it held, a drain that participates CANNOT complete — that "has not finished yet" is the whole
+  /// assertion, and it is the direction that cannot pass by luck.
+  func testTheDrainWaitsForADatabaseOpenThatIsStillBuildingItsPool() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let database = IndexDatabase(databaseURL: databaseURL)
+    XCTAssertNil(
+      database.databaseURL,
+      "fixture precondition: this database has never been opened, so the open under test is the "
+        + "first one and `databasePool` is nil while it runs")
+
+    let gate = ParkingGate()
+    database.databaseOpenGateOverride = { await gate.arrive() }
+
+    let openFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.openInBackground(into: nil)
+      openFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the open must be parked mid-flight, past the funnel gate and already "
+        + "registered as `openTask`")
+    XCTAssertFalse(openFinished.isSet, "fixture precondition: …and must not have completed")
+
+    let quitFinished = CompletionFlag()
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: makeIsolatedFolderManager(in: folder, database: database, prefix: "OpenDrain"),
+      autosaver: Autosaver())
+    Task { @MainActor in
+      await sequence.run()
+      quitFinished.isSet = true
+    }
+    // Every other phase of the sequence is O(1); given a chance this long, only the open can still be
+    // holding it.
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 1)
+
+    XCTAssertFalse(
+      quitFinished.isSet,
+      "the quit finished while a database open was still building its pool: the drain walked past "
+        + "work it cannot see anywhere else, so the latch would close over an open that then "
+        + "publishes a pool behind a checkpoint which — with `databasePool` still nil — never ran")
+    XCTAssertFalse(
+      database.isClosedForTermination,
+      "…and the latch must not be closed yet either, for the same reason")
+
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 10)
+    XCTAssertTrue(quitFinished.isSet, "…and the quit must complete once the open is allowed through")
+
+    XCTAssertTrue(
+      database.isClosedForTermination, "a completed sequence must leave the funnel closed")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "an open the drain waited for finishes BEFORE the latch, so nothing may be refused: a "
+        + "rejection here would mean the pool was published behind the checkpoint instead")
+    XCTAssertEqual(
+      database.databaseURL, databaseURL,
+      "…and the pool must be published, so the terminal checkpoint had a database to truncate")
+    XCTAssertEqual(
+      walSize(for: databaseURL), 0,
+      "…which it did (the WAL is \(walSize(for: databaseURL)) bytes)")
+  }
+
+  /// The second half of the same finding, and the reason the fix needs both. The drain closes the
+  /// window it can see; this closes the one it cannot — an open that passes the gate DURING the
+  /// drain's own suspensions, after the drain has already walked past the open handle.
+  ///
+  /// Such an open completes with the latch already closed. It must then behave exactly like every
+  /// other post-latch producer: refuse by name and publish nothing. Publishing would be the worst of
+  /// the two failures, because the caller parked on it is holding a live pool and the sequence has
+  /// already taken (or skipped) its terminal checkpoint.
+  func testAnOpenThatCompletesAfterTheLatchPublishesNoPool() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let database = IndexDatabase(databaseURL: databaseURL)
+
+    let gate = ParkingGate()
+    database.databaseOpenGateOverride = { await gate.arrive() }
+
+    let openFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.openInBackground(into: nil)
+      openFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the open must be parked past the funnel gate — an open refused on ENTRY "
+        + "would make this test pass for the wrong reason")
+
+    // The latch closes while the open sleeps: the residual window a drain cannot cover, because the
+    // open can be started by anything running during the drain's own suspension points.
+    database.closeForTermination()
+
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { openFinished.isSet }, timeout: 10)
+    XCTAssertTrue(openFinished.isSet, "the refused open must return promptly, not hang")
+
+    XCTAssertNil(
+      database.databaseURL,
+      "an open that completes after the latch must publish NO pool: its caller is parked on it and "
+        + "would write to a database the quit has already finished with")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, ["ensureOpenInBackground"],
+      "…and must refuse by name exactly once — at the publication point, not on entry, which is "
+        + "where it still had permission")
+  }
+
+  // MARK: - R6: a dirty session's index write follows its file write
+
+  /// Round 6, finding 3 — the cost of round 5's deliberate ordering, in the error path.
+  ///
+  /// Flushing the armed debounce ahead of the dirty guard is what repairs the CLEAN session (see
+  /// `testClosingACleanWindowStillFlushesItsSleepingIndexDebounce`), but for a DIRTY session that
+  /// owns the debounce it submits the in-memory edit to SQLite before `saveExisting` has even tried
+  /// the file write. The `autosaver.cancel()` that follows cannot retract an already-scheduled
+  /// database task, so a write that fails — full volume, revoked permissions — leaves FTS advertising
+  /// text that never reached the disk.
+  ///
+  /// The failure is injected through `writeDocument`, the store's own seam, so the save fails exactly
+  /// where a real one would: after the flush decision, inside `saveExisting`. Read back through an
+  /// independent connection, as every index assertion in this suite is.
+  func testAFailedCloseSaveIndexesNothingForTheDirtySessionThatOwnsTheDebounce() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let noteURL = folder.appendingPathComponent("unwritable-note.md")
+    try "before the doomed edit".write(to: noteURL, atomically: true, encoding: .utf8)
+    let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
+
+    // Ten-minute debounces: nothing fires on its own, so whatever reaches the index reached it
+    // because the close put it there.
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveFailedSaveBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true)),
+      writeDocument: { _, url in
+        throw CocoaError(
+          .fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path])
+      }
+    )
+
+    appState.documents = [ref]
+    appState.documentSession.load(document: ref, text: "before the doomed edit")
+    appState.activeDocumentText = "faileddsaveneedle that never reaches the disk"
+    store.documentDidChange(appState: appState)
+
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the session must be DIRTY — that is the half of the case the "
+        + "unconditional flush got wrong")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, ref.id,
+      "fixture precondition: the armed debounce must belong to THIS document, not to another window")
+    XCTAssertEqual(
+      try indexHits(matching: "faileddsaveneedle", at: databaseURL), 0,
+      "fixture precondition: the debounce must still be asleep")
+
+    XCTAssertFalse(
+      store.savePendingChangesOnClose(appState: appState),
+      "fixture precondition: the close-time file write must genuinely fail")
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "faileddsaveneedle", at: databaseURL), 0,
+      "a dirty session's index write must follow its own SUCCESSFUL file save: the bytes never "
+        + "reached the disk, so FTS must not advertise them — and once the write is scheduled, "
+        + "`autosaver.cancel()` cannot take it back")
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "before the doomed edit",
+      "…and the file on disk must still hold the pre-edit body, which is what makes the index row a "
+        + "lie rather than a race")
+    XCTAssertNotNil(
+      appState.lastError,
+      "…and the user must be told the save failed")
+  }
+
+  /// The other side of the same guard, and the reason it is scoped to the OWNING document rather
+  /// than to dirtiness alone: `Autosaver` is a process-wide singleton, so the armed debounce
+  /// routinely belongs to a window other than the one closing. That debounce is owed unconditionally
+  /// — the closing session's save cannot speak for it, and for an ad-hoc document nothing else ever
+  /// will — so a dirty close must still flush it even when its own save is doomed.
+  func testAFailedCloseSaveStillFlushesAnotherDocumentsArmedDebounce() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let otherURL = folder.appendingPathComponent("other-window-note.md")
+    try "the other window's saved body".write(to: otherURL, atomically: true, encoding: .utf8)
+    let otherRef = DocumentRef(id: otherURL.standardizedFileURL, isAdHoc: true)
+
+    let closingURL = folder.appendingPathComponent("closing-note.md")
+    try "before the doomed edit".write(to: closingURL, atomically: true, encoding: .utf8)
+    let closingRef = DocumentRef(id: closingURL.standardizedFileURL, isAdHoc: true)
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveOtherDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true)),
+      writeDocument: { text, url in
+        guard url.standardizedFileURL != closingRef.id else {
+          throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    )
+
+    // The OTHER window edits last, so it is the one holding the singleton's armed debounce.
+    let otherState = AppState()
+    otherState.documents = [otherRef]
+    otherState.documentSession.load(document: otherRef, text: "the other window's saved body")
+    otherState.activeDocumentText = "otherwindowneedle from the window that is not closing"
+    store.documentDidChange(appState: otherState)
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, otherRef.id,
+      "fixture precondition: the singleton's debounce must belong to the OTHER document")
+
+    appState.documents = [closingRef]
+    appState.documentSession.load(document: closingRef, text: "before the doomed edit")
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      store.savePendingChangesOnClose(appState: appState),
+      "fixture precondition: the closing window's own save must fail")
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "otherwindowneedle", at: databaseURL), 1,
+      "another document's armed debounce is owed regardless of what happens to this close: "
+        + "withholding it would drop that window's freshness for good on an ad-hoc document, which "
+        + "has no cold-open self-heal")
+  }
+
+  // MARK: - R6: the flush loop is deadline-aware between windows
+
+  /// Round 6, finding 2 — the budget could be consumed invisibly.
+  ///
+  /// Every per-window save is the app's ordinary synchronous save primitive, and phase F ran them in
+  /// one uninterrupted loop on the main actor. Control could therefore not return to the pump in
+  /// `runBlockingMainRunLoop()` until the LAST window had finished writing, so N dirty windows on a
+  /// slow volume could burn the whole deadline in a single block the timeout could not observe.
+  ///
+  /// This is a bounded mitigation, not a redesign: the write itself stays synchronous (making it
+  /// suspending means moving document state off the main actor, a save-path refactor outside this
+  /// contract), so a SINGLE large file can still overrun the budget. What is pinned here is the
+  /// granularity — the pump regains control BETWEEN windows — observed through the sequence's own
+  /// `pumpRunLoop` seam interleaved with the stores' `writeDocument` seam.
+  func testTheFinalWindowSavesLetTheDeadlinePumpRunBetweenFiles() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let log = EventLog()
+    let registry = DocumentWindowRegistry()
+    let folderManager = makeIsolatedFolderManager(in: folder, database: database, prefix: "PumpLoop")
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+
+    var windows: [NSWindow] = []
+    var noteURLs: [URL] = []
+    // Held strongly for the length of the test on purpose: the registry keeps only weak references,
+    // so controllers dropped at the end of the loop below would be reaped before the quit ever asked
+    // for them and this pin would pass with zero saves.
+    var controllers: [AppController] = []
+    defer { windows.forEach { $0.close() } }
+
+    for name in ["window-a", "window-b"] {
+      let noteURL = folder.appendingPathComponent("\(name).md")
+      try "before the quit".write(to: noteURL, atomically: true, encoding: .utf8)
+      noteURLs.append(noteURL)
+      let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
+
+      let windowState = AppState()
+      let store = DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensievePumpLoop\(name)Bookmarks")),
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery-\(name)", isDirectory: true)),
+        writeDocument: { text, url in
+          log.append("save:\(url.deletingPathExtension().lastPathComponent)")
+          try text.write(to: url, atomically: true, encoding: .utf8)
+        }
+      )
+      windowState.documents = [ref]
+      windowState.documentSession.load(document: ref, text: "before the quit")
+      windowState.activeDocumentText = "pumploopneedle in \(name)"
+      windowState.documentSession.isDirty = true
+
+      let controller = AppController(
+        appState: windowState,
+        folderManager: folderManager,
+        documentStore: store,
+        indexDatabase: database,
+        documentWindowRegistry: registry)
+      controllers.append(controller)
+      let window = makeWindow()
+      windows.append(window)
+      registry.registerController(controller, for: window)
+    }
+    XCTAssertEqual(controllers.count, 2)
+    XCTAssertEqual(
+      registry.liveDocumentControllers().count, 2,
+      "fixture precondition: two live windows, both dirty — one save cannot demonstrate a gap")
+
+    let startedAt = Date()
+    TerminationSequence(
+      registry: registry,
+      indexDatabase: database,
+      folderManager: folderManager,
+      autosaver: autosaver,
+      drainTimeout: Self.shrunkDrainBudget,
+      pumpRunLoop: { limit in
+        log.append("pump")
+        RunLoop.current.run(mode: .default, before: limit)
+      }
+    ).runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+
+    let events = log.events
+    let saveIndices = events.indices.filter { events[$0].hasPrefix("save:") }
+    XCTAssertEqual(
+      saveIndices.count, 2,
+      "fixture precondition: both windows must have saved (events: \(events))")
+    XCTAssertTrue(
+      events[saveIndices[0]..<saveIndices[1]].contains("pump"),
+      "the deadline pump must regain control BETWEEN the two window saves; without a suspension "
+        + "point there the whole loop is one uninterruptible block and the five-second budget cannot "
+        + "be enforced until the last file has been written (events: \(events))")
+
+    for noteURL in noteURLs {
+      XCTAssertEqual(
+        try String(contentsOf: noteURL, encoding: .utf8),
+        "pumploopneedle in \(noteURL.deletingPathExtension().lastPathComponent)",
+        "…and every window's bytes must still land: yielding buys deadline granularity, it must not "
+          + "cost a save")
+    }
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "…and the quit must stay bounded; it took \(elapsed) s")
+    XCTAssertTrue(
+      database.isClosedForTermination,
+      "…and the funnel must end up closed, whichever path the sequence took")
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own
@@ -909,6 +1298,26 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// awaiting the very thing it is trying to prove has NOT finished.
   @MainActor private final class CompletionFlag {
     var isSet = false
+  }
+
+  /// An ordered log two different seams write into, so a test can assert on their INTERLEAVING
+  /// rather than on wall-clock durations. Locked because `TerminationSequence`'s `pumpRunLoop` seam
+  /// is a plain nonisolated closure.
+  private final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    var events: [String] {
+      lock.lock()
+      defer { lock.unlock() }
+      return recorded
+    }
+
+    func append(_ event: String) {
+      lock.lock()
+      recorded.append(event)
+      lock.unlock()
+    }
   }
 
   /// A `FileWatcherEventSource` the test drives by hand: it records the stop the quiescence phase is

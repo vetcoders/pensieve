@@ -42,6 +42,15 @@ final class IndexDatabase {
   /// unordered close passes a settle-first test by accident. `nil` in production.
   var backgroundWriteGateOverride: (@Sendable () async -> Void)?
 
+  /// Narrow test seam, sibling of the one above: awaited INSIDE the open task, on its detached
+  /// executor, immediately before `makeDatabasePool` builds the pool and runs the migrations.
+  ///
+  /// The position is the whole point. Parked here the open has already passed the funnel gate and
+  /// already registered `openTask`, which is exactly the state the termination drain has to cope
+  /// with; a wedge placed before the gate would only prove that a refused open refuses. `nil` in
+  /// production.
+  var databaseOpenGateOverride: (@Sendable () async -> Void)?
+
   /// Coalesces concurrent off-main opens: the first `ensureOpenInBackground` that finds no pool
   /// starts the migration on a detached executor and parks this task; later callers await the SAME
   /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
@@ -135,10 +144,24 @@ final class IndexDatabase {
     _ = await ensureOpenInBackground(into: appState)
   }
 
+  /// Thrown by the open task when the termination latch closed while the pool was still being built.
+  /// It is deliberately NOT an open failure — nothing is wrong with the database — so it never
+  /// reaches `reportOpenFailure` and never surfaces to the user; the caller simply gets `nil`, the
+  /// same answer the gate at the top of `ensureOpenInBackground` would have given it a moment
+  /// earlier.
+  private struct OpenRefusedAfterTermination: Error {}
+
   private func ensureOpenInBackground(into appState: AppState?) async -> DatabasePool? {
     guard !isRefusedAfterTermination("ensureOpenInBackground") else { return nil }
     if let databasePool { return databasePool }
-    if let openTask { return try? await openTask.value }
+    if let openTask {
+      let pool = try? await openTask.value
+      // Re-consulted AFTER the await, for the same reason the owner below does it: this caller slept
+      // through an unknown amount of the quit, and handing back a pool the latch has since refused
+      // would let it write behind the terminal checkpoint.
+      guard !isRefusedAfterTermination("ensureOpenInBackground") else { return nil }
+      return pool
+    }
 
     let url: URL
     do {
@@ -148,22 +171,62 @@ final class IndexDatabase {
       return nil
     }
 
-    let task = Task<DatabasePool, Error> {
-      try await Task.detached(priority: .userInitiated) {
-        try Self.makeDatabasePool(at: url)
+    // The task PUBLISHES as well as builds, and that is not a tidiness choice. `openTask` is what the
+    // termination drain awaits, so "the open finished" and "the pool is visible" have to be the SAME
+    // event: with the publication left in the caller's continuation, the drain could resume from
+    // `openTask.value` first, report nothing owed, and let the latch close over a database that then
+    // appeared underneath it — the review finding this addresses.
+    let openGate = databaseOpenGateOverride
+    let task = Task<DatabasePool, Error> { @MainActor in
+      let pool = try await Task.detached(priority: .userInitiated) {
+        await openGate?()
+        return try Self.makeDatabasePool(at: url)
       }.value
+      guard !self.isRefusedAfterTermination("ensureOpenInBackground") else {
+        Self.discardPoolRefusedByTermination(pool)
+        throw OpenRefusedAfterTermination()
+      }
+      self.databasePool = pool
+      self.databaseURL = url
+      return pool
     }
     openTask = task
     defer { openTask = nil }
 
     do {
-      let pool = try await task.value
-      databasePool = pool
-      databaseURL = url
-      return pool
+      return try await task.value
+    } catch is OpenRefusedAfterTermination {
+      return nil
     } catch {
       reportOpenFailure(error, appState: appState)
       return nil
+    }
+  }
+
+  /// Disposes of a pool whose publication the termination latch refused.
+  ///
+  /// The migrations that just ran are committed work sitting in the WAL, and this pool is the only
+  /// connection that will ever see it — `databasePool` stays nil, so `startCheckpointOnTerminate()`
+  /// finds nothing to checkpoint and the WAL would otherwise be left at its high-water mark. Rather
+  /// than lean on GRDB's deinit-time connection teardown (whose SQLite auto-checkpoint is real but
+  /// implicit, and whose timing is ARC's business), the truncate is asked for explicitly.
+  ///
+  /// Detached rather than inline: this runs inside the quit's pumped run loop, where a synchronous
+  /// barrier write would park the pump — the exact failure mode the third Round 6 finding is about.
+  /// The task keeps the pool alive until the checkpoint returns and then drops it. Named residual: a
+  /// process that exits first leaves the WAL for the next launch's workspace-close maintenance to
+  /// reclaim, which is the same bound the post-deadline best-effort checkpoint already carries.
+  private nonisolated static func discardPoolRefusedByTermination(_ pool: DatabasePool) {
+    Task.detached(priority: .utility) {
+      do {
+        try pool.barrierWriteWithoutTransaction { db in
+          _ = try db.checkpoint(.truncate)
+        }
+      } catch {
+        NSLog(
+          "Pensieve quit: could not checkpoint a database whose open the termination latch refused: %@",
+          error.localizedDescription)
+      }
     }
   }
 
@@ -699,14 +762,31 @@ final class IndexDatabase {
     return task
   }
 
-  /// Awaits EVERY index write this database currently owes: first the scheduled hand-offs (which
-  /// join the supersede chain only once they start running), then the chain itself. Awaiting
+  /// Awaits EVERY index write this database currently owes: an open still building the pool, then
+  /// the scheduled hand-offs (which join the supersede chain only once they start running), then the
+  /// chain itself. Awaiting
   /// `pendingIndexUpdateTask` alone is not enough — it reads a tail that a just-scheduled save has
   /// not joined yet, which is exactly how a final save's write ended up landing after the quit
   /// checkpoint. The loop covers hand-offs scheduled BY the drain (a write can schedule a refresh
   /// of its own); it terminates because nothing re-arms once the workspace/app is going away.
   func drainPendingIndexWrites() async {
-    while !scheduledIndexWrites.isEmpty {
+    // Each distinct open is awaited exactly once, tracked by identity rather than by clearing
+    // `openTask` — clearing it here would break the coalescing contract and let a later joiner start
+    // a second `DatabasePool` over the same file.
+    var awaitedOpen: Task<DatabasePool, Error>?
+    while true {
+      // An in-flight OPEN is work this drain can see nowhere else. It registers in neither collection
+      // below, so without this the drain could report "nothing owed", the latch could close, and the
+      // completed open would publish a pool whose caller writes behind the terminal checkpoint —
+      // which, with `databasePool` still nil at latch time, `startCheckpointOnTerminate()` would have
+      // skipped entirely. Awaited first, because the callers parked on it schedule their writes the
+      // instant it resolves.
+      if let openTask, openTask != awaitedOpen {
+        awaitedOpen = openTask
+        _ = try? await openTask.value
+        continue
+      }
+      guard !scheduledIndexWrites.isEmpty else { break }
       let scheduled = Array(scheduledIndexWrites.values)
       scheduledIndexWrites.removeAll()
       for task in scheduled {
