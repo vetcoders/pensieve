@@ -108,6 +108,8 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   /// point against a temp database without mutating process-global state other tests share.
   var terminationWindowRegistryOverride: DocumentWindowRegistry?
   var terminationIndexDatabaseOverride: IndexDatabase?
+  var terminationFolderManagerOverride: FolderManager?
+  var terminationAutosaverOverride: Autosaver?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
@@ -190,7 +192,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       // this call. See `TerminationSequence`.
       TerminationSequence(
         registry: terminationWindowRegistryOverride ?? .shared,
-        indexDatabase: terminationIndexDatabaseOverride ?? .shared
+        indexDatabase: terminationIndexDatabaseOverride ?? .shared,
+        folderManager: terminationFolderManagerOverride,
+        autosaver: terminationAutosaverOverride
       ).runBlockingMainRunLoop()
     }
   }

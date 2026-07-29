@@ -980,6 +980,29 @@ final class FolderManager {
     }
   }
 
+  /// Termination command, issued by `TerminationSequence` in the quiescence phase. Stops every
+  /// workspace-side producer this manager owns, so the drain that follows waits for a FINITE set of
+  /// work instead of chasing a target the watcher keeps moving.
+  ///
+  /// The watcher goes first and it is the load-bearing half: `FileWatcher.stop()` bumps a
+  /// generation, so an FSEvents batch already in flight on the watcher queue is discarded instead of
+  /// being debounced into a fresh refresh during the quit's pumped run loop. The primitive already
+  /// existed — until now only `closeWorkspace` called it, so a quit left FSEvents live to the last
+  /// instruction of the process.
+  ///
+  /// Deliberately does NOT await the detached scans those four tasks may already be running. Every
+  /// one of them re-checks cancellation AND workspace identity after the walk and before it
+  /// publishes or writes (`performWatcherRefresh`, `scheduleExplicitRefresh`, the build task's
+  /// guards), so a cancelled scan can no longer produce an index write. Awaiting them would put a
+  /// full tree walk inside the quit budget and buy nothing.
+  func quiesceForTermination() {
+    watcher.stop()
+    watcherRefreshTask?.cancel()
+    forcedRefreshTask?.cancel()
+    workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
+  }
+
   /// Deterministic sync point for the post-close index housekeeping. Because the maintenance task
   /// chains on whatever final index write it was armed behind, awaiting this also awaits that
   /// write — which is exactly the ordering `removeRoot`'s last-root path depends on.
@@ -2786,6 +2809,17 @@ final class DocumentStore {
   @discardableResult
   func savePendingChangesOnClose(appState: AppState) -> Bool {
     self.appState = appState
+    // BEFORE the dirty guard, deliberately. A CLEAN session can still be holding a sleeping index
+    // debounce: the 1.5 s autosave already wrote the bytes and marked the buffer clean while the
+    // 5 s index write was still asleep. The old order returned on the guard without ever reaching
+    // the autosaver, so a close (or a quit) inside that window left the FTS row stale with no one
+    // owning the repair.
+    //
+    // FLUSH, not cancel — `Autosaver` is a process-wide singleton, so the armed debounce may belong
+    // to a DIFFERENT window than the one closing, and cancelling it there would drop that window's
+    // freshness for good on an ad-hoc document (no workspace signature ⇒ no cold-open self-heal).
+    // See `Autosaver.flushIndex()`.
+    autosaver.flushIndex()
     guard appState.documentSession.hasEditableBuffer,
       appState.documentSession.isDirty
     else {

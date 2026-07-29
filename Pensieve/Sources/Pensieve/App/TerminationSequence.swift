@@ -12,10 +12,23 @@ import Foundation
 ///
 /// So the order is written down once, here, and it is the only one:
 ///
-/// 1. flush every window's pending edit (do not wait for `willCloseNotification` — it is too late),
-/// 2. drain every index write the app owes, including the ones those flushes just scheduled,
-/// 3. take the truncating checkpoint,
-/// 4. return, and let AppKit tear the windows down.
+/// 1. QUIESCE — tell the producers the app is going away: the window registry, each window's
+///    controller, and the workspace manager (watcher stopped, refresh/build tasks cancelled),
+/// 2. FLUSH — land everything the user already owns: every window's pending edit, and the armed
+///    autosave index debounce, run NOW rather than when its 5 s timer says so,
+/// 3. DRAIN — wait for every index write the app owes, including the ones step 2 just scheduled,
+///    and for the post-close index housekeeping, all under one budget,
+/// 4. LATCH — close the index funnel one way; from here every write entry point and lazy open
+///    refuses, and the terminal checkpoint is the only DB operation left that can run,
+/// 5. take the truncating checkpoint,
+/// 6. return, and let AppKit tear the windows down.
+///
+/// Steps 1 and 4 are the difference between "the writes we knew about are safe" and "no new managed
+/// write can arise". Five review rounds each found another producer that was still alive during the
+/// quit; the answer was never a sixth patch but the missing phase — and a refusal at the funnel for
+/// whatever the inventory missed. This class is the SINGLE owner of that phase state: no other type
+/// keeps a termination flag of its own, they execute commands (`quiesceForTermination`) or are
+/// switched by this one (`IndexDatabase.closeForTermination`).
 ///
 /// Deliberately prompt-free and non-destructive: nothing here asks the user anything and nothing
 /// discards a buffer. A dirty untitled session is persisted as a recovery draft by the same
@@ -32,6 +45,8 @@ final class TerminationSequence {
 
   private let registry: DocumentWindowRegistry
   private let indexDatabase: IndexDatabase
+  private let folderManager: FolderManager
+  private let autosaver: Autosaver
   private let drainTimeout: TimeInterval
   private let pumpRunLoop: (Date) -> Void
   private var didFinish = false
@@ -44,6 +59,10 @@ final class TerminationSequence {
   init(
     registry: DocumentWindowRegistry,
     indexDatabase: IndexDatabase,
+    // Resolved inside the (main-actor) body rather than as `= .shared` defaults: a default argument
+    // is evaluated in a nonisolated context, which cannot read a main-actor-isolated `shared`.
+    folderManager: FolderManager? = nil,
+    autosaver: Autosaver? = nil,
     drainTimeout: TimeInterval = TerminationSequence.defaultDrainTimeout,
     pumpRunLoop: @escaping (Date) -> Void = { limit in
       RunLoop.current.run(mode: .default, before: limit)
@@ -51,20 +70,48 @@ final class TerminationSequence {
   ) {
     self.registry = registry
     self.indexDatabase = indexDatabase
+    self.folderManager = folderManager ?? .shared
+    self.autosaver = autosaver ?? .shared
     self.drainTimeout = drainTimeout
     self.pumpRunLoop = pumpRunLoop
   }
 
-  /// The termination contract itself.
+  /// The termination contract itself. Every wait here is an `await` — see
+  /// `runBlockingMainRunLoop()`: a synchronous wait would park the pump and make the deadline dead.
+  /// Phases Q and F introduce none: they are O(1) cancels plus one already-owed index write.
   func run() async {
+    // ---- Q: quiescence. Producers first, before anything is flushed or drained, so the drain below
+    // waits for a FINITE set of work rather than a target the watcher and the debounces keep moving.
+    let controllers = registry.liveDocumentControllers()
     // The last document window closing during Quit must not resurrect a launcher; tell the registry
     // the app is going away before anything else touches its windows.
     registry.beginTermination()
-    flushPendingWindowSaves()
+    for controller in controllers {
+      controller.quiesceForTermination()
+    }
+    folderManager.quiesceForTermination()
+
+    // ---- F: flush. Everything the user already owns lands now, not when a timer says so. Both
+    // steps PRODUCE index writes, which is precisely why the latch cannot be armed yet.
+    flushPendingWindowSaves(controllers)
+    autosaver.quiesceForTermination()
+
+    // ---- D: drain. The accepted work first, then the post-close index housekeeping — which is a
+    // barrier vacuum + truncate and, until now, was awaited only by tests. `Close Folder` followed by
+    // a fast ⌘Q raced that vacuum against this quit's own checkpoint, and GRDB serializes the two
+    // without ordering them: the vacuum could land last and leave WAL frames behind the checkpoint
+    // that was supposed to be final. Housekeeping goes second because it re-drains internally, so
+    // nothing accepted can still be owed once it returns.
     await indexDatabase.drainPendingIndexWrites()
-    // Started off-main and AWAITED, not taken on this thread. The order is unchanged — the checkpoint
-    // still happens here, after the drain, before this returns — but the wait is now a suspension
-    // point, which is what keeps it inside the budget: see `runBlockingMainRunLoop()`.
+    await folderManager.waitForPendingIndexMaintenance()
+
+    // ---- L: latch. Everything owed has landed; from here the funnel refuses, so a producer this
+    // sequence never knew about cannot write behind the checkpoint.
+    indexDatabase.closeForTermination()
+
+    // ---- C: checkpoint. Started off-main and AWAITED, not taken on this thread. The order is
+    // unchanged — the checkpoint still happens here, after the drain, before this returns — but the
+    // wait is a suspension point, which is what keeps it inside the budget.
     didStartTerminalCheckpoint = true
     await indexDatabase.startCheckpointOnTerminate()?.value
   }
@@ -115,6 +162,10 @@ final class TerminationSequence {
       "Pensieve quit: the index drain and checkpoint exceeded their %.1f s budget; leaving the "
         + "checkpoint best-effort",
       drainTimeout)
+    // A spent budget stops the WAITING; it does not put the app back into a running state. Close the
+    // funnel here too, so a producer that outlived the drain cannot slip a write in behind the
+    // best-effort checkpoint. One-way and idempotent, so a sequence that latched already is unharmed.
+    indexDatabase.closeForTermination()
     // Only when the sequence never reached it. A budget spent WAITING for the checkpoint (a wedged
     // pool reader, not a wedged writer) already has one running; a second barrier would queue behind
     // the first for nothing.
@@ -123,8 +174,8 @@ final class TerminationSequence {
     }
   }
 
-  private func flushPendingWindowSaves() {
-    for controller in registry.liveDocumentControllers() {
+  private func flushPendingWindowSaves(_ controllers: [AppController]) {
+    for controller in controllers {
       controller.savePendingChangesOnClose()
     }
   }

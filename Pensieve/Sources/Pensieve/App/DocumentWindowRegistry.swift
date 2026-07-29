@@ -673,6 +673,11 @@ final class DocumentWindowRegistry: ObservableObject {
     scheduleLauncherWindowSweep { [weak self] in
       guard let self else { return }
       launcherSweepPending = false
+      // A sweep is a DEFERRED `asyncAfter`: it cannot be cancelled, so one armed just before the
+      // quit fires INSIDE the termination sequence's pumped run loop. Closing a window there posts
+      // `willCloseNotification`, which runs a save — a brand-new managed write arriving after the
+      // sequence already flushed and drained. The quit tears every window down by itself anyway.
+      guard !isTerminating else { return }
       let activeWindow = launcherSweepSparedWindow?.window
       purgeClosedLauncherWindows()
       let allWindows = applicationWindows()
@@ -769,6 +774,9 @@ final class DocumentWindowRegistry: ObservableObject {
   private func reconcileLauncherWindows() {
     scheduleLauncherWindowSweep { [weak self] in
       guard let self else { return }
+      // Same reason as the sweep in `closeEmptyLauncherWindows`: an uncancellable deferred reap must
+      // not close windows — and so trigger saves — while the termination sequence is running.
+      guard !isTerminating else { return }
       purgeClosedLauncherWindows()
       let preferredLauncher = preferredLauncherID.flatMap { self.launcherWindows[$0]?.window }
       let shouldCloseAllLaunchers =

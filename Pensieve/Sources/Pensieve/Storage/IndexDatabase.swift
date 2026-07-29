@@ -47,6 +47,30 @@ final class IndexDatabase {
   /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
   private var openTask: Task<DatabasePool, Error>?
 
+  /// The termination latch. One-way, and it is SET BY `TerminationSequence` — never by this class on
+  /// its own, never unset, and never earlier than the sequence's drain. Position matters: the flush
+  /// phase PRODUCES index writes that must be accepted, so a latch armed at the start of the quit
+  /// would throw away exactly the work the quit exists to save.
+  ///
+  /// Past this point the funnel is closed. Every write entry point refuses, and so does lazy open —
+  /// "a read can write": the first search / backlink / count after a fresh install creates the
+  /// directory, builds the `DatabasePool` and runs every migration, which is a pile of DDL and an
+  /// FTS backfill. Gating only the twelve domain methods would leave that door open.
+  /// `startCheckpointOnTerminate()` is the one operation still allowed — it goes straight to
+  /// `databasePool` and never asks to open anything.
+  ///
+  /// This is the second of two layers and they cover different failures. Quiescing the producers
+  /// (`FolderManager.quiesceForTermination`, `Autosaver.quiesceForTermination`) protects DATA
+  /// COMPLETENESS — work that should land, lands, and the drain sees a finite snapshot. The latch
+  /// protects ORDER and CLOSURE: it makes a late write impossible by construction for producers the
+  /// inventory missed or that have not been written yet. Enumeration cannot promise that; refusal
+  /// can.
+  private(set) var isClosedForTermination = false
+
+  /// Entry points refused since the latch closed, in call order. Production never reads this; it is
+  /// the seam a test uses to prove a post-latch producer was REFUSED rather than quietly swallowed.
+  private(set) var terminationRejectedEntryPoints: [String] = []
+
   init(
     databaseURL: URL? = nil,
     searchIndexBatchSize: Int = 32,
@@ -59,11 +83,40 @@ final class IndexDatabase {
     self.didOpenBacklinkRead = didOpenBacklinkRead
   }
 
+  // MARK: - Termination latch
+
+  /// Closes the funnel. Called by `TerminationSequence` AFTER its drain and BEFORE the terminal
+  /// checkpoint, and by the post-deadline fallback — a spent budget stops the waiting, it does not
+  /// put the app back into a running state.
+  func closeForTermination() {
+    isClosedForTermination = true
+  }
+
+  /// The gate every write entry point and both open paths consult. Returns `true` when the caller
+  /// must refuse, and names the refused entry point in the log so a late producer is auditable
+  /// rather than invisible.
+  ///
+  /// Note what is NOT gated here and why: the bare `Task { }` index writes in `DocumentStore`
+  /// (`removeRoot`'s delete, the live-refresh and cold-open deltas) are deliberately left as they
+  /// are. Their work is workspace CHURN — recomputable from disk — so post-latch refusal costs a
+  /// freshness that the next launch's cold-open delta rebuilds anyway, and funnelling all six
+  /// through a registration mechanism is a refactor this termination contract does not need. What
+  /// the contract does need is that they cannot land BEHIND the checkpoint, and refusal gives
+  /// exactly that.
+  private func isRefusedAfterTermination(_ entryPoint: String) -> Bool {
+    guard isClosedForTermination else { return false }
+    terminationRejectedEntryPoints.append(entryPoint)
+    NSLog(
+      "Pensieve quit: index entry point refused after the termination latch closed (%@)", entryPoint)
+    return true
+  }
+
   /// Synchronous open — retained for the legacy synchronous workspace path and for tests that drive
   /// the index directly. The LIVE app (background import path) opens via `openInBackground` so the
   /// migration never blocks the main run loop. Building the pool + migrating is the heaviest cost
   /// (incl. the FTS5 content-link rebuild migration), so this must not be on the hot import path.
   func open(into appState: AppState? = nil) {
+    guard !isRefusedAfterTermination("open") else { return }
     do {
       let url = try resolveDatabaseURL()
       let pool = try Self.makeDatabasePool(at: url)
@@ -83,6 +136,7 @@ final class IndexDatabase {
   }
 
   private func ensureOpenInBackground(into appState: AppState?) async -> DatabasePool? {
+    guard !isRefusedAfterTermination("ensureOpenInBackground") else { return nil }
     if let databasePool { return databasePool }
     if let openTask { return try? await openTask.value }
 
@@ -562,6 +616,7 @@ final class IndexDatabase {
   /// success flag is observed by awaiting the dedicated `write` task this call owns.
   @discardableResult
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
+    guard !isRefusedAfterTermination("reindexInBackground") else { return false }
     let previous = pendingIndexUpdateTask
     guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
@@ -632,6 +687,9 @@ final class IndexDatabase {
   func scheduleIndexWrite(_ work: @escaping @MainActor @Sendable () async -> Void) -> Task<
     Void, Never
   > {
+    // Refused post-latch at the hand-off itself, not merely inside the work: the drain has already
+    // finished, so a task recorded here would never be awaited by anyone.
+    guard !isRefusedAfterTermination("scheduleIndexWrite") else { return Task {} }
     let id = UUID()
     let task = Task { @MainActor [weak self] in
       await work()
@@ -714,6 +772,7 @@ final class IndexDatabase {
     deletingPaths: [String],
     appState: AppState? = nil
   ) async -> Bool {
+    guard !isRefusedAfterTermination("updateSearchIndexInBackground") else { return false }
     let previous = pendingIndexUpdateTask
     guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
@@ -819,6 +878,7 @@ final class IndexDatabase {
   /// point that also excludes the pool's READER connections; a plain write would leave readers
   /// holding WAL snapshots and SQLite would silently downgrade the truncate to a no-op.
   func performMaintenanceInBackground(reason: MaintenanceReason) async {
+    guard !isRefusedAfterTermination("performMaintenanceInBackground") else { return }
     guard let pool = databasePool, let databaseURL else { return }
     if reason == .indexBatch,
       Self.walFileSize(for: databaseURL) < effectiveWalCheckpointThresholdBytes
@@ -1052,6 +1112,7 @@ final class IndexDatabase {
   func indexInBackground(
     document: DocumentRef, body: String, appState: AppState? = nil
   ) async -> Bool {
+    guard !isRefusedAfterTermination("indexInBackground") else { return false }
     let previous = pendingIndexUpdateTask
     guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let record = Self.documentWriteRecord(from: document, body: body)
@@ -1206,6 +1267,7 @@ final class IndexDatabase {
     documents: [DocumentRef],
     appState: AppState? = nil
   ) async {
+    guard !isRefusedAfterTermination("upsertWorkspace") else { return }
     // Same seam, same position, same reason as in the reindex/delta twins: the workspace-metadata
     // write is an index write like any other, and a test proving it is genuinely still owed at close
     // time needs to hold it here, before it touches the pool.
@@ -1294,7 +1356,11 @@ final class IndexDatabase {
       .appendingPathComponent("Pensieve", isDirectory: true)
   }
 
+  /// Sync sibling of `ensureOpenInBackground`, gated for the same reason — and it is what covers the
+  /// synchronous legacy trio (`index(document:body:)`, `updateSearchIndex`, `reindex`) without those
+  /// three needing a guard of their own: they cannot reach the pool except through here.
   private func ensureOpen(into appState: AppState?) -> DatabasePool? {
+    guard !isRefusedAfterTermination("ensureOpen") else { return nil }
     if databasePool == nil {
       open(into: appState)
     }
@@ -2180,6 +2246,7 @@ final class IndexDatabase {
     durationMs: Int,
     appState: AppState? = nil
   ) async {
+    guard !isRefusedAfterTermination("appendScanSession") else { return }
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
@@ -2217,6 +2284,7 @@ final class IndexDatabase {
     fingerprintMatches: Bool,
     appState: AppState? = nil
   ) async {
+    guard !isRefusedAfterTermination("refreshWorkspaceStats") else { return }
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
     do {
       try await Task.detached(priority: .utility) {
