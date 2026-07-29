@@ -1798,6 +1798,255 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "\(database.terminationRejectedEntryPoints)")
   }
 
+  // MARK: - R11: the producer that produces producers
+
+  /// Round 11, finding 1 (P2) — the sixth producer outside phase Q's inventory, and the only one that
+  /// can rebuild all the others.
+  ///
+  /// The initial scene arms `LaunchIntentCoordinator.startWhenLaunchIntentsSettle` and returns. Quit
+  /// before that task settles and it runs inside the quit's OWN pumped run loop, calling
+  /// `controller.start` — which restores the workspace and creates fresh validation, build, watcher,
+  /// manifest and index work after `FolderManager` was quiesced. The manifest/cache half of that can
+  /// still commit while its post-latch index write is refused, which leaves the launch metadata ahead
+  /// of FTS for the next cold start's skip decision: a stale index the skip-gate believes is current.
+  ///
+  /// The observable is deliberately the SYNCHRONOUS limb of `controller.start`. Its other two limbs
+  /// (the background index warm-up, the workspace restore) are tasks, so asserting on them would be
+  /// asserting on the scheduler; `documentStore.restoreRecoveredDraft` is a plain call inside `start`,
+  /// so a seeded recovery draft that is still unclaimed afterwards is proof the method never ran —
+  /// with no timing in the claim at all.
+  ///
+  /// Note what a bare `cancel()` would NOT have done here, which is why the fix is a one-way latch:
+  /// the startup task's only suspension is `try? await Task.sleep(...)`, so cancelling it merely
+  /// makes the sleep return early and the body proceeds to `controller.start` regardless.
+  func testQuitBeforeTheLaunchIntentSettlesCannotRestartTheProducersPhaseQStopped() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // The synchronous side-effect of `controller.start`, seeded so its absence is observable.
+    let recoveryStore = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    _ = try recoveryStore.saveDraft(
+      id: nil, title: "Recovered Untitled.md", text: "launchintentneedle from the previous session")
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveLaunchIntentQuiesceBookmarks")),
+      recoveryStore: recoveryStore
+    )
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "LaunchIntentQuiesce")
+    let registry = DocumentWindowRegistry()
+    let controller = AppController(
+      appState: appState,
+      folderManager: folderManager,
+      documentStore: store,
+      indexDatabase: database,
+      documentWindowRegistry: registry
+    )
+    let window = makeWindow()
+    defer { window.close() }
+    registry.registerController(controller, for: window)
+
+    // Armed and NOT settled — the ten-second delay is the launch that is still making up its mind
+    // when the user quits. Nothing here sleeps for it; the quit is what runs next.
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 10_000_000_000)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "fixture precondition: the startup decision must still be pending, so nothing has restored yet")
+
+    let delegate = PensieveAppDelegate()
+    delegate.terminationWindowRegistryOverride = registry
+    delegate.terminationIndexDatabaseOverride = database
+    delegate.terminationFolderManagerOverride = folderManager
+    delegate.terminationAutosaverOverride = autosaver
+    delegate.terminationLaunchIntentCoordinatorOverride = coordinator
+    delegate.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+
+    // Everything that CAN still run gets its chance — this pin asserts that something did NOT happen.
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+
+    XCTAssertNotNil(
+      recoveryStore.claimDraftForRestore(),
+      "the launch-intent startup task must not run after phase Q: the draft it would have claimed is "
+        + "still pending, which is only true if `controller.start` never ran")
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "…so no session was restored into a window the quit has already flushed")
+    XCTAssertTrue(
+      appState.workspaceRoots.isEmpty,
+      "…and no workspace was restored, which is the producer chain — validation, build, watcher, "
+        + "manifest, index — phase Q had just stopped")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "…and nothing reached the funnel after the latch, which is what a producer restarted inside "
+        + "the pumped run loop would have done. Got \(database.terminationRejectedEntryPoints)")
+  }
+
+  /// The other half of the same contract, and the control that stops the pin above from passing
+  /// because the coordinator was simply broken: a startup that SETTLED before the quit is untouched.
+  ///
+  /// This is the ordinary launch — the scene armed the coordinator, it settled, the window restored
+  /// its draft — and it must stay exactly as it was. The latch is one-way, but it is only set by
+  /// `quiesceForTermination()`, so nothing here may refuse.
+  func testALaunchIntentThatSettledBeforeTheQuitStillStartedItsWindow() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let recoveryStore = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    _ = try recoveryStore.saveDraft(
+      id: nil, title: "Recovered Untitled.md", text: "settledlaunchneedle from the previous session")
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveSettledLaunchBookmarks")),
+      recoveryStore: recoveryStore
+    )
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "SettledLaunch")
+    let registry = DocumentWindowRegistry()
+    let controller = AppController(
+      appState: appState,
+      folderManager: folderManager,
+      documentStore: store,
+      indexDatabase: database,
+      documentWindowRegistry: registry
+    )
+    let window = makeWindow()
+    defer { window.close() }
+    registry.registerController(controller, for: window)
+
+    let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertTrue(
+      appState.documentSession.hasEditableBuffer,
+      "an ordinary launch must still restore its recovery draft — the termination latch may only be "
+        + "set by `quiesceForTermination()`, never by arming")
+    XCTAssertEqual(
+      appState.documentSession.text, "settledlaunchneedle from the previous session",
+      "…with the draft's own bytes, not an empty buffer")
+  }
+
+  // MARK: - R11: a session change may not disarm another window's index debounce
+
+  /// Round 11, finding 2 (P2) — the sites 1–4 residual round 8 named consciously, now collected.
+  ///
+  /// `cancelOwnDebouncesOnSessionChange` narrowed the SAVE half to the calling window in round 8 and
+  /// deliberately left the INDEX half unconditional. The two halves are one mechanism, though: window
+  /// B arms both, window A switches document, B's save survives and B's index write is thrown away.
+  /// B's 1.5 s autosave then writes its edited text through `saveExisting(indexNow: false)` — which
+  /// indexes nothing by contract — so the bytes land and the FTS row stays stale. On the AD-HOC
+  /// document used here that is permanent: no workspace signature ⇒ no cold-open self-heal.
+  ///
+  /// Read back through an INDEPENDENT connection, and the disk is read too: the assertion is that
+  /// FTS matches what is on disk, not merely that a row exists.
+  func testASessionChangeInOneWindowLeavesAnotherWindowsIndexDebounceArmed() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // Outside every workspace root: the document class whose stale FTS row nothing ever repairs.
+    let neighbourURL = folder.appendingPathComponent("neighbour.md")
+    try "before the neighbour's edit".write(to: neighbourURL, atomically: true, encoding: .utf8)
+    let neighbourRef = DocumentRef(id: neighbourURL.standardizedFileURL, isAdHoc: true)
+
+    let switcherURL = folder.appendingPathComponent("switcher-target.md")
+    try "the document window A switches to".write(
+      to: switcherURL, atomically: true, encoding: .utf8)
+    let switcherRef = DocumentRef(id: switcherURL.standardizedFileURL, isAdHoc: true)
+
+    // A short save debounce and a slightly longer index debounce reproduce the live 1.5 s / 5 s
+    // ordering without a real-second sleep: the save lands first, the index write follows it.
+    let autosaver = Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 200)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveForeignIndexDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    // Window B: edits, arms both debounces, and is the window that must survive untouched.
+    let neighbourState = AppState()
+    neighbourState.documents = [neighbourRef]
+    neighbourState.documentSession.load(document: neighbourRef, text: "before the neighbour's edit")
+    neighbourState.activeDocumentText = "foreignindexneedle waiting out its index debounce"
+    store.documentDidChange(appState: neighbourState)
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, neighbourRef.id,
+      "fixture precondition: window B must own the singleton's armed index debounce")
+
+    // Window A, variant 1: an ordinary document switch. Its own session is clean and holds a
+    // DIFFERENT document, so the debounce it is about to reach can only ever be somebody else's.
+    let switcherState = AppState()
+    switcherState.documents = [switcherRef]
+    store.load(ref: switcherRef, into: switcherState)
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, neighbourRef.id,
+      "a document switch in window A must leave window B's index debounce ARMED — cancelling it "
+        + "here is the loss of freshness the save half was narrowed for in round 8")
+
+    // Window A, variant 2: an untitled buffer saved under a new name. Same rule, a different call
+    // site (`saveAs`), and the one that also writes bytes of its own on the way through.
+    let savingState = AppState()
+    savingState.documentSession.createUntitled()
+    savingState.activeDocumentText = "a draft window A is about to name"
+    XCTAssertTrue(
+      store.saveAs(appState: savingState, to: folder.appendingPathComponent("named-by-a.md")),
+      "fixture precondition: window A's save-as must succeed, or the call site under test is never "
+        + "reached")
+    XCTAssertEqual(
+      autosaver.armedIndexOwner, neighbourRef.id,
+      "…and a save-as in window A must not disarm it either")
+
+    // Now let window B's own timers run: the 20 ms save lands the bytes, the 200 ms index debounce
+    // fires over them.
+    try await waitUntil("window B's autosave to land its bytes on disk") {
+      (try? String(contentsOf: neighbourURL, encoding: .utf8))?.contains("foreignindexneedle")
+        == true
+    }
+    try await waitUntil("window B's surviving index debounce to publish those bytes") {
+      await database.waitForPendingReindex()
+      return (try? self.indexHits(matching: "foreignindexneedle", at: databaseURL)) == 1
+    }
+
+    XCTAssertEqual(
+      try String(contentsOf: neighbourURL, encoding: .utf8),
+      "foreignindexneedle waiting out its index debounce",
+      "window B's bytes must be on disk…")
+    XCTAssertEqual(
+      try indexHits(matching: "foreignindexneedle", at: databaseURL), 1,
+      "…and FTS must agree with them. An unconditional `cancelIndex()` on the session-change path "
+        + "leaves this at 0 for good: the autosave that follows indexes nothing by contract, and an "
+        + "ad-hoc document has no workspace signature to trigger a cold-open repair")
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own

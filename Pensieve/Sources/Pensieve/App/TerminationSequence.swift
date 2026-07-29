@@ -54,6 +54,7 @@ final class TerminationSequence {
   private let indexDatabase: IndexDatabase
   private let folderManager: FolderManager
   private let autosaver: Autosaver
+  private let launchIntentCoordinator: LaunchIntentCoordinator
   private let drainTimeout: TimeInterval
   private let pumpRunLoop: (Date) -> Void
   private var didFinish = false
@@ -70,6 +71,7 @@ final class TerminationSequence {
     // is evaluated in a nonisolated context, which cannot read a main-actor-isolated `shared`.
     folderManager: FolderManager? = nil,
     autosaver: Autosaver? = nil,
+    launchIntentCoordinator: LaunchIntentCoordinator? = nil,
     drainTimeout: TimeInterval = TerminationSequence.defaultDrainTimeout,
     pumpRunLoop: @escaping (Date) -> Void = { limit in
       RunLoop.current.run(mode: .default, before: limit)
@@ -79,6 +81,7 @@ final class TerminationSequence {
     self.indexDatabase = indexDatabase
     self.folderManager = folderManager ?? .shared
     self.autosaver = autosaver ?? .shared
+    self.launchIntentCoordinator = launchIntentCoordinator ?? .shared
     self.drainTimeout = drainTimeout
     self.pumpRunLoop = pumpRunLoop
   }
@@ -103,6 +106,14 @@ final class TerminationSequence {
   func runUserFlushPhases() {
     // ---- Q: quiescence. Producers first, before anything is flushed or drained, so the drain below
     // waits for a FINITE set of work rather than a target the watcher and the debounces keep moving.
+    //
+    // The launch-intent coordinator leads the inventory because it is the one member that produces
+    // other producers. Its pending startup task calls `controller.start`, which restores the
+    // workspace and creates fresh validation, build, watcher, manifest and index work; quiesced
+    // after the others it would simply rebuild them from inside this quit's own pumped run loop. Its
+    // command is a one-way latch rather than a cancel, because the task re-arms on every settling
+    // scene and its own cancellation is swallowed — see `LaunchIntentCoordinator`.
+    launchIntentCoordinator.quiesceForTermination()
     let controllers = registry.liveDocumentControllers()
     // The last document window closing during Quit must not resurrect a launcher; tell the registry
     // the app is going away before anything else touches its windows.

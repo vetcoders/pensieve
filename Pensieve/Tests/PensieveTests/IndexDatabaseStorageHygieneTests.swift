@@ -306,6 +306,9 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     )
     XCTAssertTrue(didWrite)
     await database.waitForPendingReindex()
+    // …and the maintenance hand-off too: since round 11 it lives outside the supersede chain, so
+    // `waitForPendingReindex()` alone would let this pin pass before the throttle was even consulted.
+    await database.drainPendingIndexWrites()
 
     XCTAssertGreaterThan(
       walSize(for: databaseURL), 0,
@@ -535,6 +538,11 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       appState: appState
     )
     XCTAssertTrue(didWrite)
+    // Since round 11 the batch maintenance is ARMED by the write rather than awaited inside it, so
+    // the save returns before the truncate — that is the liveness fix, and this is the seam that
+    // observes it. `drainPendingIndexWrites()` is the right wait because it is the same one the quit
+    // sequence uses: it tracks the maintenance hand-off, `waitForPendingReindex()` no longer does.
+    await database.drainPendingIndexWrites()
 
     XCTAssertLessThanOrEqual(
       walSize(for: databaseURL), 64 * 1024,
@@ -563,10 +571,116 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       appState: appState
     )
     XCTAssertTrue(didWrite)
+    // Drained rather than merely returned-from: since round 11 the maintenance is armed as its own
+    // tracked write, so "nothing was truncated" is only a claim once that hand-off has finished.
+    await database.drainPendingIndexWrites()
 
     XCTAssertGreaterThan(
       walSize(for: databaseURL), 0,
       "a small save must not take the barrier checkpoint — the 16 MiB throttle is the point")
+  }
+
+  // MARK: - R11: storage hygiene must not stall functional writes
+
+  /// Round 11, finding 3 (P2) — the campaign's only finding about a RUNNING session's liveness rather
+  /// than about durability.
+  ///
+  /// `performMaintenanceInBackground` takes `barrierWriteWithoutTransaction`, which excludes the
+  /// pool's READERS — deliberately, because a plain write leaves readers holding WAL snapshots and
+  /// SQLite silently downgrades the truncate to a no-op. The `.indexBatch` call was `await`ed INSIDE
+  /// the write task `pendingIndexUpdateTask` points at, so that barrier sat in the supersede tail:
+  /// one slow or wedged search/backlink query blocked not just the truncate but every reindex,
+  /// watcher delta and save submitted afterwards, for the rest of the session.
+  ///
+  /// The fix keeps the barrier exactly as it is — a passive checkpoint would recycle WAL frames
+  /// without ever shrinking the `-wal` file, quietly retiring the 16 MiB bound in the very case it
+  /// exists for — and changes only who waits for it: nobody. `.workspaceClose` maintenance keeps its
+  /// chained shape; only the hot path moved.
+  ///
+  /// The pass is parked at `maintenanceGateOverride`, which sits after every early return and
+  /// immediately before the detached vacuum + truncate. That pins the CONTRACT — "a write submitted
+  /// behind reader-blocked hygiene still completes" — rather than a race against a real reader, which
+  /// would be an assertion about the scheduler.
+  func testHotPathMaintenanceCannotStallTheIndexWritesSubmittedBehindIt() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBefore = walSize(for: databaseURL)
+    XCTAssertGreaterThan(
+      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers")
+    database.walCheckpointThresholdBytesOverride = Int64(walBefore)
+
+    // Parked exactly where the reader-excluding barrier would be: this is the wedged reader, without
+    // the race a real one would bring.
+    let gate = ParkingGate()
+    database.maintenanceGateOverride = { await gate.arrive() }
+
+    let armingRef = documentRef(root: root, name: "arms-maintenance.md")
+    let firstWriteFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.indexInBackground(
+        document: armingRef, body: "hotpathfirstneedle", appState: nil)
+      firstWriteFinished.isSet = true
+    }
+    try await waitUntil("the batch maintenance pass to reach its barrier") {
+      await gate.arrivals >= 1
+    }
+    XCTAssertTrue(
+      firstWriteFinished.isSet,
+      "fixture precondition: the write that ARMED the maintenance must already have completed — "
+        + "awaiting the barrier inside that write task is the defect under test")
+
+    // Submitted while the hygiene barrier is demonstrably held.
+    let behindRef = documentRef(root: root, name: "behind-maintenance.md")
+    let secondWriteFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.indexInBackground(
+        document: behindRef, body: "hotpathsecondneedle", appState: nil)
+      secondWriteFinished.isSet = true
+    }
+    try await waitUntil("the index write submitted behind the parked maintenance to complete") {
+      secondWriteFinished.isSet
+    }
+    let arrivalsWhileParked = await gate.arrivals
+    XCTAssertEqual(
+      arrivalsWhileParked, 1,
+      "fixture precondition: the maintenance pass must still be held — and the second write must not "
+        + "have piled another blocked barrier behind it, which is what the coalescing is for")
+    XCTAssertEqual(
+      try indexHits(matching: "hotpathsecondneedle", at: databaseURL), 1,
+      "a write submitted behind reader-blocked storage hygiene must still land: one slow search "
+        + "must never be able to stop every index update for the rest of the session")
+
+    // …and the hygiene pass is still the termination drain's business. Started while the pass is
+    // held, the drain must NOT return until it is released — that is what keeps the quit guarantees
+    // untouched by moving the work out of the supersede tail.
+    let drainFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.drainPendingIndexWrites()
+      drainFinished.isSet = true
+    }
+    try await Task.sleep(nanoseconds: 150_000_000)
+    XCTAssertFalse(
+      drainFinished.isSet,
+      "the drain must still COVER the hot-path maintenance: `scheduleIndexWrite` registers it, so a "
+        + "quit cannot latch and checkpoint while a vacuum + truncate is still in flight")
+
+    await gate.open()
+    try await waitUntil("the drain to complete once the maintenance barrier is released") {
+      drainFinished.isSet
+    }
+    XCTAssertLessThanOrEqual(
+      walSize(for: databaseURL), 64 * 1024,
+      "…and the truncate the drain waited for must actually have landed (was \(walBefore) bytes, "
+        + "now \(walSize(for: databaseURL)))")
   }
 
   /// Ordinary `Close Folder` used to compact against whatever the index happened to have finished.

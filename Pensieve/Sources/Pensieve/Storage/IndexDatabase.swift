@@ -35,6 +35,22 @@ final class IndexDatabase {
   /// here, invisible to `waitForPendingReindex()`.
   private var scheduledIndexWrites: [UUID: Task<Void, Never>] = [:]
 
+  /// The outstanding HOT-PATH (`.indexBatch`) maintenance pass, or `nil` when none is armed.
+  ///
+  /// Storage hygiene must never stall functional writes, and until round 11 it could: the batch
+  /// maintenance call was `await`ed INSIDE the write task that `pendingIndexUpdateTask` points at, so
+  /// its `barrierWriteWithoutTransaction` — which excludes the pool's READERS, that being the whole
+  /// reason the truncate needs it — sat in the supersede tail. One slow or wedged search/backlink
+  /// query therefore blocked not just the truncate but every reindex, watcher delta and save
+  /// submitted afterwards, for the rest of the running session. It is scheduled as its own tracked
+  /// write instead (see `scheduleIndexBatchMaintenance()`).
+  ///
+  /// COALESCED to at most one outstanding pass: maintenance is idempotent housekeeping, and without
+  /// this a wedged reader would let every subsequent index write pile another blocked barrier behind
+  /// the first. `.workspaceClose` maintenance is unaffected — it stays chained and awaited, because
+  /// there is nothing left to index by then and the close is what has to wait.
+  private var pendingIndexBatchMaintenance: Task<Void, Never>?
+
   /// Narrow test seam: awaited at the head of every background index write, before it waits for its
   /// predecessor and long before it touches the pool. It exists so a test can hold write #1 open and
   /// prove write #2 is GENUINELY still queued when a close or a quit runs — GRDB's
@@ -733,10 +749,12 @@ final class IndexDatabase {
           )
         }.value
         await self?.refreshSearchResultsInBackground(in: appState)
-        // A full reindex is the single biggest WAL producer in the app; bound the log while we are
-        // still off-main and no other index write can start (this call is inside the supersede
-        // chain, so `waitForPendingReindex()` covers it too).
-        await self?.performMaintenanceInBackground(reason: .indexBatch)
+        // A full reindex is the single biggest WAL producer in the app; bound the log afterwards.
+        // ARMED, not awaited: keeping the barrier inside this task put it in the supersede tail, so a
+        // pool reader that blocked the truncate blocked every write submitted behind it. Tests sync
+        // on it through `drainPendingIndexWrites()`, which tracks it, rather than through
+        // `waitForPendingReindex()`, which no longer does.
+        self?.scheduleIndexBatchMaintenance()
         return true
       } catch {
         self?.report(error, appState: appState, action: "rebuild Pensieve search index")
@@ -930,7 +948,8 @@ final class IndexDatabase {
         await self?.refreshSearchResultsInBackground(in: appState)
         // Watcher deltas are small individually but relentless in aggregate; the WAL-size throttle
         // inside `performMaintenanceInBackground` keeps this to a no-op until the log actually grows.
-        await self?.performMaintenanceInBackground(reason: .indexBatch)
+        // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
+        self?.scheduleIndexBatchMaintenance()
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")
@@ -1013,6 +1032,28 @@ final class IndexDatabase {
   /// filesystem. Both run inside `barrierWriteWithoutTransaction`, which is the only GRDB entry
   /// point that also excludes the pool's READER connections; a plain write would leave readers
   /// holding WAL snapshots and SQLite would silently downgrade the truncate to a no-op.
+  /// Arms hot-path storage hygiene as its OWN tracked index write, instead of awaiting it inside the
+  /// write task the supersede chain points at.
+  ///
+  /// This is the whole of round 11's liveness fix and it is deliberately not a change to WHAT the
+  /// maintenance does: the barrier truncate stays a full `barrierWriteWithoutTransaction`, because a
+  /// PASSIVE checkpoint recycles WAL frames without ever shrinking the `-wal` file (see
+  /// `MaintenanceReason`) — making the hot path best-effort would quietly retire the 16 MiB bound in
+  /// exactly the reindex-storm-with-readers case it was built for. What changes is who WAITS for it:
+  /// nobody. It still waits for the reader; nothing else waits for it.
+  ///
+  /// Still covered by the termination drain, and by construction rather than by convention:
+  /// `scheduleIndexWrite` registers the task in `scheduledIndexWrites`, which
+  /// `drainPendingIndexWrites()` awaits to stability before phase L latches the funnel. Refused past
+  /// the latch on both sides — here, and inside `performMaintenanceInBackground` itself.
+  private func scheduleIndexBatchMaintenance() {
+    guard !isClosedForTermination, pendingIndexBatchMaintenance == nil else { return }
+    pendingIndexBatchMaintenance = scheduleIndexWrite { [weak self] in
+      await self?.performMaintenanceInBackground(reason: .indexBatch)
+      self?.pendingIndexBatchMaintenance = nil
+    }
+  }
+
   func performMaintenanceInBackground(reason: MaintenanceReason) async {
     guard !isRefusedAfterTermination("performMaintenanceInBackground") else { return }
     guard let pool = databasePool, let databaseURL else { return }
@@ -1270,7 +1311,8 @@ final class IndexDatabase {
         // does, and without this hook nothing here would ever bound it — the declared 16 MiB
         // ceiling would only be enforced on reindex/delta paths a plain "edit and save" never
         // takes. The WAL-size throttle keeps a small save free: it stats one file and returns.
-        await self?.performMaintenanceInBackground(reason: .indexBatch)
+        // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
+        self?.scheduleIndexBatchMaintenance()
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")

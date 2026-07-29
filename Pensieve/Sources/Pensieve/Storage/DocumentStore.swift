@@ -2926,11 +2926,38 @@ final class DocumentStore {
   /// then sit in memory with nothing scheduled to write them, while its index debounce (left armed
   /// since round 7 precisely to wait for that save) fires at 5 s over text that is not on disk.
   ///
-  /// The INDEX half stays unconditional here on purpose: narrowing it is a flush-vs-cancel decision
-  /// per call site, which round 7 made for the close path only, and changing it here would alter
-  /// index behaviour on paths this cut did not review.
+  /// The INDEX half is narrowed the same way, and for the symmetrical defect. Window B armed both
+  /// debounces and window A then switches, clears, restores or saves-as; the ownership check above
+  /// preserved B's SAVE, while an unconditional `cancelIndex()` here threw away the index write that
+  /// save exists to publish. B's 1.5 s autosave then lands its edited text through
+  /// `saveExisting(indexNow: false)` and nothing re-issues the FTS row — and for an AD-HOC document
+  /// there is no workspace scan to repair it, so the stale row is permanent.
+  ///
+  /// Cancel, not flush, for our OWN debounce: every caller here is on its way to replace this
+  /// session's document, and the paths that publish text (`saveAs`) index it explicitly afterwards.
+  /// A FOREIGN debounce is left ARMED — not flushed — because flushing it would submit another
+  /// window's unsaved buffer to SQLite ahead of its file write, which is the ordering
+  /// `savePendingChangesOnClose` forbids. Left armed it fires on its own 5 s schedule over bytes its
+  /// owner's surviving autosave has by then written, or is deferred again by that owner's own close.
   private func cancelOwnDebouncesOnSessionChange(appState: AppState) {
     cancelArmedSaveIfOwned(by: appState)
+    cancelArmedIndexIfOwned(by: appState)
+  }
+
+  /// Cancels the armed 5 s index debounce ONLY when it belongs to `appState`'s CURRENT document — the
+  /// one this session is about to leave behind. A no-op when nothing is armed, when the session has
+  /// no document (an untitled window never owns an index debounce: `scheduleIndex` is only ever
+  /// called with one), or when the armed owner is another window's document.
+  ///
+  /// Identity on the index side is the URL, because that is what `Autosaver.armedIndexOwner` records.
+  /// Two windows on the SAME file are therefore indistinguishable here — the named residual from
+  /// round 8, unchanged: one of them can still cancel the other's debounce. The defect this closes is
+  /// the far larger one, where any session change cancelled a debounce for a completely different
+  /// document.
+  private func cancelArmedIndexIfOwned(by appState: AppState) {
+    guard let armedOwner = autosaver.armedIndexOwner,
+      armedOwner == appState.documentSession.document?.id
+    else { return }
     autosaver.cancelIndex()
   }
 
