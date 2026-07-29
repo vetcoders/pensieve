@@ -3939,6 +3939,182 @@ final class PensieveSmokeTests: XCTestCase {
       otherState.documentSession.isDirty, "the cancelled window keeps its unsaved work intact")
   }
 
+  /// The quit pass must be TRANSACTIONAL, not just vetoable. The existing Cancel
+  /// pin above asks the cancelling window FIRST, so the destructive branch never
+  /// fires; here the Don't Save is answered BEFORE the Cancel — the firing window
+  /// is asked LAST — which is the order that used to lose data. With decide and
+  /// apply fused, window B's "Don't Save" physically deleted its recovery draft
+  /// and cleared `isDirty` while window A's Cancel then kept the app running: B
+  /// still showed its text, but a crash lost it and the next ⌘Q/close asked
+  /// nothing. A cancelled quit must leave B exactly as recoverable as before.
+  @MainActor
+  func testQuitDiscardInAnotherWindowThenCancelKeepsTheRecoveryDraft() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitDiscardTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let discardWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      discardWindow.close()
+    }
+
+    // Window B: untitled, dirty, with a recovery draft already on disk. Its
+    // guard answers Don't Save. It is an "other" window, so ⌘Q asks it FIRST.
+    let discardRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryB", isDirectory: true))
+    var promptedDiscard = false
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: discardRecovery,
+      dirtySessionPrompt: { session in
+        promptedDiscard = session.isUntitled
+        return .discard
+      })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry)
+    XCTAssertTrue(discardController.createUntitledDocument())
+    discardState.activeDocumentText = "window B unsaved draft"
+    discardState.activeDocumentDirty = true
+    // Flush a recovery draft the way autosave/close would, so the Discard has
+    // something real to drop.
+    XCTAssertTrue(discardStore.savePendingChangesOnClose(appState: discardState))
+    XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
+    let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
+
+    // Window A: fires ⌘Q, so it is asked LAST — and Cancels.
+    var promptedCancel = false
+    let firingState = AppState()
+    let firingController = AppController(
+      appState: firingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        dirtySessionPrompt: { _ in
+          promptedCancel = true
+          return .cancel
+        }),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(firingController.createUntitledDocument())
+    firingState.activeDocumentText = "window A unsaved"
+    firingState.activeDocumentDirty = true
+
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertFalse(
+      firingController.applicationShouldTerminate(),
+      "a Cancel in the firing window must abort the whole quit")
+    XCTAssertTrue(promptedDiscard, "window B must have been asked before window A")
+    XCTAssertTrue(promptedCancel, "the firing window must have been asked last")
+
+    XCTAssertTrue(
+      discardState.activeDocumentDirty,
+      "the discarded window must stay dirty — Don't Save was only recorded")
+    XCTAssertEqual(
+      discardState.activeDocumentText, "window B unsaved draft",
+      "the buffer text must survive the aborted quit")
+    XCTAssertEqual(
+      discardState.windowModel.documentIdentity, discardIdentity,
+      "the discarded window must still own its document")
+    XCTAssertFalse(
+      discardRecovery.loadDrafts().isEmpty,
+      "the recovery draft must still exist — a cancelled Discard is recoverable")
+    // The teardown guard and the close sheet both key off the session being
+    // dirty: a silently-cleaned session would ask nothing on the NEXT close.
+    XCTAssertNotNil(
+      discardStore.closeDecision(appState: discardState).prompt,
+      "closing window B again must still ask about its unsaved work")
+  }
+
+  /// The pathed twin of the pin above, for the SECOND kind of Discard: a
+  /// file-backed document with auto-save OFF answers Don't Save, and the firing
+  /// window then Cancels. The in-memory edit is the only copy — auto-save off
+  /// means nothing reached disk — so cancelling the pending write and clearing
+  /// `isDirty` is just as irreversible as dropping an untitled draft, and must
+  /// wait for the apply phase. The file itself is never written by this path.
+  @MainActor
+  func testQuitPathedDontSaveInAnotherWindowThenCancelKeepsTheEdit() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitPathedTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let discardWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      discardWindow.close()
+    }
+
+    // Window B: a pathed doc with auto-save OFF, edited in memory only.
+    let fileURL = folder.appendingPathComponent("pathed.md")
+    try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    var promptedForPathedDocument = false
+    let discardState = AppState()
+    let discardStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      dirtySessionPrompt: { session in
+        promptedForPathedDocument = !session.isUntitled
+        return .discard
+      })
+    let discardController = AppController(
+      appState: discardState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: discardStore,
+      documentWindowRegistry: registry)
+    discardStore.load(ref: DocumentRef(id: fileURL.standardizedFileURL), into: discardState)
+    discardState.activeDocumentText = "edited, never written"
+    discardState.activeDocumentDirty = true
+
+    // Window A: fires ⌘Q, asked LAST, and Cancels.
+    let firingState = AppState()
+    let firingController = AppController(
+      appState: firingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        dirtySessionPrompt: { _ in .cancel }),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      documentWindowRegistry: registry)
+    XCTAssertTrue(firingController.createUntitledDocument())
+    firingState.activeDocumentText = "window A unsaved"
+    firingState.activeDocumentDirty = true
+
+    registry.registerController(discardController, for: discardWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertFalse(
+      firingController.applicationShouldTerminate(),
+      "a Cancel in the firing window must abort the whole quit")
+    XCTAssertTrue(
+      promptedForPathedDocument,
+      "auto-save off must ask before a pathed document is settled on quit")
+    XCTAssertTrue(
+      discardState.activeDocumentDirty,
+      "a cancelled quit must leave the pathed edit dirty — Don't Save was only recorded")
+    XCTAssertEqual(
+      discardState.activeDocumentText, "edited, never written",
+      "the in-memory edit is the only copy and must survive the aborted quit")
+    XCTAssertEqual(
+      try String(contentsOf: fileURL, encoding: .utf8), "on disk",
+      "auto-save off means the quit pass writes nothing to the file, aborted or not")
+    XCTAssertNotNil(
+      discardStore.closeDecision(appState: discardState).prompt,
+      "closing window B again must still ask about its unsaved edit")
+  }
+
   /// Open Files mirrors EVERY window's documents into EVERY window's sidebar, so
   /// closing a row can target a document owned by ANOTHER window. The dirty
   /// guard must run in the target's OWN session — cancelling it there must abort

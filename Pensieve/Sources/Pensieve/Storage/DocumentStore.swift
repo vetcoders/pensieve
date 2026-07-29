@@ -3172,8 +3172,9 @@ final class DocumentStore {
   /// guard — force-save a pathed doc, or Save/Discard/Cancel an untitled draft —
   /// without clearing the session, returning `false` only when the untitled
   /// prompt was cancelled. Correct for switching the document within one window,
-  /// where there is no later step that could still abort. A multi-window close
-  /// that CAN be cancelled late must instead split decide from apply via
+  /// where there is no later step that could still abort. A multi-window pass
+  /// that CAN be cancelled late — "Clear Open Files" and ⌘Q — must instead split
+  /// decide from apply via
   /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`.
   @discardableResult
   func prepareForDocumentSwitch(appState: AppState) -> Bool {
@@ -3370,10 +3371,16 @@ final class DocumentStore {
     applyDirtySessionResolution(resolution, appState: appState)
   }
 
-  /// Settles the current buffer before something replaces it: a document switch,
-  /// a new document, or app termination. Single-window path — decide and apply
-  /// run back to back, because there is no later window whose Cancel could
-  /// abort the pass.
+  /// Settles the current buffer before something replaces it WITHIN this window:
+  /// a document switch or a new document. Single-window path — decide and apply
+  /// run back to back, because nothing later in such a pass can still cancel it.
+  ///
+  /// App termination is deliberately NOT on this path: ⌘Q resolves every window
+  /// and a Cancel in the LAST one aborts the quit, so the fused form would have
+  /// destroyed an earlier window's draft before the pass could be called off.
+  /// That pass runs the split
+  /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`
+  /// pair instead, exactly like "Clear Open Files".
   ///
   /// Auto-save decides who owns a file-backed buffer here as well. With auto-save
   /// on, the switch flushes silently — keeping that file current is Pensieve's
