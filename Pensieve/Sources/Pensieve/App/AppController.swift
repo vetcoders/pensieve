@@ -678,21 +678,28 @@ final class AppController: ObservableObject {
     return self
   }
 
-  /// Phase-1 confirm half of the multi-window "Clear Open Files" pass. When
-  /// `identity` is this
-  /// window's active document it runs the NON-DESTRUCTIVE decide half and hands
-  /// back the resolution — a Discard is only RECORDED, not applied — so a Cancel
-  /// raised on a LATER window can abort with nothing lost. Returns `nil` when
-  /// the user cancelled. When `identity` is not this window's active doc it is a
-  /// no-op reporting `.settled`.
+  /// Phase-1 confirm for THIS window's session, the single source of truth for
+  /// every multi-window pass that can still be cancelled after this window has
+  /// answered — "Clear Open Files" and ⌘Q alike. Runs the NON-DESTRUCTIVE decide
+  /// half: a Save writes its bytes (a write is not a loss, and a failed I/O is
+  /// the last thing that can still abort the pass), while a Discard is only
+  /// RECORDED, never applied. Returns `nil` when the user cancelled, which the
+  /// caller must read as "apply nothing, close nothing".
+  func confirmDirtySessionForDeferredClose() -> DocumentStore.DirtySessionResolution? {
+    documentStore.confirmDirtySessionForExternalClose(appState: appState)
+  }
+
+  /// The "Clear Open Files" entry point: the same phase-1 confirm, gated on the
+  /// pass actually targeting this window's active document. When `identity` is
+  /// not this window's active doc it is a no-op reporting `.settled`.
   func confirmDirtySessionForExternalClose(
     identity: DocumentIdentity
   ) -> DocumentStore.DirtySessionResolution? {
     guard appState.windowModel.documentIdentity == identity.standardized else { return .settled }
-    return documentStore.confirmDirtySessionForExternalClose(appState: appState)
+    return confirmDirtySessionForDeferredClose()
   }
 
-  /// Phase-2 apply for the "Clear Open Files" pass: performs the destructive
+  /// Phase-2 apply for a deferred multi-window pass: performs the destructive
   /// step phase 1 deferred for this window — dropping an untitled draft the user
   /// chose to Discard and marking it clean. `.settled` is a no-op.
   func applyDeferredDirtySessionResolution(_ resolution: DocumentStore.DirtySessionResolution) {
@@ -733,11 +740,13 @@ final class AppController: ObservableObject {
     // single-window guard and with it the silent-loss bug this collect/apply
     // shape exists to prevent.
     //
-    // FOLLOW-UP, required rather than optional: compose the two — a multi-window
-    // atomic pass driven by the sheet — on primitives shared with the quit path,
-    // which carries the identical non-atomic defect. Until that lands, Clear Open
-    // Files is safe and atomic but visually inconsistent with the rest of the
-    // close surface.
+    // The quit path (`applicationShouldTerminate`) now shares these primitives:
+    // it was the other multi-window pass carrying the identical non-atomic
+    // defect, and it collects-then-applies through the same
+    // `confirmDirtySessionForDeferredClose` / `applyDeferredDirtySessionResolution`
+    // pair. FOLLOW-UP, still open but no longer a data-loss one: drive both
+    // passes through the sheet, so they are visually consistent with the rest of
+    // the close surface.
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
@@ -845,22 +854,42 @@ final class AppController: ObservableObject {
     // ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
     // from. Other windows would otherwise exit through their teardown path,
     // which has no veto point left and can only stash a recovery draft, never
-    // ask. Resolve each live window's session through the same synchronous
-    // Save / Don't Save / Cancel guard a document switch uses; a Cancel anywhere
-    // aborts the whole quit and leaves every window exactly as it was.
+    // ask.
+    //
+    // ATOMIC COLLECT-THEN-APPLY, on the same primitives "Clear Open Files"
+    // uses — a quit is the other multi-window pass a LATE Cancel can abort:
+    //
+    //   Phase 1 (COLLECT) — ask every window and RECORD its resolution without
+    //   performing any deferred destruction. A Save does write bytes (not a
+    //   loss, and the last step a failed I/O can still abort the quit on), but
+    //   a Discard is only remembered: its recovery draft stays on disk and its
+    //   buffer stays dirty. If ANY window cancels, apply nothing and quit
+    //   nothing — every window is exactly as it was, and an untitled Discard
+    //   answered earlier in this same pass is still recoverable.
+    //
+    //   Phase 2 (APPLY) — only once EVERY window consented, run the deferred
+    //   Discards. Fusing the two (the old `prepareForDocumentSwitch` per
+    //   window) meant a "Don't Save" in one window physically deleted its
+    //   recovery draft and cleared `isDirty` BEFORE a later window's Cancel
+    //   aborted the quit — leaving a still-rendered buffer that no longer
+    //   survives a crash and that the next ⌘Q/close no longer asks about.
+    //
+    // Self is asked LAST so the firing window's own prompt is the final word,
+    // exactly as before.
+    var deferred: [(controller: AppController, resolution: DocumentStore.DirtySessionResolution)] =
+      []
     let others = documentWindowRegistry.liveDocumentControllers().filter { $0 !== self }
-    for controller in others where !controller.resolveSessionForTermination() {
-      return false
+    for controller in others {
+      guard let resolution = controller.confirmDirtySessionForDeferredClose() else { return false }
+      deferred.append((controller, resolution))
     }
-    return resolveSessionForTermination()
-  }
+    guard let ownResolution = confirmDirtySessionForDeferredClose() else { return false }
+    deferred.append((self, ownResolution))
 
-  /// Settles THIS window's unsaved session for a quit: the same synchronous
-  /// Save / Don't Save / Cancel guard `prepareForDocumentSwitch` runs before a
-  /// buffer is replaced. Returns false when the user cancels, which aborts the
-  /// quit.
-  func resolveSessionForTermination() -> Bool {
-    documentStore.prepareForDocumentSwitch(appState: appState)
+    for (controller, resolution) in deferred {
+      controller.applyDeferredDirtySessionResolution(resolution)
+    }
+    return true
   }
 
   /// Save-on-close guard for THIS window's session. Routed from the shared
