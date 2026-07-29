@@ -724,6 +724,15 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// is the only state that proves anything: parked before the gate an open is simply refused. With
   /// it held, a drain that participates CANNOT complete — that "has not finished yet" is the whole
   /// assertion, and it is the direction that cannot pass by luck.
+  ///
+  /// Round 9 amended the tail of this test, not its subject. It used to demand an EMPTY rejection
+  /// list, reading any refusal as proof that the pool had been published behind the checkpoint. That
+  /// inference stopped holding once the owner path grew its own post-await recheck: the owner and the
+  /// drain are parked on the SAME task, so which of them resumes first is the scheduler's business,
+  /// and an owner that resumes second is correctly handed nil. Published-inside-the-quit is now
+  /// proved by the two assertions that actually mean it — the pool is published and the terminal
+  /// checkpoint truncated the WAL — while the list is checked for anything OTHER than that one
+  /// benign refusal.
   func testTheDrainWaitsForADatabaseOpenThatIsStillBuildingItsPool() throws {
     let folder = try makeTemporaryFolder()
     let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
@@ -777,13 +786,17 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     XCTAssertTrue(
       database.isClosedForTermination, "a completed sequence must leave the funnel closed")
-    XCTAssertEqual(
-      database.terminationRejectedEntryPoints, [],
-      "an open the drain waited for finishes BEFORE the latch, so nothing may be refused: a "
-        + "rejection here would mean the pool was published behind the checkpoint instead")
+    XCTAssertTrue(
+      Set(database.terminationRejectedEntryPoints).isSubset(of: ["ensureOpenInBackground"]),
+      "the ONLY refusal allowed after an open the drain waited for is the owner's own post-await "
+        + "recheck, which fires whenever the drain's continuation is scheduled first. Anything else "
+        + "here is real work that reached the funnel behind the terminal checkpoint. Got "
+        + "\(database.terminationRejectedEntryPoints)")
     XCTAssertEqual(
       database.databaseURL, databaseURL,
-      "…and the pool must be published, so the terminal checkpoint had a database to truncate")
+      "…and the pool must be published — which is also what separates that benign refusal from a "
+        + "REFUSED publication, since the latter leaves this nil — so the terminal checkpoint had a "
+        + "database to truncate")
     XCTAssertEqual(
       walSize(for: databaseURL), 0,
       "…which it did (the WAL is \(walSize(for: databaseURL)) bytes)")
@@ -832,6 +845,192 @@ final class TerminationQuiescenceTests: XCTestCase {
       database.terminationRejectedEntryPoints, ["ensureOpenInBackground"],
       "…and must refuse by name exactly once — at the publication point, not on entry, which is "
         + "where it still had permission")
+  }
+
+  // MARK: - R9: the OWNER of an open, resuming behind a latch that closed while it slept
+
+  /// Round 9, finding 1 — the mirror of the joiner half round 6 fixed, and the last window left in
+  /// the open-vs-latch family.
+  ///
+  /// The termination drain awaits the SAME `openTask` the owning caller is parked on. The instant
+  /// that task publishes its pool both continuations become runnable, and the drain's may run first:
+  /// it finds nothing else owed, the sequence closes the latch and takes the terminal checkpoint, and
+  /// only THEN does the owner resume — holding a live pool for a database the quit has already
+  /// finished with. The latch check inside the task cannot cover this: it refuses a latch that closed
+  /// BEFORE publication, and here the latch closes after it.
+  ///
+  /// `indexInBackground` is the owner on purpose. It is a real workspace update, it consumes the
+  /// open's return value directly, and given a pool it writes — so the assertion is not "a private
+  /// function returned nil" but the property the finding is actually about: none of its payload is in
+  /// the index. Read back through an INDEPENDENT connection, because the latched database refuses
+  /// reads too.
+  ///
+  /// Honest limit, and the reason for the publication seam. Racing the two continuations for real is
+  /// not a pin, it is a coin toss: measured over 15 runs of an earlier draft of this test the drain
+  /// won 13 times and the owner 2, and an owner that wins writes legitimately (the drain then awaits
+  /// its write and the checkpoint still goes last). So the latch is closed HERE, from inside the
+  /// publishing step, which reaches the same state the drain produces when it wins — deterministically
+  /// and with no continuation able to interleave. What is pinned is the contract ("a pool published
+  /// before a latch may not be handed to a caller afterwards"), not the scheduler.
+  func testTheOwnerOfAnOpenRefusesAPoolTheLatchClosedOverWhileItWasParked() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let database = IndexDatabase(databaseURL: databaseURL)
+    XCTAssertNil(
+      database.databaseURL,
+      "fixture precondition: this database has never been opened, so the update below OWNS the open "
+        + "rather than joining one")
+
+    let gate = ParkingGate()
+    database.databaseOpenGateOverride = { await gate.arrive() }
+    // The drain, standing in for the one the sequence below runs: it awaits this very open, and when
+    // its continuation is the first of the two to be scheduled it closes the latch at precisely this
+    // instant — pool already published, owner still parked.
+    database.didPublishDatabasePool = { [weak database] in database?.closeForTermination() }
+
+    let ownerFinished = CompletionFlag()
+    let ownerWroteThrough = CompletionFlag()
+    Task { @MainActor in
+      let didWrite = await database.indexInBackground(
+        document: self.documentRef(root: folder, name: "owner-note.md"),
+        body: "r9ownerpayload behind the terminal checkpoint")
+      ownerWroteThrough.isSet = didWrite
+      ownerFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the update must be parked inside the open it owns, past the funnel gate "
+        + "and already registered as `openTask`")
+    XCTAssertFalse(ownerFinished.isSet, "fixture precondition: …and must not have completed")
+
+    let quitFinished = CompletionFlag()
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: makeIsolatedFolderManager(in: folder, database: database, prefix: "OpenOwner"),
+      autosaver: Autosaver())
+    Task { @MainActor in
+      await sequence.run()
+      quitFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 1)
+    XCTAssertFalse(
+      quitFinished.isSet,
+      "fixture precondition: the drain must be parked on the very same `openTask`, which is what "
+        + "makes this a race at all")
+
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 10)
+    XCTAssertTrue(quitFinished.isSet, "the quit must complete once the open is allowed through")
+    pumpMainRunLoop(until: { ownerFinished.isSet }, timeout: 10)
+    XCTAssertTrue(ownerFinished.isSet, "…and the refused owner must return promptly, not hang")
+
+    XCTAssertEqual(
+      database.databaseURL, databaseURL,
+      "the pool must still be PUBLISHED: it was published before the latch closed, so the terminal "
+        + "checkpoint saw it — this refusal discards nothing and tears nothing down, it only declines "
+        + "to hand the pool onward")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, ["ensureOpenInBackground"],
+      "…and the owner must be refused by name exactly once, AFTER its await: an empty list here means "
+        + "the owner's continuation won the race and this test never reproduced the window")
+    XCTAssertFalse(
+      ownerWroteThrough.isSet,
+      "…so the update must report that it wrote nothing")
+    XCTAssertEqual(
+      try indexHits(matching: "r9ownerpayload", at: databaseURL), 0,
+      "…and nothing of its payload may be in the index, which is the whole point: a write through the "
+        + "returned pool would land behind a checkpoint that has already been taken")
+    XCTAssertEqual(
+      walSize(for: databaseURL), 0,
+      "…leaving the terminal checkpoint genuinely last (WAL is \(walSize(for: databaseURL)) bytes)")
+  }
+
+  // MARK: - R9: a second close must not orphan the first close's maintenance
+
+  /// Round 9, finding 2 — the missing half of round 5's P9 await.
+  ///
+  /// `indexMaintenanceTask` is the ONLY handle to a close's housekeeping, and
+  /// `scheduleIndexMaintenance(after:)` used to overwrite it. Close a workspace, reopen and close
+  /// another before the first pass has finished, and the older task is dropped on the floor:
+  /// `waitForPendingIndexMaintenance()` — the quit's one sync point — then awaits the newest handle
+  /// only, while the orphan is still draining and can enter its vacuum + truncate after the terminal
+  /// checkpoint has started, recreating WAL frames behind the operation meant to be final.
+  ///
+  /// The wedge sits INSIDE the maintenance pass, immediately before the detached vacuum, because
+  /// that is the only state that proves anything — a pass parked before it was scheduled is simply a
+  /// pass that does not exist yet. It holds the FIRST arrival only, which is precisely the finding's
+  /// shape: an old pass still working while a new, quick one sails past it.
+  ///
+  /// The assertion that cannot pass by luck is the negative one: with the first pass held, the wait
+  /// must NOT return. Unchained, the second pass runs to completion and releases it.
+  func testASecondCloseDoesNotOrphanTheFirstClosesIndexMaintenance() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+    XCTAssertEqual(
+      database.databaseURL, databaseURL,
+      "fixture precondition: the pool must be open, or maintenance returns before it ever reaches "
+        + "the wedge")
+
+    let manager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "MaintenanceChain")
+
+    let log = EventLog()
+    let arrivals = Counter()
+    let gate = ParkingGate()
+    database.maintenanceGateOverride = {
+      let arrival = arrivals.next()
+      log.append("maintenance-\(arrival)-enter")
+      // Only the FIRST pass is held. A gate that parked every pass would be satisfied by the buggy
+      // build too — the second task would park in the first one's place and the wait would block for
+      // the wrong reason.
+      guard arrival == 1 else { return }
+      await gate.arrive()
+    }
+
+    manager.closeWorkspace(into: appState)
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the first close's maintenance must be parked inside its vacuum, past "
+        + "every early return")
+
+    // The second close. This is the assignment the finding is about: it replaces the only handle to
+    // the pass that is still parked above.
+    manager.closeWorkspace(into: appState)
+
+    let waitReturned = CompletionFlag()
+    Task { @MainActor in
+      await manager.waitForPendingIndexMaintenance()
+      log.append("wait-returned")
+      waitReturned.isSet = true
+    }
+    pumpMainRunLoop(until: { waitReturned.isSet }, timeout: 1)
+    XCTAssertFalse(
+      waitReturned.isSet,
+      "the quit's only maintenance sync point returned while the FIRST close's vacuum was still "
+        + "parked: in production the terminal checkpoint would start here, and that orphaned pass "
+        + "would truncate and rewrite the WAL behind it")
+    XCTAssertEqual(
+      gate.arrivalCount, 1,
+      "…and the first pass must still be the one being held, not released early")
+
+    log.append("gate-opened")
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { waitReturned.isSet }, timeout: 10)
+    XCTAssertTrue(
+      waitReturned.isSet, "…and the wait must return once the held pass is allowed to finish")
+
+    XCTAssertEqual(
+      log.events, ["maintenance-1-enter", "gate-opened", "maintenance-2-enter", "wait-returned"],
+      "…in that order: the second pass may not even ENTER its vacuum until the first has finished, "
+        + "which is the compaction-after-writes ordering `scheduleIndexMaintenance(after:)` "
+        + "documents, preserved for free by the chain")
   }
 
   // MARK: - R6: a dirty session's index write follows its file write
@@ -1603,6 +1802,16 @@ final class TerminationQuiescenceTests: XCTestCase {
       lock.lock()
       count += 1
       lock.unlock()
+    }
+
+    /// Increments and reads back under ONE lock, so a seam that fires from two concurrent tasks can
+    /// tell which arrival it is. `increment()` followed by `value` cannot: two callers can interleave
+    /// between the two locks and both read the same number.
+    func next() -> Int {
+      lock.lock()
+      defer { lock.unlock() }
+      count += 1
+      return count
     }
   }
 

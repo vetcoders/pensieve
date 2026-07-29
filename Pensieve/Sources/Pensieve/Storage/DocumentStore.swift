@@ -971,9 +971,22 @@ final class FolderManager {
   ///   cancellation, and a save's write may not even have joined that chain yet. Ordinary
   ///   `Close Folder` used to arm this task with nothing to await and compacted straight through
   ///   a queue that was still moving.
+  ///
+  /// Successive passes CHAIN rather than replace. This handle is the only one there is, so a second
+  /// close arriving before the first close's pass has finished — reopen a workspace, close it again
+  /// — used to drop the older task on the floor: `waitForPendingIndexMaintenance()` then awaited
+  /// only the newest one, while the orphan was still draining and could enter its vacuum + truncate
+  /// after the terminal checkpoint had started, recreating WAL frames behind the operation meant to
+  /// be final. Awaiting the predecessor at the head makes "await the newest" transitively await them
+  /// all, and it preserves the compaction-after-writes ordering above for free: a pass cannot
+  /// truncate a log the previous pass's write is still growing. Cancelling the orphan instead would
+  /// be the wrong half of the cancel/drain distinction — its `barrierWriteWithoutTransaction` is
+  /// accepted work, so cancellation would abandon only the wait, not the vacuum.
   private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
     let indexDatabase = indexDatabase
+    let previous = indexMaintenanceTask
     indexMaintenanceTask = Task {
+      await previous?.value
       await pendingIndexWork?.value
       await indexDatabase.drainPendingIndexWrites()
       await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
@@ -1003,9 +1016,13 @@ final class FolderManager {
     workspaceValidationTask?.cancel()
   }
 
-  /// Deterministic sync point for the post-close index housekeeping. Because the maintenance task
-  /// chains on whatever final index write it was armed behind, awaiting this also awaits that
-  /// write — which is exactly the ordering `removeRoot`'s last-root path depends on.
+  /// Deterministic sync point for the post-close index housekeeping, and the quit's only handle on
+  /// it. Because the maintenance task chains on whatever final index write it was armed behind,
+  /// awaiting this also awaits that write — which is exactly the ordering `removeRoot`'s last-root
+  /// path depends on. And because each pass chains on its PREDECESSOR
+  /// (`scheduleIndexMaintenance(after:)`), awaiting the newest handle transitively awaits every
+  /// older pass still in flight: when this returns, no maintenance is outstanding at all, so the
+  /// terminal checkpoint that follows it cannot be overtaken by an orphaned vacuum.
   func waitForPendingIndexMaintenance() async {
     await indexMaintenanceTask?.value
   }

@@ -51,6 +51,27 @@ final class IndexDatabase {
   /// production.
   var databaseOpenGateOverride: (@Sendable () async -> Void)?
 
+  /// Narrow test seam, third sibling of the two above: awaited INSIDE `performMaintenanceInBackground`,
+  /// after every early return and immediately before the detached vacuum + truncate.
+  ///
+  /// The position is again the whole point. Parked here a maintenance pass is GENUINELY in flight —
+  /// past its guards, holding work the terminal checkpoint must not overtake — which is the state
+  /// `waitForPendingIndexMaintenance()` has to cope with when a second workspace close arms another
+  /// pass behind it. A wedge placed before the scheduling would only prove that a task nobody has
+  /// created yet has not run. `nil` in production.
+  var maintenanceGateOverride: (@Sendable () async -> Void)?
+
+  /// Narrow test seam: fired on the main actor INSIDE the open task, in the SAME step that publishes
+  /// the pool and before that task returns to the caller which owns it.
+  ///
+  /// It exists because the window the owner-path recheck closes cannot be reached from a test any
+  /// other way. That window is "the latch closed AFTER publication but BEFORE the owning
+  /// continuation was scheduled", and which of the continuations parked on the open task runs first
+  /// is the scheduler's business — measured, the drain wins most but not all of the time, so a pin
+  /// built on that race asserts the scheduler rather than the contract. Fired here a test reaches
+  /// exactly that state synchronously, with no continuation able to interleave. `nil` in production.
+  var didPublishDatabasePool: (@MainActor @Sendable () -> Void)?
+
   /// Coalesces concurrent off-main opens: the first `ensureOpenInBackground` that finds no pool
   /// starts the migration on a detached executor and parks this task; later callers await the SAME
   /// task instead of racing a second `DatabasePool`/migration. Cleared once the open resolves.
@@ -156,9 +177,9 @@ final class IndexDatabase {
     if let databasePool { return databasePool }
     if let openTask {
       let pool = try? await openTask.value
-      // Re-consulted AFTER the await, for the same reason the owner below does it: this caller slept
-      // through an unknown amount of the quit, and handing back a pool the latch has since refused
-      // would let it write behind the terminal checkpoint.
+      // Re-consulted AFTER the await, for the same reason the OWNER path below does it — the full
+      // argument lives there: this caller slept through an unknown amount of the quit, and handing
+      // back a pool the latch has since refused would let it write behind the terminal checkpoint.
       guard !isRefusedAfterTermination("ensureOpenInBackground") else { return nil }
       return pool
     }
@@ -188,13 +209,27 @@ final class IndexDatabase {
       }
       self.databasePool = pool
       self.databaseURL = url
+      self.didPublishDatabasePool?()
       return pool
     }
     openTask = task
     defer { openTask = nil }
 
     do {
-      return try await task.value
+      let pool = try await task.value
+      // Re-consulted AFTER the await, and NOT a duplicate of the check inside the task: that one
+      // refuses a latch which closed BEFORE publication, this one a latch which closed AFTER it.
+      // The window is the termination drain, which awaits this very task — so the instant the task
+      // publishes, the drain's continuation can resume first, find nothing else owed, close the
+      // latch and take the terminal checkpoint, all before this continuation is ever scheduled.
+      //
+      // The asymmetry with the in-task refusal is deliberate: nothing is discarded and nothing is
+      // torn down here. The pool IS published (publication and the in-task latch check are a single
+      // main-actor step, so a published pool always precedes the latch), which means the terminal
+      // checkpoint that just ran SAW it and truncated it. The one thing refused is handing that
+      // pool to a caller who would then write behind a checkpoint already taken.
+      guard !isRefusedAfterTermination("ensureOpenInBackground") else { return nil }
+      return pool
     } catch is OpenRefusedAfterTermination {
       return nil
     } catch {
@@ -970,6 +1005,7 @@ final class IndexDatabase {
     if attemptConversion { didAttemptAutoVacuumConversion = true }
     let pageBudget = reason == .indexBatch ? Self.incrementalVacuumPageBudget : nil
     let conversionByteLimit = effectiveAutoVacuumConversionByteLimit
+    if let gate = maintenanceGateOverride { await gate() }
 
     await Task.detached(priority: .utility) {
       if attemptConversion {
