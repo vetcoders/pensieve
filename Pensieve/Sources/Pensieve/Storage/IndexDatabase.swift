@@ -703,6 +703,16 @@ final class IndexDatabase {
   /// not take the barrier lock.
   private nonisolated static let walCheckpointThresholdBytes: Int64 = 16 * 1024 * 1024
 
+  /// Narrow test seam for the threshold above. The production constant is 16 MiB, and a unit test
+  /// that had to actually write 16 MiB of WAL to reach the batch checkpoint would be a minute-long
+  /// disk-bound test — so the two sides of the throttle (below → left alone, above → checkpoint)
+  /// are pinned by lowering the bar instead. `nil` everywhere in production.
+  var walCheckpointThresholdBytesOverride: Int64?
+
+  private var effectiveWalCheckpointThresholdBytes: Int64 {
+    walCheckpointThresholdBytesOverride ?? Self.walCheckpointThresholdBytes
+  }
+
   /// Below this much slack (256 pages ≈ 1 MiB at the default 4 KiB page size) compaction is not
   /// worth the write amplification — freed pages are reused by the next indexing pass anyway.
   private nonisolated static let freelistCompactionThresholdPages = 256
@@ -734,7 +744,7 @@ final class IndexDatabase {
   func performMaintenanceInBackground(reason: MaintenanceReason) async {
     guard let pool = databasePool, let databaseURL else { return }
     if reason == .indexBatch,
-      Self.walFileSize(for: databaseURL) < Self.walCheckpointThresholdBytes
+      Self.walFileSize(for: databaseURL) < effectiveWalCheckpointThresholdBytes
     {
       return
     }
@@ -950,6 +960,12 @@ final class IndexDatabase {
           }
         }.value
         await self?.refreshSearchResultsInBackground(in: appState)
+        // The ordinary save/autosave tail is an index write like any other: a single large document
+        // (or a long editing session's worth of small ones) grows the WAL just as a watcher delta
+        // does, and without this hook nothing here would ever bound it — the declared 16 MiB
+        // ceiling would only be enforced on reindex/delta paths a plain "edit and save" never
+        // takes. The WAL-size throttle keeps a small save free: it stats one file and returns.
+        await self?.performMaintenanceInBackground(reason: .indexBatch)
         return true
       } catch {
         self?.report(error, appState: appState, action: "update Pensieve search index")

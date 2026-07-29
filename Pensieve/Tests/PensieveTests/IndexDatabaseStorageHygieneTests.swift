@@ -399,6 +399,71 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     }
   }
 
+  // MARK: - Production wiring: an ordinary save is subject to the WAL threshold
+
+  /// Production saves route a single document through `indexInBackground`. That
+  /// path wrote, refreshed and returned — it never consulted the 16 MiB WAL
+  /// bound the rest of this cut declares, so a large document (or a long
+  /// editing session) could push the log past the ceiling and leave it there
+  /// until an unrelated lifecycle event. Threshold lowered through the internal
+  /// seam so the test does not have to write 16 MiB to reach the checkpoint.
+  func testSingleDocumentSaveCheckpointsOnceTheWalPassesTheThreshold() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBefore = walSize(for: databaseURL)
+    XCTAssertGreaterThan(
+      walBefore, 0, "fixture precondition: the WAL must be non-empty before the save under test")
+    database.walCheckpointThresholdBytesOverride = Int64(walBefore)
+
+    let didWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "saved.md"),
+      body: "the document the operator just saved",
+      appState: appState
+    )
+    XCTAssertTrue(didWrite)
+
+    XCTAssertLessThanOrEqual(
+      walSize(for: databaseURL), 64 * 1024,
+      "an ordinary save past the WAL threshold must take the checkpoint like any other index batch "
+        + "(was \(walBefore) bytes, now \(walSize(for: databaseURL)))"
+    )
+  }
+
+  /// The other half of the same contract: below the threshold a save must stay
+  /// free. A non-empty `-wal` afterwards proves no barrier checkpoint was taken
+  /// on the typing/saving hot path.
+  func testSingleDocumentSaveIsThrottledBelowTheWalThreshold() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    await database.openInBackground(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let didWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "small.md"),
+      body: "tiny save",
+      appState: appState
+    )
+    XCTAssertTrue(didWrite)
+
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "a small save must not take the barrier checkpoint — the 16 MiB throttle is the point")
+  }
+
   // MARK: - Workspace fixtures (last-root removal)
 
   private struct WorkspaceSandbox {
