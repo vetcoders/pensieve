@@ -53,6 +53,18 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     return try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(table)") ?? 0 }
   }
 
+  /// Counts FTS matches through an INDEPENDENT connection. Required after a quit: the termination
+  /// latch closes the index funnel, so the database under test refuses to open anything and would
+  /// answer every query with "empty" regardless of what actually landed on disk.
+  private func indexHits(matching needle: String, at databaseURL: URL) throws -> Int {
+    let queue = try DatabaseQueue(path: databaseURL.path)
+    return try queue.read { db in
+      try Int.fetchOne(
+        db, sql: "SELECT COUNT(*) FROM document_fts WHERE document_fts MATCH ?",
+        arguments: [needle]) ?? 0
+    }
+  }
+
   private func documentRef(root: URL, name: String) -> DocumentRef {
     DocumentRef(
       id: root.appendingPathComponent(name).standardizedFileURL,
@@ -819,15 +831,19 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     delegate.applicationWillTerminate(
       Notification(name: NSApplication.willTerminateNotification))
 
-    // Sampled before the search below opens anything against the pool.
     let walAfterQuit = walSize(for: databaseURL)
 
     XCTAssertEqual(
       try String(contentsOf: noteURL, encoding: .utf8), "edited moments before the quit",
       "the quit must flush the window's pending edit itself — willCloseNotification fires after "
         + "applicationWillTerminate, far too late to be the app's final save")
-    XCTAssertFalse(
-      database.search(query: "moments", documents: [ref], appState: appState).isEmpty,
+    // Read through an INDEPENDENT connection, not through `database.search`. Since the termination
+    // latch (R5) the quit closes the index funnel one way, and that includes the lazy open every
+    // read goes through — a read is allowed to CREATE and migrate the database, which is the last
+    // thing a process on its way out should do. So a query through the database under test now
+    // returns empty whether or not the write landed, and only the file on disk can answer this.
+    XCTAssertGreaterThan(
+      try indexHits(matching: "moments", at: databaseURL), 0,
       "the final save's index write must be drained before the process is allowed to go")
     XCTAssertLessThanOrEqual(
       walAfterQuit, 64 * 1024,
