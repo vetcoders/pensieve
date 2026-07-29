@@ -47,11 +47,16 @@ ok() {
 # active Space cannot host it (e.g. a fullscreen Screen Sharing session) --
 # an environment condition, not a product bug.
 dump_window_server_state() {
-  swift - <<'EOF' 2>/dev/null || true
+  SMOKE_OWNER_NAME="$APP_NAME" swift - <<'EOF' 2>/dev/null || true
 import CoreGraphics
+import Foundation
+// Passed through the environment rather than interpolated: the heredoc is
+// quoted so the snippet stays a literal, and the owner name is the staged
+// smoke bundle's, never the operator's app.
+let owner = ProcessInfo.processInfo.environment["SMOKE_OWNER_NAME"] ?? "PensieveSmoke"
 let wl = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
 var total = 0, onscreen = 0
-for w in wl where (w["kCGWindowOwnerName"] as? String) == "Pensieve"
+for w in wl where (w["kCGWindowOwnerName"] as? String) == owner
   && (w["kCGWindowLayer"] as? Int) == 0 {
   total += 1
   if (w["kCGWindowIsOnscreen"] as? Bool) == true { onscreen += 1 }
@@ -907,7 +912,7 @@ if [[ $ax_census_status -ne 0 ]]; then
     printf '%s\n' "$window_server_state"
     window_server_pattern='CGWINDOW_SUMMARY total=([1-9][0-9]*) onscreen=0'
     if [[ "$window_server_state" =~ $window_server_pattern ]]; then
-      log "UI-SMOKE-ENV: Pensieve window exists but is offscreen (active Space unavailable -- e.g. fullscreen Screen Sharing). Environment inconclusive, NOT a product failure. Re-run when a normal desktop Space is active."
+      log "UI-SMOKE-ENV: $APP_NAME window exists but is offscreen (active Space unavailable -- e.g. fullscreen Screen Sharing). Environment inconclusive, NOT a product failure. Re-run when a normal desktop Space is active."
       exit 3
     fi
   fi
