@@ -103,6 +103,12 @@ final class LaunchIntentCoordinator: ObservableObject {
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   private var traceObservers: [NSObjectProtocol] = []
 
+  /// Termination-path injection seams. Production leaves both `nil` and uses the app-wide
+  /// singletons; a unit test sets them so it can drive the REAL `applicationWillTerminate` entry
+  /// point against a temp database without mutating process-global state other tests share.
+  var terminationWindowRegistryOverride: DocumentWindowRegistry?
+  var terminationIndexDatabaseOverride: IndexDatabase?
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
@@ -174,11 +180,23 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
-    // The last document window closing during Quit must not resurrect a
-    // launcher; tell the registry the app is going away before its windows tear
-    // down.
     MainActor.assumeIsolated {
-      DocumentWindowRegistry.shared.beginTermination()
+      // The last document window closing during Quit must not resurrect a
+      // launcher; tell the registry the app is going away before its windows tear
+      // down.
+      (terminationWindowRegistryOverride ?? .shared).beginTermination()
+      // The index's truncating checkpoint used to hang off the custom "Quit Pensieve" menu item
+      // alone (`AppController.applicationShouldTerminate()`), so Dock quit, logout and shutdown —
+      // every path that goes straight to `terminate:` — left the WAL at its high-water mark until
+      // some later session happened to close a workspace. This notification is the one termination
+      // hook the app actually receives: `applicationShouldTerminate(_:)` on THIS delegate is never
+      // invoked under `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so
+      // wiring it there would have looked right and done nothing.
+      //
+      // Cheap by construction rather than by timeout: the batch and workspace-close checkpoints
+      // keep the WAL bounded while the app runs, so by the time we get here the truncate has
+      // little left to flush — the same assumption `applicationShouldTerminate()` already makes.
+      (terminationIndexDatabaseOverride ?? .shared).checkpointOnTerminate()
     }
   }
 }

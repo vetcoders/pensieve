@@ -9,6 +9,7 @@
 //  "the maintenance function ran": a green checkpoint call that leaves the WAL
 //  at its high-water mark would be exactly the bug this cut exists to prevent.
 
+import AppKit
 import GRDB
 import XCTest
 
@@ -242,8 +243,50 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       "reclaimed pages must shrink index.db itself (was \(sizeBefore) bytes, now \(sizeAfter))")
   }
 
-  /// Mirrors `IndexDatabase.freelistCompactionThresholdPages`; kept local because
-  /// the production constant is private and the test asserts the OBSERVABLE
-  /// contract (enough slack exists to be worth reclaiming), not the constant.
+  // MARK: - Production wiring: every quit path checkpoints
+
+  /// The checkpoint used to hang off the custom "Quit Pensieve" menu item alone
+  /// (`AppController.applicationShouldTerminate()`), so Dock quit, logout and
+  /// shutdown — everything that goes straight to `terminate:` — skipped it.
+  ///
+  /// This drives the REAL delegate entry point AppKit calls, not a helper: the
+  /// bug was never in `checkpointOnTerminate()` (which had its own passing
+  /// tests), it was in nothing calling it. Note the delegate hook deliberately
+  /// is NOT `applicationShouldTerminate(_:)`: under
+  /// `@NSApplicationDelegateAdaptor` that method is never invoked at all
+  /// (falsified at runtime on 2026-07-29), so a test pinning it would have gone
+  /// green against dead code.
+  func testApplicationWillTerminateCheckpointsTheIndexOnQuitPathsWithoutTheMenuItem() throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBefore = walSize(for: databaseURL)
+    XCTAssertGreaterThanOrEqual(
+      walBefore, 512 * 1024,
+      "fixture precondition: the churn must actually grow the WAL, otherwise the truncate proves nothing"
+    )
+
+    let delegate = PensieveAppDelegate()
+    // Kept off the process-wide singletons so this test cannot leave a
+    // `beginTermination()` latch behind for whatever runs next in the suite.
+    delegate.terminationWindowRegistryOverride = DocumentWindowRegistry()
+    delegate.terminationIndexDatabaseOverride = database
+    delegate.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+
+    XCTAssertLessThanOrEqual(
+      walSize(for: databaseURL), 64 * 1024,
+      "quitting without the menu item must still truncate the WAL (was \(walBefore) bytes, now \(walSize(for: databaseURL)))"
+    )
+  }
+
   private static let compactionThresholdPages = 256
 }
