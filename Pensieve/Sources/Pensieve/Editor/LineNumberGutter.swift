@@ -26,6 +26,18 @@ class LineNumberGutter: NSRulerView {
     didSet { needsDisplay = true }
   }
 
+  /// 1-based source line the caret currently sits on, so the gutter can pick out
+  /// that number in `gutterCurrentLine` and draw the right-edge accent marker.
+  /// `0` means "no active line". `MarkdownEditorSurface` pushes this on selection
+  /// changes; only a real line change repaints, so same-line typing stays quiet
+  /// (the per-keystroke gutter redraw the scroll pins guard against).
+  var currentLineNumber: Int = 0 {
+    didSet {
+      guard currentLineNumber != oldValue else { return }
+      needsDisplay = true
+    }
+  }
+
   /// Applies the source-panel tokens the brief maps to the gutter: `source`
   /// (fill), `border` (right edge), `srcGutter` (numbers), `srcCurrentLine`.
   func applyTokens(_ tokens: ThemeTokens) {
@@ -39,7 +51,7 @@ class LineNumberGutter: NSRulerView {
     self.textLayoutManager = textLayoutManager
     super.init(scrollView: scrollView, orientation: .verticalRuler)
     self.clientView = scrollView.documentView
-    self.ruleThickness = 40
+    self.ruleThickness = 46
   }
 
   required init(coder: NSCoder) {
@@ -94,9 +106,14 @@ class LineNumberGutter: NSRulerView {
     let textContainerInset = textView.textContainerInset
     let scrollOffset = scrollView?.documentVisibleRect.origin.y ?? 0
 
-    let attributes: [NSAttributedString.Key: Any] = [
-      .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize - 2, weight: .regular),
+    let numberFont = NSFont.monospacedDigitSystemFont(ofSize: fontSize - 2, weight: .regular)
+    let numberAttributes: [NSAttributedString.Key: Any] = [
+      .font: numberFont,
       .foregroundColor: gutterNumber,
+    ]
+    let currentLineAttributes: [NSAttributedString.Key: Any] = [
+      .font: numberFont,
+      .foregroundColor: gutterCurrentLine,
     ]
 
     var lineNumber = 1
@@ -118,6 +135,8 @@ class LineNumberGutter: NSRulerView {
 
       // Only draw if visible
       if fragmentRect.maxY >= rect.minY && fragmentRect.minY <= rect.maxY {
+        let isCurrentLine = lineNumber == currentLineNumber
+        let attributes = isCurrentLine ? currentLineAttributes : numberAttributes
         let numberString = NSString(string: "\(lineNumber)")
         let size = numberString.size(withAttributes: attributes)
         let drawPoint = NSPoint(
@@ -125,6 +144,15 @@ class LineNumberGutter: NSRulerView {
           y: fragmentRect.minY + (frame.height - size.height) / 2
         )
         numberString.draw(at: drawPoint, withAttributes: attributes)
+
+        // Active-line accent: a 2 px marker hard against the gutter's right
+        // edge, in the same current-line token as the number.
+        if isCurrentLine {
+          gutterCurrentLine.setFill()
+          NSRect(
+            x: bounds.maxX - 2, y: fragmentRect.minY, width: 2, height: frame.height
+          ).fill()
+        }
       }
 
       lineNumber += 1

@@ -120,4 +120,20 @@ final class EditorThemeChromeTests: XCTestCase {
       srgb(window.backgroundColor),
       srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
   }
+
+  /// Moving the caret to another source line pushes that 1-based line to the
+  /// gutter, which is what lets it pick out the active line's number + accent.
+  @MainActor
+  func testGutterCurrentLineFollowsCaret() {
+    let surface = MarkdownEditorSurface(
+      text: "one\ntwo\nthree\n", fontSize: 14, skin: .ink)
+
+    // Caret at the start of "two" (offset 4) → one newline before it → line 2.
+    surface.textView.setSelectedRange(NSRange(location: 4, length: 0))
+    XCTAssertEqual(surface.textView.gutter?.currentLineNumber, 2)
+
+    // Caret into "three" (offset 8) → two newlines before → line 3.
+    surface.textView.setSelectedRange(NSRange(location: 9, length: 0))
+    XCTAssertEqual(surface.textView.gutter?.currentLineNumber, 3)
+  }
 }

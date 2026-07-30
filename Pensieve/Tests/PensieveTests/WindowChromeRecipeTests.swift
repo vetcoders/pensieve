@@ -288,4 +288,26 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
   }
 
+  @MainActor
+  func testGutterAdoptsThickenedRuleAndCurrentLineToken() {
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 200, height: 400))
+    let textView = NSTextView(frame: scrollView.bounds)
+    scrollView.documentView = textView
+    let layoutManager = NSTextLayoutManager()
+    let gutter = LineNumberGutter(scrollView: scrollView, textLayoutManager: layoutManager)
+
+    // Chrome-polish cut: the ruler widened 40 -> 46.
+    XCTAssertEqual(gutter.ruleThickness, 46)
+
+    // The active-line number + right-edge marker paint from the theme's
+    // srcCurrentLine token; the fill stays the source token.
+    gutter.applyTokens(PensieveTheme.ink.tokens)
+    XCTAssertEqual(gutter.gutterCurrentLine, PensieveTheme.ink.tokens.srcCurrentLine.nsColor)
+    XCTAssertEqual(gutter.gutterBackground, PensieveTheme.ink.tokens.source.nsColor)
+
+    // The active line the gutter picks out is a settable 1-based line.
+    gutter.currentLineNumber = 4
+    XCTAssertEqual(gutter.currentLineNumber, 4)
+  }
+
 }

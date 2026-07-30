@@ -639,6 +639,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
+    updateGutterCurrentLine()
   }
 
   /// Applies a reading-surface theme to the source panel: the scroll view and
@@ -774,6 +775,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     lastNotifiedCaretOffset = range.location
     lastNotifiedSelectionLength = range.length
     onSelectionChanged?(range.location, range.length)
+    updateGutterCurrentLine()
+  }
+
+  /// Pushes the caret's 1-based source line to the gutter so it can pick out the
+  /// active line's number + accent marker. Layout-free (newline count before the
+  /// caret, matching the gutter's per-paragraph counter), and the gutter no-ops
+  /// when the line is unchanged, so same-line typing never repaints the ruler.
+  private func updateGutterCurrentLine() {
+    let caret = textView.selectedRange().location
+    textView.gutter?.currentLineNumber = lineIndex(forUTF16Offset: caret) + 1
   }
 
   /// UTF-16 cap on the completion prompt tail. Without it every debounce
