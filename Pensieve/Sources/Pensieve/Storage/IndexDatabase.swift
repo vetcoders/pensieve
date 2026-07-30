@@ -35,6 +35,15 @@ final class IndexDatabase {
   /// here, invisible to `waitForPendingReindex()`.
   private var scheduledIndexWrites: [UUID: Task<Void, Never>] = [:]
 
+  /// Tail of the HAND-OFF chain: the most recently registered `.registrationOrdered` scheduled
+  /// write. Sibling of `pendingIndexUpdateTask` one storey up, and it exists for the same reason —
+  /// see `ScheduledWriteOrdering` for why the storey below is not enough on its own.
+  ///
+  /// Deliberately never cleared, exactly like `pendingIndexUpdateTask`. Awaiting a finished task
+  /// returns immediately, and a task that has finished no longer retains ITS predecessor, so at most
+  /// one completed handle is held here and the chain does not accumulate across an editing session.
+  private var scheduledIndexWriteTail: Task<Void, Never>?
+
   /// The outstanding HOT-PATH (`.indexBatch`) maintenance pass, or `nil` when none is armed.
   ///
   /// Storage hygiene must never stall functional writes, and until round 11 it could: the batch
@@ -99,6 +108,17 @@ final class IndexDatabase {
   /// `barrierWriteWithoutTransaction` usually queues behind an already submitted `pool.write`, so an
   /// unordered close passes a settle-first test by accident. `nil` in production.
   var backgroundWriteGateOverride: (@Sendable () async -> Void)?
+
+  /// Narrow test seam, sibling of the one above but one storey up: awaited at the head of every
+  /// `.registrationOrdered` hand-off, BEFORE it waits for the hand-off registered ahead of it and
+  /// long before `work()` runs.
+  ///
+  /// The position is the whole point. Parked here a hand-off is REGISTERED — the drain can see it —
+  /// and has not entered `work()`, so it has not reserved a supersede position either. That gap is
+  /// exactly what the hand-off ordering contract covers, and it is the only place from which a test
+  /// can hold the FIRST hand-off and give the second a genuine chance to overtake it. `nil` in
+  /// production.
+  var indexWriteHandoffGateOverride: (@Sendable () async -> Void)?
 
   /// Narrow test seam, sibling of the one above: awaited INSIDE the open task, on its detached
   /// executor, immediately before `makeDatabasePool` builds the pool and runs the migrations.
@@ -963,6 +983,15 @@ final class IndexDatabase {
   /// construction, and the open moves INSIDE the task, behind `await previous?.value`, where it is
   /// just more of the work being serialized.
   ///
+  /// SCOPE, corrected in round 22. "Submission order by construction" holds for a DIRECT caller of
+  /// an entry point — the reservation really is synchronous, in the same main-actor step that read
+  /// `previous`. It does NOT reach across an unordered hop placed in FRONT of the entry point, and
+  /// `scheduleIndexWrite` used to be exactly that: two saves handed over back-to-back became two
+  /// independent unstructured tasks, whose START order Swift does not promise, so the later save
+  /// could reach this reservation FIRST and the older body could then overwrite the newer row. The
+  /// reservation point is synchronous; getting to it was not. Registration order is restored one
+  /// storey up — see `ScheduledWriteOrdering`.
+  ///
   /// The reserved position always RESOLVES. A refused or failed open returns `false` out of the
   /// task instead of escaping it, so a successor parked on this tail is released rather than wedged
   /// — the failure mode a reservation could otherwise introduce.
@@ -970,24 +999,77 @@ final class IndexDatabase {
     pendingIndexUpdateTask = Task { _ = await write.value }
   }
 
+  /// How a scheduled hand-off relates to the hand-offs registered before it.
+  ///
+  /// The problem this exists for: `scheduleIndexWrite` hands work to an UNSTRUCTURED task, and Swift
+  /// promises nothing about the order in which two such tasks start. The supersede position is
+  /// reserved synchronously — but inside `work()`, i.e. on the far side of that hop — so for a
+  /// hand-off the reservation point ITSELF raced. Two saves of the same document handed over
+  /// back-to-back could reserve in either order, and when the older one reserved second it
+  /// overwrote the newer FTS row after the newer bytes were already on disk: search advertising text
+  /// no file contains, permanently for an ad-hoc document with no workspace repair path to correct
+  /// it. Registration order is the one order the caller actually controls, so it becomes the
+  /// contract.
+  enum ScheduledWriteOrdering {
+    /// Joins the hand-off chain: `work()` does not begin until every hand-off registered EARLIER has
+    /// finished. Everything FUNCTIONAL wants this — save/autosave tails, the cold-scan workspace
+    /// upsert, created-document reindexes — and it is close to free, because those paths already
+    /// serialize on `pendingIndexUpdateTask` once they get there. All the chain adds is WHICH order
+    /// they serialize in, and it adds it deterministically rather than by executor luck.
+    case registrationOrdered
+    /// Chained to nothing; runs as soon as the runtime starts it. Reserved for STORAGE HYGIENE,
+    /// which round 11 deliberately took OUT of the supersede chain: its
+    /// `barrierWriteWithoutTransaction` excludes the pool's READERS, so a serial queue shared with
+    /// functional writes lets one wedged reader block every write submitted afterwards, for the rest
+    /// of the session. Chaining the hand-offs would rebuild that defect one storey up — a save
+    /// stuck behind a maintenance pass — so maintenance stays out of the queue here too. Pinned by
+    /// round 11's own control, `testHotPathMaintenanceCannotStallTheIndexWritesSubmittedBehindIt`:
+    /// it submits a hand-off while a pass is wedged at its barrier, which never completes if this
+    /// case is removed.
+    case independent
+  }
+
   /// Hands an index write to a background task WITHOUT losing track of it. Same shape as the bare
   /// `Task` the save tail used to spawn inline — the save still returns before the write commits —
   /// except the task is recorded here, so `drainPendingIndexWrites()` can await work that is
   /// scheduled but has not reached the supersede chain yet. The task removes itself when it
   /// finishes, so an editing session does not accumulate handles.
+  ///
+  /// Ordered hand-offs additionally join the chain in REGISTRATION order (see
+  /// `ScheduledWriteOrdering`): the predecessor is read in the same main-actor step that installs
+  /// this hand-off's own tail, which is the same pairing `reserveSupersedePosition(_:)` relies on
+  /// one storey down, for the same reason.
+  ///
+  /// The drain is unaffected by the chaining, in both directions. Nothing new is created that
+  /// `scheduledIndexWrites` cannot see — the links are references to tasks already registered here —
+  /// and awaiting the snapshot in whatever order a dictionary hands it over still terminates: the
+  /// chain is linear and points only BACKWARDS, so awaiting a successor first simply waits out its
+  /// predecessor and the predecessor is then already finished. A refusal past the latch returns
+  /// before the tail is installed, so it can never leave a link nobody resolves.
+  ///
+  /// One invariant the callers owe: an ordered hand-off's `work()` must not AWAIT another ordered
+  /// hand-off it registers itself — that would be a task waiting for its own successor. No caller
+  /// does; the only write that schedules from inside a write is maintenance, which is `.independent`
+  /// and fire-and-forget.
   @discardableResult
-  func scheduleIndexWrite(_ work: @escaping @MainActor @Sendable () async -> Void) -> Task<
-    Void, Never
-  > {
+  func scheduleIndexWrite(
+    ordering: ScheduledWriteOrdering = .registrationOrdered,
+    _ work: @escaping @MainActor @Sendable () async -> Void
+  ) -> Task<Void, Never> {
     // Refused post-latch at the hand-off itself, not merely inside the work: the drain has already
     // finished, so a task recorded here would never be awaited by anyone.
     guard !isRefusedAfterTermination("scheduleIndexWrite") else { return Task {} }
     let id = UUID()
+    let isOrdered = ordering == .registrationOrdered
+    let previous = isOrdered ? scheduledIndexWriteTail : nil
     let task = Task { @MainActor [weak self] in
+      if isOrdered, let gate = self?.indexWriteHandoffGateOverride { await gate() }
+      await previous?.value
       await work()
       self?.scheduledIndexWrites.removeValue(forKey: id)
     }
     scheduledIndexWrites[id] = task
+    if isOrdered { scheduledIndexWriteTail = task }
     return task
   }
 
@@ -1028,6 +1110,10 @@ final class IndexDatabase {
         _ = try? await openTask.value
         continue
       }
+      // Awaited in dictionary order, which is no order at all — and round 22's hand-off chain does
+      // not change that. An ordered hand-off waits only for hand-offs registered BEFORE it, so the
+      // links point strictly backwards: awaiting a successor first waits its predecessor out and
+      // then finds it already finished. No cycle is reachable, so the snapshot always drains.
       if !scheduledIndexWrites.isEmpty {
         let scheduled = Array(scheduledIndexWrites.values)
         scheduledIndexWrites.removeAll()
@@ -1321,7 +1407,13 @@ final class IndexDatabase {
     // The ladder's OWN retry re-enters here, and must not be absorbed by its own handle — see the
     // clearing order in `deferIndexBatchTruncation()`, which this guard makes load-bearing.
     guard pendingIndexBatchTruncationRetry == nil else { return }
-    pendingIndexBatchMaintenance = scheduleIndexWrite { [weak self] in
+    // `.independent` is the round-11 contract restated at the hand-off storey: this pass takes a
+    // reader-excluding barrier, so it must never sit in a queue that functional index writes also
+    // sit in. Ordered here, one wedged reader would hold up every save registered behind it — the
+    // exact defect round 11 removed from the supersede chain. It stays fully visible to the drain:
+    // ordering and registration are separate properties, and this is still recorded in
+    // `scheduledIndexWrites`.
+    pendingIndexBatchMaintenance = scheduleIndexWrite(ordering: .independent) { [weak self] in
       await self?.performMaintenanceInBackground(reason: .indexBatch)
       if let gate = self?.maintenanceCompletionGateOverride { await gate() }
       self?.pendingIndexBatchMaintenance = nil

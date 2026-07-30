@@ -3964,6 +3964,238 @@ final class TerminationQuiescenceTests: XCTestCase {
     }
   }
 
+  // MARK: - R22 / P2 (thread r3682497443): hand-offs join the chain in REGISTRATION order
+
+  /// Round 22 — the unordered hop in FRONT of the reservation.
+  ///
+  /// Round 15 made `reserveSupersedePosition(_:)` synchronous, so a DIRECT caller of
+  /// `indexInBackground` takes its chain position before its own first suspension point. The save
+  /// tail is not a direct caller: it hands the write to `scheduleIndexWrite`, whose task is
+  /// UNSTRUCTURED, and Swift promises nothing about which of two unstructured tasks starts first.
+  /// The reservation stayed synchronous; getting to it did not. Two saves of ONE document handed
+  /// over back-to-back could therefore reserve in either order, and when the older one reserved
+  /// second it overwrote the newer FTS row after the newer bytes were already on disk — search
+  /// advertising text no file contains, and for an ad-hoc document there is no workspace reindex to
+  /// ever repair it.
+  ///
+  /// The quit reaches this hardest, which is why the pin drives it rather than a synthetic caller:
+  /// `flushPendingWindowSaves` writes each window's bytes SYNCHRONOUSLY and hands the index write
+  /// off, with no suspension point in between, so two windows over one file register two hand-offs
+  /// before either has started.
+  ///
+  /// Driving, not racing (round 9's lesson). The gate sits at the HEAD of the hand-off, so arrival
+  /// order is executor order — not registration order — and a pin that assumed "arrival #2 is the
+  /// second registration" would be asserting the executor rather than the contract. Registering the
+  /// second save only once the first is demonstrably parked turns that into a fact. The second is
+  /// then released ALONE, while the first is still held: the experiment is "given every chance to
+  /// overtake, does it?".
+  ///
+  /// Both halves are asserted. STRUCTURAL: released alone, the newer hand-off must still be parked
+  /// on its predecessor with nothing written. BEHAVIOURAL: disk and FTS name the same winner, and it
+  /// is the newer bytes.
+  func testTwoSavesOfOneDocumentJoinTheIndexChainInRegistrationOrder() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("one-file-two-windows.md")
+    let originalBody = "the shared file before either save"
+    try originalBody.write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    // Ad-hoc on purpose: this is the document class the finding calls PERMANENT, because no
+    // workspace reindex will ever come back and correct a row the older save left behind.
+    XCTAssertTrue(
+      sharedRef.isAdHoc,
+      "fixture precondition: the unrepairable case is the ad-hoc one — a workspace document would "
+        + "be corrected by the next scan, which would hide the defect rather than pin it")
+
+    // Both delays effectively infinite: nothing here may be written by a TIMER.
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "HandoffOrder")
+    let registry = DocumentWindowRegistry()
+
+    let bodyOlder = "alphaneedle the FIRST save, whose row must not outlive the second"
+    let bodyNewer = "betaneedle the SECOND save, which is what the user last typed"
+
+    var windows: [NSWindow] = []
+    defer { windows.forEach { $0.close() } }
+    var controllers: [String: AppController] = [:]
+
+    for (name, body) in [("older", bodyOlder), ("newer", bodyNewer)] {
+      let windowState = AppState()
+      let store = DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveHandoffOrder\(name)Bookmarks")),
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery-\(name)", isDirectory: true))
+      )
+      windowState.documents = [sharedRef]
+      windowState.documentSession.load(document: sharedRef, text: originalBody)
+      windowState.activeDocumentText = body
+      store.documentDidChange(appState: windowState)
+
+      let controller = AppController(
+        appState: windowState,
+        folderManager: folderManager,
+        documentStore: store,
+        indexDatabase: database,
+        documentWindowRegistry: registry)
+      controllers[name] = controller
+      let window = makeWindow()
+      windows.append(window)
+      registry.registerController(controller, for: window)
+    }
+
+    let handoffGate = OrderedParkingGate()
+    database.indexWriteHandoffGateOverride = { await handoffGate.arrive() }
+
+    let sequence = TerminationSequence(
+      registry: registry,
+      indexDatabase: database,
+      folderManager: folderManager,
+      autosaver: autosaver,
+      drainTimeout: Self.shrunkDrainBudget,
+      pumpRunLoop: { _ in }
+    )
+
+    // 1 — the OLDER save, through the real quit flush. Its hand-off is registered first and is held
+    //     at the head, before it can reserve anything.
+    sequence.flushPendingWindowSaves([try XCTUnwrap(controllers["older"])])
+    pumpMainRunLoop(until: { handoffGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      handoffGate.arrivalCount, 1,
+      "fixture precondition: exactly one hand-off may be parked here, or the release indices below "
+        + "name something other than the two saves under test")
+
+    // 2 — the NEWER save. It is registered while the first is demonstrably parked, so arrival #2 is
+    //     this one by construction rather than by executor courtesy.
+    sequence.flushPendingWindowSaves([try XCTUnwrap(controllers["newer"])])
+    pumpMainRunLoop(until: { handoffGate.arrivalCount >= 2 }, timeout: 10)
+    XCTAssertEqual(
+      handoffGate.arrivalCount, 2,
+      "fixture precondition: both hand-offs must be registered and parked before either is released")
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyNewer,
+      "fixture precondition: the DISK half is already settled — both saves write their bytes "
+        + "synchronously inside the flush, so only the index is still in flight")
+    XCTAssertEqual(
+      try indexHits(matching: "alphaneedle", at: databaseURL)
+        + indexHits(matching: "betaneedle", at: databaseURL), 0,
+      "fixture precondition: neither hand-off may have written yet — both are held in front of the "
+        + "reservation, which is the window the finding is about")
+
+    // 3 — the experiment: release the SECOND registration ALONE, first one still held.
+    Task { await handoffGate.open(only: 2) }
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    XCTAssertEqual(
+      try indexHits(matching: "betaneedle", at: databaseURL), 0,
+      "released alone and ahead of its predecessor, the newer hand-off must be parked on that "
+        + "predecessor rather than running: a hand-off that can reach its reservation here has "
+        + "taken a chain position out of registration order, and whichever save reserves second "
+        + "wins the FTS row no matter which one the user typed last")
+
+    // 4 — and now the first, plus whatever the chain owes behind it.
+    let drained = CompletionFlag()
+    Task { @MainActor in
+      await database.drainPendingIndexWrites()
+      drained.isSet = true
+    }
+    Task { await handoffGate.open(through: 2) }
+    pumpMainRunLoop(until: { drained.isSet }, timeout: 20)
+    XCTAssertTrue(
+      drained.isSet,
+      "fixture precondition: the drain must have returned, or the assertions below are reading a "
+        + "database that is still being written")
+
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyNewer,
+      "the newer save owns the file, which is the fact the index has to agree with")
+    XCTAssertEqual(
+      try indexHits(matching: "betaneedle", at: databaseURL), 1,
+      "…so FTS must carry the SECOND registration's bytes: the hand-offs join the chain in the "
+        + "order they were registered, not in the order the runtime happened to start them")
+    XCTAssertEqual(
+      try indexHits(matching: "alphaneedle", at: databaseURL), 0,
+      "…with the older save's body gone, rather than reinstated by a write that reserved late")
+  }
+
+  /// Control 1 — DIFFERENT documents still all land, and a chain released BACKWARDS neither loses a
+  /// write nor deadlocks the drain.
+  ///
+  /// Ordering hand-offs is only safe if it is a queue and not a trap. Three hand-offs are registered
+  /// in a known order and then released in REVERSE — #3 first, #1 last — which is the release pattern
+  /// a chain would wedge on if any link waited on a successor instead of a predecessor. The drain is
+  /// started BEFORE the releases and awaited afterwards, so "the drain terminates under the new
+  /// shape" is asserted rather than assumed: it snapshots `scheduledIndexWrites` in dictionary order,
+  /// i.e. it may well await a successor before its predecessor, and that must still finish.
+  func testHandoffsForDifferentDocumentsAllLandEvenWhenReleasedBackwards() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let handoffGate = OrderedParkingGate()
+    database.indexWriteHandoffGateOverride = { await handoffGate.arrive() }
+
+    let names = ["one", "two", "three"]
+    // Registered one at a time, each confirmed parked before the next is handed over — the same
+    // reason the pin above stages its two saves: arrival index must be a fact.
+    for (offset, name) in names.enumerated() {
+      let ref = documentRef(root: root, name: "\(name).md")
+      database.scheduleIndexWrite {
+        _ = await database.indexInBackground(
+          document: ref, body: "distinctneedle\(name) body", appState: nil)
+      }
+      pumpMainRunLoop(until: { handoffGate.arrivalCount >= offset + 1 }, timeout: 10)
+      XCTAssertEqual(
+        handoffGate.arrivalCount, offset + 1,
+        "fixture precondition: hand-off \(offset + 1) must be parked before the next is registered")
+    }
+
+    let drained = CompletionFlag()
+    Task { @MainActor in
+      await database.drainPendingIndexWrites()
+      drained.isSet = true
+    }
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    XCTAssertFalse(
+      drained.isSet,
+      "fixture precondition: the drain must still be waiting — a drain that returned while three "
+        + "hand-offs were parked would make the assertion below vacuous")
+
+    // Backwards on purpose: the last registration is released first.
+    for index in [3, 2, 1] {
+      Task { await handoffGate.open(only: index) }
+      pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    }
+    pumpMainRunLoop(until: { drained.isSet }, timeout: 20)
+    XCTAssertTrue(
+      drained.isSet,
+      "the drain must terminate under the chained shape: hand-offs wait only on hand-offs "
+        + "registered EARLIER, so awaiting them in any order — which is what a dictionary snapshot "
+        + "does — can never close a cycle")
+
+    for name in names {
+      XCTAssertEqual(
+        try indexHits(matching: "distinctneedle\(name)", at: databaseURL), 1,
+        "every hand-off must land its own document exactly once: ordering the queue must not drop, "
+          + "coalesce or overwrite writes that were never in competition")
+    }
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own
