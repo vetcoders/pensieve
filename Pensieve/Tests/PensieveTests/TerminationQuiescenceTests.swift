@@ -753,6 +753,90 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "mean the watcher was still driving the scanner while the app was shutting down")
   }
 
+  /// The half of the watcher quiescence `stop()` cannot reach, and the reason it cannot: the
+  /// generation token is checked on the WATCHER's queue, one line above the `Task { @MainActor }`
+  /// that carries the delivery to the main actor (`FileWatcher.start(watching:onEvents:)`). A batch
+  /// that passed that check a moment before the quit is therefore already enqueued, and nothing in
+  /// the quiescence retracts it: bumping the generation is too late, and `watcherRefreshTask?.cancel()`
+  /// cancels the task that EXISTS, not the one this hop is about to arm. The quit then pumps the run
+  /// loop, which is precisely what hands that hop the main actor — after quiescence, after the drain,
+  /// in time to arm a fresh 300 ms refresh whose scan would ask the index to write.
+  ///
+  /// The construction is PLACED, not raced: `deliver` and `quiesceForTermination()` are two
+  /// synchronous main-actor calls with no suspension point between them, so the hop is provably
+  /// enqueued and provably has not run when the quit arrives.
+  ///
+  /// The control phase is load-bearing. A pin that only asserts "nothing was armed" passes just as
+  /// happily when the fixture never reached the arming site at all, so the same delivery is first run
+  /// through a LIVE manager and must arm a refresh. Only then is the second delivery meaningful.
+  func testAQueuedWatcherHopArmsNoRefreshAfterTheQuiescence() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let noteURL = root.appendingPathComponent("watched-note.md")
+    try "before the quit".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let source = RecordingWatcherSource()
+    let indexDatabase = IndexDatabase(
+      databaseURL: sandbox.support.appendingPathComponent("index.db", isDirectory: false))
+    let manager = FolderManager(
+      metadataStore: WorkspaceMetadataStore(
+        metadataURL: sandbox.support.appendingPathComponent("workspace.json")),
+      indexDatabase: indexDatabase,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveQueuedHopBookmarks")),
+      workspaceSubstrate: WorkspaceSubstrate(
+        store: WorkspaceCacheStore(
+          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true))
+      ),
+      watcher: FileWatcher(sourceFactory: { source })
+    )
+
+    let appState = AppState()
+    manager.open(url: root, into: appState)
+    await settle(manager, indexDatabase)
+    XCTAssertTrue(
+      source.isStarted,
+      "fixture precondition: opening a workspace must start the watcher, or there is no delivery to "
+        + "queue")
+
+    // CONTROL: the identical delivery on a live manager arms a refresh.
+    let armedBeforeControl = manager.watcherRefreshGeneration
+    try "changed while the app was running".write(to: noteURL, atomically: true, encoding: .utf8)
+    source.deliver([
+      FileWatcherEvent(path: noteURL.path, flags: [.itemIsFile, .itemModified])
+    ])
+    try await waitUntil("the control delivery to arm a watcher refresh") {
+      manager.watcherRefreshGeneration > armedBeforeControl
+    }
+    await manager.waitForPendingWatcherRefresh()
+    await settle(manager, indexDatabase)
+
+    // THE PIN. Deliver, then quiesce, with nothing between them: the hop is past `FileWatcher`'s
+    // generation check and has not run.
+    try "changed a moment before the quit".write(to: noteURL, atomically: true, encoding: .utf8)
+    let armedBeforeQuiesce = manager.watcherRefreshGeneration
+    source.deliver([
+      FileWatcherEvent(path: noteURL.path, flags: [.itemIsFile, .itemModified])
+    ])
+    manager.quiesceForTermination()
+
+    // Give the enqueued hop the main actor — the quit's own pumped run loop is what does this in
+    // production — and comfortably outlast the 300 ms debounce, so a refresh that WAS armed has had
+    // every chance to arm, run, and reach the index.
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+
+    XCTAssertEqual(
+      manager.watcherRefreshGeneration, armedBeforeQuiesce,
+      "a watcher hop that was already queued when the quit quiesced must arm NOTHING: the drain has "
+        + "finished, so a refresh armed here is a producer nobody is waiting for, scanning the tree "
+        + "and asking the index to write behind the terminal checkpoint")
+    XCTAssertEqual(
+      indexDatabase.terminationRejectedEntryPoints, [],
+      "…and it must be refused one layer ABOVE the latch: a refused entry point here would mean the "
+        + "refresh ran and only the funnel stopped it")
+  }
+
   /// P9: the post-close index housekeeping. `Close Folder` arms a barrier vacuum plus a truncating
   /// checkpoint on a task nobody but the tests ever awaited; a fast ⌘Q straight after it raced that
   /// vacuum against the quit's own checkpoint, and GRDB serializes the two without ordering them —

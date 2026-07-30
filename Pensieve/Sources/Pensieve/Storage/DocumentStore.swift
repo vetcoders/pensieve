@@ -40,7 +40,26 @@ final class FolderManager {
   private var watcherRefreshTask: Task<Void, Never>?
   /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
   /// completed refresh from one that was cancel-replaced by a newer event mid-await.
-  private var watcherRefreshGeneration: UInt64 = 0
+  ///
+  /// Readable from outside for the same reason `IndexDatabase.terminationRejectedEntryPoints` is:
+  /// `waitForPendingWatcherRefresh()` answers "has the armed refresh finished", and proving that
+  /// NOTHING was armed needs the counter itself — there is no task to await.
+  private(set) var watcherRefreshGeneration: UInt64 = 0
+  /// One-way switch set by `quiesceForTermination()`, and the successor half of the watcher
+  /// quiescence. `watcher.stop()` bumps a generation, so an FSEvents batch still on the watcher
+  /// queue is discarded — but the generation is checked on that queue, BEFORE the delivery hops to
+  /// the main actor (`FileWatcher.start(watching:onEvents:)`). A batch that passed the check and
+  /// enqueued its `Task { @MainActor }` a moment before the quit is therefore not retractable by
+  /// `stop()`, and cancelling `watcherRefreshTask` does nothing about it either: cancellation
+  /// applies to the task that exists, not to the one the hop is about to arm. The quit then pumps
+  /// the run loop (`TerminationSequence.runBlockingMainRunLoop()`), which is exactly what gives that
+  /// hop the main actor — after quiescence, after the drain, and in time to arm a fresh 300 ms
+  /// refresh whose scan would ask the index to write behind the terminal checkpoint.
+  ///
+  /// Quit-ONLY, deliberately: `closeWorkspace` also stops the watcher and cancels these tasks, but a
+  /// close is followed by opens that must start watching again. A latch set there would make the
+  /// first workspace switch the last one with a live watcher.
+  private var isQuiescedForTermination = false
   /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
   /// task so a filesystem event cannot cancel a user-requested refresh.
   private var forcedRefreshTask: Task<Void, Never>?
@@ -656,6 +675,10 @@ final class FolderManager {
   /// independent signature comparisons and required publications hop back to the main actor.
   /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
   func scheduleWatcherRefresh(into appState: AppState) {
+    // The arming site itself, so "no watcher refresh is armed after the quiescence" holds for every
+    // caller rather than for the one hop that is known to reach here today. A cancel covers the task
+    // that exists; only refusal covers its successor.
+    guard !isQuiescedForTermination else { return }
     watcherRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
@@ -1043,6 +1066,10 @@ final class FolderManager {
   /// guards), so a cancelled scan can no longer produce an index write. Awaiting them would put a
   /// full tree walk inside the quit budget and buy nothing.
   func quiesceForTermination() {
+    // Set BEFORE the stop, in the same synchronous step and with no suspension point between them:
+    // the two halves of the watcher quiescence must not be able to disagree, and a delivery hopping
+    // to the main actor between them would find the latch open. See `isQuiescedForTermination`.
+    isQuiescedForTermination = true
     watcher.stop()
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
@@ -2014,6 +2041,11 @@ final class FolderManager {
         let deliveredOffMain = !Thread.isMainThread
         Task { @MainActor in
           guard let self, let appState else { return }
+          // The hop's own generation check, and the one `FileWatcher` cannot give it: its token is
+          // verified on the watcher queue, one line ABOVE this enqueue, so a batch that beat the
+          // quit by a moment arrives here with nothing left to stop it. See
+          // `isQuiescedForTermination`.
+          guard !self.isQuiescedForTermination else { return }
           let rootPaths = appState.workspaceRoots.map {
             FileWatcherEvent.canonicalPath(for: $0.url.path)
           }
