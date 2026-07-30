@@ -652,7 +652,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     let tokens = theme.tokens
     activeTokens = tokens
     scrollView.backgroundColor = tokens.source.nsColor
-    textView.applyTheme(tokens)
+    textView.applyTheme(tokens, baseSize: textContentStorage.fontSize)
     textContentStorage.tokens = tokens
     // Pushing tokens runs a FULL highlight refresh, which strips
     // `.backgroundColor` document-wide — the attribute the find-match washes

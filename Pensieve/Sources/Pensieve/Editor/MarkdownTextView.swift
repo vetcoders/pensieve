@@ -105,14 +105,22 @@ class MarkdownTextView: NSTextView {
   /// `typingAttributes` are what freshly typed characters are drawn with before
   /// the debounced highlight pass reaches them, so leaving them on the previous
   /// family would make every keystroke flash the old face.
-  func applyTheme(_ tokens: ThemeTokens) {
+  ///
+  /// `baseSize` is passed in rather than read back from `font`. `NSTextView.font`
+  /// is a *rendered* attribute — it answers with the font of the FIRST character,
+  /// which the highlighter has already grown to a heading size on any document
+  /// that opens with `#` (h1 is `baseFontSize + 12`). Deriving the base face from
+  /// it made every live skin switch re-seed the caret at heading size, so the
+  /// next character typed came out 26 pt on a 14 pt document. The authority is
+  /// the storage's own base size, which is what the highlighter lays down.
+  func applyTheme(_ tokens: ThemeTokens, baseSize: CGFloat) {
     let source = tokens.source.nsColor
     let text = tokens.text.nsColor
     drawsBackground = true
     backgroundColor = source
     insertionPointColor = text
     monoFamily = tokens.monoFamily
-    let baseFont = MonoFontResolver.font(family: monoFamily, size: font?.pointSize ?? 14)
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: baseSize)
     font = baseFont
     var attributes = typingAttributes
     attributes[.font] = baseFont

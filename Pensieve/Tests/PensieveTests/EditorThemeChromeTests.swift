@@ -347,6 +347,58 @@ final class EditorThemeChromeTests: XCTestCase {
     XCTAssertEqual(keywordColor(), PensieveTheme.parchment.tokens.accent.nsColor)
   }
 
+  /// REGRESSION PIN — the caret's face after a live skin switch.
+  ///
+  /// `cce1ac7` re-fonted the pane from the theme's family and took the SIZE from
+  /// `NSTextView.font`. That getter is a *rendered* attribute: it answers with the
+  /// font of the FIRST character, and the highlighter has already grown that one
+  /// to a heading size on any document opening with `#` (h1 is `baseFontSize +
+  /// 12`). So every live switch re-seeded `font`, `typingAttributes` and the
+  /// autocomplete ghost at 26 pt on a 14 pt document — the next character typed
+  /// came out heading-sized, and the ghost suggestion with it. The body text
+  /// itself hides the bug: the full highlight refresh that follows re-lays the
+  /// base attributes at the right size, so only what is typed NEXT is wrong.
+  ///
+  /// The base size is the storage's, never a read-back of what is on screen.
+  @MainActor
+  func testLiveSkinSwitchKeepsTheCaretOnTheBaseFontSize() {
+    // Opens with an h1, so the first character carries the heading font.
+    let surface = MarkdownEditorSurface(
+      text: "# Heading\n\nbody text\n", fontSize: 14, skin: .parchment,
+      syntaxHighlightingEnabled: true)
+
+    surface.applyTheme(.ink)
+
+    let typingFont = surface.textView.typingAttributes[.font] as? NSFont
+    XCTAssertEqual(
+      typingFont?.pointSize, 14,
+      "a skin switch must not re-seed the caret at the first character's heading size")
+    XCTAssertEqual(
+      typingFont?.familyName, PensieveTheme.ink.tokens.monoFamily,
+      "…while still moving to the new skin's family")
+
+    // Repeating the switch must not compound it either.
+    surface.applyTheme(.typewriter)
+    XCTAssertEqual((surface.textView.typingAttributes[.font] as? NSFont)?.pointSize, 14)
+  }
+
+  /// The same authority holds at a non-default editor size: the base face follows
+  /// the storage's size, not whatever the first character happens to render at.
+  @MainActor
+  func testLiveSkinSwitchHonoursANonDefaultBaseFontSize() {
+    let surface = MarkdownEditorSurface(
+      text: "# Heading\n\nbody text\n", fontSize: 18, skin: .parchment,
+      syntaxHighlightingEnabled: true)
+    surface.update(
+      text: "# Heading\n\nbody text\n", fontSize: 18, syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true, asciiSafeTables: false, aiAutocompleteEnabled: false,
+      findQuery: "", findBarVisible: false)
+
+    surface.applyTheme(.ink)
+
+    XCTAssertEqual((surface.textView.typingAttributes[.font] as? NSFont)?.pointSize, 18)
+  }
+
   /// REGRESSION PIN — the start-up hang.
   ///
   /// Document windows are SwiftUI's `AppKitWindow`, and the scene puts its own
