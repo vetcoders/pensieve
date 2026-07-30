@@ -108,11 +108,22 @@ final class PreviewWebView: NSView {
   /// code blocks light (or vice versa) when the system appearance disagrees
   /// with the chosen theme. Adaptive themes (`default`/`raw`) pass `nil` and
   /// keep following the system.
-  private func applyThemeChrome(for skin: PensieveTheme) {
-    let appearance = skin.appearanceName.map { NSAppearance(named: $0) } ?? nil
+  func applyThemeChrome(for skin: PensieveTheme) {
+    let appearance = WindowChromeRecipe.windowAppearance(for: skin)
     self.appearance = appearance
     webView.appearance = appearance
     webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: skin)
+
+    // Preview-only mode mounts NO source editor, so `MarkdownEditorSurface`
+    // never runs and nobody else asserts the HOST WINDOW's chrome — pinning
+    // this view's appearance alone leaves the titlebar and sidebar on the
+    // previous skin. `load(document:)` runs this on every preview update, so
+    // the same compare-and-set invariant the editor applies also heals an
+    // external reset here. One shared definition of "wanted chrome"; equal
+    // values are skipped.
+    if let window = self.window {
+      WindowChromeRecipe.assertWindowChrome(on: window, for: skin)
+    }
   }
 
   /// WKWebView leaves a blank page behind when its WebContent process dies

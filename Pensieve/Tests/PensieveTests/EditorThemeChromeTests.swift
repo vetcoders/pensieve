@@ -121,6 +121,121 @@ final class EditorThemeChromeTests: XCTestCase {
       srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
   }
 
+  /// THE regression pin for the live-switch bug: the chrome is an INVARIANT
+  /// re-asserted on every update pass, not a one-shot pin.
+  ///
+  /// A pin guarded on "the skin changed" loses permanently to an external
+  /// reset. AppKit re-bridges the hosting view's toolbar into the window
+  /// whenever toolbar CONTENT changes — and the theme picker's label carries
+  /// the skin name, so every switch re-bridges — and a tab-group reshuffle
+  /// re-parents windows; either hands the window back a default appearance
+  /// AFTER we pinned it, with no further skin change coming to re-trigger a
+  /// pin. Here the external reset is simulated directly: pin, clobber, then
+  /// drive the same call `updateNSView` makes each pass and require the chrome
+  /// back. Fails on the pre-fix seam, which short-circuits on (skin, window).
+  @MainActor
+  func testExternalChromeResetIsHealedOnTheNextUpdatePass() {
+    let (surface, window) = makeHostedSurface(skin: .ink, windowAppearance: .darkAqua)
+    defer { window.contentView = nil }
+
+    surface.applyTheme(.parchment)
+    XCTAssertEqual(window.appearance?.name, .aqua)
+
+    // External reset: what a toolbar re-bridge / tab reshuffle does to us.
+    window.appearance = NSAppearance(named: .darkAqua)
+    window.backgroundColor = .windowBackgroundColor
+
+    // No skin change — just the next SwiftUI pass.
+    surface.applyWindowChrome(for: .parchment)
+
+    XCTAssertEqual(
+      window.appearance?.name, .aqua,
+      "an external appearance reset must be re-asserted on the next update pass")
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)),
+      "an external backing reset must be re-asserted on the next update pass")
+  }
+
+  /// Guard-ordering: a call made while the surface has no window must not
+  /// record any "already pinned" bookkeeping, because nothing was pinned. The
+  /// pin has to land once the window attaches, with the skin unchanged.
+  @MainActor
+  func testWindowlessCallDoesNotSuppressThePinAfterAttach() {
+    let surface = MarkdownEditorSurface(
+      text: "# Heading\n", fontSize: 14, skin: .parchment, syntaxHighlightingEnabled: true)
+
+    // No window yet — this is the launch ordering (`applyTheme` runs before the
+    // surface is in a window).
+    surface.applyWindowChrome(for: .parchment)
+
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    window.appearance = NSAppearance(named: .darkAqua)
+    window.contentView = surface.scrollView
+    defer { window.contentView = nil }
+
+    // Same skin as the windowless call: the pin must still land.
+    surface.applyWindowChrome(for: .parchment)
+
+    XCTAssertEqual(window.appearance?.name, .aqua)
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
+  }
+
+  /// Repeated switches (dark → light → dark) each move the chrome, and a
+  /// re-assert with the skin unchanged is idempotent (reports no correction).
+  @MainActor
+  func testRepeatedSwitchesMoveChromeAndSteadyStateIsIdempotent() {
+    let (surface, window) = makeHostedSurface(skin: .ink, windowAppearance: .darkAqua)
+    defer { window.contentView = nil }
+
+    surface.applyTheme(.parchment)
+    XCTAssertEqual(window.appearance?.name, .aqua)
+
+    surface.applyTheme(.ink)
+    XCTAssertEqual(window.appearance?.name, .darkAqua)
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .ink)))
+
+    surface.applyTheme(.parchment)
+    XCTAssertEqual(window.appearance?.name, .aqua)
+
+    // Already correct → nothing to correct, so no redundant set (this is what
+    // keeps per-pass re-assertion from becoming a recomposite storm).
+    XCTAssertFalse(
+      WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment),
+      "re-asserting an already-correct chrome must not write anything")
+  }
+
+  /// Preview-only mode mounts no source editor, so the editor seam never runs;
+  /// the preview must assert the host window's chrome itself or the titlebar
+  /// and sidebar stay on the previous skin.
+  @MainActor
+  func testPreviewChromeAssertsHostWindowAppearance() {
+    let preview = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    window.appearance = NSAppearance(named: .darkAqua)
+    window.contentView = preview
+    defer { window.contentView = nil }
+
+    preview.applyThemeChrome(for: .parchment)
+
+    XCTAssertEqual(window.appearance?.name, .aqua)
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
+  }
+
   /// Moving the caret to another source line pushes that 1-based line to the
   /// gutter, which is what lets it pick out the active line's number + accent.
   @MainActor

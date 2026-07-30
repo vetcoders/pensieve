@@ -299,15 +299,16 @@ struct EditorRepresentable: NSViewRepresentable {
       surface.applyTheme(skin)
     }
     // Keep the host window's appearance + titlebar backing in lockstep with the
-    // source panel. This is the SAME theme trigger as `applyTheme` above, but it
-    // must run whenever the window becomes available too — not only on a skin
-    // change — so the initial attach pins the chrome for the persisted skin. It
-    // is the piece the source-panel colour change alone cannot cover: without an
-    // appearance change the live layer-backed window keeps compositing the prior
-    // skin's chrome (the titlebar glass tint and the source pane) even though the
-    // NSColor properties already hold the new values, so the panel and titlebar
-    // split until something forces a full re-composite. The call is internally
-    // guarded on (skin, window) so a pure keystroke re-render is a no-op.
+    // source panel. Unlike `applyTheme` above this runs UNCONDITIONALLY, on every
+    // pass: it is a compare-and-set invariant, not a one-shot pin. The window can
+    // lose the chrome we set it without any skin change to tell us — AppKit
+    // re-bridges the hosting view's toolbar when toolbar content changes (the
+    // theme picker's label carries the skin name, so every switch re-bridges) and
+    // tab-group reshuffles re-parent windows — and a pin that only fired on a
+    // skin change would never come back to heal that. Running every pass also
+    // covers the initial attach, where `applyTheme` ran before the window
+    // existed. Equal values are skipped inside, so a keystroke re-render writes
+    // nothing.
     surface.applyWindowChrome(for: skin)
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
@@ -437,11 +438,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Active theme tokens for the source panel. Held so `update` can keep typing
   /// attributes on the theme text colour when the font size changes.
   private var activeTokens: ThemeTokens = PensieveTheme.default.tokens
-  /// Last (skin, window) the host-window chrome was pinned for, so
-  /// `applyWindowChrome` re-pins on a skin change OR a first window attach and
-  /// is a no-op on a pure keystroke re-render.
-  private var lastChromeSkin: PensieveTheme?
-  private var lastChromeWindow: ObjectIdentifier?
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -655,7 +651,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     applyWindowChrome(for: theme)
   }
 
-  /// Pins the host window's appearance and titlebar backing to the skin so the
+  /// Holds the host window's appearance and titlebar backing on the skin, so the
   /// chrome reads the same reading surface as the source panel. The appearance
   /// is the theme's fixed light/dark (or `nil` for the adaptive skins, which
   /// follow the system), and the backing colour is the recipe's titlebar glass
@@ -665,19 +661,23 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// a new opaque source colour on a live skin switch (the NSColor properties
   /// alone update without a visible repaint until an appearance change lands).
   ///
-  /// Guarded on (skin, window): it runs on a real skin change and on the first
-  /// attach (window went from `nil` to real), never on a plain keystroke
-  /// re-render. Called from `applyTheme` and from `updateNSView` (which also
-  /// covers the initial attach, where `applyTheme` ran before the window
-  /// existed).
+  /// Re-asserted (compare-and-set), NOT pinned once: `updateNSView` calls this
+  /// on every pass and `WindowChromeRecipe.assertWindowChrome` corrects only
+  /// what disagrees. A one-shot pin guarded on "the skin changed" loses
+  /// permanently to an external reset — AppKit re-bridges the toolbar when its
+  /// content changes (the theme picker's label carries the skin name, so every
+  /// switch re-bridges) and tab-group reshuffles re-parent windows; either can
+  /// hand back a default appearance after we pinned, with no further skin
+  /// change coming to re-trigger the pin. Equal values are skipped, so a
+  /// steady state issues no sets and there is no recomposite storm.
+  ///
+  /// No window means nothing to assert AND no bookkeeping — recording a
+  /// "pinned" state for a window that does not exist would claim a pin that
+  /// never happened, which is what used to let a windowless call suppress the
+  /// real one.
   func applyWindowChrome(for theme: PensieveTheme) {
-    let windowID = scrollView.window.map(ObjectIdentifier.init)
-    guard lastChromeSkin != theme || lastChromeWindow != windowID else { return }
-    lastChromeSkin = theme
-    lastChromeWindow = windowID
     guard let window = scrollView.window else { return }
-    window.appearance = theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
-    window.backgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: theme)
+    WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
   }
 
   deinit {

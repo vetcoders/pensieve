@@ -102,6 +102,63 @@ enum WindowChromeRecipe {
     theme.tokens.source.nsColor
   }
 
+  /// The window appearance a skin demands: its fixed light/dark, or `nil` for
+  /// the adaptive skins, which follow the system setting.
+  static func windowAppearance(for theme: PensieveTheme) -> NSAppearance? {
+    theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
+  }
+
+  /// Re-asserts the window's chrome (appearance + titlebar backing) for a skin,
+  /// setting ONLY the properties that currently disagree. Returns `true` when
+  /// something actually had to be corrected.
+  ///
+  /// This is a compare-and-set INVARIANT, not a one-shot pin, and that
+  /// distinction is the whole point. A single pin guarded on "skin changed"
+  /// loses permanently to any external reset: AppKit re-bridges the hosting
+  /// view's toolbar into the window when toolbar CONTENT changes (the theme
+  /// picker's label carries the skin name, so every switch re-bridges), and a
+  /// tab-group reshuffle re-parents windows — either can hand the window back a
+  /// default appearance after we pinned it, with no further skin change coming
+  /// to trigger a re-pin. Re-asserting on every update pass heals that on the
+  /// next pass; because equal values are skipped, a steady state costs two
+  /// comparisons and issues no redundant sets (no recomposite storm).
+  @discardableResult
+  static func assertWindowChrome(on window: NSWindow, for theme: PensieveTheme) -> Bool {
+    var corrected = false
+
+    let wantedAppearance = windowAppearance(for: theme)
+    if window.appearance?.name != wantedAppearance?.name {
+      window.appearance = wantedAppearance
+      corrected = true
+    }
+
+    let wantedBacking = titlebarGlassBackingColor(for: theme)
+    if !colorsMatch(window.backgroundColor, wantedBacking) {
+      window.backgroundColor = wantedBacking
+      corrected = true
+    }
+
+    return corrected
+  }
+
+  /// sRGB component comparison. `NSColor ==` is unreliable across colour spaces
+  /// and for the catalog/dynamic colours the adaptive skins use, so a plain
+  /// equality check would report a permanent mismatch and re-set the backing on
+  /// every pass.
+  private static func colorsMatch(_ lhs: NSColor?, _ rhs: NSColor) -> Bool {
+    guard let lhs else { return false }
+    if lhs == rhs { return true }
+    guard
+      let left = lhs.usingColorSpace(.sRGB),
+      let right = rhs.usingColorSpace(.sRGB)
+    else { return false }
+    let tolerance = 1.0 / 512.0
+    return abs(left.redComponent - right.redComponent) < tolerance
+      && abs(left.greenComponent - right.greenComponent) < tolerance
+      && abs(left.blueComponent - right.blueComponent) < tolerance
+      && abs(left.alphaComponent - right.alphaComponent) < tolerance
+  }
+
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
     ceil(max(0, frameHeight - contentLayoutHeight))
   }
