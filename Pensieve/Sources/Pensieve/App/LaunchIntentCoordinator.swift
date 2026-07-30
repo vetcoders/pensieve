@@ -13,9 +13,29 @@ final class LaunchIntentCoordinator: ObservableObject {
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
   private var hasExplicitURLIntent = false
+  /// Composer v2 Tor B: process exits when the last content window closes.
+  private(set) var isComposerWaitMode = false
 
   init(settleDelayNanoseconds: UInt64 = 0) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
+  }
+
+  /// Apply pure CLI parse results before the first window's settle path runs.
+  /// Safe to call from `PensieveApp.init` while `controller` is still nil —
+  /// URLs stay pending and drain on `startWhenLaunchIntentsSettle`.
+  func applyComposerLaunchArguments(_ arguments: ComposerLaunchArguments) {
+    if arguments.wait {
+      isComposerWaitMode = true
+    }
+    if !arguments.fileURLs.isEmpty {
+      handle(urls: arguments.fileURLs)
+    }
+  }
+
+  /// Test / recovery seam: reset wait mode without reconstructing the shared
+  /// coordinator (which owns in-flight startup tasks in production).
+  func resetComposerWaitModeForTests() {
+    isComposerWaitMode = false
   }
 
   func startWhenLaunchIntentsSettle(
@@ -32,7 +52,9 @@ final class LaunchIntentCoordinator: ObservableObject {
       }
 
       self.drainPendingURLs()
-      controller.start(restoringWorkspace: !self.hasExplicitURLIntent)
+      // Composer wait alone (no files) still skips restore: the session is a
+      // disposable tafla for $VC_COMPOSER, not a daily-driver workspace reopen.
+      controller.start(restoringWorkspace: !self.hasExplicitLaunchIntent)
       self.finishStartupDecision()
     }
   }
@@ -53,6 +75,10 @@ final class LaunchIntentCoordinator: ObservableObject {
   func waitForStartupDecision() async {
     await startupTask?.value
   }
+
+  /// Whether cold start should suppress the empty-workspace restore path
+  /// (explicit Finder open, CLI file args, or composer wait).
+  var hasExplicitLaunchIntent: Bool { hasExplicitURLIntent || isComposerWaitMode }
 
   private func attach(controller: AppController) {
     self.controller = controller
@@ -113,6 +139,10 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // forever in the registry's published open-tab list as a phantom "Open Files"
     // row. The shared lifecycle is idempotent and also restores one launcher
     // after the final content window closes.
+    //
+    // Composer wait mode: after the registry reconciles the close, if no live
+    // window remains we mark termination (so the deferred launcher reopen is
+    // suppressed) and quit — unblocking `$VC_COMPOSER` / `open -W`.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
@@ -121,6 +151,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
         DocumentWindowRegistry.shared.handleWindowClosed(
           window,
           tombstonePolicy: .reusableWindow)
+        Self.finishComposerWaitIfWindowless()
       }
     }
     traceObservers.append(openTabReconciler)
@@ -130,7 +161,11 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // to the foreground. Force a regular activation policy in that case so the dev build
     // is actually usable. A packaged `.app` already runs as `.regular`, so this is a no-op
     // there — guarded on a nil bundle identifier to keep shipped behavior untouched.
-    if Bundle.main.bundleIdentifier == nil {
+    // Composer wait always wants foreground activation: the blocking caller is waiting
+    // on this process and the user must reach the tafla immediately.
+    if Bundle.main.bundleIdentifier == nil
+      || LaunchIntentCoordinator.shared.isComposerWaitMode
+    {
       NSApp.setActivationPolicy(.regular)
       NSApp.activate(ignoringOtherApps: true)
     }
@@ -156,6 +191,11 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
   ) -> Bool {
+    // Wait-mode instances are disposable composer tafle: Dock re-click must
+    // not spawn a second empty session alongside the one `$VC_COMPOSER` owns.
+    if LaunchIntentCoordinator.shared.isComposerWaitMode {
+      return true
+    }
     guard !flag else { return true }
     Task { @MainActor in
       if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
@@ -165,6 +205,19 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     return true
+  }
+
+  /// Shared close → quit path for Composer wait mode. Idempotent: a second
+  /// close while terminate is already in flight is a no-op once
+  /// `beginTermination` has flipped the registry flag.
+  @MainActor
+  static func finishComposerWaitIfWindowless() {
+    guard LaunchIntentCoordinator.shared.isComposerWaitMode else { return }
+    // Suppress launcher resurrection *before* any deferred reopen scheduled
+    // by `handleWindowClosed` can fire.
+    DocumentWindowRegistry.shared.beginTermination()
+    guard !DocumentWindowRegistry.shared.applicationHasLiveWindow() else { return }
+    NSApp.terminate(nil)
   }
 
   func application(_ application: NSApplication, open urls: [URL]) {
