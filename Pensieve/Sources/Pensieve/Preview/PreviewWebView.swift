@@ -648,7 +648,7 @@ final class PreviewWebView: NSView {
       return "/* vc-skin:default — base appearance, no overlay */"
 
     case .raw:
-      // Raw: stripped chrome, full width, monospace, near "view source".
+      // Raw: true plaintext — mono, flat headings, one text colour, underlined links.
       return """
         /* vc-skin:raw */
         .markdown-body {
@@ -658,6 +658,30 @@ final class PreviewWebView: NSView {
           line-height: 1.5;
           font-size: 0.92em;
         }
+        .markdown-body h1,
+        .markdown-body h2,
+        .markdown-body h3,
+        .markdown-body h4,
+        .markdown-body h5,
+        .markdown-body h6 {
+          font-size: 1em;
+          font-weight: 700;
+          color: inherit !important;
+          border-bottom: 0;
+          padding-bottom: 0;
+          margin: 1.2em 0 0.4em;
+        }
+        .markdown-body a {
+          color: inherit !important;
+          text-decoration: underline;
+        }
+        .markdown-body li::marker {
+          color: inherit;
+        }
+        .markdown-body blockquote {
+          color: inherit !important;
+          border-left-width: 2px;
+        }
         .markdown-body pre,
         .markdown-body code,
         .markdown-body tt {
@@ -666,9 +690,6 @@ final class PreviewWebView: NSView {
           box-shadow: none !important;
           background: transparent !important;
           padding: 0 !important;
-        }
-        .markdown-body blockquote {
-          border-left-width: 2px;
         }
         """
 

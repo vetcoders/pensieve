@@ -20,6 +20,19 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("max-width: none"))
   }
 
+  func testRawSkinIsTruePlaintextWithFlatHeadingsAndUnderlinedLinks() {
+    let raw = PreviewWebView.skinCSS(for: .raw)
+    // Flat headings: body size, no accent colour — just bold.
+    XCTAssertTrue(raw.contains("font-size: 1em"))
+    // Links carry no colour of their own; underline is the only affordance.
+    XCTAssertTrue(raw.contains("text-decoration: underline"))
+
+    // `default` keeps its existing byte-for-byte contract — untouched by this skin.
+    XCTAssertEqual(
+      PreviewWebView.skinCSS(for: .default),
+      "/* vc-skin:default — base appearance, no overlay */")
+  }
+
   func testParchmentSkinIsWarmSerifAndNarrow() {
     let css = PreviewWebView.skinCSS(for: .parchment)
     XCTAssertTrue(css.contains("vc-skin:parchment"))
