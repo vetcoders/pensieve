@@ -86,6 +86,13 @@ struct ThemeTokens {
   /// Base editor text colour.
   let text: ColorSpec
 
+  // Semantic status
+  /// Attention colour for transient status — the status bar's dirty "Edited"
+  /// marker. Mirrors the preview `--vc-preview-warning` so the chrome and the
+  /// rendered surface read the same accent. Only `warning` has a chrome consumer
+  /// in this cut; `danger`/`positive` join it when they get one.
+  let warning: ColorSpec
+
   // Source-panel syntax tokens (1:1 with SyntaxHighlighter attributes)
   let srcHeading: ColorSpec
   let srcListMarker: ColorSpec
@@ -206,6 +213,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     codeBackground: ColorSpec(
       system: NSColor.textBackgroundColor.withSystemEffect(.disabled), css: "#f6f8fa"),
     text: ColorSpec(system: .textColor, css: "#1f2328"),
+    warning: ColorSpec(system: .systemOrange, css: "#9a6700"),
     srcHeading: ColorSpec(system: .labelColor, css: "#1f2328"),
     srcListMarker: ColorSpec(system: .secondaryLabelColor, css: "#57606a"),
     srcInlineCode: ColorSpec(system: .labelColor, css: "#1f2328"),
@@ -230,6 +238,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e2d8c2"),
       codeBackground: ColorSpec(hex: "#efe8d6"),
       text: ColorSpec(hex: "#2a251d"),
+      warning: ColorSpec(hex: "#8a6a20"),
       srcHeading: ColorSpec(hex: "#4a5a3c"),
       srcListMarker: ColorSpec(hex: "#9a5b28"),
       srcInlineCode: ColorSpec(hex: "#8a4a3a"),
@@ -246,6 +255,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#2a2a2a"),
       codeBackground: ColorSpec(hex: "#1f1f1f"),
       text: ColorSpec(hex: "#d2d2d2"),
+      warning: ColorSpec(hex: "#c49a72"),
       srcHeading: ColorSpec(hex: "#e0e0e0"),
       srcListMarker: ColorSpec(hex: "#6f8fa0"),
       srcInlineCode: ColorSpec(hex: "#c49a72"),
@@ -262,6 +272,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#232a36"),
       codeBackground: ColorSpec(hex: "#1a2130"),
       text: ColorSpec(hex: "#d8dde6"),
+      warning: ColorSpec(hex: "#c8b07a"),
       srcHeading: ColorSpec(hex: "#b8c4d4"),
       srcListMarker: ColorSpec(hex: "#8a7fc8"),
       srcInlineCode: ColorSpec(hex: "#c9a8d8"),
@@ -278,6 +289,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e4e8ec"),
       codeBackground: ColorSpec(hex: "#f3f5f7"),
       text: ColorSpec(hex: "#14181c"),
+      warning: ColorSpec(hex: "#7a4a12"),
       srcHeading: ColorSpec(hex: "#14181c"),
       srcListMarker: ColorSpec(hex: "#0f6f6c"),
       srcInlineCode: ColorSpec(hex: "#7a4a12"),
@@ -294,6 +306,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e6e6e6"),
       codeBackground: ColorSpec(hex: "#2b2b2b"),
       text: ColorSpec(hex: "#d4d4d4"),
+      warning: ColorSpec(hex: "#6e6e6e"),
       srcHeading: ColorSpec(hex: "#f2f2f2"),
       srcListMarker: ColorSpec(hex: "#d4d4d4"),
       srcInlineCode: ColorSpec(hex: "#d4d4d4"),

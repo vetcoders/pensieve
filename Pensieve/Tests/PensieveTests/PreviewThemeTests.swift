@@ -102,6 +102,24 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(css.contains("--vc-preview-positive: #3fb950"))
   }
 
+  /// The status bar's dirty "Edited" marker paints from `tokens.warning`; each
+  /// fixed theme mirrors its own `--vc-preview-warning` so the chrome and the
+  /// rendered preview agree, and the adaptive skins keep a system-orange warning
+  /// (the old dirty-dot colour) with the GitHub light base as its CSS fallback.
+  func testWarningStatusTokenMirrorsPreviewWarningPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.warning.css, "#8a6a20")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.warning.css, "#c49a72")
+    XCTAssertEqual(PensieveTheme.ink.tokens.warning.css, "#c8b07a")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.warning.css, "#7a4a12")
+    XCTAssertEqual(PensieveTheme.typewriter.tokens.warning.css, "#6e6e6e")
+    XCTAssertEqual(PensieveTheme.default.tokens.warning.css, "#9a6700")
+    // Fixed themes resolve the same hex to their NSColor, so the marker colour
+    // is the parsed token, not a system fallback.
+    XCTAssertEqual(
+      PensieveTheme.ink.tokens.warning.nsColor,
+      ColorSpec.nsColor(fromHex: "#c8b07a"))
+  }
+
   // MARK: - appearanceCSS threads the skin through
 
   func testAppearanceCSSAppendsSkinOverlay() {
