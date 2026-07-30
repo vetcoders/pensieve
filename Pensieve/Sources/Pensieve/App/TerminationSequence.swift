@@ -140,8 +140,42 @@ final class TerminationSequence {
     // without ordering them: the vacuum could land last and leave WAL frames behind the checkpoint
     // that was supposed to be final. Housekeeping goes second because it re-drains internally, so
     // nothing accepted can still be owed once it returns.
-    await indexDatabase.drainPendingIndexWrites()
-    await folderManager.waitForPendingIndexMaintenance()
+    //
+    // …once, which is what this loop repairs. Both waits are point-in-time, and one producer keeps
+    // running straight through them: the hot-path truncate's backoff ladder. It sleeps OUTSIDE
+    // `scheduledIndexWrites` by design — the drain must never have to wait out a timer — so a retry
+    // waking DURING the housekeeping wait cleared its handle, re-entered
+    // `scheduleIndexBatchMaintenance()` and registered a fresh pass after the last thing that would
+    // have awaited it. That pass is a plain `pool.write` doing `incremental_vacuum` + truncate, so
+    // the latch and the terminal checkpoint below could overtake it and leave WAL frames behind the
+    // operation that is supposed to be final. Reading the pair until it stops moving is the same
+    // by-identity treatment `drainPendingIndexWrites()` already gives its own three sources.
+    //
+    // Termination is by QUIESCENCE, not by hope, and that is why the ladder is stopped INSIDE the
+    // loop rather than before it. Stopped first, it would pre-empt the very window above instead of
+    // bounding the loop; stopped here — once everything visible has landed — it converts "nothing is
+    // registered right now" into "nothing more can BE registered", and the loop is then allowed
+    // exactly one more turn to collect whatever a retry registered while we were waiting. After that
+    // turn the only remaining producer of housekeeping is a workspace close, which phase Q has
+    // already stopped, so the loop reads the same handle twice and ends.
+    var awaitedMaintenance: Task<Void, Never>?
+    var didQuiesceTruncationLadder = false
+    while true {
+      await indexDatabase.drainPendingIndexWrites()
+      if let maintenance = folderManager.pendingIndexMaintenance,
+        maintenance != awaitedMaintenance
+      {
+        awaitedMaintenance = maintenance
+        await maintenance.value
+        continue
+      }
+      guard didQuiesceTruncationLadder else {
+        didQuiesceTruncationLadder = true
+        indexDatabase.quiesceIndexBatchTruncationRetry()
+        continue
+      }
+      break
+    }
 
     // ---- L: latch. Everything owed has landed; from here the funnel refuses, so a producer this
     // sequence never knew about cannot write behind the checkpoint.

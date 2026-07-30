@@ -79,6 +79,13 @@ final class IndexDatabase {
   /// role `terminationRejectedEntryPoints` plays for the latch.
   private(set) var indexBatchTruncationDeferrals = 0
 
+  /// One-way switch set by `quiesceIndexBatchTruncationRetry()`. The backoff ladder is the ONE index
+  /// producer the termination drain cannot see — it sleeps outside `scheduledIndexWrites` on purpose,
+  /// so the drain never has to wait out a timer — which also means the drain cannot bound it. This
+  /// flag is what turns "no pass is registered right now" into "no pass can BE registered", and it is
+  /// therefore what makes the stability drain in `TerminationSequence.runIndexPhases()` terminate.
+  private(set) var isIndexBatchTruncationRetryQuiesced = false
+
   /// Narrow test seam: awaited at the head of every background index write, before it waits for its
   /// predecessor and long before it touches the pool. It exists so a test can hold write #1 open and
   /// prove write #2 is GENUINELY still queued when a close or a quit runs — GRDB's
@@ -103,7 +110,11 @@ final class IndexDatabase {
   /// `waitForPendingIndexMaintenance()` has to cope with when a second workspace close arms another
   /// pass behind it. A wedge placed before the scheduling would only prove that a task nobody has
   /// created yet has not run. `nil` in production.
-  var maintenanceGateOverride: (@Sendable () async -> Void)?
+  /// Carries the pass's `MaintenanceReason` so a test can tell the two apart WITHOUT guessing from
+  /// arrival order. The quit runs both kinds through this one seam — a `.workspaceClose` pass the
+  /// sequence awaits, and a `.indexBatch` pass the backoff ladder may register underneath it — and a
+  /// pin about their ORDERING cannot be built on "the second arrival is probably the retry".
+  var maintenanceGateOverride: (@Sendable (MaintenanceReason) async -> Void)?
 
   /// Narrow test seam, fourth sibling: awaited inside the hot-path pass's OWN task, after
   /// `performMaintenanceInBackground` has returned — so after the truncate and after the pool writer
@@ -178,6 +189,36 @@ final class IndexDatabase {
   /// The deferred hot-path truncate is dropped here rather than left to be refused when it fires: it
   /// is a sleeping timer, it is the one piece of index work the drain deliberately does not track,
   /// and the terminal checkpoint that follows this latch truncates the WAL anyway.
+  /// Stops the hot-path backoff ladder, WITHOUT closing the funnel. Issued by `TerminationSequence`
+  /// from INSIDE its stability drain, at the first moment everything visible has landed — the one
+  /// point at which "nothing is owed" is about to be decided and the ladder is the only producer that
+  /// can contradict it afterwards.
+  ///
+  /// The ladder sleeps OUTSIDE `scheduledIndexWrites` by design (`deferIndexBatchTruncation()`: the
+  /// drain must never have to wait out a timer). That is what made it invisible to both drains the
+  /// quit already ran: a retry waking during `waitForPendingIndexMaintenance()` cleared its handle,
+  /// re-entered `scheduleIndexBatchMaintenance()` and registered a maintenance pass AFTER the last
+  /// thing that would have awaited it — a plain `pool.write` doing `incremental_vacuum` + truncate,
+  /// which the latch and the terminal checkpoint could then overtake, leaving WAL frames behind the
+  /// checkpoint that is supposed to be final.
+  ///
+  /// Cancelling on the main actor is exact rather than lucky: the retry body is `@MainActor` and runs
+  /// its guard, its handle clear and its re-entry synchronously after the sleep resumes. So at this
+  /// call the retry has either already registered its pass — in `scheduledIndexWrites`, which the
+  /// drain that follows covers — or it has not resumed at all, and the cancellation makes sure it
+  /// never will. Nothing in between.
+  ///
+  /// One-way, and separate from `closeForTermination()` on purpose: the latch must stay AFTER the
+  /// drain (the flush phase produces writes that have to be accepted), while the ladder has to stop
+  /// BEFORE it, or the drain is bounding a target that can still move. A truncate refused after this
+  /// point is not owed to anyone — `startCheckpointOnTerminate()` takes the WAL to zero under the
+  /// barrier regardless of what the ladder had planned.
+  func quiesceIndexBatchTruncationRetry() {
+    isIndexBatchTruncationRetryQuiesced = true
+    pendingIndexBatchTruncationRetry?.cancel()
+    pendingIndexBatchTruncationRetry = nil
+  }
+
   func closeForTermination() {
     isClosedForTermination = true
     pendingIndexBatchTruncationRetry?.cancel()
@@ -1246,7 +1287,7 @@ final class IndexDatabase {
     let attemptConversion = reason == .workspaceClose && !didAttemptAutoVacuumConversion
     if attemptConversion { didAttemptAutoVacuumConversion = true }
     let conversionByteLimit = effectiveAutoVacuumConversionByteLimit
-    if let gate = maintenanceGateOverride { await gate() }
+    if let gate = maintenanceGateOverride { await gate(reason) }
 
     if reason == .indexBatch {
       let pageBudget = Self.incrementalVacuumPageBudget
@@ -1341,7 +1382,9 @@ final class IndexDatabase {
   /// not left holding a timer that would only be refused when it fires.
   private func deferIndexBatchTruncation() {
     indexBatchTruncationDeferrals += 1
-    guard !isClosedForTermination, pendingIndexBatchTruncationRetry == nil else { return }
+    guard !isClosedForTermination, !isIndexBatchTruncationRetryQuiesced,
+      pendingIndexBatchTruncationRetry == nil
+    else { return }
     let delay = effectiveIndexBatchTruncationRetryDelayNanoseconds
     indexBatchTruncationRetryAttempt += 1
     pendingIndexBatchTruncationRetry = Task { @MainActor [weak self] in

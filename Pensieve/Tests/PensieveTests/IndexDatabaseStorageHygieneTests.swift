@@ -621,7 +621,7 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     // Parked exactly where the reader-excluding barrier would be: this is the wedged reader, without
     // the race a real one would bring.
     let gate = ParkingGate()
-    database.maintenanceGateOverride = { await gate.arrive() }
+    database.maintenanceGateOverride = { _ in await gate.arrive() }
 
     let armingRef = documentRef(root: root, name: "arms-maintenance.md")
     let firstWriteFinished = CompletionFlag()

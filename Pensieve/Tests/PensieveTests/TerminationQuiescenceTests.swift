@@ -983,7 +983,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     let log = EventLog()
     let arrivals = Counter()
     let gate = ParkingGate()
-    database.maintenanceGateOverride = {
+    database.maintenanceGateOverride = { _ in
       let arrival = arrivals.next()
       log.append("maintenance-\(arrival)-enter")
       // Only the FIRST pass is held. A gate that parked every pass would be satisfied by the buggy
@@ -1031,6 +1031,178 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…in that order: the second pass may not even ENTER its vacuum until the first has finished, "
         + "which is the compaction-after-writes ordering `scheduleIndexMaintenance(after:)` "
         + "documents, preserved for free by the chain")
+  }
+
+  // MARK: - R15 / B3: a late-waking truncation retry may not be overtaken by the latch
+
+  /// Round 15 — the last producer the quit's drain could not see.
+  ///
+  /// The hot-path truncate's backoff ladder (`deferIndexBatchTruncation()`) sleeps OUTSIDE
+  /// `scheduledIndexWrites`, deliberately: the drain must never have to wait out a timer. The cost of
+  /// that is invisibility, and the sequence used to run drain → `waitForPendingIndexMaintenance()` →
+  /// latch with nothing between the second wait and the latch. A retry waking DURING that wait clears
+  /// its handle, re-enters `scheduleIndexBatchMaintenance()` and registers a maintenance pass after
+  /// BOTH drains have returned — the outer one and the one the housekeeping task runs internally.
+  /// That pass is a plain `pool.write` doing `incremental_vacuum` + truncate, so the latch and the
+  /// terminal checkpoint can overtake it and leave WAL frames behind the operation that is supposed
+  /// to be final.
+  ///
+  /// The wedges are placed, not raced. The close's housekeeping is parked at
+  /// `maintenanceGateOverride`, which sits AFTER that task's own `drainPendingIndexWrites()` and
+  /// after every early return — the only position that makes the window real; the sibling
+  /// `maintenanceCompletionGateOverride` is never awaited for a `.workspaceClose` pass at all, so it
+  /// could not reach this state. The retry is a REAL one: a genuine wedged pool reader refuses a
+  /// genuine truncate, and the ladder takes ownership of the successor. The seam carries its
+  /// `MaintenanceReason`, so "the close's pass" and "the retry's pass" are told apart by identity
+  /// rather than by arrival order.
+  ///
+  /// The assertion that cannot pass by luck is the negative one: with the close's housekeeping
+  /// released and the retry's pass still held, a quit that FINISHES has latched and checkpointed over
+  /// a maintenance pass it never waited for.
+  func testALateWakingTruncationRetryIsNotOvertakenByTheLatch() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    // A genuine `pool.read` held open on a snapshot older than the write below, which is what makes
+    // the truncate answer `SQLITE_BUSY` instead of succeeding. The release valve sits far above every
+    // wait here, so a wrong build fails an assertion rather than being rescued by a timeout.
+    let readerReached = Counter()
+    let releaseReader = DispatchSemaphore(value: 0)
+    defer { releaseReader.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      releaseReader.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        readerReached.increment()
+        releaseReader.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let seedRef = documentRef(root: root, name: "seed.md")
+    database.index(document: seedRef, body: "latewakingseedneedle")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: there must be WAL frames for a reader to hold and a truncate to want")
+    // Every pass is allowed to reach its truncate: the 16 MiB bound is not what this pin is about,
+    // and leaving it in force would only make the fixture depend on how big the churn happened to be.
+    database.walCheckpointThresholdBytesOverride = 1
+    database.indexBatchTruncationRetryDelayNanosecondsOverride = Self.lateRetryDelayNanoseconds
+
+    // 1 — wedge the reader, then arm the hot path so its truncate is REFUSED and the ladder takes
+    //     ownership of the successor. This is the retry the rest of the pin is about.
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: seedRef, documents: [seedRef])
+    }
+    pumpMainRunLoop(until: { readerReached.value >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      readerReached.value, 1,
+      "fixture precondition: the backlink query must be holding one of the pool's readers")
+
+    Task { @MainActor in
+      _ = await database.indexInBackground(
+        document: documentRef(root: root, name: "arms-ladder.md"),
+        body: "latewakingarmneedle", appState: appState)
+    }
+    pumpMainRunLoop(until: { database.indexBatchTruncationDeferrals >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "fixture precondition: the refused truncate must have deferred onto the backoff ladder — that "
+        + "sleeping retry is the producer the drain cannot see")
+    // Let the refused pass's own task clear the coalescing handle. Without this the retry would meet
+    // round 14's absorption guard instead of arming a pass, which is a different (already pinned)
+    // window.
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+
+    // 2 — let the reader go, so the retry's pass can do real work rather than be refused again.
+    releaseReader.signal()
+
+    // 3 — park the close's housekeeping AFTER its internal drain. Installed only now, so a
+    //     `.indexBatch` arrival at this seam can only be the ladder's retry.
+    let closeGate = ParkingGate()
+    let retryGate = ParkingGate()
+    database.maintenanceGateOverride = { reason in
+      switch reason {
+      case .workspaceClose: await closeGate.arrive()
+      case .indexBatch: await retryGate.arrive()
+      }
+    }
+
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "LateRetry")
+    folderManager.closeWorkspace(into: appState)
+    pumpMainRunLoop(until: { closeGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      closeGate.arrivalCount, 1,
+      "fixture precondition: the close's housekeeping must be parked inside its vacuum — past its "
+        + "own `drainPendingIndexWrites()`, which is what makes the window this pin needs")
+    XCTAssertEqual(
+      retryGate.arrivalCount, 0,
+      "fixture precondition: the ladder's retry must still be ASLEEP when the quit starts, or the "
+        + "pass it registers would be one the quit's first drain could still see")
+
+    // 4 — the quit. Its drain finds nothing owed and parks on the housekeeping above; the retry wakes
+    //     underneath it and registers a pass neither drain has seen.
+    let quitFinished = CompletionFlag()
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: folderManager,
+      autosaver: Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000))
+    Task { @MainActor in
+      await sequence.run()
+      quitFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { retryGate.arrivalCount >= 1 }, timeout: 20)
+    XCTAssertEqual(
+      retryGate.arrivalCount, 1,
+      "fixture precondition: the ladder's retry must have woken and registered a maintenance pass "
+        + "while the quit was parked on the close's housekeeping")
+    XCTAssertFalse(quitFinished.isSet, "fixture precondition: …and the quit must still be waiting")
+
+    // 5 — release the close's housekeeping ONLY. This is the instant the sequence used to latch.
+    Task { await closeGate.open() }
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: Self.settleSeconds)
+
+    XCTAssertFalse(
+      quitFinished.isSet,
+      "the quit latched and checkpointed while a maintenance pass registered by the truncation "
+        + "ladder was still in flight. That pass is a plain `pool.write` doing `incremental_vacuum` "
+        + "+ truncate, so its frames land BEHIND the terminal checkpoint — the WAL→0 the quit "
+        + "promises is then simply untrue")
+    XCTAssertFalse(
+      database.isClosedForTermination,
+      "…and the latch must not be closed over it either, for the same reason")
+    XCTAssertEqual(
+      retryGate.arrivalCount, 1,
+      "…with that pass demonstrably still held, so this cannot be a slow-machine artefact")
+
+    // 6 — and once it is allowed to finish, the quit completes with nothing refused behind it.
+    Task { await retryGate.open() }
+    pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 20)
+    XCTAssertTrue(
+      quitFinished.isSet, "…and the quit must complete once the pass it waited for is done")
+    XCTAssertTrue(
+      database.isClosedForTermination, "a completed sequence must leave the funnel closed")
+    XCTAssertTrue(
+      database.isIndexBatchTruncationRetryQuiesced,
+      "…and the ladder must have been stopped on the way there. That is what bounds the loop above: "
+        + "without it, 'nothing is registered' never becomes 'nothing can be registered' and the "
+        + "stability drain would be trusting a sleeping timer to stay asleep")
+    XCTAssertFalse(
+      database.terminationRejectedEntryPoints.contains("performMaintenanceInBackground"),
+      "…and a pass the drain waited for is never a pass the latch has to refuse. Got "
+        + "\(database.terminationRejectedEntryPoints)")
+    XCTAssertEqual(
+      walSize(for: databaseURL), 0,
+      "…and the terminal checkpoint is the last word on the WAL (it is "
+        + "\(walSize(for: databaseURL)) bytes)")
   }
 
   // MARK: - R6: a dirty session's index write follows its file write
@@ -2159,6 +2331,16 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// asserting that something has NOT happened. Generous on purpose: this suite already carries
   /// wall-clock flakes and a settle window must not become the next one.
   private static let settleSeconds: TimeInterval = 0.25
+
+  /// How long the backoff ladder's retry sleeps in the late-waking pin. Long enough that the fixture
+  /// (release the reader, install the seam, park the close's housekeeping, start the quit) finishes
+  /// first on a loaded machine, and the pin says so out loud rather than passing for the wrong reason
+  /// if it does not.
+  private static let lateRetryDelayNanoseconds: UInt64 = 3_000_000_000
+
+  /// Release valve for the wedged pool reader, far above every wait that depends on it: a wrong build
+  /// must fail an assertion, not be rescued by a timeout.
+  private static let readerWedgeReleaseSeconds: TimeInterval = 60
 
   /// The bound a bounded quit must respect: ~12× the shrunk budget, loose on purpose because this
   /// suite already carries wall-clock flakes and this assertion must not become the next one.

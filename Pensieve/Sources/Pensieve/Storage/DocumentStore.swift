@@ -1027,6 +1027,15 @@ final class FolderManager {
     await indexMaintenanceTask?.value
   }
 
+  /// The newest armed housekeeping pass, exposed by IDENTITY rather than as a wait.
+  ///
+  /// `waitForPendingIndexMaintenance()` answers "is anything owed right now"; the quit's stability
+  /// drain also has to answer "did anything get armed WHILE I was waiting", and the two are different
+  /// questions for the same reason `drainPendingIndexWrites()` tracks its open and its tail by
+  /// identity: a pass armed during a wait is work the waiter accepted and has not waited for yet.
+  /// Reading the handle lets `TerminationSequence` tell "already awaited" from "moved".
+  var pendingIndexMaintenance: Task<Void, Never>? { indexMaintenanceTask }
+
   /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
   /// persisted bookmarks and all workspace state, returning to the "No folder open" state.
   /// Protects unsaved work — if the active document has unsaved edits it stays open in the
