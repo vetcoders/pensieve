@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 
 @main
@@ -20,6 +21,16 @@ struct PensieveApp: App {
   private let launchSettings: LaunchSettings
 
   init() {
+    // Composer v2 Tor B: parse CLI before any window settles so `--wait` and
+    // file paths are pending when the first root attaches its controller.
+    // `--help` exits before UI; pure parse lives in ComposerLaunchArguments.
+    let composerArgs = ComposerLaunchArguments.parse(CommandLine.arguments)
+    if composerArgs.showHelp {
+      fputs(ComposerLaunchArguments.usage + "\n", stderr)
+      // Exit before SwiftUI scenes materialize — this is a CLI help path.
+      exit(0)
+    }
+
     // Register the bundled OFL theme fonts into this process's font environment
     // before any view builds. Idempotent and non-fatal — a missing/failed font
     // never blocks launch; the skin CSS fallback chains cover absence.
@@ -27,6 +38,7 @@ struct PensieveApp: App {
 
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
+    launchIntentCoordinator.applyComposerLaunchArguments(composerArgs)
     let themeManager = ThemeManager()
     providerSettings = ProviderSettings.shared
     savingSettings = DocumentSavingSettings.shared
