@@ -61,9 +61,11 @@ struct ColorSpec {
 /// `LineNumberGutter`, `MarkdownTextView`) and the titlebar backing colour —
 /// plus the appearance `mode` that pins the preview flavour CSS.
 ///
-/// Fields are limited to what those surfaces consume today; the fuller surface
-/// palette from the design handoff (page/panel/accent/typography) lands with
-/// the later chrome-polish cuts that give those tokens consumers.
+/// Fields are limited to what those surfaces consume today: the source panel,
+/// the titlebar backing, the status bar (`warning`), and — from the chrome
+/// polish cut — the SwiftUI sidebar/toolbar/empty-state chrome (`accent`,
+/// `muted`, `previewHeadingFamily`). The remaining handoff palette
+/// (page/panel/`danger`/`positive`) joins as its consumers land.
 struct ThemeTokens {
   enum Mode {
     case light
@@ -86,6 +88,16 @@ struct ThemeTokens {
   /// Base editor text colour.
   let text: ColorSpec
 
+  // Semantic accents
+  /// Structural/link accent — the chrome's active-selection tint and the
+  /// sidebar's selected-file colour. Byte-parity with the preview
+  /// `--vc-preview-link` so the reading surface and the window chrome agree;
+  /// adaptive themes wrap `linkColor` with the GitHub base as CSS fallback.
+  let accent: ColorSpec
+  /// Secondary/label text — sidebar section headers, muted row glyphs. Mirrors
+  /// the preview `--vc-preview-muted`; adaptive themes wrap `secondaryLabelColor`.
+  let muted: ColorSpec
+
   // Semantic status
   /// Attention colour for transient status — the status bar's dirty "Edited"
   /// marker. Mirrors the preview `--vc-preview-warning` so the chrome and the
@@ -104,6 +116,36 @@ struct ThemeTokens {
   let srcHighlightBackground: ColorSpec
   let srcGutter: ColorSpec
   let srcCurrentLine: ColorSpec
+
+  // Typography — the bundled family names (see `BundledFonts`) each theme's CSS
+  // font-family chains reference. Chrome (the SwiftUI sidebar's row title) reads
+  // `previewHeadingFamily`; the strings are empty for the adaptive themes, which
+  // carry no bundled family and fall back to the system face. The CSS fallback
+  // chains stay on the CSS side; the native side falls back through `font(_:_:)`.
+  /// Reading-surface body family (`.markdown-body`).
+  let previewFamily: String
+  /// Heading / UI-chrome family (sidebar row titles, `.markdown-body h*`).
+  let previewHeadingFamily: String
+  /// Monospace family (source panel, code).
+  let monoFamily: String
+
+  /// Resolves a bundled family name to an `NSFont`, or the system font of the
+  /// same size when the name is empty (adaptive themes) or the family did not
+  /// register in this process. Keeps native chrome legible without the bundled
+  /// face — the same graceful degradation the CSS fallback chains give the
+  /// preview. SwiftUI's `Font.custom` degrades the same way for the SwiftUI
+  /// surfaces that consume these families directly.
+  static func font(_ family: String, _ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+    if !family.isEmpty {
+      if let named = NSFont(name: family, size: size) { return named }
+      if let byFamily = NSFontManager.shared.font(
+        withFamily: family, traits: [], weight: 5, size: size)
+      {
+        return byFamily
+      }
+    }
+    return .systemFont(ofSize: size, weight: weight)
+  }
 }
 
 /// The application theme — the reading surface layered on top of the markdown
@@ -213,6 +255,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     codeBackground: ColorSpec(
       system: NSColor.textBackgroundColor.withSystemEffect(.disabled), css: "#f6f8fa"),
     text: ColorSpec(system: .textColor, css: "#1f2328"),
+    accent: ColorSpec(system: .linkColor, css: "#0969da"),
+    muted: ColorSpec(system: .secondaryLabelColor, css: "#57606a"),
     warning: ColorSpec(system: .systemOrange, css: "#9a6700"),
     srcHeading: ColorSpec(system: .labelColor, css: "#1f2328"),
     srcListMarker: ColorSpec(system: .secondaryLabelColor, css: "#57606a"),
@@ -223,7 +267,12 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     srcHighlightBackground: ColorSpec(
       system: NSColor.systemYellow.withAlphaComponent(0.35), css: "#fff8c5"),
     srcGutter: ColorSpec(system: .tertiaryLabelColor, css: "#8c959f"),
-    srcCurrentLine: ColorSpec(system: .labelColor, css: "#1f2328")
+    srcCurrentLine: ColorSpec(system: .labelColor, css: "#1f2328"),
+    // Adaptive themes carry no bundled family: empty strings fall back to the
+    // system face on both sides (native `font(_:_:)`, SwiftUI `Font.custom`).
+    previewFamily: "",
+    previewHeadingFamily: "",
+    monoFamily: ""
   )
 
   /// Fixed-palette tokens keyed by theme. Built once (static `let`), so the
@@ -238,6 +287,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e2d8c2"),
       codeBackground: ColorSpec(hex: "#efe8d6"),
       text: ColorSpec(hex: "#2a251d"),
+      accent: ColorSpec(hex: "#9a5b28"),
+      muted: ColorSpec(hex: "#7a7062"),
       warning: ColorSpec(hex: "#8a6a20"),
       srcHeading: ColorSpec(hex: "#4a5a3c"),
       srcListMarker: ColorSpec(hex: "#9a5b28"),
@@ -247,7 +298,10 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcStrike: ColorSpec(hex: "#8a7a5a"),
       srcHighlightBackground: ColorSpec(hex: "#e8dcae"),
       srcGutter: ColorSpec(hex: "#b9ad96"),
-      srcCurrentLine: ColorSpec(hex: "#4a5a3c")
+      srcCurrentLine: ColorSpec(hex: "#4a5a3c"),
+      previewFamily: "Newsreader",
+      previewHeadingFamily: "Newsreader",
+      monoFamily: "Sometype Mono"
     ),
     .graphite: ThemeTokens(
       mode: .dark,
@@ -255,6 +309,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#2a2a2a"),
       codeBackground: ColorSpec(hex: "#1f1f1f"),
       text: ColorSpec(hex: "#d2d2d2"),
+      accent: ColorSpec(hex: "#86b8c4"),
+      muted: ColorSpec(hex: "#848484"),
       warning: ColorSpec(hex: "#c49a72"),
       srcHeading: ColorSpec(hex: "#e0e0e0"),
       srcListMarker: ColorSpec(hex: "#6f8fa0"),
@@ -264,7 +320,10 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcStrike: ColorSpec(hex: "#737373"),
       srcHighlightBackground: ColorSpec(hex: "#343434"),
       srcGutter: ColorSpec(hex: "#4f4f4f"),
-      srcCurrentLine: ColorSpec(hex: "#e0e0e0")
+      srcCurrentLine: ColorSpec(hex: "#e0e0e0"),
+      previewFamily: "Instrument Sans",
+      previewHeadingFamily: "Instrument Sans",
+      monoFamily: "JetBrains Mono"
     ),
     .ink: ThemeTokens(
       mode: .dark,
@@ -272,6 +331,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#232a36"),
       codeBackground: ColorSpec(hex: "#1a2130"),
       text: ColorSpec(hex: "#d8dde6"),
+      accent: ColorSpec(hex: "#8a7fc8"),
+      muted: ColorSpec(hex: "#8590a0"),
       warning: ColorSpec(hex: "#c8b07a"),
       srcHeading: ColorSpec(hex: "#b8c4d4"),
       srcListMarker: ColorSpec(hex: "#8a7fc8"),
@@ -281,7 +342,10 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcStrike: ColorSpec(hex: "#6a7382"),
       srcHighlightBackground: ColorSpec(hex: "#2b2540"),
       srcGutter: ColorSpec(hex: "#4b5665"),
-      srcCurrentLine: ColorSpec(hex: "#b8c4d4")
+      srcCurrentLine: ColorSpec(hex: "#b8c4d4"),
+      previewFamily: "Literata",
+      previewHeadingFamily: "Archivo",
+      monoFamily: "JetBrains Mono"
     ),
     .porcelain: ThemeTokens(
       mode: .light,
@@ -289,6 +353,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e4e8ec"),
       codeBackground: ColorSpec(hex: "#f3f5f7"),
       text: ColorSpec(hex: "#14181c"),
+      accent: ColorSpec(hex: "#0f6f6c"),
+      muted: ColorSpec(hex: "#667079"),
       warning: ColorSpec(hex: "#7a4a12"),
       srcHeading: ColorSpec(hex: "#14181c"),
       srcListMarker: ColorSpec(hex: "#0f6f6c"),
@@ -298,7 +364,10 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcStrike: ColorSpec(hex: "#667079"),
       srcHighlightBackground: ColorSpec(hex: "#d9ecea"),
       srcGutter: ColorSpec(hex: "#aab3bb"),
-      srcCurrentLine: ColorSpec(hex: "#0f6f6c")
+      srcCurrentLine: ColorSpec(hex: "#0f6f6c"),
+      previewFamily: "IBM Plex Sans",
+      previewHeadingFamily: "IBM Plex Sans",
+      monoFamily: "IBM Plex Mono"
     ),
     .typewriter: ThemeTokens(
       mode: .light,
@@ -306,6 +375,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       border: ColorSpec(hex: "#e6e6e6"),
       codeBackground: ColorSpec(hex: "#2b2b2b"),
       text: ColorSpec(hex: "#d4d4d4"),
+      accent: ColorSpec(hex: "#1c1c1c"),
+      muted: ColorSpec(hex: "#6e6e6e"),
       warning: ColorSpec(hex: "#6e6e6e"),
       srcHeading: ColorSpec(hex: "#f2f2f2"),
       srcListMarker: ColorSpec(hex: "#d4d4d4"),
@@ -315,7 +386,10 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcStrike: ColorSpec(hex: "#8a8a8a"),
       srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
       srcGutter: ColorSpec(hex: "#525252"),
-      srcCurrentLine: ColorSpec(hex: "#e8e8e8")
+      srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
+      previewFamily: "Spline Sans Mono",
+      previewHeadingFamily: "Spline Sans Mono",
+      monoFamily: "Spline Sans Mono"
     ),
   ]
 }

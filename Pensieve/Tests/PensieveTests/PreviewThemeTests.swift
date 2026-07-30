@@ -120,6 +120,70 @@ final class PreviewThemeTests: XCTestCase {
       ColorSpec.nsColor(fromHex: "#c8b07a"))
   }
 
+  /// The chrome accent (sidebar selection, toolbar diamond) is byte-parity with
+  /// each theme's preview `--vc-preview-link`; adaptive themes wrap the system
+  /// `linkColor` with the GitHub base as CSS fallback.
+  func testAccentTokenMirrorsPreviewLinkPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.accent.css, "#9a5b28")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.accent.css, "#86b8c4")
+    XCTAssertEqual(PensieveTheme.ink.tokens.accent.css, "#8a7fc8")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.accent.css, "#0f6f6c")
+    XCTAssertEqual(PensieveTheme.typewriter.tokens.accent.css, "#1c1c1c")
+    // Adaptive: live linkColor, GitHub base as the CSS fallback.
+    XCTAssertEqual(PensieveTheme.default.tokens.accent.css, "#0969da")
+    XCTAssertEqual(PensieveTheme.default.tokens.accent.nsColor, NSColor.linkColor)
+    XCTAssertEqual(PensieveTheme.raw.tokens.accent.css, "#0969da")
+  }
+
+  /// The chrome muted colour (section headers, row glyphs) mirrors each theme's
+  /// preview `--vc-preview-muted`; adaptive themes wrap `secondaryLabelColor`.
+  func testMutedTokenMirrorsPreviewMutedPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.muted.css, "#7a7062")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.muted.css, "#848484")
+    XCTAssertEqual(PensieveTheme.ink.tokens.muted.css, "#8590a0")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.muted.css, "#667079")
+    XCTAssertEqual(PensieveTheme.typewriter.tokens.muted.css, "#6e6e6e")
+    XCTAssertEqual(PensieveTheme.default.tokens.muted.css, "#57606a")
+    XCTAssertEqual(PensieveTheme.default.tokens.muted.nsColor, NSColor.secondaryLabelColor)
+  }
+
+  /// Typography tokens map to the families `BundledFonts` registers and the skin
+  /// CSS font-family chains reference. Adaptive themes carry no bundled family.
+  func testTypographyTokensMapToBundledFamiliesPerTheme() {
+    let expected: [PensieveTheme: (preview: String, heading: String, mono: String)] = [
+      .parchment: ("Newsreader", "Newsreader", "Sometype Mono"),
+      .graphite: ("Instrument Sans", "Instrument Sans", "JetBrains Mono"),
+      .ink: ("Literata", "Archivo", "JetBrains Mono"),
+      .porcelain: ("IBM Plex Sans", "IBM Plex Sans", "IBM Plex Mono"),
+      .typewriter: ("Spline Sans Mono", "Spline Sans Mono", "Spline Sans Mono"),
+    ]
+    for (skin, families) in expected {
+      XCTAssertEqual(skin.tokens.previewFamily, families.preview, skin.rawValue)
+      XCTAssertEqual(skin.tokens.previewHeadingFamily, families.heading, skin.rawValue)
+      XCTAssertEqual(skin.tokens.monoFamily, families.mono, skin.rawValue)
+      // Every referenced family is one the bundle actually registers.
+      for family in [families.preview, families.heading, families.mono] {
+        XCTAssertTrue(
+          BundledFonts.expectedResolvableFamilies.contains(family),
+          "\(skin.rawValue) references unbundled family \(family)")
+      }
+    }
+    // Adaptive themes fall back to the system face.
+    for skin in [PensieveTheme.default, .raw] {
+      XCTAssertEqual(skin.tokens.previewFamily, "")
+      XCTAssertEqual(skin.tokens.previewHeadingFamily, "")
+      XCTAssertEqual(skin.tokens.monoFamily, "")
+    }
+  }
+
+  /// An empty family name resolves to the system font of the requested size —
+  /// the deterministic native fallback the adaptive themes rely on.
+  func testEmptyFamilyResolvesToSystemFont() {
+    let resolved = ThemeTokens.font("", 12.5)
+    XCTAssertEqual(resolved.pointSize, 12.5, accuracy: 0.001)
+    XCTAssertEqual(resolved.fontName, NSFont.systemFont(ofSize: 12.5).fontName)
+  }
+
   // MARK: - appearanceCSS threads the skin through
 
   func testAppearanceCSSAppendsSkinOverlay() {
