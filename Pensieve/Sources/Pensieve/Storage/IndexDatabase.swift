@@ -128,6 +128,20 @@ final class IndexDatabase {
   /// coalescing is still correct, because the pass has yet to checkpoint. `nil` in production.
   var maintenanceCompletionGateOverride: (@Sendable () async -> Void)?
 
+  /// Narrow test seam, fifth sibling: awaited inside the single-document index write
+  /// (`indexInBackground`), after `ensureOpenInBackground` has already handed the pool over and
+  /// immediately BEFORE the detached task carrying its `pool.write` is submitted.
+  ///
+  /// The position is the whole point, and it is the only window this entry point actually has. Its
+  /// three earlier suspensions — `awaitBackgroundWriteGate()`, `await previous?.value`, the open —
+  /// are all covered by `ensureOpenInBackground`'s own post-await latch consultation, so a wedge
+  /// placed at `backgroundWriteGateOverride` would only prove that a refused open refuses. What
+  /// remains is the detached hop plus the wait for the pool's SERIALIZED WRITER, and a write parked
+  /// here is in exactly that state: accepted, holding a published pool, holding no lock, and about to
+  /// commit into a database whose terminal checkpoint may already have been taken. `nil` in
+  /// production.
+  var singleDocumentIndexWriteGateOverride: (@Sendable () async -> Void)?
+
   /// Narrow test seam: fired on the main actor INSIDE the open task, in the SAME step that publishes
   /// the pool and before that task returns to the caller which owns it.
   ///
@@ -1673,8 +1687,10 @@ final class IndexDatabase {
   /// concurrent index writes serialize in submission order and a failed write can never leave the FTS
   /// index half-applied (single transaction).
   ///
-  /// Returns `true` when the off-main write committed, `false` when it threw (still reported). Tests
-  /// sync on completion via `waitForPendingReindex()` instead of sleeping.
+  /// Returns `true` when the off-main write committed, `false` when it threw (still reported) and
+  /// `false` when the termination latch abandoned it mid-transaction (logged, deliberately NOT
+  /// reported — see `abandonIfClosedForTermination(_:)`). Tests sync on completion via
+  /// `waitForPendingReindex()` instead of sleeping.
   @discardableResult
   func indexInBackground(
     document: DocumentRef, body: String, appState: AppState? = nil
@@ -1693,9 +1709,18 @@ final class IndexDatabase {
       guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
         return false
       }
+      // The no-loop member of the class rounds 16 and 17 closed for the batch paths. "No loop" only
+      // rules out MID-transaction consultations; the one at transaction ENTRY is owed here just as
+      // much, because this call can be ACCEPTED before the latch closes and still COMMIT after it.
+      // Its entry guard and `ensureOpenInBackground` cover every suspension up to the open; what they
+      // cannot cover is the detached hop below and the wait for the pool's serialized writer, and a
+      // save queued behind a long reindex spends the whole quit exactly there.
+      let latch = self.terminationLatch
+      if let transactionGate = self.singleDocumentIndexWriteGateOverride { await transactionGate() }
       do {
         try await Task.detached(priority: .utility) {
           try pool.write { db in
+            try Self.abandonIfClosedForTermination(latch)
             try Self.ensureWorkspaceRow(for: record, in: db)
             try Self.upsertDocument(record, in: db)
           }
@@ -1709,6 +1734,14 @@ final class IndexDatabase {
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
         self.scheduleIndexBatchMaintenance()
         return true
+      } catch is IndexWriteAbandonedAfterTermination {
+        // R17 routing: an abandonment is a decision the quit made, not an error the user can act on,
+        // so it is LOGGED rather than surfaced as "could not update Pensieve search index" on an app
+        // nobody can answer any more. `false` is still the right answer to the caller — it is what
+        // keeps the save tail from persisting an on-disk signature for an index write that rolled
+        // back.
+        Self.logAbandonedWriteAfterTermination("indexInBackground")
+        return false
       } catch {
         self.report(error, appState: appState, action: "update Pensieve search index")
         return false
@@ -2111,19 +2144,27 @@ final class IndexDatabase {
   ///   partial index (the same contract a FAILED write already relies on);
   /// - a torn-down process has no use for the rest of the reindex anyway.
   ///
-  /// Placed BEFORE each `upsertDocuments` rather than after, so the granularity of the abort is one
-  /// batch of work not started, not one batch of work wasted.
+  /// In a BATCH writer it is placed BEFORE each `upsertDocuments` rather than after, so the
+  /// granularity of the abort is one batch of work not started, not one batch of work wasted. In a
+  /// SINGLE-statement writer there is no such interior, so the consultation goes at transaction
+  /// ENTRY — the first statement inside the `pool.write` closure. Round 20 closed that half of the
+  /// class (`indexInBackground`, `appendScanSession`, `refreshWorkspaceStats`): "no loop" only ever
+  /// ruled out mid-transaction consultations, never the entry one, and the window a single write
+  /// needs is the same one the batch writers had — the detached hop plus the wait for the pool's
+  /// serialized writer, which a save queued behind a long reindex spends the whole quit inside.
   ///
   /// `upsertWorkspace` is the third path consulting this, and it returns `Void` — so its
   /// abandonment cannot be propagated through a result, and it does not need to be. Its manifest and
   /// tree fingerprint are written by `commitWorkspaceManifest` BEFORE the index write is even handed
   /// off, so no return value could retract them; what must not happen is the rest of that hand-off
-  /// recording the workspace as freshly scanned. `appendScanSession` and `refreshWorkspaceStats`
-  /// (which would write a `cold_scan` row and an `index_health` of `green` over rows this
-  /// transaction rolled back) are their own entry points, and the funnel that closed in the same
-  /// step as this latch refuses both. The abandonment therefore propagates through refusal rather
-  /// than through a signature — and the `.md` search signature is a separate mechanism, gated on
-  /// the reindex/delta `Bool` that already covers it.
+  /// recording the workspace as freshly scanned. Round 17 argued that `appendScanSession` and
+  /// `refreshWorkspaceStats` (which would write a `cold_scan` row and an `index_health` of `green`
+  /// over rows this transaction rolled back) were covered because they are their own entry points and
+  /// the funnel refuses both. That is true only of a call that ARRIVES after the latch closed —
+  /// round 20 measured the other case, where the call was accepted first and its detached
+  /// `pool.write` was still queued when the funnel closed, and both now consult this latch at
+  /// transaction entry like every other write. The `.md` search signature remains a separate
+  /// mechanism, gated on the reindex/delta/index `Bool` that already covers it.
   private nonisolated static func abandonIfClosedForTermination(_ latch: TerminationLatch) throws {
     guard latch.isClosedForTermination else { return }
     throw IndexWriteAbandonedAfterTermination()
@@ -2885,9 +2926,14 @@ final class IndexDatabase {
   ) async {
     guard !isRefusedAfterTermination("appendScanSession") else { return }
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
+    // Sweep member (round 20): accepted before the latch, committed after it. This row is the one
+    // that says the workspace WAS freshly scanned, so writing it behind the terminal checkpoint over
+    // an index write that rolled back is exactly the inconsistency the latch exists to prevent.
+    let latch = terminationLatch
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in
+          try Self.abandonIfClosedForTermination(latch)
           try db.execute(
             sql: """
               INSERT INTO scan_sessions (
@@ -2909,6 +2955,8 @@ final class IndexDatabase {
           )
         }
       }.value
+    } catch is IndexWriteAbandonedAfterTermination {
+      Self.logAbandonedWriteAfterTermination("appendScanSession")
     } catch {
       report(error, appState: appState, action: "append Pensieve scan session")
     }
@@ -2923,9 +2971,13 @@ final class IndexDatabase {
   ) async {
     guard !isRefusedAfterTermination("refreshWorkspaceStats") else { return }
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
+    // Sweep member (round 20), and the twin of `appendScanSession`'s: an `index_health` of `green`
+    // committed after the terminal checkpoint would describe rows the same quit rolled back.
+    let latch = terminationLatch
     do {
       try await Task.detached(priority: .utility) {
         try pool.write { db in
+          try Self.abandonIfClosedForTermination(latch)
           let indexHealth = fileCount == 0 ? "empty" : (fingerprintMatches ? "green" : "stale")
           try db.execute(
             sql: """
@@ -2956,6 +3008,8 @@ final class IndexDatabase {
           )
         }
       }.value
+    } catch is IndexWriteAbandonedAfterTermination {
+      Self.logAbandonedWriteAfterTermination("refreshWorkspaceStats")
     } catch {
       report(error, appState: appState, action: "refresh Pensieve workspace stats")
     }

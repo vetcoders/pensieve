@@ -559,6 +559,134 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "workspace index\" on an app nobody can answer any more")
   }
 
+  /// R20 / F1 — the same defect on the NO-LOOP member: the ordinary single-document save.
+  ///
+  /// `indexInBackground` is the write the production autosave/save tail takes, and until round 20 its
+  /// `pool.write` (ensure-workspace + upsert) was the one transaction body in this file that never
+  /// asked whether the funnel had closed. Round 16 skipped it with a "no loop" justification, and
+  /// that argument only ever ruled out MID-transaction consultations — the one at transaction ENTRY
+  /// is owed here exactly as it was owed to the batch paths.
+  ///
+  /// The window had to be MEASURED rather than assumed, and it is narrower than "every suspension
+  /// after the entry guard". `awaitBackgroundWriteGate()`, `await previous?.value` and the open are
+  /// all followed by `ensureOpenInBackground`'s own post-await latch consultation, so a write parked
+  /// at any of them comes back to a `nil` pool and never reaches the transaction. What is left is the
+  /// detached hop and the wait for the pool's SERIALIZED WRITER — and that is not a hairline: a save
+  /// queued behind a long reindex sits there for the whole quit. `singleDocumentIndexWriteGateOverride`
+  /// parks exactly in that slot: pool in hand, no lock held, transaction not yet open.
+  ///
+  /// Asserted at the SUBSTRATE, through an independent connection, because the returned `Bool` is not
+  /// the contract — the rows and the WAL frames are. The terminal checkpoint is allowed to complete
+  /// FIRST (the parked write holds neither the writer nor a reader), so `walSize == 0` before the
+  /// release is a real precondition and any frame afterwards is a frame recreated behind the
+  /// checkpoint that was supposed to be the last word.
+  ///
+  /// A safety valve opens the gate so a regressed build FAILS the assertions instead of hanging.
+  func testAnAcceptedSingleDocumentIndexWriteStopsAtTheLatchWhenTheQuitBudgetExpires() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    // Seed frames so the terminal checkpoint has something to truncate — otherwise "the WAL is zero"
+    // would be true before the quit and could not tell a rolled-back write from a checkpointed one.
+    let seedRef = documentRef(root: root, name: "seed.md")
+    try "singledocseedneedle".write(to: seedRef.url, atomically: true, encoding: .utf8)
+    database.index(document: seedRef, body: "singledocseedneedle")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: there must be WAL frames for the terminal checkpoint to truncate")
+
+    let gate = ParkingGate()
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      Task { await gate.open() }
+    }
+    database.singleDocumentIndexWriteGateOverride = { await gate.arrive() }
+
+    // The write's OWN app state, so the last assertion can tell "logged" from "reported".
+    let writeAppState = AppState()
+    let writeFinished = CompletionFlag()
+    let writeReportedSuccess = CompletionFlag()
+    let savedRef = documentRef(root: root, name: "late-save.md")
+    try "abandonedsavedocneedle".write(to: savedRef.url, atomically: true, encoding: .utf8)
+    // Handed over through `scheduleIndexWrite` because that is how the save tail hands it over: the
+    // quit's drain then genuinely parks on this write instead of racing it.
+    database.scheduleIndexWrite {
+      let wrote = await database.indexInBackground(
+        document: savedRef, body: "abandonedsavedocneedle", appState: writeAppState)
+      writeReportedSuccess.isSet = wrote
+      writeFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { gate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      gate.arrivalCount, 1,
+      "fixture precondition: the save's index write must be parked past its entry guard and past the "
+        + "open, with the pool already in hand — that is the only window this entry point has")
+
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: makeIsolatedFolderManager(
+        in: folder, database: database, prefix: "AbandonedSingleDoc"),
+      autosaver: Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000),
+      drainTimeout: Self.shrunkDrainBudget)
+    let startedAt = Date()
+    sequence.runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "fixture precondition: the quit must have escaped its budget rather than waited the wedge "
+        + "out; it took \(elapsed) s")
+    XCTAssertTrue(
+      database.isClosedForTermination,
+      "fixture precondition: a spent budget must still close the funnel — that latch is the signal "
+        + "this pin is about")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "fixture precondition: the save's write must have been ACCEPTED, not refused at entry. A "
+        + "rejection here would mean this pin never reproduced the window it exists for")
+
+    // The parked write holds neither the pool's writer nor a reader, so the terminal checkpoint can
+    // and must finish while it waits. This is the state the resumed write must not be able to spoil.
+    pumpMainRunLoop(until: { walSize(for: databaseURL) == 0 }, timeout: 10)
+    XCTAssertEqual(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: the terminal checkpoint must have taken the WAL to zero before the "
+        + "parked write resumes (it is \(walSize(for: databaseURL)) bytes)")
+
+    Task { await gate.open() }
+    pumpMainRunLoop(until: { writeFinished.isSet }, timeout: 20)
+    XCTAssertTrue(writeFinished.isSet, "the abandoned write must return promptly, not hang")
+
+    // Measured BEFORE any new connection is opened, so the number is the write's doing and nothing
+    // else's.
+    let walAfterResume = walSize(for: databaseURL)
+    XCTAssertEqual(
+      walAfterResume, 0,
+      "the accepted save committed after the termination latch closed: its frames land BEHIND the "
+        + "terminal checkpoint, so the WAL→0 the quit promises is simply untrue (the WAL is "
+        + "\(walAfterResume) bytes)")
+    XCTAssertEqual(
+      try indexHits(matching: "abandonedsavedocneedle", at: databaseURL), 0,
+      "…and the transaction must have rolled back: a single-statement writer has no half-commit, so "
+        + "the row is either absent or it is a row written behind the checkpoint")
+    XCTAssertFalse(
+      writeReportedSuccess.isSet,
+      "…and an abandoned write must report failure, because that is what stops the save tail from "
+        + "persisting an on-disk signature for an index write that never landed")
+    XCTAssertNil(
+      writeAppState.lastError,
+      "…and abandonment is a decision the quit made about the index, not an error the user can act "
+        + "on: it must be LOGGED like the reindex and manifest twins, never surfaced as \"could not "
+        + "update Pensieve search index\" on an app nobody can answer any more")
+  }
+
   /// The subtle half of the latch: refusing WRITES is not enough, because in this app a read can
   /// write. `ensureOpen` builds the pool lazily and runs every migration on first creation, so a
   /// backlink query or a search arriving during the quit could create the database file, execute a
