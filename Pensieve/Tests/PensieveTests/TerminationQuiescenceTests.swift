@@ -3131,6 +3131,129 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…with window A's unsaved text untouched by a save in another window")
   }
 
+  /// Round 19, blocker 1: a batch flush must publish in ARMING order, not in array order.
+  ///
+  /// The two orders come apart the moment an owner RE-ARMS: `scheduleIndex` replaces that owner's slot
+  /// in place, so its array position is frozen at its FIRST arming while its generation is refreshed.
+  /// Window A arms, window B arms, window A edits again — array `[A, B]`, arming order `A, B, A`. Both
+  /// owners then settle, so `savePendingChangesOnClose`'s sweep flushes BOTH, and because
+  /// `IndexDatabase` preserves submission order the body that runs last is the row that survives.
+  ///
+  /// In array order that is B — a session buffer A's newer save has already made stale, holding text
+  /// that is on nobody's disk. Both entries are consumed by the flush, and this document is AD-HOC (no
+  /// workspace signature ⇒ no cold-open self-heal), so nothing would ever correct it. The R18 retire
+  /// does not reach this state: it fires only from row-publishing saves (`indexNow: true` / `saveAs`),
+  /// and every write here is an autosave.
+  ///
+  /// The assertion is deliberately about CONTENT, never about which body ran when: FTS must hold the
+  /// bytes that are actually on disk.
+  func testASettledFlushPublishesTheMostRecentlyArmedDebounceLast() async throws {
+    try await assertABatchFlushPublishesTheMostRecentlyArmedDebounceLast(
+      defaultsPrefix: "PensieveSettledFlushOrderBookmarks",
+      flush: { $0.flushIndexDebouncesWithSettledOwners() }
+    )
+  }
+
+  /// The same defect on the QUIT path's unconditional form. `flushIndex()` iterated the same array the
+  /// same way, and `quiesceForTermination()` calls it — so a quit with two windows on one file could
+  /// leave FTS holding the older arming's buffer, permanently, on exactly the documents that have no
+  /// cold-open self-heal.
+  func testTheQuitFlushPublishesTheMostRecentlyArmedDebounceLast() async throws {
+    try await assertABatchFlushPublishesTheMostRecentlyArmedDebounceLast(
+      defaultsPrefix: "PensieveQuitFlushOrderBookmarks",
+      flush: { $0.flushIndex() }
+    )
+  }
+
+  private func assertABatchFlushPublishesTheMostRecentlyArmedDebounceLast(
+    defaultsPrefix: String,
+    flush: @MainActor (Autosaver) -> Void
+  ) async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("shared-by-two-windows.md")
+    let originalBody = "the shared file before either edit"
+    try originalBody.write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    // The index delay is long enough that no index timer can fire during this test — the only thing
+    // that runs an index body here is the explicit flush seam below. The save delay is short because
+    // each window's own autosave landing is a PRECONDITION, and it is waited for by CONTENT, not by
+    // the clock.
+    let autosaver = Autosaver(saveDelayMilliseconds: 40, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(defaults: makeEphemeralDefaults(prefix: defaultsPrefix)),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    // Window A arms FIRST, which is what buys it array slot 0 — and a re-arm never gives that slot up.
+    let stateA = AppState()
+    stateA.documents = [sharedRef]
+    stateA.documentSession.load(document: sharedRef, text: originalBody)
+    stateA.activeDocumentText = "alphafirst window A's first edit, superseded below"
+    store.documentDidChange(appState: stateA)
+
+    // Window B arms SECOND, so the array is `[A, B]` from here on.
+    let bodyB = "betaneedle the text window B still holds after its own autosave"
+    let stateB = AppState()
+    stateB.documents = [sharedRef]
+    stateB.documentSession.load(document: sharedRef, text: originalBody)
+    stateB.activeDocumentText = bodyB
+    store.documentDidChange(appState: stateB)
+
+    try await waitUntil("both windows' own autosaves to land and settle their buffers") {
+      !stateA.documentSession.isDirty && !stateB.documentSession.isDirty
+    }
+
+    // A edits again. `scheduleIndex` replaces A's entry IN PLACE: array position 0 unchanged, fresh
+    // generation — this is the single step that makes array order and arming order disagree.
+    let bodyA = "alphaneedle the newest text, and the file's final on-disk content"
+    stateA.activeDocumentText = bodyA
+    store.documentDidChange(appState: stateA)
+
+    try await waitUntil("window A's second autosave to land its newer bytes") {
+      (try? String(contentsOf: sharedURL, encoding: .utf8)) == bodyA
+        && !stateA.documentSession.isDirty
+    }
+
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "fixture precondition: window A holds an armed index debounce over the shared file…")
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateB), sharedRef.id,
+      "…and so does window B, whose entry an autosave never retires")
+    XCTAssertFalse(
+      autosaver.armedIndexOwnerIsDirty(ownedBy: stateA),
+      "fixture precondition: both owners must be SETTLED, so the sweep flushes both rather than…")
+    XCTAssertFalse(
+      autosaver.armedIndexOwnerIsDirty(ownedBy: stateB),
+      "…leaving either of them armed — a deferred entry would never reach the ordering under test")
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyA,
+      "fixture precondition: A's bytes are the file's final on-disk content, B's buffer is stale")
+
+    flush(autosaver)
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "alphaneedle", at: databaseURL), 1,
+      "the entry armed MOST RECENTLY must publish LAST, so FTS holds the text that is on disk…")
+    XCTAssertEqual(
+      try indexHits(matching: "betaneedle", at: databaseURL), 0,
+      "…and never the older arming's session buffer, which array-order iteration would have let "
+        + "publish last purely because its owner armed into a later array slot")
+    XCTAssertEqual(try String(contentsOf: sharedURL, encoding: .utf8), bodyA)
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own

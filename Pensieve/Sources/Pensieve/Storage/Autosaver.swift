@@ -188,8 +188,11 @@ final class Autosaver {
   /// write that fails (full volume, revoked permissions) would leave FTS advertising content that
   /// never reached the disk. Deferred means left ARMED — that owner's own close decides, or the
   /// debounce simply fires on its own schedule over bytes its own autosave has by then written.
+  ///
+  /// Runs the entries it selects in ARMING order, not array order — see `armingOrderedGenerations`.
   func flushIndexDebouncesWithSettledOwners() {
-    for generation in indexEntries.filter({ !($0.ownerIsDirty?() ?? false) }).map(\.generation) {
+    let settled = indexEntries.filter { !($0.ownerIsDirty?() ?? false) }
+    for generation in armingOrderedGenerations(of: settled) {
       runPendingIndex(generation: generation)
     }
   }
@@ -201,8 +204,11 @@ final class Autosaver {
   /// the dirty-owner reservation above has nothing left to protect. Idempotent — each body is
   /// dropped before it is invoked — because the sequence flushes through the window closes AND
   /// through `quiesceForTermination()`, and both may reach the same debounce.
+  ///
+  /// In ARMING order, for the same reason the settled-owner flush above is — see
+  /// `armingOrderedGenerations`.
   func flushIndex() {
-    for generation in indexEntries.map(\.generation) {
+    for generation in armingOrderedGenerations(of: indexEntries) {
       runPendingIndex(generation: generation)
     }
   }
@@ -265,6 +271,10 @@ final class Autosaver {
   ///
   /// Generations are collected BEFORE anything is discarded, because `discardIndexEntry(at:)` mutates
   /// the array the predicate just walked.
+  ///
+  /// Deliberately NOT arming-ordered, unlike the two flushes: this batch runs no bodies at all. Every
+  /// selected entry is cancelled, the selection is a set predicate, and the result is the same
+  /// whichever order the removals happen in — there is no "last writer" for iteration order to pick.
   func retireSettledIndexDebounces(for document: URL, except owner: AnyObject) {
     let retired = indexEntries.filter {
       $0.document == document && $0.owner !== owner && !($0.ownerIsDirty?() ?? false)
@@ -301,6 +311,33 @@ final class Autosaver {
   private func nextGeneration() -> UInt64 {
     generationCounter &+= 1
     return generationCounter
+  }
+
+  /// The generations of `entries` in ARMING order — oldest arming first — so that running the bodies
+  /// in this order publishes the most recently armed one LAST.
+  ///
+  /// Round 19, blocker 1. Both flushes used to iterate `indexEntries` in ARRAY order, and array order
+  /// is not arming order: `scheduleIndex` re-arms an existing owner by replacing its slot IN PLACE
+  /// (`indexEntries[existing] = entry`), which keeps that owner's original position while handing it a
+  /// brand-new generation. So for two windows on ONE file — A armed, then B armed, then A re-armed —
+  /// the array reads `[A, B]` while the arming order is `A, B, A`. A settled-owner flush then ran A
+  /// before B, and because `IndexDatabase` preserves submission order the LAST body to publish won:
+  /// B's older session buffer became the final FTS row over bytes A had just written to disk. Both
+  /// entries are consumed by the flush, so for an AD-HOC document — no workspace signature, therefore
+  /// no cold-open self-heal — that stale row was permanent.
+  ///
+  /// Generation IS arming recency, and the substrate says so unconditionally: `generationCounter` is
+  /// mutated in exactly one place (`nextGeneration()`, strictly increasing), `nextGeneration()` is
+  /// called only at the TOP of `scheduleSave` and `scheduleIndex` before either branches, and an index
+  /// entry's `generation` is only ever set from that fresh value at construction — the in-place
+  /// replacement installs a whole new entry, generation included. Nothing copies or reuses one. So
+  /// sorting ascending is exactly "oldest arming first", and it is a no-op for the append-only case
+  /// where array order already agreed.
+  ///
+  /// Ordering only. Which entries are in `entries` — flushed versus left armed — is the caller's
+  /// classification and is untouched here.
+  private func armingOrderedGenerations(of entries: [IndexEntry]) -> [UInt64] {
+    entries.map(\.generation).sorted()
   }
 
   private func saveEntryIndex(ownedBy session: AnyObject) -> Int? {
