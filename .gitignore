@@ -108,5 +108,11 @@ dist/
 /docs/workforce
 /.claude
 
+# Cut 2: bundled OFL theme fonts. The blanket `*.txt` denial above would strip
+# the OFL license files out of the SwiftPM resource bundle on a fresh clone /
+# CI build, breaking the OFL redistribution requirement. The `.ttf` fonts are
+# not ignored; only the licenses need rescuing.
+!Pensieve/Sources/Pensieve/Resources/Fonts/**/OFL.txt
+
 # vibecrafted-hooks-template warns retention
 .husky/warns/

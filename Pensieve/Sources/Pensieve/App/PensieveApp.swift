@@ -14,6 +14,11 @@ struct PensieveApp: App {
   private let providerSettings: ProviderSettings
 
   init() {
+    // Register the bundled OFL theme fonts into this process's font environment
+    // before any view builds. Idempotent and non-fatal — a missing/failed font
+    // never blocks launch; the skin CSS fallback chains cover absence.
+    BundledFonts.registerOnce()
+
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()

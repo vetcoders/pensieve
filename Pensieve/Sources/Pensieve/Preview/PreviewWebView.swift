@@ -168,7 +168,10 @@ final class PreviewWebView: NSView {
           style.id = 'vc-preview-style';
           document.head.appendChild(style);
         }
-        style.textContent = \(PreviewWebView.javaScriptStringLiteral(document.styleHTML));
+        const nextStyle = \(PreviewWebView.javaScriptStringLiteral(document.styleHTML));
+        if (style.textContent !== nextStyle) {
+          style.textContent = nextStyle;
+        }
         article.innerHTML = \(PreviewWebView.javaScriptStringLiteral(document.bodyHTML));
 
         const mermaidRuntime = \(PreviewWebView.javaScriptStringLiteral(document.mermaidJavaScript ?? ""));
@@ -231,346 +234,353 @@ final class PreviewWebView: NSView {
   static func appearanceCSS(fontSize: CGFloat, skin: PensieveTheme = .default)
     -> String
   {
-    """
-    :root {
-      color-scheme: light dark;
-      --vc-font-size: \(Int(fontSize))px;
-      --vc-preview-text: #1f2328;
-      --vc-preview-muted: #57606a;
-      --vc-preview-border: #d0d7de;
-      --vc-preview-code-bg: #f6f8fa;
-      --vc-preview-code-shadow: 0 1px 2px rgba(31, 35, 40, 0.06), 0 8px 24px rgba(31, 35, 40, 0.05);
-      --vc-preview-link: #0969da;
-      --vc-preview-row-alt: #f6f8fa;
-      --vc-preview-mark-bg: #fff8c5;
-      --vc-preview-mark-text: #24292f;
-      /* Semantic status tokens (P0/HOLD/OPEN markers). Kept in the base block so
-         `default` and `raw` carry them too; single-mode skins re-tune them. */
-      --vc-preview-danger: #cf222e;
-      --vc-preview-warning: #9a6700;
-      --vc-preview-positive: #1a7f37;
-      --vc-preview-diagram-bg: #ffffff;
-      --vc-preview-diagram-error-bg: #fff1f1;
-      --vc-preview-diagram-error-text: #8c1d18;
-      --vc-preview-math-bg: #f6f8fa;
-      --vc-preview-page-background: transparent;
-      \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
-    }
-
-    @media (prefers-color-scheme: dark) {
+    let skinBlock = skinCSS(for: skin)
+    // Deliver the bundled families to WebContent via @font-face data URIs —
+    // process-scope CTFontManager registration does not cross into the WebView's
+    // out-of-process content. Scoped to the families this skin references, so
+    // `default`/`raw` carry no font payload.
+    let fontFaces = BundledFonts.fontFaceCSS(referencedIn: skinBlock)
+    return """
+      \(fontFaces)
       :root {
-        --vc-preview-text: #f0f0f0;
-        --vc-preview-muted: #a1a1aa;
-        --vc-preview-border: #3f3f46;
-        --vc-preview-code-bg: #2a2a2d;
-        --vc-preview-code-shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.18);
-        --vc-preview-link: #8ab4f8;
-        --vc-preview-row-alt: #242428;
-        --vc-preview-mark-bg: #4a3f16;
-        --vc-preview-mark-text: #fff3b0;
-        --vc-preview-danger: #ff7b72;
-        --vc-preview-warning: #d29922;
-        --vc-preview-positive: #3fb950;
-        --vc-preview-diagram-bg: #18181b;
-        --vc-preview-diagram-error-bg: #3f1d1d;
-        --vc-preview-diagram-error-text: #fecaca;
-        --vc-preview-math-bg: #27272a;
+        color-scheme: light dark;
+        --vc-font-size: \(Int(fontSize))px;
+        --vc-preview-text: #1f2328;
+        --vc-preview-muted: #57606a;
+        --vc-preview-border: #d0d7de;
+        --vc-preview-code-bg: #f6f8fa;
+        --vc-preview-code-shadow: 0 1px 2px rgba(31, 35, 40, 0.06), 0 8px 24px rgba(31, 35, 40, 0.05);
+        --vc-preview-link: #0969da;
+        --vc-preview-row-alt: #f6f8fa;
+        --vc-preview-mark-bg: #fff8c5;
+        --vc-preview-mark-text: #24292f;
+        /* Semantic status tokens (P0/HOLD/OPEN markers). Kept in the base block so
+           `default` and `raw` carry them too; single-mode skins re-tune them. */
+        --vc-preview-danger: #cf222e;
+        --vc-preview-warning: #9a6700;
+        --vc-preview-positive: #1a7f37;
+        --vc-preview-diagram-bg: #ffffff;
+        --vc-preview-diagram-error-bg: #fff1f1;
+        --vc-preview-diagram-error-text: #8c1d18;
+        --vc-preview-math-bg: #f6f8fa;
+        --vc-preview-page-background: transparent;
+        \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
       }
-    }
 
-    html,
-    body {
-      background: transparent !important;
-      color: var(--vc-preview-text) !important;
-    }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --vc-preview-text: #f0f0f0;
+          --vc-preview-muted: #a1a1aa;
+          --vc-preview-border: #3f3f46;
+          --vc-preview-code-bg: #2a2a2d;
+          --vc-preview-code-shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.18);
+          --vc-preview-link: #8ab4f8;
+          --vc-preview-row-alt: #242428;
+          --vc-preview-mark-bg: #4a3f16;
+          --vc-preview-mark-text: #fff3b0;
+          --vc-preview-danger: #ff7b72;
+          --vc-preview-warning: #d29922;
+          --vc-preview-positive: #3fb950;
+          --vc-preview-diagram-bg: #18181b;
+          --vc-preview-diagram-error-bg: #3f1d1d;
+          --vc-preview-diagram-error-text: #fecaca;
+          --vc-preview-math-bg: #27272a;
+        }
+      }
 
-    html {
-      overflow-x: hidden;
-    }
+      html,
+      body {
+        background: transparent !important;
+        color: var(--vc-preview-text) !important;
+      }
 
-    body {
-      font-size: var(--vc-font-size);
-      margin: 0 !important;
-      padding: calc(var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable)) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
-      box-sizing: border-box;
-      min-height: 100vh;
-      overflow-wrap: anywhere;
-      word-wrap: break-word;
-    }
+      html {
+        overflow-x: hidden;
+      }
 
-    body::before {
-      content: "";
-      position: fixed;
-      top: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
-      right: 0;
-      bottom: 0;
-      left: 0;
-      background: var(--vc-preview-page-background);
-      pointer-events: none;
-    }
+      body {
+        font-size: var(--vc-font-size);
+        margin: 0 !important;
+        padding: calc(var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable)) + \(Int(WindowChromeRecipe.previewContentTopInset))px) clamp(12px, 3vw, 28px) clamp(12px, 3vw, 28px) !important;
+        box-sizing: border-box;
+        min-height: 100vh;
+        overflow-wrap: anywhere;
+        word-wrap: break-word;
+      }
 
-    /* No page-side chrome band here — deliberately. The dissolve under the
-       titlebar glass is owned by the OS on macOS 26 (WebKit's auto-adopted
-       obscuredContentInsets pocket renders the same scroll-edge ghosts as the
-       editor pane; measured, polarize L3). Two imitations died against
-       measured platform walls and must not come back: (1) backdrop-filter is
-       dead in exactly this strip — Core Animation refuses nested backdrop
-       capture under the native titlebar glass (cut 7-12; the same rule blurs
-       fine in a plain window, and @supports lies because the limit is
-       positional); (2) a masked backing veil (cuts 7-12/7-12b) sits ON TOP of
-       the pocket's own ghosts and can only mute them — it transmitted 0/255
-       on the operator window (polarize L2). */
+      body::before {
+        content: "";
+        position: fixed;
+        top: var(\(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable));
+        right: 0;
+        bottom: 0;
+        left: 0;
+        background: var(--vc-preview-page-background);
+        pointer-events: none;
+      }
 
-    .markdown-body {
-      max-width: 980px;
-      margin: 0 auto;
-      color: var(--vc-preview-text) !important;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-      line-height: 1.65;
-      position: relative;
-      overflow-wrap: anywhere;
-      word-wrap: break-word;
-    }
+      /* No page-side chrome band here — deliberately. The dissolve under the
+         titlebar glass is owned by the OS on macOS 26 (WebKit's auto-adopted
+         obscuredContentInsets pocket renders the same scroll-edge ghosts as the
+         editor pane; measured, polarize L3). Two imitations died against
+         measured platform walls and must not come back: (1) backdrop-filter is
+         dead in exactly this strip — Core Animation refuses nested backdrop
+         capture under the native titlebar glass (cut 7-12; the same rule blurs
+         fine in a plain window, and @supports lies because the limit is
+         positional); (2) a masked backing veil (cuts 7-12/7-12b) sits ON TOP of
+         the pocket's own ghosts and can only mute them — it transmitted 0/255
+         on the operator window (polarize L2). */
 
-    .markdown-body > :first-child {
-      margin-top: 0 !important;
-    }
+      .markdown-body {
+        max-width: 980px;
+        margin: 0 auto;
+        color: var(--vc-preview-text) !important;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.65;
+        position: relative;
+        overflow-wrap: anywhere;
+        word-wrap: break-word;
+      }
 
-    .markdown-body h1,
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4,
-    .markdown-body h5,
-    .markdown-body h6 {
-      overflow-wrap: anywhere;
-      word-wrap: break-word;
-      hyphens: auto;
-      line-height: 1.25;
-      margin-top: 1.4em;
-      margin-bottom: 0.55em;
-    }
+      .markdown-body > :first-child {
+        margin-top: 0 !important;
+      }
 
-    .markdown-body h1,
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4 {
-      font-weight: 700;
-    }
+      .markdown-body h1,
+      .markdown-body h2,
+      .markdown-body h3,
+      .markdown-body h4,
+      .markdown-body h5,
+      .markdown-body h6 {
+        overflow-wrap: anywhere;
+        word-wrap: break-word;
+        hyphens: auto;
+        line-height: 1.25;
+        margin-top: 1.4em;
+        margin-bottom: 0.55em;
+      }
 
-    .markdown-body h1 {
-      font-size: 2em;
-    }
+      .markdown-body h1,
+      .markdown-body h2,
+      .markdown-body h3,
+      .markdown-body h4 {
+        font-weight: 700;
+      }
 
-    .markdown-body h2 {
-      font-size: 1.5em;
-    }
+      .markdown-body h1 {
+        font-size: 2em;
+      }
 
-    .markdown-body h3 {
-      font-size: 1.25em;
-    }
+      .markdown-body h2 {
+        font-size: 1.5em;
+      }
 
-    .markdown-body h4 {
-      font-size: 1em;
-    }
+      .markdown-body h3 {
+        font-size: 1.25em;
+      }
 
-    .markdown-body h5 {
-      font-size: 0.875em;
-    }
+      .markdown-body h4 {
+        font-size: 1em;
+      }
 
-    .markdown-body h6 {
-      font-size: 0.85em;
-    }
+      .markdown-body h5 {
+        font-size: 0.875em;
+      }
 
-    .markdown-body h1,
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4,
-    .markdown-body h5 {
-      color: var(--vc-preview-text) !important;
-    }
+      .markdown-body h6 {
+        font-size: 0.85em;
+      }
 
-    .markdown-body h2,
-    .markdown-body hr,
-    .markdown-body table tr,
-    .markdown-body table th,
-    .markdown-body table td {
-      border-color: var(--vc-preview-border) !important;
-    }
+      .markdown-body h1,
+      .markdown-body h2,
+      .markdown-body h3,
+      .markdown-body h4,
+      .markdown-body h5 {
+        color: var(--vc-preview-text) !important;
+      }
 
-    .markdown-body h6,
-    .markdown-body blockquote {
-      color: var(--vc-preview-muted) !important;
-    }
+      .markdown-body h2,
+      .markdown-body hr,
+      .markdown-body table tr,
+      .markdown-body table th,
+      .markdown-body table td {
+        border-color: var(--vc-preview-border) !important;
+      }
 
-    .markdown-body blockquote {
-      border-left-color: var(--vc-preview-border) !important;
-    }
+      .markdown-body h6,
+      .markdown-body blockquote {
+        color: var(--vc-preview-muted) !important;
+      }
 
-    .markdown-body a {
-      color: var(--vc-preview-link) !important;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
+      .markdown-body blockquote {
+        border-left-color: var(--vc-preview-border) !important;
+      }
 
-    .markdown-body code,
-    .markdown-body tt {
-      background: var(--vc-preview-code-bg) !important;
-      color: var(--vc-preview-text) !important;
-      border: 0 !important;
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
-      white-space: normal !important;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
+      .markdown-body a {
+        color: var(--vc-preview-link) !important;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
 
-    .markdown-body pre {
-      background: var(--vc-preview-code-bg) !important;
-      color: var(--vc-preview-text) !important;
-      max-width: 100%;
-      overflow-x: auto;
-      border: 0 !important;
-      border-radius: 8px;
-      box-shadow: var(--vc-preview-code-shadow);
-      padding: 12px 14px;
-      margin: 1rem 0;
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
-      font-size: 0.92em;
-      line-height: 1.5;
-    }
+      .markdown-body code,
+      .markdown-body tt {
+        background: var(--vc-preview-code-bg) !important;
+        color: var(--vc-preview-text) !important;
+        border: 0 !important;
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+        white-space: normal !important;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
 
-    .markdown-body pre code,
-    .markdown-body pre tt {
-      background: transparent !important;
-      margin: 0;
-      padding: 0;
-      white-space: pre !important;
-      overflow-wrap: normal;
-      word-break: normal;
-      font-family: inherit;
-    }
+      .markdown-body pre {
+        background: var(--vc-preview-code-bg) !important;
+        color: var(--vc-preview-text) !important;
+        max-width: 100%;
+        overflow-x: auto;
+        border: 0 !important;
+        border-radius: 8px;
+        box-shadow: var(--vc-preview-code-shadow);
+        padding: 12px 14px;
+        margin: 1rem 0;
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+        font-size: 0.92em;
+        line-height: 1.5;
+      }
 
-    /* Task lists: GFM-style — no bullet, checkbox inline with its label. */
-    .markdown-body .task-list-item {
-      list-style: none;
-    }
+      .markdown-body pre code,
+      .markdown-body pre tt {
+        background: transparent !important;
+        margin: 0;
+        padding: 0;
+        white-space: pre !important;
+        overflow-wrap: normal;
+        word-break: normal;
+        font-family: inherit;
+      }
 
-    .markdown-body .task-list-item-checkbox {
-      margin: 0 0.45em 0 -1.35em;
-      vertical-align: middle;
-    }
+      /* Task lists: GFM-style — no bullet, checkbox inline with its label. */
+      .markdown-body .task-list-item {
+        list-style: none;
+      }
 
-    .markdown-body .task-list-item > p {
-      display: inline;
-      margin: 0;
-    }
+      .markdown-body .task-list-item-checkbox {
+        margin: 0 0.45em 0 -1.35em;
+        vertical-align: middle;
+      }
 
-    .markdown-body img {
-      max-width: 100%;
-      height: auto;
-    }
+      .markdown-body .task-list-item > p {
+        display: inline;
+        margin: 0;
+      }
 
-    .markdown-body table {
-      display: block;
-      width: 100%;
-      max-width: 100%;
-      overflow-x: auto;
-      border-collapse: collapse;
-    }
+      .markdown-body img {
+        max-width: 100%;
+        height: auto;
+      }
 
-    .markdown-body table tr {
-      background: transparent !important;
-    }
+      .markdown-body table {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        overflow-x: auto;
+        border-collapse: collapse;
+      }
 
-    .markdown-body table tr:nth-child(2n) {
-      background: var(--vc-preview-row-alt) !important;
-    }
+      .markdown-body table tr {
+        background: transparent !important;
+      }
 
-    .markdown-body table th,
-    .markdown-body table td {
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
+      .markdown-body table tr:nth-child(2n) {
+        background: var(--vc-preview-row-alt) !important;
+      }
 
-    .markdown-body mark {
-      background: var(--vc-preview-mark-bg) !important;
-      color: var(--vc-preview-mark-text) !important;
-    }
+      .markdown-body table th,
+      .markdown-body table td {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
 
-    .markdown-body .vc-math {
-      background: var(--vc-preview-math-bg);
-      border-radius: 4px;
-      color: var(--vc-preview-text);
-      font-family: "KaTeX_Main", "STIX Two Math", "Times New Roman", serif;
-      overflow-wrap: anywhere;
-    }
+      .markdown-body mark {
+        background: var(--vc-preview-mark-bg) !important;
+        color: var(--vc-preview-mark-text) !important;
+      }
 
-    .markdown-body .vc-math-inline {
-      display: inline-block;
-      padding: 0 0.22em;
-      vertical-align: baseline;
-    }
+      .markdown-body .vc-math {
+        background: var(--vc-preview-math-bg);
+        border-radius: 4px;
+        color: var(--vc-preview-text);
+        font-family: "KaTeX_Main", "STIX Two Math", "Times New Roman", serif;
+        overflow-wrap: anywhere;
+      }
 
-    .markdown-body .vc-math-display {
-      border: 1px solid var(--vc-preview-border);
-      display: block;
-      margin: 1rem 0;
-      overflow-x: auto;
-      padding: 0.85rem 1rem;
-      text-align: center;
-      white-space: pre-wrap;
-    }
+      .markdown-body .vc-math-inline {
+        display: inline-block;
+        padding: 0 0.22em;
+        vertical-align: baseline;
+      }
 
-    .markdown-body .vc-math.vc-math-error {
-      color: var(--vc-preview-diagram-error-text);
-    }
+      .markdown-body .vc-math-display {
+        border: 1px solid var(--vc-preview-border);
+        display: block;
+        margin: 1rem 0;
+        overflow-x: auto;
+        padding: 0.85rem 1rem;
+        text-align: center;
+        white-space: pre-wrap;
+      }
 
-    /* Mermaid preview support added by pensieve-mermaid-preview-20260525. */
-    .markdown-body .mermaid {
-      background: var(--vc-preview-diagram-bg);
-      border: 1px solid var(--vc-preview-border);
-      border-radius: 6px;
-      box-sizing: border-box;
-      color: var(--vc-preview-text);
-      margin: 1rem 0;
-      max-width: 100%;
-      overflow-x: auto;
-      padding: 1rem;
-      text-align: center;
-    }
+      .markdown-body .vc-math.vc-math-error {
+        color: var(--vc-preview-diagram-error-text);
+      }
 
-    .markdown-body .mermaid svg {
-      background: transparent !important;
-      height: auto;
-      max-width: 100%;
-    }
+      /* Mermaid preview support added by pensieve-mermaid-preview-20260525. */
+      .markdown-body .mermaid {
+        background: var(--vc-preview-diagram-bg);
+        border: 1px solid var(--vc-preview-border);
+        border-radius: 6px;
+        box-sizing: border-box;
+        color: var(--vc-preview-text);
+        margin: 1rem 0;
+        max-width: 100%;
+        overflow-x: auto;
+        padding: 1rem;
+        text-align: center;
+      }
 
-    .markdown-body .mermaid .label,
-    .markdown-body .mermaid .nodeLabel,
-    .markdown-body .mermaid .edgeLabel,
-    .markdown-body .mermaid text {
-      color: var(--vc-preview-text) !important;
-      fill: var(--vc-preview-text) !important;
-    }
+      .markdown-body .mermaid svg {
+        background: transparent !important;
+        height: auto;
+        max-width: 100%;
+      }
 
-    .markdown-body .mermaid .edgePath .path,
-    .markdown-body .mermaid .flowchart-link,
-    .markdown-body .mermaid .relationshipLine {
-      stroke: var(--vc-preview-muted) !important;
-    }
+      .markdown-body .mermaid .label,
+      .markdown-body .mermaid .nodeLabel,
+      .markdown-body .mermaid .edgeLabel,
+      .markdown-body .mermaid text {
+        color: var(--vc-preview-text) !important;
+        fill: var(--vc-preview-text) !important;
+      }
 
-    .markdown-body .mermaid.vc-mermaid-error {
-      background: var(--vc-preview-diagram-error-bg);
-      color: var(--vc-preview-diagram-error-text) !important;
-      font-family: "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono";
-      text-align: left;
-      white-space: pre-wrap;
-    }
+      .markdown-body .mermaid .edgePath .path,
+      .markdown-body .mermaid .flowchart-link,
+      .markdown-body .mermaid .relationshipLine {
+        stroke: var(--vc-preview-muted) !important;
+      }
 
-    /* Reading-surface skin overlay — re-tunes the base appearance tokens and
-       body typography. Comes last so it wins over the base block above without
-       re-implementing any flavor (markdown.css / gfm.css) rules. */
-    \(skinCSS(for: skin))
-    """
+      .markdown-body .mermaid.vc-mermaid-error {
+        background: var(--vc-preview-diagram-error-bg);
+        color: var(--vc-preview-diagram-error-text) !important;
+        font-family: "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono";
+        text-align: left;
+        white-space: pre-wrap;
+      }
+
+      /* Reading-surface skin overlay — re-tunes the base appearance tokens and
+         body typography. Comes last so it wins over the base block above without
+         re-implementing any flavor (markdown.css / gfm.css) rules. */
+      \(skinBlock)
+      """
   }
 
   /// CSS overlay for a reading-surface skin. Each skin overrides design tokens
