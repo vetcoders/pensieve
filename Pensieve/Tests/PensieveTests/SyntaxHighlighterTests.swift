@@ -63,11 +63,13 @@ final class SyntaxHighlighterTests: XCTestCase {
 
   // MARK: - Heading
 
-  func testHeadingIsGreenAndBold() {
+  func testHeadingUsesThemeHeadingColorAndBold() {
+    // Default theme: headings are a neutral variant of the text colour
+    // (labelColor), never the old systemGreen accent.
     let md = "# Title\n"
     let storage = highlighted(md)
     let at = index(of: "Title", in: md)
-    XCTAssertEqual(color(storage, at: at), NSColor.systemGreen)
+    XCTAssertEqual(color(storage, at: at), NSColor.labelColor)
     let f = font(storage, at: at)
     XCTAssertNotNil(f)
     // Level-1 heading: baseFontSize + (7-1)*2 = 14 + 12 = 26, bold system font.
@@ -109,11 +111,13 @@ final class SyntaxHighlighterTests: XCTestCase {
 
   // MARK: - Inline code
 
-  func testInlineCodeIsPinkWithBackground() {
+  func testInlineCodeUsesThemeCodeColorWithBackground() {
+    // Default theme: inline code foreground is the theme's srcInlineCode token
+    // (labelColor for the adaptive default); the code background is unchanged.
     let md = "call `foo()` now"
     let storage = highlighted(md)
     let at = index(of: "foo()", in: md)
-    XCTAssertEqual(color(storage, at: at), NSColor.systemPink)
+    XCTAssertEqual(color(storage, at: at), NSColor.labelColor)
     let expectedBackground = NSColor.textBackgroundColor.withSystemEffect(.disabled)
     XCTAssertEqual(backgroundColor(storage, at: at), expectedBackground)
     XCTAssertEqual(
@@ -122,57 +126,67 @@ final class SyntaxHighlighterTests: XCTestCase {
 
   // MARK: - Link
 
-  func testLinkIsAccentColorAndUnderlined() {
+  func testLinkUsesThemeLinkColorAndUnderlined() {
+    // Default theme: links use the srcLink token (linkColor for the adaptive
+    // default) instead of controlAccentColor, so links and list markers share
+    // one theme accent family rather than two different system blues.
     let md = "see [docs](https://x.io) here"
     let storage = highlighted(md)
     let at = index(of: "docs", in: md)
-    XCTAssertEqual(color(storage, at: at), NSColor.controlAccentColor)
+    XCTAssertEqual(color(storage, at: at), NSColor.linkColor)
     XCTAssertEqual(underline(storage, at: at), NSUnderlineStyle.single.rawValue)
   }
 
   // MARK: - Task checkbox
 
-  func testTaskCheckboxIsBlueSemibold() {
+  func testTaskCheckboxUsesThemeListMarkerColorSemibold() {
+    // Default theme: list markers/checkboxes use the srcListMarker token
+    // (secondaryLabelColor for the adaptive default), not systemBlue.
     let md = "- [x] done\n"
     let storage = highlighted(md)
     // The marker run is the "- [x]" portion; sample inside the bracket.
     let at = index(of: "[x]", in: md)
-    XCTAssertEqual(color(storage, at: at), NSColor.systemBlue)
+    XCTAssertEqual(color(storage, at: at), NSColor.secondaryLabelColor)
     XCTAssertEqual(
       font(storage, at: at), NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold))
   }
 
   // MARK: - List markers
 
-  func testUnorderedListMarkerIsBlue() {
+  func testUnorderedListMarkerUsesThemeListMarkerColor() {
     let md = "- item\n"
     let storage = highlighted(md)
     // The dash marker is at index 0.
-    XCTAssertEqual(color(storage, at: 0), NSColor.systemBlue)
+    XCTAssertEqual(color(storage, at: 0), NSColor.secondaryLabelColor)
   }
 
-  func testOrderedListMarkerIsBlue() {
+  func testOrderedListMarkerUsesThemeListMarkerColor() {
     let md = "1. item\n"
     let storage = highlighted(md)
-    XCTAssertEqual(color(storage, at: 0), NSColor.systemBlue)
+    XCTAssertEqual(color(storage, at: 0), NSColor.secondaryLabelColor)
   }
 
   // MARK: - Strikethrough & blockquote
 
-  func testStrikethroughIsOrangeWithLine() {
+  func testStrikethroughUsesThemeStrikeColorWithLine() {
+    // Default theme: strikethrough uses the srcStrike token
+    // (secondaryLabelColor for the adaptive default), not systemOrange.
     let md = "x ~~gone~~ y"
     let storage = highlighted(md)
     let at = index(of: "gone", in: md)
-    XCTAssertEqual(color(storage, at: at), NSColor.systemOrange)
+    XCTAssertEqual(color(storage, at: at), NSColor.secondaryLabelColor)
     XCTAssertEqual(strikethrough(storage, at: at), NSUnderlineStyle.single.rawValue)
   }
 
-  func testHighlightMarkupGetsInlineBackground() {
+  func testHighlightMarkupGetsThemeMarkBackground() {
     let md = "x ==marked== y"
     let storage = highlighted(md)
     let at = index(of: "marked", in: md)
 
-    XCTAssertEqual(color(storage, at: at), NSColor.labelColor)
+    // Default theme: highlight foreground is the theme text token (textColor);
+    // the mark background is the theme highlight token (systemYellow @ 35% for
+    // the adaptive default).
+    XCTAssertEqual(color(storage, at: at), NSColor.textColor)
     XCTAssertEqual(backgroundColor(storage, at: at), NSColor.systemYellow.withAlphaComponent(0.35))
   }
 
@@ -181,6 +195,35 @@ final class SyntaxHighlighterTests: XCTestCase {
     let storage = highlighted(md)
     let at = index(of: "quoted", in: md)
     XCTAssertEqual(color(storage, at: at), NSColor.secondaryLabelColor)
+  }
+
+  // MARK: - Theme tokens drive the source-panel colours
+
+  func testHighlighterHonoursThemeTokens() {
+    // A fixed-palette theme replaces every adaptive default: heading and link
+    // resolve to the theme's own hex tokens, proving the source panel is driven
+    // by ThemeTokens rather than hardcoded system colours.
+    let md = "# Title\nsee [docs](https://x.io)\n"
+    let storage = NSTextStorage(string: md)
+    let fullRange = NSRange(location: 0, length: (md as NSString).length)
+
+    let syntax = SyntaxHighlighter()
+    syntax.baseFontSize = fontSize
+    syntax.tokens = PensieveTheme.ink.tokens
+
+    storage.beginEditing()
+    syntax.resetBaseAttributes(storage, range: fullRange)
+    syntax.highlight(storage, range: fullRange)
+    storage.endEditing()
+
+    let headingAt = index(of: "Title", in: md)
+    XCTAssertEqual(
+      color(storage, at: headingAt), PensieveTheme.ink.tokens.srcHeading.nsColor)
+    let linkAt = index(of: "docs", in: md)
+    XCTAssertEqual(color(storage, at: linkAt), PensieveTheme.ink.tokens.srcLink.nsColor)
+    // Base text also follows the theme text token.
+    let baseAt = index(of: "see", in: md)
+    XCTAssertEqual(color(storage, at: baseAt), PensieveTheme.ink.tokens.text.nsColor)
   }
 
   // MARK: - Code block (Swift)

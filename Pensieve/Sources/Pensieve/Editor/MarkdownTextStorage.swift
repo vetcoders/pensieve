@@ -33,6 +33,17 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
   }
 
+  /// Active theme tokens for the source panel. Forwarded to the markdown
+  /// highlighter (the code-block highlighter keeps its own fixed language
+  /// palette) and re-runs a full refresh so every already-typed range picks up
+  /// the new colours.
+  var tokens: ThemeTokens = PensieveTheme.default.tokens {
+    didSet {
+      highlighter.tokens = tokens
+      refreshHighlighting()
+    }
+  }
+
   override func processEditing(
     for textStorage: NSTextStorage, edited editMask: NSTextStorageEditActions,
     range newCharRange: NSRange, changeInLength delta: Int,

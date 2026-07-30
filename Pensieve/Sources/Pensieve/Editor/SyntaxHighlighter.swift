@@ -3,6 +3,15 @@ import AppKit
 class SyntaxHighlighter {
   var baseFontSize: CGFloat = 14
 
+  /// Active theme tokens. The highlighter runs per keystroke, so setting this
+  /// invalidates the resolved-`NSColor` cache exactly once (on skin change),
+  /// never inside the highlight pass. Defaults to the GitHub `default` surface
+  /// (adaptive system colours) so any highlighter built without a theme keeps
+  /// the established look.
+  var tokens: ThemeTokens = PensieveTheme.default.tokens {
+    didSet { cachedColors = nil }
+  }
+
   /// Compiled-once markdown regexes. The patterns are CONSTANT (independent of
   /// font size or runtime state), so compiling them as `static let` happens a
   /// single time per process instead of on every highlight pass / keystroke.
@@ -61,6 +70,44 @@ class SyntaxHighlighter {
     return fresh
   }
 
+  /// Resolved `NSColor`s for the active `tokens`. Parsing hex → `NSColor`
+  /// happens here, ONCE per skin change (mirrors `FontCache`), so the
+  /// per-keystroke `applyMarkdownAttributes` pass only reads cached instances.
+  private struct ColorCache {
+    let text: NSColor
+    let heading: NSColor
+    let listMarker: NSColor
+    let inlineCode: NSColor
+    let inlineCodeBackground: NSColor
+    let link: NSColor
+    let quote: NSColor
+    let strike: NSColor
+    let highlightBackground: NSColor
+    let rule: NSColor
+
+    init(tokens: ThemeTokens) {
+      self.text = tokens.text.nsColor
+      self.heading = tokens.srcHeading.nsColor
+      self.listMarker = tokens.srcListMarker.nsColor
+      self.inlineCode = tokens.srcInlineCode.nsColor
+      self.inlineCodeBackground = tokens.codeBackground.nsColor
+      self.link = tokens.srcLink.nsColor
+      self.quote = tokens.srcQuote.nsColor
+      self.strike = tokens.srcStrike.nsColor
+      self.highlightBackground = tokens.srcHighlightBackground.nsColor
+      self.rule = tokens.border.nsColor
+    }
+  }
+
+  private var cachedColors: ColorCache?
+
+  private func colors() -> ColorCache {
+    if let cached = cachedColors { return cached }
+    let fresh = ColorCache(tokens: tokens)
+    cachedColors = fresh
+    return fresh
+  }
+
   func highlight(_ textStorage: NSTextStorage, range: NSRange) {
     guard let targetRange = validRange(range, in: textStorage) else { return }
     let string = textStorage.string as NSString
@@ -70,7 +117,7 @@ class SyntaxHighlighter {
   func resetBaseAttributes(_ textStorage: NSTextStorage, range: NSRange) {
     guard let targetRange = validRange(range, in: textStorage) else { return }
     let baseFont = NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
-    let baseColor = NSColor.textColor
+    let baseColor = colors().text
 
     textStorage.removeAttribute(.font, range: targetRange)
     textStorage.removeAttribute(.foregroundColor, range: targetRange)
@@ -98,26 +145,29 @@ class SyntaxHighlighter {
     // regex (which re-bridges the whole string each time).
     let swiftString = string as String
     let fonts = self.fonts()
+    let colors = self.colors()
 
     // Blockquote: ^> text
     highlightRegex(
       Patterns.blockquote, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.secondaryLabelColor
+        .foregroundColor: colors.quote
       ])
 
     // Horizontal rules: ---, ***, or ___ on their own line
     highlightRegex(
       Patterns.horizontalRule, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.separatorColor
+        .foregroundColor: colors.rule
       ])
 
-    // Task list checkboxes: - [ ] / - [x]
+    // Task list checkboxes: - [ ] / - [x]. Lists, checkboxes and links share
+    // the one theme accent (srcListMarker / srcLink) instead of two different
+    // system blues sitting side by side.
     highlightRegex(
       Patterns.taskCheckbox, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.systemBlue,
+        .foregroundColor: colors.listMarker,
         .font: fonts.semibold,
       ])
 
@@ -125,17 +175,19 @@ class SyntaxHighlighter {
     highlightRegex(
       Patterns.unorderedList, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.systemBlue,
+        .foregroundColor: colors.listMarker,
         .font: fonts.semibold,
       ])
     highlightRegex(
       Patterns.orderedList, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.systemBlue,
+        .foregroundColor: colors.listMarker,
         .font: fonts.semibold,
       ])
 
-    // Headings: ^# text
+    // Headings: ^# text. The heading colour is a variant of the theme text
+    // colour (or a neutral palette tone), never an accent — hierarchy comes
+    // from weight + size, which stay unchanged.
     Patterns.heading.enumerateMatches(in: swiftString, options: [], range: targetRange) {
       match, _, _ in
       guard let match = match else { return }
@@ -144,7 +196,7 @@ class SyntaxHighlighter {
       let size = baseFontSize + CGFloat((7 - level) * 2)
       let font = NSFont.systemFont(ofSize: size, weight: .bold)
       textStorage.addAttribute(.font, value: font, range: match.range)
-      textStorage.addAttribute(.foregroundColor, value: NSColor.systemGreen, range: match.range)
+      textStorage.addAttribute(.foregroundColor, value: colors.heading, range: match.range)
     }
 
     // Bold: **text** or __text__
@@ -158,16 +210,16 @@ class SyntaxHighlighter {
     highlightRegex(
       Patterns.strikethrough, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.systemOrange,
+        .foregroundColor: colors.strike,
         .strikethroughStyle: NSUnderlineStyle.single.rawValue,
       ])
 
-    // Highlight: ==text==
+    // Highlight: ==text== — theme mark background instead of systemYellow @ 35%.
     highlightRegex(
       Patterns.highlight, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.labelColor,
-        .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.35),
+        .foregroundColor: colors.text,
+        .backgroundColor: colors.highlightBackground,
       ])
 
     // Italic: *text* or _text_ (basic regex)
@@ -178,20 +230,20 @@ class SyntaxHighlighter {
         .font: fonts.italic
       ])
 
-    // Inline code: `code`
+    // Inline code: `code` — the one warm token in the source panel.
     highlightRegex(
       Patterns.inlineCode, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
         .font: fonts.inlineCode,
-        .backgroundColor: NSColor.textBackgroundColor.withSystemEffect(.disabled),
-        .foregroundColor: NSColor.systemPink,
+        .backgroundColor: colors.inlineCodeBackground,
+        .foregroundColor: colors.inlineCode,
       ])
 
     // Links: [text](url)
     highlightRegex(
       Patterns.link, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: NSColor.controlAccentColor,
+        .foregroundColor: colors.link,
         .underlineStyle: NSUnderlineStyle.single.rawValue,
       ])
   }

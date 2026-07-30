@@ -63,15 +63,18 @@ final class PensieveSmokeTests: XCTestCase {
     let codeRange = nsText.range(of: "`code`")
     let linkRange = nsText.range(of: "[link](https://example.com)")
 
+    // Default (adaptive) theme tokens: heading + inline code are neutral
+    // labelColor, links follow the linkColor token — the retired garish accents
+    // (systemGreen/Pink/controlAccentColor) no longer appear.
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: linkRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.controlAccentColor)
+      NSColor.linkColor)
     XCTAssertEqual(
       storage.attribute(.underlineStyle, at: linkRange.location, effectiveRange: nil) as? Int,
       NSUnderlineStyle.single.rawValue)
@@ -95,18 +98,20 @@ final class PensieveSmokeTests: XCTestCase {
     let taskMarker = nsText.range(of: "- [x]")
     let strikeRange = nsText.range(of: "~~removed~~")
 
+    // Default (adaptive) theme: list markers/checkboxes share the srcListMarker
+    // token (secondaryLabelColor), not systemBlue.
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: unorderedMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: orderedMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: taskMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.strikethroughStyle, at: strikeRange.location, effectiveRange: nil) as? Int,
       NSUnderlineStyle.single.rawValue)
@@ -139,11 +144,11 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: editedHeadingRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.backgroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
         as? NSColor,
@@ -356,7 +361,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      NSColor.labelColor)
   }
 
   @MainActor

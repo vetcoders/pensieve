@@ -7,6 +7,34 @@ class LineNumberGutter: NSRulerView {
     didSet { needsDisplay = true }
   }
 
+  // Theme colours for the gutter. Defaulted to the previous system colours so a
+  // gutter built without a theme keeps the established look. The gutter fill is
+  // the editor `source` (not `windowBackgroundColor`) so it stops reading as a
+  // separate band beside the text on dark themes. `currentLine` is carried for
+  // the active-line marker that lands with the chrome-polish cut; it has no
+  // painter yet.
+  var gutterBackground: NSColor = .windowBackgroundColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterBorder: NSColor = .separatorColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterNumber: NSColor = .tertiaryLabelColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterCurrentLine: NSColor = .labelColor {
+    didSet { needsDisplay = true }
+  }
+
+  /// Applies the source-panel tokens the brief maps to the gutter: `source`
+  /// (fill), `border` (right edge), `srcGutter` (numbers), `srcCurrentLine`.
+  func applyTokens(_ tokens: ThemeTokens) {
+    gutterBackground = tokens.source.nsColor
+    gutterBorder = tokens.border.nsColor
+    gutterNumber = tokens.srcGutter.nsColor
+    gutterCurrentLine = tokens.srcCurrentLine.nsColor
+  }
+
   init(scrollView: NSScrollView, textLayoutManager: NSTextLayoutManager) {
     self.textLayoutManager = textLayoutManager
     super.init(scrollView: scrollView, orientation: .verticalRuler)
@@ -52,11 +80,11 @@ class LineNumberGutter: NSRulerView {
     defer { NSGraphicsContext.current?.restoreGraphicsState() }
     NSBezierPath(rect: allowed).setClip()
 
-    NSColor.windowBackgroundColor.setFill()
+    gutterBackground.setFill()
     bounds.fill()
 
     // Draw right border
-    NSColor.separatorColor.setStroke()
+    gutterBorder.setStroke()
     let path = NSBezierPath()
     path.move(to: NSPoint(x: bounds.maxX - 1, y: bounds.minY))
     path.line(to: NSPoint(x: bounds.maxX - 1, y: bounds.maxY))
@@ -68,7 +96,7 @@ class LineNumberGutter: NSRulerView {
 
     let attributes: [NSAttributedString.Key: Any] = [
       .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize - 2, weight: .regular),
-      .foregroundColor: NSColor.tertiaryLabelColor,
+      .foregroundColor: gutterNumber,
     ]
 
     var lineNumber = 1

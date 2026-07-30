@@ -39,7 +39,13 @@ struct PreviewView: View {
       scrollSyncCoordinator: scrollSyncCoordinator
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.textBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    // Backdrop behind the transparent WebView. Tied to the theme surface so a
+    // dark skin never flashes a light strip before the page paints, matching
+    // the titlebar backing colour the recipe feeds the chrome.
+    .background(
+      Color(WindowChromeRecipe.titlebarGlassBackingColor(for: themeManager.skin))
+        .ignoresSafeArea(.container, edges: .top)
+    )
     .ignoresSafeArea(.container, edges: .top)
   }
 }

@@ -145,8 +145,22 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(expected, 0)
   }
 
-  func testTitlebarGlassBackingColorMatchesEditorSurface() {
-    XCTAssertEqual(WindowChromeRecipe.titlebarGlassBackingColor, .textBackgroundColor)
+  func testTitlebarGlassBackingColorIsTheThemeSourceToken() {
+    // The adaptive `default` theme keeps the established editor surface...
+    XCTAssertEqual(
+      WindowChromeRecipe.titlebarGlassBackingColor(for: .default), .textBackgroundColor)
+    // ...and a fixed-palette theme feeds its own source colour so the titlebar
+    // strip never lights up on a dark surface.
+    let inkBacking = WindowChromeRecipe.titlebarGlassBackingColor(for: .ink)
+      .usingColorSpace(.sRGB)
+    let inkSource = PensieveTheme.ink.tokens.source.nsColor.usingColorSpace(.sRGB)
+    XCTAssertNotNil(inkBacking)
+    XCTAssertNotNil(inkSource)
+    if let inkBacking, let inkSource {
+      XCTAssertEqual(inkBacking.redComponent, inkSource.redComponent, accuracy: 0.001)
+      XCTAssertEqual(inkBacking.greenComponent, inkSource.greenComponent, accuracy: 0.001)
+      XCTAssertEqual(inkBacking.blueComponent, inkSource.blueComponent, accuracy: 0.001)
+    }
   }
 
   @MainActor
@@ -155,9 +169,11 @@ final class WindowChromeRecipeTests: XCTestCase {
     let webView = view.subviews.compactMap { $0 as? WKWebView }.first
     XCTAssertNotNil(webView)
     // WKWebView resolves the dynamic catalog colour to concrete sRGB on set;
-    // compare resolved components, not colour identity.
+    // compare resolved components, not colour identity. A freshly built view
+    // (no document loaded) backs the chrome with the `default` theme surface.
     let applied = webView?.underPageBackgroundColor.usingColorSpace(.sRGB)
-    let expected = WindowChromeRecipe.titlebarGlassBackingColor.usingColorSpace(.sRGB)
+    let expected = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
+      .usingColorSpace(.sRGB)
     XCTAssertNotNil(applied)
     XCTAssertNotNil(expected)
     if let applied, let expected {

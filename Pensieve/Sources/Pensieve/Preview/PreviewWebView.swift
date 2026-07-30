@@ -29,7 +29,7 @@ final class PreviewWebView: NSView {
     let config = WKWebViewConfiguration()
     webView = WKWebView(frame: .zero, configuration: config)
     webView.setValue(false, forKey: "drawsBackground")
-    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor
+    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
     webView.setAccessibilityIdentifier("pensieve.preview")
     super.init(frame: frameRect)
 
@@ -90,12 +90,29 @@ final class PreviewWebView: NSView {
   /// WKWebView process stay stable while typing.
   func load(document: PreviewDocument) {
     lastDocument = document
+    applyThemeChrome(for: document.skin)
     let identity = PreviewLoadIdentity(document: document)
     guard loadedIdentity == identity else {
       loadFullPage(document, identity: identity)
       return
     }
     updateLoadedPage(document)
+  }
+
+  /// Pins the WebView (and its container) to the theme's appearance and feeds
+  /// the chrome the theme's source surface as the titlebar backing colour.
+  ///
+  /// Single-mode skins ship NO `@media (prefers-color-scheme:)`, so an explicit
+  /// `NSAppearance` is the only thing stopping the flavour bundle (`gfm.css`,
+  /// which DOES branch on `prefers-color-scheme`) from painting a dark theme's
+  /// code blocks light (or vice versa) when the system appearance disagrees
+  /// with the chosen theme. Adaptive themes (`default`/`raw`) pass `nil` and
+  /// keep following the system.
+  private func applyThemeChrome(for skin: PensieveTheme) {
+    let appearance = skin.appearanceName.map { NSAppearance(named: $0) } ?? nil
+    self.appearance = appearance
+    webView.appearance = appearance
+    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: skin)
   }
 
   /// WKWebView leaves a blank page behind when its WebContent process dies

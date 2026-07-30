@@ -88,6 +88,22 @@ class MarkdownTextView: NSTextView {
     typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
   }
 
+  /// Applies the active theme to the editor surface: the pane background is the
+  /// theme `source`, the caret + typing colour follow the theme `text`, and the
+  /// gutter receives its own source-panel tokens. Called from
+  /// `MarkdownEditorSurface` on setup and whenever the skin changes.
+  func applyTheme(_ tokens: ThemeTokens) {
+    let source = tokens.source.nsColor
+    let text = tokens.text.nsColor
+    drawsBackground = true
+    backgroundColor = source
+    insertionPointColor = text
+    var attributes = typingAttributes
+    attributes[.foregroundColor] = text
+    typingAttributes = attributes
+    gutter?.applyTokens(tokens)
+  }
+
   func setupGutter(layoutManager: NSTextLayoutManager) {
     guard let scrollView = enclosingScrollView else { return }
     let newGutter = LineNumberGutter(scrollView: scrollView, textLayoutManager: layoutManager)

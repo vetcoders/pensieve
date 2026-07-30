@@ -86,10 +86,11 @@ enum WindowChromeRecipe {
 
   /// Backing colour WebKit composites into the titlebar glass above the
   /// preview page (`WKWebView.underPageBackgroundColor`). Must be the same
-  /// surface the editor pane feeds the chrome — `textBackgroundColor` — or
-  /// the glass strip reads a different tint on each side of the split
+  /// surface the editor pane reports for the active theme — `tokens.source` —
+  /// or the glass strip reads a different tint on each side of the split
   /// divider: WebKit's default under-page colour is a light warm gray that
-  /// glows through dark chrome as a lighter, sepia-tinted patch.
+  /// glows through dark chrome as a lighter, sepia-tinted patch, and a fixed
+  /// `textBackgroundColor` would light-up a dark theme's titlebar.
   ///
   /// This colour and the pre-macOS-26 fallback offset below are the ONLY
   /// chrome truths the preview consumes. The scrolled dissolve itself has one
@@ -97,7 +98,9 @@ enum WindowChromeRecipe {
   /// editor's scroll view, WebKit's auto-adopted `obscuredContentInsets`
   /// pocket for the preview (measured, polarize L3: the pocket renders the
   /// same scroll-edge ghosts as the editor band, 2–12/255 vs 3–11/255).
-  static var titlebarGlassBackingColor: NSColor { .textBackgroundColor }
+  static func titlebarGlassBackingColor(for theme: PensieveTheme) -> NSColor {
+    theme.tokens.source.nsColor
+  }
 
   static func titlebarGlassHeight(frameHeight: CGFloat, contentLayoutHeight: CGFloat) -> CGFloat {
     ceil(max(0, frameHeight - contentLayoutHeight))

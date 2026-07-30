@@ -5,6 +5,7 @@ import SwiftUI
 struct EditorView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  @EnvironmentObject private var themeManager: ThemeManager
   @State private var autocompleteError: String?
   private let scrollSyncCoordinator: ScrollSyncCoordinator?
 
@@ -24,6 +25,7 @@ struct EditorView: View {
         text: documentText,
         editorMode: appState.mode,
         fontSize: appState.fontSize,
+        skin: themeManager.skin,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
         rewriteCommand: appState.pendingAIRewriteCommand,
@@ -127,7 +129,7 @@ struct EditorView: View {
         }
       }
     }
-    .background(Color(NSColor.textBackgroundColor))
+    .background(Color(themeManager.skin.tokens.source.nsColor))
   }
 
   private var documentText: Binding<String> {
@@ -156,6 +158,9 @@ struct EditorRepresentable: NSViewRepresentable {
   @Binding var text: String
   let editorMode: EditorMode
   let fontSize: CGFloat
+  /// Reading-surface skin driving the source panel tokens. Defaulted so test
+  /// call sites that build the representable directly keep the GitHub surface.
+  let skin: PensieveTheme
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
   let rewriteCommand: AIRewriteCommand?
@@ -184,6 +189,7 @@ struct EditorRepresentable: NSViewRepresentable {
     text: Binding<String>,
     editorMode: EditorMode,
     fontSize: CGFloat,
+    skin: PensieveTheme = .default,
     syntaxHighlightingEnabled: Bool,
     formattingCommand: MarkdownFormatCommand?,
     rewriteCommand: AIRewriteCommand? = nil,
@@ -208,6 +214,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self._text = text
     self.editorMode = editorMode
     self.fontSize = fontSize
+    self.skin = skin
     self.syntaxHighlightingEnabled = syntaxHighlightingEnabled
     self.formattingCommand = formattingCommand
     self.rewriteCommand = rewriteCommand
@@ -234,12 +241,14 @@ struct EditorRepresentable: NSViewRepresentable {
     let surface = MarkdownEditorSurface(
       text: text,
       fontSize: fontSize,
+      skin: skin,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
       aiAutocompleteEnabled: aiAutocompleteEnabled,
       documentID: documentID
     )
+    context.coordinator.lastAppliedSkin = skin
     surface.onTextChanged = { newText in
       self.text = newText
       self.isDirty = true
@@ -282,6 +291,13 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
     surface.onRewritePreviewChanged = onRewritePreviewChanged
     surface.configureDocument(id: documentID)
+    // Re-theme only on an actual skin change. Pushing tokens re-runs a full
+    // highlight refresh, so doing it on every keystroke re-render would be the
+    // per-keystroke hang the perf pins guard against.
+    if context.coordinator.lastAppliedSkin != skin {
+      context.coordinator.lastAppliedSkin = skin
+      surface.applyTheme(skin)
+    }
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
     // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
@@ -335,6 +351,9 @@ struct EditorRepresentable: NSViewRepresentable {
 
   final class Coordinator {
     var surface: MarkdownEditorSurface?
+    /// Last skin pushed to the surface, so `updateNSView` re-themes only on a
+    /// real change and never re-runs the highlight pass per keystroke.
+    var lastAppliedSkin: PensieveTheme?
     private var lastAppliedFormattingCommandID: UUID?
     private var lastAppliedRewriteCommandID: UUID?
     private var lastAppliedFindCommandID: UUID?
@@ -404,6 +423,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onRewritePreviewChanged: ((AIRewritePreview?) -> Void)?
   private var lastNotifiedCaretOffset = -1
   private var lastNotifiedSelectionLength = -1
+  /// Active theme tokens for the source panel. Held so `update` can keep typing
+  /// attributes on the theme text colour when the font size changes.
+  private var activeTokens: ThemeTokens = PensieveTheme.default.tokens
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -431,6 +453,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   init(
     text: String,
     fontSize: CGFloat,
+    skin: PensieveTheme = .default,
     syntaxHighlightingEnabled: Bool = true,
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
@@ -521,6 +544,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     bindAutocomplete()
     bindRewritePreview()
+    // Theme the surface BEFORE the initial content load so the first highlight
+    // pass in `update` already uses the theme's source-panel colours.
+    applyTheme(skin)
     update(
       text: text,
       fontSize: fontSize,
@@ -561,7 +587,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       textView.font = baseFont
       // Keep typing attributes in lockstep with the base font so newly typed text renders in
       // the monospaced face immediately (no system-font flash before the highlight pass).
-      textView.typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
+      // Foreground stays on the active theme text colour, not a fixed system one.
+      textView.typingAttributes = [
+        .font: baseFont, .foregroundColor: activeTokens.text.nsColor,
+      ]
       textView.gutter?.fontSize = fontSize
       textView.gutter?.needsDisplay = true
     }
@@ -594,6 +623,18 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
+  }
+
+  /// Applies a reading-surface theme to the source panel: the scroll view and
+  /// text view backgrounds become the theme `source`, the caret + typing colour
+  /// follow `text`, the gutter takes its own tokens, and the markdown
+  /// highlighter re-runs with the theme's syntax palette.
+  func applyTheme(_ theme: PensieveTheme) {
+    let tokens = theme.tokens
+    activeTokens = tokens
+    scrollView.backgroundColor = tokens.source.nsColor
+    textView.applyTheme(tokens)
+    textContentStorage.tokens = tokens
   }
 
   deinit {
