@@ -33,7 +33,7 @@ final class PreviewThemeTests: XCTestCase {
     let css = PreviewWebView.skinCSS(for: .graphite)
     XCTAssertTrue(css.contains("vc-skin:graphite"))
     XCTAssertTrue(css.contains("Instrument Sans"))
-    XCTAssertTrue(css.contains("#c9d0d8"))
+    XCTAssertTrue(css.contains("#d2d2d2"))
     XCTAssertTrue(css.contains("JetBrains Mono"))
   }
 
@@ -357,8 +357,8 @@ final class PreviewThemeTests: XCTestCase {
 
   // MARK: - PensieveTheme migration + fresh-install default
 
-  func testFreshInstallDefaultsToInk() {
-    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: nil), .ink)
+  func testFreshInstallDefaultsToGraphite() {
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: nil), .graphite)
   }
 
   func testKnownRawValuesResolveToThemselves() {
@@ -396,9 +396,9 @@ final class PreviewThemeTests: XCTestCase {
 
   // MARK: - ThemeManager persists + migrates the skin
 
-  func testThemeManagerFreshInstallDefaultsToInk() {
+  func testThemeManagerFreshInstallDefaultsToGraphite() {
     let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.fresh")
-    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .ink)
+    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .graphite)
   }
 
   func testThemeManagerPersistsSkinSelection() {

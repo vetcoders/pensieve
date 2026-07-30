@@ -682,21 +682,21 @@ final class PreviewWebView: NSView {
       return """
         /* vc-skin:graphite — dark-only, cool desaturated, report instrument */
         :root {
-          --vc-preview-text: #c9d0d8;
-          --vc-preview-muted: #79838f;
-          --vc-preview-border: #21262e;
-          --vc-preview-code-bg: #171b22;
+          --vc-preview-text: #d2d2d2;
+          --vc-preview-muted: #848484;
+          --vc-preview-border: #2a2a2a;
+          --vc-preview-code-bg: #1f1f1f;
           --vc-preview-link: #86b8c4;
-          --vc-preview-row-alt: #14181e;
-          --vc-preview-mark-bg: #2a3340;
-          --vc-preview-mark-text: #dde3ea;
-          --vc-preview-math-bg: #171b22;
-          --vc-preview-diagram-bg: #12151a;
+          --vc-preview-row-alt: #191919;
+          --vc-preview-mark-bg: #343434;
+          --vc-preview-mark-text: #e4e4e4;
+          --vc-preview-math-bg: #1f1f1f;
+          --vc-preview-diagram-bg: #161616;
           --vc-preview-danger: #c88a8a;
           --vc-preview-warning: #c49a72;
           --vc-preview-positive: #86b8c4;
-          --vc-preview-graphite-bg: #0e1013;
-          --vc-preview-graphite-thead: #171b21;
+          --vc-preview-graphite-bg: #1d1d1d;
+          --vc-preview-graphite-thead: #1c1c1c;
           --vc-preview-page-background: var(--vc-preview-graphite-bg);
         }
         .markdown-body {

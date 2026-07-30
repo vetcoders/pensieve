@@ -115,9 +115,9 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   case raw
   /// Warm light paper, serif measure.
   case parchment
-  /// Cool desaturated dark, report instrument.
+  /// Cool desaturated dark, report instrument — the fresh-install default.
   case graphite
-  /// Signature dark surface — the fresh-install default.
+  /// Signature dark surface.
   case ink
   /// Clinical light neutral, semantic colour only.
   case porcelain
@@ -168,11 +168,11 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
 
   // MARK: - Migration
 
-  /// Fresh installs default to `ink`. Known raw values pass through; legacy
-  /// values from the pre-consolidation set map to their nearest survivor;
-  /// anything else falls back to the GitHub `default`.
+  /// Fresh installs default to `graphite`. Known raw values pass through;
+  /// legacy values from the pre-consolidation set map to their nearest
+  /// survivor; anything else falls back to the GitHub `default`.
   static func resolve(persistedRawValue raw: String?) -> PensieveTheme {
-    guard let raw else { return .ink }
+    guard let raw else { return .graphite }
     if let known = PensieveTheme(rawValue: raw) { return known }
     return legacyMigration[raw] ?? .default
   }
@@ -242,19 +242,19 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     ),
     .graphite: ThemeTokens(
       mode: .dark,
-      source: ColorSpec(hex: "#101318"),
-      border: ColorSpec(hex: "#21262e"),
-      codeBackground: ColorSpec(hex: "#171b22"),
-      text: ColorSpec(hex: "#c9d0d8"),
-      srcHeading: ColorSpec(hex: "#a8bcc8"),
+      source: ColorSpec(hex: "#161616"),
+      border: ColorSpec(hex: "#2a2a2a"),
+      codeBackground: ColorSpec(hex: "#1f1f1f"),
+      text: ColorSpec(hex: "#d2d2d2"),
+      srcHeading: ColorSpec(hex: "#e0e0e0"),
       srcListMarker: ColorSpec(hex: "#6f8fa0"),
       srcInlineCode: ColorSpec(hex: "#c49a72"),
       srcLink: ColorSpec(hex: "#86b8c4"),
-      srcQuote: ColorSpec(hex: "#6b7480"),
-      srcStrike: ColorSpec(hex: "#6b7480"),
-      srcHighlightBackground: ColorSpec(hex: "#2a3340"),
-      srcGutter: ColorSpec(hex: "#4a535e"),
-      srcCurrentLine: ColorSpec(hex: "#a8bcc8")
+      srcQuote: ColorSpec(hex: "#737373"),
+      srcStrike: ColorSpec(hex: "#737373"),
+      srcHighlightBackground: ColorSpec(hex: "#343434"),
+      srcGutter: ColorSpec(hex: "#4f4f4f"),
+      srcCurrentLine: ColorSpec(hex: "#e0e0e0")
     ),
     .ink: ThemeTokens(
       mode: .dark,
