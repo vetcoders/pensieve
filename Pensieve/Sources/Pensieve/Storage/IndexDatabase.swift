@@ -53,7 +53,8 @@ final class IndexDatabase {
 
   /// The armed RETRY of a hot-path truncate that a reader would not let through, or `nil` when none
   /// is owed. Round 12: the hot-path pass no longer waits readers out, so something has to bring it
-  /// back — see `deferIndexBatchTruncation()`.
+  /// back — see `deferIndexBatchTruncation()`. Round 14: while it is installed it also SUPPRESSES
+  /// hot-path arming, so the backoff cannot be bypassed by ordinary writes.
   private var pendingIndexBatchTruncationRetry: Task<Void, Never>?
 
   /// A hot-path maintenance request that arrived while a pass was ALREADY in flight, and therefore
@@ -1111,16 +1112,35 @@ final class IndexDatabase {
   /// clears the handle, because a pass which has already checkpointed cannot cover frames committed
   /// after it.
   ///
+  /// ABSORBED by an armed backoff ladder, which is round 14 and the arming-side twin of round 13's
+  /// trap. While `pendingIndexBatchTruncationRetry` owes a successor, a reader has just refused a
+  /// truncate — so a request arriving here would arm a pass that the same reader refuses again in
+  /// ~0.2 ms, having paid for an `incremental_vacuum` first. Once per save or watcher delta, for as
+  /// long as the wedge lasts: the 1 s → 30 s backoff defeated from the outside. The ladder's own
+  /// successor comes back through this method, re-stats the WAL and therefore covers these newer
+  /// frames too, so the request is deferred (bounded by the 30 s cap) rather than dropped — the same
+  /// contract round 13 wrote, reached from the other side.
+  ///
+  /// That branch deliberately does NOT set `indexBatchMaintenanceRequestedWhileActive`. That flag
+  /// means "coalesced into a pass which had already checkpointed", and re-arming is the only way to
+  /// cover such a request; here the ladder's successor covers it by construction, so setting the flag
+  /// would only arm a redundant extra pass once the ladder's pass completed.
+  ///
   /// Still covered by the termination drain, and by construction rather than by convention:
   /// `scheduleIndexWrite` registers the task in `scheduledIndexWrites`, which
   /// `drainPendingIndexWrites()` awaits to stability before phase L latches the funnel. Refused past
-  /// the latch on both sides — here, and inside `performMaintenanceInBackground` itself.
+  /// the latch on both sides — here, and inside `performMaintenanceInBackground` itself. Neither does
+  /// the absorption weaken the quit: `closeForTermination()` cancels the ladder and
+  /// `startCheckpointOnTerminate()` enforces WAL→0 under the barrier regardless of what was owed.
   private func scheduleIndexBatchMaintenance() {
     guard !isClosedForTermination else { return }
     guard pendingIndexBatchMaintenance == nil else {
       indexBatchMaintenanceRequestedWhileActive = true
       return
     }
+    // The ladder's OWN retry re-enters here, and must not be absorbed by its own handle — see the
+    // clearing order in `deferIndexBatchTruncation()`, which this guard makes load-bearing.
+    guard pendingIndexBatchTruncationRetry == nil else { return }
     pendingIndexBatchMaintenance = scheduleIndexWrite { [weak self] in
       await self?.performMaintenanceInBackground(reason: .indexBatch)
       if let gate = self?.maintenanceCompletionGateOverride { await gate() }
@@ -1296,6 +1316,9 @@ final class IndexDatabase {
     pendingIndexBatchTruncationRetry = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: delay)
       guard let self, !Task.isCancelled else { return }
+      // Clearing BEFORE re-entering is load-bearing since round 14: `scheduleIndexBatchMaintenance()`
+      // now absorbs a request while this handle is installed, so re-entering first would make the
+      // ladder absorb its own retry and hygiene would never run again. Ordering, not luck — pinned.
       self.pendingIndexBatchTruncationRetry = nil
       self.scheduleIndexBatchMaintenance()
     }

@@ -1045,6 +1045,211 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
   }
 
+  // MARK: - R14: an armed backoff ladder must absorb incoming maintenance requests
+
+  /// Round 14 — the ARMING-side twin of the trap round 13 closed on the re-arm side. Round 12's
+  /// ladder owns a successor after a reader refuses a truncate, but `scheduleIndexBatchMaintenance()`
+  /// only consulted the latch and the coalescing handle. Once the refused pass had cleared that
+  /// handle, the ladder was armed and nothing was in flight — so the next save or watcher delta walked
+  /// straight past both guards and armed a fresh pass: a 4096-page `incremental_vacuum` plus a
+  /// checkpoint the same wedged reader refuses ~0.2 ms later. Once per index write, for as long as the
+  /// wedge lasts, which is the 1 s → 30 s backoff defeated from the outside — the ladder existed
+  /// precisely so a reader that never lets go cannot be polled.
+  ///
+  /// The contract is ABSORPTION, not refusal: the ladder's successor re-enters through the same single
+  /// entry point, re-stats the WAL and therefore covers the newer write's frames as well. So the pin
+  /// asserts both halves — no second attempt while the wedge holds (step 4), and the newer write's
+  /// frames still checkpointed once the reader lets go, with nothing further submitted (step 5).
+  ///
+  /// `indexBatchTruncationDeferrals` is the discriminator, and it is exact here: while the reader is
+  /// wedged, any pass that gets armed MUST end in a refusal, so an extra attempt cannot hide. The
+  /// proof that the fixture reaches the arming-side window rather than round 13's coalescing window is
+  /// the mutation: removing the new guard turns step 4 into `2`, which is only reachable past the
+  /// coalescing guard.
+  func testAnArmedTruncationRetryAbsorbsAHotPathMaintenanceRequest() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    // Same wedge shape as the round-12/13 pool pins: a genuine `pool.read` held open, with the release
+    // valve far above every wait below so a wrong build fails an assertion instead of being rescued.
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.poolWedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the WAL must start over the (lowered) bound")
+    database.walCheckpointThresholdBytesOverride = Self.coalescedRearmWalBoundBytes
+    // Long next to the quiet windows below, so a pass appearing there can only have been armed by the
+    // hot path, never by the ladder firing early.
+    database.indexBatchTruncationRetryDelayNanosecondsOverride = Self.ladderRetryDelayNanoseconds
+
+    // 1 — wedge a genuine pool reader inside `fetchBacklinkRecords`' own `pool.read`.
+    let documents = (0..<3).map { documentRef(root: root, name: "churn-\($0).md") }
+    let backlinksFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: documents[0], documents: documents)
+      backlinksFinished.isSet = true
+    }
+    try await waitUntil("the backlink query to be holding one of the pool's readers") {
+      wedge.isReached
+    }
+
+    // 2 — arm the hot path. The reader holds an older snapshot, so the truncate is REFUSED and the
+    //     ladder takes ownership of the successor.
+    let armingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "arms-maintenance.md"),
+      body: "armingsidearmneedle",
+      appState: appState
+    )
+    XCTAssertTrue(armingDidWrite)
+    try await waitUntil("the refused pass to defer onto the backoff ladder", timeout: 5) {
+      database.indexBatchTruncationDeferrals == 1
+    }
+    // Let that pass's task finish clearing its coalescing handle. Without this the write below would
+    // meet round 13's coalescing guard, which is a different window and already pinned.
+    try await Task.sleep(nanoseconds: Self.ladderQuietWindowNanoseconds)
+
+    // 3 — a real save lands while the ladder owes a successor. This is the hot-path request that used
+    //     to arm a pass of its own.
+    let laterDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "lands-while-armed.md"),
+      body: Self.walGrowingBody(needle: "armingsidelaterneedle"),
+      appState: appState
+    )
+    XCTAssertTrue(laterDidWrite)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: that save must leave the WAL OVER the bound, or a pass armed by it would "
+        + "return early at the threshold check and the absorption would be untestable")
+
+    // 4 — nothing new may be armed: the reader is still wedged, so a pass here is the busy-poll the
+    //     backoff exists to prevent.
+    try await Task.sleep(nanoseconds: Self.ladderQuietWindowNanoseconds)
+    XCTAssertTrue(
+      wedge.isReached,
+      "fixture precondition: the wedged reader must still be holding its connection through the "
+        + "quiet window")
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "an incoming request must be ABSORBED by the armed ladder rather than arming a pass of its "
+        + "own: a second refusal here is round 12's backoff bypassed from the arming side, once per "
+        + "index write for the whole wedge")
+
+    // 5 — absorbed, not dropped: once the reader lets go, the ladder's successor alone re-stats the
+    //     WAL and covers the newer save's frames, with nothing further submitted.
+    released.signal()
+    try await waitUntil(
+      "the ladder's successor to enforce the bound over the absorbed request's frames", timeout: 20
+    ) {
+      walSize(for: databaseURL) <= Self.coalescedRearmWalBoundBytes
+    }
+    XCTAssertEqual(
+      try indexHits(matching: "armingsidelaterneedle", at: databaseURL), 1,
+      "…and it must have enforced the bound by checkpointing those frames, not by losing them")
+    try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
+  }
+
+  /// The trap the guard above creates, pinned so it cannot be reintroduced: the ladder must not
+  /// absorb its OWN retry. That retry re-enters through `scheduleIndexBatchMaintenance()` — which is
+  /// deliberate, it is how the latch, the coalescing and the 16 MiB threshold get re-checked — so if
+  /// it re-entered while `pendingIndexBatchTruncationRetry` still pointed at itself, the new guard
+  /// would swallow it and hot-path hygiene would never run again for the life of the process. A
+  /// self-deadlock, and one that no other pin would notice: every other path would look healthy.
+  ///
+  /// `deferIndexBatchTruncation()` clears the handle BEFORE re-entering, which is what makes this
+  /// safe. The pin drives exactly that path — a retry firing after the reader let go — and asserts
+  /// the pass actually ran and truncated. Nothing else is submitted after the arming save, so the
+  /// ladder's own retry is the only thing that can enforce the bound.
+  func testTheArmedTruncationRetryIsNotAbsorbedByItsOwnHandle() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.poolWedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the WAL must start over the (lowered) bound")
+    database.walCheckpointThresholdBytesOverride = Self.coalescedRearmWalBoundBytes
+    database.indexBatchTruncationRetryDelayNanosecondsOverride =
+      Self.selfAbsorptionLadderDelayNanoseconds
+
+    // 1 — wedge a genuine pool reader, so the first pass is refused and the ladder arms.
+    let documents = (0..<3).map { documentRef(root: root, name: "churn-\($0).md") }
+    let backlinksFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: documents[0], documents: documents)
+      backlinksFinished.isSet = true
+    }
+    try await waitUntil("the backlink query to be holding one of the pool's readers") {
+      wedge.isReached
+    }
+
+    // 2 — the one and only hot-path write in this pin.
+    let armingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "arms-maintenance.md"),
+      body: Self.walGrowingBody(needle: "selfabsorptionarmneedle"),
+      appState: appState
+    )
+    XCTAssertTrue(armingDidWrite)
+    try await waitUntil("the refused pass to defer onto the backoff ladder", timeout: 5) {
+      database.indexBatchTruncationDeferrals == 1
+    }
+
+    // 3 — let the reader go while the retry is still sleeping, then submit NOTHING else. Only the
+    //     ladder's own re-entry can bring the WAL back under the bound now.
+    released.signal()
+    try await waitUntil(
+      "the ladder's own retry to re-enter, run a pass and truncate the WAL", timeout: 20
+    ) {
+      walSize(for: databaseURL) <= Self.coalescedRearmWalBoundBytes
+    }
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "the retry must have fired AFTER the release and truncated on its first attempt — a second "
+        + "deferral would mean this pin proved a later rung of the ladder rather than the re-entry "
+        + "under test")
+    XCTAssertEqual(
+      try indexHits(matching: "selfabsorptionarmneedle", at: databaseURL), 1,
+      "…and the bound must have been enforced by checkpointing the arming save's frames into the "
+        + "database, not by losing them")
+    try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
+  }
+
   /// Ordinary `Close Folder` used to compact against whatever the index happened to have finished.
   /// `closeWorkspace` cancels `FolderManager`'s `indexUpdateTask` — which by its own contract
   /// abandons only the WAIT, never the write underneath, that one belongs to `IndexDatabase`'s
@@ -1685,6 +1890,12 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   /// How long the composition pin watches for a successor that must not appear. 25× below the ladder
   /// delay above, so a loaded runner cannot turn a correct build into a failure.
   private static let ladderQuietWindowNanoseconds: UInt64 = 200_000_000
+
+  /// Ladder delay for the round-14 self-absorption pin, where the retry must fire AFTER the reader let
+  /// go. The release is a semaphore signal taken within milliseconds of the deferral being observed,
+  /// so this is a wide margin on the gap it has to lose — and short enough that the pin does not turn
+  /// into a wall-clock test.
+  private static let selfAbsorptionLadderDelayNanoseconds: UInt64 = 2_000_000_000
 
   /// A document body big enough that committing it alone pushes the `-wal` file over
   /// `coalescedRearmWalBoundBytes` (~288 KiB against a 64 KiB bound), carrying a searchable needle so
