@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.
 - Find-bar match highlights survive a live theme switch (and a font-size change, and toggling rich markdown) instead of vanishing while the bar still counts "1 of N".
+- Typing with a bundled-font theme active no longer rebuilds and re-ships the theme's inlined `@font-face` payload (0.2–0.8 MB) to the preview on every debounced keystroke.
 
 ## [0.4.2] - 2026-07-22
 

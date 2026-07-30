@@ -174,6 +174,12 @@ enum BundledFonts {
   /// `<slug>-<weight>-<regular|italic>.ttf`; the slug may itself contain hyphens
   /// (`spline-sans-mono-400-italic.ttf`), so the weight is located as the first
   /// all-digit component and the slug is everything before it.
+  /// The bundled faces, parsed ONCE per process. The font tree ships inside the
+  /// app bundle and cannot change at runtime, so rescanning the `Fonts`
+  /// directory per CSS assembly (which happened on every debounced keystroke via
+  /// the `faces()` default argument) is pure waste.
+  static let bundledFaces: [Face] = faces()
+
   static func faces(from urls: [URL] = bundledFontURLs()) -> [Face] {
     urls.compactMap { url in
       let stem = url.deletingPathExtension().lastPathComponent
@@ -209,7 +215,7 @@ enum BundledFonts {
   /// skin does not use contribute nothing, so `default`/`raw` emit an empty string
   /// and carry zero font payload. A face whose bytes can't be read is skipped —
   /// its family still degrades to the CSS fallback chain.
-  static func fontFaceCSS(referencedIn css: String, faces: [Face] = faces()) -> String {
+  static func fontFaceCSS(referencedIn css: String, faces: [Face] = bundledFaces) -> String {
     let referenced = faces.filter { css.contains("\"\($0.family)\"") }
     guard !referenced.isEmpty else { return "" }
     return referenced.compactMap { face -> String? in

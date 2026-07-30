@@ -21,9 +21,14 @@ final class PreviewWebView: NSView {
   // WebContent process dies or an in-place update fails under the same identity.
   private var lastDocument: PreviewDocument?
   private let titlebarGlassController = PreviewTitlebarGlassController()
+  /// Stylesheet the loaded page is known to carry, so a same-identity edit can
+  /// skip re-shipping an unchanged (and font-payload-heavy) style block.
+  private var appliedStyleHTML: String?
 
   // Test seam: observes full-page (re)loads without a live WKWebView process.
   var fullPageLoadObserver: ((PreviewDocument) -> Void)?
+  // Test seam: observes the in-place update script without a live WebContent process.
+  var inPlaceUpdateObserver: ((String) -> Void)?
 
   override init(frame frameRect: NSRect) {
     let config = WKWebViewConfiguration()
@@ -159,6 +164,9 @@ final class PreviewWebView: NSView {
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
     webView.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
+    // The full HTML embeds this stylesheet inline, so the page carries it
+    // already — the next same-identity edit has nothing to re-ship.
+    appliedStyleHTML = document.styleHTML
     titlebarGlassController.fullPageLoadDidStart()
     fullPageLoadObserver?(document)
   }
@@ -173,16 +181,7 @@ final class PreviewWebView: NSView {
           return false;
         }
 
-        let style = document.getElementById('vc-preview-style');
-        if (!style) {
-          style = document.createElement('style');
-          style.id = 'vc-preview-style';
-          document.head.appendChild(style);
-        }
-        const nextStyle = \(PreviewWebView.javaScriptStringLiteral(document.styleHTML));
-        if (style.textContent !== nextStyle) {
-          style.textContent = nextStyle;
-        }
+      \(styleUpdateScript(for: document))
         article.innerHTML = \(PreviewWebView.javaScriptStringLiteral(document.bodyHTML));
 
         const mermaidRuntime = \(PreviewWebView.javaScriptStringLiteral(document.mermaidJavaScript ?? ""));
@@ -222,9 +221,37 @@ final class PreviewWebView: NSView {
         return true;
       })();
       """
+    inPlaceUpdateObserver?(script)
     webView.evaluateJavaScript(script) { [weak self, document] result, error in
       self?.handleUpdateScriptResult(result, error: error, for: document)
     }
+  }
+
+  /// The `<style>` half of the in-place update — omitted entirely when the loaded
+  /// page already carries this exact stylesheet.
+  ///
+  /// The composed stylesheet embeds the skin's `@font-face` payload, so for a
+  /// bundled-font theme it is a 0.2–0.8 MB string. Shipping it on every debounced
+  /// keystroke meant escaping that blob into a JS literal and marshalling it
+  /// across the WebKit bridge only for the page to compare it and throw it away.
+  /// The payload still goes out whenever it genuinely changed (skin switch, font
+  /// size), and a full page load re-embeds it in the HTML — both update the
+  /// bookkeeping, so the page and this side never disagree about what is loaded.
+  private func styleUpdateScript(for document: PreviewDocument) -> String {
+    guard appliedStyleHTML != document.styleHTML else { return "" }
+    appliedStyleHTML = document.styleHTML
+    return """
+        let style = document.getElementById('vc-preview-style');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'vc-preview-style';
+          document.head.appendChild(style);
+        }
+        const nextStyle = \(PreviewWebView.javaScriptStringLiteral(document.styleHTML));
+        if (style.textContent !== nextStyle) {
+          style.textContent = nextStyle;
+        }
+      """
   }
 
   /// Completion for the in-place update script. A `false`/error result means
@@ -242,6 +269,31 @@ final class PreviewWebView: NSView {
     loadFullPage(current, identity: PreviewLoadIdentity(document: current))
   }
 
+  /// Assembled `@font-face` payload per skin. The bundle cannot change at
+  /// runtime, so a skin's payload is a process constant — and it is a big one
+  /// (0.2–0.8 MB of base64 for a bundled-font theme). Rebuilding it inside
+  /// `appearanceCSS` meant every debounced keystroke rescanned the `Fonts`
+  /// directory, re-read the faces and re-joined the whole blob before anything
+  /// compared it. Assembled at most once per skin instead.
+  private static let fontFaceCSSLock = NSLock()
+  private static var fontFaceCSSBySkin: [PensieveTheme: String] = [:]
+
+  /// Test seam: how many times a skin payload has actually been assembled, so
+  /// the cache can be pinned without a wall-clock measurement.
+  private(set) static var fontFaceCSSAssemblyCount = 0
+
+  private static func cachedFontFaceCSS(for skin: PensieveTheme, referencedIn skinBlock: String)
+    -> String
+  {
+    fontFaceCSSLock.lock()
+    defer { fontFaceCSSLock.unlock() }
+    if let cached = fontFaceCSSBySkin[skin] { return cached }
+    let assembled = BundledFonts.fontFaceCSS(referencedIn: skinBlock)
+    fontFaceCSSBySkin[skin] = assembled
+    fontFaceCSSAssemblyCount += 1
+    return assembled
+  }
+
   static func appearanceCSS(fontSize: CGFloat, skin: PensieveTheme = .default)
     -> String
   {
@@ -250,7 +302,7 @@ final class PreviewWebView: NSView {
     // process-scope CTFontManager registration does not cross into the WebView's
     // out-of-process content. Scoped to the families this skin references, so
     // `default`/`raw` carry no font payload.
-    let fontFaces = BundledFonts.fontFaceCSS(referencedIn: skinBlock)
+    let fontFaces = cachedFontFaceCSS(for: skin, referencedIn: skinBlock)
     return """
       \(fontFaces)
       :root {

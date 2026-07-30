@@ -123,6 +123,37 @@ final class BundledFontsTests: XCTestCase {
     }
   }
 
+  /// A skin's `@font-face` payload is a process constant (the bundle cannot
+  /// change at runtime) and an expensive one — 0.2–0.8 MB of base64 plus a
+  /// directory rescan. It must be assembled at most once per skin, not on every
+  /// `appearanceCSS` call, which rides every debounced keystroke.
+  func testFontFaceCSSIsAssembledOncePerSkin() {
+    // Warm the skin so the assertion does not race the first (legitimate) build.
+    _ = PreviewWebView.appearanceCSS(fontSize: 14, skin: .ink)
+    let assembliesBefore = PreviewWebView.fontFaceCSSAssemblyCount
+
+    let small = PreviewWebView.appearanceCSS(fontSize: 14, skin: .ink)
+    let large = PreviewWebView.appearanceCSS(fontSize: 22, skin: .ink)
+
+    XCTAssertEqual(
+      PreviewWebView.fontFaceCSSAssemblyCount, assembliesBefore,
+      "the @font-face payload was rebuilt for an already-seen skin")
+    // The cache is keyed on the skin alone: font size must not invalidate it,
+    // and both stylesheets must still carry the same faces.
+    XCTAssertTrue(small.contains("@font-face"))
+    XCTAssertTrue(large.contains("@font-face"))
+    XCTAssertEqual(
+      small.components(separatedBy: "@font-face").count,
+      large.components(separatedBy: "@font-face").count)
+  }
+
+  /// Faces are parsed from the bundle once per process — the `faces()` default
+  /// argument used to rescan the `Fonts` directory on every CSS assembly.
+  func testBundledFacesAreParsedOncePerProcess() {
+    XCTAssertEqual(BundledFonts.bundledFaces.count, 26)
+    XCTAssertEqual(BundledFonts.bundledFaces, BundledFonts.faces())
+  }
+
   /// The assembled preview stylesheet carries the @font-face block for a themed
   /// skin and none for `default` — proving the injection point is wired.
   func testAppearanceCSSInjectsFontFacesForThemedSkinOnly() {
