@@ -108,32 +108,96 @@ enum WindowChromeRecipe {
     theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
   }
 
-  /// Re-asserts the window's chrome (appearance + titlebar backing) for a skin,
-  /// setting ONLY the properties that currently disagree. Returns `true` when
-  /// something actually had to be corrected.
+  /// The appearance we last WROTE to a window, keyed weakly by that window so an
+  /// entry disappears with the window it describes.
   ///
-  /// This is a compare-and-set INVARIANT, not a one-shot pin, and that
-  /// distinction is the whole point. A single pin guarded on "skin changed"
-  /// loses permanently to any external reset: AppKit re-bridges the hosting
-  /// view's toolbar into the window when toolbar CONTENT changes (the theme
-  /// picker's label carries the skin name, so every switch re-bridges), and a
-  /// tab-group reshuffle re-parents windows — either can hand the window back a
-  /// default appearance after we pinned it, with no further skin change coming
-  /// to trigger a re-pin. Re-asserting on every update pass heals that on the
-  /// next pass; because equal values are skipped, a steady state costs two
-  /// comparisons and issues no redundant sets (no recomposite storm).
+  /// This bookkeeping exists because `NSWindow.appearance` is not a property this
+  /// app can read its own writes back from. Measured on the running app (release
+  /// build, instrumented `assertWindowChrome`, 1.27 MB restored draft, parchment):
+  /// the assignment lands — reading `window.appearance` immediately afterwards
+  /// returns the value we set — and by the time the NEXT update pass runs, the
+  /// same window (one identity, 125 consecutive passes) reports `appearance ==
+  /// nil` and `effectiveAppearance == darkAqua` again. The document windows are
+  /// SwiftUI's `AppKitWindow`: the scene owns their appearance and puts its own
+  /// answer back after anyone else writes.
+  ///
+  /// A compare-and-set against that read-back therefore never converges. Every
+  /// pass sees the same mismatch and writes again, each write re-drives the
+  /// SwiftUI graph into another full `updateNSView`, and that pass writes again —
+  /// an unbounded update loop whose every cycle pays the document-sized editor
+  /// hot path. That is the reported hang: main thread pinned at 99% CPU with the
+  /// window stuck at 0×0, only for a big document (each cycle costs ~140 ms at
+  /// 1.27 MB) crossed with a skin that demands a FIXED appearance (the adaptive
+  /// skins want `nil`, which is what the window reports anyway, so they never
+  /// write and never spin). Measured against the same rig: never writing the
+  /// appearance settles at 0% CPU, writing it exactly once settles at 0% CPU,
+  /// writing it per pass burns 99%.
+  ///
+  /// So the appearance is asserted on OUR intent — the value we last wrote for
+  /// this window — instead of on a read-back that is not ours to trust. The
+  /// healing property `c454889` and `da7954a` exist for is kept by the backing
+  /// colour, which DOES round-trip faithfully and which the same external resets
+  /// take out: see `assertWindowChrome`.
+  nonisolated(unsafe) private static let assertedAppearances =
+    NSMapTable<NSWindow, AssertedAppearance>.weakToStrongObjects()
+
+  /// Boxed `NSAppearance.Name?` — `NSMapTable` stores objects, and "this window
+  /// was asserted, and what it wanted was the adaptive `nil`" has to be
+  /// representable as distinct from "this window was never asserted".
+  private final class AssertedAppearance {
+    let name: NSAppearance.Name?
+    init(_ name: NSAppearance.Name?) { self.name = name }
+  }
+
+  /// Re-asserts the window's chrome (appearance + titlebar backing) for a skin,
+  /// setting ONLY what currently disagrees. Returns `true` when something
+  /// actually had to be corrected.
+  ///
+  /// This is an INVARIANT re-asserted on every update pass, not a one-shot pin,
+  /// and that distinction is still the whole point. A single pin guarded on
+  /// "skin changed" loses permanently to any external reset: AppKit re-bridges
+  /// the hosting view's toolbar into the window when toolbar CONTENT changes
+  /// (the theme picker's label carries the skin name, so every switch
+  /// re-bridges), and a tab-group reshuffle re-parents windows — either can hand
+  /// the window back a default chrome after we pinned it, with no further skin
+  /// change coming to trigger a re-pin.
+  ///
+  /// What the two halves compare against differs, because only one of them can
+  /// be read back honestly:
+  ///
+  ///   * `backgroundColor` round-trips (measured: a steady pass reports it equal
+  ///     to the wanted backing), so it stays a plain compare-and-set — the real
+  ///     level-triggered invariant, idempotent in a steady state.
+  ///   * `appearance` does NOT round-trip on a SwiftUI-owned window (see
+  ///     `assertedAppearances`), so re-deriving "does it disagree?" from the
+  ///     window would spin forever. It is edge-triggered on the value we last
+  ///     wrote for this window instead: a skin change, a first assert, and a
+  ///     window we have never asserted all still write.
+  ///
+  /// The appearance is ALSO rewritten whenever the backing had to be corrected.
+  /// That is what keeps the healing property: an external reset does not take
+  /// the appearance alone — it hands the window back a default chrome, backing
+  /// included — so the property we CAN read back is the detector for the one we
+  /// cannot. It is the same clobber shape the regression tests model (they reset
+  /// appearance and backing together, because that is what a re-bridge and a
+  /// re-parent do), and the same one the original report described: the titlebar
+  /// strip, which is the backing colour, stayed on the previous skin.
   @discardableResult
   static func assertWindowChrome(on window: NSWindow, for theme: PensieveTheme) -> Bool {
     var corrected = false
 
+    let wantedBacking = titlebarGlassBackingColor(for: theme)
+    let backingDisagrees = !colorsMatch(window.backgroundColor, wantedBacking)
+
     let wantedAppearance = windowAppearance(for: theme)
-    if window.appearance?.name != wantedAppearance?.name {
+    let asserted = assertedAppearances.object(forKey: window)
+    if asserted == nil || asserted?.name != wantedAppearance?.name || backingDisagrees {
       window.appearance = wantedAppearance
+      assertedAppearances.setObject(AssertedAppearance(wantedAppearance?.name), forKey: window)
       corrected = true
     }
 
-    let wantedBacking = titlebarGlassBackingColor(for: theme)
-    if !colorsMatch(window.backgroundColor, wantedBacking) {
+    if backingDisagrees {
       window.backgroundColor = wantedBacking
       corrected = true
     }
@@ -150,6 +214,19 @@ enum WindowChromeRecipe {
   /// (the WebView's under-page backing) on every pass and needs the SAME
   /// comparison, for the same reason — two different comparisons would be two
   /// different definitions of "already correct".
+  ///
+  /// The tolerance is one 8-bit channel step, not half of one, because
+  /// `WKWebView` round-trips `underPageBackgroundColor` through an 8-bit
+  /// surface. Measured: setting sRGB `(0.101, 0.1037, 0.1099)` reads back as
+  /// `(0.101961, 0.101961, 0.109804)` — a worst case of `0.5/255 ≈ 0.00196`,
+  /// which OVERSHOOTS a `1/512 ≈ 0.00195` tolerance. Today's fixed skins are
+  /// built from hex, so their components are already 8-bit exact and round-trip
+  /// unchanged; any token that was not would make the preview's compare fail
+  /// forever and re-set the backing on every single pass — the same never-
+  /// converging invariant that made the window appearance spin, on the same hot
+  /// path. One channel step is still far finer than any real colour difference,
+  /// so an external clobber (a system window background, WebKit's default warm
+  /// gray) is nowhere near being mistaken for "already correct".
   static func colorsMatch(_ lhs: NSColor?, _ rhs: NSColor) -> Bool {
     guard let lhs else { return false }
     if lhs == rhs { return true }
@@ -157,7 +234,7 @@ enum WindowChromeRecipe {
       let left = lhs.usingColorSpace(.sRGB),
       let right = rhs.usingColorSpace(.sRGB)
     else { return false }
-    let tolerance = 1.0 / 512.0
+    let tolerance = 1.0 / 255.0
     return abs(left.redComponent - right.redComponent) < tolerance
       && abs(left.greenComponent - right.greenComponent) < tolerance
       && abs(left.blueComponent - right.blueComponent) < tolerance

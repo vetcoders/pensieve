@@ -346,4 +346,121 @@ final class EditorThemeChromeTests: XCTestCase {
 
     XCTAssertEqual(keywordColor(), PensieveTheme.parchment.tokens.accent.nsColor)
   }
+
+  /// REGRESSION PIN — the start-up hang.
+  ///
+  /// Document windows are SwiftUI's `AppKitWindow`, and the scene puts its own
+  /// answer back after anyone else writes `appearance`: measured on the running
+  /// app, the assignment lands, and the very next update pass reads `nil` again,
+  /// 125 passes in a row on one window. A compare-and-set against that read-back
+  /// never converges — every pass writes, every write re-drives the SwiftUI graph
+  /// into another `updateNSView`, and each cycle pays the document-sized editor
+  /// hot path. Restoring a 1.27 MB draft under a fixed-appearance skin pinned the
+  /// main thread at 99% CPU with the window stuck at 0×0.
+  ///
+  /// So: a steady state must write NOTHING, even when the window keeps reporting
+  /// an appearance that is not the one we asked for. Restoring the unconditional
+  /// `window.appearance?.name != wanted` write fails this outright.
+  @MainActor
+  func testSteadyStateWritesNothingToAWindowThatNeverKeepsItsAppearance() {
+    let window = AppearanceRevertingWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+
+    // First pass: nothing asserted for this window yet, so the chrome is written.
+    XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
+    XCTAssertEqual(window.appearanceWrites, 1)
+    // The window did NOT keep it — this is the condition the whole pin is about.
+    XCTAssertNil(window.appearance)
+
+    // Every later pass, same skin, chrome otherwise intact: no writes at all.
+    for _ in 0..<32 {
+      XCTAssertFalse(
+        WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment),
+        "a steady pass must report nothing corrected")
+    }
+    XCTAssertEqual(
+      window.appearanceWrites, 1,
+      "re-asserting a chrome we already wrote must not write again: every write re-drives"
+        + " the SwiftUI graph into another full update pass, which is the hang")
+  }
+
+  /// The other half of the same pin: writing less must not cost the healing
+  /// property `c454889` / `da7954a` exist for. An external reset (toolbar
+  /// re-bridge, tab-group re-parent) hands the window back a DEFAULT chrome —
+  /// backing colour included — and the backing is the half that round-trips
+  /// honestly, so it is the detector for the half that does not. A clobber must
+  /// still put the appearance back.
+  @MainActor
+  func testAnExternalClobberStillRewritesTheAppearanceItCannotReadBack() {
+    let window = AppearanceRevertingWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+
+    XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
+    XCTAssertEqual(window.appearanceWrites, 1)
+    XCTAssertFalse(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
+
+    // What a re-bridge / re-parent leaves behind.
+    window.backgroundColor = .windowBackgroundColor
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment),
+      "a clobbered chrome must still be corrected")
+    XCTAssertEqual(
+      window.appearanceWrites, 2,
+      "the appearance rides the backing's clobber signal: healing only the colour would"
+        + " leave a re-bridged window on the wrong appearance, the bug c454889 fixed")
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
+  }
+
+  /// A skin change is an edge on our own intent, so it writes even though the
+  /// window reports the same (never-kept) appearance before and after.
+  @MainActor
+  func testSkinChangeStillMovesTheAppearanceOfANonKeepingWindow() {
+    let window = AppearanceRevertingWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+
+    XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
+    XCTAssertEqual(window.lastAppearanceWritten??.name, .aqua)
+
+    XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .ink))
+    XCTAssertEqual(window.lastAppearanceWritten??.name, .darkAqua)
+    XCTAssertEqual(window.appearanceWrites, 2)
+
+    // …and the new skin's steady state is quiet again.
+    XCTAssertFalse(WindowChromeRecipe.assertWindowChrome(on: window, for: .ink))
+    XCTAssertEqual(window.appearanceWrites, 2)
+  }
+}
+
+/// Models SwiftUI's `AppKitWindow` for the chrome pins: the write lands, and
+/// then the scene puts its own answer back before anybody can read it again.
+/// Both halves are what the running app does — measured with an instrumented
+/// release build, which saw the value it had just assigned and then `nil` on the
+/// next pass, for 125 consecutive passes on one window.
+private final class AppearanceRevertingWindow: NSWindow {
+  private(set) var appearanceWrites = 0
+  /// Outer optional: "nothing written yet". Inner: the adaptive skins' `nil`.
+  private(set) var lastAppearanceWritten: NSAppearance??
+
+  override var appearance: NSAppearance? {
+    get { super.appearance }
+    set {
+      appearanceWrites += 1
+      lastAppearanceWritten = newValue
+      super.appearance = newValue
+      // The scene takes it back.
+      super.appearance = nil
+    }
+  }
 }
