@@ -164,6 +164,21 @@ final class IndexDatabase {
   /// can.
   private(set) var isClosedForTermination = false
 
+  /// The same latch, readable WITHOUT the main actor — and it exists because a `Bool` on a
+  /// `@MainActor` class is unreadable from the one place that has to consult it.
+  ///
+  /// `isClosedForTermination` gates ENTRY. Every write entry point checks it before it starts, and
+  /// that is all the protection an accepted write ever had: once `reindexInBackground` has passed
+  /// the guard and its detached `replaceSearchIndex` holds the pool's writer, nothing can stop it.
+  /// `sequence.cancel()` does not — the write is a `Task.detached` no cancellation reaches, and
+  /// SQLite work is not cancellation-aware anyway. So a large reindex that outlives the quit's
+  /// budget commits AFTER the fallback checkpoint that was supposed to be the last word on the WAL.
+  ///
+  /// Closing that needs a check INSIDE the transaction, on the writer's own thread, between batches
+  /// — a synchronous read from a `nonisolated static` context, which the main-actor flag cannot
+  /// serve. Hence a lock-guarded mirror, set by the same one-way `closeForTermination()`.
+  private let terminationLatch = TerminationLatch()
+
   /// Entry points refused since the latch closed, in call order. Production never reads this; it is
   /// the seam a test uses to prove a post-latch producer was REFUSED rather than quietly swallowed.
   private(set) var terminationRejectedEntryPoints: [String] = []
@@ -221,6 +236,9 @@ final class IndexDatabase {
 
   func closeForTermination() {
     isClosedForTermination = true
+    // Set in the same one-way step, so "the funnel is closed" and "an accepted write must stop
+    // building" can never disagree. See `terminationLatch`.
+    terminationLatch.close()
     pendingIndexBatchTruncationRetry?.cancel()
     pendingIndexBatchTruncationRetry = nil
     // Past the latch nothing is owed: `scheduleIndexBatchMaintenance()` refuses anyway, so a
@@ -824,6 +842,7 @@ final class IndexDatabase {
     guard !isRefusedAfterTermination("reindexInBackground") else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
+    let latch = terminationLatch
     // Chain position RESERVED before this call's first suspension point — see
     // `reserveSupersedePosition(_:)`. The open moved INSIDE the task for exactly that reason.
     let previous = pendingIndexUpdateTask
@@ -840,7 +859,8 @@ final class IndexDatabase {
             with: documents,
             pool: pool,
             batchSize: batchSize,
-            didInsertBatch: didInsertBatch
+            didInsertBatch: didInsertBatch,
+            latch: latch
           )
         }.value
         await self.refreshSearchResultsInBackground(in: appState)
@@ -851,6 +871,9 @@ final class IndexDatabase {
         // `waitForPendingReindex()`, which no longer does.
         self.scheduleIndexBatchMaintenance()
         return true
+      } catch is IndexWriteAbandonedAfterTermination {
+        Self.logAbandonedWriteAfterTermination("reindexInBackground")
+        return false
       } catch {
         self.report(error, appState: appState, action: "rebuild Pensieve search index")
         return false
@@ -868,12 +891,26 @@ final class IndexDatabase {
         with: documents,
         pool: pool,
         batchSize: searchIndexBatchSize,
-        didInsertBatch: didInsertSearchIndexBatch
+        didInsertBatch: didInsertSearchIndexBatch,
+        latch: terminationLatch
       )
       refreshSearchResults(in: appState)
+    } catch is IndexWriteAbandonedAfterTermination {
+      Self.logAbandonedWriteAfterTermination("reindex")
     } catch {
       report(error, appState: appState, action: "rebuild Pensieve search index")
     }
+  }
+
+  /// An abandoned write is auditable, like a refused one, and for the same reason: it is a decision
+  /// the quit made about the user's index, not an error the user can act on. Deliberately NOT routed
+  /// through `report(...)` — surfacing "could not rebuild the search index" while the app is closing
+  /// would turn a correct rollback into an alert nobody can answer.
+  private nonisolated static func logAbandonedWriteAfterTermination(_ entryPoint: String) {
+    NSLog(
+      "Pensieve quit: an accepted index write was abandoned mid-transaction after the termination "
+        + "latch closed (%@); it rolled back, so no frames land behind the terminal checkpoint",
+      entryPoint)
   }
 
   /// Awaits the in-flight background index write (full reindex OR incremental
@@ -1014,9 +1051,12 @@ final class IndexDatabase {
         deletingPaths: deletingPaths,
         pool: pool,
         batchSize: searchIndexBatchSize,
-        didInsertBatch: didInsertSearchIndexBatch
+        didInsertBatch: didInsertSearchIndexBatch,
+        latch: terminationLatch
       )
       refreshSearchResults(in: appState)
+    } catch is IndexWriteAbandonedAfterTermination {
+      Self.logAbandonedWriteAfterTermination("updateSearchIndex")
     } catch {
       report(error, appState: appState, action: "update Pensieve search index")
     }
@@ -1047,6 +1087,7 @@ final class IndexDatabase {
     guard !isRefusedAfterTermination("updateSearchIndexInBackground") else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
+    let latch = terminationLatch
     // Chain position RESERVED before this call's first suspension point — see
     // `reserveSupersedePosition(_:)`.
     let previous = pendingIndexUpdateTask
@@ -1064,7 +1105,8 @@ final class IndexDatabase {
             deletingPaths: deletingPaths,
             pool: pool,
             batchSize: batchSize,
-            didInsertBatch: didInsertBatch
+            didInsertBatch: didInsertBatch,
+            latch: latch
           )
         }.value
         await self.refreshSearchResultsInBackground(in: appState)
@@ -1073,6 +1115,9 @@ final class IndexDatabase {
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
         self.scheduleIndexBatchMaintenance()
         return true
+      } catch is IndexWriteAbandonedAfterTermination {
+        Self.logAbandonedWriteAfterTermination("updateSearchIndexInBackground")
+        return false
       } catch {
         self.report(error, appState: appState, action: "update Pensieve search index")
         return false
@@ -1890,11 +1935,13 @@ final class IndexDatabase {
     with documents: [DocumentRef],
     pool: DatabasePool,
     batchSize: Int,
-    didInsertBatch: (@Sendable (Int) -> Void)?
+    didInsertBatch: (@Sendable (Int) -> Void)?,
+    latch: TerminationLatch
   ) throws {
     let records = documents.compactMap { documentWriteRecord(from: $0) }
 
     try pool.write { db in
+      try abandonIfClosedForTermination(latch)
       // Workspaces represented in this reindex (so tombstoning is scoped to them),
       // each mapped to its REAL canonical_path so the search full-path
       // reconstruction (canonical_path || '/' || path) is correct.
@@ -1920,12 +1967,14 @@ final class IndexDatabase {
         }
         batch.append(record)
         if batch.count == batchSize {
+          try abandonIfClosedForTermination(latch)
           try upsertDocuments(batch, in: db)
           didInsertBatch?(batch.count)
           batch.removeAll(keepingCapacity: true)
         }
       }
       if !batch.isEmpty {
+        try abandonIfClosedForTermination(latch)
         try upsertDocuments(batch, in: db)
         didInsertBatch?(batch.count)
       }
@@ -1959,13 +2008,15 @@ final class IndexDatabase {
     deletingPaths: [String],
     pool: DatabasePool,
     batchSize: Int,
-    didInsertBatch: (@Sendable (Int) -> Void)?
+    didInsertBatch: (@Sendable (Int) -> Void)?,
+    latch: TerminationLatch
   ) throws {
     // Read bodies off the write transaction so a slow/failed disk read can't
     // hold the write lock open. A doc whose body cannot be read is skipped.
     let records = documents.compactMap { documentWriteRecord(from: $0) }
 
     try pool.write { db in
+      try abandonIfClosedForTermination(latch)
       for fullPath in deletingPaths {
         try deleteDocumentByFullPath(fullPath, in: db)
       }
@@ -1984,16 +2035,46 @@ final class IndexDatabase {
         }
         batch.append(record)
         if batch.count == batchSize {
+          try abandonIfClosedForTermination(latch)
           try upsertDocuments(batch, in: db)
           didInsertBatch?(batch.count)
           batch.removeAll(keepingCapacity: true)
         }
       }
       if !batch.isEmpty {
+        try abandonIfClosedForTermination(latch)
         try upsertDocuments(batch, in: db)
         didInsertBatch?(batch.count)
       }
     }
+  }
+
+  /// The in-transaction half of the termination latch: throws once the funnel has closed, so the
+  /// enclosing `pool.write` ROLLS BACK instead of committing behind the terminal checkpoint.
+  ///
+  /// Entry gating alone cannot give this. `reindexInBackground` / `updateSearchIndexInBackground`
+  /// re-check the latch only at entry (through `ensureOpenInBackground`); past that point the write
+  /// is a detached task holding the pool's writer, and the quit's budget-expiry path
+  /// (`sequence.cancel()` → `closeForTermination()` → best-effort `startCheckpointOnTerminate()`)
+  /// reaches none of it. A 20 000-document cold reindex that entered before the latch therefore kept
+  /// building through the quit and committed after the checkpoint — the WAL→0 the quit promises was
+  /// simply untrue, and by exactly the frames the biggest WAL producer in the app writes.
+  ///
+  /// Rolling the WHOLE transaction back rather than committing what was built so far is the correct
+  /// half of the trade, and it costs nothing that is owed to anyone:
+  ///
+  /// - a `documents`/FTS write is recomputable from disk — it is workspace churn, not user bytes,
+  ///   and phases Q/F have already landed everything the user owns;
+  /// - the abandoned write returns `false`, so its caller does NOT persist the on-disk `.md`
+  ///   signature, and the next launch's cold-start skip-gate re-indexes rather than skipping over a
+  ///   partial index (the same contract a FAILED write already relies on);
+  /// - a torn-down process has no use for the rest of the reindex anyway.
+  ///
+  /// Placed BEFORE each `upsertDocuments` rather than after, so the granularity of the abort is one
+  /// batch of work not started, not one batch of work wasted.
+  private nonisolated static func abandonIfClosedForTermination(_ latch: TerminationLatch) throws {
+    guard latch.isClosedForTermination else { return }
+    throw IndexWriteAbandonedAfterTermination()
   }
 
   /// Deletes the `documents` row whose RECONSTRUCTED full path matches `fullPath`
@@ -2887,3 +2968,31 @@ private struct IndexDocumentRecord: Sendable {
   var size: Int
   var isAdHoc: Bool
 }
+
+/// Lock-guarded mirror of `IndexDatabase.isClosedForTermination`, readable from the detached
+/// executor an index write's `pool.write` runs on. See `IndexDatabase.terminationLatch` for why the
+/// main-actor flag cannot serve that read.
+///
+/// One-way, like the flag it mirrors: `close()` has no counterpart, so a batch loop that reads
+/// `false` can only be racing a latch that has not closed yet — never one that has re-opened.
+private final class TerminationLatch: @unchecked Sendable {
+  private let lock = NSLock()
+  private var isClosed = false
+
+  var isClosedForTermination: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isClosed
+  }
+
+  func close() {
+    lock.lock()
+    isClosed = true
+    lock.unlock()
+  }
+}
+
+/// Thrown out of a multi-batch index write whose transaction was still building when the
+/// termination latch closed. Not a failure, and deliberately not reported to the user: the rollback
+/// is the POINT. See `IndexDatabase.abandonIfClosedForTermination(_:)`.
+private struct IndexWriteAbandonedAfterTermination: Error {}

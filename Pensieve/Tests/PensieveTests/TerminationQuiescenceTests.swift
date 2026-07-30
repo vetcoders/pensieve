@@ -329,6 +329,122 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and the truncated WAL must stay truncated (it is \(walSize(for: databaseURL)) bytes)")
   }
 
+  // MARK: - R16 / F1: an ACCEPTED write must stop building at the latch
+
+  /// Round 16, finding 1 — the half of the latch that entry gating cannot reach.
+  ///
+  /// Everything above is about writes that arrive AFTER the funnel closed. This one is about the
+  /// write that was already inside it. `reindexInBackground` re-checks the latch only at entry (via
+  /// `ensureOpenInBackground`); past that point its `replaceSearchIndex` runs on a `Task.detached`
+  /// holding the pool's writer, and the budget-expiry path — `sequence.cancel()` →
+  /// `closeForTermination()` → best-effort `startCheckpointOnTerminate()` — reaches none of it.
+  /// `cancel()` does not stop a detached task, and SQLite work is not cancellation-aware anyway.
+  ///
+  /// So the substrate matters, and it is not what "batches" suggests: `replaceSearchIndex` is ONE
+  /// `pool.write` for the WHOLE document set — the batch loop batches STATEMENTS, not transactions.
+  /// A reindex that outlives the budget therefore commits everything at once, after the fallback
+  /// checkpoint that was supposed to be the last word on the WAL. And it makes the fix exact:
+  /// throwing between batches rolls the whole transaction back, so nothing lands behind the
+  /// checkpoint rather than "less" landing behind it.
+  ///
+  /// The wedge is real: `didInsertSearchIndexBatch` fires from INSIDE that `pool.write`, so holding
+  /// the first batch holds a genuine writer mid-build — the exact state the finding describes. With
+  /// `searchIndexBatchSize: 1` the loop has an iteration left for every remaining document, so the
+  /// batch count IS the observation: 1 means the write stopped at the latch, more means it kept
+  /// building through the quit.
+  ///
+  /// A safety valve releases the wedge so a regressed build FAILS the assertions instead of hanging
+  /// the suite.
+  func testAnAcceptedReindexStopsBuildingWhenTheQuitBudgetExpires() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let batches = Counter()
+    let releaseWedge = DispatchSemaphore(value: 0)
+    defer { releaseWedge.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      releaseWedge.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { _ in
+        // Only the FIRST batch is held. Holding every batch would park the write again after the
+        // latch and prove nothing about whether the loop CHOSE to stop.
+        guard batches.next() == 1 else { return }
+        releaseWedge.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let refs = (0..<12).map { documentRef(root: root, name: "abandon-\($0).md") }
+    for (offset, ref) in refs.enumerated() {
+      try "abandonedreindexneedle \(offset)".write(to: ref.url, atomically: true, encoding: .utf8)
+    }
+
+    let writeFinished = CompletionFlag()
+    let writeReportedSuccess = CompletionFlag()
+    Task { @MainActor in
+      let wrote = await database.reindexInBackground(documents: refs, appState: nil)
+      writeReportedSuccess.isSet = wrote
+      writeFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { batches.value >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      batches.value, 1,
+      "fixture precondition: the reindex must be mid-build, holding the pool's writer inside its "
+        + "transaction")
+
+    // The quit. Its drain parks on this accepted write, the budget expires, and the fallback
+    // latches and starts the best-effort checkpoint — all while the reindex is still building.
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: makeIsolatedFolderManager(
+        in: folder, database: database, prefix: "AbandonedReindex"),
+      autosaver: Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000),
+      drainTimeout: Self.shrunkDrainBudget)
+    let startedAt = Date()
+    sequence.runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "fixture precondition: the quit must have escaped its budget rather than waited the wedge "
+        + "out; it took \(elapsed) s")
+    XCTAssertTrue(
+      database.isClosedForTermination,
+      "fixture precondition: a spent budget must still close the funnel — that latch is the signal "
+        + "this pin is about")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "fixture precondition: the reindex must have been ACCEPTED, not refused at entry. A rejection "
+        + "here would mean this pin never reproduced the window it exists for")
+
+    releaseWedge.signal()
+    pumpMainRunLoop(until: { writeFinished.isSet }, timeout: 20)
+    XCTAssertTrue(writeFinished.isSet, "the abandoned write must return promptly, not hang")
+
+    XCTAssertEqual(
+      batches.value, 1,
+      "the accepted reindex kept building after the termination latch closed: with a batch per "
+        + "document, every increment past the first is a statement executed behind the fallback "
+        + "checkpoint, and the whole transaction then commits behind it")
+    XCTAssertFalse(
+      writeReportedSuccess.isSet,
+      "…and an abandoned write must report failure, because that is what stops its caller from "
+        + "persisting the on-disk `.md` signature — the next launch has to cold-reindex rather than "
+        + "skip over an index this quit never finished")
+    XCTAssertEqual(
+      try indexHits(matching: "abandonedreindexneedle", at: databaseURL), 0,
+      "…and the transaction must have rolled back WHOLLY: `replaceSearchIndex` is a single "
+        + "`pool.write`, so a partially-built reindex is not a smaller commit, it is no commit")
+  }
+
   /// The subtle half of the latch: refusing WRITES is not enough, because in this app a read can
   /// write. `ensureOpen` builds the pool lazily and runs every migration on first creation, so a
   /// backlink query or a search arriving during the quit could create the database file, execute a
