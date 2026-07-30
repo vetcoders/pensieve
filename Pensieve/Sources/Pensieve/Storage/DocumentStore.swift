@@ -2872,6 +2872,10 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
       recoveryStore.deleteDraft(id: recoveryID)
       appState.lastError = nil
+      // Same publication, same exposure: saving AS an existing file makes our bytes that file's
+      // content, so a settled window already open on it holds a buffer this write has just made
+      // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
+      retireSettledForeignIndexDebounces(for: ref.id, by: appState)
       indexDocument(ref, appState.documentSession.text, appState)
       return true
     } catch {
@@ -3007,6 +3011,34 @@ final class DocumentStore {
     autosaver.cancelIndex(ownedBy: appState)
   }
 
+  /// Retires every OTHER window's armed index debounce over the document `appState` has just written,
+  /// for the owners that are SETTLED. Called by the save paths that publish an index row of their own
+  /// (`saveExisting(indexNow: true)`, `saveAs`), immediately before they publish it.
+  ///
+  /// The defect this closes: two windows on one file. Window A edits, its 1.5 s autosave lands A's
+  /// bytes and marks A CLEAN, and its 5 s index debounce stays armed — correctly, that debounce is
+  /// what publishes A's row. Window B then writes different text to the same file and indexes it now.
+  /// `cancelArmedIndexIfOwned` scopes to B's own entry since round 15, so A's survives, and when it
+  /// fires it publishes A's session buffer over B's row. B's bytes are the file's final content, so
+  /// FTS ends up advertising text that is on nobody's disk, and nothing ever corrects it: A is clean,
+  /// and a clean window has no future save.
+  ///
+  /// That last sentence is exactly where the round 7/15 reservation stops applying. Leaving a foreign
+  /// entry armed is right when its owner is DIRTY — its autosave is still owed and will land and
+  /// correct FTS — and wrong when its owner is settled, for whom no such correction is ever coming.
+  /// So the disposition splits on the owner's LIVE dirtiness, not on whose entry it is.
+  ///
+  /// Retire means CANCEL. See `Autosaver.retireSettledIndexDebounces(for:except:)` for why flushing
+  /// would publish the very body being retired.
+  ///
+  /// This also restores the invariant `savePendingChangesOnClose`'s settled-owner flush already
+  /// assumes — that a settled owner's buffer matches the document on disk. A settled entry could only
+  /// go stale by somebody else writing the file, and every in-app write of that file now passes
+  /// through here.
+  private func retireSettledForeignIndexDebounces(for document: URL, by appState: AppState) {
+    autosaver.retireSettledIndexDebounces(for: document, except: appState)
+  }
+
   /// Cancels the armed 1.5 s save debounce ONLY when it belongs to `appState`. A no-op when nothing
   /// is armed, when the debounce belongs to another window, or when its owner is already gone — an
   /// orphaned body captures its session weakly and no-ops when it fires, so there is nothing to
@@ -3093,6 +3125,11 @@ final class DocumentStore {
       }
     ) { [weak self, weak appState] in
       guard let self, let appState, let ref = appState.documentSession.document else { return }
+      // Deliberately NOT a `retireSettledForeignIndexDebounces` site, unlike the two save paths. The
+      // retire is licensed by having just written the file: it cancels a neighbour's row because the
+      // row replacing it is built from the bytes now on disk. A debounce publishes an in-memory
+      // buffer without writing anything, so it has no such claim — cancelling a neighbour's entry
+      // from here would be the plain freshness loss the flush-over-cancel rule forbids.
       self.indexDocument(ref, appState.documentSession.text, appState)
     }
   }
@@ -3230,6 +3267,11 @@ final class DocumentStore {
         // cancelling their debounce would leave FTS holding our text with nothing scheduled to
         // correct it once their autosave lands.
         cancelArmedIndexIfOwned(by: appState)
+        // …and that "once their autosave lands" is a promise only a DIRTY owner keeps. A second
+        // window that is already CLEAN owes no further save, so its armed debounce would fire over a
+        // session buffer this write has just made stale and leave FTS holding text that is on no
+        // disk. Retired here, immediately before we publish the row that supersedes it.
+        retireSettledForeignIndexDebounces(for: ref.id, by: appState)
         indexDocument(ref, appState.documentSession.text, appState)
       }
       return true

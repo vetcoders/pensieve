@@ -2971,6 +2971,166 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and FTS must agree with the disk, which is the whole point of not dropping the write")
   }
 
+  /// Round 18. Two windows on the SAME file, and the second one is CLEAN: its settled index debounce
+  /// must not publish its stale session buffer over a newer save's row.
+  ///
+  /// Round 15 gave every window its own index entry and narrowed `cancelArmedIndexIfOwned` to the
+  /// saver's own, deliberately leaving a foreign entry armed — on the rationale that its owner's
+  /// autosave "will land and correct FTS". That rationale holds for a DIRTY owner and fails for a
+  /// settled one: window A autosaves (its bytes on disk, its buffer clean, its 5 s index debounce
+  /// still armed), window B then writes different text to the same file and indexes it now, and A's
+  /// surviving debounce later publishes A's in-memory text over B's row. B's bytes are the file's
+  /// final content, so FTS ends up advertising text that is on no disk — and A, being clean, has no
+  /// future save that would ever correct it.
+  ///
+  /// The debounce is fired through `flushIndex()` rather than by waiting out a timer: it runs the body
+  /// through exactly the `runPendingIndex` path the timer would, so the assertion is about which text
+  /// a fired body publishes and never about how long anything took.
+  func testASettledSecondWindowsIndexDebounceCannotOverwriteANewerSaveOfTheSameFile() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("shared-by-two-windows.md")
+    try "the shared file before either edit".write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    // The index delay is long enough that no index timer can fire during this test — the only thing
+    // that runs an index body here is the explicit seam below. The save delay is short because window
+    // A's own autosave landing is a PRECONDITION, and it is waited for by CONTENT, not by the clock.
+    let autosaver = Autosaver(saveDelayMilliseconds: 40, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveSettledForeignDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    let bodyA = "windowaneedle the older text window A still holds in memory"
+    let stateA = AppState()
+    stateA.documents = [sharedRef]
+    stateA.documentSession.load(document: sharedRef, text: "the shared file before either edit")
+    stateA.activeDocumentText = bodyA
+    store.documentDidChange(appState: stateA)
+
+    try await waitUntil("window A's own autosave to land its bytes") {
+      (try? String(contentsOf: sharedURL, encoding: .utf8)) == bodyA
+    }
+    XCTAssertFalse(
+      stateA.documentSession.isDirty,
+      "fixture precondition: window A must be SETTLED — its own autosave wrote its bytes")
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "fixture precondition: …while still holding the armed index debounce that owes A's row")
+
+    // Window B writes DIFFERENT text to the same file and indexes it now — an ordinary ⌘S.
+    let bodyB = "windowbneedle the newer text window B commits to disk"
+    let stateB = AppState()
+    stateB.documents = [sharedRef]
+    stateB.documentSession.load(document: sharedRef, text: bodyA)
+    stateB.activeDocumentText = bodyB
+    store.documentDidChange(appState: stateB)
+    store.save(appState: stateB)
+
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyB,
+      "fixture precondition: B's bytes are the file's final on-disk content")
+    try await waitUntil("B's save to publish its row") {
+      await database.drainPendingIndexWrites()
+      return ((try? self.indexHits(matching: "windowbneedle", at: databaseURL)) ?? 0) == 1
+    }
+
+    XCTAssertNil(
+      autosaver.armedIndexDocument(ownedBy: stateA),
+      "a SETTLED window's debounce over the file just written must be RETIRED: it owes a row for a "
+        + "buffer this save has made stale, and a clean owner has no future save that would ever "
+        + "supersede it")
+
+    autosaver.flushIndex()
+    await database.drainPendingIndexWrites()
+
+    XCTAssertEqual(
+      try indexHits(matching: "windowbneedle", at: databaseURL), 1,
+      "FTS must still hold the text that is actually on disk…")
+    XCTAssertEqual(
+      try indexHits(matching: "windowaneedle", at: databaseURL), 0,
+      "…and never window A's stale session buffer, which is on nobody's disk and which nothing "
+        + "would ever correct")
+    XCTAssertEqual(try String(contentsOf: sharedURL, encoding: .utf8), bodyB)
+  }
+
+  /// The control for the pin above: the retire must split on the foreign owner's DIRTINESS, not
+  /// simply drop every neighbour's entry over the saved document.
+  ///
+  /// A DIRTY second window still owes a file write of its own. Its index debounce is what publishes
+  /// the row for those bytes, and its autosave really will land and correct FTS — the rounds 7/8/15
+  /// reservation, unchanged. Retiring it here would be the freshness loss the flush-over-cancel rule
+  /// exists to forbid, permanently so on an ad-hoc document, which has no workspace signature and
+  /// therefore no cold-open self-heal.
+  ///
+  /// Both debounces are set beyond the test's life on purpose: window A must still be holding unsaved
+  /// text when window B saves, so its autosave must not be allowed to land and settle it.
+  func testADirtySecondWindowsIndexDebounceSurvivesANewerSaveOfTheSameFile() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("shared-by-two-windows.md")
+    try "the shared file before either edit".write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveDirtyForeignDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    let stateA = AppState()
+    stateA.documents = [sharedRef]
+    stateA.documentSession.load(document: sharedRef, text: "the shared file before either edit")
+    stateA.activeDocumentText = "windowaneedle the text window A has NOT saved yet"
+    store.documentDidChange(appState: stateA)
+
+    XCTAssertTrue(
+      stateA.documentSession.isDirty,
+      "fixture precondition: window A must be holding unsaved text")
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "fixture precondition: …behind an armed index debounce over the shared file")
+
+    let stateB = AppState()
+    stateB.documents = [sharedRef]
+    stateB.documentSession.load(document: sharedRef, text: "the shared file before either edit")
+    stateB.activeDocumentText = "windowbneedle the text window B commits to disk"
+    store.documentDidChange(appState: stateB)
+    store.save(appState: stateB)
+
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "a DIRTY window's debounce over the file just written must stay ARMED: its owner's own save is "
+        + "still owed, that save will land these bytes, and this debounce is what publishes them")
+    XCTAssertTrue(
+      autosaver.armedIndexOwnerIsDirty(ownedBy: stateA),
+      "…and it must still read as owed, not be quietly reclassified on the way")
+    XCTAssertTrue(
+      stateA.documentSession.isDirty,
+      "…with window A's unsaved text untouched by a save in another window")
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own

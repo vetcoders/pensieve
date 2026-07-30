@@ -240,6 +240,43 @@ final class Autosaver {
     discardIndexEntry(at: index)
   }
 
+  /// Drops every OTHER owner's armed index write over `document` whose owner is SETTLED — clean, or
+  /// gone. Called by a save that has just written `document`'s bytes and is publishing its own index
+  /// row for them. `except` is that save's own session, whose entry its caller handles itself.
+  ///
+  /// CANCEL, not flush, and this is the one place where the flush-over-cancel rule inverts. That rule
+  /// protects an armed entry because dropping it loses index freshness nothing else will restore. Here
+  /// the caller is publishing a row for this very document, built from the bytes it just put on disk —
+  /// so the freshness the retired entry owed is not lost, it is SUPERSEDED by something strictly
+  /// better. Flushing instead would run the entry's body, and that body reads its owner's LIVE
+  /// `documentSession.text`: for a settled owner on a file somebody else has since rewritten, that is
+  /// a stale session buffer, so the flush would publish exactly the text this retire exists to keep
+  /// out of FTS. Cancel loses nothing; flush actively corrupts.
+  ///
+  /// A DIRTY foreign owner is left ARMED, which is rounds 7/8/15 unchanged: its body is owed a future
+  /// write, its own autosave will land those bytes, and its debounce is what publishes them. The
+  /// distinction is the whole finding — the "their autosave will land and correct FTS" reservation is
+  /// TRUE for a dirty owner and FALSE for a settled one, because a clean owner has no future save and
+  /// therefore nothing that would ever supersede its stale body.
+  ///
+  /// Dirtiness is read LIVE, through the same provider every other caller uses, so an owner that
+  /// autosaved itself clean since arming is correctly seen as settled. A VANISHED owner reads as not
+  /// dirty and is retired too: its body captures the session weakly and would write nothing anyway.
+  ///
+  /// Generations are collected BEFORE anything is discarded, because `discardIndexEntry(at:)` mutates
+  /// the array the predicate just walked.
+  func retireSettledIndexDebounces(for document: URL, except owner: AnyObject) {
+    let retired = indexEntries.filter {
+      $0.document == document && $0.owner !== owner && !($0.ownerIsDirty?() ?? false)
+    }.map(\.generation)
+    for generation in retired {
+      guard let index = indexEntries.firstIndex(where: { $0.generation == generation }) else {
+        continue
+      }
+      discardIndexEntry(at: index)
+    }
+  }
+
   /// Process-wide teardown: every owner's save and every owner's index debounce. Reserved for the
   /// quit path (behind the quiescence latch, where nothing may re-arm) and for test teardown; a
   /// caller that means "mine" must say so through the `ownedBy:` forms, and an ownerless cancel on a
