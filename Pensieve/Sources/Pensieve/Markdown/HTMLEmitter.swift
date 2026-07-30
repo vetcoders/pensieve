@@ -16,6 +16,19 @@ struct HTMLEmitter: MarkupVisitor {
   var nextBlockIndex: Int = 0
   private var rendersWikilinks = true
 
+  /// The markdown the visited document was parsed from — the SAME string handed
+  /// to `Document(parsing:)`, or the source locations below will not line up.
+  ///
+  /// Needed because cmark resolves backslash escapes before it builds the AST:
+  /// `\[~] wip` and `[~] wip` yield an identical `Text.string`, so only the
+  /// source can say whether the author escaped the marker.
+  private let source: String
+  private var sourceIndex: SourceIndex?
+
+  init(source: String) {
+    self.source = source
+  }
+
   mutating func defaultVisit(_ markup: any Markup) -> String {
     markup.children.map { visit($0) }.joined()
   }
@@ -90,7 +103,7 @@ struct HTMLEmitter: MarkupVisitor {
       return
         "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled\(checked) />\(inner)</li>"
     }
-    if let children = Self.strippingInProgressMarker(listItem) {
+    if let children = strippingInProgressMarker(listItem) {
       let inner = children.map { visit($0) }.joined()
       return
         "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled data-vc-task-state=\"in-progress\" aria-checked=\"mixed\" />\(inner)</li>"
@@ -198,17 +211,21 @@ struct HTMLEmitter: MarkupVisitor {
   /// when the item is not an in-progress task.
   ///
   /// Mirrors GFM's own rule for `[ ]`/`[x]`: the marker counts only when it
-  /// opens the item's first paragraph and is followed by whitespace (or is that
-  /// paragraph's entire text). `- [~]wip` is therefore prose, exactly as
-  /// `- [x]wip` is. When stripping empties the paragraph it is dropped, so
-  /// `- [~]` emits the same bare `<li>` shape as `- [ ]`.
-  private static func strippingInProgressMarker(_ listItem: ListItem) -> [any Markup]? {
+  /// opens the item's first paragraph, is not backslash-escaped, and is followed
+  /// by whitespace (or is that paragraph's entire text). `- [~]wip` and
+  /// `- \[~] wip` are therefore prose, exactly as `- [x]wip` and `- \[x] done`
+  /// are. When stripping empties the paragraph it is dropped, so `- [~]` emits
+  /// the same bare `<li>` shape as `- [ ]`.
+  private mutating func strippingInProgressMarker(_ listItem: ListItem) -> [any Markup]? {
     var children = Array(listItem.children)
     guard let paragraph = children.first as? Paragraph else { return nil }
     var inlines = Array(paragraph.inlineChildren)
-    guard var text = inlines.first as? Text, text.string.hasPrefix(inProgressMarker)
+    guard var text = inlines.first as? Text, text.string.hasPrefix(Self.inProgressMarker)
     else { return nil }
-    let remainder = text.string.dropFirst(inProgressMarker.count)
+    // cmark strips the backslash while building the Text node, so an escaped
+    // marker is indistinguishable from a real one in the AST — ask the source.
+    guard !isEscaped(text) else { return nil }
+    let remainder = text.string.dropFirst(Self.inProgressMarker.count)
     guard remainder.first.map(\.isWhitespace) ?? true else { return nil }
 
     text.string = String(remainder.drop(while: \.isWhitespace))
@@ -223,6 +240,45 @@ struct HTMLEmitter: MarkupVisitor {
       children[0] = Paragraph(inlines)
     }
     return children
+  }
+
+  /// True when the inline's first source character is a backslash — i.e. what
+  /// looks like a marker in the AST was written `\[~]` and is prose.
+  ///
+  /// Without a source range (source positions disabled, or a `source` that does
+  /// not match the parsed string) the answer is "not escaped", which is the
+  /// behaviour that predates this check.
+  private mutating func isEscaped(_ inline: some InlineMarkup) -> Bool {
+    guard let start = inline.range?.lowerBound else { return false }
+    if sourceIndex == nil { sourceIndex = SourceIndex(source) }
+    return sourceIndex?.byte(at: start) == UInt8(ascii: "\\")
+  }
+
+  /// `source` as UTF-8 bytes plus each line's start offset, so a cmark
+  /// `SourceLocation` (1-based line, 1-based column) resolves to a byte in O(1).
+  /// Built at most once per emitted document, and only when a candidate marker
+  /// actually asks — a document with no `[~]` never pays for it.
+  private struct SourceIndex {
+    private let bytes: [UInt8]
+    private let lineStarts: [Int]
+
+    init(_ source: String) {
+      let bytes = Array(source.utf8)
+      var lineStarts = [0]
+      for (offset, byte) in bytes.enumerated() where byte == UInt8(ascii: "\n") {
+        lineStarts.append(offset + 1)
+      }
+      self.bytes = bytes
+      self.lineStarts = lineStarts
+    }
+
+    func byte(at location: SourceLocation) -> UInt8? {
+      guard location.line >= 1, location.line <= lineStarts.count, location.column >= 1
+      else { return nil }
+      let offset = lineStarts[location.line - 1] + location.column - 1
+      guard offset < bytes.count else { return nil }
+      return bytes[offset]
+    }
   }
 
   private mutating func wrappedBlock(_ tag: String, inner: String) -> String {

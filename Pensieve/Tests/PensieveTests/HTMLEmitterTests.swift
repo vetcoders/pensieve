@@ -6,7 +6,7 @@ import XCTest
 final class HTMLEmitterTests: XCTestCase {
   private func render(_ markdown: String) -> String {
     let document = Document(parsing: markdown)
-    var emitter = HTMLEmitter()
+    var emitter = HTMLEmitter(source: markdown)
     return emitter.visit(document)
   }
 
@@ -143,6 +143,44 @@ final class HTMLEmitterTests: XCTestCase {
     }
   }
 
+  /// GFM keeps an escaped `\[x]` as prose; the third state must obey the same
+  /// escape. cmark resolves `\[` before it builds the Text node, so the AST alone
+  /// cannot tell `\[~] wip` from `[~] wip` — the emitter has to consult the
+  /// source. An author who escaped the marker asked for literal text.
+  func testEscapedMarkerStaysProseInsteadOfBecomingATask() {
+    let html = render("- \\[~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
+  /// The escape must not disarm the marker for the whole document: the unescaped
+  /// sibling in the same list still promotes, and the escaped one is untouched.
+  func testEscapedAndRealMarkersCoexistInOneList() {
+    let html = render("- \\[~] literal\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// The source lookup is by line + column, so a marker that is not on line 1
+  /// (and sits behind a longer prefix) must resolve just as exactly.
+  func testEscapeDetectionHoldsForLaterLinesAndNestedItems() {
+    let html = render("intro\n\n- first\n- [~] real\n  - \\[~] literal\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+  }
+
+  /// GFM's own escaped checkbox is unaffected — the byte-parity guard for the
+  /// two states cmark already owns.
+  func testEscapedGFMCheckboxStillRendersAsProse() {
+    let html = render("- \\[x] done\n- \\[ ] todo\n")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertTrue(html.contains("[x] done"), html)
+    XCTAssertTrue(html.contains("[ ] todo"), html)
+  }
+
   /// A single `~` is also a GFM strikethrough delimiter; promoting the marker
   /// must not swallow a later `~pair~` on the same line.
   func testInProgressTaskLeavesStrikethroughOnTheSameLineIntact() {
@@ -185,8 +223,9 @@ final class HTMLEmitterTests: XCTestCase {
   }
 
   func testParagraphAnchorsCount() {
-    let document = Document(parsing: "# A\n\nBody\n\n## B\n\n- l1\n- l2")
-    var emitter = HTMLEmitter()
+    let markdown = "# A\n\nBody\n\n## B\n\n- l1\n- l2"
+    let document = Document(parsing: markdown)
+    var emitter = HTMLEmitter(source: markdown)
     _ = emitter.visit(document)
     // 4 top-level blocks: h1, p, h2, ul
     XCTAssertGreaterThanOrEqual(
