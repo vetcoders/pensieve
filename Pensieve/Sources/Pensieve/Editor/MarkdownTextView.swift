@@ -83,24 +83,42 @@ class MarkdownTextView: NSTextView {
     // (proportional system) font and visibly "pops" to monospace only once the debounced
     // highlight pass re-applies attributes — the font-jump the operator saw per keystroke.
     // `EditorRepresentable.update` keeps these in sync when the font size changes.
-    let baseFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    // No theme has landed yet, so `monoFamily` is empty and this resolves to the
+    // system monospaced face; `applyTheme` swaps in the skin's family.
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: 14)
     font = baseFont
     typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
   }
 
+  /// Monospace family the active theme dresses the source panel in
+  /// (`ThemeTokens.monoFamily`). Empty until a theme lands — and empty for the
+  /// adaptive skins — which resolves to the system monospaced face.
+  private(set) var monoFamily: String = ""
+
   /// Applies the active theme to the editor surface: the pane background is the
-  /// theme `source`, the caret + typing colour follow the theme `text`, and the
-  /// gutter receives its own source-panel tokens. Called from
-  /// `MarkdownEditorSurface` on setup and whenever the skin changes.
+  /// theme `source`, the caret + typing colour follow the theme `text`, the pane
+  /// takes the theme's monospace family, and the gutter receives its own
+  /// source-panel tokens. Called from `MarkdownEditorSurface` on setup and
+  /// whenever the skin changes.
+  ///
+  /// The family has to land here, not only in the highlighter: `font` and
+  /// `typingAttributes` are what freshly typed characters are drawn with before
+  /// the debounced highlight pass reaches them, so leaving them on the previous
+  /// family would make every keystroke flash the old face.
   func applyTheme(_ tokens: ThemeTokens) {
     let source = tokens.source.nsColor
     let text = tokens.text.nsColor
     drawsBackground = true
     backgroundColor = source
     insertionPointColor = text
+    monoFamily = tokens.monoFamily
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: font?.pointSize ?? 14)
+    font = baseFont
     var attributes = typingAttributes
+    attributes[.font] = baseFont
     attributes[.foregroundColor] = text
     typingAttributes = attributes
+    autocompleteGhostField?.font = baseFont
     gutter?.applyTokens(tokens)
   }
 
@@ -188,7 +206,7 @@ class MarkdownTextView: NSTextView {
       addSubview(ghostField)
     }
     ghostField.stringValue = suggestion
-    ghostField.font = font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ghostField.font = font ?? MonoFontResolver.font(family: monoFamily, size: 14)
     ghostField.sizeToFit()
     ghostField.setFrameOrigin(
       autocompleteGhostOrigin(caretLocation: caretLocation, size: ghostField.frame.size))

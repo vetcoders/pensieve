@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The source panel is now set in each theme's own monospace family — Sometype Mono (Parchment), JetBrains Mono (Graphite, Ink), IBM Plex Mono (Porcelain), Spline Sans Mono (Typewriter) — across body text, bold/semibold spans, inline code, the caret's typing attributes, the autocomplete ghost, and the line-number gutter. `Default` and `Raw` keep the system monospaced face.
 - Task lists gained a third checkbox state: `- [~]` ("in progress") is highlighted in the source panel like `- [ ]` / `- [x]` and renders in preview as a diamond inside an accent-coloured frame.
 
 ### Fixed

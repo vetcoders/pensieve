@@ -38,13 +38,26 @@ class LineNumberGutter: NSRulerView {
     }
   }
 
+  /// Monospace family the line numbers are drawn in — the theme's own
+  /// (`ThemeTokens.monoFamily`), so the gutter cannot read as a different
+  /// typeface than the text beside it. Empty (adaptive skins) keeps the system
+  /// tabular figures.
+  var monoFamily: String = "" {
+    didSet {
+      guard monoFamily != oldValue else { return }
+      needsDisplay = true
+    }
+  }
+
   /// Applies the source-panel tokens the brief maps to the gutter: `source`
-  /// (fill), `border` (right edge), `srcGutter` (numbers), `srcCurrentLine`.
+  /// (fill), `border` (right edge), `srcGutter` (numbers), `srcCurrentLine`,
+  /// plus the theme's monospace family for the numbers themselves.
   func applyTokens(_ tokens: ThemeTokens) {
     gutterBackground = tokens.source.nsColor
     gutterBorder = tokens.border.nsColor
     gutterNumber = tokens.srcGutter.nsColor
     gutterCurrentLine = tokens.srcCurrentLine.nsColor
+    monoFamily = tokens.monoFamily
   }
 
   init(scrollView: NSScrollView, textLayoutManager: NSTextLayoutManager) {
@@ -106,7 +119,10 @@ class LineNumberGutter: NSRulerView {
     let textContainerInset = textView.textContainerInset
     let scrollOffset = scrollView?.documentVisibleRect.origin.y ?? 0
 
-    let numberFont = NSFont.monospacedDigitSystemFont(ofSize: fontSize - 2, weight: .regular)
+    // Resolved (and cached) per family+size — this runs on every gutter repaint,
+    // i.e. on every scroll, so it must never construct a font from scratch.
+    let numberFont = MonoFontResolver.font(
+      family: monoFamily, size: fontSize - 2, fallback: .monoDigits)
     let numberAttributes: [NSAttributedString.Key: Any] = [
       .font: numberFont,
       .foregroundColor: gutterNumber,

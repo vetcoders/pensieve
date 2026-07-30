@@ -46,6 +46,14 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
   }
 
+  /// The source panel's base face for the active tokens and font size. Every
+  /// surface that paints its own text (the text view, its typing attributes, the
+  /// autocomplete ghost) reads it from here, so nothing can end up in a
+  /// different family than the highlighter's own base attributes.
+  var baseFont: NSFont {
+    highlighter.baseFont
+  }
+
   override func processEditing(
     for textStorage: NSTextStorage, edited editMask: NSTextStorageEditActions,
     range newCharRange: NSRange, changeInLength delta: Int,

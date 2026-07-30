@@ -39,37 +39,55 @@ class SyntaxHighlighter {
     }
   }
 
-  /// Fonts that depend on `baseFontSize`. Rebuilt only when the font size
-  /// changes (the `NSFontManager.convert` italic derivation is the most
+  /// Fonts that depend on `baseFontSize` and the theme's `monoFamily`. Rebuilt
+  /// only when one of those two changes (the italic derivation is the most
   /// expensive piece, so caching it is the biggest per-keystroke win).
   private struct FontCache {
     let size: CGFloat
+    let family: String
     let base: NSFont
     let bold: NSFont
     let italic: NSFont
+    /// Slant to add on top of `italic` when the family ships no italic face —
+    /// see `MonoFontResolver.Italic`.
+    let italicObliqueness: CGFloat
     let semibold: NSFont
     let inlineCode: NSFont
 
-    init(size: CGFloat) {
+    init(size: CGFloat, family: String) {
       self.size = size
-      let base = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-      self.base = base
-      self.bold = NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
-      self.semibold = NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
-      self.inlineCode = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-      self.italic = NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+      self.family = family
+      self.base = MonoFontResolver.font(family: family, size: size)
+      self.bold = MonoFontResolver.font(family: family, size: size, weight: .bold)
+      self.semibold = MonoFontResolver.font(family: family, size: size, weight: .semibold)
+      self.inlineCode = MonoFontResolver.font(family: family, size: size)
+      let italic = MonoFontResolver.italicFont(family: family, size: size)
+      self.italic = italic.font
+      self.italicObliqueness = italic.obliqueness
     }
   }
 
   private var cachedFonts: FontCache?
 
   private func fonts() -> FontCache {
-    if let cached = cachedFonts, cached.size == baseFontSize {
+    // `monoFamily` is a token like any other, so the cache key includes it: a live
+    // skin switch must re-FONT the source panel, not only retint it. Keying it
+    // here rather than invalidating from `tokens.didSet` keeps ONE definition of
+    // "this cache is stale".
+    let family = tokens.monoFamily
+    if let cached = cachedFonts, cached.size == baseFontSize, cached.family == family {
       return cached
     }
-    let fresh = FontCache(size: baseFontSize)
+    let fresh = FontCache(size: baseFontSize, family: family)
     cachedFonts = fresh
     return fresh
+  }
+
+  /// The source panel's base face for the active theme and size — the single
+  /// answer every other surface (text view, typing attributes, ghost field) must
+  /// agree with, so nothing can drift into a different family.
+  var baseFont: NSFont {
+    fonts().base
   }
 
   /// Resolved `NSColor`s for the active `tokens`. Parsing hex → `NSColor`
@@ -144,7 +162,7 @@ class SyntaxHighlighter {
 
   func resetBaseAttributes(_ textStorage: NSTextStorage, range: NSRange) {
     guard let targetRange = validRange(range, in: textStorage) else { return }
-    let baseFont = NSFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
+    let baseFont = fonts().base
     let baseColor = colors().text
 
     textStorage.removeAttribute(.font, range: targetRange)
@@ -152,6 +170,9 @@ class SyntaxHighlighter {
     textStorage.removeAttribute(.backgroundColor, range: targetRange)
     textStorage.removeAttribute(.underlineStyle, range: targetRange)
     textStorage.removeAttribute(.strikethroughStyle, range: targetRange)
+    // Synthetic italics live in `.obliqueness`, so a reset that left it behind
+    // would keep slanting text that is no longer emphasised.
+    textStorage.removeAttribute(.obliqueness, range: targetRange)
 
     textStorage.addAttribute(.font, value: baseFont, range: targetRange)
     textStorage.addAttribute(.foregroundColor, value: baseColor, range: targetRange)
@@ -252,13 +273,17 @@ class SyntaxHighlighter {
         .backgroundColor: colors.highlightBackground,
       ])
 
-    // Italic: *text* or _text_ (basic regex)
-    // macOS doesn't have a built-in italic monospaced font easily, we use regular italic trait if available
+    // Italic: *text* or _text_ (basic regex). Most bundled mono families ship no
+    // italic face at all, so when the resolver could not find one the slant is
+    // synthesised with `.obliqueness` — otherwise `*emphasis*` would be
+    // indistinguishable from body text on parchment, graphite, ink and porcelain.
+    var italicAttributes: [NSAttributedString.Key: Any] = [.font: fonts.italic]
+    if fonts.italicObliqueness != 0 {
+      italicAttributes[.obliqueness] = fonts.italicObliqueness
+    }
     highlightRegex(
       Patterns.italic, in: swiftString, storage: textStorage, targetRange: targetRange,
-      attributes: [
-        .font: fonts.italic
-      ])
+      attributes: italicAttributes)
 
     // Inline code: `code` — the one warm token in the source panel.
     highlightRegex(
