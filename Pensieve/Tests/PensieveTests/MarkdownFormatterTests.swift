@@ -40,6 +40,14 @@ final class MarkdownFormatterTests: XCTestCase {
     )
     XCTAssertEqual(task?.replacement, "\n- [ ] ")
 
+    // `[~]` ("in progress") continues as a task, not as a bare dash.
+    let inProgress = MarkdownFormatter.autoconversion(
+      in: "- [~] wip",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(inProgress?.replacement, "\n- [ ] ")
+
     let quote = MarkdownFormatter.autoconversion(
       in: "> thought",
       range: NSRange(location: 9, length: 0),

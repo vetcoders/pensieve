@@ -84,7 +84,9 @@ enum MarkdownFormatter {
   }
 
   private enum AutoconversionPatterns {
-    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX]\]\s*(.*)$"#)
+    /// `[~]` ("in progress") continues like the other two states — Return on a
+    /// `- [~] …` line opens the next item as an empty `- [ ] `, not a bare dash.
+    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX~]\]\s*(.*)$"#)
     static let unorderedList = compile(#"^(\s*)([-*+])\s+(.*)$"#)
     static let orderedList = compile(#"^(\s*)(\d+)([.)])\s+(.*)$"#)
     static let blockquote = compile(#"^(\s*)>\s?(.*)$"#)

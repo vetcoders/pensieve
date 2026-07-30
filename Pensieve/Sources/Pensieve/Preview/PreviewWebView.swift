@@ -485,6 +485,43 @@ final class PreviewWebView: NSView {
         margin: 0;
       }
 
+      /* Third task state — `[~]` "in progress" (mockups 1a–1e, 2a). GFM has no
+         such checkbox, so HTMLEmitter tags the input with `data-vc-task-state`
+         and CSS draws it: an accent frame with a diamond inside. `[ ]` and `[x]`
+         never match this selector and keep the native control untouched. The
+         accent is `--vc-preview-link` — the one token every skin already
+         re-tunes — so the diamond follows the skin without per-skin CSS, and the
+         attribute selector outranks the skin overlays' bare class rules. */
+      .markdown-body .task-list-item-checkbox[data-vc-task-state="in-progress"] {
+        appearance: none;
+        -webkit-appearance: none;
+        box-sizing: border-box;
+        width: 13px;
+        height: 13px;
+        border: 1.5px solid var(--vc-preview-link);
+        border-radius: 3px;
+        background: transparent;
+        /* inline-block, not a flex/grid box: those take their baseline from the
+           first in-flow item and would drop the frame ~2px below the native
+           `[ ]`/`[x]` controls sitting in the same list. The diamond is
+           positioned instead of laid out, so the box keeps an empty
+           inline-block's baseline — the same one a bare checkbox has. */
+        display: inline-block;
+        position: relative;
+      }
+
+      .markdown-body .task-list-item-checkbox[data-vc-task-state="in-progress"]::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 6px;
+        height: 6px;
+        margin: -3px 0 0 -3px;
+        background: var(--vc-preview-link);
+        transform: rotate(45deg);
+      }
+
       .markdown-body img {
         max-width: 100%;
         height: auto;
@@ -955,8 +992,8 @@ final class PreviewWebView: NSView {
           box-shadow: none;
           border-radius: 0;
         }
-        /* Checkbox jako rysowany kwadrat — 3 stany. Wymaga wsparcia po stronie
-           pipeline'u dla [~]; patrz sekcja 4. */
+        /* Checkbox jako rysowany kwadrat. Stan „w trakcie” (`[~]`) rysuje blok
+           bazowy z tokenu akcentu — tu wychodzi #1c1c1c, jak w makiecie 2a. */
         .markdown-body .task-list-item-checkbox {
           appearance: none;
           -webkit-appearance: none;

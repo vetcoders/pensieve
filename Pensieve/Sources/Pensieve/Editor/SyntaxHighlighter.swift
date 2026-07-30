@@ -18,7 +18,9 @@ class SyntaxHighlighter {
   private enum Patterns {
     static let blockquote = compile("(?m)^>.*$")
     static let horizontalRule = compile(#"(?m)^\s{0,3}([-*_])(?:\s*\1){2,}\s*$"#)
-    static let taskCheckbox = compile(#"(?m)^\s{0,3}[-*+]\s+\[[ xX]\]"#)
+    /// `[~]` is the third state ("in progress") the preview draws as a diamond;
+    /// the source panel gives it the same checkbox token as `[ ]`/`[x]`.
+    static let taskCheckbox = compile(#"(?m)^\s{0,3}[-*+]\s+\[[ xX~]\]"#)
     static let unorderedList = compile(#"(?m)^\s{0,3}[-*+](?=\s+)"#)
     static let orderedList = compile(#"(?m)^\s{0,3}\d+\.(?=\s+)"#)
     static let heading = compile("(?m)^#{1,6}\\s+.*$")

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Task lists gained a third checkbox state: `- [~]` ("in progress") is highlighted in the source panel like `- [ ]` / `- [x]` and renders in preview as a diamond inside an accent-coloured frame.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added

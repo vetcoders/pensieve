@@ -236,6 +236,42 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(raw.contains("box-shadow: none !important"))
   }
 
+  /// `[~]` draws as a diamond in a frame (mockups 1a–1e, 2a) from the accent
+  /// token, so every skin gets it from the base block — no per-skin CSS — and the
+  /// native `[ ]`/`[x]` controls are never touched.
+  func testAppearanceCSSDrawsTheInProgressCheckboxAsAnAccentDiamondForEverySkin() {
+    let frameSelector =
+      ".markdown-body .task-list-item-checkbox[data-vc-task-state=\"in-progress\"]"
+
+    for skin in PensieveTheme.allCases {
+      let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: skin)
+
+      let frame = cssRule(selector: frameSelector, containing: "border:", in: css)
+      XCTAssertTrue(
+        frame?.contains("border: 1.5px solid var(--vc-preview-link);") == true,
+        "skin \(skin.rawValue): \(frame ?? "missing")")
+      XCTAssertTrue(
+        frame?.contains("-webkit-appearance: none;") == true,
+        "skin \(skin.rawValue): \(frame ?? "missing")")
+
+      let diamond = cssRule(selector: "\(frameSelector)::after", containing: "transform:", in: css)
+      XCTAssertTrue(
+        diamond?.contains("transform: rotate(45deg);") == true,
+        "skin \(skin.rawValue): \(diamond ?? "missing")")
+      XCTAssertTrue(
+        diamond?.contains("background: var(--vc-preview-link);") == true,
+        "skin \(skin.rawValue): \(diamond ?? "missing")")
+    }
+
+    // The two GFM states keep the native control: on `default` nothing styles
+    // the bare checkbox class beyond placement. (`typewriter` deliberately draws
+    // all three — that is its own signature, not the base contract.)
+    let bare = cssRule(
+      selector: ".markdown-body .task-list-item-checkbox", containing: "appearance: none",
+      in: PreviewWebView.appearanceCSS(fontSize: 14, skin: .default))
+    XCTAssertNil(bare, bare ?? "")
+  }
+
   func testAppearanceCSSDefinesRelativeHeadingScaleIndependentOfFlavor() {
     for skin in [PensieveTheme.default, .ink, .parchment] {
       let css = PreviewWebView.appearanceCSS(fontSize: 16, skin: skin)

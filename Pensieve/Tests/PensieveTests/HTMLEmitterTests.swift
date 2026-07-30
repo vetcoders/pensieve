@@ -105,6 +105,64 @@ final class HTMLEmitterTests: XCTestCase {
       html.contains("class=\"task-list-item-checkbox\" disabled checked />"), html)
   }
 
+  func testInProgressTaskEmitsThirdStateWithoutTheLiteralMarker() {
+    let html = render("- [~] wip")
+    XCTAssertTrue(html.contains("<li class=\"task-list-item\">"), html)
+    XCTAssertTrue(
+      html.contains(
+        "class=\"task-list-item-checkbox\" disabled data-vc-task-state=\"in-progress\" aria-checked=\"mixed\" />"
+      ), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+    XCTAssertTrue(html.contains(">wip</p>"), html)
+    // The third state is never `checked` — that would make it read as done.
+    XCTAssertFalse(html.contains("checked />"), html)
+  }
+
+  func testInProgressTaskKeepsInlineChildrenAndNestedBlocks() {
+    let html = render("- [~] **bold** tail\n  - [~] inner")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 2, html)
+    XCTAssertTrue(html.contains("<strong>bold</strong> tail"), html)
+    XCTAssertTrue(html.contains(">inner</p>"), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+  }
+
+  func testEmptyInProgressTaskEmitsBareItemLikeAnEmptyUncheckedTask() {
+    let html = render("- [~]")
+    XCTAssertTrue(html.contains("data-vc-task-state=\"in-progress\""), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+    XCTAssertFalse(html.contains("<p"), html)
+  }
+
+  /// `[~]` is a checkbox only where GFM would accept one: opening the item and
+  /// followed by whitespace. Everything else stays prose.
+  func testTildeMarkerOutsideTaskPositionStaysLiteralText() {
+    for markdown in ["- [~]wip", "- wip [~] tail", "[~] loose paragraph"] {
+      let html = render(markdown)
+      XCTAssertFalse(html.contains("task-list-item"), "\(markdown) → \(html)")
+      XCTAssertTrue(html.contains("[~]"), "\(markdown) → \(html)")
+    }
+  }
+
+  /// A single `~` is also a GFM strikethrough delimiter; promoting the marker
+  /// must not swallow a later `~pair~` on the same line.
+  func testInProgressTaskLeavesStrikethroughOnTheSameLineIntact() {
+    let html = render("- [~] wip ~gone~ tail")
+    XCTAssertTrue(html.contains("data-vc-task-state=\"in-progress\""), html)
+    XCTAssertTrue(html.contains("wip <del>gone</del> tail"), html)
+  }
+
+  /// Guards the `default` theme's GitHub contract: the two states GFM already
+  /// knows emit exactly the same bytes as before the third state existed.
+  func testExistingCheckboxStatesEmitNoThirdStateAttributes() {
+    let html = render("- [ ] todo\n- [x] done\n- [X] shouted")
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertFalse(html.contains("aria-checked"), html)
+    let unchecked = "class=\"task-list-item-checkbox\" disabled />"
+    let checked = "class=\"task-list-item-checkbox\" disabled checked />"
+    XCTAssertEqual(html.components(separatedBy: unchecked).count - 1, 1, html)
+    XCTAssertEqual(html.components(separatedBy: checked).count - 1, 2, html)
+  }
+
   func testBlockquote() {
     let html = render("> quoted")
     XCTAssertTrue(html.contains("<blockquote"), html)

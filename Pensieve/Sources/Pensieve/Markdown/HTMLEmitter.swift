@@ -84,12 +84,18 @@ struct HTMLEmitter: MarkupVisitor {
 
   mutating func visitListItem(_ listItem: ListItem) -> String {
     // List items inherit the parent list's block anchor; do not consume one.
-    let inner = listItem.children.map { visit($0) }.joined()
     if let checkbox = listItem.checkbox {
+      let inner = listItem.children.map { visit($0) }.joined()
       let checked = checkbox == .checked ? " checked" : ""
       return
         "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled\(checked) />\(inner)</li>"
     }
+    if let children = Self.strippingInProgressMarker(listItem) {
+      let inner = children.map { visit($0) }.joined()
+      return
+        "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled data-vc-task-state=\"in-progress\" aria-checked=\"mixed\" />\(inner)</li>"
+    }
+    let inner = listItem.children.map { visit($0) }.joined()
     return "<li>\(inner)</li>"
   }
 
@@ -178,6 +184,46 @@ struct HTMLEmitter: MarkupVisitor {
   }
 
   // MARK: - Helpers
+
+  /// The third task-checkbox state: `- [~] …` meaning "in progress".
+  ///
+  /// GFM — and therefore cmark inside swift-markdown — only knows `[ ]` and
+  /// `[x]`, so `listItem.checkbox` is `nil` here and the marker survives as
+  /// literal text at the head of the item's first paragraph. Promoting it in the
+  /// emitter keeps the parser untouched (it is a vendored dependency) while the
+  /// preview still receives a real task-list item.
+  private static let inProgressMarker = "[~]"
+
+  /// Returns the item's children with a leading `[~]` marker stripped, or `nil`
+  /// when the item is not an in-progress task.
+  ///
+  /// Mirrors GFM's own rule for `[ ]`/`[x]`: the marker counts only when it
+  /// opens the item's first paragraph and is followed by whitespace (or is that
+  /// paragraph's entire text). `- [~]wip` is therefore prose, exactly as
+  /// `- [x]wip` is. When stripping empties the paragraph it is dropped, so
+  /// `- [~]` emits the same bare `<li>` shape as `- [ ]`.
+  private static func strippingInProgressMarker(_ listItem: ListItem) -> [any Markup]? {
+    var children = Array(listItem.children)
+    guard let paragraph = children.first as? Paragraph else { return nil }
+    var inlines = Array(paragraph.inlineChildren)
+    guard var text = inlines.first as? Text, text.string.hasPrefix(inProgressMarker)
+    else { return nil }
+    let remainder = text.string.dropFirst(inProgressMarker.count)
+    guard remainder.first.map(\.isWhitespace) ?? true else { return nil }
+
+    text.string = String(remainder.drop(while: \.isWhitespace))
+    if text.string.isEmpty {
+      inlines.removeFirst()
+    } else {
+      inlines[0] = text
+    }
+    if inlines.isEmpty {
+      children.removeFirst()
+    } else {
+      children[0] = Paragraph(inlines)
+    }
+    return children
+  }
 
   private mutating func wrappedBlock(_ tag: String, inner: String) -> String {
     let anchor = nextAnchorAttr()

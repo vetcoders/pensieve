@@ -151,6 +151,26 @@ final class SyntaxHighlighterTests: XCTestCase {
       font(storage, at: at), NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold))
   }
 
+  func testInProgressTaskCheckboxGetsTheSameMarkerTreatment() {
+    // `[~]` is the third state ("in progress"); the source panel must not leave
+    // it looking like prose next to `[ ]` and `[x]`.
+    let md = "- [~] wip\n"
+    let storage = highlighted(md)
+    let at = index(of: "[~]", in: md)
+    XCTAssertEqual(color(storage, at: at), NSColor.secondaryLabelColor)
+    XCTAssertEqual(
+      font(storage, at: at), NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold))
+  }
+
+  func testEmptyAndCheckedCheckboxesStillMatchAfterThirdState() {
+    for md in ["- [ ] todo\n", "* [x] done\n", "+ [X] shouted\n"] {
+      let storage = highlighted(md)
+      XCTAssertEqual(
+        font(storage, at: 2), NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold),
+        md)
+    }
+  }
+
   // MARK: - List markers
 
   func testUnorderedListMarkerUsesThemeListMarkerColor() {
