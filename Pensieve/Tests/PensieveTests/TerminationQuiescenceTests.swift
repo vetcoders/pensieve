@@ -1682,12 +1682,16 @@ final class TerminationQuiescenceTests: XCTestCase {
   ///
   /// Honesty about the driving (round 9's lesson): which continuation parked on a completed open
   /// resumes first is the scheduler's business, so the two tails are not RACED here, they are placed.
-  /// The first update is parked on the real `databaseOpenGateOverride` wedge, released, and caught at
-  /// the write gate — which proves its tail is installed, because the write task can only reach that
-  /// gate after the main-actor step that assigned the tail has finished. The drain is then started
-  /// and given the run loop until it can only be parked on that tail. Only then is the second update
-  /// admitted. That is the state the finding describes, reached deterministically instead of hoped
-  /// for.
+  /// Each update is caught at the write gate, which its task can only reach after the main-actor step
+  /// that installed its tail. The drain is started between the two and given the run loop until it can
+  /// only be parked on the first tail; only then is the second update admitted. That is the state the
+  /// finding describes, reached deterministically instead of hoped for.
+  ///
+  /// Round 15 note on the driving, not on the contract: the first update used to be parked inside
+  /// `databaseOpenGateOverride` and released from there, because the tail was installed only after the
+  /// open returned. Positions are now RESERVED before the entry point's first suspension point (see
+  /// `IndexDatabase.reserveSupersedePosition(_:)`), so the write gate alone places both tails and the
+  /// open needs no wedge here — it happens inside the first write, behind that gate.
   ///
   /// The assertion that cannot pass by luck is the negative one: with the second tail installed and
   /// its write still held, a drain that returns has walked past a write it accepted.
@@ -1700,12 +1704,10 @@ final class TerminationQuiescenceTests: XCTestCase {
     let database = IndexDatabase(databaseURL: databaseURL)
     XCTAssertNil(
       database.databaseURL,
-      "fixture precondition: the first update must genuinely park on the initial open, which is the "
-        + "state the finding is about")
+      "fixture precondition: nothing may be open yet — the first update carries the initial open "
+        + "with it, behind the write gate")
 
-    let openGate = ParkingGate()
     let writeGate = OrderedParkingGate()
-    database.databaseOpenGateOverride = { await openGate.arrive() }
     database.backgroundWriteGateOverride = { await writeGate.arrive() }
 
     let firstRef = documentRef(root: root, name: "first-update.md")
@@ -1719,20 +1721,11 @@ final class TerminationQuiescenceTests: XCTestCase {
         upserting: [firstRef], deletingPaths: [], appState: nil)
       firstFinished.isSet = true
     }
-    pumpMainRunLoop(until: { openGate.arrivalCount >= 1 }, timeout: 10)
-    XCTAssertGreaterThanOrEqual(
-      openGate.arrivalCount, 1,
-      "fixture precondition: the first update must be parked INSIDE the open, past the funnel gate")
-
-    Task { await openGate.open() }
     pumpMainRunLoop(until: { writeGate.arrivalCount >= 1 }, timeout: 10)
     XCTAssertGreaterThanOrEqual(
       writeGate.arrivalCount, 1,
       "fixture precondition: the first update's write must be parked at the write gate, which is "
         + "only reachable after the main-actor step that installed its tail")
-    XCTAssertEqual(
-      database.databaseURL, databaseURL,
-      "…and the pool must be published, so the second update below is admitted without parking")
 
     let drainFinished = CompletionFlag()
     Task { @MainActor in
@@ -1796,6 +1789,105 @@ final class TerminationQuiescenceTests: XCTestCase {
       database.terminationRejectedEntryPoints, [],
       "…and a drain that waited for everything leaves the latch with nothing to refuse. Got "
         + "\(database.terminationRejectedEntryPoints)")
+  }
+
+  // MARK: - R15 / B2: the supersede position is reserved before the first suspension point
+
+  /// Round 15 — the ordering hole the initial open opened. All three background index entry points
+  /// used to read `previous = pendingIndexUpdateTask`, then `await ensureOpenInBackground(...)`, and
+  /// install their OWN tail only after that await returned. Two writes suspended on the same initial
+  /// open therefore captured the SAME predecessor — neither had installed a tail yet — so neither
+  /// awaited the other. Which of them then ran first was the scheduler's business, and the loser
+  /// could be the user's NEWER text: the older body's `upsertDocument` replaces the row by path.
+  /// GRDB serializes the two `pool.write`s; it does not order them. Ordering is exactly what the
+  /// supersede chain exists to add, and a chain position taken AFTER a suspension point is not a
+  /// position at all.
+  ///
+  /// Driving, not racing (round 9's lesson, and the reason this pin is deterministic where an
+  /// ordering race could not be). The open is wedged for the whole test, so a build that reaches it
+  /// has by definition suspended before reserving. Both writes are then submitted in order and the
+  /// SECOND one is released alone at the write gate — reverse resumption, forced rather than hoped
+  /// for. A build that reserved synchronously parks it on its predecessor's tail and it cannot even
+  /// reach the open; a build that did not reserve never gets a write task to the gate in the first
+  /// place, because it is still inside the open.
+  ///
+  /// Both halves are asserted: the STRUCTURAL one (positions taken with the open not yet attempted)
+  /// and the BEHAVIOURAL one (whatever the release order, the newer text is what survives in
+  /// `documents`/FTS).
+  func testTwoWritesParkedOnTheInitialOpenKeepTheirSubmissionOrder() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let database = IndexDatabase(databaseURL: databaseURL)
+    XCTAssertNil(
+      database.databaseURL,
+      "fixture precondition: nothing may be open yet — the finding is about the INITIAL open, which "
+        + "is the one suspension point every entry point is guaranteed to hit")
+
+    let openGate = ParkingGate()
+    let writeGate = OrderedParkingGate()
+    database.databaseOpenGateOverride = { await openGate.arrive() }
+    database.backgroundWriteGateOverride = { await writeGate.arrive() }
+
+    // ONE document, written twice: old then new. The upsert replaces the row by path, so "which
+    // body is on disk at the end" is a direct read of which write landed last.
+    let ref = documentRef(root: root, name: "superseded.md")
+
+    let olderFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.indexInBackground(
+        document: ref, body: "supersedeoldneedle", appState: nil)
+      olderFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { writeGate.arrivalCount >= 1 }, timeout: 10)
+
+    let newerFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.indexInBackground(
+        document: ref, body: "supersedenewneedle", appState: nil)
+      newerFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { writeGate.arrivalCount >= 2 }, timeout: 10)
+
+    XCTAssertGreaterThanOrEqual(
+      writeGate.arrivalCount, 2,
+      "both writes must have a task at the write gate, which they can only reach after the "
+        + "main-actor step that installed their tail. A build that captures its predecessor and "
+        + "then awaits the open before reserving is still parked INSIDE that open here, with no "
+        + "task, no tail, and — for the second write — the same predecessor as the first")
+    XCTAssertEqual(
+      openGate.arrivalCount, 0,
+      "…and neither may have reached the open yet: the position in the chain has to be taken "
+        + "BEFORE the call's first suspension point, or it is taken from a state two callers share")
+
+    // Reverse resumption, forced: the NEWER write is released alone while the older one is still
+    // held at the gate.
+    Task { await writeGate.open(only: 2) }
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    XCTAssertEqual(
+      openGate.arrivalCount, 0,
+      "the newer write must be parked on its PREDECESSOR's tail, not racing it: reaching the open "
+        + "here means it chained onto nothing and would commit whenever the scheduler let it")
+    XCTAssertFalse(
+      newerFinished.isSet, "fixture precondition: …with that write demonstrably still owed")
+
+    // Now the older one, and the open behind it.
+    Task { await writeGate.open(through: 2) }
+    pumpMainRunLoop(until: { openGate.arrivalCount >= 1 }, timeout: 10)
+    Task { await openGate.open() }
+    pumpMainRunLoop(until: { olderFinished.isSet && newerFinished.isSet }, timeout: 10)
+    XCTAssertTrue(
+      olderFinished.isSet && newerFinished.isSet,
+      "fixture precondition: both writes must have completed once the open was released")
+
+    XCTAssertEqual(
+      try indexHits(matching: "supersedenewneedle", at: databaseURL), 1,
+      "the NEWER body is what the user last saved, so it is what the index must advertise")
+    XCTAssertEqual(
+      try indexHits(matching: "supersedeoldneedle", at: databaseURL), 0,
+      "…and the older body must not have overwritten it on the way out of a shared open")
   }
 
   // MARK: - R11: the producer that produces producers
@@ -2330,6 +2422,15 @@ final class TerminationQuiescenceTests: XCTestCase {
         waiters.removeValue(forKey: waiterIndex)
         continuation.resume()
       }
+    }
+
+    /// Releases EXACTLY one arrival, leaving earlier ones held. `open(through:)` cannot express this,
+    /// and the supersede-ordering pin needs it: releasing the SECOND write while the first is still
+    /// parked is the whole experiment — a build that orders by submission holds it behind its
+    /// predecessor anyway, a build that does not lets it run ahead.
+    func open(only index: Int) {
+      guard let continuation = waiters.removeValue(forKey: index) else { return }
+      continuation.resume()
     }
   }
 

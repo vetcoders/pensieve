@@ -781,14 +781,18 @@ final class IndexDatabase {
   @discardableResult
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
     guard !isRefusedAfterTermination("reindexInBackground") else { return false }
-    let previous = pendingIndexUpdateTask
-    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
+    // Chain position RESERVED before this call's first suspension point — see
+    // `reserveSupersedePosition(_:)`. The open moved INSIDE the task for exactly that reason.
+    let previous = pendingIndexUpdateTask
 
-    let write = Task { [weak self] () -> Bool in
+    let write = Task { @MainActor [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
+      guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
+        return false
+      }
       do {
         try await Task.detached(priority: .utility) {
           try Self.replaceSearchIndex(
@@ -798,22 +802,22 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        await self?.refreshSearchResultsInBackground(in: appState)
+        await self.refreshSearchResultsInBackground(in: appState)
         // A full reindex is the single biggest WAL producer in the app; bound the log afterwards.
         // ARMED, not awaited: keeping the barrier inside this task put it in the supersede tail, so a
         // pool reader that blocked the truncate blocked every write submitted behind it. Tests sync
         // on it through `drainPendingIndexWrites()`, which tracks it, rather than through
         // `waitForPendingReindex()`, which no longer does.
-        self?.scheduleIndexBatchMaintenance()
+        self.scheduleIndexBatchMaintenance()
         return true
       } catch {
-        self?.report(error, appState: appState, action: "rebuild Pensieve search index")
+        self.report(error, appState: appState, action: "rebuild Pensieve search index")
         return false
       }
     }
     // Keep the supersede chain `Void`-typed: a later update awaits "the prior write finished",
     // not its boolean result.
-    pendingIndexUpdateTask = Task { _ = await write.value }
+    reserveSupersedePosition(write)
     return await write.value
   }
 
@@ -842,6 +846,29 @@ final class IndexDatabase {
   private func awaitBackgroundWriteGate() async {
     guard let gate = backgroundWriteGateOverride else { return }
     await gate()
+  }
+
+  /// Installs `write`'s `Void`-typed tail as the newest link of the supersede chain, SYNCHRONOUSLY —
+  /// in the very same main-actor step in which its caller read `previous`.
+  ///
+  /// That pairing IS the ordering contract, and until now a suspension point sat between its two
+  /// halves: all three background entry points captured `previous = pendingIndexUpdateTask`, then
+  /// `await ensureOpenInBackground(...)`, and installed their own tail only afterwards. Two writes
+  /// suspended on the same INITIAL open therefore captured the SAME predecessor — neither had
+  /// installed a tail yet — and, resuming in whatever order the scheduler chose, ran unordered:
+  /// each awaited a predecessor that was not the other, so the older body could overwrite the newer
+  /// one's row in `documents`/FTS. GRDB serializes the two `pool.write`s but does not order them,
+  /// which is precisely what this chain exists to add.
+  ///
+  /// Reserving here — before the call's first `await` — makes submission order the chain order by
+  /// construction, and the open moves INSIDE the task, behind `await previous?.value`, where it is
+  /// just more of the work being serialized.
+  ///
+  /// The reserved position always RESOLVES. A refused or failed open returns `false` out of the
+  /// task instead of escaping it, so a successor parked on this tail is released rather than wedged
+  /// — the failure mode a reservation could otherwise introduce.
+  private func reserveSupersedePosition(_ write: Task<Bool, Never>) {
+    pendingIndexUpdateTask = Task { _ = await write.value }
   }
 
   /// Hands an index write to a background task WITHOUT losing track of it. Same shape as the bare
@@ -977,14 +1004,18 @@ final class IndexDatabase {
     appState: AppState? = nil
   ) async -> Bool {
     guard !isRefusedAfterTermination("updateSearchIndexInBackground") else { return false }
-    let previous = pendingIndexUpdateTask
-    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let batchSize = searchIndexBatchSize
     let didInsertBatch = didInsertSearchIndexBatch
+    // Chain position RESERVED before this call's first suspension point — see
+    // `reserveSupersedePosition(_:)`.
+    let previous = pendingIndexUpdateTask
 
-    let write = Task { [weak self] () -> Bool in
+    let write = Task { @MainActor [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
+      guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
+        return false
+      }
       do {
         try await Task.detached(priority: .utility) {
           try Self.applySearchIndexDelta(
@@ -995,19 +1026,19 @@ final class IndexDatabase {
             didInsertBatch: didInsertBatch
           )
         }.value
-        await self?.refreshSearchResultsInBackground(in: appState)
+        await self.refreshSearchResultsInBackground(in: appState)
         // Watcher deltas are small individually but relentless in aggregate; the WAL-size throttle
         // inside `performMaintenanceInBackground` keeps this to a no-op until the log actually grows.
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
-        self?.scheduleIndexBatchMaintenance()
+        self.scheduleIndexBatchMaintenance()
         return true
       } catch {
-        self?.report(error, appState: appState, action: "update Pensieve search index")
+        self.report(error, appState: appState, action: "update Pensieve search index")
         return false
       }
     }
     // Supersede chain stays `Void`-typed (see `reindexInBackground`).
-    pendingIndexUpdateTask = Task { _ = await write.value }
+    reserveSupersedePosition(write)
     return await write.value
   }
 
@@ -1530,13 +1561,19 @@ final class IndexDatabase {
     document: DocumentRef, body: String, appState: AppState? = nil
   ) async -> Bool {
     guard !isRefusedAfterTermination("indexInBackground") else { return false }
-    let previous = pendingIndexUpdateTask
-    guard let pool = await ensureOpenInBackground(into: appState) else { return false }
     let record = Self.documentWriteRecord(from: document, body: body)
+    // Chain position RESERVED before this call's first suspension point — see
+    // `reserveSupersedePosition(_:)`. This entry point is the one the ordering defect bites
+    // hardest: two saves of the SAME document parked on the initial open would resume unordered,
+    // and the loser is the user's NEWER text.
+    let previous = pendingIndexUpdateTask
 
-    let write = Task { [weak self] () -> Bool in
+    let write = Task { @MainActor [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
+      guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
+        return false
+      }
       do {
         try await Task.detached(priority: .utility) {
           try pool.write { db in
@@ -1544,22 +1581,22 @@ final class IndexDatabase {
             try Self.upsertDocument(record, in: db)
           }
         }.value
-        await self?.refreshSearchResultsInBackground(in: appState)
+        await self.refreshSearchResultsInBackground(in: appState)
         // The ordinary save/autosave tail is an index write like any other: a single large document
         // (or a long editing session's worth of small ones) grows the WAL just as a watcher delta
         // does, and without this hook nothing here would ever bound it — the declared 16 MiB
         // ceiling would only be enforced on reindex/delta paths a plain "edit and save" never
         // takes. The WAL-size throttle keeps a small save free: it stats one file and returns.
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
-        self?.scheduleIndexBatchMaintenance()
+        self.scheduleIndexBatchMaintenance()
         return true
       } catch {
-        self?.report(error, appState: appState, action: "update Pensieve search index")
+        self.report(error, appState: appState, action: "update Pensieve search index")
         return false
       }
     }
     // Supersede chain stays `Void`-typed (see `reindexInBackground`).
-    pendingIndexUpdateTask = Task { _ = await write.value }
+    reserveSupersedePosition(write)
     return await write.value
   }
 
