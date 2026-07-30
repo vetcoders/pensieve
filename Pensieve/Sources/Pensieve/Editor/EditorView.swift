@@ -298,6 +298,17 @@ struct EditorRepresentable: NSViewRepresentable {
       context.coordinator.lastAppliedSkin = skin
       surface.applyTheme(skin)
     }
+    // Keep the host window's appearance + titlebar backing in lockstep with the
+    // source panel. This is the SAME theme trigger as `applyTheme` above, but it
+    // must run whenever the window becomes available too — not only on a skin
+    // change — so the initial attach pins the chrome for the persisted skin. It
+    // is the piece the source-panel colour change alone cannot cover: without an
+    // appearance change the live layer-backed window keeps compositing the prior
+    // skin's chrome (the titlebar glass tint and the source pane) even though the
+    // NSColor properties already hold the new values, so the panel and titlebar
+    // split until something forces a full re-composite. The call is internally
+    // guarded on (skin, window) so a pure keystroke re-render is a no-op.
+    surface.applyWindowChrome(for: skin)
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
     // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
@@ -426,6 +437,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Active theme tokens for the source panel. Held so `update` can keep typing
   /// attributes on the theme text colour when the font size changes.
   private var activeTokens: ThemeTokens = PensieveTheme.default.tokens
+  /// Last (skin, window) the host-window chrome was pinned for, so
+  /// `applyWindowChrome` re-pins on a skin change OR a first window attach and
+  /// is a no-op on a pure keystroke re-render.
+  private var lastChromeSkin: PensieveTheme?
+  private var lastChromeWindow: ObjectIdentifier?
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -635,6 +651,32 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.backgroundColor = tokens.source.nsColor
     textView.applyTheme(tokens)
     textContentStorage.tokens = tokens
+    applyWindowChrome(for: theme)
+  }
+
+  /// Pins the host window's appearance and titlebar backing to the skin so the
+  /// chrome reads the same reading surface as the source panel. The appearance
+  /// is the theme's fixed light/dark (or `nil` for the adaptive skins, which
+  /// follow the system), and the backing colour is the recipe's titlebar glass
+  /// backing — the same `tokens.source` the pane paints, so the glass strip and
+  /// the pane can never split. Assigning the window appearance also forces the
+  /// full window re-composite the live layer-backed pane needs to actually show
+  /// a new opaque source colour on a live skin switch (the NSColor properties
+  /// alone update without a visible repaint until an appearance change lands).
+  ///
+  /// Guarded on (skin, window): it runs on a real skin change and on the first
+  /// attach (window went from `nil` to real), never on a plain keystroke
+  /// re-render. Called from `applyTheme` and from `updateNSView` (which also
+  /// covers the initial attach, where `applyTheme` ran before the window
+  /// existed).
+  func applyWindowChrome(for theme: PensieveTheme) {
+    let windowID = scrollView.window.map(ObjectIdentifier.init)
+    guard lastChromeSkin != theme || lastChromeWindow != windowID else { return }
+    lastChromeSkin = theme
+    lastChromeWindow = windowID
+    guard let window = scrollView.window else { return }
+    window.appearance = theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
+    window.backgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: theme)
   }
 
   deinit {
