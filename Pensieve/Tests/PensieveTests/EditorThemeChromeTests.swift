@@ -251,4 +251,27 @@ final class EditorThemeChromeTests: XCTestCase {
     surface.textView.setSelectedRange(NSRange(location: 9, length: 0))
     XCTAssertEqual(surface.textView.gutter?.currentLineNumber, 3)
   }
+
+  /// Fenced code rides the SAME live-switch path as the rest of the source
+  /// panel. `applyTheme` pushes tokens onto the markdown highlighter AND the
+  /// code-block highlighter before the full refresh; pushing them afterwards (or
+  /// not at all) leaves already-typed code blocks on the previous skin until the
+  /// next keystroke — the stale-colour shape this pins against.
+  @MainActor
+  func testLiveSkinSwitchRetintsFencedCodeBlocks() {
+    let surface = MarkdownEditorSurface(
+      text: "intro\n\n```swift\nfunc greet() {}\n```\n", fontSize: 14, skin: .ink)
+    let storage = surface.textView.textStorage ?? surface.textStorage
+    let keywordAt = (storage.string as NSString).range(of: "func").location
+
+    func keywordColor() -> NSColor? {
+      storage.attribute(.foregroundColor, at: keywordAt, effectiveRange: nil) as? NSColor
+    }
+
+    XCTAssertEqual(keywordColor(), PensieveTheme.ink.tokens.accent.nsColor)
+
+    surface.applyTheme(.parchment)
+
+    XCTAssertEqual(keywordColor(), PensieveTheme.parchment.tokens.accent.nsColor)
+  }
 }

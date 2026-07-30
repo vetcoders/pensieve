@@ -33,13 +33,15 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
   }
 
-  /// Active theme tokens for the source panel. Forwarded to the markdown
-  /// highlighter (the code-block highlighter keeps its own fixed language
-  /// palette) and re-runs a full refresh so every already-typed range picks up
-  /// the new colours.
+  /// Active theme tokens for the source panel. Forwarded to BOTH highlighters —
+  /// the markdown one and the fenced-code one — before the full refresh, so
+  /// every already-typed range (prose and code alike) picks up the new colours
+  /// in the same pass. Pushing tokens after the refresh would leave fenced code
+  /// on the previous skin until the next edit.
   var tokens: ThemeTokens = PensieveTheme.default.tokens {
     didSet {
       highlighter.tokens = tokens
+      codeBlockHighlighter.tokens = tokens
       refreshHighlighting()
     }
   }

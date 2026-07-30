@@ -183,15 +183,15 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: returnRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: stringRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemRed)
+      PensieveTheme.default.tokens.srcInlineCode.nsColor)
   }
 
   @MainActor
@@ -215,7 +215,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: plainRange.location, effectiveRange: nil) as? NSColor,
       NSColor.textColor)
@@ -257,7 +257,7 @@ final class PensieveSmokeTests: XCTestCase {
       let range = updatedText.range(of: token)
       XCTAssertEqual(
         storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor,
-        NSColor.systemPink,
+        PensieveTheme.default.tokens.accent.nsColor,
         "in-block line \(token) must stay code-highlighted across cached edits")
     }
   }
@@ -297,7 +297,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: insideRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
   }
 
   /// Invariant 3: deleting a ``` fence line takes the full-refresh path and the
@@ -319,7 +319,7 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(
         .foregroundColor, at: nsText.range(of: "let value").location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
 
     // Delete the opening fence line (including its trailing newline).
     let openingLine = nsText.range(of: "```swift\n")
@@ -332,7 +332,7 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil))
     XCTAssertNotEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink,
+      PensieveTheme.default.tokens.accent.nsColor,
       "removing the opening fence must drop code highlighting from the former block body")
   }
 
