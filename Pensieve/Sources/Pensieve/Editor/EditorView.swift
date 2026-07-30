@@ -591,6 +591,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
       textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
+      // A full highlight refresh strips `.backgroundColor` document-wide, and the
+      // find washes live in that attribute — see `reapplyFindHighlights`.
+      reapplyFindHighlights()
     }
 
     if textContentStorage.fontSize != fontSize {
@@ -605,6 +608,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       ]
       textView.gutter?.fontSize = fontSize
       textView.gutter?.needsDisplay = true
+      reapplyFindHighlights()
     }
 
     if textStorage.string != text {
@@ -648,6 +652,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.backgroundColor = tokens.source.nsColor
     textView.applyTheme(tokens)
     textContentStorage.tokens = tokens
+    // Pushing tokens runs a FULL highlight refresh, which strips
+    // `.backgroundColor` document-wide — the attribute the find-match washes
+    // live in. `updateFind` will not repaint them (unchanged query + non-empty
+    // matches short-circuits), so the matches would stay invisible until the
+    // operator retyped the query. Repaint from the cached matches instead of
+    // clearing them: clearing would also drop the active-match index and the
+    // scroll position the operator is reading.
+    reapplyFindHighlights()
     applyWindowChrome(for: theme)
   }
 
@@ -1204,6 +1216,22 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     findQuery = query
     refreshFindMatches()
+  }
+
+  /// Repaints the CACHED find matches after something else wiped the document's
+  /// `.backgroundColor` (a theme switch, a font-size change, a syntax-highlight
+  /// toggle — all of which run a full highlight refresh). Idempotent, and a
+  /// no-op when no find session is live, so it never costs a keystroke.
+  ///
+  /// Match ranges are validated against the current text first: the caller may
+  /// sit in the same update pass that is about to replace the document, and
+  /// painting a stale range past the end of the storage would raise. Skipping is
+  /// safe — the text change reaches `refreshFindMatches` on its own.
+  func reapplyFindHighlights() {
+    guard !findMatches.isEmpty else { return }
+    let length = textStorage.length
+    guard findMatches.allSatisfy({ NSMaxRange($0) <= length }) else { return }
+    applyFindHighlights()
   }
 
   func clearFindHighlights() {
