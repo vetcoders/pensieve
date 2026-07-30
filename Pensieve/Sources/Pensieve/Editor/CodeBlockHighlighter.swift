@@ -126,11 +126,6 @@ class CodeBlockHighlighter {
       self.literal = tokens.text.nsColor
     }
 
-    /// Below this contrast against the source surface an accent cannot carry
-    /// text. WCAG's large-text / non-text threshold; every fixed palette's
-    /// accent clears it comfortably except a deliberate collision.
-    private static let minimumKeywordContrast: CGFloat = 3
-
     /// Keywords lean on the theme accent — but a theme is free to pick an accent
     /// that IS its own source surface. Typewriter's ink `#1c1c1c` on a `#1c1c1c`
     /// panel is correct for chrome (where it sits on the light window surface)
@@ -144,31 +139,10 @@ class CodeBlockHighlighter {
       // cache-build time. AppKit already guarantees `linkColor` reads on
       // `textBackgroundColor`, so only fixed palettes need the guard.
       guard tokens.mode != nil else { return accent }
-      guard let ratio = contrast(accent, tokens.source.nsColor),
-        ratio >= minimumKeywordContrast
-      else {
+      guard ThemeContrast.isLegible(accent, on: tokens.source.nsColor) else {
         return tokens.srcHeading.nsColor
       }
       return accent
-    }
-
-    /// WCAG relative luminance, or `nil` when the colour cannot be expressed in
-    /// sRGB (pattern/catalog colours) — the caller then keeps the accent.
-    private static func relativeLuminance(_ color: NSColor) -> CGFloat? {
-      guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
-      func channel(_ value: CGFloat) -> CGFloat {
-        value <= 0.03928 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
-      }
-      return 0.2126 * channel(srgb.redComponent)
-        + 0.7152 * channel(srgb.greenComponent)
-        + 0.0722 * channel(srgb.blueComponent)
-    }
-
-    private static func contrast(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat? {
-      guard let left = relativeLuminance(lhs), let right = relativeLuminance(rhs) else {
-        return nil
-      }
-      return (max(left, right) + 0.05) / (min(left, right) + 0.05)
     }
 
     func color(for role: Role) -> NSColor {

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Task lists gained a third checkbox state: `- [~]` ("in progress") is highlighted in the source panel like `- [ ]` / `- [x]` and renders in preview as a diamond inside an accent-coloured frame.
 
+### Fixed
+
+- `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added

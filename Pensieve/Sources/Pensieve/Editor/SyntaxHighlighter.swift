@@ -85,6 +85,8 @@ class SyntaxHighlighter {
     let quote: NSColor
     let strike: NSColor
     let highlightBackground: NSColor
+    /// Text colour INSIDE the `==highlight==` wash — see `legibleHighlightText`.
+    let highlightText: NSColor
     let rule: NSColor
 
     init(tokens: ThemeTokens) {
@@ -97,7 +99,31 @@ class SyntaxHighlighter {
       self.quote = tokens.srcQuote.nsColor
       self.strike = tokens.srcStrike.nsColor
       self.highlightBackground = tokens.srcHighlightBackground.nsColor
+      self.highlightText = ColorCache.legibleHighlightText(tokens)
       self.rule = tokens.border.nsColor
+    }
+
+    /// A marked span normally keeps the body text colour on the theme's mark
+    /// wash — but a theme is free to pick a wash that IS its own text colour
+    /// family. Typewriter paints `#d4d4d4` text on an `#e6e6e6` wash (≈1.2:1):
+    /// the highlight literally erases what it marks. When the body text cannot
+    /// carry the wash, fall back to the theme's `source` — the pane colour, so
+    /// the mark reads as an inverted stamp (typewriter: `#1c1c1c` on `#e6e6e6`),
+    /// which is that palette's own idiom. Same shape as
+    /// `CodeBlockHighlighter`'s accent guard: another token from the SAME
+    /// theme, never an invented per-theme hex. Computed once per token change
+    /// (this cache), never inside the highlight pass.
+    private static func legibleHighlightText(_ tokens: ThemeTokens) -> NSColor {
+      let text = tokens.text.nsColor
+      // Adaptive themes (`default`/`raw`) wrap LIVE semantic colours: resolving
+      // them here would freeze whichever appearance was active when the cache
+      // was built. AppKit already guarantees `textColor` reads on the
+      // translucent systemYellow wash, so only fixed palettes need the guard.
+      guard tokens.mode != nil else { return text }
+      guard ThemeContrast.isLegible(text, on: tokens.srcHighlightBackground.nsColor) else {
+        return tokens.source.nsColor
+      }
+      return text
     }
   }
 
@@ -217,10 +243,12 @@ class SyntaxHighlighter {
       ])
 
     // Highlight: ==text== — theme mark background instead of systemYellow @ 35%.
+    // The foreground is the body text token unless it would be illegible on the
+    // theme's own wash (see `ColorCache.legibleHighlightText`).
     highlightRegex(
       Patterns.highlight, in: swiftString, storage: textStorage, targetRange: targetRange,
       attributes: [
-        .foregroundColor: colors.text,
+        .foregroundColor: colors.highlightText,
         .backgroundColor: colors.highlightBackground,
       ])
 

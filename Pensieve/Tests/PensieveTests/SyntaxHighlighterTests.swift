@@ -210,6 +210,60 @@ final class SyntaxHighlighterTests: XCTestCase {
     XCTAssertEqual(backgroundColor(storage, at: at), NSColor.systemYellow.withAlphaComponent(0.35))
   }
 
+  /// Typewriter's mark wash (`#e6e6e6`) is one step from its body text
+  /// (`#d4d4d4`) — ≈1.2:1, a highlight that erases what it marks. The marked
+  /// span must fall back to the theme's own `source` token (an inverted stamp)
+  /// and clear the WCAG non-text threshold.
+  func testHighlightForegroundFallsBackWhenTheWashSwallowsTheTextColour() {
+    let tokens = PensieveTheme.typewriter.tokens
+    let md = "x ==marked== y"
+    let storage = NSTextStorage(string: md)
+    let fullRange = NSRange(location: 0, length: (md as NSString).length)
+
+    let syntax = SyntaxHighlighter()
+    syntax.baseFontSize = fontSize
+    syntax.tokens = tokens
+
+    storage.beginEditing()
+    syntax.resetBaseAttributes(storage, range: fullRange)
+    syntax.highlight(storage, range: fullRange)
+    storage.endEditing()
+
+    let at = index(of: "marked", in: md)
+    XCTAssertEqual(backgroundColor(storage, at: at), tokens.srcHighlightBackground.nsColor)
+    XCTAssertEqual(color(storage, at: at), tokens.source.nsColor)
+    XCTAssertNotEqual(
+      color(storage, at: at), tokens.text.nsColor,
+      "the body text colour is invisible on this theme's wash")
+    let ratio = ThemeContrast.ratio(
+      tokens.source.nsColor, tokens.srcHighlightBackground.nsColor)
+    XCTAssertNotNil(ratio)
+    XCTAssertGreaterThanOrEqual(ratio ?? 0, ThemeContrast.minimumTextContrast)
+  }
+
+  /// Every other fixed palette already reads on its own wash, so the marked span
+  /// keeps the body text colour — the fallback must not fire wholesale.
+  func testHighlightForegroundKeepsTheTextColourWhenTheWashIsLegible() {
+    for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain] {
+      let tokens = skin.tokens
+      let md = "x ==marked== y"
+      let storage = NSTextStorage(string: md)
+      let fullRange = NSRange(location: 0, length: (md as NSString).length)
+
+      let syntax = SyntaxHighlighter()
+      syntax.baseFontSize = fontSize
+      syntax.tokens = tokens
+
+      storage.beginEditing()
+      syntax.resetBaseAttributes(storage, range: fullRange)
+      syntax.highlight(storage, range: fullRange)
+      storage.endEditing()
+
+      XCTAssertEqual(
+        color(storage, at: index(of: "marked", in: md)), tokens.text.nsColor, skin.rawValue)
+    }
+  }
+
   func testBlockquoteIsSecondaryLabel() {
     let md = "> quoted line\n"
     let storage = highlighted(md)
