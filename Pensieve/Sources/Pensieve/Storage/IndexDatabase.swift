@@ -56,6 +56,18 @@ final class IndexDatabase {
   /// back — see `deferIndexBatchTruncation()`.
   private var pendingIndexBatchTruncationRetry: Task<Void, Never>?
 
+  /// A hot-path maintenance request that arrived while a pass was ALREADY in flight, and therefore
+  /// coalesced into the handle above rather than armed on its own.
+  ///
+  /// Round 13. Coalescing is only sound while the active pass still covers the requester's frames,
+  /// and it stops covering them the moment it has checkpointed: an index write that commits after
+  /// the pass truncated but before its task clears `pendingIndexBatchMaintenance` adds WAL frames no
+  /// pass has seen. Dropping that request left the log over the 16 MiB bound with nothing owed —
+  /// disk space, not durability, but held until the next index write or close/quit happened to come
+  /// along. So the request is REMEMBERED here and honoured when the handle clears
+  /// (`rearmIndexBatchMaintenanceIfRequestedWhileActive()`).
+  private var indexBatchMaintenanceRequestedWhileActive = false
+
   /// How many times in a row a hot-path truncate has been deferred, which is what the backoff ladder
   /// in `effectiveIndexBatchTruncationRetryDelayNanoseconds` reads. Reset the moment a pass truncates
   /// or finds the WAL already under the bound.
@@ -91,6 +103,18 @@ final class IndexDatabase {
   /// pass behind it. A wedge placed before the scheduling would only prove that a task nobody has
   /// created yet has not run. `nil` in production.
   var maintenanceGateOverride: (@Sendable () async -> Void)?
+
+  /// Narrow test seam, fourth sibling: awaited inside the hot-path pass's OWN task, after
+  /// `performMaintenanceInBackground` has returned — so after the truncate and after the pool writer
+  /// was released — and immediately before that task clears `pendingIndexBatchMaintenance`.
+  ///
+  /// The position is the whole point, and it is a different window from `maintenanceGateOverride`'s.
+  /// Parked here the pass has already DONE its work while the coalescing handle is still installed,
+  /// which is exactly the state round 13's finding describes: an index write committing now adds WAL
+  /// frames the pass cannot have covered, and its maintenance request would previously be dropped by
+  /// the coalescing guard. A wedge before the truncate could not reach that state — there the
+  /// coalescing is still correct, because the pass has yet to checkpoint. `nil` in production.
+  var maintenanceCompletionGateOverride: (@Sendable () async -> Void)?
 
   /// Narrow test seam: fired on the main actor INSIDE the open task, in the SAME step that publishes
   /// the pool and before that task returns to the caller which owns it.
@@ -157,6 +181,10 @@ final class IndexDatabase {
     isClosedForTermination = true
     pendingIndexBatchTruncationRetry?.cancel()
     pendingIndexBatchTruncationRetry = nil
+    // Past the latch nothing is owed: `scheduleIndexBatchMaintenance()` refuses anyway, so a
+    // remembered request could only ever be refused when the re-arm fired. Cleared so "latched
+    // ⇒ no maintenance outstanding" is literally true rather than true by downstream accident.
+    indexBatchMaintenanceRequestedWhileActive = false
   }
 
   /// The gate every write entry point and both open paths consult. Returns `true` when the caller
@@ -1078,18 +1106,48 @@ final class IndexDatabase {
   ///
   /// Coalesced to at most one outstanding pass (see `pendingIndexBatchMaintenance`), which is also
   /// what keeps the round-12 deferral cheap: a pass that could not truncate re-arms exactly one
-  /// successor rather than leaving a fan of retries behind.
+  /// successor rather than leaving a fan of retries behind. Coalesced is not DISCARDED, though —
+  /// round 13: a request that finds a pass in flight is recorded and honoured when that pass's task
+  /// clears the handle, because a pass which has already checkpointed cannot cover frames committed
+  /// after it.
   ///
   /// Still covered by the termination drain, and by construction rather than by convention:
   /// `scheduleIndexWrite` registers the task in `scheduledIndexWrites`, which
   /// `drainPendingIndexWrites()` awaits to stability before phase L latches the funnel. Refused past
   /// the latch on both sides — here, and inside `performMaintenanceInBackground` itself.
   private func scheduleIndexBatchMaintenance() {
-    guard !isClosedForTermination, pendingIndexBatchMaintenance == nil else { return }
+    guard !isClosedForTermination else { return }
+    guard pendingIndexBatchMaintenance == nil else {
+      indexBatchMaintenanceRequestedWhileActive = true
+      return
+    }
     pendingIndexBatchMaintenance = scheduleIndexWrite { [weak self] in
       await self?.performMaintenanceInBackground(reason: .indexBatch)
+      if let gate = self?.maintenanceCompletionGateOverride { await gate() }
       self?.pendingIndexBatchMaintenance = nil
+      self?.rearmIndexBatchMaintenanceIfRequestedWhileActive()
     }
+  }
+
+  /// Honours a maintenance request that the coalescing guard folded into a pass which had already
+  /// checkpointed by then. Called by that pass's task the instant it clears the handle, so the
+  /// successor is armed with nothing else needed to trigger it — no later index write, no lifecycle
+  /// event. That is the round-13 contract: a request either RUNS, coalesces into a pass that will
+  /// still cover its frames, or re-arms a successor. Never silently dropped.
+  ///
+  /// The one case that must NOT re-arm promptly is a pass the reader refused, and the two mechanisms
+  /// compose through this guard. `deferIndexBatchTruncation()` has already armed a successor on the
+  /// backoff ladder (1 s → ×2 → cap 30 s), and that successor comes back through
+  /// `scheduleIndexBatchMaintenance()`, so it re-stats the WAL and covers the coalesced request's
+  /// frames as well — the request is absorbed, not lost. Re-arming here on top of that would put a
+  /// pass in flight IMMEDIATELY after a refusal, which the reader would refuse again in ~0.2 ms:
+  /// the ladder exists precisely so a wedged reader cannot be polled, and prompt re-arming would
+  /// bypass it once per write for as long as the wedge lasts.
+  private func rearmIndexBatchMaintenanceIfRequestedWhileActive() {
+    guard indexBatchMaintenanceRequestedWhileActive else { return }
+    indexBatchMaintenanceRequestedWhileActive = false
+    guard pendingIndexBatchTruncationRetry == nil else { return }
+    scheduleIndexBatchMaintenance()
   }
 
   /// Reclaims index disk space off the main actor. No-op when the pool was never opened: maintenance

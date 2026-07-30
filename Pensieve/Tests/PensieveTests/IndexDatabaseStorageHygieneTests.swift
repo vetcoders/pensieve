@@ -834,6 +834,217 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
   }
 
+  // MARK: - R13: a coalesced maintenance request must re-arm, never be dropped
+
+  /// Round 13 — the last hole in round 11's coalescing guard. `scheduleIndexBatchMaintenance()`
+  /// returned as soon as it saw a pass already armed, which is sound only while that pass still
+  /// covers the requester's frames. It stops covering them the moment it has checkpointed: an index
+  /// write that commits after the truncate but before the pass's task clears
+  /// `pendingIndexBatchMaintenance` adds WAL frames no pass has ever seen, and its request was
+  /// dropped on the floor. The log then stayed over the 16 MiB bound with NOTHING owed — until the
+  /// next index write or a close/quit happened to come along, which under an idle editor is minutes
+  /// or never. Disk space rather than durability, same family as the bound itself.
+  ///
+  /// The pass is parked at `maintenanceCompletionGateOverride`, which sits after
+  /// `performMaintenanceInBackground` returned — so after the truncate, with the pool writer already
+  /// released — and immediately before the handle is cleared. That is the window verbatim, reached
+  /// synchronously instead of raced: parking BEFORE the truncate (`maintenanceGateOverride`, rounds
+  /// 11–12) reaches a state where coalescing is still correct, and would pin nothing.
+  ///
+  /// The discriminator is step 3: after the release NOTHING further is submitted — no index write, no
+  /// workspace close, no quit — so the WAL can only come back under the bound if the coalesced
+  /// request armed its own successor.
+  func testAMaintenanceRequestCoalescedIntoACheckpointedPassRearmsItsOwnSuccessor() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the WAL must start over the (lowered) bound, or the arming write never "
+        + "puts a pass in flight at all")
+    database.walCheckpointThresholdBytesOverride = Self.coalescedRearmWalBoundBytes
+
+    // Parked with the pass's work DONE and its coalescing handle still installed.
+    let completionGate = ParkingGate()
+    database.maintenanceCompletionGateOverride = { await completionGate.arrive() }
+
+    // 1 — arm the hot path through the ordinary save tail, then let the pass do its work and park.
+    let armingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "arms-maintenance.md"),
+      body: "coalescedrearmarmneedle",
+      appState: appState
+    )
+    XCTAssertTrue(armingDidWrite)
+    try await waitUntil("the hygiene pass to reach the handle-clearing gate", timeout: 5) {
+      await completionGate.arrivals >= 1
+    }
+    XCTAssertLessThanOrEqual(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the parked pass must ALREADY have checkpointed — while it has not, "
+        + "coalescing a later write into it is correct, and that is not the window under test")
+
+    // 2 — a save commits NOW: after that checkpoint, before the handle clears. Its own maintenance
+    //     request is the one the guard swallows.
+    let racingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "races-the-handle.md"),
+      body: Self.walGrowingBody(needle: "coalescedrearmracingneedle"),
+      appState: appState
+    )
+    XCTAssertTrue(racingDidWrite)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the racing save must have pushed the WAL back OVER the bound, or a "
+        + "successor pass would have nothing to enforce")
+    let arrivalsAfterTheRacingSave = await completionGate.arrivals
+    XCTAssertEqual(
+      arrivalsAfterTheRacingSave, 1,
+      "fixture precondition: that save's request must have been COALESCED into the parked pass "
+        + "rather than arming a second one — the coalescing is what this pin is about")
+
+    // 3 — release the pass and submit NOTHING else. No write, no close, no quit.
+    await completionGate.open()
+    try await waitUntil(
+      "the coalesced maintenance request to re-arm a successor pass and hand the WAL back under the "
+        + "bound", timeout: 10
+    ) {
+      walSize(for: databaseURL) <= Self.coalescedRearmWalBoundBytes
+    }
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 0,
+      "no reader was ever wedged here, so the successor must have TRUNCATED rather than deferred — "
+        + "otherwise this pin would be passing on the round-12 ladder instead of the re-arm")
+    XCTAssertEqual(
+      try indexHits(matching: "coalescedrearmracingneedle", at: databaseURL), 1,
+      "…and the bound must have been enforced by checkpointing the racing save's frames into the "
+        + "database, not by losing them")
+  }
+
+  /// The other half of round 13, and the trap in it: the prompt re-arm must not fight round 12's
+  /// backoff ladder. A pass the wedged reader REFUSED has already armed a successor through
+  /// `deferIndexBatchTruncation()` (1 s → ×2 → cap 30 s), and that successor comes back through
+  /// `scheduleIndexBatchMaintenance()`, so it re-stats the WAL and covers the coalesced request's
+  /// frames as well — absorbed, not lost. Re-arming promptly ON TOP of that would put a pass in
+  /// flight immediately after a refusal, which the same reader refuses again in ~0.2 ms: once per
+  /// index write, for as long as the wedge lasts. The ladder exists precisely so a reader that never
+  /// lets go cannot be polled.
+  ///
+  /// So this pins the composition from both sides: no extra pass while the ladder owes one (step 4),
+  /// and the coalesced request still enforced once the reader lets go, with nothing further
+  /// submitted (step 5).
+  func testACoalescedRequestDuringARefusedTruncateStaysOnTheBackoffLadder() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    // Same wedge shape as the round-12 pool pin: a genuine `pool.read` held open, with the release
+    // valve far above every wait below so a wrong build fails an assertion instead of being rescued.
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.poolWedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), Self.coalescedRearmWalBoundBytes,
+      "fixture precondition: the WAL must start over the (lowered) bound")
+    database.walCheckpointThresholdBytesOverride = Self.coalescedRearmWalBoundBytes
+    // Long next to the quiet window in step 4 and short next to its own wait in step 5, so the
+    // ladder's successor cannot fire early enough to be mistaken for a prompt re-arm.
+    database.indexBatchTruncationRetryDelayNanosecondsOverride = Self.ladderRetryDelayNanoseconds
+
+    let completionGate = ParkingGate()
+    database.maintenanceCompletionGateOverride = { await completionGate.arrive() }
+
+    // 1 — wedge a genuine pool reader inside `fetchBacklinkRecords`' own `pool.read`.
+    let documents = (0..<3).map { documentRef(root: root, name: "churn-\($0).md") }
+    let backlinksFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: documents[0], documents: documents)
+      backlinksFinished.isSet = true
+    }
+    try await waitUntil("the backlink query to be holding one of the pool's readers") {
+      wedge.isReached
+    }
+
+    // 2 — arm the hot path. The reader holds an older snapshot, so the truncate is REFUSED, the pass
+    //     defers onto the ladder, and only then parks with its handle still installed.
+    let armingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "arms-maintenance.md"),
+      body: "ladderarmneedle",
+      appState: appState
+    )
+    XCTAssertTrue(armingDidWrite)
+    try await waitUntil("the refused pass to reach the handle-clearing gate", timeout: 5) {
+      await completionGate.arrivals >= 1
+    }
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "fixture precondition: the parked pass must have been REFUSED by the wedged reader — a pass "
+        + "that truncated would put the ladder out of the picture entirely")
+
+    // 3 — a save commits while the refused pass still holds the handle, so its request coalesces.
+    let racingDidWrite = await database.indexInBackground(
+      document: documentRef(root: root, name: "races-the-handle.md"),
+      body: Self.walGrowingBody(needle: "ladderracingneedle"),
+      appState: appState
+    )
+    XCTAssertTrue(racingDidWrite)
+    let arrivalsAfterTheRacingSave = await completionGate.arrivals
+    XCTAssertEqual(
+      arrivalsAfterTheRacingSave, 1,
+      "fixture precondition: that save's request must have been coalesced, not armed as a second "
+        + "pass")
+
+    // 4 — release the pass. The coalesced request must NOT put a successor in flight now: the reader
+    //     is still wedged, so it would be refused within a millisecond and the ladder would be
+    //     bypassed once per write for the whole wedge.
+    await completionGate.open()
+    try await Task.sleep(nanoseconds: Self.ladderQuietWindowNanoseconds)
+    XCTAssertTrue(
+      wedge.isReached,
+      "fixture precondition: the wedged reader must still be holding its connection through the "
+        + "quiet window")
+    XCTAssertEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "a coalesced request must be absorbed by the ladder that already owes a successor, not "
+        + "re-armed on top of it: a second refusal here is the ~0.2 ms busy-poll round 12's backoff "
+        + "exists to prevent")
+
+    // 5 — and it is ABSORBED rather than lost: once the reader lets go, the ladder's own successor
+    //     re-stats the WAL and covers the racing save's frames too, with nothing further submitted.
+    released.signal()
+    try await waitUntil(
+      "the ladder's successor to enforce the bound over the coalesced request's frames", timeout: 20
+    ) {
+      walSize(for: databaseURL) <= Self.coalescedRearmWalBoundBytes
+    }
+    XCTAssertEqual(
+      try indexHits(matching: "ladderracingneedle", at: databaseURL), 1,
+      "…and it must have enforced the bound by checkpointing those frames, not by losing them")
+    try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
+  }
+
   /// Ordinary `Close Folder` used to compact against whatever the index happened to have finished.
   /// `closeWorkspace` cancels `FolderManager`'s `indexUpdateTask` — which by its own contract
   /// abandons only the WAIT, never the write underneath, that one belongs to `IndexDatabase`'s
@@ -1458,6 +1669,29 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   /// longest is 10 s) so a build that reintroduces the reader-excluding barrier fails an assertion
   /// instead of being rescued by the release.
   private static let poolWedgeReleaseSeconds: TimeInterval = 45
+
+  /// The WAL bound the two round-13 pins work against, lowered through
+  /// `walCheckpointThresholdBytesOverride` for the same reason every other pin here lowers it: a test
+  /// that had to write the production 16 MiB would be a minute-long disk-bound test. Small enough
+  /// that a single save crosses it, large enough that a truncated (zero-length) `-wal` is
+  /// unambiguously under it.
+  private static let coalescedRearmWalBoundBytes: Int64 = 64 * 1024
+
+  /// Ladder delay for the composition pin. Long next to its 200 ms quiet window — so a successor
+  /// appearing during that window can only be a prompt re-arm, never the ladder firing early — and
+  /// short next to the 20 s wait that follows the reader's release.
+  private static let ladderRetryDelayNanoseconds: UInt64 = 5_000_000_000
+
+  /// How long the composition pin watches for a successor that must not appear. 25× below the ladder
+  /// delay above, so a loaded runner cannot turn a correct build into a failure.
+  private static let ladderQuietWindowNanoseconds: UInt64 = 200_000_000
+
+  /// A document body big enough that committing it alone pushes the `-wal` file over
+  /// `coalescedRearmWalBoundBytes` (~288 KiB against a 64 KiB bound), carrying a searchable needle so
+  /// the pin can prove the frames were CHECKPOINTED rather than dropped.
+  private static func walGrowingBody(needle: String) -> String {
+    needle + " " + String(repeating: "coalesced rearm payload ", count: 12_000)
+  }
 
   /// Polls a monotone condition instead of sleeping a fixed amount: a correct build waits only as
   /// long as it actually needs, and a wrong one fails the assertion rather than a guessed duration.
