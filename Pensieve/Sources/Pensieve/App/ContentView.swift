@@ -38,7 +38,14 @@ struct ContentView: View {
       appState.documentHasEditableBuffer
         ? appState.documentTitle : "Pensieve"
     )
-    .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
+    // 5.2: the subtitle carries the document's breadcrumb path; the dirty
+    // "Edited" state it used to hold now lives in the status bar's marker.
+    .navigationSubtitle(
+      appState.documentHasEditableBuffer
+        ? EditorToolbelt.breadcrumbSubtitle(
+          for: appState.documentURL, workspaceRoots: appState.workspaceRoots)
+        : ""
+    )
     .toolbar {
       EditorToolbelt(
         appState: appState,

@@ -99,6 +99,33 @@ final class EditorToolbeltTests: XCTestCase {
       expectedToolbarIdentifiers)
   }
 
+  // MARK: - Titlebar breadcrumb subtitle (5.2)
+
+  func testBreadcrumbIsWorkspaceRootedWhenFileLivesUnderARoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/10_projects/vetcoders/reports/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]),
+      "proj › 10_projects › vetcoders › reports")
+  }
+
+  func testBreadcrumbForFileDirectlyInRootIsJustTheRoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]), "proj")
+  }
+
+  func testBreadcrumbOutsideWorkspaceUsesLastFewParentComponents() {
+    let file = URL(fileURLWithPath: "/a/b/c/d/e/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: []), "c › d › e")
+  }
+
+  func testBreadcrumbIsEmptyWithoutAnActiveDocument() {
+    XCTAssertEqual(EditorToolbelt.breadcrumbSubtitle(for: nil, workspaceRoots: []), "")
+  }
+
   // MARK: - Titlebar order contract
 
   func testTitlebarOrderSeparatesShareDispatchAndStartsEditRowWithRichMarkdownToggle() {

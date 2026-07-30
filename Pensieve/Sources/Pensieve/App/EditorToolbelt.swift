@@ -135,6 +135,31 @@ struct EditorToolbelt: ToolbarContent {
     hasEditableBuffer && mode != .preview
   }
 
+  /// Titlebar breadcrumb (5.2): the containing-folder chain for the active
+  /// document, joined by " › ". Workspace-rooted when the file lives under a
+  /// root (`10_projects › vetcoders › reports`), otherwise the last few
+  /// tilde-abbreviated parent components. The `navigationSubtitle` carries this
+  /// path because the dirty "Edited" state already lives in the status bar.
+  static func breadcrumbSubtitle(for url: URL?, workspaceRoots: [WorkspaceRoot]) -> String {
+    guard let url else { return "" }
+    let standardized = url.standardizedFileURL
+    let parentPath = standardized.deletingLastPathComponent().path
+
+    if let root = workspaceRoots.first(where: {
+      standardized.path.hasPrefix($0.url.standardizedFileURL.path + "/")
+    }) {
+      // Crumb from the root's own name down to the containing folder.
+      let rootParent = root.url.standardizedFileURL.deletingLastPathComponent().path
+      let relative =
+        parentPath.hasPrefix(rootParent)
+        ? String(parentPath.dropFirst(rootParent.count)) : parentPath
+      return relative.split(separator: "/").joined(separator: " › ")
+    }
+
+    let abbreviated = (parentPath as NSString).abbreviatingWithTildeInPath
+    return abbreviated.split(separator: "/").suffix(3).joined(separator: " › ")
+  }
+
   static func visibleToolbarIdentifierOrder(
     for mode: EditorMode,
     hasEditableBuffer: Bool
@@ -212,13 +237,15 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       ForEach(EditorMode.allCases) { mode in
         Label(mode.label, systemImage: mode.systemImage)
-          .labelStyle(.iconOnly)
+          .labelStyle(.titleAndIcon)
           .tag(mode)
       }
     }
+    // 5.2: a labeled segmented control (Source · Split · Preview · Focus) — the
+    // active mode reads from the filled capsule and its title, not a dimmed icon.
     .pickerStyle(.segmented)
     .help("Editor layout")
-    .frame(minWidth: 140)
+    .frame(minWidth: 300)
     .accessibilityIdentifier(Self.modePickerIdentifier)
   }
 
@@ -472,7 +499,15 @@ private struct AppearanceToolbarMenu: View {
       .help("Preview theme — the reading surface for the rendered markdown")
       .accessibilityIdentifier("pensieve.toolbar.skinPicker")
     } label: {
-      Label("Preview Appearance", systemImage: "paintpalette")
+      // 5.2: the active theme is named in the label, marked by an accent-tinted
+      // diamond, instead of an anonymous paintpalette. Flavor stays inside the
+      // menu (and the status-bar chip).
+      Label {
+        Text(themeManager.skin.displayName)
+      } icon: {
+        Image(systemName: "diamond.fill")
+          .foregroundStyle(Color(themeManager.skin.tokens.accent.nsColor))
+      }
     }
     .help("Preview appearance — markdown flavor and reading theme")
     .accessibilityLabel("Preview Appearance")
