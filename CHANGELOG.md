@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Find-bar match highlights survive a live theme switch (and a font-size change, and toggling rich markdown) instead of vanishing while the bar still counts "1 of N".
 - Typing with a bundled-font theme active no longer rebuilds and re-ships the theme's inlined `@font-face` payload (0.2–0.8 MB) to the preview on every debounced keystroke.
 - An escaped `\[~]` stays prose in the preview instead of being promoted to an in-progress task — the same escape GFM already honours for `\[x]` / `\[ ]`.
+- Preview-only windows keep the active theme's titlebar and appearance after a toolbar re-bridge or a tab-group reshuffle: chrome is re-asserted on every hosting pass and on every re-parent, instead of riding a rendered document the preview's own update dedupe may never send.
 
 ## [0.4.2] - 2026-07-22
 

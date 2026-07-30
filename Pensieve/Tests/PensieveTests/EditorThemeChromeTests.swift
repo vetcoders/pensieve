@@ -236,6 +236,78 @@ final class EditorThemeChromeTests: XCTestCase {
       srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
   }
 
+  /// The preview's chrome must be an INVARIANT re-asserted per pass, exactly like
+  /// the editor's — not something that only rides a rendered document.
+  /// `PreviewPipeline.apply` drops a request equal to `lastApplied`, so while the
+  /// content is unchanged `load(document:)` never runs; in preview-only mode there
+  /// is no editor surface to heal the window either. Here the external reset is
+  /// simulated directly and healed by the same call the hosting `updateNSView`
+  /// makes every pass.
+  @MainActor
+  func testPreviewChromeResetIsHealedWithoutANewDocument() {
+    let preview = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    window.contentView = preview
+    defer { window.contentView = nil }
+
+    preview.applyThemeChrome(for: .parchment)
+    XCTAssertEqual(window.appearance?.name, .aqua)
+
+    // External reset: what a toolbar re-bridge / tab reshuffle does to us.
+    window.appearance = NSAppearance(named: .darkAqua)
+    window.backgroundColor = .windowBackgroundColor
+
+    // No new document — just the next hosting pass.
+    preview.applyThemeChrome(for: .parchment)
+
+    XCTAssertEqual(window.appearance?.name, .aqua)
+    XCTAssertEqual(
+      srgb(window.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
+    // Steady state: nothing left to correct, so the per-pass re-assert is free.
+    XCTAssertFalse(
+      WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment),
+      "re-asserting an already-correct preview chrome must not write anything")
+  }
+
+  /// Re-parenting the preview (tab-group reshuffle, window recycle) hands it a
+  /// window that knows nothing about the skin, and the render dedupe means no new
+  /// document has to follow. The move itself must re-assert the chrome.
+  @MainActor
+  func testPreviewChromeFollowsTheViewToANewWindow() {
+    let preview = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+    let first = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    first.contentView = preview
+    preview.applyThemeChrome(for: .ink)
+    XCTAssertEqual(first.appearance?.name, .darkAqua)
+    first.contentView = nil
+
+    let second = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    second.appearance = NSAppearance(named: .aqua)
+    second.backgroundColor = .windowBackgroundColor
+    second.contentView = preview
+    defer { second.contentView = nil }
+
+    XCTAssertEqual(
+      second.appearance?.name, .darkAqua,
+      "a re-parented preview must dress its new window without a new document")
+    XCTAssertEqual(
+      srgb(second.backgroundColor),
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .ink)))
+  }
+
   /// Moving the caret to another source line pushes that 1-based line to the
   /// gutter, which is what lets it pick out the active line's number + accent.
   @MainActor

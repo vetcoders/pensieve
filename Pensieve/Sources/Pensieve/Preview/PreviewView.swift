@@ -87,6 +87,13 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func updateNSView(_ nsView: PreviewWebView, context: Context) {
+    // Chrome is asserted on EVERY pass, outside the render pipeline. Going through
+    // `load(document:)` alone is not enough: the pipeline drops a request equal to
+    // the last applied one, so unchanged content means no document — and in
+    // preview-only mode no `MarkdownEditorSurface` exists to assert the host
+    // window's chrome instead. Compare-and-set inside, so an unchanged skin writes
+    // nothing. Mirrors `EditorRepresentable.updateNSView`.
+    nsView.applyThemeChrome(for: skin)
     context.coordinator.update(scrollSyncCoordinator: scrollSyncCoordinator)
     context.coordinator.submit(request: currentRequest, autoReload: autoReload, initial: false)
   }

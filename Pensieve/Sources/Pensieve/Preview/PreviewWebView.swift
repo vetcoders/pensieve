@@ -24,6 +24,9 @@ final class PreviewWebView: NSView {
   /// Stylesheet the loaded page is known to carry, so a same-identity edit can
   /// skip re-shipping an unchanged (and font-payload-heavy) style block.
   private var appliedStyleHTML: String?
+  /// Last skin `applyThemeChrome` was asked for, so a re-parent can re-assert the
+  /// chrome without waiting for a document the render dedupe may never send.
+  private var assertedSkin: PensieveTheme?
 
   // Test seam: observes full-page (re)loads without a live WKWebView process.
   var fullPageLoadObserver: ((PreviewDocument) -> Void)?
@@ -67,6 +70,12 @@ final class PreviewWebView: NSView {
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     titlebarGlassController.attach(to: window)
+    // A re-parent hands us a window that knows nothing about the skin, and no
+    // new document has to follow (the render dedupe may hold everything back
+    // while the content is unchanged). Heal it here from the last asserted skin.
+    if let assertedSkin {
+      applyThemeChrome(for: assertedSkin)
+    }
   }
 
   override func layout() {
@@ -113,19 +122,38 @@ final class PreviewWebView: NSView {
   /// code blocks light (or vice versa) when the system appearance disagrees
   /// with the chosen theme. Adaptive themes (`default`/`raw`) pass `nil` and
   /// keep following the system.
+  ///
+  /// Re-asserted (compare-and-set) on every hosting update pass and on every
+  /// re-parent — NOT once per rendered document. Riding `load(document:)` alone
+  /// was not enough: `PreviewPipeline.apply` drops a request equal to
+  /// `lastApplied`, so while the content is unchanged no document reaches the
+  /// sink at all, and in preview-only mode there is no `MarkdownEditorSurface` to
+  /// heal the host window instead. A toolbar re-bridge or tab-group reshuffle
+  /// that clobbered the appearance therefore stayed clobbered for as long as the
+  /// reader did not type — the same bug class `c454889` fixed on the editor path.
+  ///
+  /// Equal values are skipped at every level (this view, the WebView, the
+  /// window), so a steady state issues no sets and there is no recomposite storm.
   func applyThemeChrome(for skin: PensieveTheme) {
+    assertedSkin = skin
+
     let appearance = WindowChromeRecipe.windowAppearance(for: skin)
-    self.appearance = appearance
-    webView.appearance = appearance
-    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: skin)
+    if self.appearance?.name != appearance?.name {
+      self.appearance = appearance
+    }
+    if webView.appearance?.name != appearance?.name {
+      webView.appearance = appearance
+    }
+    let backing = WindowChromeRecipe.titlebarGlassBackingColor(for: skin)
+    if !WindowChromeRecipe.colorsMatch(webView.underPageBackgroundColor, backing) {
+      webView.underPageBackgroundColor = backing
+    }
 
     // Preview-only mode mounts NO source editor, so `MarkdownEditorSurface`
     // never runs and nobody else asserts the HOST WINDOW's chrome — pinning
     // this view's appearance alone leaves the titlebar and sidebar on the
-    // previous skin. `load(document:)` runs this on every preview update, so
-    // the same compare-and-set invariant the editor applies also heals an
-    // external reset here. One shared definition of "wanted chrome"; equal
-    // values are skipped.
+    // previous skin. One shared definition of "wanted chrome"; equal values are
+    // skipped inside.
     if let window = self.window {
       WindowChromeRecipe.assertWindowChrome(on: window, for: skin)
     }

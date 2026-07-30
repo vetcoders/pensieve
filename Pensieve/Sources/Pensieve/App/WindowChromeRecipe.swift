@@ -145,7 +145,12 @@ enum WindowChromeRecipe {
   /// and for the catalog/dynamic colours the adaptive skins use, so a plain
   /// equality check would report a permanent mismatch and re-set the backing on
   /// every pass.
-  private static func colorsMatch(_ lhs: NSColor?, _ rhs: NSColor) -> Bool {
+  ///
+  /// Internal, not private: the preview sink re-asserts its own view-level chrome
+  /// (the WebView's under-page backing) on every pass and needs the SAME
+  /// comparison, for the same reason — two different comparisons would be two
+  /// different definitions of "already correct".
+  static func colorsMatch(_ lhs: NSColor?, _ rhs: NSColor) -> Bool {
     guard let lhs else { return false }
     if lhs == rhs { return true }
     guard
