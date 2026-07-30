@@ -1248,10 +1248,15 @@ final class TerminationQuiescenceTests: XCTestCase {
     //     `.indexBatch` arrival at this seam can only be the ladder's retry.
     let closeGate = ParkingGate()
     let retryGate = ParkingGate()
+    // Nothing in this pin opens a workspace, so the close's housekeeping must still be running into
+    // a quiet index and the round-16 downgrade must not fire. Counted rather than folded into
+    // `closeGate`, so a build that downgrades here fails an assertion instead of passing quietly.
+    let downgradedArrivals = Counter()
     database.maintenanceGateOverride = { reason in
       switch reason {
       case .workspaceClose: await closeGate.arrive()
       case .indexBatch: await retryGate.arrive()
+      case .workspaceCloseIntoOpenWorkspace: downgradedArrivals.increment()
       }
     }
 
@@ -1321,9 +1326,161 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and a pass the drain waited for is never a pass the latch has to refuse. Got "
         + "\(database.terminationRejectedEntryPoints)")
     XCTAssertEqual(
+      downgradedArrivals.value, 0,
+      "…and no pass may have taken the reopen downgrade: nothing here opens a workspace, so the "
+        + "close's housekeeping owes the quit its reader-excluding WAL→0")
+    XCTAssertEqual(
       walSize(for: databaseURL), 0,
       "…and the terminal checkpoint is the last word on the WAL (it is "
         + "\(walSize(for: databaseURL)) bytes)")
+  }
+
+  // MARK: - R16 / F2: a close's housekeeping must not exclude the NEXT workspace's readers
+
+  /// Round 16, finding 2 — the close pass that outlives the close.
+  ///
+  /// `closeWorkspace` arms `indexMaintenanceTask` and nobody on any OPEN path cancels it, awaits it
+  /// or even looks at it. Its own head is where the seconds go — the predecessor pass, the caller's
+  /// final write, `drainPendingIndexWrites()` — so `Close Folder` followed by `Open Folder`, an
+  /// ordinary two-second sequence, lands the `.workspaceClose` pass inside the NEW workspace's
+  /// opening searches. That pass takes `barrierWriteWithoutTransaction`, and in GRDB 6.29.3 that is
+  /// the one lock which excludes the pool's reader CHECKOUTS (measured in round 12): every search,
+  /// backlink and count in the fresh workspace waits it out.
+  ///
+  /// The wedged reader is what turns "waits it out" into something a test can decide without a
+  /// stopwatch. A barrier cannot complete while a genuine `pool.read` is held, so on the old
+  /// behaviour the close's housekeeping never finishes and the probe reads never come back. On the
+  /// downgraded pass — plain write, `busy_timeout = 0`, `SQLITE_BUSY` means "not now" — both do.
+  /// Neither assertion can pass by luck: they are the two halves of "no reader was excluded".
+  ///
+  /// The window is placed, not raced. An index write parked at `backgroundWriteGateOverride` holds
+  /// the close pass at its own `drainPendingIndexWrites()` — the production position — so the next
+  /// workspace demonstrably opens BEFORE the pass chooses its lock.
+  func testACloseMaintenancePassDoesNotExcludeTheNextWorkspacesReaders() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let readerReached = Counter()
+    let releaseReader = DispatchSemaphore(value: 0)
+    defer { releaseReader.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      releaseReader.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        readerReached.increment()
+        releaseReader.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let seedRef = documentRef(root: root, name: "seed.md")
+    try "reopenmaintenanceseed".write(to: seedRef.url, atomically: true, encoding: .utf8)
+    database.index(document: seedRef, body: "reopenmaintenanceseed")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: there must be WAL frames for the close's pass to want to truncate")
+    // Every pass is allowed to reach its checkpoint: the 16 MiB bound is not what this pin decides.
+    database.walCheckpointThresholdBytesOverride = 1
+
+    // 1 — a genuine pool reader, held for the whole experiment.
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: seedRef, documents: [seedRef])
+    }
+    pumpMainRunLoop(until: { readerReached.value >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      readerReached.value, 1,
+      "fixture precondition: the backlink query must be holding one of the pool's readers")
+
+    // 2 — an index write the close still owes, parked at the head of its task. This is what holds
+    //     the close's housekeeping at its drain while the operator opens the next folder.
+    let writeGate = ParkingGate()
+    database.backgroundWriteGateOverride = { await writeGate.arrive() }
+    let owedRef = documentRef(root: root, name: "still-owed.md")
+    database.scheduleIndexWrite {
+      _ = await database.indexInBackground(
+        document: owedRef, body: "reopenmaintenanceowed", appState: nil)
+    }
+    pumpMainRunLoop(until: { writeGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      writeGate.arrivalCount, 1,
+      "fixture precondition: an index write must be owed and parked, or the close's housekeeping "
+        + "sails past its drain and there is no window to open a workspace into")
+
+    // 3 — the close. Its pass is armed and immediately parks behind the drain above.
+    let reasonsAtTheLock = EventLog()
+    database.maintenanceGateOverride = { reason in reasonsAtTheLock.append("\(reason)") }
+    let manager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "ReopenMaintenance")
+    manager.closeWorkspace(into: appState)
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    XCTAssertEqual(
+      reasonsAtTheLock.events, [],
+      "fixture precondition: the close's pass must still be behind its drain — a pass that already "
+        + "chose its lock cannot be shown to notice the open that follows")
+
+    // 4 — the next workspace, opened through the path the app actually uses. The synchronous
+    //     sibling would rebuild the `DatabasePool`, which would strand the wedged reader on the old
+    //     one and quietly dissolve the experiment.
+    manager.openInBackground(url: root, into: appState)
+    XCTAssertFalse(
+      appState.workspaceRoots.isEmpty,
+      "fixture precondition: the next workspace must actually have opened")
+
+    // 5 — let the owed write through. The close's pass now chooses its lock, with a workspace open.
+    Task { await writeGate.open() }
+
+    let maintenanceFinished = CompletionFlag()
+    Task { @MainActor in
+      await manager.waitForPendingIndexMaintenance()
+      maintenanceFinished.isSet = true
+    }
+    // Reads issued continuously from the moment the pass is released, so one of them is guaranteed
+    // to ask for a reader connection while the pass holds its lock.
+    let probeReads = Counter()
+    let rootPaths = [root.standardizedFileURL.path]
+    Task { @MainActor in
+      while !maintenanceFinished.isSet {
+        _ = await database.indexedDocumentCountInBackground(forRootPaths: rootPaths)
+        probeReads.increment()
+      }
+    }
+
+    pumpMainRunLoop(until: { maintenanceFinished.isSet }, timeout: 20)
+
+    XCTAssertTrue(
+      maintenanceFinished.isSet,
+      "the close's housekeeping ran a reader-excluding barrier into the next workspace. With a "
+        + "genuine pool reader held it cannot complete — and in production that is every search, "
+        + "backlink and count in the freshly opened folder waiting on a vacuum the previous "
+        + "workspace armed")
+    XCTAssertGreaterThan(
+      probeReads.value, 0,
+      "…and the new workspace's reads must have kept flowing while it ran, which is the same fact "
+        + "from the reader's side")
+    // The owed write's own hot-path pass reaches this seam too — `.indexBatch` arrivals are
+    // expected company. What must NOT appear is an undowngraded close.
+    XCTAssertTrue(
+      reasonsAtTheLock.events.contains("workspaceCloseIntoOpenWorkspace"),
+      "…by DOWNGRADING rather than cancelling: cancelling would drop the WAL bound the close pass "
+        + "exists to provide, and delaying the open on it would be worse still. Got "
+        + "\(reasonsAtTheLock.events)")
+    XCTAssertFalse(
+      reasonsAtTheLock.events.contains("workspaceClose"),
+      "…and no pass may still be claiming the quiet index this one no longer has. Got "
+        + "\(reasonsAtTheLock.events)")
+    XCTAssertGreaterThanOrEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "…and the bound must be deferred onto the backoff ladder rather than retired: the wedged "
+        + "reader still holds WAL frames, so the truncate is owed, not done")
+    XCTAssertFalse(
+      database.isIndexBatchTruncationRetryQuiesced,
+      "…with the ladder still live, since nothing here is quitting")
   }
 
   // MARK: - R6: a dirty session's index write follows its file write

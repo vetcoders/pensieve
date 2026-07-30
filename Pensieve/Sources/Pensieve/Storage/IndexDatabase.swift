@@ -1143,6 +1143,27 @@ final class IndexDatabase {
     /// The workspace is being closed (also covers "last root removed"). Nothing is being indexed,
     /// so this is the one point where the heavier compaction work is allowed to run.
     case workspaceClose
+    /// A workspace close whose housekeeping is no longer running into the quiet index it was armed
+    /// for: ANOTHER workspace opened while this pass was still queued behind the close's drain.
+    ///
+    /// `Close Folder` immediately followed by `Open Folder` is an ordinary two-second sequence, and
+    /// the pass `closeWorkspace` arms is unawaited by every open path — so the heavy variant below
+    /// (full-freelist `incremental_vacuum`, a one-off `VACUUM` conversion, and a truncate under
+    /// `barrierWriteWithoutTransaction`) used to land in the middle of the NEW workspace's opening
+    /// searches. The barrier is the part that hurts: in GRDB 6.29.3 it excludes the pool's READER
+    /// checkouts, so every search, backlink and count in the fresh workspace waits it out.
+    ///
+    /// Downgraded rather than cancelled, because cancelling would silently drop the WAL bound the
+    /// close pass exists to provide. This reason runs the SAME hygiene the app already runs while
+    /// the operator types — plain write, `busy_timeout = 0`, `SQLITE_BUSY` means "not now" and
+    /// re-arms the backoff ladder — so the bound is deferred and still enforced, and no reader is
+    /// ever excluded for it.
+    case workspaceCloseIntoOpenWorkspace
+
+    /// Whether this pass may take `barrierWriteWithoutTransaction` — the one GRDB lock that
+    /// excludes the pool's reader connections and not merely its writer. The real axis behind the
+    /// three cases: "is anybody left who would notice being locked out of the index?"
+    var mayExcludeReaders: Bool { self == .workspaceClose }
   }
 
   /// A background batch only triggers a checkpoint once the log is worth truncating. 16 MiB is ~4×
@@ -1294,7 +1315,8 @@ final class IndexDatabase {
   /// moves into the WAL, so truncating afterwards is what actually returns the bytes to the
   /// filesystem.
   ///
-  /// The two reasons deliberately take DIFFERENT locks, and that is round 12's fix:
+  /// The reasons deliberately take DIFFERENT locks, and that is round 12's fix, generalised in
+  /// round 16 to the axis `MaintenanceReason.mayExcludeReaders` names:
   ///
   /// - `.workspaceClose` (like the terminal checkpoint) keeps `barrierWriteWithoutTransaction`. In
   ///   GRDB 6.29.3 that is `readerPool.barrier { writer.sync }`: it waits for the readers in flight
@@ -1305,6 +1327,10 @@ final class IndexDatabase {
   ///   exclusion makes storage hygiene wait for a reader and every LATER read wait for the
   ///   hygiene. So the hot path takes a plain `writeWithoutTransaction` and treats a refused
   ///   checkpoint as "not now": the truncate is DEFERRED and re-armed, never waited out.
+  /// - `.workspaceCloseIntoOpenWorkspace` is a close pass that discovered it is no longer running
+  ///   into a quiet index — a NEW workspace opened while it was queued behind the close's drain —
+  ///   so "by close time there is nothing left" stopped being true and the exclusion stopped being
+  ///   correct. It therefore takes the hot path's lock, for the hot path's reason.
   ///
   /// Measured on GRDB 6.29.3 / SQLite on macOS 15 (round-12 probe, recorded because both halves are
   /// counter-intuitive):
@@ -1321,7 +1347,7 @@ final class IndexDatabase {
   func performMaintenanceInBackground(reason: MaintenanceReason) async {
     guard !isRefusedAfterTermination("performMaintenanceInBackground") else { return }
     guard let pool = databasePool, let databaseURL else { return }
-    if reason == .indexBatch,
+    if !reason.mayExcludeReaders,
       Self.walFileSize(for: databaseURL) < effectiveWalCheckpointThresholdBytes
     {
       // Under the bound nothing is owed, so a ladder built up by earlier deferrals starts over.
@@ -1329,12 +1355,17 @@ final class IndexDatabase {
       return
     }
 
+    // The one-off `VACUUM` conversion stays on the undowngraded close and nowhere else: it is the
+    // single most expensive thing this method can do, it is unbounded in the sense that matters
+    // (a full rewrite of the logical database), and `didAttemptAutoVacuumConversion` is NOT set on
+    // the downgraded path — so a close that gave way to a reopen defers the conversion to the next
+    // real close rather than retiring it.
     let attemptConversion = reason == .workspaceClose && !didAttemptAutoVacuumConversion
     if attemptConversion { didAttemptAutoVacuumConversion = true }
     let conversionByteLimit = effectiveAutoVacuumConversionByteLimit
     if let gate = maintenanceGateOverride { await gate(reason) }
 
-    if reason == .indexBatch {
+    if !reason.mayExcludeReaders {
       let pageBudget = Self.incrementalVacuumPageBudget
       let outcome = await Task.detached(priority: .utility) {
         Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget)

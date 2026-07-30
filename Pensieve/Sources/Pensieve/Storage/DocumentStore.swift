@@ -32,6 +32,11 @@ final class FolderManager {
   /// only while its own generation is still current. Without this, a build cancelled by
   /// `applyRefresh` or superseded by an ad-hoc file open left `.opening` on screen forever.
   private var openFlowGeneration: UInt64 = 0
+  /// Bumped by every workspace OPEN, and by nothing else — deliberately not `openFlowGeneration`,
+  /// which a close bumps too. `scheduleIndexMaintenance` captures it so a close's housekeeping can
+  /// answer one question at the moment it matters: "is the index still as quiet as it was when I
+  /// was armed?" See `scheduleIndexMaintenance(after:)`.
+  private var workspaceOpenGeneration: UInt64 = 0
   private var watcherRefreshTask: Task<Void, Never>?
   /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
   /// completed refresh from one that was cancel-replaced by a newer event mid-await.
@@ -982,14 +987,43 @@ final class FolderManager {
   /// truncate a log the previous pass's write is still growing. Cancelling the orphan instead would
   /// be the wrong half of the cancel/drain distinction — its `barrierWriteWithoutTransaction` is
   /// accepted work, so cancellation would abandon only the wait, not the vacuum.
+  ///
+  /// …and everything above assumes the pass still lands in the quiet moment it was armed for. It
+  /// need not: `Close Folder` followed by `Open Folder` is an ordinary two-second sequence, no open
+  /// path cancels or awaits this handle, and the waits at the head of the task (the predecessor, the
+  /// caller's final write, the index drain) are exactly where the seconds go. So the `.workspaceClose`
+  /// pass — full-freelist `incremental_vacuum`, a possible one-off `VACUUM`, and a truncate under
+  /// `barrierWriteWithoutTransaction` — used to run INSIDE the next workspace's opening searches, and
+  /// that barrier excludes the pool's reader checkouts (GRDB 6.29.3, measured in round 12). The new
+  /// workspace's first search, backlink and count all wait it out.
+  ///
+  /// The reason is therefore decided at the LAST moment rather than at arm time, and the answer is a
+  /// downgrade rather than a cancellation. Cancelling would drop the WAL bound this pass exists to
+  /// provide; delaying the open on it is worse still. `.workspaceCloseIntoOpenWorkspace` keeps the
+  /// obligation and drops only the exclusion — plain write, fail-fast truncate, backoff ladder — so
+  /// the bound is deferred and still enforced while the new workspace reads freely.
+  ///
+  /// Deciding it in the task (not at arm time) also keeps the quit honest: the LAST close before a
+  /// quit is followed by no open at all, so it still takes the barrier and the WAL→0 promise is
+  /// unconditional. Named residual: an open that arrives after this pass has already ENTERED its
+  /// barrier is not retracted — the barrier is not abortable — but that window is the barrier's own
+  /// duration rather than the whole armed lifetime of the task, and the unbounded part of it (the
+  /// `VACUUM` conversion) is skipped on every downgraded pass.
   private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
     let indexDatabase = indexDatabase
     let previous = indexMaintenanceTask
-    indexMaintenanceTask = Task {
+    let armedAtOpenGeneration = workspaceOpenGeneration
+    indexMaintenanceTask = Task { [weak self] in
       await previous?.value
       await pendingIndexWork?.value
       await indexDatabase.drainPendingIndexWrites()
-      await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
+      // Read on the main actor immediately before the call, with no suspension point between the
+      // two: `performMaintenanceInBackground` only suspends once it reaches its detached work, so an
+      // open cannot slip in between this decision and the lock it selects. A deallocated manager
+      // reads as "no open" — the old behaviour, and the safe one.
+      let reopened = (self?.workspaceOpenGeneration ?? armedAtOpenGeneration) != armedAtOpenGeneration
+      await indexDatabase.performMaintenanceInBackground(
+        reason: reopened ? .workspaceCloseIntoOpenWorkspace : .workspaceClose)
     }
   }
 
@@ -1092,6 +1126,8 @@ final class FolderManager {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
+    // Before the hot-reopen short-circuit below, so BOTH open shapes are covered by one bump.
+    workspaceOpenGeneration &+= 1
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
     let exclusions = Set(metadata.excludedPaths)
@@ -1249,6 +1285,9 @@ final class FolderManager {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
+    // The background sibling of the bump in `openResolvedWorkspace` — same reason, and it covers
+    // this path's own hot-reopen branch too.
+    workspaceOpenGeneration &+= 1
     let generation = openFlowGeneration
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let requestedRootPaths = rootURLs.map { $0.standardizedFileURL.path }
