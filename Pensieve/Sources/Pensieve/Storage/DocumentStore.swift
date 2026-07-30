@@ -1078,10 +1078,18 @@ final class FolderManager {
   /// longer had. So the exclusion decision is now REVALIDATED at barrier acquisition, from the
   /// detached closure, through a lock-guarded generation the main actor is not needed to read.
   ///
-  /// Named residual, re-derived: an open that arrives after the pass has already ENTERED its barrier
-  /// is not retracted — the barrier is not abortable. That window is now genuinely the barrier's own
-  /// duration and no longer the whole detached prologue, and the unbounded part of it (the `VACUUM`
-  /// conversion) is skipped on every downgraded pass, including one downgraded at the barrier.
+  /// Round 21 closed the last unbounded stretch of that prologue. Between the first revalidation and
+  /// the first byte of the `VACUUM` conversion sits the queue for the pool's SERIALIZED WRITER,
+  /// which a save or a reindex already in flight can hold for as long as it likes; a workspace
+  /// opened during that wait had its own first index writes queued behind a whole-file rewrite. The
+  /// conversion now carries the predicate into its write and reads it with the writer in hand.
+  ///
+  /// Named residual, re-derived: an open that arrives after the pass has already ENTERED its
+  /// barrier, or after the conversion's rewrite has BEGUN, is not retracted — neither is abortable.
+  /// Those windows are now exactly the barrier's own duration and the rewrite's own duration
+  /// (bounded by `IndexDatabase.autoVacuumConversionByteLimit`, measured at roughly 1.3 s at that
+  /// ceiling on an SSD, and paid at most once per database), rather than the whole detached
+  /// prologue.
   private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
     let indexDatabase = indexDatabase
     let previous = indexMaintenanceTask

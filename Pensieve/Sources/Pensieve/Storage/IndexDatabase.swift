@@ -1268,6 +1268,16 @@ final class IndexDatabase {
   /// happen needs the flag itself — there is no VACUUM to observe.
   private(set) var didAttemptAutoVacuumConversion = false
 
+  /// How many close passes gave the one-shot conversion up to a workspace that opened while the
+  /// conversion was still queuing for the pool's writer.
+  ///
+  /// Round 21, finding 2, and it needs a counter of its own for the reason round 20's
+  /// `barrierTimeMaintenanceDowngrades` did: `didAttemptAutoVacuumConversion == false` is reached by
+  /// three different roads — a pass downgraded before the conversion (round 20), a pass that never
+  /// ran one, and this one — so the flag alone cannot tell them apart. This is the only seam that
+  /// says the conversion was abandoned AT the writer rather than declined before it.
+  private(set) var autoVacuumConversionsDeferredByOpen = 0
+
   /// Arms hot-path storage hygiene as its OWN tracked index write, instead of awaiting it inside the
   /// write task the supersede chain points at. Round 11's liveness fix, and the SINGLE hot-path entry
   /// point: the three background index writes call this, and nothing else reaches
@@ -1365,7 +1375,9 @@ final class IndexDatabase {
   ///   correct. It therefore takes the hot path's lock, for the hot path's reason. Since round 20
   ///   that discovery is made twice: once by the caller before this method is entered, and once by
   ///   this method immediately before the barrier, because the prologue in between is long enough
-  ///   to contain a whole-file `VACUUM`.
+  ///   to contain a whole-file `VACUUM`. Round 21 added a third reading INSIDE that `VACUUM`'s own
+  ///   write, because the queue for the pool's writer sits between the first reading and the first
+  ///   byte of the rewrite — see `convertToIncrementalAutoVacuumIfNeeded`.
   ///
   /// Measured on GRDB 6.29.3 / SQLite on macOS 15 (round-12 probe, recorded because both halves are
   /// counter-intuitive):
@@ -1428,25 +1440,37 @@ final class IndexDatabase {
     }
 
     let pageBudget = Self.incrementalVacuumPageBudget
-    let outcome = await Task.detached(priority: .utility) { () -> ClosePassOutcome in
+    let result = await Task.detached(priority: .utility) { () -> ClosePassResult in
       // Revalidation, first reading: BEFORE the conversion, so a pass that has already lost its
       // quiet index never pays for the whole-file rewrite the downgraded reason is defined to skip.
       if let exclusionRemainsWarranted, !exclusionRemainsWarranted() {
-        return .downgraded(
-          Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
-          didAttemptConversion: false)
+        return ClosePassResult(
+          outcome: .downgraded(
+            Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
+            didAttemptConversion: false),
+          conversionDeferredByOpen: false)
       }
+      // Round 21, finding 2: the reading above is NOT the last word on the conversion. Between it
+      // and the first byte of the rewrite sit a `pool.read` for the pragma, two file stats, and —
+      // the unbounded part — the wait for the pool's SERIALIZED WRITER, which a save or a reindex
+      // already in flight can hold for as long as it likes. So the conversion carries the predicate
+      // INTO its write and reads it once more with the writer already in hand.
+      var conversion = AutoVacuumConversionOutcome.notOwed
       if attemptConversion {
-        Self.convertToIncrementalAutoVacuumIfNeeded(
-          pool: pool, databaseURL: databaseURL, byteLimit: conversionByteLimit)
+        conversion = Self.convertToIncrementalAutoVacuumIfNeeded(
+          pool: pool, databaseURL: databaseURL, byteLimit: conversionByteLimit,
+          exclusionRemainsWarranted: exclusionRemainsWarranted)
       }
+      let conversionDeferredByOpen = conversion == .deferredByOpen
       // Revalidation, second reading: immediately before the lock, which is what shrinks the
       // residual to the barrier's own duration. The conversion above can take seconds, and an open
       // arriving during it would otherwise still meet a reader-excluding barrier.
       if let exclusionRemainsWarranted, !exclusionRemainsWarranted() {
-        return .downgraded(
-          Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
-          didAttemptConversion: attemptConversion)
+        return ClosePassResult(
+          outcome: .downgraded(
+            Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
+            didAttemptConversion: attemptConversion && !conversionDeferredByOpen),
+          conversionDeferredByOpen: conversionDeferredByOpen)
       }
       do {
         try pool.barrierWriteWithoutTransaction { db in
@@ -1456,10 +1480,19 @@ final class IndexDatabase {
       } catch {
         NSLog("Pensieve index maintenance failed: %@", error.localizedDescription)
       }
-      return .excludedReaders
+      return ClosePassResult(
+        outcome: .excludedReaders, conversionDeferredByOpen: conversionDeferredByOpen)
     }.value
 
-    switch outcome {
+    if result.conversionDeferredByOpen {
+      autoVacuumConversionsDeferredByOpen += 1
+      // Deferred, never retired — the same contract both revalidation downgrades keep. The flag was
+      // set optimistically on the main actor before the hand-off, and this is where a conversion
+      // that gave way at the writer hands it back to the next real close.
+      didAttemptAutoVacuumConversion = false
+    }
+
+    switch result.outcome {
     case .excludedReaders:
       break
     case .downgraded(let hotPathOutcome, let didAttemptConversion):
@@ -1485,6 +1518,25 @@ final class IndexDatabase {
   private enum ClosePassOutcome {
     case excludedReaders
     case downgraded(IndexBatchMaintenanceOutcome, didAttemptConversion: Bool)
+  }
+
+  /// The close pass's result, carried out of the detached closure. `conversionDeferredByOpen` rides
+  /// alongside the outcome rather than inside it because the two answer different questions — what
+  /// the pass did at its lock, and whether the one-shot conversion is still owed — and round 21 made
+  /// the second reachable on its own.
+  private struct ClosePassResult {
+    var outcome: ClosePassOutcome
+    var conversionDeferredByOpen: Bool
+  }
+
+  /// What the one-shot `auto_vacuum` conversion did. `notOwed` folds together "already incremental",
+  /// "over the byte ceiling" and "the attempt failed": all three are answers this process is not
+  /// going to improve on, so all three retire the obligation. `deferredByOpen` is the one that keeps
+  /// it — see `autoVacuumConversionsDeferredByOpen`.
+  private enum AutoVacuumConversionOutcome: Equatable {
+    case converted
+    case notOwed
+    case deferredByOpen
   }
 
   /// What one hot-path hygiene pass achieved. `readerHeldTheWal` is the state that has to be told
@@ -1618,12 +1670,28 @@ final class IndexDatabase {
   /// running it — `makeConfiguration`'s `prepareDatabase` guarantees that for every writer, so the
   /// conversion is literally "VACUUM once". Best-effort by design: a failure (no disk space, busy
   /// database) leaves the database perfectly usable, just uncompacted.
+  ///
+  /// `exclusionRemainsWarranted` is round 21's half, and it is read at the LAST instruction before
+  /// the rewrite — inside the write, with the pool's writer already held. Everything this method
+  /// does before that point can wait an unbounded time on somebody else's write, and a workspace
+  /// opened during that wait would have its own first index writes queued behind a whole-file
+  /// rewrite (measured at roughly 1.3 s for a database at the 256 MiB ceiling on an SSD). Reading
+  /// the predicate here means the conversion is abandoned for anything that arrives before the
+  /// writer is taken, and `deferredByOpen` hands the obligation to the next real close rather than
+  /// retiring it. `nil` means "no revalidation available" — the hot path and the tests that drive
+  /// this directly — and is treated as still warranted.
+  ///
+  /// Named residual, and it is irreducible: `VACUUM` is atomic and not abortable, so an open that
+  /// arrives after the rewrite has BEGUN still waits it out. That window is now exactly the
+  /// rewrite's own duration, bounded by `autoVacuumConversionByteLimit`, and it is paid at most once
+  /// per database.
   private nonisolated static func convertToIncrementalAutoVacuumIfNeeded(
-    pool: DatabasePool, databaseURL: URL, byteLimit: Int64
-  ) {
+    pool: DatabasePool, databaseURL: URL, byteLimit: Int64,
+    exclusionRemainsWarranted: (@Sendable () -> Bool)?
+  ) -> AutoVacuumConversionOutcome {
     do {
       let mode = try pool.read { db in try Int.fetchOne(db, sql: "PRAGMA auto_vacuum") ?? 0 }
-      guard mode != 2 else { return }
+      guard mode != 2 else { return .notOwed }
       // The bound has to be the LOGICAL database, not the main file. `VACUUM` rewrites everything
       // SQLite considers committed, and in WAL mode a large slice of that can still be sitting in
       // `index.db-wal` — a reader holding a snapshot is enough to keep checkpoints from moving it
@@ -1632,11 +1700,19 @@ final class IndexDatabase {
       let logicalSize = fileSize(at: databaseURL) + walFileSize(for: databaseURL)
       guard logicalSize <= byteLimit else {
         NSLog("Pensieve index too large for auto_vacuum conversion; keeping WAL checkpoints only")
-        return
+        return .notOwed
       }
-      try pool.vacuum()
+      // `writeWithoutTransaction` rather than `pool.vacuum()` — the same call GRDB's own `vacuum()`
+      // makes — so the last reading of the predicate happens with the writer in hand instead of
+      // before the queue for it.
+      return try pool.writeWithoutTransaction { db -> AutoVacuumConversionOutcome in
+        if let exclusionRemainsWarranted, !exclusionRemainsWarranted() { return .deferredByOpen }
+        try db.execute(sql: "VACUUM")
+        return .converted
+      }
     } catch {
       NSLog("Pensieve index auto_vacuum conversion failed: %@", error.localizedDescription)
+      return .notOwed
     }
   }
 

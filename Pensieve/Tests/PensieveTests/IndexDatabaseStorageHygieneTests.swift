@@ -242,6 +242,247 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       "a legacy database whose main file AND WAL fit the ceiling must still be converted")
   }
 
+  // MARK: - R21 / F2: an open must not be serialized behind the legacy conversion
+
+  /// Round 21, finding 2 — the last unbounded stretch of the close pass's prologue.
+  ///
+  /// Round 20 made the close pass revalidate its exclusion decision twice: once before the one-shot
+  /// `VACUUM` conversion and once immediately before the barrier. The first of those readings was
+  /// treated as covering the conversion, and it does not. Between it and the first byte of the
+  /// rewrite sit a `pool.read` for the pragma, two file stats, and — the part with no bound at all —
+  /// the queue for the pool's SERIALIZED WRITER, which a save or a reindex already inside its
+  /// transaction can hold for as long as it likes. A workspace opened in that stretch met a
+  /// whole-file rewrite anyway: measured at roughly 1.3 s for a database at the 256 MiB ceiling on an
+  /// SSD, and paid by the NEW workspace's first index writes, which queue behind it.
+  ///
+  /// So the writer wedge here is not scenery — it IS the finding. The conversion is held exactly
+  /// where production holds it, the open lands while it waits, and the contract is that the rewrite
+  /// must then not happen at all: the predicate is read once more with the writer in hand.
+  ///
+  /// Asserted at the substrate through an independent connection (`auto_vacuum` is still 0, so no
+  /// rewrite occurred) rather than on a stopwatch, and corroborated by the two counters that tell
+  /// this deferral from round 20's and from a conversion that was simply not owed.
+  func testAWorkspaceOpeningWhileTheConversionQueuesForTheWriterIsNotMadeToWaitForIt() async throws
+  {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try await makeLegacyDatabase(at: databaseURL)
+
+    let probe = ExclusionRevalidationProbe()
+    let harness = try await makeHeldWriterConversionFixture(
+      databaseURL: databaseURL, root: root, probe: probe)
+
+    // The open, placed rather than raced: the pass has demonstrably read the predicate once and been
+    // told the index is still quiet, and it cannot have reached the rewrite because the writer it
+    // needs is held by the wedged batch. This is `workspaceOpenGeneration.bump()`, one layer down.
+    probe.markWorkspaceOpened()
+    harness.releaseWedgedWriter.signal()
+    try await waitUntil("the close pass to complete", timeout: 30) { harness.maintenanceFinished.isSet
+    }
+
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 0,
+      "a workspace that opened while the one-shot conversion was still queuing for the writer must "
+        + "not have its index writes serialized behind a whole-file rewrite — and the substrate "
+        + "statement of that is that the rewrite never ran")
+    XCTAssertEqual(
+      harness.database.autoVacuumConversionsDeferredByOpen, 1,
+      "…and it must be recorded as a conversion abandoned AT the writer, which is the only thing "
+        + "that tells this deferral apart from round 20's pre-conversion downgrade")
+    XCTAssertFalse(
+      harness.database.didAttemptAutoVacuumConversion,
+      "…with the obligation DEFERRED to the next real close, never retired by a pass that gave way "
+        + "before paying for it")
+    XCTAssertGreaterThanOrEqual(
+      probe.reads, 2,
+      "fixture precondition: the predicate must genuinely have been re-read after the first "
+        + "revalidation, or this pin is asserting round 20's reading rather than round 21's")
+
+    try await finish(harness)
+  }
+
+  /// The control for the pin above, and the half that keeps the migration alive: with nothing opening
+  /// while the conversion queues, the same held-writer sequence must still convert once it gets the
+  /// writer.
+  ///
+  /// Without it, "give way to an open" could be satisfied by a build that simply never converts
+  /// again — which would retire the `auto_vacuum` migration silently, leaving every legacy database
+  /// unable to hand freed pages back to the filesystem for the rest of the product's life.
+  func testTheConversionStillRunsWhenNothingOpensWhileItQueuesForTheWriter() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try await makeLegacyDatabase(at: databaseURL)
+
+    let probe = ExclusionRevalidationProbe()
+    let harness = try await makeHeldWriterConversionFixture(
+      databaseURL: databaseURL, root: root, probe: probe)
+
+    // The gap is opened and closed with NOTHING happening in it. That is the whole experiment.
+    harness.releaseWedgedWriter.signal()
+    try await waitUntil("the close pass to complete", timeout: 30) { harness.maintenanceFinished.isSet
+    }
+
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 2,
+      "a close pass that waited for the writer and found the index still quiet must spend the "
+        + "one-shot conversion: deferring is for an open that arrived, not for every wait")
+    XCTAssertEqual(
+      harness.database.autoVacuumConversionsDeferredByOpen, 0,
+      "…so nothing may have been recorded as abandoned at the writer")
+    XCTAssertTrue(
+      harness.database.didAttemptAutoVacuumConversion,
+      "…and the pass that paid for it is the one allowed to retire it")
+
+    try await finish(harness)
+  }
+
+  /// A legacy database, an index write wedged INSIDE the pool's writer, and a `.workspaceClose` pass
+  /// released as far as its first revalidation — the shared state both round-21 conversion pins need.
+  ///
+  /// Returns with the pass provably past that first reading (`probe.reads >= 1`) and provably unable
+  /// to have started the rewrite, because the writer is still held. What the caller does next — let a
+  /// workspace open, or nothing — is the experiment.
+  private func makeHeldWriterConversionFixture(
+    databaseURL: URL, root: URL, probe: ExclusionRevalidationProbe
+  ) async throws -> HeldWriterConversionFixture {
+    let batches = WriterWedge()
+    let releaseWedgedWriter = DispatchSemaphore(value: 0)
+    // Safety valve, far above every wait here: a build that never reaches the wedge must FAIL its
+    // assertions rather than hang the suite.
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.poolWedgeReleaseSeconds) {
+      releaseWedgedWriter.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { _ in
+        // Only the FIRST batch is held: holding every batch would re-park the write after the
+        // release and turn the teardown into a second experiment.
+        guard batches.next() == 1 else { return }
+        releaseWedgedWriter.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 0,
+      "fixture precondition: opening an existing database must not have converted it by itself")
+
+    // Real files: the delta path reads each body off disk before it opens its transaction, and a
+    // document it cannot read is skipped — which would leave no batch to wedge on.
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let refs = try (0..<4).map { index -> DocumentRef in
+      let ref = documentRef(root: root, name: "held-writer-\(index).md")
+      try "heldwriterneedle \(index)".write(to: ref.url, atomically: true, encoding: .utf8)
+      return ref
+    }
+    let wedgedWriteFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.updateSearchIndexInBackground(
+        upserting: refs, deletingPaths: [], appState: nil)
+      wedgedWriteFinished.isSet = true
+    }
+    try await waitUntil("an index write to be holding the pool's SERIALIZED WRITER", timeout: 20) {
+      batches.value >= 1
+    }
+
+    let maintenanceFinished = CompletionFlag()
+    Task { @MainActor in
+      await database.performMaintenanceInBackground(
+        reason: .workspaceClose,
+        exclusionRemainsWarranted: { probe.stillWarranted() })
+      maintenanceFinished.isSet = true
+    }
+    try await waitUntil("the close pass to take its FIRST revalidation", timeout: 20) {
+      probe.reads >= 1
+    }
+    XCTAssertEqual(
+      try pragmaValue("auto_vacuum", at: databaseURL), 0,
+      "fixture precondition: the pass was told the index is still quiet, and it cannot have rewritten "
+        + "anything yet, because the writer it needs is held")
+
+    return HeldWriterConversionFixture(
+      database: database,
+      appState: appState,
+      releaseWedgedWriter: releaseWedgedWriter,
+      maintenanceFinished: maintenanceFinished,
+      wedgedWriteFinished: wedgedWriteFinished
+    )
+  }
+
+  /// Lets the wedged write return, so neither pin leaves a task parked on a semaphore.
+  private func finish(_ fixture: HeldWriterConversionFixture) async throws {
+    fixture.releaseWedgedWriter.signal()
+    try await waitUntil("the wedged index write to return", timeout: 30) {
+      fixture.wedgedWriteFinished.isSet
+    }
+  }
+
+  @MainActor
+  private struct HeldWriterConversionFixture {
+    let database: IndexDatabase
+    /// Held only so the database's owner outlives the pins' assertions.
+    let appState: AppState
+    let releaseWedgedWriter: DispatchSemaphore
+    let maintenanceFinished: CompletionFlag
+    let wedgedWriteFinished: CompletionFlag
+  }
+
+  /// The `exclusionRemainsWarranted` predicate, instrumented. Read from the close pass's DETACHED
+  /// closure and mutated from the main thread, so both halves are lock-guarded.
+  ///
+  /// `markWorkspaceOpened()` stands in for `workspaceOpenGeneration.bump()`: monotone, one-way, and
+  /// therefore incapable of flapping back to "still quiet" the way a raced real open could.
+  private final class ExclusionRevalidationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var readCount = 0
+    private var workspaceOpened = false
+
+    var reads: Int {
+      lock.lock()
+      defer { lock.unlock() }
+      return readCount
+    }
+
+    func markWorkspaceOpened() {
+      lock.lock()
+      workspaceOpened = true
+      lock.unlock()
+    }
+
+    func stillWarranted() -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      readCount += 1
+      return !workspaceOpened
+    }
+  }
+
+  /// Counts batch boundaries from GRDB's writer thread while the test reads the count from the main
+  /// thread — the same reason `WedgeSignal` is lock-guarded.
+  private final class WriterWedge: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+      lock.lock()
+      defer { lock.unlock() }
+      return count
+    }
+
+    func next() -> Int {
+      lock.lock()
+      defer { lock.unlock() }
+      count += 1
+      return count
+    }
+  }
+
   // MARK: - WAL bound
 
   /// The headline assertion: after churn the `-wal` file has a real high-water
