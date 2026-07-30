@@ -39,18 +39,21 @@ final class TerminationQuiescenceTests: XCTestCase {
   func testAutosaverFlushRunsTheArmedIndexWriteExactlyOnceAndCannotReArmAfterQuiescence() {
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
     let runs = Counter()
-    let owner = URL(fileURLWithPath: "/tmp/pensieve-autosaver-pin.md").standardizedFileURL
-    // The save debounce is owned by a SESSION object; held for the whole test because the autosaver
+    let document = URL(fileURLWithPath: "/tmp/pensieve-autosaver-pin.md").standardizedFileURL
+    // Both debounces are owned by a SESSION object; held for the whole test because the autosaver
     // keeps that ownership weakly.
+    let indexingSession = AppState()
     let savingSession = AppState()
 
     // A CLEAN owner: this pin is about flush mechanics, and a clean owner is the case that flushes.
-    autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
+    autosaver.scheduleIndex(owner: indexingSession, document: document, ownerIsDirty: { false }) {
+      runs.increment()
+    }
     XCTAssertEqual(
       runs.value, 0,
       "fixture precondition: with a ten-minute debounce the body must still be asleep")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, owner,
+      autosaver.armedIndexDocument(ownedBy: indexingSession), document,
       "…and the armed body must name the document it would index, so a close can tell its own "
         + "unsaved text from another window's")
 
@@ -69,7 +72,9 @@ final class TerminationQuiescenceTests: XCTestCase {
     autosaver.quiesceForTermination()
     XCTAssertTrue(autosaver.isQuiescedForTermination)
 
-    autosaver.scheduleIndex(owner: owner, ownerIsDirty: { false }) { runs.increment() }
+    autosaver.scheduleIndex(owner: indexingSession, document: document, ownerIsDirty: { false }) {
+      runs.increment()
+    }
     autosaver.scheduleSave(owner: savingSession) { runs.increment() }
     autosaver.flushIndex()
     XCTAssertEqual(
@@ -1258,8 +1263,8 @@ final class TerminationQuiescenceTests: XCTestCase {
       "fixture precondition: the session must be DIRTY — that is the half of the case the "
         + "unconditional flush got wrong")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, ref.id,
-      "fixture precondition: the armed debounce must belong to THIS document, not to another window")
+      autosaver.armedIndexDocument(ownedBy: appState), ref.id,
+      "fixture precondition: the armed debounce must belong to THIS window, over THIS document")
     XCTAssertEqual(
       try indexHits(matching: "faileddsaveneedle", at: databaseURL), 0,
       "fixture precondition: the debounce must still be asleep")
@@ -1336,15 +1341,15 @@ final class TerminationQuiescenceTests: XCTestCase {
     otherState.activeDocumentText = "otherwindowneedle from the window that is not closing"
     store.documentDidChange(appState: otherState)
     XCTAssertEqual(
-      autosaver.armedIndexOwner, otherRef.id,
-      "fixture precondition: the singleton's debounce must belong to the OTHER document")
+      autosaver.armedIndexDocument(ownedBy: otherState), otherRef.id,
+      "fixture precondition: the armed debounce must belong to the OTHER window's document")
 
     // …and then its own autosave lands: bytes on disk, buffer clean, index debounce still asleep.
     // This is the R5 window, and the reason the flush must not be withheld here.
     try otherState.documentSession.text.write(to: otherURL, atomically: true, encoding: .utf8)
     otherState.documentSession.isDirty = false
     XCTAssertFalse(
-      autosaver.armedIndexOwnerIsDirty,
+      autosaver.armedIndexOwnerIsDirty(ownedBy: otherState),
       "fixture precondition: the debounce's owner must read as CLEAN — that is the half of the rule "
         + "this pin defends")
 
@@ -1421,8 +1426,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     otherState.activeDocumentText = "deferredneedle that is only in the other window's buffer"
     store.documentDidChange(appState: otherState)
     XCTAssertEqual(
-      autosaver.armedIndexOwner, otherRef.id,
-      "fixture precondition: the singleton's debounce must belong to the OTHER document")
+      autosaver.armedIndexDocument(ownedBy: otherState), otherRef.id,
+      "fixture precondition: the armed debounce must belong to the OTHER window's document")
     XCTAssertTrue(
       otherState.documentSession.isDirty,
       "fixture precondition: the debounce's owner must be DIRTY — that is the case the R6 check "
@@ -1443,7 +1448,7 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "for another window's unsaved buffer, and once the write is scheduled nothing can take it "
         + "back")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, otherRef.id,
+      autosaver.armedIndexDocument(ownedBy: otherState), otherRef.id,
       "…and deferred means LEFT ARMED, not cancelled: dropping it would be the loss the flush-over-"
         + "cancel rule exists to prevent")
 
@@ -1535,9 +1540,9 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     XCTAssertTrue(
       autosaver.armedSaveIsOwned(by: ownerState),
-      "fixture precondition: the window that edited last must own the singleton's armed SAVE")
+      "fixture precondition: the window that edited last must own an armed SAVE")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, ownerRef.id,
+      autosaver.armedIndexDocument(ownedBy: ownerState), ownerRef.id,
       "fixture precondition: …and its armed index write, which round 7 defers to that save")
 
     // Everything from here to the close is synchronous on purpose: no suspension point, so neither
@@ -1560,7 +1565,7 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "deferred index debounce is waiting for, and deleting it leaves the index free to publish "
         + "text that no longer has anything scheduled to write it")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, ownerRef.id,
+      autosaver.armedIndexDocument(ownedBy: ownerState), ownerRef.id,
       "…and round 7's deferral must still be in place, or this pin would prove nothing about the "
         + "order of the two")
 
@@ -1669,8 +1674,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     neighbourState.activeDocumentText = "neighbourneedle waiting out its index debounce"
     store.documentDidChange(appState: neighbourState)
     XCTAssertEqual(
-      autosaver.armedIndexOwner, ref.id,
-      "fixture precondition: the neighbour must own the singleton's armed index debounce")
+      autosaver.armedIndexDocument(ownedBy: neighbourState), ref.id,
+      "fixture precondition: the neighbour must hold an armed index debounce")
 
     let untitledState = AppState()
     untitledState.documentSession.createUntitled()
@@ -1678,7 +1683,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     store.documentDidChange(appState: untitledState)
 
     XCTAssertEqual(
-      autosaver.armedIndexOwner, ref.id,
+      autosaver.armedIndexDocument(ownedBy: neighbourState), ref.id,
       "an untitled window has no index debounce of its own to cancel, so cancelling here could only "
         + "ever throw away a neighbour's — and on an ad-hoc document nothing would ever repair it")
   }
@@ -2263,8 +2268,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     neighbourState.activeDocumentText = "foreignindexneedle waiting out its index debounce"
     store.documentDidChange(appState: neighbourState)
     XCTAssertEqual(
-      autosaver.armedIndexOwner, neighbourRef.id,
-      "fixture precondition: window B must own the singleton's armed index debounce")
+      autosaver.armedIndexDocument(ownedBy: neighbourState), neighbourRef.id,
+      "fixture precondition: window B must hold an armed index debounce")
 
     // Window A, variant 1: an ordinary document switch. Its own session is clean and holds a
     // DIFFERENT document, so the debounce it is about to reach can only ever be somebody else's.
@@ -2272,7 +2277,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     switcherState.documents = [switcherRef]
     store.load(ref: switcherRef, into: switcherState)
     XCTAssertEqual(
-      autosaver.armedIndexOwner, neighbourRef.id,
+      autosaver.armedIndexDocument(ownedBy: neighbourState), neighbourRef.id,
       "a document switch in window A must leave window B's index debounce ARMED — cancelling it "
         + "here is the loss of freshness the save half was narrowed for in round 8")
 
@@ -2286,7 +2291,7 @@ final class TerminationQuiescenceTests: XCTestCase {
       "fixture precondition: window A's save-as must succeed, or the call site under test is never "
         + "reached")
     XCTAssertEqual(
-      autosaver.armedIndexOwner, neighbourRef.id,
+      autosaver.armedIndexDocument(ownedBy: neighbourState), neighbourRef.id,
       "…and a save-as in window A must not disarm it either")
 
     // Now let window B's own timers run: the 20 ms save lands the bytes, the 200 ms index debounce
@@ -2309,6 +2314,190 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and FTS must agree with them. An unconditional `cancelIndex()` on the session-change path "
         + "leaves this at 0 for good: the autosave that follows indexes nothing by contract, and an "
         + "ad-hoc document has no workspace signature to trigger a cold-open repair")
+  }
+
+  // MARK: - R15: the debounces are held PER WINDOW
+
+  /// Round 15, blocker 1 (P1, user-data loss) — the residual rounds 7, 8 and 11 named and deferred,
+  /// and the one that costs bytes without anybody closing anything.
+  ///
+  /// `Autosaver` held ONE armed save and ONE armed index write, and every arming cancelled whatever
+  /// was there. So the defect needed no close, no quit and no unusual timing: window A is edited,
+  /// window B is edited less than 1.5 s later, and A's pending save is gone — silently, while both
+  /// windows are still open. A's bytes then live only in its buffer, with nothing scheduled to write
+  /// them; a crash, a force-quit or a log-out loses the edit, and a FILE-BACKED document has no
+  /// recovery draft behind it. One debounce over, B's arming also dropped A's index write, which on
+  /// an ad-hoc document is a permanently stale FTS row (no workspace signature ⇒ no cold-open
+  /// self-heal). Every ownership rule the previous rounds added guarded the CANCEL paths; none of
+  /// them was reached here.
+  ///
+  /// The pin is deliberately end-to-end and asserts about BOTH sides. The two edits are separated by
+  /// no suspension point, so B really does arm inside A's debounce window, and the structural
+  /// assertions run before either timer can fire. Then both files must end up holding their OWN text
+  /// and both index writes must land — the singleton behaviour leaves A's file at its pre-edit body
+  /// and A's needle out of FTS for good.
+  func testEditingASecondWindowDoesNotCancelTheFirstWindowsPendingSaveOrIndexWrite() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    // Ad-hoc on both sides: the document class whose stale FTS row nothing ever repairs, so a
+    // dropped index write is permanent rather than merely late.
+    let urlA = folder.appendingPathComponent("window-a.md")
+    try "window A before the edit".write(to: urlA, atomically: true, encoding: .utf8)
+    let refA = DocumentRef(id: urlA.standardizedFileURL, isAdHoc: true)
+
+    let urlB = folder.appendingPathComponent("window-b.md")
+    try "window B before the edit".write(to: urlB, atomically: true, encoding: .utf8)
+    let refB = DocumentRef(id: urlB.standardizedFileURL, isAdHoc: true)
+
+    // The production 1.5 s / 5 s ordering, shrunk through `Autosaver`'s own init seam: the save
+    // lands first, the index write follows it. The assertion is the ORDER and the OWNERSHIP, never
+    // the timings.
+    let autosaver = Autosaver(saveDelayMilliseconds: 40, indexDelayMilliseconds: 200)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensievePerWindowDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    let bodyA = "windowaneedle that must not be cancelled by another window"
+    let stateA = AppState()
+    stateA.documents = [refA]
+    stateA.documentSession.load(document: refA, text: "window A before the edit")
+    stateA.activeDocumentText = bodyA
+    store.documentDidChange(appState: stateA)
+
+    // No suspension point between the two edits: window B arms strictly INSIDE window A's debounce,
+    // which is the entire scenario.
+    let bodyB = "windowbneedle from the window that edited second"
+    let stateB = AppState()
+    stateB.documents = [refB]
+    stateB.documentSession.load(document: refB, text: "window B before the edit")
+    stateB.activeDocumentText = bodyB
+    store.documentDidChange(appState: stateB)
+
+    XCTAssertTrue(
+      autosaver.armedSaveIsOwned(by: stateA),
+      "arming for window B must not take window A's pending save: nothing else is scheduled to put "
+        + "A's buffer on disk, and a file-backed document has no recovery draft behind it")
+    XCTAssertTrue(
+      autosaver.armedSaveIsOwned(by: stateB),
+      "…and B's own save must be armed, or this pin would pass on an autosaver that simply never "
+        + "arms")
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), refA.id,
+      "…and the same holds one debounce over: B's arming must not drop A's index write, which on an "
+        + "ad-hoc document nothing would ever re-issue")
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateB), refB.id,
+      "…with B holding its own")
+
+    try await waitUntil("both windows' autosaves to land their own bytes") {
+      (try? String(contentsOf: urlA, encoding: .utf8)) == bodyA
+        && (try? String(contentsOf: urlB, encoding: .utf8)) == bodyB
+    }
+    XCTAssertEqual(
+      try String(contentsOf: urlA, encoding: .utf8), bodyA,
+      "each file must hold ITS OWN text: the loss this pin forbids is A's edit staying in memory "
+        + "while B's is written")
+    XCTAssertEqual(try String(contentsOf: urlB, encoding: .utf8), bodyB)
+
+    try await waitUntil("both windows' deferred index writes to publish those bytes") {
+      await database.drainPendingIndexWrites()
+      return ((try? self.indexHits(matching: "windowaneedle", at: databaseURL)) ?? 0) == 1
+        && ((try? self.indexHits(matching: "windowbneedle", at: databaseURL)) ?? 0) == 1
+    }
+    XCTAssertEqual(
+      try indexHits(matching: "windowaneedle", at: databaseURL), 1,
+      "…and BOTH index writes must land, in the order their saves did")
+    XCTAssertEqual(try indexHits(matching: "windowbneedle", at: databaseURL), 1)
+  }
+
+  /// The round 8 residual that per-owner keying closes on the way: two windows open on the SAME file.
+  ///
+  /// Ownership on the index side used to be the document URL, so `cancelArmedIndexIfOwned` could not
+  /// tell "my own debounce over this file" from "the other window's debounce over the same file". A
+  /// perfectly ordinary document switch in window B therefore threw away window A's pending index
+  /// write over A's unsaved text — and for an ad-hoc document that row is never revisited. Keying on
+  /// the SESSION makes the two distinguishable: B simply has no entry of its own to cancel.
+  ///
+  /// End-to-end, because "still armed" is only half the claim: A's own autosave must then land its
+  /// bytes and A's surviving debounce must publish exactly those bytes.
+  func testASessionChangeInASecondWindowOnTheSameFileLeavesTheFirstWindowsDebounceArmed()
+    async throws
+  {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("shared-by-two-windows.md")
+    try "the shared file before the edit".write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    let elsewhereURL = folder.appendingPathComponent("window-b-switches-here.md")
+    try "the document window B switches to".write(
+      to: elsewhereURL, atomically: true, encoding: .utf8)
+    let elsewhereRef = DocumentRef(id: elsewhereURL.standardizedFileURL, isAdHoc: true)
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 40, indexDelayMilliseconds: 200)
+    let store = DocumentStore(
+      autosaver: autosaver,
+      indexDatabase: database,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveSameFileDebounceBookmarks")),
+      recoveryStore: RecoveryStore(
+        directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    )
+
+    let bodyA = "sharedfileneedle from the window that is not switching"
+    let stateA = AppState()
+    stateA.documents = [sharedRef]
+    stateA.documentSession.load(document: sharedRef, text: "the shared file before the edit")
+    stateA.activeDocumentText = bodyA
+    store.documentDidChange(appState: stateA)
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "fixture precondition: window A must hold an armed index debounce over the shared file")
+
+    // Window B is open on the SAME document and is clean, so its switch is the ordinary path — the
+    // one that used to match on the URL and cancel a debounce belonging to somebody else.
+    let stateB = AppState()
+    stateB.documents = [sharedRef, elsewhereRef]
+    stateB.documentSession.load(document: sharedRef, text: "the shared file before the edit")
+    XCTAssertNil(
+      autosaver.armedIndexDocument(ownedBy: stateB),
+      "fixture precondition: window B must have armed nothing of its own — it only ever reads")
+
+    store.load(ref: elsewhereRef, into: stateB)
+
+    XCTAssertEqual(
+      autosaver.armedIndexDocument(ownedBy: stateA), sharedRef.id,
+      "a switch in a window that shares the FILE must leave the other window's debounce armed: "
+        + "sharing a document is not owning its debounce, and on an ad-hoc document dropping it is "
+        + "permanent")
+
+    try await waitUntil("window A's autosave to land its bytes on disk") {
+      (try? String(contentsOf: sharedURL, encoding: .utf8)) == bodyA
+    }
+    try await waitUntil("window A's surviving index debounce to publish those bytes") {
+      await database.drainPendingIndexWrites()
+      return ((try? self.indexHits(matching: "sharedfileneedle", at: databaseURL)) ?? 0) == 1
+    }
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyA,
+      "…and FTS must agree with the disk, which is the whole point of not dropping the write")
   }
 
   // MARK: - Fixtures
