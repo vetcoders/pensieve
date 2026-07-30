@@ -1849,6 +1849,11 @@ final class IndexDatabase {
     guard let pool = await ensureOpenInBackground(into: appState) else { return }
     let didInsertBatch = didInsertSearchIndexBatch
     let batchSize = searchIndexBatchSize
+    // The third write path that builds document/FTS rows in a loop, and the entry guard above is
+    // exactly as insufficient here as it was for the reindex/delta twins: once this call has passed
+    // it, the write is a detached task holding the pool's writer, and nothing on the quit's
+    // budget-expiry path reaches it. See `abandonIfClosedForTermination(_:)`.
+    let latch = terminationLatch
 
     do {
       // Build per-document write records keyed on each doc's OWN root identity
@@ -1872,6 +1877,7 @@ final class IndexDatabase {
       }
       try await Task.detached(priority: .utility) {
         try pool.write { db in
+          try Self.abandonIfClosedForTermination(latch)
           // The REGISTRY row for the whole N-root workspace (manifest / scan_session /
           // stats anchor). Document rows below live under their per-root workspace_ids.
           try Self.upsertWorkspace(identity: identity, roots: roots, lastSeenAt: lastSeenAt, in: db)
@@ -1884,6 +1890,7 @@ final class IndexDatabase {
           // byte-identical; multi-root fans out to one group per root.
           let recordsByWorkspace = Dictionary(grouping: records, by: \.workspaceID)
           for (workspaceID, group) in recordsByWorkspace {
+            try Self.abandonIfClosedForTermination(latch)
             // FK target: the per-root workspaces row, mapped to its real canonical_path
             // so the search full-path reconstruction (canonical_path || '/' || path)
             // stays correct for every root.
@@ -1899,6 +1906,7 @@ final class IndexDatabase {
               indexedAt: lastSeenAt,
               batchSize: batchSize,
               didInsertBatch: didInsertBatch,
+              latch: latch,
               in: db
             )
             try Self.tombstoneDocumentsNotIn(
@@ -1913,6 +1921,8 @@ final class IndexDatabase {
           }
         }
       }.value
+    } catch is IndexWriteAbandonedAfterTermination {
+      Self.logAbandonedWriteAfterTermination("upsertWorkspace")
     } catch {
       report(error, appState: appState, action: "update Pensieve workspace index")
     }
@@ -2103,6 +2113,17 @@ final class IndexDatabase {
   ///
   /// Placed BEFORE each `upsertDocuments` rather than after, so the granularity of the abort is one
   /// batch of work not started, not one batch of work wasted.
+  ///
+  /// `upsertWorkspace` is the third path consulting this, and it returns `Void` — so its
+  /// abandonment cannot be propagated through a result, and it does not need to be. Its manifest and
+  /// tree fingerprint are written by `commitWorkspaceManifest` BEFORE the index write is even handed
+  /// off, so no return value could retract them; what must not happen is the rest of that hand-off
+  /// recording the workspace as freshly scanned. `appendScanSession` and `refreshWorkspaceStats`
+  /// (which would write a `cold_scan` row and an `index_health` of `green` over rows this
+  /// transaction rolled back) are their own entry points, and the funnel that closed in the same
+  /// step as this latch refuses both. The abandonment therefore propagates through refusal rather
+  /// than through a signature — and the `.md` search signature is a separate mechanism, gated on
+  /// the reindex/delta `Bool` that already covers it.
   private nonisolated static func abandonIfClosedForTermination(_ latch: TerminationLatch) throws {
     guard latch.isClosedForTermination else { return }
     throw IndexWriteAbandonedAfterTermination()
@@ -2321,6 +2342,7 @@ final class IndexDatabase {
     indexedAt: Date,
     batchSize: Int = 1,
     didInsertBatch: (@Sendable (Int) -> Void)? = nil,
+    latch: TerminationLatch,
     in db: Database
   ) throws {
     let timestamp = Int(indexedAt.timeIntervalSince1970)
@@ -2365,6 +2387,11 @@ final class IndexDatabase {
       if changedInBatch == batchSize {
         didInsertBatch?(changedInBatch)
         changedInBatch = 0
+        // The workspace-manifest twin of the reindex/delta batch consultation, and the same
+        // granularity: a batch is never STARTED after the latch closed. Placed here rather than at
+        // the head of the loop because this writer batches per WRITTEN row — an unchanged row is
+        // skipped before it counts, so "start of a batch" is the boundary, not the iteration.
+        try abandonIfClosedForTermination(latch)
       }
     }
     if changedInBatch > 0 {

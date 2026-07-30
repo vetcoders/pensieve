@@ -445,6 +445,120 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "`pool.write`, so a partially-built reindex is not a smaller commit, it is no commit")
   }
 
+  /// The same defect on the THIRD write path, and the one round 16 knowingly left open: the
+  /// workspace-manifest upsert. `upsertWorkspace` has the entry guard and the write-gate seam, but
+  /// nothing inside its `pool.write` ever asked whether the funnel had closed — so an accepted
+  /// manifest commit that outlived the quit's budget wrote `documents` (and, through the triggers,
+  /// FTS) rows and recreated WAL frames behind the terminal checkpoint, exactly as the reindex did.
+  ///
+  /// Two things make this path its own pin rather than a copy. Its batching lives one level down, in
+  /// the shared `upsertDocuments(records:workspaceID:indexedAt:batchSize:didInsertBatch:latch:in:)`
+  /// writer, so the consultation had to go to the batch BOUNDARY there — this writer counts only
+  /// rows it actually wrote, so "one iteration" and "one batch" are not the same thing. And it
+  /// returns `Void`: there is no `false` to carry the abandonment out to a caller. What must not
+  /// happen is the rest of `commitWorkspaceManifest`'s hand-off recording the workspace as freshly
+  /// scanned over rows that rolled back, and that is covered by refusal — `appendScanSession` and
+  /// `refreshWorkspaceStats` are separate entry points which the funnel refuses. The manifest and
+  /// fingerprint themselves are written BEFORE the index write is handed off, so no return value
+  /// could have retracted them anyway.
+  ///
+  /// Handed over through `scheduleIndexWrite` because that is how production hands it over: the
+  /// quit's drain then genuinely parks on this write instead of racing it.
+  func testAnAcceptedWorkspaceUpsertStopsBuildingWhenTheQuitBudgetExpires() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let batches = Counter()
+    let releaseWedge = DispatchSemaphore(value: 0)
+    defer { releaseWedge.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      releaseWedge.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      searchIndexBatchSize: 1,
+      didInsertSearchIndexBatch: { _ in
+        // Only the FIRST batch is held — see the reindex twin: holding every batch would park the
+        // write again after the latch and prove nothing about whether the loop CHOSE to stop.
+        guard batches.next() == 1 else { return }
+        releaseWedge.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let refs = (0..<12).map { documentRef(root: root, name: "manifest-abandon-\($0).md") }
+    for (offset, ref) in refs.enumerated() {
+      try "abandonedmanifestneedle \(offset)".write(to: ref.url, atomically: true, encoding: .utf8)
+    }
+    let identity = WorkspaceIdentity.make(roots: [root], bookmarkData: nil)
+
+    // The write's OWN app state, so the last assertion can tell "logged" from "reported": an
+    // abandoned write must not raise a user-facing error on an app that is closing.
+    let writeAppState = AppState()
+    let writeFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.upsertWorkspace(
+        identity: identity,
+        roots: [root],
+        documents: refs,
+        appState: writeAppState
+      )
+      writeFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { batches.value >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      batches.value, 1,
+      "fixture precondition: the manifest upsert must be mid-build, holding the pool's writer "
+        + "inside its transaction")
+
+    let sequence = TerminationSequence(
+      registry: DocumentWindowRegistry(),
+      indexDatabase: database,
+      folderManager: makeIsolatedFolderManager(
+        in: folder, database: database, prefix: "AbandonedManifest"),
+      autosaver: Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000),
+      drainTimeout: Self.shrunkDrainBudget)
+    let startedAt = Date()
+    sequence.runBlockingMainRunLoop()
+    let elapsed = Date().timeIntervalSince(startedAt)
+
+    XCTAssertLessThan(
+      elapsed, Self.boundedQuitSeconds,
+      "fixture precondition: the quit must have escaped its budget rather than waited the wedge "
+        + "out; it took \(elapsed) s")
+    XCTAssertTrue(
+      database.isClosedForTermination,
+      "fixture precondition: a spent budget must still close the funnel — that latch is the signal "
+        + "this pin is about")
+    XCTAssertEqual(
+      database.terminationRejectedEntryPoints, [],
+      "fixture precondition: the manifest upsert must have been ACCEPTED, not refused at entry. A "
+        + "rejection here would mean this pin never reproduced the window it exists for")
+
+    releaseWedge.signal()
+    pumpMainRunLoop(until: { writeFinished.isSet }, timeout: 20)
+    XCTAssertTrue(writeFinished.isSet, "the abandoned write must return promptly, not hang")
+
+    XCTAssertEqual(
+      batches.value, 1,
+      "the accepted workspace upsert kept building after the termination latch closed: with a batch "
+        + "per document, every increment past the first is a statement executed behind the fallback "
+        + "checkpoint, and the whole transaction then commits behind it")
+    XCTAssertEqual(
+      try indexHits(matching: "abandonedmanifestneedle", at: databaseURL), 0,
+      "…and the transaction must have rolled back WHOLLY: the manifest upsert is a single "
+        + "`pool.write` too, so a half-written workspace is not a smaller commit, it is no commit")
+    XCTAssertNil(
+      writeAppState.lastError,
+      "…and abandonment is a decision the quit made about the index, not an error the user can act "
+        + "on: it must be LOGGED like the reindex twin, never surfaced as \"could not update "
+        + "workspace index\" on an app nobody can answer any more")
+  }
+
   /// The subtle half of the latch: refusing WRITES is not enough, because in this app a read can
   /// write. `ensureOpen` builds the pool lazily and runs every migration on first creation, so a
   /// backlink query or a search arriving during the quit could create the database file, execute a
