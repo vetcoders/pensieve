@@ -170,9 +170,7 @@ struct EditorPreviewSplit: View {
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
     if !appState.documentHasEditableBuffer {
-      DocumentEmptyStateView(
-        hasWorkspace: appState.hasWorkspaceContent
-      )
+      DocumentEmptyStateView()
     } else {
       switch appState.mode {
       case .source:
@@ -243,42 +241,25 @@ private struct FocusModeDimmingOverlay: View {
 /// after the workspace is cleared. The window stays alive; this view is the
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
-  let hasWorkspace: Bool
+  @EnvironmentObject private var controller: AppController
 
   var body: some View {
-    VStack(spacing: 18) {
-      VStack(spacing: 12) {
-        Image(systemName: "doc.text")
-          .font(.system(size: 48, weight: .light))
-          .foregroundStyle(.tertiary)
+    VStack(spacing: 26) {
+      EmptyStateWordmark(size: 40)
 
-        Text("No Document Open")
-          .font(.title2)
-          .foregroundStyle(.secondary)
+      EmptyStateShortcuts()
 
-        Text(secondaryMessage)
-          .font(.callout)
-          .foregroundStyle(.tertiary)
-          .multilineTextAlignment(.center)
-          .padding(.horizontal, 32)
-          .accessibilityIdentifier("pensieve.emptyState.message")
+      EmptyStateRecents(store: controller.recentDocuments)
 
-        Text(BuildIdentity.current.conciseLabel)
-          .font(.caption)
-          .foregroundStyle(.tertiary)
-          .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
-      }
+      Text(BuildIdentity.current.conciseLabel)
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+        .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
     }
+    .padding(32)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
     .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.emptyState")
-  }
-
-  private var secondaryMessage: String {
-    if hasWorkspace {
-      return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
-    }
-    return "Open a Markdown file or folder from the File menu to get started."
   }
 }

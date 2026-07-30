@@ -127,23 +127,16 @@ struct SidebarView: View {
   }
 
   private var emptyState: some View {
-    VStack(spacing: 12) {
+    VStack(alignment: .leading, spacing: 16) {
       Spacer()
-      Image(systemName: "folder.badge.plus")
-        .font(.system(size: 36))
-        .foregroundColor(.secondary)
-      Text("No folder open")
-        .font(.headline)
-      Text("⌘O opens a Markdown file. ⌘⇧O opens a workspace folder.")
-        .font(.caption)
-        .foregroundColor(.secondary)
-      Button("New File…") {
-        controller.createUntitledDocument()
-      }
-      .accessibilityIdentifier("pensieve.sidebar.emptyState.newFile")
+      EmptyStateWordmark(size: 22)
+      EmptyStateShortcuts(
+        newFileAccessibilityIdentifier: "pensieve.sidebar.emptyState.newFile")
+      EmptyStateRecents(store: controller.recentDocuments, limit: 5)
       Spacer()
     }
-    .frame(maxWidth: .infinity)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.horizontal, 14)
     .accessibilityIdentifier("pensieve.sidebar.emptyState")
   }
 
