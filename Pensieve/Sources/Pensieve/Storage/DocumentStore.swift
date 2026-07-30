@@ -63,6 +63,12 @@ final class FolderManager {
   /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
   /// task so a filesystem event cannot cancel a user-requested refresh.
   private var forcedRefreshTask: Task<Void, Never>?
+  /// Bumped by every explicit refresh this manager actually ARMS, and readable from outside for the
+  /// same reason `watcherRefreshGeneration` is: proving that nothing was armed needs the counter
+  /// itself, because a task that was never created leaves no handle to await. Round 19's trash-route
+  /// latch is what made that distinguishable — the refusal happens before the task exists, so a test
+  /// that watched only the scanner could not tell the arming site's refusal from the task body's.
+  private(set) var forcedRefreshGeneration: UInt64 = 0
   /// Tracks the off-main FTS index write launched by live refresh or cold indexing (incremental
   /// delta OR full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so
   /// callers can await it. The underlying `pool.write` is a single transaction inside
@@ -748,16 +754,38 @@ final class FolderManager {
     scheduleExplicitRefresh(into: appState, forcePresentation: true)
   }
 
+  /// The arming site of the explicit reconcile, latched against the quit for the same reason
+  /// `scheduleWatcherRefresh` is — and, since round 19, for a reason that is not hypothetical.
+  ///
+  /// `moveToTrash` genuinely SUSPENDS before it gets here: it parks on a `withCheckedContinuation`
+  /// around Finder's `recycleItems`, and only the completion brings it back to prune, remove
+  /// references, and ask for this refresh. A quit that begins while it is parked therefore has no
+  /// `forcedRefreshTask` to cancel — there is none yet — and `runBlockingMainRunLoop()` is precisely
+  /// what resumes the continuation. Without this guard the resumed call armed a full replacement scan
+  /// whose `applyRefresh` republishes the tree, commits the workspace manifest and asks the index to
+  /// write, all after the drain had already taken its snapshots. A cancel covers the task that exists;
+  /// only refusal covers its successor.
+  ///
+  /// Round 17 said this method was out of scope because a queued WATCHER hop cannot reach it. That
+  /// remains true and is not what this closes: the trash continuation is a different route in.
+  ///
+  /// Checked in the task BODY as well, because the arming site can be passed a moment before the latch
+  /// closes while the body only starts afterwards — the same "the two halves must not disagree"
+  /// property `quiesceForTermination()` documents. Quit-only, so `moveToTrash` outside termination
+  /// reconciles exactly as before.
   @discardableResult
   private func scheduleExplicitRefresh(
     into appState: AppState,
     forcePresentation: Bool
   ) -> Task<Void, Never>? {
+    guard !isQuiescedForTermination else { return nil }
     guard appState.hasWorkspaceContent else { return nil }
+    forcedRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
     let task = Task { [weak self, weak appState] in
       guard let self, let appState, appState.hasWorkspaceContent else { return }
+      guard !self.isQuiescedForTermination else { return }
       let roots = appState.workspaceRoots.map(\.url)
       let rootPaths = roots.map { $0.standardizedFileURL.path }
       let exclusions = appState.excludedWorkspacePaths

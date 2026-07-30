@@ -837,6 +837,140 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "refresh ran and only the funnel stopped it")
   }
 
+  /// Round 19, blocker 2. The sibling of the pin above, on the route the R17 fix does not cover.
+  ///
+  /// `moveToTrash` genuinely SUSPENDS: it parks on a `withCheckedContinuation` around Finder's
+  /// `recycleItems` and only afterwards prunes, removes references, and calls
+  /// `scheduleExplicitRefresh(forcePresentation: true)`. A quit that begins while it is parked
+  /// therefore finds no `forcedRefreshTask` to cancel — there is none yet — and the termination
+  /// run-loop pump is exactly what resumes the continuation. The arming site used to consult only
+  /// `hasWorkspaceContent`, so the resumed call armed a full replacement scan whose `applyRefresh`
+  /// publishes the workspace cache, commits the manifest, and asks the index to write, all after the
+  /// drain has already taken its snapshots.
+  ///
+  /// This is a DIFFERENT route rather than a hole in R17: that round latched the watcher's queued hop,
+  /// and correctly said `scheduleExplicitRefresh` was unreachable from one. It is reachable from here.
+  ///
+  /// Arming is observed through the injected scanner, because there is no public handle for a task
+  /// that was never created: every refresh runs its walk through the builder, so zero invocations
+  /// after the quiescence IS "nothing armed". The control ahead of it trashes an identical folder on a
+  /// LIVE manager, so a fixture that silently stopped reaching the refresh at all would fail loudly
+  /// instead of passing for the wrong reason.
+  func testATrashResumedAfterTheQuiescenceArmsNoExplicitRefresh() async throws {
+    let fixture = try TrashTestFixture.make()
+    let liveFolderURL = fixture.root.appendingPathComponent("live", isDirectory: true)
+      .standardizedFileURL
+    let quitFolderURL = fixture.root.appendingPathComponent("quit", isDirectory: true)
+      .standardizedFileURL
+    for folder in [liveFolderURL, quitFolderURL] {
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      try "# \(folder.lastPathComponent) note".write(
+        to: folder.appendingPathComponent("note.md"), atomically: true, encoding: .utf8)
+    }
+
+    let scanner = CountingWorkspaceBuilder()
+    let harness = try makeTrashHarness(root: fixture.root, workspaceBuilder: scanner.builder)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+    await harness.openWorkspace()
+
+    // CONTROL: the identical trash on a live manager reconciles, and a reconcile is a scanner walk.
+    scanner.reset()
+    let armedBeforeControl = harness.folderManager.forcedRefreshGeneration
+    let liveOperation = harness.requestTrash(liveFolderURL)
+    await harness.waitForRecycleRequest()
+    harness.completeRecycle()
+    let liveDidTrash = await liveOperation.value
+    XCTAssertTrue(liveDidTrash)
+    await settle(harness.folderManager, harness.indexDatabase)
+    XCTAssertGreaterThan(
+      harness.folderManager.forcedRefreshGeneration, armedBeforeControl,
+      "fixture precondition: a normal trash must still ARM its explicit refresh — the latch below is "
+        + "quit-only, and a fixture that never reached the refresh would prove nothing")
+    XCTAssertGreaterThan(
+      scanner.invocations, 0, "…and that arming must really reach a scanner walk")
+    XCTAssertFalse(treeContains(harness.appState.workspaceTree, url: liveFolderURL))
+
+    // THE PIN. Park on the recycle continuation, quiesce, and only then resume — the ordering the
+    // termination run-loop pump produces.
+    scanner.reset()
+    let armedBeforeQuiesce = harness.folderManager.forcedRefreshGeneration
+    let quitOperation = harness.requestTrash(quitFolderURL)
+    await harness.waitForRecycleRequest()
+    harness.folderManager.quiesceForTermination()
+    harness.completeRecycle()
+    let quitDidTrash = await quitOperation.value
+    XCTAssertTrue(
+      quitDidTrash,
+      "the trash itself must still succeed: the latch refuses the PRODUCER, it does not abort the "
+        + "user's operation or its synchronous state repair")
+
+    // Give anything that WAS armed every chance to arm, walk, and publish before asserting it wasn't.
+    await settle(harness.folderManager, harness.indexDatabase)
+    try await Task.sleep(nanoseconds: UInt64(Self.settleSeconds * 1_000_000_000))
+    await settle(harness.folderManager, harness.indexDatabase)
+
+    XCTAssertEqual(
+      harness.folderManager.forcedRefreshGeneration, armedBeforeQuiesce,
+      "a continuation resumed after the quiescence must ARM no explicit refresh: the drain has taken "
+        + "its snapshots, so a replacement scan armed here publishes workspace cache and manifest "
+        + "state and asks the index to write behind the terminal checkpoint")
+    XCTAssertEqual(
+      scanner.invocations, 0,
+      "…and nothing may reach a scanner walk either — refused at the arming site, so the walk is "
+        + "never even started inside the quit's budget")
+    XCTAssertFalse(
+      treeContains(harness.appState.workspaceTree, url: quitFolderURL),
+      "…while the synchronous half of the trash — prune, reference removal — is untouched by the "
+        + "latch, so the quit still sees the state the user's action produced")
+  }
+
+  /// The successor half of the pin above: a refresh whose ARMING site was passed a moment before the
+  /// latch closed, but whose task body only gets the main actor afterwards.
+  ///
+  /// `quiesceForTermination()` cancels `forcedRefreshTask`, but the body's only cancellation check
+  /// sits AFTER its detached walk — so without a latch consultation inside the body, a quit still
+  /// paid for a full tree scan it had already decided to discard, inside its own budget. The arming
+  /// and the quiescence are two synchronous main-actor steps here with no suspension between them,
+  /// which is exactly the production ordering: the body cannot have started yet.
+  func testARefreshArmedAMomentBeforeTheQuiescenceStartsNoScanAfterIt() async throws {
+    let fixture = try TrashTestFixture.make()
+    try "# a note the refresh would walk".write(
+      to: fixture.root.appendingPathComponent("note.md"), atomically: true, encoding: .utf8)
+
+    let scanner = CountingWorkspaceBuilder()
+    let harness = try makeTrashHarness(root: fixture.root, workspaceBuilder: scanner.builder)
+    defer {
+      harness.closeWorkspace()
+      fixture.cleanup()
+    }
+    await harness.openWorkspace()
+
+    // CONTROL: the same arming on a live manager really does walk.
+    scanner.reset()
+    harness.folderManager.refresh(into: harness.appState, force: true)
+    await settle(harness.folderManager, harness.indexDatabase)
+    XCTAssertGreaterThan(
+      scanner.invocations, 0,
+      "fixture precondition: this arming must reach the scanner when nothing has quiesced")
+
+    // THE PIN. Arm, then quiesce, with no suspension between them.
+    scanner.reset()
+    harness.folderManager.refresh(into: harness.appState, force: true)
+    harness.folderManager.quiesceForTermination()
+
+    await settle(harness.folderManager, harness.indexDatabase)
+    try await Task.sleep(nanoseconds: UInt64(Self.settleSeconds * 1_000_000_000))
+    await settle(harness.folderManager, harness.indexDatabase)
+
+    XCTAssertEqual(
+      scanner.invocations, 0,
+      "a body that reaches the main actor after the quiescence must not start its walk: the result "
+        + "is discarded either way, and the walk is charged to the quit's budget")
+  }
+
   /// P9: the post-close index housekeeping. `Close Folder` arms a barrier vacuum plus a truncating
   /// checkpoint on a task nobody but the tests ever awaited; a fast ⌘Q straight after it raced that
   /// vacuum against the quit's own checkpoint, and GRDB serializes the two without ordering them —
@@ -3330,6 +3464,13 @@ final class TerminationQuiescenceTests: XCTestCase {
         store: WorkspaceCacheStore(
           baseDirectory: folder.appendingPathComponent("WorkspaceCache", isDirectory: true)))
     )
+  }
+
+  private func treeContains(_ nodes: [WorkspaceNode], url: URL) -> Bool {
+    let path = url.standardizedFileURL.path
+    return nodes.contains { node in
+      node.url?.standardizedFileURL.path == path || treeContains(node.children ?? [], url: url)
+    }
   }
 
   private func settle(_ manager: FolderManager, _ indexDatabase: IndexDatabase) async {
