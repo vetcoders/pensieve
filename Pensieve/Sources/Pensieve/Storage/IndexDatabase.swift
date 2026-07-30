@@ -79,6 +79,13 @@ final class IndexDatabase {
   /// role `terminationRejectedEntryPoints` plays for the latch.
   private(set) var indexBatchTruncationDeferrals = 0
 
+  /// Close passes that decided to exclude readers and then took it back at barrier acquisition,
+  /// because a workspace opened inside their detached prologue. Production never reads it; it is the
+  /// only seam that can tell a BARRIER-TIME downgrade from a call-time one, since the latter is
+  /// visible in the `MaintenanceReason` that reaches `maintenanceGateOverride` and the former by
+  /// construction is not — it happens after that seam.
+  private(set) var barrierTimeMaintenanceDowngrades = 0
+
   /// One-way switch set by `quiesceIndexBatchTruncationRetry()`. The backoff ladder is the ONE index
   /// producer the termination drain cannot see — it sleeps outside `scheduledIndexWrites` on purpose,
   /// so the drain never has to wait out a timer — which also means the drain cannot bound it. This
@@ -1172,6 +1179,13 @@ final class IndexDatabase {
     /// the operator types — plain write, `busy_timeout = 0`, `SQLITE_BUSY` means "not now" and
     /// re-arms the backoff ladder — so the bound is deferred and still enforced, and no reader is
     /// ever excluded for it.
+    ///
+    /// Reachable in two ways since round 20, with identical semantics. A pass may CARRY this reason
+    /// from the moment it is called (the open had already happened by then), or it may carry
+    /// `.workspaceClose` and be downgraded to this behaviour at BARRIER ACQUISITION, when the open
+    /// happened inside its detached prologue instead. The second case never appears in the `reason`
+    /// value — see `performMaintenanceInBackground(reason:exclusionRemainsWarranted:)` and the
+    /// `barrierTimeMaintenanceDowngrades` counter.
     case workspaceCloseIntoOpenWorkspace
 
     /// Whether this pass may take `barrierWriteWithoutTransaction` — the one GRDB lock that
@@ -1248,7 +1262,11 @@ final class IndexDatabase {
 
   /// The legacy-database conversion is attempted at most once per process — a failed or skipped
   /// conversion must not re-run a multi-second VACUUM on every workspace close.
-  private var didAttemptAutoVacuumConversion = false
+  ///
+  /// Readable from outside for the same reason `indexBatchTruncationDeferrals` is: a pass that gave
+  /// way to a reopen must DEFER the conversion rather than retire it, and proving something did not
+  /// happen needs the flag itself — there is no VACUUM to observe.
+  private(set) var didAttemptAutoVacuumConversion = false
 
   /// Arms hot-path storage hygiene as its OWN tracked index write, instead of awaiting it inside the
   /// write task the supersede chain points at. Round 11's liveness fix, and the SINGLE hot-path entry
@@ -1344,7 +1362,10 @@ final class IndexDatabase {
   /// - `.workspaceCloseIntoOpenWorkspace` is a close pass that discovered it is no longer running
   ///   into a quiet index — a NEW workspace opened while it was queued behind the close's drain —
   ///   so "by close time there is nothing left" stopped being true and the exclusion stopped being
-  ///   correct. It therefore takes the hot path's lock, for the hot path's reason.
+  ///   correct. It therefore takes the hot path's lock, for the hot path's reason. Since round 20
+  ///   that discovery is made twice: once by the caller before this method is entered, and once by
+  ///   this method immediately before the barrier, because the prologue in between is long enough
+  ///   to contain a whole-file `VACUUM`.
   ///
   /// Measured on GRDB 6.29.3 / SQLite on macOS 15 (round-12 probe, recorded because both halves are
   /// counter-intuitive):
@@ -1358,7 +1379,20 @@ final class IndexDatabase {
   ///   call truncates the file to zero. Silent recycling is what a PASSIVE checkpoint does (see
   ///   `MaintenanceReason`), which is why the deferral keeps retrying a TRUNCATE: the 16 MiB bound
   ///   has to be enforced eventually, not quietly retired.
-  func performMaintenanceInBackground(reason: MaintenanceReason) async {
+  /// `exclusionRemainsWarranted` is round 20's half of the same axis, and it is a SECOND reading of
+  /// the question `reason` already answered once. The caller decides the reason on the main actor
+  /// immediately before this call, but the lock is taken much later — after the seam below, after the
+  /// detached hop, and (on the undowngraded path) after a `VACUUM` conversion that rewrites the whole
+  /// file. An `Open Folder` landing anywhere in that prologue would leave a `.workspaceClose` pass
+  /// excluding the readers of a workspace that opened after it decided. So a pass that MAY exclude
+  /// readers asks again immediately before the barrier; a `false` there downgrades it in place, with
+  /// the same semantics a call-time downgrade has — obligation kept, exclusion dropped, conversion
+  /// not retired. `nil` (the default) means "no revalidation available", which is what the hot path
+  /// and the tests that drive this method directly pass.
+  func performMaintenanceInBackground(
+    reason: MaintenanceReason,
+    exclusionRemainsWarranted: (@Sendable () -> Bool)? = nil
+  ) async {
     guard !isRefusedAfterTermination("performMaintenanceInBackground") else { return }
     guard let pool = databasePool, let databaseURL else { return }
     if !reason.mayExcludeReaders,
@@ -1393,10 +1427,26 @@ final class IndexDatabase {
       return
     }
 
-    await Task.detached(priority: .utility) {
+    let pageBudget = Self.incrementalVacuumPageBudget
+    let outcome = await Task.detached(priority: .utility) { () -> ClosePassOutcome in
+      // Revalidation, first reading: BEFORE the conversion, so a pass that has already lost its
+      // quiet index never pays for the whole-file rewrite the downgraded reason is defined to skip.
+      if let exclusionRemainsWarranted, !exclusionRemainsWarranted() {
+        return .downgraded(
+          Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
+          didAttemptConversion: false)
+      }
       if attemptConversion {
         Self.convertToIncrementalAutoVacuumIfNeeded(
           pool: pool, databaseURL: databaseURL, byteLimit: conversionByteLimit)
+      }
+      // Revalidation, second reading: immediately before the lock, which is what shrinks the
+      // residual to the barrier's own duration. The conversion above can take seconds, and an open
+      // arriving during it would otherwise still meet a reader-excluding barrier.
+      if let exclusionRemainsWarranted, !exclusionRemainsWarranted() {
+        return .downgraded(
+          Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget),
+          didAttemptConversion: attemptConversion)
       }
       do {
         try pool.barrierWriteWithoutTransaction { db in
@@ -1406,7 +1456,35 @@ final class IndexDatabase {
       } catch {
         NSLog("Pensieve index maintenance failed: %@", error.localizedDescription)
       }
+      return .excludedReaders
     }.value
+
+    switch outcome {
+    case .excludedReaders:
+      break
+    case .downgraded(let hotPathOutcome, let didAttemptConversion):
+      barrierTimeMaintenanceDowngrades += 1
+      // A conversion the pass never ran must not be retired by it — same contract as the call-time
+      // downgrade, which simply never sets the flag.
+      if attemptConversion, !didAttemptConversion { didAttemptAutoVacuumConversion = false }
+      switch hotPathOutcome {
+      case .truncated, .failed:
+        indexBatchTruncationRetryAttempt = 0
+      case .readerHeldTheWal:
+        // The obligation survives the downgrade: the bound is deferred onto the backoff ladder,
+        // exactly as it is when the downgrade was decided at call time.
+        deferIndexBatchTruncation()
+      }
+    }
+  }
+
+  /// What a `.workspaceClose` pass actually did once it reached its lock — the two outcomes barrier-
+  /// time revalidation created. `downgraded` carries the hot-path result so the caller can re-arm the
+  /// truncation ladder on the main actor, and whether the one-off `VACUUM` conversion was paid for,
+  /// so a pass that gave way before it does not retire it.
+  private enum ClosePassOutcome {
+    case excludedReaders
+    case downgraded(IndexBatchMaintenanceOutcome, didAttemptConversion: Bool)
   }
 
   /// What one hot-path hygiene pass achieved. `readerHeldTheWal` is the state that has to be told

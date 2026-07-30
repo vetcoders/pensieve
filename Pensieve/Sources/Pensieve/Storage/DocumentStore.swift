@@ -36,7 +36,13 @@ final class FolderManager {
   /// which a close bumps too. `scheduleIndexMaintenance` captures it so a close's housekeeping can
   /// answer one question at the moment it matters: "is the index still as quiet as it was when I
   /// was armed?" See `scheduleIndexMaintenance(after:)`.
-  private var workspaceOpenGeneration: UInt64 = 0
+  ///
+  /// Lock-guarded rather than a plain `UInt64` since round 20: the close pass has to ask that
+  /// question a SECOND time, at barrier acquisition, from inside a detached closure that has no main
+  /// actor to read this from. Same shape and same reason as `IndexDatabase`'s `TerminationLatch`,
+  /// with one difference worth naming — a latch is one-way, a generation is not, so this is a
+  /// snapshot/compare rather than a flag.
+  private let workspaceOpenGeneration = WorkspaceOpenGeneration()
   private var watcherRefreshTask: Task<Void, Never>?
   /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
   /// completed refresh from one that was cancel-replaced by a newer event mid-await.
@@ -1056,25 +1062,44 @@ final class FolderManager {
   ///
   /// Deciding it in the task (not at arm time) also keeps the quit honest: the LAST close before a
   /// quit is followed by no open at all, so it still takes the barrier and the WAL→0 promise is
-  /// unconditional. Named residual: an open that arrives after this pass has already ENTERED its
-  /// barrier is not retracted — the barrier is not abortable — but that window is the barrier's own
-  /// duration rather than the whole armed lifetime of the task, and the unbounded part of it (the
-  /// `VACUUM` conversion) is skipped on every downgraded pass.
+  /// unconditional. Nothing legitimate can contradict that during a quit either: `TerminationSequence`
+  /// quiesces this manager before it drains, `quiesceForTermination()` stops the watcher and cancels
+  /// every refresh/build task, and the open entry points are main-actor calls the quit's pumped run
+  /// loop has nothing left to deliver — so no bump can arrive between the decision and the barrier
+  /// while the process is closing.
+  ///
+  /// Rounds 16 and 20, in that order, are why the decision is taken TWICE. Round 16 read the
+  /// generation on the main actor immediately before the call and argued no open could slip in,
+  /// because `performMaintenanceInBackground` "only suspends once it reaches its detached work". That
+  /// covered decision→call and nothing after it: round 12 had already measured that the pass parks
+  /// BEFORE `Task.detached { barrier }`, and on the undowngraded path a one-off `VACUUM` conversion —
+  /// seconds of whole-file rewrite — runs inside that detached closure before the lock is taken. An
+  /// `Open Folder` landing in that gap kept a `.workspaceClose` pass claiming a quiet index it no
+  /// longer had. So the exclusion decision is now REVALIDATED at barrier acquisition, from the
+  /// detached closure, through a lock-guarded generation the main actor is not needed to read.
+  ///
+  /// Named residual, re-derived: an open that arrives after the pass has already ENTERED its barrier
+  /// is not retracted — the barrier is not abortable. That window is now genuinely the barrier's own
+  /// duration and no longer the whole detached prologue, and the unbounded part of it (the `VACUUM`
+  /// conversion) is skipped on every downgraded pass, including one downgraded at the barrier.
   private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
     let indexDatabase = indexDatabase
     let previous = indexMaintenanceTask
-    let armedAtOpenGeneration = workspaceOpenGeneration
-    indexMaintenanceTask = Task { [weak self] in
+    // Captured by value, not through `self`: the generation object outlives a deallocated manager and
+    // nothing can bump it once the manager is gone, so "deallocated reads as no open" — the old
+    // behaviour, and the safe one — now holds by construction instead of by an optional fallback.
+    let openGeneration = workspaceOpenGeneration
+    let armedAtOpenGeneration = openGeneration.current
+    indexMaintenanceTask = Task {
       await previous?.value
       await pendingIndexWork?.value
       await indexDatabase.drainPendingIndexWrites()
-      // Read on the main actor immediately before the call, with no suspension point between the
-      // two: `performMaintenanceInBackground` only suspends once it reaches its detached work, so an
-      // open cannot slip in between this decision and the lock it selects. A deallocated manager
-      // reads as "no open" — the old behaviour, and the safe one.
-      let reopened = (self?.workspaceOpenGeneration ?? armedAtOpenGeneration) != armedAtOpenGeneration
+      let reopened = openGeneration.hasChanged(since: armedAtOpenGeneration)
       await indexDatabase.performMaintenanceInBackground(
-        reason: reopened ? .workspaceCloseIntoOpenWorkspace : .workspaceClose)
+        reason: reopened ? .workspaceCloseIntoOpenWorkspace : .workspaceClose,
+        exclusionRemainsWarranted: {
+          !openGeneration.hasChanged(since: armedAtOpenGeneration)
+        })
     }
   }
 
@@ -1182,7 +1207,7 @@ final class FolderManager {
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
     // Before the hot-reopen short-circuit below, so BOTH open shapes are covered by one bump.
-    workspaceOpenGeneration &+= 1
+    workspaceOpenGeneration.bump()
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
     let exclusions = Set(metadata.excludedPaths)
@@ -1342,7 +1367,7 @@ final class FolderManager {
     openFlowGeneration &+= 1
     // The background sibling of the bump in `openResolvedWorkspace` — same reason, and it covers
     // this path's own hot-reopen branch too.
-    workspaceOpenGeneration &+= 1
+    workspaceOpenGeneration.bump()
     let generation = openFlowGeneration
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let requestedRootPaths = rootURLs.map { $0.standardizedFileURL.path }
@@ -3394,6 +3419,36 @@ final class DocumentStore {
       return openFileURL.deletingLastPathComponent()
     }
     return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+  }
+}
+
+/// Lock-guarded counter of workspace OPENS, readable from the detached executor a close pass's
+/// barrier is taken on. See `FolderManager.scheduleIndexMaintenance(after:)` for why the main-actor
+/// `UInt64` it replaced could not serve that read.
+///
+/// Deliberately NOT a one-way latch like `IndexDatabase.TerminationLatch`, and the difference is the
+/// whole reason this is a snapshot/compare: a workspace can open, close and open again, so "has
+/// anything happened since?" is the only question with a stable answer. `hasChanged(since:)` is
+/// monotone for a fixed snapshot, which is what lets the pass ask it twice and trust the second
+/// answer.
+private final class WorkspaceOpenGeneration: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: UInt64 = 0
+
+  var current: UInt64 {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+
+  func bump() {
+    lock.lock()
+    value &+= 1
+    lock.unlock()
+  }
+
+  func hasChanged(since snapshot: UInt64) -> Bool {
+    current != snapshot
   }
 }
 

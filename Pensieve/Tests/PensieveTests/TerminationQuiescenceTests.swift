@@ -1790,6 +1790,12 @@ final class TerminationQuiescenceTests: XCTestCase {
       "…and no pass may have taken the reopen downgrade: nothing here opens a workspace, so the "
         + "close's housekeeping owes the quit its reader-excluding WAL→0")
     XCTAssertEqual(
+      database.barrierTimeMaintenanceDowngrades, 0,
+      "…including round 20's LATER downgrade window, which the reason at the seam cannot show: the "
+        + "quit's barrier is unconditional, and quiescence is what makes it so — the sequence stops "
+        + "the watcher and cancels every refresh/build before it drains, so no open can arrive "
+        + "between a close pass's decision and its lock while the process is closing")
+    XCTAssertEqual(
       walSize(for: databaseURL), 0,
       "…and the terminal checkpoint is the last word on the WAL (it is "
         + "\(walSize(for: databaseURL)) bytes)")
@@ -1941,6 +1947,233 @@ final class TerminationQuiescenceTests: XCTestCase {
     XCTAssertFalse(
       database.isIndexBatchTruncationRetryQuiesced,
       "…with the ladder still live, since nothing here is quitting")
+  }
+
+  // MARK: - R20 / F2: the exclusion decision must hold AT the barrier, not merely at call time
+
+  /// Round 20, finding 2 — the R16 downgrade through a later window.
+  ///
+  /// Round 16 decided the close pass's reason on the main actor immediately before the call and
+  /// argued that no open could slip in, because `performMaintenanceInBackground` "only suspends once
+  /// it reaches its detached work". That covered decision→call and nothing after it. Round 12 had
+  /// already measured where the pass actually parks — BEFORE `Task.detached { barrier }` — and on the
+  /// undowngraded path a one-off `VACUUM` conversion runs inside that detached closure before the
+  /// lock is taken. `Open Folder` landing anywhere in that prologue left a `.workspaceClose` pass
+  /// excluding the readers of a workspace that opened after it decided: the exact R16 symptom, one
+  /// window later.
+  ///
+  /// `maintenanceGateOverride` parks in precisely that slot, which is why this pin can place the open
+  /// rather than race it. The reason recorded AT the seam is `workspaceClose` — the call-time
+  /// decision was exclusion, and that is the whole point: a build that downgraded earlier would be
+  /// proving round 16's fix, not this one. The downgrade therefore has to be read from
+  /// `barrierTimeMaintenanceDowngrades`, the only seam that can see it.
+  ///
+  /// The wedged reader is what makes it decidable without a stopwatch, as in the R16 twin: a barrier
+  /// cannot complete while a genuine `pool.read` is held, so on the old behaviour the pass never
+  /// finishes and the probe reads never come back. A safety valve releases the reader so a regressed
+  /// build FAILS instead of hanging.
+  func testACloseMaintenancePassRevalidatesItsDowngradeAtBarrierAcquisition() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let readerReached = Counter()
+    let releaseReader = DispatchSemaphore(value: 0)
+    defer { releaseReader.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      releaseReader.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        readerReached.increment()
+        releaseReader.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let seedRef = documentRef(root: root, name: "seed.md")
+    try "barrierrevalidationseed".write(to: seedRef.url, atomically: true, encoding: .utf8)
+    database.index(document: seedRef, body: "barrierrevalidationseed")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: there must be WAL frames for the close's pass to want to truncate")
+    // Every pass is allowed to reach its checkpoint: the 16 MiB bound is not what this pin decides.
+    database.walCheckpointThresholdBytesOverride = 1
+
+    // 1 — a genuine pool reader, held for the whole experiment.
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: seedRef, documents: [seedRef])
+    }
+    pumpMainRunLoop(until: { readerReached.value >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      readerReached.value, 1,
+      "fixture precondition: the backlink query must be holding one of the pool's readers")
+
+    // 2 — the close, parked at the gap round 12 measured: past the reason decision, before the lock.
+    let reasonsAtTheLock = EventLog()
+    let closeGate = ParkingGate()
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      Task { await closeGate.open() }
+    }
+    database.maintenanceGateOverride = { reason in
+      reasonsAtTheLock.append("\(reason)")
+      guard reason == .workspaceClose else { return }
+      await closeGate.arrive()
+    }
+    let manager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "BarrierRevalidation")
+    manager.closeWorkspace(into: appState)
+    pumpMainRunLoop(until: { closeGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      closeGate.arrivalCount, 1,
+      "fixture precondition: the close's pass must be parked INSIDE the gap — past its own drain and "
+        + "past the reason it chose, but before the lock that reason selects")
+    XCTAssertTrue(
+      reasonsAtTheLock.events.contains("workspaceClose"),
+      "fixture precondition: the CALL-TIME decision must have been exclusion, or this pin would be "
+        + "re-proving round 16's fix instead of this one. Got \(reasonsAtTheLock.events)")
+
+    // 3 — the next workspace, opened through the path the app actually uses, INTO the gap.
+    manager.openInBackground(url: root, into: appState)
+    XCTAssertFalse(
+      appState.workspaceRoots.isEmpty,
+      "fixture precondition: the next workspace must actually have opened")
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+
+    // 4 — the observers first, so the reads are demonstrably in flight WHILE the pass runs. Armed
+    //     after the release they could all land afterwards on a fast machine and prove nothing.
+    let maintenanceFinished = CompletionFlag()
+    Task { @MainActor in
+      await manager.waitForPendingIndexMaintenance()
+      maintenanceFinished.isSet = true
+    }
+    let probeReads = Counter()
+    let rootPaths = [root.standardizedFileURL.path]
+    Task { @MainActor in
+      while !maintenanceFinished.isSet {
+        _ = await database.indexedDocumentCountInBackground(forRootPaths: rootPaths)
+        probeReads.increment()
+      }
+    }
+    pumpMainRunLoop(until: { probeReads.value >= 1 }, timeout: 10)
+    XCTAssertGreaterThanOrEqual(
+      probeReads.value, 1,
+      "fixture precondition: the new workspace's reads must already be flowing before the pass is "
+        + "released, or 'they kept flowing' would be a statement about scheduling luck")
+
+    // 5 — release the pass. It now has to notice, at the lock, what it could not know when it chose.
+    Task { await closeGate.open() }
+    pumpMainRunLoop(until: { maintenanceFinished.isSet }, timeout: 20)
+
+    XCTAssertTrue(
+      maintenanceFinished.isSet,
+      "the close's housekeeping took a reader-excluding barrier against a workspace that opened "
+        + "after it chose. With a genuine pool reader held it cannot complete — and in production "
+        + "that is every search, backlink and count in the freshly opened folder waiting on a vacuum "
+        + "the previous workspace armed")
+    // The exclusion proof is the assertion above, not this counter: with a genuine `pool.read` held
+    // for the whole run, a barrier cannot complete AT ALL (round 12's measurement), so "it finished"
+    // already means "it excluded nobody". This is the same fact from the reader's side, and it is
+    // deliberately NOT asserted as "more reads after the release than before" — a downgraded pass is
+    // a plain write of a fraction of a millisecond, so requiring the counter to straddle that instant
+    // would be asserting the scheduler. What it does pin is that the new workspace's reads were in
+    // flight against this pool while the pass was live.
+    XCTAssertGreaterThanOrEqual(
+      probeReads.value, 1,
+      "…and the new workspace's reads must have been flowing against this pool while the pass ran")
+    XCTAssertEqual(
+      database.barrierTimeMaintenanceDowngrades, 1,
+      "…by DOWNGRADING at the lock. The reason at the seam stays `workspaceClose` by construction — "
+        + "the revalidation happens after it — so this counter is the only place the decision is "
+        + "visible, and it is what tells a barrier-time downgrade from round 16's call-time one")
+    XCTAssertGreaterThanOrEqual(
+      database.indexBatchTruncationDeferrals, 1,
+      "…with the WAL obligation deferred onto the backoff ladder rather than retired: the wedged "
+        + "reader still holds frames, so the truncate is owed, not done")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "…which is the same fact at the substrate — a downgraded pass that had quietly dropped the "
+        + "bound would leave a truncated WAL and nothing owed")
+    XCTAssertFalse(
+      database.didAttemptAutoVacuumConversion,
+      "…and the one-off `VACUUM` conversion must be DEFERRED to the next real close, not retired by "
+        + "a pass that gave way before paying for it")
+  }
+
+  /// The control for the pin above, and the half that keeps the quit honest: with nothing opening in
+  /// the gap, the same sequence must still take the reader-excluding barrier.
+  ///
+  /// Without this, "revalidate at the barrier" could be satisfied by a build that simply never
+  /// excludes readers again — which would silently retire the unconditional WAL→0 the last close
+  /// before a quit is there to provide. No reader is wedged here on purpose: a correct build takes
+  /// the barrier, and a barrier that has to wait out a reader would make the control a timing test
+  /// rather than a contract test.
+  func testACloseMaintenancePassStillExcludesReadersWhenNothingOpensInTheGap() throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let appState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    let seedRef = documentRef(root: root, name: "seed.md")
+    try "barriercontrolseed".write(to: seedRef.url, atomically: true, encoding: .utf8)
+    database.index(document: seedRef, body: "barriercontrolseed")
+    XCTAssertGreaterThan(
+      walSize(for: databaseURL), 0,
+      "fixture precondition: there must be WAL frames for the close's pass to truncate")
+    database.walCheckpointThresholdBytesOverride = 1
+
+    let reasonsAtTheLock = EventLog()
+    let closeGate = ParkingGate()
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.readerWedgeReleaseSeconds) {
+      Task { await closeGate.open() }
+    }
+    database.maintenanceGateOverride = { reason in
+      reasonsAtTheLock.append("\(reason)")
+      guard reason == .workspaceClose else { return }
+      await closeGate.arrive()
+    }
+    let manager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "BarrierControl")
+    manager.closeWorkspace(into: appState)
+    pumpMainRunLoop(until: { closeGate.arrivalCount >= 1 }, timeout: 10)
+    XCTAssertEqual(
+      closeGate.arrivalCount, 1,
+      "fixture precondition: the close's pass must be parked in the same gap the downgrade pin uses")
+
+    // The gap is opened and closed with NOTHING happening in it. That is the whole experiment.
+    pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
+    Task { await closeGate.open() }
+
+    let maintenanceFinished = CompletionFlag()
+    Task { @MainActor in
+      await manager.waitForPendingIndexMaintenance()
+      maintenanceFinished.isSet = true
+    }
+    pumpMainRunLoop(until: { maintenanceFinished.isSet }, timeout: 20)
+    XCTAssertTrue(maintenanceFinished.isSet, "the close's housekeeping must complete")
+
+    XCTAssertEqual(
+      database.barrierTimeMaintenanceDowngrades, 0,
+      "no workspace opened, so nothing may have taken the barrier-time downgrade: the close still "
+        + "owes the reader-excluding WAL→0 that makes the quit's promise unconditional. Got "
+        + "\(reasonsAtTheLock.events)")
+    XCTAssertTrue(
+      database.didAttemptAutoVacuumConversion,
+      "…and the undowngraded pass is the one allowed to spend the one-off `VACUUM` conversion, so "
+        + "the flag it sets must still be set")
+    XCTAssertEqual(
+      walSize(for: databaseURL), 0,
+      "…and the barrier's truncate is the last word on the WAL (it is "
+        + "\(walSize(for: databaseURL)) bytes)")
   }
 
   // MARK: - R6: a dirty session's index write follows its file write
