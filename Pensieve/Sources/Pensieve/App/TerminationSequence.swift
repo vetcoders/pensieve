@@ -276,9 +276,44 @@ final class TerminationSequence {
   /// volume delay the quit for as long as their writes take. Bounding that safely needs the save path
   /// itself to become suspending — a refactor this contract does not own — and until then a slow quit
   /// beats a lost buffer.
-  private func flushPendingWindowSaves(_ controllers: [AppController]) {
-    for controller in controllers {
+  ///
+  /// ORDER, round 21 (operator decision, 2026-07-30, not a review finding). Two windows may hold the
+  /// SAME file, both dirty, with different text. Every save here writes the whole buffer, so the one
+  /// that runs LAST is the one whose bytes survive — and until now that was whichever order
+  /// `DocumentWindowRegistry.liveDocumentControllers()` happened to produce, which walks a dictionary
+  /// keyed by `ObjectIdentifier`. The winner was therefore not focus, not recency, not registration
+  /// order: it was the hash seed. The rule is now the one the operator can predict — the window the
+  /// user EDITED MOST RECENTLY writes last and wins — and the marker is `AppState.lastEditGeneration`
+  /// (`EditRecency`), stamped by the single edit funnel.
+  ///
+  /// The sort is made STABLE by breaking ties on the incoming position, because ties are the common
+  /// case: windows over DIFFERENT files never race for the same bytes, and a window nobody edited
+  /// this session sits at generation 0. Equal generations therefore keep the order they arrived in,
+  /// and for every workspace without two dirty windows on one file this is the identity permutation.
+  ///
+  /// The sibling half is FTS, and it needs no work here: `runUserFlushPhases` calls
+  /// `autosaver.quiesceForTermination()` straight after this loop, and round 19 made its `flushIndex`
+  /// publish in ARMING order — which is the same recency, one debounce down. Disk and index therefore
+  /// agree on the same winner, and the round-21 pin asserts both.
+  ///
+  /// Internal rather than private so that pin can place the adversarial order deterministically: the
+  /// registry's dictionary iteration cannot be asked for "the older-edited window last", so a test
+  /// that went through `runUserFlushPhases()` would be asserting the hash seed on the mutation.
+  func flushPendingWindowSaves(_ controllers: [AppController]) {
+    for controller in Self.lastEditRecencyOrdered(controllers) {
       controller.savePendingChangesOnClose()
     }
+  }
+
+  /// `controllers` oldest-edit first, ties resolved by incoming position — see
+  /// `flushPendingWindowSaves`.
+  private static func lastEditRecencyOrdered(_ controllers: [AppController]) -> [AppController] {
+    controllers.enumerated()
+      .sorted { lhs, rhs in
+        let left = lhs.element.lastEditGeneration
+        let right = rhs.element.lastEditGeneration
+        return left == right ? lhs.offset < rhs.offset : left < right
+      }
+      .map(\.element)
   }
 }

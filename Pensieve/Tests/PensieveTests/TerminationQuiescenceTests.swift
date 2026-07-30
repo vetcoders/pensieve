@@ -3749,6 +3749,221 @@ final class TerminationQuiescenceTests: XCTestCase {
     XCTAssertEqual(try String(contentsOf: sharedURL, encoding: .utf8), bodyA)
   }
 
+  // MARK: - R21 / F3: the quit's window flush follows last-edit recency
+
+  /// Round 21, finding 3 — an OPERATOR DECISION (2026-07-30), not a review finding.
+  ///
+  /// Two windows can hold the same file, both dirty, with different text. Every save writes the WHOLE
+  /// buffer, so whichever window's save runs LAST is the one whose bytes survive — and the quit's
+  /// flush loop took that order from `DocumentWindowRegistry.liveDocumentControllers()`, which walks a
+  /// dictionary keyed by `ObjectIdentifier`. The winner was therefore neither focus nor recency nor
+  /// registration order: it was the hash seed, and the user could lose the text they had just typed to
+  /// a window they had not touched in an hour. The rule Monika decided is the one a user can predict —
+  /// the window edited MOST RECENTLY writes last and wins.
+  ///
+  /// The array handed to the flush is ADVERSARIAL on purpose: the older-edited window sits LAST, which
+  /// is exactly the position that used to decide the file. Handing it to `flushPendingWindowSaves`
+  /// directly rather than driving `runUserFlushPhases()` is what makes the mutation proof mean
+  /// something — the registry cannot be asked for a specific iteration order, so a pin that went
+  /// through it would be asserting the hash seed.
+  ///
+  /// The sibling half is FTS, and it is asserted here too. Nothing extra was needed to make it agree:
+  /// each save publishes its own row as it lands, so reordering the saves reorders the index writes
+  /// with them, and `quiesceForTermination()` then flushes what remains in ARMING order (round 19) —
+  /// the same recency, one debounce down. Both roads point at the newer window. The pin asserts the
+  /// index anyway, because "disk and search name the same winner" is the contract the user meets, and
+  /// the mutation below breaks BOTH halves at once.
+  func testTheQuitFlushLetsTheMostRecentlyEditedWindowWriteItsBytesLast() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let sharedURL = folder.appendingPathComponent("shared-by-two-windows.md")
+    let originalBody = "the shared file before either edit"
+    try originalBody.write(to: sharedURL, atomically: true, encoding: .utf8)
+    let sharedRef = DocumentRef(id: sharedURL.standardizedFileURL, isAdHoc: true)
+
+    // Both delays are effectively infinite: nothing in this pin may be written by a TIMER. Every byte
+    // that reaches the disk comes from the quit's own flush, which is the path under test.
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "EditRecency")
+    let registry = DocumentWindowRegistry()
+    let log = EventLog()
+
+    let bodyA = "alphaneedle window A's text, edited FIRST and therefore the loser"
+    let bodyB = "betaneedle window B's text, edited SECOND and therefore the winner"
+
+    var windows: [NSWindow] = []
+    defer { windows.forEach { $0.close() } }
+    var controllers: [String: AppController] = [:]
+    var states: [String: AppState] = [:]
+
+    // Edited in array order — A, then B — so B carries the higher `lastEditGeneration`.
+    for (name, body) in [("A", bodyA), ("B", bodyB)] {
+      let windowState = AppState()
+      states[name] = windowState
+      let store = DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveEditRecency\(name)Bookmarks")),
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery-\(name)", isDirectory: true)),
+        writeDocument: { text, url in
+          log.append("save:\(name)")
+          try text.write(to: url, atomically: true, encoding: .utf8)
+        }
+      )
+      windowState.documents = [sharedRef]
+      windowState.documentSession.load(document: sharedRef, text: originalBody)
+      windowState.activeDocumentText = body
+      // The ONE edit funnel, which is where the marker is stamped. Going through it rather than
+      // setting `isDirty` by hand is the point: a pin that stamped the generation itself would prove
+      // nothing about the path a keystroke takes.
+      store.documentDidChange(appState: windowState)
+
+      let controller = AppController(
+        appState: windowState,
+        folderManager: folderManager,
+        documentStore: store,
+        indexDatabase: database,
+        documentWindowRegistry: registry)
+      controllers[name] = controller
+      let window = makeWindow()
+      windows.append(window)
+      registry.registerController(controller, for: window)
+    }
+
+    let controllerA = try XCTUnwrap(controllers["A"])
+    let controllerB = try XCTUnwrap(controllers["B"])
+    XCTAssertGreaterThan(
+      controllerB.lastEditGeneration, controllerA.lastEditGeneration,
+      "fixture precondition: window B must be the more recently EDITED of the two, or there is no "
+        + "recency for the flush to follow")
+    XCTAssertTrue(
+      try XCTUnwrap(states["A"]).documentSession.isDirty
+        && XCTUnwrap(states["B"]).documentSession.isDirty,
+      "fixture precondition: both windows must be dirty — one clean buffer is a no-op save and the "
+        + "ordering would be untestable")
+
+    let sequence = TerminationSequence(
+      registry: registry,
+      indexDatabase: database,
+      folderManager: folderManager,
+      autosaver: autosaver,
+      drainTimeout: Self.shrunkDrainBudget,
+      pumpRunLoop: { _ in }
+    )
+    // ADVERSARIAL order: the older-edited window LAST, which is the slot that decides the file.
+    sequence.flushPendingWindowSaves([controllerB, controllerA])
+    autosaver.quiesceForTermination()
+    await database.drainPendingIndexWrites()
+
+    let events = log.events
+    XCTAssertEqual(
+      try String(contentsOf: sharedURL, encoding: .utf8), bodyB,
+      "the bytes that survive a quit must be the ones the user typed most recently, never the ones "
+        + "belonging to whichever window a dictionary happened to hand over last (events: \(events))")
+    XCTAssertEqual(
+      events, ["save:A", "save:B"],
+      "…which means the flush ran oldest-edit FIRST, regardless of the order it was handed")
+    XCTAssertEqual(
+      try indexHits(matching: "betaneedle", at: databaseURL), 1,
+      "…and FTS must name the same winner as the disk, or search points at text nobody has")
+    XCTAssertEqual(
+      try indexHits(matching: "alphaneedle", at: databaseURL), 0,
+      "…with the losing window's buffer nowhere in the index")
+  }
+
+  /// The control, and the half that keeps the reordering honest: two dirty windows over DIFFERENT
+  /// files must each land their OWN bytes.
+  ///
+  /// Ordering across different documents is explicitly out of scope for the operator's rule — there is
+  /// nothing to arbitrate, because no two saves target the same path — so the sort must be a
+  /// permutation that changes nothing about what ends up on disk. A build that "won" the pin above by
+  /// dropping saves, coalescing them, or letting the last writer overwrite everything would fail here.
+  func testTwoDirtyWindowsOverDifferentFilesEachLandTheirOwnBytes() async throws {
+    let folder = try makeTemporaryFolder()
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+
+    let hostState = AppState()
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open(into: hostState)
+    XCTAssertNil(hostState.lastError)
+
+    let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "EditRecencyControl")
+    let registry = DocumentWindowRegistry()
+
+    var windows: [NSWindow] = []
+    defer { windows.forEach { $0.close() } }
+    var controllers: [String: AppController] = [:]
+    var urls: [String: URL] = [:]
+
+    for name in ["A", "B"] {
+      let noteURL = folder.appendingPathComponent("own-file-\(name).md")
+      try "before the quit".write(to: noteURL, atomically: true, encoding: .utf8)
+      urls[name] = noteURL
+      let ref = DocumentRef(id: noteURL.standardizedFileURL, isAdHoc: true)
+
+      let windowState = AppState()
+      let store = DocumentStore(
+        autosaver: autosaver,
+        indexDatabase: database,
+        bookmarkStore: BookmarkStore(
+          defaults: makeEphemeralDefaults(prefix: "PensieveEditRecencyControl\(name)Bookmarks")),
+        recoveryStore: RecoveryStore(
+          directoryURL: folder.appendingPathComponent("Recovery-\(name)", isDirectory: true))
+      )
+      windowState.documents = [ref]
+      windowState.documentSession.load(document: ref, text: "before the quit")
+      windowState.activeDocumentText = "ownfileneedle\(name.lowercased()) in window \(name)"
+      store.documentDidChange(appState: windowState)
+
+      let controller = AppController(
+        appState: windowState,
+        folderManager: folderManager,
+        documentStore: store,
+        indexDatabase: database,
+        documentWindowRegistry: registry)
+      controllers[name] = controller
+      let window = makeWindow()
+      windows.append(window)
+      registry.registerController(controller, for: window)
+    }
+
+    let sequence = TerminationSequence(
+      registry: registry,
+      indexDatabase: database,
+      folderManager: folderManager,
+      autosaver: autosaver,
+      drainTimeout: Self.shrunkDrainBudget,
+      pumpRunLoop: { _ in }
+    )
+    sequence.flushPendingWindowSaves([
+      try XCTUnwrap(controllers["B"]), try XCTUnwrap(controllers["A"]),
+    ])
+    autosaver.quiesceForTermination()
+    await database.drainPendingIndexWrites()
+
+    for name in ["A", "B"] {
+      XCTAssertEqual(
+        try String(contentsOf: try XCTUnwrap(urls[name]), encoding: .utf8),
+        "ownfileneedle\(name.lowercased()) in window \(name)",
+        "windows over DIFFERENT files never race for the same bytes, so reordering the flush must "
+          + "leave every one of them holding its own text")
+      XCTAssertEqual(
+        try indexHits(matching: "ownfileneedle\(name.lowercased())", at: databaseURL), 1,
+        "…and each must be in FTS exactly once")
+    }
+  }
+
   // MARK: - Fixtures
 
   /// The drain budget under test, shrunk from the production 5 s through `TerminationSequence`'s own

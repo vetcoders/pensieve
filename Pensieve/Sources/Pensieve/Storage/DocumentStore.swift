@@ -3009,6 +3009,10 @@ final class DocumentStore {
       return
     }
     appState.documentSession.isDirty = true
+    // The ONE edit funnel, which is why the last-edit marker is stamped here and nowhere else. It is
+    // what orders the quit's window flush when two windows hold the SAME file — see
+    // `TerminationSequence.flushPendingWindowSaves`.
+    appState.noteEdit()
     scheduleAutosave(appState: appState)
     scheduleIndexUpdate(appState: appState)
   }

@@ -585,6 +585,13 @@ final class AppController: ObservableObject {
     documentStore.savePendingChangesOnClose(appState: appState)
   }
 
+  /// When this window's session was last edited, on the process-wide `EditRecency` scale. Read by
+  /// `TerminationSequence.flushPendingWindowSaves` to decide which of two windows over the SAME file
+  /// writes its bytes LAST.
+  var lastEditGeneration: UInt64 {
+    appState.lastEditGeneration
+  }
+
   /// Closes the active document session without exiting Pensieve.
   /// Dirty sessions are routed through the existing save semantics in
   /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,

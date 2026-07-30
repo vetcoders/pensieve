@@ -53,11 +53,43 @@ struct FindBarCommand: Equatable, Identifiable {
   let action: Action
 }
 
+/// Hands every edit a value no earlier edit in this process has held, so "which window did the user
+/// touch most recently?" can be answered by comparing two integers.
+///
+/// Round 21, finding 3 (operator decision, 2026-07-30). A wall-clock timestamp would answer the same
+/// question worse: two edits inside one clock tick compare equal, and the clock can go backwards.
+/// The precedent is `Autosaver.generationCounter`, which round 19 used as the ordering source for
+/// the quit's index flush — the same shape, one layer up, because the SAVE order needs a marker that
+/// exists even when nothing is armed (auto-save off arms no debounce at all).
+@MainActor
+enum EditRecency {
+  private static var counter: UInt64 = 0
+
+  /// Strictly increasing, single mutator, never reused — the three properties the ordering rests on.
+  static func next() -> UInt64 {
+    counter &+= 1
+    return counter
+  }
+}
+
 @Observable
 @MainActor
 final class AppState {
   let workspaceStore: WorkspaceStore
   let windowModel: DocumentWindowModel
+
+  /// When this window's session was last EDITED, on `EditRecency`'s process-wide scale. `0` means
+  /// "never edited in this process", which is where every window starts and where a window that only
+  /// ever displayed a document stays.
+  ///
+  /// Observation-ignored on purpose: it is bumped on every keystroke and read by nothing on the view
+  /// side, so tracking it would put a per-keystroke invalidation into `@Observable` for no reader.
+  @ObservationIgnored private(set) var lastEditGeneration: UInt64 = 0
+
+  /// Recorded by the ONE edit funnel, `DocumentStore.documentDidChange(appState:)`.
+  func noteEdit() {
+    lastEditGeneration = EditRecency.next()
+  }
 
   init(
     workspaceStore: WorkspaceStore? = nil,
