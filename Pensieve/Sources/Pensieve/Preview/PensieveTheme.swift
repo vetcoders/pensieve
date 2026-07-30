@@ -114,15 +114,15 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// Raw surface: stripped chrome, monospace, near "view source", adaptive.
   case raw
   /// Warm light paper, serif measure.
-  case pergament
+  case parchment
   /// Cool desaturated dark, report instrument.
   case graphite
   /// Signature dark surface — the fresh-install default.
   case ink
   /// Clinical light neutral, semantic colour only.
-  case klinika
+  case porcelain
   /// One mono family everywhere, achromatic.
-  case maszynopis
+  case typewriter
 
   var id: String { rawValue }
 
@@ -130,11 +130,11 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     switch self {
     case .default: return "Default"
     case .raw: return "Raw"
-    case .pergament: return "Pergament"
+    case .parchment: return "Parchment"
     case .graphite: return "Graphite"
     case .ink: return "Ink"
-    case .klinika: return "Klinika"
-    case .maszynopis: return "Maszynopis"
+    case .porcelain: return "Porcelain"
+    case .typewriter: return "Typewriter"
     }
   }
 
@@ -143,11 +143,11 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     switch self {
     case .default: return "doc.richtext"
     case .raw: return "text.alignleft"
-    case .pergament: return "book"
+    case .parchment: return "book"
     case .graphite: return "terminal"
     case .ink: return "drop.fill"
-    case .klinika: return "cross.case"
-    case .maszynopis: return "keyboard"
+    case .porcelain: return "cross.case"
+    case .typewriter: return "keyboard"
     }
   }
 
@@ -179,15 +179,18 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
 
   /// Legacy `pensieve.preview.skin` values → their consolidation target.
   static let legacyMigration: [String: PensieveTheme] = [
-    "paper": .pergament,
-    "mla": .pergament,
+    "paper": .parchment,
+    "mla": .parchment,
     "code": .graphite,
-    "vista": .klinika,
-    "notion": .klinika,
-    "vercel": .klinika,
-    "themeable": .klinika,
-    "jamstatic": .klinika,
+    "vista": .porcelain,
+    "notion": .porcelain,
+    "vercel": .porcelain,
+    "themeable": .porcelain,
+    "jamstatic": .porcelain,
     "glass": .ink,
+    "pergament": .parchment,
+    "klinika": .porcelain,
+    "maszynopis": .typewriter,
   ]
 
   // MARK: - Token tables
@@ -221,7 +224,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   private static let tokenTable: [PensieveTheme: ThemeTokens] = [
     .default: adaptiveTokens,
     .raw: adaptiveTokens,
-    .pergament: ThemeTokens(
+    .parchment: ThemeTokens(
       mode: .light,
       source: ColorSpec(hex: "#fdfbf4"),
       border: ColorSpec(hex: "#e2d8c2"),
@@ -269,7 +272,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcGutter: ColorSpec(hex: "#4b5665"),
       srcCurrentLine: ColorSpec(hex: "#b8c4d4")
     ),
-    .klinika: ThemeTokens(
+    .porcelain: ThemeTokens(
       mode: .light,
       source: ColorSpec(hex: "#ffffff"),
       border: ColorSpec(hex: "#e4e8ec"),
@@ -285,7 +288,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcGutter: ColorSpec(hex: "#aab3bb"),
       srcCurrentLine: ColorSpec(hex: "#0f6f6c")
     ),
-    .maszynopis: ThemeTokens(
+    .typewriter: ThemeTokens(
       mode: .light,
       source: ColorSpec(hex: "#1c1c1c"),
       border: ColorSpec(hex: "#e6e6e6"),

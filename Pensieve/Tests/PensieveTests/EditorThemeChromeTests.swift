@@ -41,7 +41,7 @@ final class EditorThemeChromeTests: XCTestCase {
     color.usingColorSpace(.sRGB) ?? color
   }
 
-  /// Live switch ink → klinika: the pane background AND the titlebar backing +
+  /// Live switch ink → porcelain: the pane background AND the titlebar backing +
   /// window appearance must all move to the new skin together.
   @MainActor
   func testLiveSkinSwitchMovesSourcePaneAndTitlebarChromeTogether() {
@@ -49,31 +49,31 @@ final class EditorThemeChromeTests: XCTestCase {
     let (surface, window) = makeHostedSurface(skin: .ink, windowAppearance: .darkAqua)
     defer { window.contentView = nil }
 
-    surface.applyTheme(.klinika)
+    surface.applyTheme(.porcelain)
 
-    let klinikaSource = srgb(PensieveTheme.klinika.tokens.source.nsColor)
+    let porcelainSource = srgb(PensieveTheme.porcelain.tokens.source.nsColor)
 
     // Source pane: the property the pane paints from.
-    XCTAssertEqual(srgb(surface.textView.backgroundColor), klinikaSource)
-    XCTAssertEqual(srgb(surface.scrollView.backgroundColor), klinikaSource)
+    XCTAssertEqual(srgb(surface.textView.backgroundColor), porcelainSource)
+    XCTAssertEqual(srgb(surface.scrollView.backgroundColor), porcelainSource)
 
     // Titlebar backing: the window backing colour the glass strip composites,
     // pinned to the SAME source token (the invariant WindowChromeRecipeTests
     // pins for titlebarGlassBackingColor).
     XCTAssertEqual(
       srgb(window.backgroundColor),
-      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .klinika)))
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .porcelain)))
 
-    // Appearance: klinika is a fixed light skin, so the whole window (and its
+    // Appearance: porcelain is a fixed light skin, so the whole window (and its
     // titlebar glass tint) must be pinned to aqua — not left on the prior dark
     // appearance. This is what forces the live re-composite of the pane.
     XCTAssertEqual(window.appearance?.name, .aqua)
   }
 
-  /// Reverse direction klinika → ink pins the dark appearance + dark backing.
+  /// Reverse direction porcelain → ink pins the dark appearance + dark backing.
   @MainActor
   func testLiveSkinSwitchToDarkSkinPinsDarkChrome() {
-    let (surface, window) = makeHostedSurface(skin: .klinika, windowAppearance: .aqua)
+    let (surface, window) = makeHostedSurface(skin: .porcelain, windowAppearance: .aqua)
     defer { window.contentView = nil }
 
     surface.applyTheme(.ink)
@@ -107,17 +107,17 @@ final class EditorThemeChromeTests: XCTestCase {
   /// pass; here we drive that seam directly with an unchanged skin.
   @MainActor
   func testWindowChromePinsOnFirstAttachForPersistedSkin() {
-    let (surface, window) = makeHostedSurface(skin: .pergament, windowAppearance: .darkAqua)
+    let (surface, window) = makeHostedSurface(skin: .parchment, windowAppearance: .darkAqua)
     defer { window.contentView = nil }
 
     // The skin did not change since construction, but the window only became
     // available after init — the same call updateNSView makes each pass must
     // pin the persisted skin's chrome on that first attach.
-    surface.applyWindowChrome(for: .pergament)
+    surface.applyWindowChrome(for: .parchment)
 
     XCTAssertEqual(window.appearance?.name, .aqua)
     XCTAssertEqual(
       srgb(window.backgroundColor),
-      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .pergament)))
+      srgb(WindowChromeRecipe.titlebarGlassBackingColor(for: .parchment)))
   }
 }

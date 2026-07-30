@@ -462,7 +462,7 @@ private struct AppearanceToolbarMenu: View {
       // Reading-surface skin, orthogonal to the flavor: it re-dresses BOTH the
       // rendered preview and the source editor — surface, typography and syntax
       // tokens — without changing the markdown dialect. Seven first-party
-      // themes: Default, Raw, Pergament, Graphite, Ink, Klinika, Maszynopis.
+      // themes: Default, Raw, Parchment, Graphite, Ink, Porcelain, Typewriter.
       Picker("Theme", selection: $themeManager.skin) {
         ForEach(PensieveTheme.allCases) { skin in
           Label(skin.displayName, systemImage: skin.systemImage).tag(skin)

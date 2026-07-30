@@ -614,9 +614,9 @@ final class PreviewWebView: NSView {
         }
         """
 
-    case .pergament:
+    case .parchment:
       return """
-        /* vc-skin:pergament — light-only, warm paper, serif measure */
+        /* vc-skin:parchment — light-only, warm paper, serif measure */
         :root {
           --vc-preview-text: #2a251d;
           --vc-preview-muted: #7a7062;
@@ -631,8 +631,8 @@ final class PreviewWebView: NSView {
           --vc-preview-danger: #8a3a2a;
           --vc-preview-warning: #8a6a20;
           --vc-preview-positive: #4a5a3c;
-          --vc-preview-pergament-bg: #f7f2e4;
-          --vc-preview-page-background: var(--vc-preview-pergament-bg);
+          --vc-preview-parchment-bg: #f7f2e4;
+          --vc-preview-page-background: var(--vc-preview-parchment-bg);
         }
         .markdown-body {
           max-width: 680px;
@@ -809,9 +809,9 @@ final class PreviewWebView: NSView {
         }
         """
 
-    case .klinika:
+    case .porcelain:
       return """
-        /* vc-skin:klinika — light-only, clinical neutral, semantic colour only */
+        /* vc-skin:porcelain — light-only, clinical neutral, semantic colour only */
         :root {
           --vc-preview-text: #14181c;
           --vc-preview-muted: #667079;
@@ -826,8 +826,8 @@ final class PreviewWebView: NSView {
           --vc-preview-danger: #b4322c;
           --vc-preview-warning: #7a4a12;
           --vc-preview-positive: #0f6f6c;
-          --vc-preview-klinika-bg: #ffffff;
-          --vc-preview-page-background: var(--vc-preview-klinika-bg);
+          --vc-preview-porcelain-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-porcelain-bg);
         }
         .markdown-body {
           max-width: 820px;
@@ -871,9 +871,9 @@ final class PreviewWebView: NSView {
         }
         """
 
-    case .maszynopis:
+    case .typewriter:
       return """
-        /* vc-skin:maszynopis — one mono family everywhere, achromatic, centred heads */
+        /* vc-skin:typewriter — one mono family everywhere, achromatic, centred heads */
         :root {
           --vc-preview-text: #1c1c1c;
           --vc-preview-muted: #6e6e6e;
@@ -888,8 +888,8 @@ final class PreviewWebView: NSView {
           --vc-preview-danger: #1c1c1c;
           --vc-preview-warning: #6e6e6e;
           --vc-preview-positive: #1c1c1c;
-          --vc-preview-maszynopis-bg: #ffffff;
-          --vc-preview-page-background: var(--vc-preview-maszynopis-bg);
+          --vc-preview-typewriter-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-typewriter-bg);
         }
         /* Jedna rodzina na wszystko — to jest cały motyw. */
         .markdown-body,
