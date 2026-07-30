@@ -51,6 +51,21 @@ final class IndexDatabase {
   /// there is nothing left to index by then and the close is what has to wait.
   private var pendingIndexBatchMaintenance: Task<Void, Never>?
 
+  /// The armed RETRY of a hot-path truncate that a reader would not let through, or `nil` when none
+  /// is owed. Round 12: the hot-path pass no longer waits readers out, so something has to bring it
+  /// back — see `deferIndexBatchTruncation()`.
+  private var pendingIndexBatchTruncationRetry: Task<Void, Never>?
+
+  /// How many times in a row a hot-path truncate has been deferred, which is what the backoff ladder
+  /// in `effectiveIndexBatchTruncationRetryDelayNanoseconds` reads. Reset the moment a pass truncates
+  /// or finds the WAL already under the bound.
+  private var indexBatchTruncationRetryAttempt = 0
+
+  /// Hot-path truncates deferred because a reader still held WAL frames. Production never reads it;
+  /// it is the seam a test uses to prove the pass GAVE UP AND RE-ARMED rather than waited — the same
+  /// role `terminationRejectedEntryPoints` plays for the latch.
+  private(set) var indexBatchTruncationDeferrals = 0
+
   /// Narrow test seam: awaited at the head of every background index write, before it waits for its
   /// predecessor and long before it touches the pool. It exists so a test can hold write #1 open and
   /// prove write #2 is GENUINELY still queued when a close or a quit runs — GRDB's
@@ -134,8 +149,14 @@ final class IndexDatabase {
   /// Closes the funnel. Called by `TerminationSequence` AFTER its drain and BEFORE the terminal
   /// checkpoint, and by the post-deadline fallback — a spent budget stops the waiting, it does not
   /// put the app back into a running state.
+  ///
+  /// The deferred hot-path truncate is dropped here rather than left to be refused when it fires: it
+  /// is a sleeping timer, it is the one piece of index work the drain deliberately does not track,
+  /// and the terminal checkpoint that follows this latch truncates the WAL anyway.
   func closeForTermination() {
     isClosedForTermination = true
+    pendingIndexBatchTruncationRetry?.cancel()
+    pendingIndexBatchTruncationRetry = nil
   }
 
   /// The gate every write entry point and both open paths consult. Returns `true` when the caller
@@ -994,6 +1015,30 @@ final class IndexDatabase {
     walCheckpointThresholdBytesOverride ?? Self.walCheckpointThresholdBytes
   }
 
+  /// First retry delay for a deferred hot-path truncate, doubling per consecutive deferral up to
+  /// `indexBatchTruncationRetryMaximumDelayNanoseconds`. A second is short next to the reader it is
+  /// waiting out and long next to the ~0.2 ms a refused checkpoint costs, and the ceiling keeps a
+  /// reader that never lets go from turning into a busy poll for the rest of the session.
+  private nonisolated static let indexBatchTruncationRetryBaseDelayNanoseconds: UInt64 = 1_000_000_000
+  private nonisolated static let indexBatchTruncationRetryMaximumDelayNanoseconds: UInt64 =
+    30_000_000_000
+
+  /// Narrow test seam for the ladder above, same shape as `walCheckpointThresholdBytesOverride`: a
+  /// pin that had to wait real seconds for the re-arm would be a wall-clock flake. `nil` in
+  /// production.
+  var indexBatchTruncationRetryDelayNanosecondsOverride: UInt64?
+
+  private var effectiveIndexBatchTruncationRetryDelayNanoseconds: UInt64 {
+    if let indexBatchTruncationRetryDelayNanosecondsOverride {
+      return indexBatchTruncationRetryDelayNanosecondsOverride
+    }
+    // Shift clamped so a long-lived wedge cannot overflow the doubling before the cap applies.
+    let shift = min(indexBatchTruncationRetryAttempt, 30)
+    return min(
+      Self.indexBatchTruncationRetryBaseDelayNanoseconds << shift,
+      Self.indexBatchTruncationRetryMaximumDelayNanoseconds)
+  }
+
   /// Below this much slack (256 pages ≈ 1 MiB at the default 4 KiB page size) compaction is not
   /// worth the write amplification — freed pages are reused by the next indexing pass anyway.
   private nonisolated static let freelistCompactionThresholdPages = 256
@@ -1024,23 +1069,16 @@ final class IndexDatabase {
   /// conversion must not re-run a multi-second VACUUM on every workspace close.
   private var didAttemptAutoVacuumConversion = false
 
-  /// Reclaims index disk space off the main actor. No-op when the pool was never opened: maintenance
-  /// must never be the thing that CREATES/migrates a database.
-  ///
-  /// Order is deliberate — compact first, checkpoint second: `incremental_vacuum` writes its page
-  /// moves into the WAL, so truncating afterwards is what actually returns the bytes to the
-  /// filesystem. Both run inside `barrierWriteWithoutTransaction`, which is the only GRDB entry
-  /// point that also excludes the pool's READER connections; a plain write would leave readers
-  /// holding WAL snapshots and SQLite would silently downgrade the truncate to a no-op.
   /// Arms hot-path storage hygiene as its OWN tracked index write, instead of awaiting it inside the
-  /// write task the supersede chain points at.
+  /// write task the supersede chain points at. Round 11's liveness fix, and the SINGLE hot-path entry
+  /// point: the three background index writes call this, and nothing else reaches
+  /// `performMaintenanceInBackground(reason: .indexBatch)` — including round 12's deferred retry,
+  /// which comes back through here precisely so it re-checks the latch, the coalescing and the WAL
+  /// threshold instead of re-running a pass on its own authority.
   ///
-  /// This is the whole of round 11's liveness fix and it is deliberately not a change to WHAT the
-  /// maintenance does: the barrier truncate stays a full `barrierWriteWithoutTransaction`, because a
-  /// PASSIVE checkpoint recycles WAL frames without ever shrinking the `-wal` file (see
-  /// `MaintenanceReason`) — making the hot path best-effort would quietly retire the 16 MiB bound in
-  /// exactly the reindex-storm-with-readers case it was built for. What changes is who WAITS for it:
-  /// nobody. It still waits for the reader; nothing else waits for it.
+  /// Coalesced to at most one outstanding pass (see `pendingIndexBatchMaintenance`), which is also
+  /// what keeps the round-12 deferral cheap: a pass that could not truncate re-arms exactly one
+  /// successor rather than leaving a fan of retries behind.
   ///
   /// Still covered by the termination drain, and by construction rather than by convention:
   /// `scheduleIndexWrite` registers the task in `scheduledIndexWrites`, which
@@ -1054,20 +1092,66 @@ final class IndexDatabase {
     }
   }
 
+  /// Reclaims index disk space off the main actor. No-op when the pool was never opened: maintenance
+  /// must never be the thing that CREATES/migrates a database.
+  ///
+  /// Order is deliberate — compact first, checkpoint second: `incremental_vacuum` writes its page
+  /// moves into the WAL, so truncating afterwards is what actually returns the bytes to the
+  /// filesystem.
+  ///
+  /// The two reasons deliberately take DIFFERENT locks, and that is round 12's fix:
+  ///
+  /// - `.workspaceClose` (like the terminal checkpoint) keeps `barrierWriteWithoutTransaction`. In
+  ///   GRDB 6.29.3 that is `readerPool.barrier { writer.sync }`: it waits for the readers in flight
+  ///   to be returned and blocks every reader CHECKOUT until it is done. By close/quit time there is
+  ///   nothing left to index and the close is the thing that has to wait, so excluding readers is
+  ///   correct there — and it is what makes the quit's WAL→0 guarantee unconditional.
+  /// - `.indexBatch` runs while the operator is typing, searching and saving, where that same
+  ///   exclusion makes storage hygiene wait for a reader and every LATER read wait for the
+  ///   hygiene. So the hot path takes a plain `writeWithoutTransaction` and treats a refused
+  ///   checkpoint as "not now": the truncate is DEFERRED and re-armed, never waited out.
+  ///
+  /// Measured on GRDB 6.29.3 / SQLite on macOS 15 (round-12 probe, recorded because both halves are
+  /// counter-intuitive):
+  ///
+  /// - With the barrier pending on a wedged reader, a `pool.write` submitted behind it COMPLETES,
+  ///   while a `pool.read` BLOCKS. The writer is only taken once the readers have drained, so the
+  ///   damage a hot-path barrier does is to READS — searches, backlinks, counts — not to saves.
+  /// - A plain-write `db.checkpoint(.truncate)` does NOT silently degrade to a no-op, which is what
+  ///   the comment here used to claim. With a reader on an older snapshot it returns `SQLITE_BUSY`
+  ///   in ~0.2 ms and leaves the `-wal` file exactly as it was; once that reader is gone the same
+  ///   call truncates the file to zero. Silent recycling is what a PASSIVE checkpoint does (see
+  ///   `MaintenanceReason`), which is why the deferral keeps retrying a TRUNCATE: the 16 MiB bound
+  ///   has to be enforced eventually, not quietly retired.
   func performMaintenanceInBackground(reason: MaintenanceReason) async {
     guard !isRefusedAfterTermination("performMaintenanceInBackground") else { return }
     guard let pool = databasePool, let databaseURL else { return }
     if reason == .indexBatch,
       Self.walFileSize(for: databaseURL) < effectiveWalCheckpointThresholdBytes
     {
+      // Under the bound nothing is owed, so a ladder built up by earlier deferrals starts over.
+      indexBatchTruncationRetryAttempt = 0
       return
     }
 
     let attemptConversion = reason == .workspaceClose && !didAttemptAutoVacuumConversion
     if attemptConversion { didAttemptAutoVacuumConversion = true }
-    let pageBudget = reason == .indexBatch ? Self.incrementalVacuumPageBudget : nil
     let conversionByteLimit = effectiveAutoVacuumConversionByteLimit
     if let gate = maintenanceGateOverride { await gate() }
+
+    if reason == .indexBatch {
+      let pageBudget = Self.incrementalVacuumPageBudget
+      let outcome = await Task.detached(priority: .utility) {
+        Self.compactAndTruncateWithoutExcludingReaders(pool: pool, pageBudget: pageBudget)
+      }.value
+      switch outcome {
+      case .truncated, .failed:
+        indexBatchTruncationRetryAttempt = 0
+      case .readerHeldTheWal:
+        deferIndexBatchTruncation()
+      }
+      return
+    }
 
     await Task.detached(priority: .utility) {
       if attemptConversion {
@@ -1076,13 +1160,87 @@ final class IndexDatabase {
       }
       do {
         try pool.barrierWriteWithoutTransaction { db in
-          try Self.reclaimFreePages(in: db, pageBudget: pageBudget)
+          try Self.reclaimFreePages(in: db, pageBudget: nil)
           try db.checkpoint(.truncate)
         }
       } catch {
         NSLog("Pensieve index maintenance failed: %@", error.localizedDescription)
       }
     }.value
+  }
+
+  /// What one hot-path hygiene pass achieved. `readerHeldTheWal` is the state that has to be told
+  /// apart from the other two: it is not a failure and not a success, it is "come back later".
+  private enum IndexBatchMaintenanceOutcome {
+    case truncated
+    case readerHeldTheWal
+    case failed
+  }
+
+  /// The hot-path pass: compaction plus a truncating checkpoint taken from a PLAIN pool write, so it
+  /// can neither be blocked by a reader nor block one. Never waits: a reader holding WAL frames comes
+  /// back as `readerHeldTheWal` for the caller to re-arm.
+  private nonisolated static func compactAndTruncateWithoutExcludingReaders(
+    pool: DatabasePool, pageBudget: Int
+  ) -> IndexBatchMaintenanceOutcome {
+    do {
+      return try pool.writeWithoutTransaction { db in
+        try reclaimFreePages(in: db, pageBudget: pageBudget)
+        return try truncateWalWithoutWaitingForReaders(db) ? .truncated : .readerHeldTheWal
+      }
+    } catch {
+      NSLog("Pensieve index maintenance failed: %@", error.localizedDescription)
+      return .failed
+    }
+  }
+
+  /// Takes the truncating checkpoint with the connection's busy handler OFF, so SQLite ANSWERS
+  /// instead of waiting. `false` means a reader still holds WAL frames (`SQLITE_BUSY`, the extended
+  /// codes included since `resultCode` is the primary one); every other error is thrown on.
+  ///
+  /// The writer carries no busy handler as this project configures GRDB (`Configuration.busyMode`
+  /// defaults to `.immediateError`, and `DatabasePool` gives the 10 s timeout to READERS only), so
+  /// zeroing it is belt and braces — and it is what keeps fail-fast a property of THIS code instead
+  /// of a GRDB default that a later configuration change could flip into a blocking wait. Restored
+  /// afterwards because the connection goes back into the pool for ordinary writes.
+  private nonisolated static func truncateWalWithoutWaitingForReaders(_ db: Database) throws -> Bool
+  {
+    let previousBusyTimeout = try Int.fetchOne(db, sql: "PRAGMA busy_timeout") ?? 0
+    try db.execute(sql: "PRAGMA busy_timeout = 0")
+    defer { try? db.execute(sql: "PRAGMA busy_timeout = \(previousBusyTimeout)") }
+    do {
+      try db.checkpoint(.truncate)
+      return true
+    } catch let error as DatabaseError where error.resultCode == .SQLITE_BUSY {
+      return false
+    }
+  }
+
+  /// Re-arms a hot-path truncate a reader would not let through.
+  ///
+  /// What this enforces is a SIZE bound, so giving up would retire it silently: once the reindex
+  /// storm ends, nothing else is coming to bring the WAL back under 16 MiB before the workspace
+  /// closes — and the reader that refused the checkpoint can be a single long backlink query. So the
+  /// pass re-arms itself on a backoff ladder and comes back through
+  /// `scheduleIndexBatchMaintenance()`, which re-checks the latch, the coalescing and the threshold.
+  /// It therefore stops on its own the moment the truncate lands or the WAL is back under the bound,
+  /// and while it does not, each attempt costs a file stat plus a ~0.2 ms refused checkpoint.
+  ///
+  /// Deliberately NOT registered in `scheduledIndexWrites`: the drain must never have to wait out a
+  /// sleep. The quit does not need it either — `startCheckpointOnTerminate()` truncates the WAL
+  /// itself under the drain budget — and `closeForTermination()` cancels this so a latched process is
+  /// not left holding a timer that would only be refused when it fires.
+  private func deferIndexBatchTruncation() {
+    indexBatchTruncationDeferrals += 1
+    guard !isClosedForTermination, pendingIndexBatchTruncationRetry == nil else { return }
+    let delay = effectiveIndexBatchTruncationRetryDelayNanoseconds
+    indexBatchTruncationRetryAttempt += 1
+    pendingIndexBatchTruncationRetry = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: delay)
+      guard let self, !Task.isCancelled else { return }
+      self.pendingIndexBatchTruncationRetry = nil
+      self.scheduleIndexBatchMaintenance()
+    }
   }
 
   /// STARTS the truncating checkpoint for the quit path — the LAST step of `TerminationSequence`,

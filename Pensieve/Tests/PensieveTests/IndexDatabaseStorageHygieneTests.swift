@@ -683,6 +683,157 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
         + "now \(walSize(for: databaseURL)))")
   }
 
+  // MARK: - R12: hot-path hygiene takes no reader-excluding lock at all
+
+  /// Round 12 — the POOL-LEVEL half of round 11's finding 3. Round 11 moved WHO WAITS for the
+  /// `.indexBatch` pass out of the supersede tail; the pass itself still took
+  /// `barrierWriteWithoutTransaction` and still waited a reader out. Its pin parks at
+  /// `maintenanceGateOverride`, which sits BEFORE that barrier is entered, so nothing in this suite
+  /// exercised the pool lock. This does, with a genuine wedged reader and no seam standing in for it.
+  ///
+  /// The mechanism is NOT the one the review claimed, and the difference decides what this pin
+  /// asserts. Measured against GRDB 6.29.3 (round-12 probe, verbatim in `R12_report.md`):
+  /// `barrierWriteWithoutTransaction` is `readerPool.barrier { writer.sync }`, so the serialized
+  /// writer is taken only AFTER the readers have drained. A `pool.write` submitted while the barrier
+  /// is pending therefore COMPLETES — saves, watcher deltas and reindexes are not frozen by it. A
+  /// `pool.read` submitted while the barrier is pending BLOCKS: reader checkout goes through the very
+  /// queue the barrier holds. So the damage a hot-path barrier does is to every LATER READ — search,
+  /// backlinks, counts — for as long as one slow reader keeps the barrier waiting.
+  ///
+  /// Hence the discriminator here is the SEARCH submitted while the hygiene pass runs (step 4). The
+  /// write in step 5 is corroboration only: it passes with the barrier restored too, and saying
+  /// otherwise would be repeating the claim instead of pinning it.
+  ///
+  /// The other half is that the truncate cannot simply be abandoned: the 16 MiB bound is a size
+  /// bound, and a plain-write TRUNCATE checkpoint does not silently no-op (the pre-round-12 comment
+  /// in `performMaintenanceInBackground` said it would) — with a reader on an older snapshot SQLite
+  /// answers `SQLITE_BUSY` in ~0.2 ms and leaves the `-wal` alone. So the pass defers and re-arms,
+  /// and step 6 pins that the deferred truncate lands once the reader lets go WITHOUT any further
+  /// index write arriving to carry it.
+  func testHotPathMaintenanceNeitherWaitsForAReaderNorBlocksTheReadsBehindIt() async throws {
+    let folder = try makeTemporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let databaseURL = folder.appendingPathComponent("index.db", isDirectory: false)
+    let root = folder.appendingPathComponent("workspace", isDirectory: true)
+
+    // The wedge holds one of GRDB's reader connections on a real `pool.read`. The valve is far above
+    // every wait below, so a build that reintroduces the barrier FAILS the assertions instead of
+    // being rescued by the release.
+    let wedge = WedgeSignal()
+    let released = DispatchSemaphore(value: 0)
+    defer { released.signal() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + Self.poolWedgeReleaseSeconds) {
+      released.signal()
+    }
+
+    let appState = AppState()
+    let database = IndexDatabase(
+      databaseURL: databaseURL,
+      didOpenBacklinkRead: {
+        wedge.markReached()
+        released.wait()
+      })
+    database.open(into: appState)
+    XCTAssertNil(appState.lastError)
+
+    churn(database: database, root: root, count: 300, deleting: 0)
+    let walBefore = walSize(for: databaseURL)
+    XCTAssertGreaterThan(
+      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers")
+    database.walCheckpointThresholdBytesOverride = Int64(walBefore)
+    // Milliseconds instead of the production second: this pin waits for the re-arm, and a real-second
+    // ladder in a test is a wall-clock flake waiting to happen.
+    database.indexBatchTruncationRetryDelayNanosecondsOverride = 25_000_000
+
+    // 1 — wedge a genuine pool reader, inside `fetchBacklinkRecords`' own `pool.read`.
+    let documents = (0..<3).map { documentRef(root: root, name: "churn-\($0).md") }
+    let backlinksFinished = CompletionFlag()
+    Task { @MainActor in
+      _ = await database.backlinksInBackground(to: documents[0], documents: documents)
+      backlinksFinished.isSet = true
+    }
+    try await waitUntil("the backlink query to be holding one of the pool's readers") {
+      wedge.isReached
+    }
+
+    // 2 — arm the hot path. This write also moves the WAL forward BEHIND the wedged reader, which is
+    // what makes its snapshot an older one: that is the case where SQLite refuses the truncate rather
+    // than quietly succeeding, so the deferral below is a real refusal and not a fixture artefact.
+    let armingRef = documentRef(root: root, name: "arms-maintenance.md")
+    let armingWriteFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.indexInBackground(
+        document: armingRef, body: "poolwedgearmneedle", appState: nil)
+      armingWriteFinished.isSet = true
+    }
+    try await waitUntil("the write that arms the hygiene pass to complete", timeout: 5) {
+      armingWriteFinished.isSet
+    }
+
+    // 3 — the pass must GIVE UP on the truncate and re-arm it, rather than wait the reader out. With
+    // the barrier restored this wait is what times out: the pass never comes back at all.
+    try await waitUntil(
+      "the hot-path hygiene pass to refuse the truncate and re-arm it", timeout: 5
+    ) {
+      database.indexBatchTruncationDeferrals >= 1
+    }
+    XCTAssertGreaterThanOrEqual(
+      walSize(for: databaseURL), walBefore,
+      "a WAL truncated while the reader still holds its snapshot would mean the pass either waited "
+        + "for the reader or reported success it did not achieve")
+
+    // 4 — THE DISCRIMINATOR: a search submitted while the reader is still wedged. Reader checkout is
+    // what a pending barrier blocks, so this is the read the old shape froze for the whole session.
+    let searchFinished = CompletionFlag()
+    let searchHits = SearchHitCount()
+    Task { @MainActor in
+      let results = await database.searchInBackground(
+        query: "poolwedgearmneedle", documents: [armingRef])
+      searchHits.value = results.count
+      searchFinished.isSet = true
+    }
+    try await waitUntil(
+      "the search submitted behind the hot-path hygiene pass to complete", timeout: 5
+    ) {
+      searchFinished.isSet
+    }
+    XCTAssertTrue(
+      wedge.isReached,
+      "fixture precondition: the wedged reader must still be holding its connection — the search "
+        + "must have gone through the pool WHILE the hygiene pass was subject to it")
+    XCTAssertGreaterThan(
+      searchHits.value, 0,
+      "the search must actually have reached the index (and seen the arming write), not returned an "
+        + "empty list from a refused open")
+
+    // 5 — corroboration, not the discriminator: an index write submitted behind the pass lands too.
+    let behindRef = documentRef(root: root, name: "behind-maintenance.md")
+    let behindWriteFinished = CompletionFlag()
+    database.scheduleIndexWrite {
+      await database.indexInBackground(
+        document: behindRef, body: "poolwedgebehindneedle", appState: nil)
+      behindWriteFinished.isSet = true
+    }
+    try await waitUntil("the index write submitted behind the hygiene pass to complete", timeout: 5) {
+      behindWriteFinished.isSet
+    }
+    XCTAssertEqual(
+      try indexHits(matching: "poolwedgebehindneedle", at: databaseURL), 1,
+      "the write submitted behind reader-blocked storage hygiene must land on disk")
+
+    // 6 — release the reader and submit NOTHING further: the deferred truncate has to come back on
+    // its own and enforce the bound. Without the re-arm the WAL would keep its high-water mark until
+    // an unrelated lifecycle event, which is how the 16 MiB bound gets retired by accident.
+    released.signal()
+    try await waitUntil(
+      "the deferred truncate to re-arm itself and hand the WAL back once the reader let go",
+      timeout: 10
+    ) {
+      walSize(for: databaseURL) <= 64 * 1024
+    }
+    try await waitUntil("the wedged backlink query to finish") { backlinksFinished.isSet }
+  }
+
   /// Ordinary `Close Folder` used to compact against whatever the index happened to have finished.
   /// `closeWorkspace` cancels `FolderManager`'s `indexUpdateTask` — which by its own contract
   /// abandons only the WAIT, never the write underneath, that one belongs to `IndexDatabase`'s
@@ -1296,6 +1447,17 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   @MainActor private final class CompletionFlag {
     var isSet = false
   }
+
+  /// Sibling of `CompletionFlag` for the one probe that has to report WHAT it read, not just that it
+  /// returned: a search that completed with zero hits would not prove it reached the pool.
+  @MainActor private final class SearchHitCount {
+    var value = 0
+  }
+
+  /// The wedged-reader valve for the round-12 pool pin. Far above every wait in that test (the
+  /// longest is 10 s) so a build that reintroduces the reader-excluding barrier fails an assertion
+  /// instead of being rescued by the release.
+  private static let poolWedgeReleaseSeconds: TimeInterval = 45
 
   /// Polls a monotone condition instead of sleeping a fixed amount: a correct build waits only as
   /// long as it actually needs, and a wrong one fails the assertion rather than a guessed duration.
