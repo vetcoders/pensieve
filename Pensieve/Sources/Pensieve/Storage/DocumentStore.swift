@@ -1271,6 +1271,40 @@ final class FolderManager {
       rootURLs: roots, currentSignature: currentSignature, into: appState)
   }
 
+  /// Whether the PERSISTED `.md` signature still describes the tree the current walk found — the
+  /// corroboration a cold-start valid-skip needs on top of the manifest's tree fingerprint.
+  ///
+  /// Round 21, finding 1. The two cold-start artifacts are written in OPPOSITE orders relative to
+  /// the index write they describe, and only one of them is safe to trust alone:
+  ///
+  /// - the manifest and its tree fingerprint are committed by `commitWorkspaceManifest` BEFORE the
+  ///   paired index write is even handed to `scheduleIndexWrite`, so a quit whose budget closes the
+  ///   termination latch in between rolls the documents/FTS transaction back and leaves the
+  ///   fingerprint on disk describing a tree the index does not hold;
+  /// - the `.md` signature is written by `persistSearchSignature` only AFTER its index write
+  ///   reported success, which is why a failed or abandoned write simply leaves the previous one in
+  ///   place (see `performColdIndex`).
+  ///
+  /// The skip gate used to ask only for `.valid` plus "the index has ANY rows for this workspace",
+  /// and rows left over from the PREVIOUS launch satisfy that. The next cold start then skipped over
+  /// its own repair, and because a skip issues no index write and no manifest re-commit, nothing at
+  /// startup ever revisited it: on an unchanged tree the stale FTS state survived indefinitely.
+  ///
+  /// So the gate now asks the persisted signature the same question `performColdIndex` asks before
+  /// taking ITS skip — the two decisions were making different demands of the same substrate, and
+  /// this gate is the one that suppresses `performColdIndex` entirely. Disagreement, or no persisted
+  /// signature at all, is answered `false`: the caller runs the full cold path, which re-derives the
+  /// index and persists the signature, so the cost of the conservative answer is one reindex on the
+  /// first launch after an abandoned write (or after an upgrade from a pre-signature workspace) and
+  /// warm starts from then on. Fail open, never fail skip.
+  static func persistedIndexAgreesWithTree(
+    persisted: WorkspaceSignature?,
+    current: WorkspaceSignature?
+  ) -> Bool {
+    guard let persisted, let current else { return false }
+    return WorkspaceSignature.delta(from: persisted, to: current).isEmpty
+  }
+
   /// Cold-start skip-gate. On a fresh launch the in-memory tree is empty, so `attemptHotReopen`'s
   /// cold-start short-circuit (STAB-R01 / B-01) hands off to the cold-scan path; this gate then
   /// consults the EXISTING substrate verdict against the persisted `tree-fingerprint.json` so an
@@ -1287,12 +1321,14 @@ final class FolderManager {
   /// - the substrate verdict is genuinely `.valid` (tree-fingerprint match + schema/scanner/
   ///   exclusions/roots/bookmark checks) — NOT a new validity notion;
   /// - the FTS index already has rows for this workspace (empty-index guard, invariant 2): a
-  ///   matching fingerprint over an empty index must still FULL-reindex, never skip.
+  ///   matching fingerprint over an empty index must still FULL-reindex, never skip;
+  /// - the PERSISTED `.md` signature still describes this walk (round 21, finding 1) — see
+  ///   `persistedIndexAgreesWithTree` for why the fingerprint alone cannot answer this.
   ///
   /// On a valid skip it opens the index, restores the in-memory `.md` baseline from the persisted
-  /// signature (so the first in-session edit goes INCREMENTAL, not full) — falling back to the
-  /// current scan's signature if none is persisted — and issues NO index write and NO manifest
-  /// re-commit. No `.indexing` activity is set: the caller clears `workspaceActivity` directly.
+  /// signature (so the first in-session edit goes INCREMENTAL, not full) and issues NO index write
+  /// and NO manifest re-commit. No `.indexing` activity is set: the caller clears
+  /// `workspaceActivity` directly.
   private func attemptColdStartValidSkip(
     scans: [WorkspaceScan],
     rootURLs: [URL],
@@ -1334,13 +1370,24 @@ final class FolderManager {
         return false
       }
 
-      // Restore the in-memory `.md` baseline so the FIRST in-session edit goes INCREMENTAL. Prefer
-      // the persisted signature (matches the live index); fall back to a signature derived from
-      // the walk we already have (re-uses the scan's documents — no extra enumeration). Either way
-      // no index write is issued: the verdict is `.valid`, so the on-disk index already matches.
-      lastWorkspaceSignature =
-        cacheStore.readSearchSignature(for: identity)
-        ?? FolderManager.signature(from: scans)
+      // Round 21, finding 1: the persisted `.md` signature has to CORROBORATE the fingerprint before
+      // this gate may suppress the whole cold path, because the fingerprint is persisted before its
+      // index write and the signature only after it. No persisted signature, or one that no longer
+      // describes this walk, means the full cold path — which repairs. See
+      // `persistedIndexAgreesWithTree`.
+      let persistedSignature = cacheStore.readSearchSignature(for: identity)
+      guard
+        Self.persistedIndexAgreesWithTree(
+          persisted: persistedSignature, current: FolderManager.signature(from: scans)),
+        let persistedSignature
+      else {
+        return false
+      }
+
+      // Restore the in-memory `.md` baseline so the FIRST in-session edit goes INCREMENTAL. It is
+      // the persisted signature by construction now — the guard above refuses the skip without one —
+      // and it matches the live index, which is what the `.valid` verdict plus that agreement mean.
+      lastWorkspaceSignature = persistedSignature
       if persistPresentationCache {
         do {
           try cacheStore.writeWorkspaceScans(scans, for: identity)
@@ -1513,7 +1560,16 @@ final class FolderManager {
         )
       else { return }
 
-      if cacheIsValid, indexedCount > 0 {
+      // The background sibling of `attemptColdStartValidSkip`'s gate, and it carries the round-21
+      // corroboration for the same reason: this branch suppresses the manifest commit AND
+      // `performColdIndex` below, so a fingerprint left describing an index write that never
+      // committed would be believed here too. The validation job already read both signatures off
+      // the one walk it owns, so this costs no scan.
+      if cacheIsValid, indexedCount > 0,
+        FolderManager.persistedIndexAgreesWithTree(
+          persisted: validation.persistedSearchSignature,
+          current: validation.currentSearchSignature)
+      {
         self.setOpenActivity(.cacheHit(label), into: appState)
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
