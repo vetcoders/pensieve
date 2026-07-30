@@ -40,7 +40,7 @@ final class EditorToolbeltTests: XCTestCase {
   func testSkinAxisAutoPopulates() {
     // The menu renders one row per case — every skin needs a display name
     // and a symbol, and the ids the picker tags on must stay unique.
-    let skins = ThemeManager.PreviewTheme.allCases
+    let skins = PensieveTheme.allCases
     XCTAssertFalse(skins.isEmpty)
     XCTAssertEqual(Set(skins.map(\.id)).count, skins.count)
     for skin in skins {

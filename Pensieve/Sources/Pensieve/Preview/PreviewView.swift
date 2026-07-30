@@ -50,7 +50,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
-  let skin: ThemeManager.PreviewTheme
+  let skin: PensieveTheme
   let themeManager: ThemeManager
   let documentURL: URL?
   let autoReload: Bool

@@ -459,14 +459,12 @@ private struct AppearanceToolbarMenu: View {
       .help("Markdown flavor — plain Markdown or GitHub Flavored")
       .accessibilityIdentifier("pensieve.toolbar.themePicker")
 
-      // Reading-surface skin, orthogonal to the flavor: it re-skins the
-      // rendered surface — paper-like, code-like, stripped, or a document
-      // theme — without changing the markdown dialect. Authorial skins
-      // (Default, Document, Code, Raw, Vista, MLA, Jamstatic) plus
-      // open-licensed ports (Notion, Vercel, Themeable, Glass — see
-      // THIRD_PARTY_THEMES.md).
+      // Reading-surface skin, orthogonal to the flavor: it re-dresses BOTH the
+      // rendered preview and the source editor — surface, typography and syntax
+      // tokens — without changing the markdown dialect. Seven first-party
+      // themes: Default, Raw, Pergament, Graphite, Ink, Klinika, Maszynopis.
       Picker("Theme", selection: $themeManager.skin) {
-        ForEach(ThemeManager.PreviewTheme.allCases) { skin in
+        ForEach(PensieveTheme.allCases) { skin in
           Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
         }
       }

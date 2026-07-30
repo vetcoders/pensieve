@@ -211,7 +211,7 @@ final class PreviewWebView: NSView {
     loadFullPage(current, identity: PreviewLoadIdentity(document: current))
   }
 
-  static func appearanceCSS(fontSize: CGFloat, skin: ThemeManager.PreviewTheme = .default)
+  static func appearanceCSS(fontSize: CGFloat, skin: PensieveTheme = .default)
     -> String
   {
     """
@@ -227,6 +227,11 @@ final class PreviewWebView: NSView {
       --vc-preview-row-alt: #f6f8fa;
       --vc-preview-mark-bg: #fff8c5;
       --vc-preview-mark-text: #24292f;
+      /* Semantic status tokens (P0/HOLD/OPEN markers). Kept in the base block so
+         `default` and `raw` carry them too; single-mode skins re-tune them. */
+      --vc-preview-danger: #cf222e;
+      --vc-preview-warning: #9a6700;
+      --vc-preview-positive: #1a7f37;
       --vc-preview-diagram-bg: #ffffff;
       --vc-preview-diagram-error-bg: #fff1f1;
       --vc-preview-diagram-error-text: #8c1d18;
@@ -246,6 +251,9 @@ final class PreviewWebView: NSView {
         --vc-preview-row-alt: #242428;
         --vc-preview-mark-bg: #4a3f16;
         --vc-preview-mark-text: #fff3b0;
+        --vc-preview-danger: #ff7b72;
+        --vc-preview-warning: #d29922;
+        --vc-preview-positive: #3fb950;
         --vc-preview-diagram-bg: #18181b;
         --vc-preview-diagram-error-bg: #3f1d1d;
         --vc-preview-diagram-error-text: #fecaca;
@@ -552,88 +560,17 @@ final class PreviewWebView: NSView {
   /// (`--vc-preview-*`) and `.markdown-body` typography only; structural rules
   /// stay owned by the base appearance block and the flavor bundle. `.default`
   /// emits nothing so the established GitHub surface is byte-for-byte unchanged.
-  static func skinCSS(for skin: ThemeManager.PreviewTheme) -> String {
+  ///
+  /// The five fixed-palette skins are SINGLE-MODE: they set every token
+  /// unconditionally (no `@media (prefers-color-scheme:)`) and come LAST in the
+  /// stylesheet, so they win over the base block's dark `@media` regardless of
+  /// system appearance. The WebView's pinned `NSAppearance` (see `PensieveTheme
+  /// .appearanceName`) keeps the flavour bundle (`gfm.css`) from flipping the
+  /// base the other way.
+  static func skinCSS(for skin: PensieveTheme) -> String {
     switch skin {
     case .default:
       return "/* vc-skin:default — base appearance, no overlay */"
-
-    case .paper:
-      // Warm paper: serif body, narrow measure, generous line height, ink-on-cream.
-      return """
-        /* vc-skin:paper */
-        :root {
-          --vc-preview-text: #2b2620;
-          --vc-preview-muted: #6b6358;
-          --vc-preview-border: #e3d9c6;
-          --vc-preview-code-bg: #f3ecda;
-          --vc-preview-link: #8a5a2b;
-          --vc-preview-row-alt: #f3ecda;
-          --vc-preview-paper-bg: #faf4e6;
-          --vc-preview-page-background: var(--vc-preview-paper-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #e8e0d0;
-            --vc-preview-muted: #b3a892;
-            --vc-preview-border: #4a4234;
-            --vc-preview-code-bg: #2b2820;
-            --vc-preview-link: #d9a566;
-            --vc-preview-row-alt: #26231c;
-            --vc-preview-paper-bg: #1d1a14;
-            --vc-preview-page-background: var(--vc-preview-paper-bg);
-          }
-        }
-        .markdown-body {
-          max-width: 720px;
-          font-family: "New York", Georgia, "Iowan Old Style", "Times New Roman", serif;
-          line-height: 1.78;
-          letter-spacing: 0.1px;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-family: "New York", Georgia, "Iowan Old Style", serif;
-          letter-spacing: 0.2px;
-        }
-        """
-
-    case .code:
-      // Code surface: monospace everything, terminal-ish slate tokens, tight rhythm.
-      return """
-        /* vc-skin:code */
-        :root {
-          --vc-preview-text: #d6deeb;
-          --vc-preview-muted: #8694a8;
-          --vc-preview-border: #20293a;
-          --vc-preview-code-bg: #0d1623;
-          --vc-preview-link: #7fb3ff;
-          --vc-preview-row-alt: #131d2c;
-          --vc-preview-code-surface: #0a121d;
-          --vc-preview-page-background: var(--vc-preview-code-surface);
-        }
-        @media (prefers-color-scheme: light) {
-          :root {
-            --vc-preview-text: #1b2330;
-            --vc-preview-muted: #5a6675;
-            --vc-preview-border: #d2dae6;
-            --vc-preview-code-bg: #eef2f7;
-            --vc-preview-link: #1f6feb;
-            --vc-preview-row-alt: #f1f5fa;
-            --vc-preview-code-surface: #f6f9fc;
-            --vc-preview-page-background: var(--vc-preview-code-surface);
-          }
-        }
-        .markdown-body {
-          max-width: 900px;
-          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
-          line-height: 1.55;
-          font-size: 0.95em;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
-          letter-spacing: -0.2px;
-        }
-        """
 
     case .raw:
       // Raw: stripped chrome, full width, monospace, near "view source".
@@ -660,345 +597,374 @@ final class PreviewWebView: NSView {
         }
         """
 
-    case .notion:
-      // Notion-like: warm neutral ink on white, comfortable measure, red inline
-      // code accent. Palette derived from the Apache-2.0 Typora Notion theme
-      // (cayxc, modified s1m4ne); dark tokens are the upstream values.
+    case .pergament:
       return """
-        /* vc-skin:notion */
+        /* vc-skin:pergament — light-only, warm paper, serif measure */
         :root {
-          --vc-preview-text: #37352f;
-          --vc-preview-muted: #73716d;
-          --vc-preview-border: #e1e7e8;
-          --vc-preview-code-bg: #ededeb;
-          --vc-preview-link: #2383e2;
-          --vc-preview-row-alt: #f7f6f3;
-          --vc-preview-notion-bg: #ffffff;
-          --vc-preview-notion-code: #eb5757;
-          --vc-preview-page-background: var(--vc-preview-notion-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #d4d4d4;
-            --vc-preview-muted: #9c9c9c;
-            --vc-preview-border: #3d3d3d;
-            --vc-preview-code-bg: #292927;
-            --vc-preview-link: #9c9c9c;
-            --vc-preview-row-alt: #202020;
-            --vc-preview-notion-bg: #191919;
-            --vc-preview-notion-code: #eb5757;
-            --vc-preview-page-background: var(--vc-preview-notion-bg);
-          }
+          --vc-preview-text: #2a251d;
+          --vc-preview-muted: #7a7062;
+          --vc-preview-border: #e2d8c2;
+          --vc-preview-code-bg: #efe8d6;
+          --vc-preview-link: #9a5b28;
+          --vc-preview-row-alt: #f2ece0;
+          --vc-preview-mark-bg: #e8dcae;
+          --vc-preview-mark-text: #2a251d;
+          --vc-preview-math-bg: #f3ecda;
+          --vc-preview-diagram-bg: #fbf8ef;
+          --vc-preview-danger: #8a3a2a;
+          --vc-preview-warning: #8a6a20;
+          --vc-preview-positive: #4a5a3c;
+          --vc-preview-pergament-bg: #f7f2e4;
+          --vc-preview-page-background: var(--vc-preview-pergament-bg);
         }
         .markdown-body {
-          max-width: 820px;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-          line-height: 1.55;
+          max-width: 680px;
+          font-family: "Newsreader", "New York", Georgia, "Iowan Old Style", serif;
+          font-size: 1.02em;
+          line-height: 1.78;
+          letter-spacing: 0.1px;
         }
         .markdown-body h1, .markdown-body h2, .markdown-body h3,
         .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-weight: 700;
-          letter-spacing: -0.01em;
+          font-family: "Newsreader", "New York", Georgia, serif;
+          font-weight: 600;
+          letter-spacing: -0.005em;
         }
-        .markdown-body :not(pre) > code,
-        .markdown-body tt {
-          color: var(--vc-preview-notion-code) !important;
+        .markdown-body h2 {
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          padding-bottom: 0.3em;
+        }
+        /* Tabele książkowe: tylko linie poziome, bez ramki i bez zebry w środku. */
+        .markdown-body table {
+          border: 0 !important;
+          border-top: 1px solid var(--vc-preview-border) !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          border-collapse: collapse;
+        }
+        .markdown-body thead th {
+          background: transparent !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          font: 500 0.72em/1 "Newsreader", Georgia, serif;
+          letter-spacing: 0.09em;
+          text-transform: uppercase;
+          color: var(--vc-preview-muted) !important;
+        }
+        .markdown-body table td, .markdown-body table th {
+          border-left: 0 !important;
+          border-right: 0 !important;
+        }
+        .markdown-body pre, .markdown-body code, .markdown-body tt {
+          font-family: "Sometype Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          color: #8a4a3a !important;
         }
         """
 
-    case .vista:
-      // Vista: Helvetica technical-doc look with framed, banded, hover-lit
-      // tables.
+    case .graphite:
       return """
-        /* vc-skin:vista */
+        /* vc-skin:graphite — dark-only, cool desaturated, report instrument */
         :root {
-          --vc-preview-text: #1a1a1a;
-          --vc-preview-muted: #555555;
-          --vc-preview-border: #e0e0e0;
-          --vc-preview-code-bg: #f6f8fa;
-          --vc-preview-link: #1f6feb;
-          --vc-preview-row-alt: #fafafa;
-          --vc-preview-vista-bg: #f9f9f9;
-          --vc-preview-vista-thead: #f1f1f1;
-          --vc-preview-vista-hover: #f5f8ff;
-          --vc-preview-page-background: var(--vc-preview-vista-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #dedede;
-            --vc-preview-muted: #aaaaaa;
-            --vc-preview-border: #333333;
-            --vc-preview-code-bg: rgba(245, 245, 245, 0.06);
-            --vc-preview-link: #8ab4f8;
-            --vc-preview-row-alt: #181818;
-            --vc-preview-vista-bg: #101010;
-            --vc-preview-vista-thead: #1f1f1f;
-            --vc-preview-vista-hover: #1a2030;
-            --vc-preview-page-background: var(--vc-preview-vista-bg);
-          }
+          --vc-preview-text: #c9d0d8;
+          --vc-preview-muted: #79838f;
+          --vc-preview-border: #21262e;
+          --vc-preview-code-bg: #171b22;
+          --vc-preview-link: #86b8c4;
+          --vc-preview-row-alt: #14181e;
+          --vc-preview-mark-bg: #2a3340;
+          --vc-preview-mark-text: #dde3ea;
+          --vc-preview-math-bg: #171b22;
+          --vc-preview-diagram-bg: #12151a;
+          --vc-preview-danger: #c88a8a;
+          --vc-preview-warning: #c49a72;
+          --vc-preview-positive: #86b8c4;
+          --vc-preview-graphite-bg: #0e1013;
+          --vc-preview-graphite-thead: #171b21;
+          --vc-preview-page-background: var(--vc-preview-graphite-bg);
         }
         .markdown-body {
-          max-width: 900px;
-          font-family: "Helvetica Neue", Helvetica, Arial, -apple-system, BlinkMacSystemFont, sans-serif;
-          line-height: 1.6;
+          max-width: 860px;
+          font-family: "Instrument Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          line-height: 1.68;
         }
         .markdown-body h1, .markdown-body h2, .markdown-body h3,
         .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-weight: 600;
+          font-family: "Instrument Sans", -apple-system, sans-serif;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+        }
+        /* Tabela raportowa: mono w komórkach, żeby liczby stały w kolumnie. */
+        .markdown-body table {
+          border: 1px solid var(--vc-preview-border) !important;
+          border-radius: 4px;
+          border-collapse: separate;
+          border-spacing: 0;
+          overflow: hidden;
+          font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.9em;
+          font-variant-numeric: tabular-nums;
+        }
+        .markdown-body thead th {
+          background: var(--vc-preview-graphite-thead) !important;
+          font: 500 0.72em/1 "JetBrains Mono", monospace;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: var(--vc-preview-muted) !important;
+        }
+        .markdown-body pre, .markdown-body code, .markdown-body tt {
+          font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          color: var(--vc-preview-warning) !important;
+        }
+        """
+
+    case .ink:
+      return """
+        /* vc-skin:ink — dark-only, signature surface: mercury silver + one violet */
+        :root {
+          --vc-preview-text: #c6ccd6;
+          --vc-preview-muted: #8590a0;
+          --vc-preview-border: #232a36;
+          --vc-preview-code-bg: #1a2130;
+          --vc-preview-link: #8a7fc8;
+          --vc-preview-row-alt: #151b26;
+          --vc-preview-mark-bg: #2b2540;
+          --vc-preview-mark-text: #e4e8ef;
+          --vc-preview-math-bg: #1a2130;
+          --vc-preview-diagram-bg: #121722;
+          --vc-preview-danger: #c88a8a;
+          --vc-preview-warning: #c8b07a;
+          --vc-preview-positive: #8fa89a;
+          --vc-preview-ink-bg: #0f131a;
+          --vc-preview-ink-silver: #b8c4d4;
+          --vc-preview-ink-strong: #e4e8ef;
+          --vc-preview-page-background: var(--vc-preview-ink-bg);
+        }
+        .markdown-body {
+          max-width: 780px;
+          font-family: "Literata", "New York", Georgia, serif;
+          font-size: 1.01em;
+          line-height: 1.72;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "Archivo", -apple-system, BlinkMacSystemFont, sans-serif;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          color: var(--vc-preview-ink-strong) !important;
+        }
+        /* Sygnatura motywu: gasnąca srebrna linia pod h2 zamiast pełnej reguły. */
+        .markdown-body h2 {
+          border-bottom: 0 !important;
+          padding-bottom: 0.35em;
+          position: relative;
+        }
+        .markdown-body h2::after {
+          content: "";
+          position: absolute;
+          left: 0; right: 0; bottom: 0;
+          height: 1px;
+          background: linear-gradient(to right, var(--vc-preview-link), rgba(138, 127, 200, 0));
         }
         .markdown-body table {
           border: 1px solid var(--vc-preview-border) !important;
-          border-radius: 6px;
+          border-radius: 7px;
           border-collapse: separate;
           border-spacing: 0;
           overflow: hidden;
         }
         .markdown-body thead th {
-          background: var(--vc-preview-vista-thead) !important;
+          background: var(--vc-preview-code-bg) !important;
+          font: 600 0.72em/1 "Archivo", sans-serif;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--vc-preview-muted) !important;
+        }
+        .markdown-body table td {
+          font-variant-numeric: tabular-nums;
+        }
+        .markdown-body pre, .markdown-body code, .markdown-body tt {
+          font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          color: #c9a8d8 !important;
+        }
+        """
+
+    case .klinika:
+      return """
+        /* vc-skin:klinika — light-only, clinical neutral, semantic colour only */
+        :root {
+          --vc-preview-text: #14181c;
+          --vc-preview-muted: #667079;
+          --vc-preview-border: #e4e8ec;
+          --vc-preview-code-bg: #f3f5f7;
+          --vc-preview-link: #0f6f6c;
+          --vc-preview-row-alt: #f8fafb;
+          --vc-preview-mark-bg: #d9ecea;
+          --vc-preview-mark-text: #14181c;
+          --vc-preview-math-bg: #f3f5f7;
+          --vc-preview-diagram-bg: #fafbfc;
+          --vc-preview-danger: #b4322c;
+          --vc-preview-warning: #7a4a12;
+          --vc-preview-positive: #0f6f6c;
+          --vc-preview-klinika-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-klinika-bg);
+        }
+        .markdown-body {
+          max-width: 820px;
+          font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          line-height: 1.7;
+        }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          font-family: "IBM Plex Sans", -apple-system, sans-serif;
           font-weight: 600;
+          letter-spacing: -0.01em;
         }
-        .markdown-body tbody tr:nth-child(even) {
-          background: var(--vc-preview-row-alt) !important;
-        }
-        .markdown-body tbody tr:hover {
-          background: var(--vc-preview-vista-hover) !important;
-        }
-        """
-
-    case .mla:
-      // MLA: Times serif, double-spaced, narrow academic measure with indented
-      // paragraphs and a centred title.
-      return """
-        /* vc-skin:mla */
-        :root {
-          --vc-preview-text: #1a1a1a;
-          --vc-preview-muted: #555555;
-          --vc-preview-border: #d8d2c4;
-          --vc-preview-code-bg: #f2efe6;
-          --vc-preview-link: #7a4a1f;
-          --vc-preview-row-alt: #f2efe6;
-          --vc-preview-mla-bg: #fbfaf5;
-          --vc-preview-page-background: var(--vc-preview-mla-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #e8e4d8;
-            --vc-preview-muted: #b0a890;
-            --vc-preview-border: #463f31;
-            --vc-preview-code-bg: #262219;
-            --vc-preview-link: #d2a16a;
-            --vc-preview-row-alt: #211d15;
-            --vc-preview-mla-bg: #17140d;
-            --vc-preview-page-background: var(--vc-preview-mla-bg);
-          }
-        }
-        .markdown-body {
-          max-width: 680px;
-          font-family: "Times New Roman", Times, Georgia, serif;
-          line-height: 2.0;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-family: "Times New Roman", Times, Georgia, serif;
-          font-weight: 700;
-        }
-        .markdown-body h1 {
-          text-align: center;
-          font-size: 1.3em;
-        }
-        .markdown-body p {
-          text-indent: 2em;
-          margin: 0;
-        }
-        """
-
-    case .jamstatic:
-      // Jamstatic: Poppins sans, slate body, lilac accents, deep-violet links.
-      return """
-        /* vc-skin:jamstatic */
-        :root {
-          --vc-preview-text: #52525b;
-          --vc-preview-muted: #71717a;
-          --vc-preview-border: #b1a3cc;
-          --vc-preview-code-bg: #f2f7ff;
-          --vc-preview-link: #300a66;
-          --vc-preview-row-alt: #f2f7ff;
-          --vc-preview-jam-bg: #ffffff;
-          --vc-preview-jam-accent: #b1a3cc;
-          --vc-preview-page-background: var(--vc-preview-jam-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #cdd0d6;
-            --vc-preview-muted: #9b9ba6;
-            --vc-preview-border: #4a4060;
-            --vc-preview-code-bg: #262234;
-            --vc-preview-link: #c4b5fd;
-            --vc-preview-row-alt: #242031;
-            --vc-preview-jam-bg: #1b1b22;
-            --vc-preview-jam-accent: #b1a3cc;
-            --vc-preview-page-background: var(--vc-preview-jam-bg);
-          }
-        }
-        .markdown-body {
-          max-width: 860px;
-          font-family: "Poppins", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-          line-height: 1.6;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-family: "Poppins", system-ui, sans-serif;
-          font-weight: 700;
-        }
-        .markdown-body a {
-          font-weight: 700;
-        }
-        .markdown-body blockquote {
-          border-left: 0.3rem solid var(--vc-preview-jam-accent) !important;
-        }
-        """
-
-    case .vercel:
-      // Vercel: Geist-style sans, near-black ink on white, blue links, purple
-      // callout accent. Derived from the MIT Typora Vercel theme (tecladochen);
-      // Geist falls back to the system sans (font fallback policy).
-      return """
-        /* vc-skin:vercel */
-        :root {
-          --vc-preview-text: #171717;
-          --vc-preview-muted: #666666;
-          --vc-preview-border: #eaeaea;
-          --vc-preview-code-bg: #fafafa;
-          --vc-preview-link: #0072f5;
-          --vc-preview-row-alt: #fafafa;
-          --vc-preview-vercel-bg: #ffffff;
-          --vc-preview-vercel-accent: #8e4ec6;
-          --vc-preview-page-background: var(--vc-preview-vercel-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #ededed;
-            --vc-preview-muted: #a1a1a1;
-            --vc-preview-border: #333333;
-            --vc-preview-code-bg: #1a1a1a;
-            --vc-preview-link: #52aeff;
-            --vc-preview-row-alt: #141414;
-            --vc-preview-vercel-bg: #0a0a0a;
-            --vc-preview-vercel-accent: #bf7af0;
-            --vc-preview-page-background: var(--vc-preview-vercel-bg);
-          }
-        }
-        .markdown-body {
-          max-width: 880px;
-          font-family: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
-          line-height: 1.65;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-weight: 700;
-          letter-spacing: -0.02em;
-        }
-        .markdown-body a {
-          text-decoration: none;
-          border-bottom: 1px solid var(--vc-preview-link);
-        }
-        .markdown-body blockquote {
-          border-left: 3px solid var(--vc-preview-vercel-accent) !important;
-        }
-        .markdown-body pre,
-        .markdown-body code,
-        .markdown-body tt {
-          font-family: "GeistMono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-        }
-        """
-
-    case .themeable:
-      // Themeable: Inter sans on slate, clean Tailwind-ish palette. Derived from
-      // the MIT Typora Themeable theme (jhildenbiddle); Inter falls back to the
-      // system sans.
-      return """
-        /* vc-skin:themeable */
-        :root {
-          --vc-preview-text: #1e293b;
-          --vc-preview-muted: #64748b;
-          --vc-preview-border: #e2e8f0;
-          --vc-preview-code-bg: #f1f5f9;
-          --vc-preview-link: #2563eb;
-          --vc-preview-row-alt: #f8fafc;
-          --vc-preview-themeable-bg: #ffffff;
-          --vc-preview-page-background: var(--vc-preview-themeable-bg);
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #e2e8f0;
-            --vc-preview-muted: #94a3b8;
-            --vc-preview-border: #334155;
-            --vc-preview-code-bg: #1e293b;
-            --vc-preview-link: #60a5fa;
-            --vc-preview-row-alt: #1e293b;
-            --vc-preview-themeable-bg: #0f172a;
-            --vc-preview-page-background: var(--vc-preview-themeable-bg);
-          }
-        }
-        .markdown-body {
-          max-width: 820px;
-          font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          line-height: 1.7;
-        }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3,
-        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
-          font-weight: 700;
-          letter-spacing: -0.015em;
-        }
-        """
-
-    case .glass:
-      // Glass: translucent, backdrop-blurred panels over a soft gradient, with
-      // pastel accents. Derived from the MIT Typora Foresee theme (passwordgloo).
-      return """
-        /* vc-skin:glass */
-        :root {
-          --vc-preview-text: #333333;
-          --vc-preview-muted: #666666;
-          --vc-preview-border: rgba(0, 0, 0, 0.08);
-          --vc-preview-code-bg: rgba(255, 255, 255, 0.45);
-          --vc-preview-link: #2f6fb3;
-          --vc-preview-row-alt: rgba(255, 255, 255, 0.35);
-          --vc-preview-glass-panel: rgba(255, 255, 255, 0.40);
-          --vc-preview-glass-grad-a: #e8f0ff;
-          --vc-preview-glass-grad-b: #f6e8ff;
-          --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
-        }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --vc-preview-text: #e0e0e0;
-            --vc-preview-muted: #a8a8a8;
-            --vc-preview-border: rgba(255, 255, 255, 0.10);
-            --vc-preview-code-bg: rgba(255, 255, 255, 0.06);
-            --vc-preview-link: #b3daff;
-            --vc-preview-row-alt: rgba(255, 255, 255, 0.05);
-            --vc-preview-glass-panel: rgba(40, 40, 50, 0.45);
-            --vc-preview-glass-grad-a: #1b2236;
-            --vc-preview-glass-grad-b: #2a1b36;
-            --vc-preview-page-background: linear-gradient(135deg, var(--vc-preview-glass-grad-a), var(--vc-preview-glass-grad-b));
-          }
-        }
-        .markdown-body {
-          max-width: 820px;
-          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
-          line-height: 1.7;
-        }
-        .markdown-body pre,
-        .markdown-body blockquote,
+        /* Karta pacjenta: gruba reguła otwierająca tabelę, dalej włosowe linie. */
         .markdown-body table {
-          background: var(--vc-preview-glass-panel) !important;
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          border: 1px solid var(--vc-preview-border) !important;
-          border-radius: 12px;
+          border: 0 !important;
+          border-top: 2px solid var(--vc-preview-text) !important;
+          border-collapse: collapse;
+          font-variant-numeric: tabular-nums;
+        }
+        .markdown-body thead th {
+          background: transparent !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          font: 600 0.7em/1 "IBM Plex Mono", ui-monospace, monospace;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: var(--vc-preview-muted) !important;
+        }
+        .markdown-body tbody tr {
+          background: transparent !important;
+          border-bottom: 1px solid #eef1f4 !important;
+        }
+        .markdown-body table td, .markdown-body table th {
+          border-left: 0 !important;
+          border-right: 0 !important;
+        }
+        .markdown-body pre, .markdown-body code, .markdown-body tt {
+          font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          color: var(--vc-preview-warning) !important;
+        }
+        """
+
+    case .maszynopis:
+      return """
+        /* vc-skin:maszynopis — one mono family everywhere, achromatic, centred heads */
+        :root {
+          --vc-preview-text: #1c1c1c;
+          --vc-preview-muted: #6e6e6e;
+          --vc-preview-border: #e6e6e6;
+          --vc-preview-code-bg: #f1f1f1;
+          --vc-preview-link: #1c1c1c;
+          --vc-preview-row-alt: #f7f7f7;
+          --vc-preview-mark-bg: #e6e6e6;
+          --vc-preview-mark-text: #1c1c1c;
+          --vc-preview-math-bg: #f3f3f3;
+          --vc-preview-diagram-bg: #f7f7f7;
+          --vc-preview-danger: #1c1c1c;
+          --vc-preview-warning: #6e6e6e;
+          --vc-preview-positive: #1c1c1c;
+          --vc-preview-maszynopis-bg: #ffffff;
+          --vc-preview-page-background: var(--vc-preview-maszynopis-bg);
+        }
+        /* Jedna rodzina na wszystko — to jest cały motyw. */
+        .markdown-body,
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6,
+        .markdown-body pre, .markdown-body code, .markdown-body tt,
+        .markdown-body table {
+          font-family: "Spline Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body {
+          max-width: 700px;
+          font-size: 0.96em;
+          line-height: 1.72;
+        }
+        /* Hierarchia z wagi i światła, nie z rozmiaru: wyśrodkowane, ledwo większe. */
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          text-align: center;
+          font-weight: 700;
+          letter-spacing: 0;
+          border-bottom: 0 !important;
+          margin-top: 2.1em;
+          margin-bottom: 1.05em;
+        }
+        .markdown-body h1 { font-size: 1.22em; }
+        .markdown-body h2 { font-size: 1.12em; }
+        .markdown-body h3 { font-size: 1.04em; }
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 1em; }
+        /* Linki bez barwy — sam podkreślnik. */
+        .markdown-body a {
+          color: var(--vc-preview-text) !important;
+          text-decoration: none;
+          border-bottom: 1px solid #a8a8a8;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          background: var(--vc-preview-code-bg) !important;
+          color: var(--vc-preview-text) !important;
+          padding: 1px 4px;
+        }
+        .markdown-body pre {
+          background: #f3f3f3 !important;
+          box-shadow: none;
+          border-radius: 0;
+        }
+        /* Checkbox jako rysowany kwadrat — 3 stany. Wymaga wsparcia po stronie
+           pipeline'u dla [~]; patrz sekcja 4. */
+        .markdown-body .task-list-item-checkbox {
+          appearance: none;
+          -webkit-appearance: none;
+          width: 13px;
+          height: 13px;
+          border: 1.5px solid #a8a8a8;
+          border-radius: 3px;
+          background: transparent;
+          vertical-align: -2px;
+        }
+        .markdown-body .task-list-item-checkbox:checked {
+          background: var(--vc-preview-text);
+          border-color: var(--vc-preview-text);
+        }
+        .markdown-body .task-list-item-checkbox:checked::after {
+          content: "";
+          display: block;
+          width: 100%;
+          height: 100%;
+          background: #ffffff;
+          clip-path: polygon(18% 52%, 40% 74%, 84% 26%, 92% 36%, 40% 88%, 10% 60%);
+        }
+        .markdown-body table {
+          border: 0 !important;
+          border-top: 1px solid var(--vc-preview-border) !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          border-collapse: collapse;
+          font-size: 0.94em;
+        }
+        .markdown-body thead th {
+          background: transparent !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          font-weight: 700;
+          font-size: 0.8em;
+          color: var(--vc-preview-muted) !important;
+        }
+        .markdown-body table td, .markdown-body table th {
+          border-left: 0 !important;
+          border-right: 0 !important;
         }
         .markdown-body blockquote {
-          padding: 0.6em 1em;
+          border-left: 2px solid var(--vc-preview-text) !important;
+          background: var(--vc-preview-row-alt);
+          padding: 0.6em 0.9em;
+          font-style: italic;
+          color: #4a4a4a !important;
         }
         """
     }

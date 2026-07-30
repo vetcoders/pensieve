@@ -14,80 +14,71 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertFalse(css.contains(".markdown-body"))
   }
 
-  func testPaperSkinIsSerifAndNarrow() {
-    let css = PreviewWebView.skinCSS(for: .paper)
-    XCTAssertTrue(css.contains("vc-skin:paper"))
-    XCTAssertTrue(css.contains("serif"))
-    XCTAssertTrue(css.contains("max-width: 720px"))
-  }
-
-  func testCodeSkinIsMonospace() {
-    let css = PreviewWebView.skinCSS(for: .code)
-    XCTAssertTrue(css.contains("vc-skin:code"))
-    XCTAssertTrue(css.contains("monospace"))
-  }
-
   func testRawSkinStripsChrome() {
     let css = PreviewWebView.skinCSS(for: .raw)
     XCTAssertTrue(css.contains("vc-skin:raw"))
     XCTAssertTrue(css.contains("max-width: none"))
   }
 
-  func testNotionSkinUsesNotionTokens() {
-    let css = PreviewWebView.skinCSS(for: .notion)
-    XCTAssertTrue(css.contains("vc-skin:notion"))
-    // Notion ink + red inline-code accent are the signature tokens.
-    XCTAssertTrue(css.contains("#37352f"))
-    XCTAssertTrue(css.contains("--vc-preview-notion-code"))
-  }
-
-  func testVistaSkinBandsTables() {
-    let css = PreviewWebView.skinCSS(for: .vista)
-    XCTAssertTrue(css.contains("vc-skin:vista"))
-    XCTAssertTrue(css.contains("Helvetica"))
-    // Banded rows are the VISTA table signature.
-    XCTAssertTrue(css.contains("tbody tr:nth-child(even)"))
-  }
-
-  func testMLASkinIsSerifAndDoubleSpaced() {
-    let css = PreviewWebView.skinCSS(for: .mla)
-    XCTAssertTrue(css.contains("vc-skin:mla"))
+  func testPergamentSkinIsWarmSerifAndNarrow() {
+    let css = PreviewWebView.skinCSS(for: .pergament)
+    XCTAssertTrue(css.contains("vc-skin:pergament"))
     XCTAssertTrue(css.contains("serif"))
-    XCTAssertTrue(css.contains("line-height: 2.0"))
+    XCTAssertTrue(css.contains("Newsreader"))
+    XCTAssertTrue(css.contains("max-width: 680px"))
+    XCTAssertTrue(css.contains("--vc-preview-pergament-bg: #f7f2e4"))
   }
 
-  func testJamstaticSkinIsPoppinsWithLilacAccent() {
-    let css = PreviewWebView.skinCSS(for: .jamstatic)
-    XCTAssertTrue(css.contains("vc-skin:jamstatic"))
-    XCTAssertTrue(css.contains("Poppins"))
-    XCTAssertTrue(css.contains("#b1a3cc"))
+  func testGraphiteSkinIsCoolReportInstrument() {
+    let css = PreviewWebView.skinCSS(for: .graphite)
+    XCTAssertTrue(css.contains("vc-skin:graphite"))
+    XCTAssertTrue(css.contains("Instrument Sans"))
+    XCTAssertTrue(css.contains("#c9d0d8"))
+    XCTAssertTrue(css.contains("JetBrains Mono"))
   }
 
-  func testVercelSkinIsBlueLinkOnNearBlackInk() {
-    let css = PreviewWebView.skinCSS(for: .vercel)
-    XCTAssertTrue(css.contains("vc-skin:vercel"))
-    XCTAssertTrue(css.contains("#171717"))
-    XCTAssertTrue(css.contains("Geist"))
-    XCTAssertTrue(css.contains("font-weight: 700"))
-  }
-
-  func testThemeableSkinIsInterOnSlate() {
-    let css = PreviewWebView.skinCSS(for: .themeable)
-    XCTAssertTrue(css.contains("vc-skin:themeable"))
-    XCTAssertTrue(css.contains("Inter"))
-    XCTAssertTrue(css.contains("#1e293b"))
-  }
-
-  func testGlassSkinIsBackdropBlurred() {
-    let css = PreviewWebView.skinCSS(for: .glass)
-    XCTAssertTrue(css.contains("vc-skin:glass"))
-    XCTAssertTrue(css.contains("backdrop-filter: blur"))
+  func testInkSkinIsSignatureDarkWithFadingHeadingRule() {
+    let css = PreviewWebView.skinCSS(for: .ink)
+    XCTAssertTrue(css.contains("vc-skin:ink"))
+    XCTAssertTrue(css.contains("Literata"))
+    XCTAssertTrue(css.contains("#c6ccd6"))
+    // Signature: the fading silver rule under h2 is an ::after gradient, not a
+    // full border.
+    XCTAssertTrue(css.contains("h2::after"))
     XCTAssertTrue(css.contains("linear-gradient"))
+    XCTAssertTrue(css.contains("--vc-preview-link: #8a7fc8"))
+  }
+
+  func testKlinikaSkinIsClinicalNeutral() {
+    let css = PreviewWebView.skinCSS(for: .klinika)
+    XCTAssertTrue(css.contains("vc-skin:klinika"))
+    XCTAssertTrue(css.contains("IBM Plex Sans"))
+    XCTAssertTrue(css.contains("#14181c"))
+    // Patient-card table opens with a thick rule.
+    XCTAssertTrue(css.contains("border-top: 2px solid var(--vc-preview-text) !important"))
+  }
+
+  func testMaszynopisSkinIsOneMonoFamilyCentred() {
+    let css = PreviewWebView.skinCSS(for: .maszynopis)
+    XCTAssertTrue(css.contains("vc-skin:maszynopis"))
+    XCTAssertTrue(css.contains("Spline Sans Mono"))
+    XCTAssertTrue(css.contains("monospace"))
+    XCTAssertTrue(css.contains("text-align: center"))
+  }
+
+  func testFixedPaletteSkinsCarryNoPrefersColorSchemeBlock() {
+    // Single-mode themes set every token unconditionally; the appearance is
+    // pinned on the WebView instead of branching on the system setting.
+    for skin in [PensieveTheme.pergament, .graphite, .ink, .klinika, .maszynopis] {
+      XCTAssertFalse(
+        PreviewWebView.skinCSS(for: skin).contains("prefers-color-scheme"),
+        "skin \(skin.rawValue) must not branch on prefers-color-scheme")
+    }
   }
 
   func testEverySkinIsExhaustivelyCovered() {
     // Guards against an enum case being added without a skinCSS branch + marker.
-    for skin in ThemeManager.PreviewTheme.allCases {
+    for skin in PensieveTheme.allCases {
       let css = PreviewWebView.skinCSS(for: skin)
       XCTAssertTrue(
         css.contains("vc-skin:\(skin.rawValue)"),
@@ -95,18 +86,34 @@ final class PreviewThemeTests: XCTestCase {
     }
   }
 
+  // MARK: - semantic status tokens live in the base block
+
+  func testBaseBlockDefinesSemanticStatusTokensInBothModes() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
+
+    // Light defaults in the base :root...
+    XCTAssertTrue(css.contains("--vc-preview-danger: #cf222e"))
+    XCTAssertTrue(css.contains("--vc-preview-warning: #9a6700"))
+    XCTAssertTrue(css.contains("--vc-preview-positive: #1a7f37"))
+    // ...and dark overrides in the base @media block, so `default`/`raw` keep
+    // the tokens without any skin overlay.
+    XCTAssertTrue(css.contains("--vc-preview-danger: #ff7b72"))
+    XCTAssertTrue(css.contains("--vc-preview-warning: #d29922"))
+    XCTAssertTrue(css.contains("--vc-preview-positive: #3fb950"))
+  }
+
   // MARK: - appearanceCSS threads the skin through
 
   func testAppearanceCSSAppendsSkinOverlay() {
     let base = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
-    let paper = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
+    let pergament = PreviewWebView.appearanceCSS(fontSize: 14, skin: .pergament)
 
     // Both carry the shared base tokens...
     XCTAssertTrue(base.contains("--vc-preview-text"))
-    XCTAssertTrue(paper.contains("--vc-preview-text"))
-    // ...but only the paper skin appends its overlay marker.
-    XCTAssertFalse(base.contains("vc-skin:paper"))
-    XCTAssertTrue(paper.contains("vc-skin:paper"))
+    XCTAssertTrue(pergament.contains("--vc-preview-text"))
+    // ...but only the pergament skin appends its overlay marker.
+    XCTAssertFalse(base.contains("vc-skin:pergament"))
+    XCTAssertTrue(pergament.contains("vc-skin:pergament"))
   }
 
   func testAppearanceCSSDefaultsToDefaultSkin() {
@@ -148,7 +155,7 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   func testAppearanceCSSDefinesRelativeHeadingScaleIndependentOfFlavor() {
-    for skin in [ThemeManager.PreviewTheme.default, .vercel, .paper] {
+    for skin in [PensieveTheme.default, .ink, .pergament] {
       let css = PreviewWebView.appearanceCSS(fontSize: 16, skin: skin)
 
       XCTAssertTrue(css.contains("line-height: 1.25"), "skin \(skin.rawValue)")
@@ -182,14 +189,14 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   func testAppearanceCSSDefaultsTitlebarOverlapToOpaqueUntilNativeMeasurement() {
-    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .pergament)
 
     XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-height: 0px"))
     XCTAssertTrue(css.contains("body::before"))
     XCTAssertTrue(css.contains("top: var(--vc-preview-titlebar-glass-height)"))
     XCTAssertTrue(css.contains("background: var(--vc-preview-page-background)"))
-    XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-paper-bg)"))
-    XCTAssertFalse(css.contains("background: var(--vc-preview-paper-bg) !important"))
+    XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-pergament-bg)"))
+    XCTAssertFalse(css.contains("background: var(--vc-preview-pergament-bg) !important"))
   }
 
   func testAppearanceCSSPinsPreviewTopContentInsetToWindowChromeRecipe() {
@@ -316,16 +323,12 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   func testOpaqueSkinsRouteBackgroundThroughPageBackdropToken() {
-    let skins: [ThemeManager.PreviewTheme] = [
-      .paper,
-      .code,
-      .notion,
-      .vista,
-      .mla,
-      .jamstatic,
-      .vercel,
-      .themeable,
-      .glass,
+    let skins: [PensieveTheme] = [
+      .pergament,
+      .graphite,
+      .ink,
+      .klinika,
+      .maszynopis,
     ]
 
     for skin in skins {
@@ -345,24 +348,71 @@ final class PreviewThemeTests: XCTestCase {
       markdown: "x", fontSize: 14, theme: .gfm, documentURL: nil)
     XCTAssertEqual(withDefault.skin, .default)
 
-    let withCode = PreviewRenderRequest(
-      markdown: "x", fontSize: 14, theme: .gfm, skin: .code, documentURL: nil)
-    XCTAssertEqual(withCode.skin, .code)
+    let withInk = PreviewRenderRequest(
+      markdown: "x", fontSize: 14, theme: .gfm, skin: .ink, documentURL: nil)
+    XCTAssertEqual(withInk.skin, .ink)
     // Skin participates in equality so a skin change is a distinct request.
-    XCTAssertNotEqual(withDefault, withCode)
+    XCTAssertNotEqual(withDefault, withInk)
   }
 
-  // MARK: - ThemeManager persists the skin
+  // MARK: - PensieveTheme migration + fresh-install default
+
+  func testFreshInstallDefaultsToInk() {
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: nil), .ink)
+  }
+
+  func testKnownRawValuesResolveToThemselves() {
+    for theme in PensieveTheme.allCases {
+      XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: theme.rawValue), theme)
+    }
+  }
+
+  func testLegacyRawValuesMigrateToConsolidationTargets() {
+    let expected: [String: PensieveTheme] = [
+      "paper": .pergament,
+      "mla": .pergament,
+      "code": .graphite,
+      "vista": .klinika,
+      "notion": .klinika,
+      "vercel": .klinika,
+      "themeable": .klinika,
+      "jamstatic": .klinika,
+      "glass": .ink,
+    ]
+    for (raw, target) in expected {
+      XCTAssertEqual(
+        PensieveTheme.resolve(persistedRawValue: raw), target,
+        "legacy skin \(raw) should migrate to \(target.rawValue)")
+    }
+  }
+
+  func testUnknownRawValueFallsBackToDefault() {
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: "nonexistent-skin"), .default)
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: ""), .default)
+  }
+
+  // MARK: - ThemeManager persists + migrates the skin
+
+  func testThemeManagerFreshInstallDefaultsToInk() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.fresh")
+    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .ink)
+  }
 
   func testThemeManagerPersistsSkinSelection() {
     let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.tests")
 
     let manager = ThemeManager(defaults: defaults)
-    XCTAssertEqual(manager.skin, .default)
-    manager.skin = .paper
+    manager.skin = .pergament
 
     let reloaded = ThemeManager(defaults: defaults)
-    XCTAssertEqual(reloaded.skin, .paper)
+    XCTAssertEqual(reloaded.skin, .pergament)
+  }
+
+  func testThemeManagerMigratesLegacyPersistedSkin() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.legacy")
+    defaults.set("glass", forKey: "pensieve.preview.skin")
+
+    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .ink)
   }
 }
 
