@@ -218,6 +218,11 @@ struct DocumentWindowRootView: View {
           return
         }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+        // Frontmost window == the document a relaunch must bring back. Without
+        // this the persisted value would only track the last document OPENED,
+        // so simply switching back to an older tab before quitting restored the
+        // wrong one.
+        controller.noteWindowBecameKey()
       }
       // App-wide save-on-close guard. Every window (factory-built document tab AND
       // state-restored WindowGroup scene) shares this root, and every close
@@ -247,6 +252,13 @@ struct DocumentWindowRootView: View {
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
+    }
+    // A relaunch that restores a document still owes the user their unsaved
+    // crash draft. It arrives as a second window, which adopts the draft on its
+    // own start — the restored document was already claimed by this window, so
+    // there is nothing left for it to reopen.
+    controller.requestOpenRecoveredDraftWindow = {
+      DocumentWindowRegistry.shared.openLauncherWindow()
     }
   }
 

@@ -64,6 +64,10 @@ final class AppController: ObservableObject {
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
+  /// Asks for one more window so a pending crash draft can come back WITHOUT
+  /// evicting the document this window is restoring. Unwired (tests, headless)
+  /// means "no window to give it": the draft then stays in this window.
+  var requestOpenRecoveredDraftWindow: (() -> Void)?
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -133,10 +137,36 @@ final class AppController: ObservableObject {
     // Untitled", and the dirty untitled session then blocked the load of the
     // document the window was opened for.
     guard restoringWorkspace else { return }
-    if documentStore.restoreRecoveredDraft(into: appState) {
+
+    // Restore ORDER matters. A relaunch brings back exactly one window (the
+    // v1 contract carries no tab-group restoration), and the recovery pass used
+    // to claim it unconditionally: the window came back as "Recovered Untitled",
+    // the now-dirty session made `selectRestoredDocument` bail, and the real
+    // file the user was reading was dropped entirely. The document claims this
+    // window first; the crash draft gets a window of its own so neither piece
+    // of the previous session is lost.
+    let restoredDocumentURL = documentStore.claimRestoredActiveDocument()
+    if let restoredDocumentURL,
+      documentStore.restoreActiveDocument(restoredDocumentURL, into: appState)
+    {
+      if documentStore.hasPendingRecoveryDraft, let requestOpenRecoveredDraftWindow {
+        requestOpenRecoveredDraftWindow()
+      }
+    } else if documentStore.restoreRecoveredDraft(into: appState) {
+      // No document to restore (or it is gone from disk): the draft keeps this
+      // window rather than being stranded with nowhere to appear.
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
+  }
+
+  /// The window became key: it now owns "the document a relaunch restores".
+  /// An untitled window does NOT clear the record — its unsaved buffer already
+  /// comes back through the recovery draft, and erasing the last real document
+  /// would strand the file window the user also had open.
+  func noteWindowBecameKey() {
+    guard let url = appState.documentSession.url else { return }
+    documentStore.noteActiveDocumentForRestore(url)
   }
 
   func openFolder(url: URL) {

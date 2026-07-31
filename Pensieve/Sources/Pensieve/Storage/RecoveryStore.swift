@@ -46,6 +46,13 @@ final class RecoveryStore {
     return draft
   }
 
+  /// Whether a draft is still waiting for a window, WITHOUT consuming it. The
+  /// restoring window uses this to decide that the draft needs a window of its
+  /// own instead of taking over the one restoring the previous document.
+  var hasPendingRestoreDraft: Bool {
+    !hasHandedOutRestoreDraft && !loadDrafts().isEmpty
+  }
+
   private var hasHandedOutRestoreDraft = false
 
   func loadDrafts() -> [RecoveryDraft] {

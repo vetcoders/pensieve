@@ -8,7 +8,9 @@ final class BookmarkStore {
   private let legacyFolderBookmarkKey = "Pensieve.openFolder.bookmark"
   private let rootBookmarksKey = "Pensieve.workspace.rootBookmarks"
   private let fileBookmarksKey = "Pensieve.workspace.fileBookmarks"
+  private let activeDocumentKey = "Pensieve.workspace.activeDocument"
   private var activeAccess: [URL: Bool] = [:]
+  private var hasHandedOutActiveDocument = false
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -161,11 +163,39 @@ final class BookmarkStore {
     return RestoredWorkspaceBookmarks(rootURLs: rootURLs, fileURLs: fileURLs)
   }
 
+  /// Records the document the user is on so the next launch reopens it. Only a
+  /// path is stored: reading it back needs no scope of its own — the file is
+  /// either inside a restored root or already carries its own file bookmark,
+  /// and minting a second bookmark per launch would grow `fileBookmarks`
+  /// without bound.
+  func persistActiveDocument(url: URL?) {
+    guard let url else {
+      defaults.removeObject(forKey: activeDocumentKey)
+      return
+    }
+    defaults.set(url.standardizedFileURL.path, forKey: activeDocumentKey)
+  }
+
+  /// Hands the previous session's active document to the FIRST restoring
+  /// window, at most once per launch — the same single-handout discipline
+  /// `RecoveryStore.claimDraftForRestore` uses. Without it every restoring
+  /// window would reopen the same document, and the pending crash draft would
+  /// have no window left to come back in.
+  func claimActiveDocumentForRestore() -> URL? {
+    guard !hasHandedOutActiveDocument else { return nil }
+    hasHandedOutActiveDocument = true
+    guard let path = defaults.string(forKey: activeDocumentKey) else { return nil }
+    let url = URL(fileURLWithPath: path).standardizedFileURL
+    guard isExistingFile(url) else { return nil }
+    return url
+  }
+
   func clear(into appState: AppState, error: String? = nil) {
     stopAllAccess()
     defaults.removeObject(forKey: legacyFolderBookmarkKey)
     defaults.removeObject(forKey: rootBookmarksKey)
     defaults.removeObject(forKey: fileBookmarksKey)
+    defaults.removeObject(forKey: activeDocumentKey)
     appState.bookmarkData = nil
     if let error {
       appState.lastError = error
