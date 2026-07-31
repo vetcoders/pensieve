@@ -6,7 +6,6 @@ class MarkdownTextStorage: NSTextContentStorage {
   private var highlightWorkItem: DispatchWorkItem?
   private var pendingHighlightRange: NSRange?
   private var pendingRequiresFullRefresh = false
-  private var pendingRethemeCompletion = false
   private var lastProcessedString = ""
 
   /// Delay before a scheduled highlight pass runs. Shared by the typing debounce
@@ -35,6 +34,51 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// prove what the timings say: a skin switch on a large document must not run
   /// one synchronously, and a burst of switches must collapse into ONE.
   private(set) var fullRefreshCount = 0
+
+  // MARK: - Deferred retheme sweep
+
+  /// Next character offset the deferred sweep still has to paint, or `nil` when
+  /// no sweep is in flight.
+  private var rethemeSweepCursor: Int?
+  private var rethemeWorkItem: DispatchWorkItem?
+
+  /// Rolling estimate of what a reset + both highlighters cost per character,
+  /// used to size the next chunk from a TIME budget rather than a fixed
+  /// character count. Seeded from the measured debug figure and then replaced by
+  /// real measurements, because a release build is several times faster and a
+  /// chunk frozen at the debug size would make the sweep needlessly long there.
+  private var rethemeSecondsPerCharacter = MarkdownTextStorage.seedSecondsPerCharacter
+
+  /// Chunks completed in the current (or most recent) sweep, and the longest any
+  /// single chunk held the main thread. Both exist for the perf pins: the whole
+  /// point of chunking is that no single chunk blocks longer than a frame.
+  private(set) var rethemeChunkCount = 0
+  private(set) var longestRethemeChunkDuration: TimeInterval = 0
+
+  /// Whether a sweep still has ranges to paint. Exposed so a pin can land an
+  /// edit at a moment that is provably MID-sweep instead of guessing a delay.
+  var isRethemeSweepInFlight: Bool { rethemeSweepCursor != nil }
+
+  /// Wall time one chunk of the deferred sweep may spend on the main thread.
+  ///
+  /// Settable so the pins can force a many-chunk sweep without a megabyte
+  /// fixture; production always uses the default. One 60 Hz frame is the budget
+  /// because the chunk rides a frame: anything longer and the sweep is back to
+  /// being a visible stall, just a smaller one.
+  var rethemeChunkTimeBudget: TimeInterval = MarkdownTextStorage.defaultRethemeChunkTimeBudget
+
+  static let defaultRethemeChunkTimeBudget: TimeInterval = 1.0 / 60.0
+
+  /// Measured on the running app: ~0.7 µs per character for a full reset + both
+  /// highlighters in a debug build (860 ms for a 1.27 MB draft).
+  static let seedSecondsPerCharacter: TimeInterval = 0.7e-6
+
+  /// Chunk-length guard rails. The floor stops a pathological measurement from
+  /// degenerating into a per-character crawl that would never finish; the
+  /// ceiling stops one from swallowing the whole document and re-creating the
+  /// single blocking pass this replaced.
+  static let minimumRethemeChunkLength = 2_048
+  static let maximumRethemeChunkLength = 262_144
 
   /// Cached, document-order list of every ``` fence line's `NSRange`.
   ///
@@ -94,9 +138,8 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// So: repaint what is on screen now, defer the rest. The viewport is widened
   /// to whole paragraphs and to any code block it touches — the same context the
   /// full pass would give it, so the visible text is not coloured as prose for
-  /// the duration of the deferral — and re-highlighted inline. The
-  /// full-document pass then rides the existing debounced work item, which also
-  /// coalesces a burst of switches into a single full pass.
+  /// the duration of the deferral — and re-highlighted inline. The rest of the
+  /// document is then swept in frame-sized chunks.
   private func rethemeHighlighting() {
     guard let textStorage = textStorage else { return }
     let string = textStorage.string as NSString
@@ -112,23 +155,120 @@ class MarkdownTextStorage: NSTextContentStorage {
     let scopedRange = codeBlockAwareRange(
       for: scopedHighlightRange(for: viewportRange, in: string))
     refreshHighlighting(in: scopedRange)
-    scheduleFullRethemeRefresh()
+    startRethemeSweep()
   }
 
-  /// Queues the rest of the document behind the viewport repaint. Cancels any
-  /// pending pass first, so eight clicks in a row cost one full refresh instead
-  /// of eight.
-  private func scheduleFullRethemeRefresh() {
-    highlightWorkItem?.cancel()
-    pendingHighlightRange = nil
-    pendingRequiresFullRefresh = true
-    pendingRethemeCompletion = true
+  /// Starts (or restarts) the deferred sweep that carries the new palette across
+  /// the rest of the document.
+  ///
+  /// The first cut of this fix queued ONE full-document pass behind the viewport
+  /// repaint. That removed the stall from in front of the repaint but not from
+  /// the main thread: measured on the running app, `applyTheme` fell from 860 ms
+  /// to 150 ms, yet the remaining ~700 ms still landed as a single block one
+  /// timer tick later, and click→pixels only came down from 3.5–4.5 s to 2.2 s.
+  ///
+  /// So the pass is cut into chunks sized from a TIME budget — one frame — and
+  /// each chunk rides its own timer, yielding the main thread in between. The
+  /// document is swept front to back; the viewport region is re-covered on the
+  /// way past, which is wasted work but never a wrong colour, and it keeps the
+  /// cursor arithmetic to a single monotonic offset.
+  ///
+  /// Restarting cancels whatever is in flight, so a burst of skin switches
+  /// leaves exactly one sweep — the coalescing the previous cut got from
+  /// cancelling its single work item.
+  private func startRethemeSweep() {
+    rethemeWorkItem?.cancel()
+    rethemeSweepCursor = 0
+    rethemeChunkCount = 0
+    longestRethemeChunkDuration = 0
+    scheduleNextRethemeChunk()
+  }
+
+  private func cancelRethemeSweep() {
+    rethemeWorkItem?.cancel()
+    rethemeWorkItem = nil
+    rethemeSweepCursor = nil
+  }
+
+  /// A chunk is scheduled on a TIMER, never `main.async`. Blocks enqueued on the
+  /// main queue drain within the run-loop iteration that queued them, so a chain
+  /// of `async` chunks would run back-to-back inside one iteration and add up to
+  /// exactly the single blocking pass this replaced. The delay is the chunk
+  /// budget itself: long enough to let the frame the previous chunk dirtied
+  /// actually composite, short enough that the sweep is not idling.
+  ///
+  /// The FIRST chunk uses the same delay rather than the 70 ms typing debounce.
+  /// It costs nothing perceptually — the viewport was already repainted
+  /// synchronously — and it shortens the tail, which is what the operator hits
+  /// when scrolling right after a switch.
+  private func scheduleNextRethemeChunk() {
     let workItem = DispatchWorkItem { [weak self] in
-      self?.applyScheduledHighlightingRefresh()
+      self?.applyNextRethemeChunk()
     }
-    highlightWorkItem = workItem
+    rethemeWorkItem = workItem
     DispatchQueue.main.asyncAfter(
-      deadline: .now() + Self.highlightRefreshDelay, execute: workItem)
+      deadline: .now() + rethemeChunkTimeBudget, execute: workItem)
+  }
+
+  private func applyNextRethemeChunk() {
+    rethemeWorkItem = nil
+    guard let cursor = rethemeSweepCursor, let textStorage = textStorage else {
+      rethemeSweepCursor = nil
+      return
+    }
+
+    let string = textStorage.string as NSString
+    guard cursor < string.length else {
+      finishRethemeSweep()
+      return
+    }
+
+    // Clamped against the CURRENT length on every turn: the document can shrink
+    // between chunks (an undo, a delete, an external reload), and a cursor
+    // captured before that must not index past the end.
+    let planned = clampedRange(
+      NSRange(location: cursor, length: plannedRethemeChunkLength()),
+      textLength: string.length)
+    let chunk = codeBlockAwareRange(for: scopedHighlightRange(for: planned, in: string))
+
+    let started = Date()
+    refreshHighlighting(in: chunk)
+    let elapsed = Date().timeIntervalSince(started)
+
+    rethemeChunkCount += 1
+    longestRethemeChunkDuration = max(longestRethemeChunkDuration, elapsed)
+    if chunk.length > 0 {
+      // Smoothed, so one noisy sample (a chunk that happened to straddle a big
+      // fenced block) cannot halve or double every chunk that follows.
+      rethemeSecondsPerCharacter =
+        (rethemeSecondsPerCharacter + elapsed / Double(chunk.length)) / 2
+    }
+
+    // `codeBlockAwareRange` can widen BACKWARDS to swallow a block that opened
+    // before the cursor, so the end of the painted chunk is the only honest next
+    // cursor — and it must still advance, or a degenerate range would spin.
+    let next = max(NSMaxRange(chunk), cursor + 1)
+    if next >= string.length {
+      finishRethemeSweep()
+    } else {
+      rethemeSweepCursor = next
+      scheduleNextRethemeChunk()
+    }
+  }
+
+  /// Chunk length that should fit the budget at the currently measured cost.
+  private func plannedRethemeChunkLength() -> Int {
+    let perCharacter = max(rethemeSecondsPerCharacter, 1e-9)
+    let estimate = Int(rethemeChunkTimeBudget / perCharacter)
+    return min(max(estimate, Self.minimumRethemeChunkLength), Self.maximumRethemeChunkLength)
+  }
+
+  /// Completion fires ONCE, after the last chunk — the find washes are repainted
+  /// from here, and repainting them while the sweep still had ranges to strip
+  /// would just erase them again.
+  private func finishRethemeSweep() {
+    cancelRethemeSweep()
+    onRethemeCompleted?()
   }
 
   /// The source panel's base face for the active tokens and font size. Every
@@ -184,6 +324,17 @@ class MarkdownTextStorage: NSTextContentStorage {
     requiresFullRefresh: Bool
   ) {
     highlightWorkItem?.cancel()
+    // The document moved under an in-flight retheme sweep. Everything BEFORE the
+    // cursor already carries the new palette, so the sweep is rebased rather
+    // than restarted: an edit ahead of the cursor shifts every remaining offset
+    // by `delta`, and restarting from zero on each keystroke would let continuous
+    // typing starve the sweep and leave the tail of a big document on the old
+    // skin indefinitely. The edited range itself is repainted by this very pass,
+    // so no range is left behind either way.
+    if let cursor = rethemeSweepCursor {
+      let rebased = editedRange.location <= cursor ? max(0, cursor + delta) : cursor
+      rethemeSweepCursor = min(rebased, textStorage?.length ?? rebased)
+    }
     if requiresFullRefresh {
       pendingRequiresFullRefresh = true
       pendingHighlightRange = nil
@@ -211,13 +362,7 @@ class MarkdownTextStorage: NSTextContentStorage {
 
   private func applyScheduledHighlightingRefresh() {
     guard !pendingRequiresFullRefresh else {
-      // Read before the refresh: it clears the pending state, completion flag
-      // included.
-      let completesARetheme = pendingRethemeCompletion
       refreshHighlighting()
-      if completesARetheme {
-        onRethemeCompleted?()
-      }
       return
     }
 
@@ -236,7 +381,12 @@ class MarkdownTextStorage: NSTextContentStorage {
     highlightWorkItem = nil
     pendingHighlightRange = nil
     pendingRequiresFullRefresh = false
-    pendingRethemeCompletion = false
+    // A full pass paints every range the sweep still had queued, so the sweep is
+    // absorbed rather than left running behind it. It still owes its completion
+    // callback: this pass strips `.backgroundColor` document-wide exactly like
+    // the last chunk would have, and the find washes have to come back.
+    let absorbedSweep = rethemeSweepCursor != nil
+    cancelRethemeSweep()
     // Full refresh can follow a wholesale text replacement (document load,
     // font/syntax toggle), so invalidate the fence cache here too.
     fenceLineRangesCache = nil
@@ -253,6 +403,9 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
     textStorage.endEditing()
     lastProcessedString = textStorage.string
+    if absorbedSweep {
+      onRethemeCompleted?()
+    }
   }
 
   private func refreshHighlighting(in range: NSRange) {
