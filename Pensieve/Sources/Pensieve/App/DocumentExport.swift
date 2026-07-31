@@ -2,6 +2,31 @@ import AppKit
 import UniformTypeIdentifiers
 import WebKit
 
+/// The light/dark half of the preview surface an export must reproduce.
+enum PreviewColorVariant: Equatable {
+  case light
+  case dark
+
+  private static let darkQuery = "@media (prefers-color-scheme: dark) {"
+  private static let lightQuery = "@media (prefers-color-scheme: light) {"
+  /// Always-true / never-true media conditions. Rewriting the query keeps the
+  /// block — and therefore the cascade order inside the sheet — intact.
+  private static let alwaysQuery = "@media all {"
+  private static let neverQuery = "@media not all {"
+
+  /// Re-emit `css` with every `prefers-color-scheme` query resolved to `variant`
+  /// so a renderer that ignores the media feature (WebKit while printing) still
+  /// lands on the right half of the theme.
+  static func pinning(_ css: String, to variant: PreviewColorVariant) -> String {
+    css
+      .replacingOccurrences(
+        of: darkQuery, with: variant == .dark ? alwaysQuery : neverQuery
+      )
+      .replacingOccurrences(
+        of: lightQuery, with: variant == .light ? alwaysQuery : neverQuery)
+  }
+}
+
 enum DocumentExportError: Error, LocalizedError {
   case pdfPaginationFailed
 
@@ -124,10 +149,15 @@ enum DocumentExport {
   ) -> PreviewDocument? {
     guard session.hasEditableBuffer else { return nil }
 
+    // The skin is the reading surface the preview pane is actually showing.
+    // Leaving it at the `.default` fallback silently exported a different
+    // surface than the one on screen — including its light/dark variant, which
+    // is how a light preview turned into a dark PDF.
     let request = PreviewRenderRequest(
       markdown: session.text,
       fontSize: fontSize,
       theme: theme,
+      skin: themeManager.skin,
       documentURL: session.url
     )
     return PreviewPipeline(themeManager: themeManager).makeDocument(for: request)
@@ -196,6 +226,75 @@ enum DocumentExport {
     return info
   }
 
+  /// Appearance the export renders under. The preview pane inherits the app's
+  /// effective appearance, and export is WYSIWYG relative to that pane — so pin
+  /// the same appearance explicitly instead of letting an offscreen, windowless
+  /// web view resolve `prefers-color-scheme` from ambient state.
+  static func exportAppearance() -> NSAppearance {
+    NSApplication.shared.effectiveAppearance
+  }
+
+  nonisolated static func colorVariant(for appearance: NSAppearance) -> PreviewColorVariant {
+    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
+  }
+
+  /// The colour the preview pane shows behind a theme whose page background is
+  /// transparent — i.e. `NSColor.textBackgroundColor` resolved under the pinned
+  /// appearance, as a CSS hex literal.
+  static func pageBaseColor(for appearance: NSAppearance) -> String {
+    var hex = "#ffffff"
+    appearance.performAsCurrentDrawingAppearance {
+      guard let color = NSColor.textBackgroundColor.usingColorSpace(.sRGB) else { return }
+      hex = String(
+        format: "#%02x%02x%02x",
+        Int((color.redComponent * 255).rounded()),
+        Int((color.greenComponent * 255).rounded()),
+        Int((color.blueComponent * 255).rounded())
+      )
+    }
+    return hex
+  }
+
+  /// Export HTML for the PDF pipeline.
+  ///
+  /// WebKit renders print jobs with `prefers-color-scheme` forced to *light* and
+  /// drops backgrounds, no matter what appearance the web view carries — so a
+  /// dark reading surface would silently print as a light one. Re-emit the
+  /// composed stylesheet with the colour-scheme queries already resolved to the
+  /// variant the preview pane is showing, and paint the page background, so the
+  /// PDF matches the screen in either direction.
+  nonisolated static func pdfExportHTML(
+    for document: PreviewDocument,
+    variant: PreviewColorVariant,
+    pageBase: String
+  ) -> String {
+    let pinnedStyle = """
+      <style id="vc-export-color-scheme">
+      \(PreviewColorVariant.pinning(document.styleHTML, to: variant))
+      /* The preview paints its surface with a `position: fixed` layer, which a
+         paginated renderer would stamp onto the first page only. Drop it and
+         paint the same two layers on the page box instead: the pane's own
+         background underneath, the skin's page background over it. */
+      body::before { display: none !important; }
+      html {
+        background: \(pageBase) !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+      body {
+        background: var(--vc-preview-page-background, transparent) !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+        min-height: 0 !important;
+      }
+      </style>
+      """
+    guard let head = document.html.range(of: "</head>") else {
+      return document.html + pinnedStyle
+    }
+    return document.html.replacingCharacters(in: head, with: "\(pinnedStyle)</head>")
+  }
+
   private static func showExportFailure(title: String, error: Error) {
     let alert = NSAlert()
     alert.messageText = title
@@ -215,17 +314,21 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
   /// The print pipeline needs the web view inside a window; keep our own
   /// offscreen one so no sheet can ever surface on the user's document window.
   private let host: NSWindow
+  let variant: PreviewColorVariant
   private var completion: ((Result<Void, Error>) -> Void)?
   private var didFinish = false
 
   init(
     document: PreviewDocument,
     outputURL: URL,
-    paperSize: NSSize = DocumentExport.defaultPaperSize()
+    paperSize: NSSize = DocumentExport.defaultPaperSize(),
+    appearance: NSAppearance? = nil
   ) {
+    let resolvedAppearance = appearance ?? DocumentExport.exportAppearance()
     self.document = document
     self.outputURL = outputURL
     self.paperSize = paperSize
+    self.variant = DocumentExport.colorVariant(for: resolvedAppearance)
     // Lay the content out at the printable width so the print pipeline scales
     // 1:1 instead of shrinking a 794pt viewport onto the page.
     let frame = NSRect(
@@ -242,13 +345,22 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
       defer: false
     )
     super.init()
+    webView.appearance = resolvedAppearance
+    host.appearance = resolvedAppearance
     host.contentView = webView
     webView.navigationDelegate = self
   }
 
   func start(completion: @escaping (Result<Void, Error>) -> Void) {
     self.completion = completion
-    webView.loadHTMLString(document.html, baseURL: document.baseURL)
+    webView.loadHTMLString(
+      DocumentExport.pdfExportHTML(
+        for: document,
+        variant: variant,
+        pageBase: DocumentExport.pageBaseColor(for: webView.appearance ?? .currentDrawing())
+      ),
+      baseURL: document.baseURL
+    )
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

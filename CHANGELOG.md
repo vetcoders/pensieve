@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Word export stops turning body text into headings. Heading detection is now relative to the document's own running-text size and requires the whole paragraph to be bold, so a normal paragraph containing one bold phrase is no longer exported as `Heading3` — the previous absolute point thresholds misfired for every preview font size above 13pt.
 - Word export drops the HTML importer's ordered-list marker text, which used to print next to the numbering Word draws itself ("1. 1 First step").
 - PDF export paginates. The export ran through `WKWebView.createPDF`, which renders a document onto a single page as tall as its content — one endless page with no page breaks. It now drives the WebKit print pipeline onto A4 or US Letter (by region) with 0.75in margins.
+- PDF export reproduces the palette the preview pane is showing. It used to render the `.default` skin under whatever appearance an offscreen web view happened to resolve, so a light preview could export dark. The export now carries the active skin, pins the appearance the reader is looking at, and resolves the `prefers-color-scheme` queries into the stylesheet before printing — WebKit forces print jobs to light and drops backgrounds, which would otherwise flatten a genuinely dark reading surface.
 
 ## [0.4.2] - 2026-07-22
 

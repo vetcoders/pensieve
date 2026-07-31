@@ -175,6 +175,115 @@ final class DocumentExportTests: XCTestCase {
     XCTAssertEqual(info.verticalPagination, .automatic)
   }
 
+  // MARK: - Export palette
+
+  /// Export is WYSIWYG relative to the preview pane, so the exported PDF must
+  /// carry the skin the pane is showing — not the `.default` fallback.
+  @MainActor
+  func testRenderDocumentCarriesTheSkinThePreviewPaneIsShowing() throws {
+    let session = DocumentSession(
+      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-export/Skin.md")),
+      text: "# Skin",
+      isDirty: false
+    )
+    let themeManager = ThemeManager()
+    themeManager.skin = .paper
+
+    let document = try XCTUnwrap(
+      DocumentExport.renderDocument(
+        session: session,
+        theme: .markdown,
+        fontSize: 16,
+        themeManager: themeManager
+      )
+    )
+
+    XCTAssertTrue(document.html.contains("vc-skin:paper"), "export must not fall back to .default")
+  }
+
+  /// WebKit renders print jobs with `prefers-color-scheme` forced to light, so
+  /// the variant has to be resolved into the stylesheet before printing.
+  func testPDFExportHTMLResolvesTheColourSchemeQueriesForThePinnedVariant() {
+    let css = """
+      :root { --vc-preview-text: #111; }
+      @media (prefers-color-scheme: dark) { :root { --vc-preview-text: #eee; } }
+      @media (prefers-color-scheme: light) { :root { --vc-preview-text: #000; } }
+      """
+    let dark = PreviewColorVariant.pinning(css, to: .dark)
+    XCTAssertTrue(dark.contains("@media all { :root { --vc-preview-text: #eee; } }"))
+    XCTAssertTrue(dark.contains("@media not all { :root { --vc-preview-text: #000; } }"))
+
+    let light = PreviewColorVariant.pinning(css, to: .light)
+    XCTAssertTrue(light.contains("@media not all { :root { --vc-preview-text: #eee; } }"))
+    XCTAssertTrue(light.contains("@media all { :root { --vc-preview-text: #000; } }"))
+    XCTAssertFalse(
+      light.contains("prefers-color-scheme"),
+      "no colour-scheme query may survive into a print job"
+    )
+  }
+
+  @MainActor
+  func testPDFExportPagePaintsThePaneBackgroundForTheResolvedAppearance() throws {
+    let session = DocumentSession(
+      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-export/Palette.md")),
+      text: "# Palette",
+      isDirty: false
+    )
+    let document = try XCTUnwrap(
+      DocumentExport.renderDocument(
+        session: session,
+        theme: .markdown,
+        fontSize: 16,
+        themeManager: ThemeManager()
+      )
+    )
+    let darkAqua = try XCTUnwrap(NSAppearance(named: .darkAqua))
+    let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
+
+    XCTAssertEqual(DocumentExport.colorVariant(for: darkAqua), .dark)
+    XCTAssertEqual(DocumentExport.colorVariant(for: aqua), .light)
+
+    let darkBase = DocumentExport.pageBaseColor(for: darkAqua)
+    let lightBase = DocumentExport.pageBaseColor(for: aqua)
+    XCTAssertNotEqual(
+      darkBase, lightBase, "the page base must follow the appearance, not a constant")
+
+    let html = DocumentExport.pdfExportHTML(for: document, variant: .dark, pageBase: darkBase)
+    XCTAssertTrue(html.contains("background: \(darkBase) !important"), "page base must be painted")
+    XCTAssertTrue(
+      html.contains("body::before { display: none !important; }"),
+      "the fixed preview surface layer would only stamp the first page"
+    )
+    XCTAssertTrue(html.contains("print-color-adjust: exact"))
+  }
+
+  /// The offscreen export view must not resolve `prefers-color-scheme` from
+  /// ambient state — it renders under the appearance the reader is looking at.
+  @MainActor
+  func testPDFExportJobPinsTheAppearanceItRendersUnder() throws {
+    let session = DocumentSession(
+      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-export/Pin.md")),
+      text: "# Pin",
+      isDirty: false
+    )
+    let document = try XCTUnwrap(
+      DocumentExport.renderDocument(
+        session: session,
+        theme: .markdown,
+        fontSize: 16,
+        themeManager: ThemeManager()
+      )
+    )
+    let job = PDFExportJob(
+      document: document,
+      outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("unused.pdf"),
+      appearance: NSAppearance(named: .darkAqua)
+    )
+
+    XCTAssertEqual(job.webView.appearance?.name, .darkAqua)
+    XCTAssertEqual(job.variant, .dark)
+  }
+
   @MainActor
   func testRenderDocumentBuildsStandalonePreviewHTMLForActiveSession() {
     let sourceURL = URL(fileURLWithPath: "/tmp/pensieve-export/Daily.md")
