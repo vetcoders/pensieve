@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The toolbar's Mode picker answers a click again.** It was drawn as a single greyed-out "Mode" chip that opened nothing while the diamond next to it still worked. A segmented picker cannot live inside a segmented control: declaring it inside the family's `ControlGroup` made macOS fold the whole picker into one disabled segment carrying its title. The picker is now declared directly in its toolbar group and comes back as one live segment per mode.
+- **The toolbar's format buttons edit the document again.** Bold, Italic, Strike, Quote, Code, Link and the two list actions shared a control group with the Rich Markdown toggle, which put the whole control into on/off tracking — a click lit the segment like a sticky state instead of running a one-shot action. The format actions now sit in a group of their own and stay momentary, matching the floating selection bar and the Format menu.
+- **The "»" overflow menu is no longer empty on a narrow window.** Every toolbar family wrapped its entire contents in a control group, and a control group contributes no menu entry, so the controls macOS clipped away had nothing to fall back to. The mode picker, the appearance menu, Reload Preview and Rewrite with AI now carry named entries into that menu.
 - `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.
 - Find-bar match highlights survive a live theme switch (and a font-size change, and toggling rich markdown) instead of vanishing while the bar still counts "1 of N".
 - Typing with a bundled-font theme active no longer rebuilds and re-ships the theme's inlined `@font-face` payload (0.2–0.8 MB) to the preview on every debounced keystroke.
