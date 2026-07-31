@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import XCTest
 
 @testable import Pensieve
@@ -96,6 +97,82 @@ final class DocumentExportTests: XCTestCase {
     let markdown = try OfficeOpenXMLDocument.readMarkdown(data)
     XCTAssertTrue(markdown.contains("1. Pierwszy krok"), markdown)
     XCTAssertFalse(markdown.contains("1. 1 Pierwszy"), markdown)
+  }
+
+  // MARK: - PDF pagination
+
+  @MainActor
+  func testPDFExportPaginatesALongDocumentAcrossPages() throws {
+    let markdown = (1...120)
+      .map { "## Rozdział \($0)\n\nZażółć gęślą jaźń — akapit numer \($0) w długim dokumencie.\n" }
+      .joined(separator: "\n")
+    let session = DocumentSession(
+      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-export/Long.md")),
+      text: markdown,
+      isDirty: false
+    )
+    let document = try XCTUnwrap(
+      DocumentExport.renderDocument(
+        session: session,
+        theme: .markdown,
+        fontSize: 16,
+        themeManager: ThemeManager()
+      )
+    )
+
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensievePDFExport-\(UUID().uuidString).pdf")
+    addTeardownBlock { try? FileManager.default.removeItem(at: output) }
+
+    let written = expectation(description: "PDF written")
+    var outcome: Result<Void, Error>?
+    DocumentExport.writePDF(document: document, to: output) { result in
+      outcome = result
+      written.fulfill()
+    }
+    wait(for: [written], timeout: 120)
+
+    guard case .success = try XCTUnwrap(outcome) else {
+      return XCTFail("PDF export failed: \(String(describing: outcome))")
+    }
+    let pdf = try XCTUnwrap(PDFDocument(url: output))
+    XCTAssertGreaterThan(
+      pdf.pageCount, 1,
+      "createPDF rendered every document onto one endless page; the print pipeline must paginate"
+    )
+    // AppKit snaps the requested size to the closest known paper (A4 is
+    // 595.2755×841.8898pt), so compare within a point.
+    let page = try XCTUnwrap(pdf.page(at: 0)).bounds(for: .mediaBox)
+    let expected = DocumentExport.defaultPaperSize()
+    XCTAssertEqual(page.size.width, expected.width, accuracy: 1)
+    XCTAssertEqual(page.size.height, expected.height, accuracy: 1)
+  }
+
+  func testDefaultPaperSizeFollowsTheRegionsPaperStandard() {
+    XCTAssertEqual(
+      DocumentExport.defaultPaperSize(for: Locale(identifier: "en_US")),
+      NSSize(width: 612, height: 792)
+    )
+    XCTAssertEqual(
+      DocumentExport.defaultPaperSize(for: Locale(identifier: "pl_PL")),
+      NSSize(width: 595, height: 842)
+    )
+  }
+
+  func testPrintInfoRunsHeadlessStraightToTheChosenPDFFile() {
+    let output = URL(fileURLWithPath: "/tmp/pensieve-export/Report.pdf")
+    let info = DocumentExport.printInfo(
+      paperSize: NSSize(width: 595, height: 842), savingTo: output)
+
+    XCTAssertEqual(info.jobDisposition, .save)
+    XCTAssertEqual(info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] as? URL, output)
+    XCTAssertEqual(info.paperSize.width, 595, accuracy: 1)
+    XCTAssertEqual(info.paperSize.height, 842, accuracy: 1)
+    XCTAssertEqual(info.topMargin, 54)
+    XCTAssertEqual(info.bottomMargin, 54)
+    XCTAssertEqual(info.leftMargin, 54)
+    XCTAssertEqual(info.rightMargin, 54)
+    XCTAssertEqual(info.verticalPagination, .automatic)
   }
 
   @MainActor

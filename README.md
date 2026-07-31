@@ -32,7 +32,9 @@ Pensieve keeps Markdown as the source of truth while making exchange with Word-f
 - **Word → Markdown:** choose **File → Import Word or PDF…**, use **Open File…**, or open a `.docx` with Pensieve from Finder. The source stays untouched and the conversion opens as an unsaved `.md` draft.
 - **PDF → Markdown:** text-based PDFs follow the same import path. Scanned PDFs without a text layer are rejected with an OCR-required message instead of opening a blank document.
 
-The existing HTML and PDF export options remain available in the File menu.
+The existing HTML and PDF export options remain available in the File menu. **File → Export
+PDF…** paginates onto real pages — A4 or US Letter depending on your region, with 0.75in
+margins.
 
 ## Requirements
 
