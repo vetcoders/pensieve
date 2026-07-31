@@ -63,17 +63,6 @@ struct EditorToolbelt: ToolbarContent {
     Self.showsEditToolbelt(for: appState.mode, hasEditableBuffer: hasEditableBuffer)
   }
 
-  /// Fill for the toolbar's on-state toggle chips. Without it the system paints
-  /// them in `controlAccentColor` — system blue over a parchment or typewriter
-  /// titlebar — so the one loud colour in the chrome was the only thing a skin
-  /// could not dress. Reads the same `ThemeTokens` the pane and titlebar dress
-  /// from, so a skin switch moves the chips with the rest of the chrome:
-  /// `ContentView` observes `ThemeManager`, and rebuilding its body rebuilds
-  /// this `ToolbarContent`. No extra observer, no document work.
-  private var chromeAccent: Color {
-    Color(themeManager.skin.tokens.chromeAccent.nsColor)
-  }
-
   var body: some ToolbarContent {
     ToolbarItemGroup {
       ControlGroup {
@@ -281,6 +270,14 @@ struct EditorToolbelt: ToolbarContent {
 
   /// Rich Markdown is the row's only non-format action: a native toolbar
   /// toggle whose on state the system renders like the sidebar button's.
+  ///
+  /// The on-state chip of this toggle — and of every other toggle in this
+  /// toolbar — is painted from the active skin, but NOT from here. A
+  /// `ControlGroup` of toggles is bridged into a single `NSSegmentedControl`
+  /// that AppKit fills from `controlAccentColor`, out of reach of any SwiftUI
+  /// modifier on these views (measured: neither `.tint` nor a custom
+  /// `ToggleStyle` survives the bridge). The skin colour is asserted on the
+  /// AppKit side instead — see `WindowChromeRecipe.assertToolbarChipTint`.
   private var richMarkdownToggle: some View {
     Toggle(
       isOn: Binding(
@@ -290,7 +287,6 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       Label("Rich Markdown", systemImage: "textformat.alt")
     }
-    .tint(chromeAccent)
     .help("Rich Markdown (⌘/)")
     .accessibilityLabel("Rich Markdown")
     .accessibilityValue(appState.richMarkdownEnabled ? "On" : "Off")
@@ -315,7 +311,6 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       Label("Auto Reload Preview", systemImage: "arrow.triangle.2.circlepath")
     }
-    .tint(chromeAccent)
     .help("Automatically reload the preview after edits")
     .accessibilityIdentifier(Self.autoReloadIdentifier)
   }
@@ -329,7 +324,6 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       Label("Scroll Sync", systemImage: "arrow.up.and.down")
     }
-    .tint(chromeAccent)
     .help("Keep editor and preview positions synchronized")
     .disabled(!hasEditableBuffer)
     .accessibilityIdentifier(Self.scrollSyncIdentifier)
@@ -344,7 +338,6 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       Label("Dictation", systemImage: "waveform.circle")
     }
-    .tint(chromeAccent)
     .help("Open Dictation")
     .accessibilityIdentifier(Self.dictationIdentifier)
   }
@@ -358,7 +351,6 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       Label("AI Autocomplete", systemImage: "sparkles")
     }
-    .tint(chromeAccent)
     .help("Suggest the next phrase as you type; press Tab to accept")
     .accessibilityIdentifier(Self.autocompleteIdentifier)
   }

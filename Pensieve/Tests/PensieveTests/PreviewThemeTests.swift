@@ -173,18 +173,20 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   /// The two legibility invariants a filled chip has to satisfy on every fixed
-  /// palette: the glyph riding on the fill stays readable (contrast against the
-  /// light glyph the prominent style draws), and the chip itself separates from
-  /// the titlebar backing it sits on (`source`) instead of dissolving into it.
-  /// This is the guard that catches a future skin reusing an ink token — the
-  /// exact failure typewriter's `accent == source` would have shipped.
+  /// palette: the glyph riding on the fill stays readable, and the chip itself
+  /// separates from the titlebar backing it sits on (`source`) instead of
+  /// dissolving into it. Both are measured on the colours the chrome pass
+  /// actually paints with — the bezel it sets and the glyph AppKit draws over it
+  /// — so a future change to either is measured, not assumed. This is the guard
+  /// that catches a skin reusing an ink token: the exact failure typewriter's
+  /// `accent == source` would have shipped.
   func testChromeAccentStaysLegibleAgainstGlyphAndTitlebarBacking() {
     for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter] {
-      let fill = skin.tokens.chromeAccent.nsColor
-      let glyphContrast = Self.contrastRatio(fill, .white)
+      let fill = WindowChromeRecipe.toolbarChipBezelColor(for: skin)
+      let glyphContrast = Self.contrastRatio(fill, WindowChromeRecipe.toolbarChipGlyphColor)
       XCTAssertGreaterThanOrEqual(
         glyphContrast, 4.5,
-        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) cannot carry a light glyph "
+        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) cannot carry its glyph "
           + "(contrast \(String(format: "%.2f", glyphContrast)))")
 
       let backingContrast = Self.contrastRatio(fill, skin.tokens.source.nsColor)
