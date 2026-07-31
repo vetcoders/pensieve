@@ -310,4 +310,147 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(gutter.currentLineNumber, 4)
   }
 
+  // MARK: - Toolbar chip tint
+
+  /// The chip fill is the skin's `chromeAccent`, byte-for-byte — the same token
+  /// table the titlebar backing reads, so the chips and the strip they sit on
+  /// can never come from two different skins.
+  func testToolbarChipBezelColorIsTheSkinsChromeAccent() {
+    for skin in PensieveTheme.allCases {
+      XCTAssertEqual(
+        WindowChromeRecipe.toolbarChipBezelColor(for: skin),
+        skin.tokens.chromeAccent.nsColor,
+        skin.rawValue)
+    }
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter),
+      ColorSpec.nsColor(fromHex: "#a8342a"))
+    // Adaptive skins still follow the accent picked in System Settings.
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarChipBezelColor(for: .default), NSColor.controlAccentColor)
+  }
+
+  /// The discriminator that keeps the paint on the toggle chips and off the rest
+  /// of the toolbar. A SwiftUI `ControlGroup` becomes one segmented control, and
+  /// its tracking mode is what says which kind of group it was: independent
+  /// toggles (`.selectAny`), the single-selection mode picker (`.selectOne`), or
+  /// a row of plain buttons (`.momentary`).
+  @MainActor
+  func testOnlyMultiSelectToggleGroupsCountAsChipGroups() {
+    func control(_ tracking: NSSegmentedControl.SwitchTracking) -> NSSegmentedControl {
+      let control = NSSegmentedControl()
+      control.segmentCount = 3
+      control.trackingMode = tracking
+      return control
+    }
+
+    XCTAssertTrue(WindowChromeRecipe.isToggleChipGroup(control(.selectAny)))
+    XCTAssertFalse(
+      WindowChromeRecipe.isToggleChipGroup(control(.selectOne)),
+      "the segmented mode picker must keep its own selection colour")
+    XCTAssertFalse(
+      WindowChromeRecipe.isToggleChipGroup(control(.momentary)),
+      "a group of plain buttons has no on-state chip to paint")
+  }
+
+  /// A window with no toolbar has nothing to correct — the assertion must stay
+  /// silent rather than report a correction on every pass, because
+  /// `assertWindowChrome` folds this result into its own converged/not answer.
+  @MainActor
+  func testToolbarChipAssertionIsSilentWithoutAToolbar() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    XCTAssertTrue(WindowChromeRecipe.toolbarSegmentedControls(in: window).isEmpty)
+    XCTAssertFalse(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+  }
+
+  /// The real shape, minus SwiftUI: a toolbar carrying one toggle group and one
+  /// single-selection picker. The chip group takes the skin's fill, the picker
+  /// is left alone, and a second pass corrects nothing — the compare-and-set
+  /// converges instead of re-writing on every update pass.
+  @MainActor
+  func testToolbarChipAssertionPaintsToggleGroupsOnlyAndConverges() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    let chips = NSSegmentedControl()
+    chips.segmentCount = 2
+    chips.trackingMode = .selectAny
+
+    let picker = NSSegmentedControl()
+    picker.segmentCount = 3
+    picker.trackingMode = .selectOne
+
+    let toolbar = NSToolbar(identifier: "pensieve.test.chiptint")
+    let delegate = StubToolbarDelegate(views: [chips, picker])
+    toolbar.delegate = delegate
+    window.toolbar = toolbar
+
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarSegmentedControls(in: window).count, 2,
+      "premise: the walk reaches both view-backed toolbar items")
+
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .parchment))
+    XCTAssertNil(picker.selectedSegmentBezelColor, "the mode picker must not be repainted")
+
+    // Converged: nothing left to correct on the next pass.
+    XCTAssertFalse(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+
+    // A skin switch moves the chip; an external reset (what a toolbar re-bridge
+    // does) is healed by the next pass.
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .porcelain))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
+
+    chips.selectedSegmentBezelColor = nil
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .porcelain))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
+  }
+}
+
+/// Minimal toolbar delegate handing back two view-backed items — the AppKit
+/// shape a SwiftUI `ControlGroup` is bridged into.
+@MainActor
+private final class StubToolbarDelegate: NSObject, NSToolbarDelegate {
+  static let chipsIdentifier = NSToolbarItem.Identifier("pensieve.test.chips")
+  static let pickerIdentifier = NSToolbarItem.Identifier("pensieve.test.picker")
+
+  private let views: [NSView]
+
+  init(views: [NSView]) {
+    self.views = views
+  }
+
+  func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    [Self.chipsIdentifier, Self.pickerIdentifier]
+  }
+
+  func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    toolbarDefaultItemIdentifiers(toolbar)
+  }
+
+  func toolbar(
+    _ toolbar: NSToolbar,
+    itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+    willBeInsertedIntoToolbar flag: Bool
+  ) -> NSToolbarItem? {
+    let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+    item.view = itemIdentifier == Self.chipsIdentifier ? views[0] : views[1]
+    return item
+  }
 }

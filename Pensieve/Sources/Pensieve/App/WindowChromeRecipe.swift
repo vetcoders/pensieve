@@ -102,6 +102,96 @@ enum WindowChromeRecipe {
     theme.tokens.source.nsColor
   }
 
+  /// Fill for the on-state chips of the toolbar's toggle groups (Rich Markdown,
+  /// auto reload, scroll sync, dictation, autocomplete). The skin's
+  /// `chromeAccent`, the same token table `titlebarGlassBackingColor` reads.
+  static func toolbarChipBezelColor(for theme: PensieveTheme) -> NSColor {
+    theme.tokens.chromeAccent.nsColor
+  }
+
+  /// The glyph AppKit draws over a custom `selectedSegmentBezelColor`.
+  ///
+  /// Not a colour this app sets — AppKit picks the contrasting content tint
+  /// itself — but a measured fact the palette has to be chosen against, so it is
+  /// written down where the legibility pin can read it. Measured on the running
+  /// toolbar (staged probe app, both a warm sienna and a deep teal bezel): the
+  /// selected segment's template image is drawn white.
+  static let toolbarChipGlyphColor: NSColor = .white
+
+  /// Every `NSSegmentedControl` the window's toolbar currently hosts.
+  ///
+  /// A SwiftUI `ControlGroup` in a toolbar is not a row of buttons: the bridge
+  /// folds the whole group into ONE `NSSegmentedControl` (`SwiftUISegmentedControl`),
+  /// one segment per child. The walk is scoped to `toolbar.items` — and their
+  /// subitems, which is where the hosting views actually hang — rather than the
+  /// titlebar view tree, so a per-pass assertion stays a handful of nodes.
+  static func toolbarSegmentedControls(in window: NSWindow) -> [NSSegmentedControl] {
+    var found: [NSSegmentedControl] = []
+
+    func collect(from view: NSView) {
+      if let segmented = view as? NSSegmentedControl { found.append(segmented) }
+      for subview in view.subviews { collect(from: subview) }
+    }
+
+    for item in window.toolbar?.items ?? [] {
+      if let view = item.view { collect(from: view) }
+      if let group = item as? NSToolbarItemGroup {
+        for subitem in group.subitems {
+          if let view = subitem.view { collect(from: view) }
+        }
+      }
+    }
+    return found
+  }
+
+  /// A control whose segments toggle independently — a `ControlGroup` holding
+  /// at least one `Toggle`. This is the discriminator that keeps the paint on
+  /// the chips the request is about and off everything else in the toolbar: the
+  /// segmented mode picker tracks `.selectOne`, a group of plain buttons tracks
+  /// `.momentary`, and only a group containing toggles tracks `.selectAny`.
+  static func isToggleChipGroup(_ control: NSSegmentedControl) -> Bool {
+    control.trackingMode == .selectAny
+  }
+
+  /// Repaints the on-state chips of the toolbar's toggle groups from the skin,
+  /// setting only what currently disagrees. Returns `true` when something had
+  /// to be corrected.
+  ///
+  /// Why this lives on the AppKit side at all: the toggles are declared in
+  /// SwiftUI (`EditorToolbelt`), but a toolbar `ControlGroup` is bridged into a
+  /// native segmented control whose selected segment AppKit fills from
+  /// `controlAccentColor`. That painter is downstream of every SwiftUI modifier
+  /// on the toggle — measured on a staged probe app: a `.tint` on the toggle and
+  /// a custom `ToggleStyle` are both dropped, and the chip stays system blue over
+  /// a parchment or porcelain titlebar. `selectedSegmentBezelColor` is the one
+  /// lever AppKit exposes for it.
+  ///
+  /// Why it is re-asserted on every pass rather than pinned once: SwiftUI resets
+  /// the bezel colour whenever it rebuilds the toolbar — which a skin switch
+  /// always does, since the appearance menu's label carries the skin name — so a
+  /// one-shot pin would survive exactly until the switch that needs it.
+  ///
+  /// Why a plain compare-and-set is safe here, when the window appearance next
+  /// door needs edge-triggering: this property DOES round-trip. Measured over 45
+  /// consecutive passes on the probe — the first pass corrects, every pass after
+  /// it reads back the value we wrote and corrects nothing — and the write does
+  /// not re-drive the SwiftUI graph (the view body was evaluated once across all
+  /// 45). So the never-converging loop `assertedAppearances` exists to prevent
+  /// has no analogue on this path.
+  @discardableResult
+  static func assertToolbarChipTint(on window: NSWindow, for theme: PensieveTheme) -> Bool {
+    let wanted = toolbarChipBezelColor(for: theme)
+    var corrected = false
+
+    for control in toolbarSegmentedControls(in: window) where isToggleChipGroup(control) {
+      guard !colorsMatch(control.selectedSegmentBezelColor, wanted) else { continue }
+      control.selectedSegmentBezelColor = wanted
+      corrected = true
+    }
+
+    return corrected
+  }
+
   /// The window appearance a skin demands: its fixed light/dark, or `nil` for
   /// the adaptive skins, which follow the system setting.
   static func windowAppearance(for theme: PensieveTheme) -> NSAppearance? {
@@ -199,6 +289,13 @@ enum WindowChromeRecipe {
 
     if backingDisagrees {
       window.backgroundColor = wantedBacking
+      corrected = true
+    }
+
+    // The toolbar's on-state chips are chrome too, and they are lost to the same
+    // external resets this method exists to heal (a toolbar re-bridge hands the
+    // segmented control back its default accent fill).
+    if assertToolbarChipTint(on: window, for: theme) {
       corrected = true
     }
 
