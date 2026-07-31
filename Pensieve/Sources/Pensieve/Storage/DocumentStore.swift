@@ -2601,6 +2601,38 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
+  /// A crash draft is waiting but has not been handed to a window yet.
+  var hasPendingRecoveryDraft: Bool {
+    recoveryStore.hasPendingRestoreDraft
+  }
+
+  /// The document the previous session left active, handed out ONCE per launch.
+  func claimRestoredActiveDocument() -> URL? {
+    bookmarkStore.claimActiveDocumentForRestore()
+  }
+
+  /// Publishes the window's current document as the one a relaunch should
+  /// reopen. Called on every load and whenever a window becomes key, so the
+  /// persisted value tracks the frontmost document rather than the last file
+  /// that happened to be opened.
+  func noteActiveDocumentForRestore(_ url: URL?) {
+    bookmarkStore.persistActiveDocument(url: url)
+  }
+
+  /// Reopens the document a relaunch is restoring into a still-empty window.
+  /// Deliberately refuses a window that already carries a buffer: restoration
+  /// may never overwrite live content.
+  @discardableResult
+  func restoreActiveDocument(_ url: URL, into appState: AppState) -> Bool {
+    let standardizedURL = url.standardizedFileURL
+    guard !appState.documentSession.hasEditableBuffer else { return false }
+    guard FileManager.default.fileExists(atPath: standardizedURL.path) else { return false }
+
+    self.appState = appState
+    loadClean(ref: documentRef(for: standardizedURL, appState: appState), into: appState)
+    return appState.documentSession.url?.standardizedFileURL == standardizedURL
+  }
+
   @discardableResult
   func restoreRecoveredDraft(into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
@@ -2636,6 +2668,9 @@ final class DocumentStore {
       appState.selectedDocumentID = ref.id
       appState.documentSession.load(document: ref, text: text)
       appState.lastError = nil
+      // Remember what this window is showing: a relaunch restores exactly one
+      // document window, and it must be the document the user was reading.
+      bookmarkStore.persistActiveDocument(url: ref.url)
     } catch {
       appState.lastError =
         "Could not load \(ref.url.lastPathComponent): \(error.localizedDescription)"

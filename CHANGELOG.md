@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Relaunch restored the wrong session: the pending "Recovered Untitled" crash draft claimed the one window a launch brings back, its dirty buffer then blocked document selection, and the file the user was actually reading was dropped entirely. The document the previous session had frontmost is now persisted and restored first; a pending crash draft comes back in a window of its own, so neither half of the session is lost.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
