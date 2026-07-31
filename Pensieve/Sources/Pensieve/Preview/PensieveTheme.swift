@@ -64,7 +64,7 @@ struct ColorSpec {
 /// Fields are limited to what those surfaces consume today: the source panel,
 /// the titlebar backing, the status bar (`warning`), and — from the chrome
 /// polish cut — the SwiftUI sidebar/toolbar/empty-state chrome (`accent`,
-/// `muted`, `previewHeadingFamily`). The remaining handoff palette
+/// `chromeAccent`, `muted`, `previewHeadingFamily`). The remaining handoff palette
 /// (page/panel/`danger`/`positive`) joins as its consumers land.
 struct ThemeTokens {
   enum Mode {
@@ -94,6 +94,23 @@ struct ThemeTokens {
   /// `--vc-preview-link` so the reading surface and the window chrome agree;
   /// adaptive themes wrap `linkColor` with the GitHub base as CSS fallback.
   let accent: ColorSpec
+  /// Prominent-chrome FILL — the toolbar's on-state toggle chips (Rich
+  /// Markdown, auto reload, scroll sync, dictation, autocomplete), which the
+  /// system otherwise paints in `controlAccentColor` and which read as system
+  /// blue against every fixed palette.
+  ///
+  /// Split from `accent` because that token is tuned as *ink*: text and link
+  /// colour on the reading surface. As a filled control several skins' ink
+  /// fails — graphite's and ink's are too pale to carry a glyph, and
+  /// typewriter's is byte-identical to its own titlebar backing (`source`), so
+  /// the chip would vanish. Where the ink survives as a fill (parchment,
+  /// porcelain) this token repeats it verbatim. Adaptive skins keep
+  /// `controlAccentColor`, so `default`/`raw` still follow the accent the user
+  /// picked in System Settings.
+  ///
+  /// Chrome-only: no preview stylesheet consumes it, so the `css` string is
+  /// carried for parity, not emitted.
+  let chromeAccent: ColorSpec
   /// Secondary/label text — sidebar section headers, muted row glyphs. Mirrors
   /// the preview `--vc-preview-muted`; adaptive themes wrap `secondaryLabelColor`.
   let muted: ColorSpec
@@ -256,6 +273,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       system: NSColor.textBackgroundColor.withSystemEffect(.disabled), css: "#f6f8fa"),
     text: ColorSpec(system: .textColor, css: "#1f2328"),
     accent: ColorSpec(system: .linkColor, css: "#0969da"),
+    chromeAccent: ColorSpec(system: .controlAccentColor, css: "#0969da"),
     muted: ColorSpec(system: .secondaryLabelColor, css: "#57606a"),
     warning: ColorSpec(system: .systemOrange, css: "#9a6700"),
     srcHeading: ColorSpec(system: .labelColor, css: "#1f2328"),
@@ -288,6 +306,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       codeBackground: ColorSpec(hex: "#efe8d6"),
       text: ColorSpec(hex: "#2a251d"),
       accent: ColorSpec(hex: "#9a5b28"),
+      // Sienna ink survives as a fill on warm paper: same value as the link.
+      chromeAccent: ColorSpec(hex: "#9a5b28"),
       muted: ColorSpec(hex: "#7a7062"),
       warning: ColorSpec(hex: "#8a6a20"),
       srcHeading: ColorSpec(hex: "#4a5a3c"),
@@ -310,6 +330,9 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       codeBackground: ColorSpec(hex: "#1f1f1f"),
       text: ColorSpec(hex: "#d2d2d2"),
       accent: ColorSpec(hex: "#86b8c4"),
+      // The pale slate link would carry no glyph as a fill; deepened along the
+      // same hue so a light glyph clears it and it still lifts off #161616.
+      chromeAccent: ColorSpec(hex: "#3d6f7d"),
       muted: ColorSpec(hex: "#848484"),
       warning: ColorSpec(hex: "#c49a72"),
       srcHeading: ColorSpec(hex: "#e0e0e0"),
@@ -332,6 +355,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       codeBackground: ColorSpec(hex: "#1a2130"),
       text: ColorSpec(hex: "#d8dde6"),
       accent: ColorSpec(hex: "#8a7fc8"),
+      // Same iris hue, deepened until a light glyph clears the fill.
+      chromeAccent: ColorSpec(hex: "#6a5fae"),
       muted: ColorSpec(hex: "#8590a0"),
       warning: ColorSpec(hex: "#c8b07a"),
       srcHeading: ColorSpec(hex: "#b8c4d4"),
@@ -354,6 +379,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       codeBackground: ColorSpec(hex: "#f3f5f7"),
       text: ColorSpec(hex: "#14181c"),
       accent: ColorSpec(hex: "#0f6f6c"),
+      // Deep clinical teal is already fill-strength on white: same as the link.
+      chromeAccent: ColorSpec(hex: "#0f6f6c"),
       muted: ColorSpec(hex: "#667079"),
       warning: ColorSpec(hex: "#7a4a12"),
       srcHeading: ColorSpec(hex: "#14181c"),
@@ -376,6 +403,9 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       codeBackground: ColorSpec(hex: "#2b2b2b"),
       text: ColorSpec(hex: "#d4d4d4"),
       accent: ColorSpec(hex: "#1c1c1c"),
+      // The ink IS this skin's surface (#1c1c1c), so a chip painted with it
+      // would be invisible. Ribbon red is the one warm mark a typewriter owns.
+      chromeAccent: ColorSpec(hex: "#a8342a"),
       muted: ColorSpec(hex: "#6e6e6e"),
       warning: ColorSpec(hex: "#6e6e6e"),
       srcHeading: ColorSpec(hex: "#f2f2f2"),

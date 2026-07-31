@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The source panel is now set in each theme's own monospace family — Sometype Mono (Parchment), JetBrains Mono (Graphite, Ink), IBM Plex Mono (Porcelain), Spline Sans Mono (Typewriter) — across body text, bold/semibold spans, inline code, the caret's typing attributes, the autocomplete ghost, and the line-number gutter. `Default` and `Raw` keep the system monospaced face.
 - Task lists gained a third checkbox state: `- [~]` ("in progress") is highlighted in the source panel like `- [ ]` / `- [x]` and renders in preview as a diamond inside an accent-coloured frame.
 
+### Changed
+
+- The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, ribbon red on Typewriter. `Default` and `Raw` keep the accent chosen in System Settings.
+
 ### Fixed
 
 - `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.

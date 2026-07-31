@@ -148,6 +148,70 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertEqual(PensieveTheme.raw.tokens.accent.css, "#0969da")
   }
 
+  /// The toolbar's on-state toggle chips (Rich Markdown, auto reload, scroll
+  /// sync, dictation, autocomplete) fill from `chromeAccent`, not from the
+  /// system accent. Where the link ink is already fill-strength the token
+  /// repeats it verbatim; graphite/ink deepen their pale link, and typewriter
+  /// needs a value of its own because its link ink IS its titlebar backing.
+  func testChromeAccentTokenIsFillStrengthPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.chromeAccent.css, "#9a5b28")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.chromeAccent.css, "#3d6f7d")
+    XCTAssertEqual(PensieveTheme.ink.tokens.chromeAccent.css, "#6a5fae")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.chromeAccent.css, "#0f6f6c")
+    XCTAssertEqual(PensieveTheme.typewriter.tokens.chromeAccent.css, "#a8342a")
+
+    // Adaptive skins keep the accent the user picked in System Settings, so
+    // `default`/`raw` are the ONLY skins where the chips may read system blue.
+    for skin in [PensieveTheme.default, .raw] {
+      XCTAssertEqual(skin.tokens.chromeAccent.nsColor, NSColor.controlAccentColor, skin.rawValue)
+    }
+
+    // Fixed skins resolve their own hex — no system fallback leaks in.
+    XCTAssertEqual(
+      PensieveTheme.typewriter.tokens.chromeAccent.nsColor,
+      ColorSpec.nsColor(fromHex: "#a8342a"))
+  }
+
+  /// The two legibility invariants a filled chip has to satisfy on every fixed
+  /// palette: the glyph riding on the fill stays readable (contrast against the
+  /// light glyph the prominent style draws), and the chip itself separates from
+  /// the titlebar backing it sits on (`source`) instead of dissolving into it.
+  /// This is the guard that catches a future skin reusing an ink token — the
+  /// exact failure typewriter's `accent == source` would have shipped.
+  func testChromeAccentStaysLegibleAgainstGlyphAndTitlebarBacking() {
+    for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter] {
+      let fill = skin.tokens.chromeAccent.nsColor
+      let glyphContrast = Self.contrastRatio(fill, .white)
+      XCTAssertGreaterThanOrEqual(
+        glyphContrast, 4.5,
+        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) cannot carry a light glyph "
+          + "(contrast \(String(format: "%.2f", glyphContrast)))")
+
+      let backingContrast = Self.contrastRatio(fill, skin.tokens.source.nsColor)
+      XCTAssertGreaterThanOrEqual(
+        backingContrast, 2.0,
+        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) dissolves into its titlebar "
+          + "backing \(skin.tokens.source.css) "
+          + "(contrast \(String(format: "%.2f", backingContrast)))")
+    }
+  }
+
+  /// WCAG relative luminance / contrast ratio over sRGB components.
+  private static func contrastRatio(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
+    let first = relativeLuminance(lhs)
+    let second = relativeLuminance(rhs)
+    return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+  }
+
+  private static func relativeLuminance(_ color: NSColor) -> CGFloat {
+    let srgb = color.usingColorSpace(.sRGB) ?? color
+    func linear(_ component: CGFloat) -> CGFloat {
+      component <= 0.03928 ? component / 12.92 : pow((component + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * linear(srgb.redComponent) + 0.7152 * linear(srgb.greenComponent) + 0.0722
+      * linear(srgb.blueComponent)
+  }
+
   /// The chrome muted colour (section headers, row glyphs) mirrors each theme's
   /// preview `--vc-preview-muted`; adaptive themes wrap `secondaryLabelColor`.
   func testMutedTokenMirrorsPreviewMutedPerTheme() {
