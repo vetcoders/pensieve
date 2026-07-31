@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Word export no longer collapses into a sliver. Every numbering level in `word/numbering.xml` now declares its own `w:pPr/w:ind` geometry; without it a consumer (reproduced in Pages, the default `.docx` handler on a Mac without Office) resolved the list paragraph indent to nearly the whole text column, squeezing the document into a two-character strip against the right margin and spreading it over dozens of near-empty pages.
+- Word export stops turning body text into headings. Heading detection is now relative to the document's own running-text size and requires the whole paragraph to be bold, so a normal paragraph containing one bold phrase is no longer exported as `Heading3` — the previous absolute point thresholds misfired for every preview font size above 13pt.
+- Word export drops the HTML importer's ordered-list marker text, which used to print next to the numbering Word draws itself ("1. 1 First step").
 
 ## [0.4.2] - 2026-07-22
 

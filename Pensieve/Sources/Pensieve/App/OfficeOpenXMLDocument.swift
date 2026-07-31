@@ -151,6 +151,7 @@ private struct WordDocumentWriter {
     let source = attributed.string as NSString
     guard source.length > 0 else { return [] }
 
+    let baseSize = bodyPointSize()
     var result: [WordParagraph] = []
     var cursor = 0
     while cursor < source.length {
@@ -164,13 +165,33 @@ private struct WordDocumentWriter {
         for: NSRange(location: cursor, length: 0)
       )
       let range = NSRange(location: start, length: contentsEnd - start)
-      result.append(makeParagraph(range: range))
+      result.append(makeParagraph(range: range, baseSize: baseSize))
       cursor = max(end, cursor + 1)
     }
     return result
   }
 
-  private func makeParagraph(range: NSRange) -> WordParagraph {
+  /// The document's running-text point size: the size covering the most
+  /// characters, smaller size winning a tie. Heading detection is relative to
+  /// this because the preview's base size is a user setting — absolute
+  /// thresholds classified ordinary 16pt body text as a heading.
+  private func bodyPointSize() -> CGFloat {
+    var histogram: [CGFloat: Int] = [:]
+    attributed.enumerateAttribute(
+      .font,
+      in: NSRange(location: 0, length: attributed.length)
+    ) { value, range, _ in
+      guard let font = value as? NSFont, font.pointSize > 0 else { return }
+      histogram[font.pointSize.rounded(), default: 0] += range.length
+    }
+    return
+      histogram
+      .max { lhs, rhs in
+        lhs.value == rhs.value ? lhs.key > rhs.key : lhs.value < rhs.value
+      }?.key ?? 12
+  }
+
+  private func makeParagraph(range: NSRange, baseSize: CGFloat) -> WordParagraph {
     guard range.length > 0 else { return WordParagraph(kind: .body, runs: []) }
     let style =
       attributed.attribute(.paragraphStyle, at: range.location, effectiveRange: nil)
@@ -185,7 +206,7 @@ private struct WordDocumentWriter {
         ["decimal", "roman", "alpha", "latin"].contains(where: format.contains)
         ? .ordered : .bullet
     } else {
-      kind = headingLevel(range).map(WordParagraph.Kind.heading) ?? .body
+      kind = headingLevel(range, baseSize: baseSize).map(WordParagraph.Kind.heading) ?? .body
     }
 
     var runs: [WordRun] = []
@@ -218,7 +239,11 @@ private struct WordDocumentWriter {
   private func rangeAfterListMarker(_ range: NSRange) -> NSRange {
     let raw = (attributed.string as NSString).substring(with: range)
     guard
-      let regex = try? NSRegularExpression(pattern: #"^\s*(?:[•◦▪‣]\s*|\d+[.)]\s*)"#),
+      // AppKit's HTML importer writes an ordered marker as "\t1\t" — no
+      // punctuation — so the `\d+[.)]` branch missed it and the numeral was
+      // exported as body text *next to* the numbering Word renders itself
+      // ("1. 1 First item"). Accept a tab-delimited numeral too.
+      let regex = try? NSRegularExpression(pattern: #"^\s*(?:[•◦▪‣]\s*|\d+[.)]\s*|\d+\t\s*)"#),
       let match = regex.firstMatch(
         in: raw,
         range: NSRange(location: 0, length: (raw as NSString).length)
@@ -230,17 +255,26 @@ private struct WordDocumentWriter {
     )
   }
 
-  private func headingLevel(_ range: NSRange) -> Int? {
+  /// A heading is set entirely in bold and larger than the running text.
+  /// Requiring *every* run to be bold matters: a body paragraph containing one
+  /// bold phrase used to satisfy the old "any run is bold" test and shipped as
+  /// a Heading3, so whole paragraphs arrived in Word as bold headings.
+  private func headingLevel(_ range: NSRange, baseSize: CGFloat) -> Int? {
     var size: CGFloat = 0
-    var bold = false
+    var sawFont = false
+    var allBold = true
     attributed.enumerateAttribute(.font, in: range) { value, _, _ in
       guard let font = value as? NSFont else { return }
+      sawFont = true
       size = max(size, font.pointSize)
-      bold = bold || font.fontDescriptor.symbolicTraits.contains(.bold)
+      allBold = allBold && font.fontDescriptor.symbolicTraits.contains(.bold)
     }
-    if size >= 22 { return 1 }
-    if size >= 17 { return 2 }
-    if size >= 14, bold { return 3 }
+    guard sawFont, allBold, baseSize > 0 else { return nil }
+
+    let ratio = size / baseSize
+    if ratio >= 1.8 { return 1 }
+    if ratio >= 1.4 { return 2 }
+    if ratio >= 1.12 { return 3 }
     return nil
   }
 
