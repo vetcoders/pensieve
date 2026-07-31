@@ -9,17 +9,74 @@ import SwiftUI
 /// `ThemeManager`, so the accent wordmark and the key-cap hairlines repaint on
 /// a live theme switch.
 
+/// The colours the DETAIL-PANE empty state paints with.
+///
+/// That surface stands in for the document pane — `EditorPreviewSplit` mounts it
+/// exactly where `EditorView`/`PreviewView` go — and the host window's titlebar
+/// glass is already backed by the same token
+/// (`WindowChromeRecipe.titlebarGlassBackingColor` is `tokens.source`). Painting
+/// it with `NSColor.windowBackgroundColor` left one unthemed system patch under
+/// a themed titlebar: on parchment the strip is cream and everything below it
+/// was system grey, and it did not move on a skin switch.
+///
+/// The sidebar's empty state keeps the system sidebar material, so it does NOT
+/// take this palette — the shared chrome pieces stay system-tinted when no
+/// palette is handed to them.
+struct EmptyStatePalette {
+  /// The pane surface: the skin's editor background.
+  let background: NSColor
+  /// Body text on `background`.
+  let primaryText: NSColor
+  /// Labels and glyphs on `background`.
+  let secondaryText: NSColor
+  /// De-emphasised caption (the build identity line).
+  let tertiaryText: NSColor
+  /// Wordmark tint — the accent, or the theme's body text where the accent
+  /// cannot carry text on this surface.
+  let wordmark: NSColor
+  /// Raised chip surface for the shortcut key caps.
+  let keyCapFill: NSColor
+
+  init(theme: PensieveTheme) {
+    let tokens = theme.tokens
+    let surface = tokens.source.nsColor
+    background = surface
+    primaryText = tokens.text.nsColor
+    secondaryText = tokens.muted.nsColor
+    tertiaryText = tokens.muted.nsColor.withAlphaComponent(0.72)
+    keyCapFill = tokens.codeBackground.nsColor
+
+    // A fixed palette is free to collide by design: typewriter's accent IS its
+    // source surface, because that accent was drawn for the light window chrome.
+    // Fall back to another token from the SAME theme rather than an invented hex
+    // — the rule the source-panel highlighters already follow. An UNMEASURABLE
+    // pair keeps the accent: the adaptive skins' catalog colours (`linkColor` on
+    // `textBackgroundColor`) resolve per appearance at draw time and cannot be
+    // ratioed here, and they are legible by construction.
+    let accent = tokens.accent.nsColor
+    if let ratio = ThemeContrast.ratio(accent, surface), ratio < ThemeContrast.minimumTextContrast {
+      wordmark = tokens.text.nsColor
+    } else {
+      wordmark = accent
+    }
+  }
+}
+
 /// The app wordmark, tinted from the theme accent. `size` lets the wide detail
 /// pane show it large and the narrow sidebar show it small.
 struct EmptyStateWordmark: View {
   @EnvironmentObject private var themeManager: ThemeManager
   var size: CGFloat = 34
+  /// Set on the detail pane, where the wordmark sits on the skin's own surface;
+  /// `nil` in the sidebar, which keeps the system material.
+  var palette: EmptyStatePalette?
 
   var body: some View {
-    let family = themeManager.skin.tokens.previewHeadingFamily
+    let tokens = themeManager.skin.tokens
+    let family = tokens.previewHeadingFamily
     Text("Pensieve")
       .font(family.isEmpty ? .system(size: size, weight: .semibold) : .custom(family, size: size))
-      .foregroundStyle(Color(themeManager.skin.tokens.accent.nsColor))
+      .foregroundStyle(Color(palette?.wordmark ?? tokens.accent.nsColor))
       .accessibilityIdentifier("pensieve.emptyState.wordmark")
   }
 }
@@ -29,6 +86,10 @@ struct EmptyStateWordmark: View {
 struct ShortcutKeyCap: View {
   @EnvironmentObject private var themeManager: ThemeManager
   let symbols: String
+  /// See `EmptyStateWordmark.palette`. The cap's label inherits the host's
+  /// primary foreground, so its fill has to come from the same place: a system
+  /// chip under themed text reads as a light patch on a dark skin's pane.
+  var palette: EmptyStatePalette?
 
   var body: some View {
     Text(symbols)
@@ -37,7 +98,7 @@ struct ShortcutKeyCap: View {
       .padding(.vertical, 3)
       .background(
         RoundedRectangle(cornerRadius: 5, style: .continuous)
-          .fill(Color(NSColor.controlBackgroundColor))
+          .fill(Color(palette?.keyCapFill ?? NSColor.controlBackgroundColor))
       )
       .overlay(
         RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -55,6 +116,8 @@ struct EmptyStateShortcuts: View {
   /// Accessibility id for the clickable New File row — lets the sidebar keep the
   /// identifier its empty state exposed before this cut.
   var newFileAccessibilityIdentifier = "pensieve.emptyState.newFile"
+  /// See `EmptyStateWordmark.palette` — handed straight to the key caps.
+  var palette: EmptyStatePalette?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -73,7 +136,7 @@ struct EmptyStateShortcuts: View {
 
   private func shortcutRow(_ symbols: String, _ label: String) -> some View {
     HStack(spacing: 8) {
-      ShortcutKeyCap(symbols: symbols)
+      ShortcutKeyCap(symbols: symbols, palette: palette)
         .frame(width: 44, alignment: .leading)
       Text(label)
         .font(.callout)

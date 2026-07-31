@@ -242,12 +242,19 @@ private struct FocusModeDimmingOverlay: View {
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
   @EnvironmentObject private var controller: AppController
+  @EnvironmentObject private var themeManager: ThemeManager
 
   var body: some View {
+    // This placeholder occupies the document pane, so it dresses from the active
+    // skin's surface — the same token the editor pane and the titlebar glass
+    // backing already use. `windowBackgroundColor` painted a system-grey pane
+    // that ignored the theme (parchment: cream titlebar, grey body) and stayed
+    // put on a skin switch.
+    let palette = EmptyStatePalette(theme: themeManager.skin)
     VStack(spacing: 26) {
-      EmptyStateWordmark(size: 40)
+      EmptyStateWordmark(size: 40, palette: palette)
 
-      EmptyStateShortcuts()
+      EmptyStateShortcuts(palette: palette)
 
       EmptyStateRecents(store: controller.recentDocuments)
 
@@ -256,9 +263,18 @@ struct DocumentEmptyStateView: View {
         .foregroundStyle(.tertiary)
         .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
     }
+    // The hierarchical levels the shared chrome asks for (`.secondary` labels,
+    // the `.tertiary` build line) resolve against these, so every glyph on the
+    // pane comes from the skin instead of the system label colours — which, on a
+    // skin whose surface disagrees with its pinned appearance, land unreadable.
+    .foregroundStyle(
+      Color(palette.primaryText),
+      Color(palette.secondaryText),
+      Color(palette.tertiaryText)
+    )
     .padding(32)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .background(Color(palette.background).ignoresSafeArea(.container, edges: .top))
     .ignoresSafeArea(.container, edges: .top)
     .accessibilityIdentifier("pensieve.emptyState")
   }
