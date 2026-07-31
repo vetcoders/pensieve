@@ -46,13 +46,46 @@ final class BookmarkStore {
       includingResourceValuesForKeys: nil,
       relativeTo: nil
     )
-    var bookmarks = fileBookmarkData
-    if !bookmarks.contains(data) {
-      bookmarks.append(data)
-    }
-    defaults.set(bookmarks, forKey: fileBookmarksKey)
+    defaults.set(fileBookmarks(replacingEntryFor: url, with: data), forKey: fileBookmarksKey)
     activate(url)
     appState.lastError = nil
+  }
+
+  /// One blob per file. The old guard was `Data` equality, but the bookmark
+  /// bytes minted for the SAME file are not stable — reopening a file through
+  /// a different (non-standardized) path, or after the volume metadata moves,
+  /// yields a byte-different blob the contains-check could not recognise. The
+  /// persisted list grew a new entry every time: six copies of one file among
+  /// fifteen entries on the operator's install. Identity is the RESOLVED path.
+  private func fileBookmarks(replacingEntryFor url: URL, with data: Data) -> [Data] {
+    var seenPaths: Set<String> = [url.standardizedFileURL.path]
+    var deduplicated = fileBookmarkData.filter { bookmark in
+      // Unresolvable today ≠ garbage: an unplugged volume or a file the user
+      // will restore must not cost them the bookmark, so keep what cannot be
+      // identified rather than pruning it.
+      guard let path = resolvedPath(for: bookmark) else { return true }
+      return seenPaths.insert(path).inserted
+    }
+    deduplicated.append(data)
+    return deduplicated
+  }
+
+  private func resolvedPath(for bookmark: Data) -> String? {
+    var bookmarkIsStale = false
+    guard
+      let url = try? URL(
+        resolvingBookmarkData: bookmark,
+        options: [.withSecurityScope],
+        relativeTo: nil,
+        bookmarkDataIsStale: &bookmarkIsStale
+      )
+    else { return nil }
+    return url.standardizedFileURL.path
+  }
+
+  private func uniqueByPath(_ urls: [URL]) -> [URL] {
+    var seenPaths: Set<String> = []
+    return urls.filter { seenPaths.insert($0.standardizedFileURL.path).inserted }
   }
 
   /// Replaces the complete persisted workspace only after every new bookmark has been created.
@@ -60,7 +93,7 @@ final class BookmarkStore {
   /// security-scoped bookmark; callers can still update their live in-memory workspace and surface
   /// the persistence failure without erasing otherwise valid roots.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
-    let roots = try rootURLs.map { url in
+    let roots = try uniqueByPath(rootURLs).map { url in
       (
         url.standardizedFileURL,
         try url.bookmarkData(
@@ -70,7 +103,7 @@ final class BookmarkStore {
         )
       )
     }
-    let files = try fileURLs.map { url in
+    let files = try uniqueByPath(fileURLs).map { url in
       (
         url.standardizedFileURL,
         try url.bookmarkData(
@@ -146,6 +179,7 @@ final class BookmarkStore {
     let rootURLs = restoreURLs(
       from: roots,
       expectedKind: .directory,
+      deduplicatingInto: rootBookmarksKey,
       staleHandler: { [weak self] url, appState in
         try self?.persistRoot(url: url, into: appState)
       },
@@ -154,6 +188,7 @@ final class BookmarkStore {
     let fileURLs = restoreURLs(
       from: files,
       expectedKind: .file,
+      deduplicatingInto: fileBookmarksKey,
       staleHandler: { [weak self] url, appState in
         try self?.persistFile(url: url, into: appState)
       },
@@ -270,13 +305,29 @@ final class BookmarkStore {
     case file
   }
 
+  /// Resolves a saved list AND heals it: installs polluted by the old
+  /// byte-equality guard carry several blobs for one file, and every launch
+  /// resolved each of them. The surviving blob per path is written back under
+  /// `key`, so the list shrinks to the truth once instead of being re-read
+  /// forever. Entries that fail to resolve are kept untouched — unreachable is
+  /// not the same as bogus.
   private func restoreURLs(
     from bookmarks: [Data],
     expectedKind: ExpectedKind,
+    deduplicatingInto key: String,
     staleHandler: (URL, AppState) throws -> Void,
     into appState: AppState
   ) -> [URL] {
-    bookmarks.compactMap { data in
+    var urls: [URL] = []
+    var keptBookmarks: [Data] = []
+    var seenPaths: Set<String> = []
+    // A stale bookmark makes the stale handler mint a REPLACEMENT blob into the
+    // very key this pass would rewrite. Leave the list alone in that case
+    // rather than clobbering the refreshed entry with the one it replaced; the
+    // next launch deduplicates on a settled list.
+    var didRefreshStaleBookmark = false
+
+    for data in bookmarks {
       var bookmarkIsStale = false
       do {
         let url = try URL(
@@ -291,23 +342,37 @@ final class BookmarkStore {
           ? isExistingDirectory(url)
           : isExistingFile(url)
         guard exists else {
-          return nil
+          // Resolvable but gone from disk: out of the live workspace, still
+          // kept on record. Pruning it is a separate decision from removing a
+          // duplicate of a file that IS there.
+          keptBookmarks.append(data)
+          continue
+        }
+        guard seenPaths.insert(url.standardizedFileURL.path).inserted else {
+          continue
         }
 
         activate(url)
 
         if bookmarkIsStale {
+          didRefreshStaleBookmark = true
           try staleHandler(url, appState)
         }
 
-        return url
+        keptBookmarks.append(data)
+        urls.append(url)
       } catch {
         // Missing/stale saved workspace entries are startup state, not a user action failure.
         // Bare launch must still present the empty launcher instead of surfacing an old bookmark
         // error when the only saved folder was removed outside Pensieve.
-        return nil
+        keptBookmarks.append(data)
       }
     }
+
+    if !didRefreshStaleBookmark, keptBookmarks.count != bookmarks.count {
+      defaults.set(keptBookmarks, forKey: key)
+    }
+    return urls
   }
 }
 
