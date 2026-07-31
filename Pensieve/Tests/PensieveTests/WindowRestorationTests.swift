@@ -148,6 +148,38 @@ final class WindowRestorationTests: XCTestCase {
     XCTAssertEqual(restoredState.documentSession.text, "unsaved crash draft")
   }
 
+  /// End to end over the REAL restore path: persisted workspace roots plus the
+  /// persisted active document. The background workspace rebuild runs its own
+  /// `selectRestoredDocument` pass, which must leave the document the window
+  /// already restored alone instead of jumping to the first file in the tree.
+  func testWorkspaceRestoreKeepsTheDocumentTheWindowAlreadyRestored() async throws {
+    let environment = try makeRestoreEnvironment()
+    // Sorts before the restored document, so a stomp is unmistakable.
+    let decoyURL = environment.folder.appendingPathComponent("AAA-first-in-tree.md")
+    try "not what the user was reading".write(to: decoyURL, atomically: true, encoding: .utf8)
+
+    let previousState = AppState()
+    let previousStore = makeStore(in: environment)
+    try environment.bookmarkStore.replaceWorkspace(
+      rootURLs: [environment.folder], fileURLs: [], into: previousState)
+    previousStore.load(
+      ref: DocumentRef(id: environment.documentURL, isAdHoc: false), into: previousState)
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    let restoredController = makeController(in: relaunch, appState: restoredState)
+    restoredController.start(restoringWorkspace: true)
+    await relaunch.folderManagerProbe.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(
+      restoredState.documentSession.url?.standardizedFileURL,
+      environment.documentURL.standardizedFileURL,
+      "the workspace rebuild replaced the restored document with the first file in the tree")
+    XCTAssertTrue(
+      restoredState.allDocuments.contains { $0.url.lastPathComponent == "AAA-first-in-tree.md" },
+      "the workspace did not actually restore, so the assertion above proves nothing")
+  }
+
   // MARK: - Harness
 
   /// One simulated installation: a defaults domain, a recovery directory and a
@@ -161,6 +193,9 @@ final class WindowRestorationTests: XCTestCase {
     let bookmarkStore: BookmarkStore
     let recoveryStore: RecoveryStore
     let documentStoreProbe: DocumentStore
+    /// Shared like `FolderManager.shared` in production: every window's
+    /// controller drives the SAME workspace restore.
+    let folderManagerProbe: FolderManager
     let makeRelaunch: @MainActor () -> RestoreEnvironment
 
     @MainActor
@@ -197,6 +232,12 @@ final class WindowRestorationTests: XCTestCase {
             databaseURL: folder.appendingPathComponent("index-\(UUID().uuidString).db")),
           bookmarkStore: bookmarkStore,
           recoveryStore: recoveryStore),
+        folderManagerProbe: FolderManager(
+          metadataStore: WorkspaceMetadataStore(
+            metadataURL: folder.appendingPathComponent("workspace-\(UUID().uuidString).json")),
+          indexDatabase: IndexDatabase(
+            databaseURL: folder.appendingPathComponent("index-\(UUID().uuidString).db")),
+          bookmarkStore: bookmarkStore),
         makeRelaunch: { build() }
       )
     }
@@ -227,13 +268,7 @@ final class WindowRestorationTests: XCTestCase {
       databaseURL: environment.folder.appendingPathComponent("index-\(UUID().uuidString).db"))
     return AppController(
       appState: appState,
-      folderManager: FolderManager(
-        metadataStore: WorkspaceMetadataStore(
-          metadataURL: environment.folder.appendingPathComponent(
-            "workspace-\(UUID().uuidString).json")),
-        indexDatabase: indexDatabase,
-        bookmarkStore: environment.bookmarkStore
-      ),
+      folderManager: environment.folderManagerProbe,
       documentStore: documentStore ?? makeStore(in: environment),
       indexDatabase: indexDatabase
     )
