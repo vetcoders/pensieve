@@ -187,7 +187,7 @@ final class DocumentExportTests: XCTestCase {
       isDirty: false
     )
     let themeManager = ThemeManager()
-    themeManager.skin = .paper
+    themeManager.skin = .parchment
 
     let document = try XCTUnwrap(
       DocumentExport.renderDocument(
@@ -198,7 +198,8 @@ final class DocumentExportTests: XCTestCase {
       )
     )
 
-    XCTAssertTrue(document.html.contains("vc-skin:paper"), "export must not fall back to .default")
+    XCTAssertTrue(
+      document.html.contains("vc-skin:parchment"), "export must not fall back to .default")
   }
 
   /// WebKit renders print jobs with `prefers-color-scheme` forced to light, so
@@ -255,6 +256,32 @@ final class DocumentExportTests: XCTestCase {
       "the fixed preview surface layer would only stamp the first page"
     )
     XCTAssertTrue(html.contains("print-color-adjust: exact"))
+  }
+
+  /// A single-mode skin pins its own appearance on the preview pane regardless
+  /// of the system setting, so the export must resolve the appearance from the
+  /// skin — not from `NSApp.effectiveAppearance`. Otherwise Parchment on a dark
+  /// Mac (or Ink on a light one) prints the half of the theme nobody is looking
+  /// at, which is the very WYSIWYG break this export path exists to close.
+  @MainActor
+  func testExportAppearanceFollowsASingleModeSkinRatherThanTheSystem() throws {
+    XCTAssertEqual(
+      DocumentExport.colorVariant(for: DocumentExport.exportAppearance(for: .parchment)),
+      .light,
+      "a light-only skin must export light whatever the system appearance is"
+    )
+    XCTAssertEqual(
+      DocumentExport.colorVariant(for: DocumentExport.exportAppearance(for: .ink)),
+      .dark,
+      "a dark-only skin must export dark whatever the system appearance is"
+    )
+
+    // Adaptive skins carry no fixed appearance and keep following the app.
+    let adaptive = DocumentExport.exportAppearance(for: .default)
+    XCTAssertEqual(
+      DocumentExport.colorVariant(for: adaptive),
+      DocumentExport.colorVariant(for: NSApplication.shared.effectiveAppearance)
+    )
   }
 
   /// The offscreen export view must not resolve `prefers-color-scheme` from

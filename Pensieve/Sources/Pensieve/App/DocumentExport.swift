@@ -226,12 +226,16 @@ enum DocumentExport {
     return info
   }
 
-  /// Appearance the export renders under. The preview pane inherits the app's
-  /// effective appearance, and export is WYSIWYG relative to that pane — so pin
-  /// the same appearance explicitly instead of letting an offscreen, windowless
-  /// web view resolve `prefers-color-scheme` from ambient state.
-  static func exportAppearance() -> NSAppearance {
-    NSApplication.shared.effectiveAppearance
+  /// Appearance the export renders under. Export is WYSIWYG relative to the
+  /// preview pane, so it must resolve the appearance exactly the way the pane
+  /// does (`PreviewWebView.applyThemeChrome`): a single-mode skin pins its own
+  /// appearance regardless of the system setting — Parchment reads light on a
+  /// dark Mac, Ink reads dark on a light one — and only the adaptive skins
+  /// (`default`/`raw`) follow the app's effective appearance. Taking
+  /// `NSApp.effectiveAppearance` unconditionally would print the half of the
+  /// theme the reader is *not* looking at whenever the two disagree.
+  static func exportAppearance(for skin: PensieveTheme = .default) -> NSAppearance {
+    WindowChromeRecipe.windowAppearance(for: skin) ?? NSApplication.shared.effectiveAppearance
   }
 
   nonisolated static func colorVariant(for appearance: NSAppearance) -> PreviewColorVariant {
@@ -324,7 +328,9 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
     paperSize: NSSize = DocumentExport.defaultPaperSize(),
     appearance: NSAppearance? = nil
   ) {
-    let resolvedAppearance = appearance ?? DocumentExport.exportAppearance()
+    // The document carries the skin it was composed for, so the export renders
+    // under the same light/dark half the preview pane is showing.
+    let resolvedAppearance = appearance ?? DocumentExport.exportAppearance(for: document.skin)
     self.document = document
     self.outputURL = outputURL
     self.paperSize = paperSize
