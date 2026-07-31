@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import UniformTypeIdentifiers
 import WebKit
 
@@ -29,11 +30,14 @@ enum PreviewColorVariant: Equatable {
 
 enum DocumentExportError: Error, LocalizedError {
   case pdfPaginationFailed
+  case pdfSheetPaintingFailed
 
   var errorDescription: String? {
     switch self {
     case .pdfPaginationFailed:
       return "The PDF could not be paginated for export."
+    case .pdfSheetPaintingFailed:
+      return "The exported PDF could not be given the reading surface's background."
     }
   }
 }
@@ -244,19 +248,111 @@ enum DocumentExport {
 
   /// The colour the preview pane shows behind a theme whose page background is
   /// transparent — i.e. `NSColor.textBackgroundColor` resolved under the pinned
-  /// appearance, as a CSS hex literal.
-  static func pageBaseColor(for appearance: NSAppearance) -> String {
-    var hex = "#ffffff"
+  /// appearance.
+  static func pageBaseSurface(for appearance: NSAppearance) -> NSColor {
+    var color = NSColor.white
     appearance.performAsCurrentDrawingAppearance {
-      guard let color = NSColor.textBackgroundColor.usingColorSpace(.sRGB) else { return }
-      hex = String(
-        format: "#%02x%02x%02x",
-        Int((color.redComponent * 255).rounded()),
-        Int((color.greenComponent * 255).rounded()),
-        Int((color.blueComponent * 255).rounded())
-      )
+      color = NSColor.textBackgroundColor.usingColorSpace(.sRGB) ?? .white
     }
-    return hex
+    return color
+  }
+
+  /// `pageBaseSurface` as a CSS hex literal.
+  static func pageBaseColor(for appearance: NSAppearance) -> String {
+    let color = pageBaseSurface(for: appearance)
+    return String(
+      format: "#%02x%02x%02x",
+      Int((color.redComponent * 255).rounded()),
+      Int((color.greenComponent * 255).rounded()),
+      Int((color.blueComponent * 255).rounded())
+    )
+  }
+
+  /// Reads back the surface the export actually renders on: the skin's page
+  /// background where the skin defines one, the page base otherwise. Asking the
+  /// rendered document beats re-deriving the cascade in Swift — the CSS custom
+  /// property is the only place that colour is defined.
+  static let sheetColorProbeScript = "getComputedStyle(document.documentElement).backgroundColor"
+
+  /// Parse a colour the way `getComputedStyle` reports one — legacy
+  /// `rgb()`/`rgba()` notation. A fully transparent surface yields no colour, so
+  /// the caller can fall back to the page base.
+  nonisolated static func sheetColor(fromCSS css: String) -> NSColor? {
+    let scalars =
+      css
+      .replacingOccurrences(of: "rgba", with: "")
+      .replacingOccurrences(of: "rgb", with: "")
+      .trimmingCharacters(in: CharacterSet(charactersIn: "() "))
+      .components(separatedBy: CharacterSet(charactersIn: ",/"))
+      .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    guard scalars.count >= 3 else { return nil }
+    let alpha = scalars.count > 3 ? scalars[3] : 1
+    guard alpha > 0 else { return nil }
+    return NSColor(
+      srgbRed: scalars[0] / 255,
+      green: scalars[1] / 255,
+      blue: scalars[2] / 255,
+      alpha: alpha
+    )
+  }
+
+  /// Lay `color` under every page of the PDF at `url`.
+  ///
+  /// WebKit paints the export surface inside the printable rectangle only — the
+  /// sheet margins are bare paper by construction, and the tail of the last page
+  /// stops where the content does — so a dark reading surface printed as a dark
+  /// block floating on white. The paginated content is redrawn on top of a
+  /// full-bleed fill instead, which keeps the text vector (selectable,
+  /// searchable) and carries the link annotations across.
+  nonisolated static func paintSheetBackground(_ color: NSColor, inPDFAt url: URL) throws {
+    guard
+      let source = PDFDocument(url: url),
+      source.pageCount > 0,
+      var mediaBox = source.page(at: 0)?.bounds(for: .mediaBox),
+      let fill = color.usingColorSpace(.sRGB)?.cgColor
+    else { throw DocumentExportError.pdfSheetPaintingFailed }
+
+    let data = NSMutableData()
+    guard
+      let consumer = CGDataConsumer(data: data as CFMutableData),
+      let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil)
+    else { throw DocumentExportError.pdfSheetPaintingFailed }
+
+    for index in 0..<source.pageCount {
+      guard let page = source.page(at: index), let pageRef = page.pageRef else { continue }
+      var box = page.bounds(for: .mediaBox)
+      context.beginPage(mediaBox: &box)
+      context.setFillColor(fill)
+      context.fill(box)
+      context.drawPDFPage(pageRef)
+      context.endPage()
+    }
+    context.closePDF()
+
+    guard
+      let painted = PDFDocument(data: data as Data),
+      painted.pageCount == source.pageCount
+    else { throw DocumentExportError.pdfSheetPaintingFailed }
+
+    painted.documentAttributes = source.documentAttributes
+    for index in 0..<source.pageCount {
+      guard let original = source.page(at: index), let page = painted.page(at: index) else {
+        continue
+      }
+      for annotation in original.annotations {
+        original.removeAnnotation(annotation)
+        page.addAnnotation(annotation)
+      }
+    }
+
+    guard let output = painted.dataRepresentation() else {
+      throw DocumentExportError.pdfSheetPaintingFailed
+    }
+    let scopedAccess = url.startAccessingSecurityScopedResource()
+    defer {
+      if scopedAccess { url.stopAccessingSecurityScopedResource() }
+    }
+    try output.write(to: url, options: .atomic)
   }
 
   /// Export HTML for the PDF pipeline.
@@ -277,11 +373,13 @@ enum DocumentExport {
       \(PreviewColorVariant.pinning(document.styleHTML, to: variant))
       /* The preview paints its surface with a `position: fixed` layer, which a
          paginated renderer would stamp onto the first page only. Drop it and
-         paint the same two layers on the page box instead: the pane's own
-         background underneath, the skin's page background over it. */
+         paint the same surface on the page box instead: the skin's page
+         background where it defines one, the pane's own base otherwise. Both
+         boxes carry it so the colour read back off `document.documentElement`
+         is the one the sheet is painted with. */
       body::before { display: none !important; }
       html {
-        background: \(pageBase) !important;
+        background: var(--vc-preview-page-background, \(pageBase)) !important;
         -webkit-print-color-adjust: exact;
         print-color-adjust: exact;
       }
@@ -319,6 +417,9 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
   /// offscreen one so no sheet can ever surface on the user's document window.
   private let host: NSWindow
   let variant: PreviewColorVariant
+  /// Surface the printed sheet is painted with — the page base until the loaded
+  /// document reports the skin's own page background.
+  private(set) var sheetColor: NSColor
   private var completion: ((Result<Void, Error>) -> Void)?
   private var didFinish = false
 
@@ -335,6 +436,7 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
     self.outputURL = outputURL
     self.paperSize = paperSize
     self.variant = DocumentExport.colorVariant(for: resolvedAppearance)
+    self.sheetColor = DocumentExport.pageBaseSurface(for: resolvedAppearance)
     // Lay the content out at the printable width so the print pipeline scales
     // 1:1 instead of shrinking a 794pt viewport onto the page.
     let frame = NSRect(
@@ -373,6 +475,19 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
     guard !didFinish else { return }
     didFinish = true
 
+    // Read the surface off the rendered document before printing: the sheet
+    // margins are painted from Swift, and they have to carry exactly the colour
+    // the skin puts behind the text.
+    webView.evaluateJavaScript(DocumentExport.sheetColorProbeScript) { [weak self] value, _ in
+      guard let self else { return }
+      if let css = value as? String, let color = DocumentExport.sheetColor(fromCSS: css) {
+        self.sheetColor = color
+      }
+      self.printPaginated()
+    }
+  }
+
+  private func printPaginated() {
     // `createPDF` renders the whole document onto ONE page whose height is the
     // full content height — a single endless page, by design. The print
     // pipeline is the only WKWebView path that paginates, so drive that
@@ -401,7 +516,13 @@ final class PDFExportJob: NSObject, WKNavigationDelegate {
     success: Bool,
     contextInfo: UnsafeMutableRawPointer?
   ) {
-    finish(success ? .success(()) : .failure(DocumentExportError.pdfPaginationFailed))
+    guard success else { return finish(.failure(DocumentExportError.pdfPaginationFailed)) }
+    do {
+      try DocumentExport.paintSheetBackground(sheetColor, inPDFAt: outputURL)
+      finish(.success(()))
+    } catch {
+      finish(.failure(error))
+    }
   }
 
   func webView(

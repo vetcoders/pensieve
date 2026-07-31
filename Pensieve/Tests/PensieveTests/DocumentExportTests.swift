@@ -250,12 +250,143 @@ final class DocumentExportTests: XCTestCase {
       darkBase, lightBase, "the page base must follow the appearance, not a constant")
 
     let html = DocumentExport.pdfExportHTML(for: document, variant: .dark, pageBase: darkBase)
-    XCTAssertTrue(html.contains("background: \(darkBase) !important"), "page base must be painted")
+    XCTAssertTrue(
+      html.contains("background: var(--vc-preview-page-background, \(darkBase)) !important"),
+      "the sheet must carry the skin's page background, falling back to the pane's base"
+    )
     XCTAssertTrue(
       html.contains("body::before { display: none !important; }"),
       "the fixed preview surface layer would only stamp the first page"
     )
     XCTAssertTrue(html.contains("print-color-adjust: exact"))
+  }
+
+  func testSheetColourReadsTheComputedStyleNotationWebKitReports() throws {
+    let opaque = try XCTUnwrap(DocumentExport.sheetColor(fromCSS: "rgb(30, 30, 30)"))
+    XCTAssertEqual(opaque.redComponent, 30.0 / 255, accuracy: 0.001)
+    XCTAssertEqual(opaque.blueComponent, 30.0 / 255, accuracy: 0.001)
+
+    let translucent = try XCTUnwrap(DocumentExport.sheetColor(fromCSS: "rgba(20, 24, 33, 0.5)"))
+    XCTAssertEqual(translucent.alphaComponent, 0.5, accuracy: 0.001)
+
+    XCTAssertNil(
+      DocumentExport.sheetColor(fromCSS: "rgba(0, 0, 0, 0)"),
+      "a transparent surface must fall back to the page base, not print black"
+    )
+    XCTAssertNil(DocumentExport.sheetColor(fromCSS: "transparent"))
+  }
+
+  /// The print pipeline paints the reading surface inside the printable
+  /// rectangle only, so a dark skin came out as a dark block floating on white:
+  /// a bare paper frame around every page and a bare tail under the last one.
+  /// Export is WYSIWYG against the pane, so the whole sheet carries the surface.
+  @MainActor
+  func testPDFExportPaintsTheWholeSheetWithTheReadingSurface() throws {
+    let letter = NSSize(width: 612, height: 792)
+
+    let dark = try exportPDF(try longExportDocument(skin: .ink), paperSize: letter)
+    XCTAssertGreaterThan(dark.pageCount, 1, "the export must still paginate")
+    for index in 0..<dark.pageCount {
+      let page = try XCTUnwrap(dark.page(at: index))
+      XCTAssertEqual(page.bounds(for: .mediaBox).width, letter.width, accuracy: 1)
+      let corners = try sheetCorners(of: page)
+      for (name, color) in corners {
+        XCTAssertLessThan(
+          luminance(color), 0.35,
+          "page \(index + 1) corner \(name) is bare paper (\(color)) under a dark surface"
+        )
+      }
+      let spread = corners.map { luminance($0.1) }
+      XCTAssertLessThan(
+        (spread.max() ?? 0) - (spread.min() ?? 0), 0.02,
+        "page \(index + 1) must be one uniform sheet, not a block on a frame"
+      )
+    }
+
+    // The same pass must leave a light surface light — the fix cannot darken the
+    // half of the theme that was already correct.
+    let light = try exportPDF(try longExportDocument(skin: .parchment), paperSize: letter)
+    XCTAssertGreaterThan(light.pageCount, 1)
+    for index in 0..<light.pageCount {
+      let page = try XCTUnwrap(light.page(at: index))
+      for (name, color) in try sheetCorners(of: page) {
+        XCTAssertGreaterThan(
+          luminance(color), 0.85,
+          "page \(index + 1) corner \(name) darkened (\(color)) under a light surface"
+        )
+      }
+    }
+  }
+
+  // MARK: - PDF sheet probes
+
+  @MainActor
+  private func longExportDocument(skin: PensieveTheme) throws -> PreviewDocument {
+    let markdown = (1...60)
+      .map { "## Rozdział \($0)\n\nZażółć gęślą jaźń — akapit numer \($0) w eksporcie.\n" }
+      .joined(separator: "\n")
+    let session = DocumentSession(
+      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-export/Sheet.md")),
+      text: markdown,
+      isDirty: false
+    )
+    let themeManager = ThemeManager()
+    themeManager.skin = skin
+    return try XCTUnwrap(
+      DocumentExport.renderDocument(
+        session: session,
+        theme: .markdown,
+        fontSize: 16,
+        themeManager: themeManager
+      )
+    )
+  }
+
+  /// Exports through the real print pipeline, under the appearance the skin
+  /// pins — the same resolution the preview pane performs.
+  @MainActor
+  private func exportPDF(_ document: PreviewDocument, paperSize: NSSize) throws -> PDFDocument {
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveSheet-\(UUID().uuidString).pdf")
+    addTeardownBlock { try? FileManager.default.removeItem(at: output) }
+
+    let job = PDFExportJob(document: document, outputURL: output, paperSize: paperSize)
+    let written = expectation(description: "PDF written for \(document.skin)")
+    var outcome: Result<Void, Error>?
+    job.start { result in
+      outcome = result
+      written.fulfill()
+    }
+    wait(for: [written], timeout: 120)
+
+    guard case .success = try XCTUnwrap(outcome) else {
+      throw XCTSkip("PDF export failed: \(String(describing: outcome))")
+    }
+    return try XCTUnwrap(PDFDocument(url: output))
+  }
+
+  /// Colours in the four corners of a rasterised page — the paper the reader
+  /// sees around the text column.
+  private func sheetCorners(of page: PDFPage) throws -> [(String, NSColor)] {
+    let bounds = page.bounds(for: .mediaBox)
+    let image = page.thumbnail(
+      of: NSSize(width: bounds.width, height: bounds.height), for: .mediaBox)
+    let data = try XCTUnwrap(image.tiffRepresentation)
+    let bitmap = try XCTUnwrap(NSBitmapImageRep(data: data))
+    let inset = 4
+    let samples = [
+      ("top-left", inset, inset),
+      ("top-right", bitmap.pixelsWide - 1 - inset, inset),
+      ("bottom-left", inset, bitmap.pixelsHigh - 1 - inset),
+      ("bottom-right", bitmap.pixelsWide - 1 - inset, bitmap.pixelsHigh - 1 - inset),
+    ]
+    return try samples.map { name, x, y in
+      (name, try XCTUnwrap(bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB)))
+    }
+  }
+
+  private func luminance(_ color: NSColor) -> CGFloat {
+    0.299 * color.redComponent + 0.587 * color.greenComponent + 0.114 * color.blueComponent
   }
 
   /// A single-mode skin pins its own appearance on the preview pane regardless
