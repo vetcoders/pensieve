@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The workspace import banner counted the whole corpus: every cold open announced "Indexing N Markdown files" with `N` = every document in the workspace, so editing three notes and relaunching claimed thousands of files were being reindexed. The banner now names the reindex queue the open actually writes, and an open with no index work ahead makes no import claim at all.
+- A cold open in the background import path compared the persisted `.md` signature against itself, so its incremental reindex always saw an empty delta and never ran. The comparison now uses the freshly measured signature from the open's own tree walk, so edits made while the app was closed are indexed (and the persisted baseline advances) on the next launch.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added

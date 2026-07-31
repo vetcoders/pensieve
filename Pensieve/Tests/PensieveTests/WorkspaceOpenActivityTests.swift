@@ -180,6 +180,83 @@ final class WorkspaceOpenActivityTests: XCTestCase {
     XCTAssertEqual(appState.allDocuments.count, 1)
   }
 
+  /// The import banner must name the files this open actually reindexes, not the size of the
+  /// workspace. A relaunch that edited 3 of 12 documents used to announce "Indexing 12 Markdown
+  /// files" (`allDocuments.count`) — the whole corpus, on every single open, which is what made
+  /// the app look like it re-grinds everything for a three-file edit.
+  func testColdReindexBannerCountsChangedFilesNotTheWholeCorpus() async throws {
+    let folder = try makeTemporaryFolder()
+    let support = try makeTemporaryFolder(prefix: "PensieveOpenActivitySupportTests")
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+      try? FileManager.default.removeItem(at: support)
+    }
+    for index in 0..<12 {
+      try String(repeating: "alpha \(index) ", count: index + 2).write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let substrate = WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: support))
+    let indexDatabase = IndexDatabase(
+      databaseURL: support.appendingPathComponent("index.db", isDirectory: false))
+
+    let firstState = AppState()
+    let firstActivity = WorkspaceActivityLog(observing: firstState)
+    let firstManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: try temporaryBookmarkStore(),
+      workspaceSubstrate: substrate
+    )
+    firstManager.openInBackground(url: folder, into: firstState)
+    await firstManager.waitForPendingWorkspaceBuild()
+    await firstManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    // A true first import really does index the whole corpus — the honest count there IS 12.
+    XCTAssertTrue(
+      firstActivity.observedDetails.contains("Indexing 12 Markdown files"),
+      "a first import announces the full corpus it indexes (observed: \(firstActivity.observedDetails))"
+    )
+    firstManager.closeWorkspace(into: firstState)  // simulate app quit between launches
+
+    // Three documents change while the app is closed; byte length changes too, so the
+    // second-resolution mtime/size signature cannot miss them.
+    for index in 0..<3 {
+      try String(repeating: "editedtoken \(index) ", count: 40).write(
+        to: folder.appendingPathComponent("note-\(index).md"), atomically: true, encoding: .utf8)
+    }
+
+    let secondState = AppState()
+    let secondActivity = WorkspaceActivityLog(observing: secondState)
+    let secondManager = FolderManager(
+      metadataStore: temporaryMetadataStore(),
+      indexDatabase: indexDatabase,
+      bookmarkStore: try temporaryBookmarkStore(),
+      workspaceSubstrate: substrate
+    )
+    secondManager.openInBackground(url: folder, into: secondState)
+    await secondManager.waitForPendingWorkspaceBuild()
+    await secondManager.waitForPendingIndexUpdate()
+    await indexDatabase.waitForPendingReindex()
+
+    XCTAssertEqual(secondState.allDocuments.count, 12, "the workspace still holds all 12 documents")
+    XCTAssertTrue(
+      secondActivity.observedDetails.contains("Indexing 3 Markdown files"),
+      "the banner names the reindex queue, not the corpus (observed: \(secondActivity.observedDetails))"
+    )
+    XCTAssertFalse(
+      secondActivity.observedDetails.contains("Indexing 12 Markdown files"),
+      "a 3-file delta must never claim the whole corpus (observed: \(secondActivity.observedDetails))"
+    )
+    // The queue the banner announced is also the queue that was written: the incremental delta
+    // only exists because the reindex diffs the FRESHLY measured signature against the persisted
+    // baseline (diffing the persisted signature against itself reported "nothing changed").
+    XCTAssertEqual(
+      indexDatabase.search(query: "editedtoken", documents: secondState.allDocuments).count, 3,
+      "the edited documents are searchable after the incremental cold reindex")
+  }
+
   private func makeTemporaryFolder(prefix: String = "PensieveOpenActivityTests") throws -> URL {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
@@ -197,6 +274,40 @@ final class WorkspaceOpenActivityTests: XCTestCase {
 
   private func temporaryBookmarkStore() throws -> BookmarkStore {
     BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveOpenActivityBookmarkTests"))
+  }
+}
+
+/// Records every non-nil `WorkspaceActivity.detail` an `AppState` passes through. `AppState` is
+/// `@Observable` (no Combine `$` publisher), so this re-arms an Observation tracking loop: each
+/// change schedules a main-actor read of the new value and re-arms. The open flow suspends
+/// between phases, so each published phase is captured.
+@MainActor
+private final class WorkspaceActivityLog {
+  private(set) var observedDetails: [String] = []
+  private let appState: AppState
+
+  init(observing appState: AppState) {
+    self.appState = appState
+    record(appState.workspaceActivity)
+    arm()
+  }
+
+  private func record(_ activity: WorkspaceActivity?) {
+    if let activity {
+      observedDetails.append(activity.detail)
+    }
+  }
+
+  private func arm() {
+    withObservationTracking {
+      _ = appState.workspaceActivity
+    } onChange: { [weak self] in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.record(self.appState.workspaceActivity)
+        self.arm()
+      }
+    }
   }
 }
 

@@ -1020,9 +1020,11 @@ final class FolderManager {
     }
 
     DebugTrace.log("cold reindex roots=\(rootURLs.count)")
-    // The skip-gate said no: index writes are genuinely ahead — NOW the import claim is honest.
-    setOpenActivity(.indexing(documentCount: appState.allDocuments.count), into: appState)
-    coldRebuildWorkspace(scans: scans, into: appState)
+    // The skip-gate said no: index writes are genuinely ahead — NOW the import claim is honest,
+    // and the plan (decided before the claim) knows how many files those writes actually cover.
+    let plan = coldIndexPlan(scans: scans, into: appState)
+    announceColdIndex(plan, into: appState)
+    indexUpdateTask = performColdIndex(plan, into: appState)
     // Hand the manifest commit the fingerprint derived from THIS walk so it does not re-walk.
     // Multi-root delegates to the single-root v1 fingerprint byte-for-byte when count == 1, so
     // single-root manifests are unchanged; N>1 gets the root-qualified v2 fingerprint.
@@ -1041,16 +1043,25 @@ final class FolderManager {
 
   /// Persisted-signature-aware index decision for the cold-open path, given the tree the SINGLE
   /// cold-open walk already produced (`scans` — its tree was already applied to `appState`).
-  /// Computes the current `.md` signature, then defers the skip/incremental/full FTS decision to
-  /// `performColdIndex` (which reads the PERSISTED signature + the index-content guard). Unlike
-  /// the live refresh search tail keyed on the IN-MEMORY baseline, this honors the on-disk
-  /// baseline so a relaunch with no `.md` changes
-  /// SKIPS the reindex entirely. The caller owns the one walk; this never re-walks.
-  private func coldRebuildWorkspace(scans: [WorkspaceScan], into appState: AppState) {
-    let roots = appState.workspaceRoots.map(\.url)
-    let currentSignature = FolderManager.signature(from: scans)
-    indexUpdateTask = performColdIndex(
-      rootURLs: roots, currentSignature: currentSignature, into: appState)
+  /// Measures the current `.md` signature from that walk and hands the skip/incremental/full FTS
+  /// decision the PERSISTED signature + the index-content guard. Unlike the live refresh search
+  /// tail keyed on the IN-MEMORY baseline, this honors the on-disk baseline so a relaunch with no
+  /// `.md` changes SKIPS the reindex entirely. The caller owns the one walk; this never re-walks.
+  private func coldIndexPlan(scans: [WorkspaceScan], into appState: AppState) -> ColdIndexPlan {
+    coldIndexPlan(
+      rootURLs: appState.workspaceRoots.map(\.url),
+      currentSignature: FolderManager.signature(from: scans),
+      into: appState
+    )
+  }
+
+  /// Publishes the import claim for a cold index. The count is the plan's real queue, never the
+  /// corpus size. A zero-work plan (manifest/fingerprint refresh with no FTS write ahead) makes
+  /// NO import claim at all — "Indexing 0 Markdown files" would be a worse lie than silence, and
+  /// the caller's existing `.opening`/`.cacheMiss` state already describes that work honestly.
+  private func announceColdIndex(_ plan: ColdIndexPlan, into appState: AppState) {
+    guard plan.pendingCount > 0 else { return }
+    setOpenActivity(.indexing(documentCount: plan.pendingCount), into: appState)
   }
 
   /// Cold-start skip-gate. On a fresh launch the in-memory tree is empty, so `attemptHotReopen`'s
@@ -1307,9 +1318,17 @@ final class FolderManager {
       }
       DebugTrace.log("cold reindex roots=\(roots.count)")
       // The skip-gate said no: manifest commit + index writes are genuinely ahead — the
-      // "Importing Workspace" claim becomes honest exactly here, never during the walk.
-      self.setOpenActivity(
-        .indexing(documentCount: appState.allDocuments.count), into: appState)
+      // "Importing Workspace" claim becomes honest exactly here, never during the walk. The plan
+      // is decided now, on the same inputs `performColdIndex` consumes below (the manifest commit
+      // in between touches neither the persisted search signature nor this content guard), so the
+      // banner can name the delta it is about to write instead of the whole corpus.
+      let plan = self.coldIndexPlan(
+        rootURLs: roots,
+        currentSignature: validation.currentSignature,
+        precomputedIndexHasContent: indexedCount > 0,
+        into: appState
+      )
+      self.announceColdIndex(plan, into: appState)
       let workspaceIndexWriteTask: Task<Void, Never>?
       if let fingerprint = validation.fingerprint {
         workspaceIndexWriteTask = self.commitWorkspaceManifest(
@@ -1327,12 +1346,7 @@ final class FolderManager {
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       await workspaceIndexWriteTask?.value
       guard !Task.isCancelled, generation == self.openFlowGeneration else { return }
-      let indexTask = self.performColdIndex(
-        rootURLs: roots,
-        currentSignature: validation.searchSignature,
-        precomputedIndexHasContent: indexedCount > 0,
-        into: appState
-      )
+      let indexTask = self.performColdIndex(plan, into: appState)
       self.indexUpdateTask = indexTask
       await indexTask?.value
       // The defer clears the `.indexing` activity (generation-guarded, so a superseding
@@ -1642,6 +1656,36 @@ final class FolderManager {
     )
   }
 
+  /// The FTS work one cold open is about to perform. Decided BEFORE the import activity is
+  /// published so the banner can name the queue it is really about to grind instead of the whole
+  /// corpus. Purely a decision: every side effect (baseline advance, index write, signature
+  /// persistence) belongs to `performColdIndex`.
+  private struct ColdIndexPlan {
+    enum Work {
+      case skip
+      case incremental(upserts: [DocumentRef], deletingPaths: [String])
+      case full(documents: [DocumentRef])
+    }
+
+    var work: Work
+    /// `nil` for an empty root set; paired with a `nil` signature it means "reindex, persist
+    /// nothing" — never skip / never delta on uncertainty (fail open).
+    var identity: WorkspaceIdentity?
+    var currentSignature: WorkspaceSignature?
+
+    /// Files this operation actually touches — the only count the banner may honestly claim.
+    var pendingCount: Int {
+      switch work {
+      case .skip:
+        return 0
+      case .incremental(let upserts, let deletingPaths):
+        return upserts.count + deletingPaths.count
+      case .full(let documents):
+        return documents.count
+      }
+    }
+  }
+
   /// Decides the cold-open FTS work using the PERSISTED `.md` signature (survives across
   /// launches, unlike the in-memory `lastWorkspaceSignature`) and an index-content guard:
   ///
@@ -1652,39 +1696,21 @@ final class FolderManager {
   /// - no persisted signature, OR the index is empty/missing for this workspace (true first run
   ///   / post-reset / operator nuked Application Support) → FULL reindex.
   ///
-  /// In all three branches the in-memory baseline is set to `current` so the first subsequent
-  /// edit goes incremental. The persisted signature is (re)written ONLY after the index write
-  /// succeeds (skip needs no write — the prior signature already matches the live index). Returns
-  /// the launched index-write Task (nil on skip) so the caller can await it.
-  ///
-  /// Multi-root (identity == nil) or a failed current-signature scan (current == nil) falls back
-  /// to a FULL reindex with NO persistence — never skip / never delta on uncertainty (fail open).
-  @discardableResult
-  private func performColdIndex(
+  /// A missing identity (empty root set) or a failed current-signature scan (current == nil) falls
+  /// back to a FULL reindex with NO persistence — never skip / never delta on uncertainty.
+  private func coldIndexPlan(
     rootURLs: [URL],
     currentSignature: WorkspaceSignature?,
     precomputedIndexHasContent: Bool? = nil,
     into appState: AppState
-  ) -> Task<Void, Never>? {
+  ) -> ColdIndexPlan {
     let documents = appState.allDocuments
-    let indexDatabase = indexDatabase
     let identity = cacheIdentity(rootURLs: rootURLs, appState: appState)
     let rootPaths = rootURLs.map { $0.standardizedFileURL.path }
-    // Prior in-memory baseline; the Task tails reset to it if the FTS write fails (see
-    // `revertBaselineOnFailedWrite`). At true cold open this is nil — a failed write then leaves
-    // the baseline nil so the first edit FULL-reindexes (fail open), which is correct.
-    let priorBaseline = lastWorkspaceSignature
 
     guard let identity, let currentSignature else {
-      // Multi-root or signature scan failure: full reindex, persist nothing.
-      lastWorkspaceSignature = currentSignature
-      return Task { [weak self, weak appState] in
-        let didWrite = await indexDatabase.reindexInBackground(
-          documents: documents, appState: appState)
-        if !didWrite {
-          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
-        }
-      }
+      return ColdIndexPlan(
+        work: .full(documents: documents), identity: identity, currentSignature: currentSignature)
     }
 
     let persisted = cacheStore.readSearchSignature(for: identity)
@@ -1694,25 +1720,55 @@ final class FolderManager {
       precomputedIndexHasContent
       ?? (indexDatabase.indexedDocumentCount(forRootPaths: rootPaths, appState: appState) > 0)
 
-    // SKIP: nothing changed and the index is already populated for this workspace.
-    if let persisted, indexHasContent,
-      WorkspaceSignature.delta(from: persisted, to: currentSignature).isEmpty
-    {
-      lastWorkspaceSignature = currentSignature
-      return nil
+    guard let persisted, indexHasContent else {
+      // FULL: no persisted signature, or the index is empty/missing for this workspace.
+      return ColdIndexPlan(
+        work: .full(documents: documents), identity: identity, currentSignature: currentSignature)
+    }
+
+    let delta = WorkspaceSignature.delta(from: persisted, to: currentSignature)
+    guard !delta.isEmpty else {
+      // SKIP: nothing changed and the index is already populated for this workspace.
+      return ColdIndexPlan(work: .skip, identity: identity, currentSignature: currentSignature)
     }
 
     // INCREMENTAL: a persisted baseline exists, it differs, and the index has rows to delta.
-    if let persisted, indexHasContent {
-      let delta = WorkspaceSignature.delta(from: persisted, to: currentSignature)
-      let documentsByPath = Dictionary(
-        documents.map { ($0.url.standardizedFileURL.path, $0) },
-        uniquingKeysWith: { first, _ in first }
-      )
-      let upserts = delta.upsertedPaths.compactMap { documentsByPath[$0] }
-      let deletingPaths = delta.removed
-      let cacheStore = cacheStore
-      lastWorkspaceSignature = currentSignature
+    let documentsByPath = Dictionary(
+      documents.map { ($0.url.standardizedFileURL.path, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
+    let upserts = delta.upsertedPaths.compactMap { documentsByPath[$0] }
+    return ColdIndexPlan(
+      work: .incremental(upserts: upserts, deletingPaths: delta.removed),
+      identity: identity,
+      currentSignature: currentSignature
+    )
+  }
+
+  /// Executes a `ColdIndexPlan`. In all three branches the in-memory baseline is set to the plan's
+  /// signature so the first subsequent edit goes incremental. The persisted signature is
+  /// (re)written ONLY after the index write succeeds (skip needs no write — the prior signature
+  /// already matches the live index). Returns the launched index-write Task (nil on skip) so the
+  /// caller can await it.
+  @discardableResult
+  private func performColdIndex(_ plan: ColdIndexPlan, into appState: AppState)
+    -> Task<Void, Never>?
+  {
+    let indexDatabase = indexDatabase
+    let cacheStore = cacheStore
+    let identity = plan.identity
+    let currentSignature = plan.currentSignature
+    // Prior in-memory baseline; the Task tails reset to it if the FTS write fails (see
+    // `revertBaselineOnFailedWrite`). At true cold open this is nil — a failed write then leaves
+    // the baseline nil so the first edit FULL-reindexes (fail open), which is correct.
+    let priorBaseline = lastWorkspaceSignature
+    lastWorkspaceSignature = currentSignature
+
+    switch plan.work {
+    case .skip:
+      return nil
+
+    case .incremental(let upserts, let deletingPaths):
       return Task { [weak self, weak appState] in
         let didWrite = await indexDatabase.updateSearchIndexInBackground(
           upserting: upserts, deletingPaths: deletingPaths, appState: appState)
@@ -1720,21 +1776,23 @@ final class FolderManager {
           self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
           return
         }
-        Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
+        if let identity, let currentSignature {
+          Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
+        }
       }
-    }
 
-    // FULL: no persisted signature, or the index is empty/missing for this workspace.
-    let cacheStore = cacheStore
-    lastWorkspaceSignature = currentSignature
-    return Task { [weak self, weak appState] in
-      let didWrite = await indexDatabase.reindexInBackground(
-        documents: documents, appState: appState)
-      guard didWrite else {
-        self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
-        return
+    case .full(let documents):
+      return Task { [weak self, weak appState] in
+        let didWrite = await indexDatabase.reindexInBackground(
+          documents: documents, appState: appState)
+        guard didWrite else {
+          self?.revertBaselineOnFailedWrite(to: priorBaseline, ifAdvancedTo: currentSignature)
+          return
+        }
+        if let identity, let currentSignature {
+          Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
+        }
       }
-      Self.persistSearchSignature(currentSignature, for: identity, using: cacheStore)
     }
   }
 
