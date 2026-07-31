@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Word export no longer collapses into a sliver. Every numbering level in `word/numbering.xml` now declares its own `w:pPr/w:ind` geometry; without it a consumer (reproduced in Pages, the default `.docx` handler on a Mac without Office) resolved the list paragraph indent to nearly the whole text column, squeezing the document into a two-character strip against the right margin and spreading it over dozens of near-empty pages.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
