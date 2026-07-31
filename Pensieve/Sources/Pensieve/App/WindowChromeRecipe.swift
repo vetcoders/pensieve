@@ -198,6 +198,18 @@ enum WindowChromeRecipe {
     theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
   }
 
+  /// The same demand expressed at the SwiftUI level, which is the ONLY level a
+  /// scene-owned window respects — see `pensieveSkinAppearance`. Derived from
+  /// `windowAppearance` rather than from the token table a second time, so the
+  /// AppKit and SwiftUI answers cannot drift apart.
+  static func preferredColorScheme(for theme: PensieveTheme) -> ColorScheme? {
+    switch theme.appearanceName {
+    case .some(.darkAqua): return .dark
+    case .some: return .light
+    case .none: return nil
+    }
+  }
+
   /// The appearance we last WROTE to a window, keyed weakly by that window so an
   /// entry disappears with the window it describes.
   ///
@@ -358,6 +370,62 @@ enum WindowChromeRecipe {
     guard let content = contentLayoutRect(in: view) else { return visible }
     let clipped = visible.intersection(content)
     return clipped.isEmpty ? visible : clipped
+  }
+}
+
+extension View {
+  /// Declares the skin's fixed light/dark for the window hosting this root.
+  ///
+  /// This is the half of the chrome that `assertWindowChrome` provably CANNOT
+  /// deliver, and it is why a light skin used to render a split window: parchment
+  /// pane, dark sidebar and traffic lights. The editor and preview paint every
+  /// pixel they own from the token table, so they look right whatever the window
+  /// appearance says; the sidebar is a system material and the titlebar widgets
+  /// are AppKit's, so they follow `effectiveAppearance` — and on a SwiftUI
+  /// scene-owned window that stays the SYSTEM appearance no matter what AppKit
+  /// writes.
+  ///
+  /// Measured on a probe app (two windows, same SwiftUI root, dark system, the
+  /// shipping edge-triggered assert running on every update pass):
+  ///
+  ///   * `NSWindow` + `NSHostingView` (the factory tab path) keeps the written
+  ///     appearance — `appearance=aqua`, 15/15 passes.
+  ///   * the `WindowGroup` scene's own window (the launcher — which is the window
+  ///     restoration loads the recovered document into, so it is the FIRST thing
+  ///     an operator sees on a cold start) reports `appearance=nil`,
+  ///     `effective=darkAqua` on every one of those same passes. The scene owns
+  ///     that property and puts its own answer back.
+  ///
+  /// Re-asserting harder is not the fix — that is exactly the never-converging
+  /// write loop `assertedAppearances` exists to prevent (the 99% CPU start-up
+  /// hang). Declaring the value where SwiftUI already owns it is: with this
+  /// modifier the same probe reports `appearance=aqua` on BOTH windows, follows a
+  /// live skin switch in one pass, and returns to the system appearance for the
+  /// adaptive skins (`nil`) — with no write loop, because a declared value is
+  /// idempotent by construction.
+  ///
+  /// `assertWindowChrome` stays: it owns the titlebar backing colour, the chip
+  /// tint, and the recomposite kick a live skin switch needs on the layer-backed
+  /// editor pane. The two agree by construction — both read
+  /// `PensieveTheme.appearanceName`.
+  ///
+  /// The manager is OBSERVED by the modifier itself rather than by the root that
+  /// applies it. A skin switch has to rebuild whatever declares the appearance,
+  /// and the roots that host document windows hold their `ThemeManager` to hand
+  /// it down through `.environmentObject` — reading `.skin` off a plain stored
+  /// property there would repaint the panes on a switch and leave the sidebar and
+  /// titlebar on the previous skin. Owning the observation here means applying
+  /// the modifier is the whole contract; the caller cannot get it half right.
+  func pensieveSkinAppearance(_ themeManager: ThemeManager) -> some View {
+    modifier(SkinAppearanceModifier(themeManager: themeManager))
+  }
+}
+
+private struct SkinAppearanceModifier: ViewModifier {
+  @ObservedObject var themeManager: ThemeManager
+
+  func body(content: Content) -> some View {
+    content.preferredColorScheme(WindowChromeRecipe.preferredColorScheme(for: themeManager.skin))
   }
 }
 

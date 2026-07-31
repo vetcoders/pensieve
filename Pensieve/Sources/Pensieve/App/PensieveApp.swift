@@ -142,6 +142,12 @@ struct DocumentWindowRootView: View {
 
   var body: some View {
     ContentView(hostWindow: $currentWindow)
+      // Every window this app can build — the scene-owned launcher (which is
+      // where restoration puts the recovered document), a state-restored
+      // WindowGroup scene, and every factory-built native tab — shares THIS
+      // root, so declaring the skin's appearance once here is what makes a
+      // light skin light on all of them, chrome included.
+      .pensieveSkinAppearance(themeManager)
       .environment(appState)
       .environmentObject(controller)
       .environmentObject(controller.transcriptionService)
