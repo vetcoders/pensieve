@@ -2,6 +2,17 @@ import AppKit
 import UniformTypeIdentifiers
 import WebKit
 
+enum DocumentExportError: Error, LocalizedError {
+  case pdfPaginationFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .pdfPaginationFailed:
+      return "The PDF could not be paginated for export."
+    }
+  }
+}
+
 @MainActor
 enum DocumentExport {
   static func exportHTML(
@@ -138,7 +149,7 @@ enum DocumentExport {
     return "\(sanitized).\(fileExtension)"
   }
 
-  private static func writePDF(
+  static func writePDF(
     document: PreviewDocument,
     to outputURL: URL,
     completion: @escaping (Result<Void, Error>) -> Void
@@ -153,6 +164,38 @@ enum DocumentExport {
 
   private static var activePDFJobs: [PDFExportJob] = []
 
+  /// Paper the print pipeline lays the export out on. Regions on US Letter get
+  /// Letter; everyone else — Poland included — gets ISO A4.
+  nonisolated static func defaultPaperSize(for locale: Locale = .current) -> NSSize {
+    let letterRegions: Set<String> = ["US", "CA", "MX", "PH", "CL", "CO", "CR", "GT", "DO", "VE"]
+    let region = locale.region?.identifier ?? ""
+    return letterRegions.contains(region)
+      ? NSSize(width: 612, height: 792)  // 8.5×11in in points
+      : NSSize(width: 595, height: 842)  // A4 in points
+  }
+
+  /// Print settings for a paginated PDF export: no panels, PDF-to-disk
+  /// disposition, and 0.75in margins on every edge.
+  nonisolated static func printInfo(paperSize: NSSize, savingTo outputURL: URL) -> NSPrintInfo {
+    let margin: CGFloat = 54  // 0.75in
+    let info = NSPrintInfo(
+      dictionary: [
+        .jobDisposition: NSPrintInfo.JobDisposition.save,
+        .jobSavingURL: outputURL,
+      ]
+    )
+    info.paperSize = paperSize
+    info.topMargin = margin
+    info.bottomMargin = margin
+    info.leftMargin = margin
+    info.rightMargin = margin
+    info.horizontalPagination = .fit
+    info.verticalPagination = .automatic
+    info.isHorizontallyCentered = false
+    info.isVerticallyCentered = false
+    return info
+  }
+
   private static func showExportFailure(title: String, error: Error) {
     let alert = NSAlert()
     alert.messageText = title
@@ -164,18 +207,42 @@ enum DocumentExport {
 }
 
 @MainActor
-private final class PDFExportJob: NSObject, WKNavigationDelegate {
+final class PDFExportJob: NSObject, WKNavigationDelegate {
   private let document: PreviewDocument
   private let outputURL: URL
-  private let webView: WKWebView
+  private let paperSize: NSSize
+  let webView: WKWebView
+  /// The print pipeline needs the web view inside a window; keep our own
+  /// offscreen one so no sheet can ever surface on the user's document window.
+  private let host: NSWindow
   private var completion: ((Result<Void, Error>) -> Void)?
   private var didFinish = false
 
-  init(document: PreviewDocument, outputURL: URL) {
+  init(
+    document: PreviewDocument,
+    outputURL: URL,
+    paperSize: NSSize = DocumentExport.defaultPaperSize()
+  ) {
     self.document = document
     self.outputURL = outputURL
-    self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 794, height: 1123))
+    self.paperSize = paperSize
+    // Lay the content out at the printable width so the print pipeline scales
+    // 1:1 instead of shrinking a 794pt viewport onto the page.
+    let frame = NSRect(
+      x: 0,
+      y: 0,
+      width: paperSize.width - 108,
+      height: paperSize.height - 108
+    )
+    self.webView = WKWebView(frame: frame)
+    self.host = NSWindow(
+      contentRect: frame,
+      styleMask: [.borderless],
+      backing: .buffered,
+      defer: false
+    )
     super.init()
+    host.contentView = webView
     webView.navigationDelegate = self
   }
 
@@ -188,24 +255,35 @@ private final class PDFExportJob: NSObject, WKNavigationDelegate {
     guard !didFinish else { return }
     didFinish = true
 
-    // Leave WKPDFConfiguration.rect nil so createPDF captures the full
-    // content bounds; assigning webView.bounds cropped long documents
-    // to the first viewport.
-    let configuration = WKPDFConfiguration()
-    webView.createPDF(configuration: configuration) { [weak self] result in
-      guard let self else { return }
-      switch result {
-      case .success(let data):
-        do {
-          try data.write(to: outputURL, options: .atomic)
-          finish(.success(()))
-        } catch {
-          finish(.failure(error))
-        }
-      case .failure(let error):
-        finish(.failure(error))
-      }
-    }
+    // `createPDF` renders the whole document onto ONE page whose height is the
+    // full content height — a single endless page, by design. The print
+    // pipeline is the only WKWebView path that paginates, so drive that
+    // instead, headless (no print or progress panel) and straight to disk.
+    let operation = webView.printOperation(
+      with: DocumentExport.printInfo(paperSize: paperSize, savingTo: outputURL)
+    )
+    operation.showsPrintPanel = false
+    operation.showsProgressPanel = false
+    operation.view?.frame = NSRect(origin: .zero, size: webView.bounds.size)
+
+    // `run()` blocks the main run loop, which is exactly what WKPrintingView
+    // needs to service its web content process — the job then never converges
+    // and streams pages until the disk fills (measured: 2 GB and climbing on a
+    // two-page document). `runModal` keeps the loop alive and terminates.
+    operation.runModal(
+      for: host,
+      delegate: self,
+      didRun: #selector(printOperationDidRun(_:success:contextInfo:)),
+      contextInfo: nil
+    )
+  }
+
+  @objc private func printOperationDidRun(
+    _ operation: NSPrintOperation,
+    success: Bool,
+    contextInfo: UnsafeMutableRawPointer?
+  ) {
+    finish(success ? .success(()) : .failure(DocumentExportError.pdfPaginationFailed))
   }
 
   func webView(
