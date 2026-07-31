@@ -164,9 +164,26 @@ final class AppController: ObservableObject {
   /// An untitled window does NOT clear the record — its unsaved buffer already
   /// comes back through the recovery draft, and erasing the last real document
   /// would strand the file window the user also had open.
+  ///
+  /// Quit is NOT a window activation. Terminating tears every window down, and
+  /// each close hands key status to a surviving sibling — a cascade of
+  /// `didBecomeKey` the user never triggered. Left ungated it overwrote the
+  /// record with whichever window happened to die last, which is always the
+  /// oldest one: the window the previous launch restored. That closed the loop
+  /// — the same file came back forever, whatever the user actually worked on.
   func noteWindowBecameKey() {
+    guard !documentWindowRegistry.isTerminating else { return }
     guard let url = appState.documentSession.url else { return }
     documentStore.noteActiveDocumentForRestore(url)
+  }
+
+  /// This window is going away. Closing a document window is the user retiring
+  /// that document, so it stops being what a relaunch reopens (conditionally —
+  /// a sibling window may already own the record). During termination the
+  /// closes are teardown, not intent: the record must survive them untouched.
+  func noteWindowWillClose() {
+    guard !documentWindowRegistry.isTerminating else { return }
+    documentStore.noteActiveDocumentClosed(appState.documentSession.url)
   }
 
   func openFolder(url: URL) {

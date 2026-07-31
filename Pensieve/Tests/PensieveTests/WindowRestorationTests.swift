@@ -121,6 +121,148 @@ final class WindowRestorationTests: XCTestCase {
       "restore reopened the last document OPENED instead of the one that was frontmost")
   }
 
+  /// Switching documents INSIDE one window is the ordinary way the operator
+  /// moves around (Open Files / Workspace click). The restore record must
+  /// follow the selection, not stay on the first file the window ever showed.
+  func testSelectingAnotherDocumentInTheSameWindowMovesTheRestoreRecord() throws {
+    let environment = try makeRestoreEnvironment()
+    let secondURL = environment.folder.appendingPathComponent("opened-later.md")
+    try "the document the user switched to".write(to: secondURL, atomically: true, encoding: .utf8)
+
+    let windowState = AppState()
+    let windowStore = makeStore(in: environment)
+    windowStore.load(
+      ref: DocumentRef(id: environment.documentURL, isAdHoc: true), into: windowState)
+    XCTAssertTrue(
+      windowStore.select(ref: DocumentRef(id: secondURL, isAdHoc: true), into: windowState))
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    makeController(in: relaunch, appState: restoredState).start(restoringWorkspace: true)
+
+    XCTAssertEqual(
+      restoredState.documentSession.url?.standardizedFileURL,
+      secondURL.standardizedFileURL,
+      "restore reopened the document the window started on instead of the one the user "
+        + "switched to")
+  }
+
+  /// The operator's report: the SAME file comes back every launch, whatever she
+  /// worked on. Quit tears every window down, and each close hands key status to
+  /// a surviving sibling — a `didBecomeKey` cascade nobody triggered. The window
+  /// that dies last is the oldest one, i.e. the window the previous launch
+  /// restored, so an ungated key handler re-pins the same document forever.
+  func testQuitTeardownKeepsTheDocumentTheUserWasOnInsteadOfTheOldestWindow() throws {
+    let environment = try makeRestoreEnvironment()
+    let workedOnURL = environment.folder.appendingPathComponent("what-she-was-working-on.md")
+    try "the document the user was on at quit"
+      .write(to: workedOnURL, atomically: true, encoding: .utf8)
+
+    // Window A is the one the previous launch restored; window B is the file
+    // the user opened afterwards and left frontmost.
+    let restoredWindowState = AppState()
+    let restoredWindowStore = makeStore(in: environment)
+    restoredWindowStore.load(
+      ref: DocumentRef(id: environment.documentURL, isAdHoc: true), into: restoredWindowState)
+    let restoredWindowController = makeController(
+      in: environment, appState: restoredWindowState, documentStore: restoredWindowStore)
+
+    let workedOnState = AppState()
+    let workedOnStore = makeStore(in: environment)
+    workedOnStore.load(ref: DocumentRef(id: workedOnURL, isAdHoc: true), into: workedOnState)
+    let workedOnController = makeController(
+      in: environment, appState: workedOnState, documentStore: workedOnStore)
+    workedOnController.noteWindowBecameKey()
+
+    // ── Quit ──────────────────────────────────────────────────────────────
+    // `applicationWillTerminate` first, then the teardown cascade: B closes,
+    // AppKit promotes A to key, A closes too.
+    environment.windowRegistryProbe.beginTermination()
+    workedOnController.noteWindowWillClose()
+    restoredWindowController.noteWindowBecameKey()
+    restoredWindowController.noteWindowWillClose()
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    makeController(in: relaunch, appState: restoredState).start(restoringWorkspace: true)
+
+    XCTAssertEqual(
+      restoredState.documentSession.url?.standardizedFileURL,
+      workedOnURL.standardizedFileURL,
+      "the quit teardown rewrote the restore record with the window that died last — the "
+        + "previous launch's document comes back instead of the one the user was on")
+  }
+
+  /// Closing the active document (⌘W, "Close from Open Files") retires it: a
+  /// relaunch must not drag it back.
+  func testClosingTheActiveDocumentStopsItComingBackOnRelaunch() throws {
+    let environment = try makeRestoreEnvironment()
+
+    let windowState = AppState()
+    let windowStore = makeStore(in: environment)
+    windowStore.load(
+      ref: DocumentRef(id: environment.documentURL, isAdHoc: true), into: windowState)
+    XCTAssertTrue(windowStore.select(ref: nil, into: windowState))
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    makeController(in: relaunch, appState: restoredState).start(restoringWorkspace: true)
+
+    XCTAssertNil(
+      restoredState.documentSession.url,
+      "the document the user closed before quitting was restored anyway")
+    XCTAssertFalse(restoredState.documentSession.hasEditableBuffer)
+  }
+
+  /// Same for closing the WINDOW that shows it — outside termination that is
+  /// the user retiring the document, not teardown.
+  func testClosingADocumentWindowDropsItsRestoreRecord() throws {
+    let environment = try makeRestoreEnvironment()
+
+    let windowState = AppState()
+    let windowStore = makeStore(in: environment)
+    windowStore.load(
+      ref: DocumentRef(id: environment.documentURL, isAdHoc: true), into: windowState)
+    makeController(in: environment, appState: windowState, documentStore: windowStore)
+      .noteWindowWillClose()
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    makeController(in: relaunch, appState: restoredState).start(restoringWorkspace: true)
+
+    XCTAssertNil(
+      restoredState.documentSession.url,
+      "closing the document window left it as the document the next launch reopens")
+  }
+
+  /// …but a close only retires the record it OWNS. Closing an older window must
+  /// not erase the document another window is still frontmost with.
+  func testClosingAnotherWindowKeepsTheFrontmostDocumentsRestoreRecord() throws {
+    let environment = try makeRestoreEnvironment()
+    let frontmostURL = environment.folder.appendingPathComponent("still-frontmost.md")
+    try "still frontmost".write(to: frontmostURL, atomically: true, encoding: .utf8)
+
+    let olderState = AppState()
+    let olderStore = makeStore(in: environment)
+    olderStore.load(ref: DocumentRef(id: environment.documentURL, isAdHoc: true), into: olderState)
+
+    let frontmostState = AppState()
+    let frontmostStore = makeStore(in: environment)
+    frontmostStore.load(ref: DocumentRef(id: frontmostURL, isAdHoc: true), into: frontmostState)
+
+    makeController(in: environment, appState: olderState, documentStore: olderStore)
+      .noteWindowWillClose()
+
+    let relaunch = environment.relaunched()
+    let restoredState = AppState()
+    makeController(in: relaunch, appState: restoredState).start(restoringWorkspace: true)
+
+    XCTAssertEqual(
+      restoredState.documentSession.url?.standardizedFileURL,
+      frontmostURL.standardizedFileURL,
+      "closing a background window cleared the record the frontmost window owned")
+  }
+
   /// A document deleted between sessions must not strand the launch window:
   /// the pending draft takes it instead of nothing being restored at all.
   func testDeletedActiveDocumentFallsBackToTheRecoveryDraft() throws {
@@ -196,6 +338,9 @@ final class WindowRestorationTests: XCTestCase {
     /// Shared like `FolderManager.shared` in production: every window's
     /// controller drives the SAME workspace restore.
     let folderManagerProbe: FolderManager
+    /// Shared like `DocumentWindowRegistry.shared`: one per simulated process,
+    /// so `beginTermination()` reaches every window's controller.
+    let windowRegistryProbe: DocumentWindowRegistry
     let makeRelaunch: @MainActor () -> RestoreEnvironment
 
     @MainActor
@@ -238,6 +383,16 @@ final class WindowRestorationTests: XCTestCase {
           indexDatabase: IndexDatabase(
             databaseURL: folder.appendingPathComponent("index-\(UUID().uuidString).db")),
           bookmarkStore: bookmarkStore),
+        windowRegistryProbe: DocumentWindowRegistry(
+          canMutateWindowTabs: { false },
+          scheduleDeferredMainWork: { _ in },
+          scheduleLauncherWindowSweep: { _ in },
+          mergeWindowIntoTabs: { _, _ in },
+          orderAndActivateWindow: { _ in },
+          currentMergeTarget: { nil },
+          applicationWindows: { [] },
+          closeWindow: { _ in }
+        ),
         makeRelaunch: { build() }
       )
     }
@@ -270,7 +425,8 @@ final class WindowRestorationTests: XCTestCase {
       appState: appState,
       folderManager: environment.folderManagerProbe,
       documentStore: documentStore ?? makeStore(in: environment),
-      indexDatabase: indexDatabase
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: environment.windowRegistryProbe
     )
   }
 }

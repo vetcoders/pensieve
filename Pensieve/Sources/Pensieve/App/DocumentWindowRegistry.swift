@@ -60,8 +60,10 @@ final class DocumentWindowRegistry: ObservableObject {
   private var launcherReopenPending = false
   private var launcherReopenAwaitingFactory = false
   /// Set once the app starts quitting so the last document window's close does
-  /// not resurrect a launcher mid-termination.
-  private var isTerminating = false
+  /// not resurrect a launcher mid-termination — and so the key/close churn of a
+  /// dying window group cannot rewrite the restore record the user's last
+  /// action left behind.
+  private(set) var isTerminating = false
   /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure? {
     didSet {
