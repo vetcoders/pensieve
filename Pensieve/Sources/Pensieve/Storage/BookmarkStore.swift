@@ -168,12 +168,40 @@ final class BookmarkStore {
   /// either inside a restored root or already carries its own file bookmark,
   /// and minting a second bookmark per launch would grow `fileBookmarks`
   /// without bound.
+  /// Writes only when the ACTIVE DOCUMENT'S IDENTITY changes: every window
+  /// activation and every load funnels through here, so an unconditional
+  /// `defaults.set` would rewrite the same path on churn the user never caused.
   func persistActiveDocument(url: URL?) {
-    guard let url else {
+    let path = url?.standardizedFileURL.path
+    guard path != persistedActiveDocumentPath else { return }
+    guard let path else {
       defaults.removeObject(forKey: activeDocumentKey)
       return
     }
-    defaults.set(url.standardizedFileURL.path, forKey: activeDocumentKey)
+    defaults.set(path, forKey: activeDocumentKey)
+  }
+
+  /// Forgets the restore record when it names `url` — the document the user
+  /// just closed must not come back on the next launch. Conditional because
+  /// Open Files/tab closes cross windows: another window's document may
+  /// already own the record, and clearing it would strand that window.
+  func clearActiveDocument(ifMatching url: URL) {
+    guard persistedActiveDocumentPath == url.standardizedFileURL.path else { return }
+    defaults.removeObject(forKey: activeDocumentKey)
+  }
+
+  /// Follows the active document through a Save As: the record is a path, so
+  /// leaving it on the pre-save URL would restore a file the user renamed away
+  /// from (or nothing at all, once the old path is gone).
+  func repointActiveDocument(from previousURL: URL?, to newURL: URL) {
+    guard let previousURL,
+      persistedActiveDocumentPath == previousURL.standardizedFileURL.path
+    else { return }
+    defaults.set(newURL.standardizedFileURL.path, forKey: activeDocumentKey)
+  }
+
+  private var persistedActiveDocumentPath: String? {
+    defaults.string(forKey: activeDocumentKey)
   }
 
   /// Hands the previous session's active document to the FIRST restoring

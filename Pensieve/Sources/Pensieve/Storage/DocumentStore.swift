@@ -2619,6 +2619,15 @@ final class DocumentStore {
     bookmarkStore.persistActiveDocument(url: url)
   }
 
+  /// The user closed this document (⌘W, the tab's "×", "Close from Open
+  /// Files", the window's red button). It stops being what a relaunch reopens
+  /// — but only if it still owns the record: another window may have taken it
+  /// over in the meantime.
+  func noteActiveDocumentClosed(_ url: URL?) {
+    guard let url else { return }
+    bookmarkStore.clearActiveDocument(ifMatching: url)
+  }
+
   /// Reopens the document a relaunch is restoring into a still-empty window.
   /// Deliberately refuses a window that already carries a buffer: restoration
   /// may never overwrite live content.
@@ -2687,9 +2696,14 @@ final class DocumentStore {
     }
 
     guard let ref else {
+      // Read the URL BEFORE the session is cleared: closing the document the
+      // relaunch record names must forget it, or the file the user just closed
+      // comes back on every launch.
+      let closedURL = appState.documentSession.url
       autosaver.cancel()
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
+      noteActiveDocumentClosed(closedURL)
       return true
     }
 
@@ -2709,6 +2723,7 @@ final class DocumentStore {
     guard appState.documentSession.hasEditableBuffer else { return false }
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
     let previousID = appState.documentSession.id
+    let previousURL = appState.documentSession.url
     let recoveryID = appState.documentSession.recoveryID
 
     do {
@@ -2722,6 +2737,9 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
       recoveryStore.deleteDraft(id: recoveryID)
       appState.lastError = nil
+      // The active document changed identity: keep the relaunch record on the
+      // same document rather than on a path that no longer holds it.
+      bookmarkStore.repointActiveDocument(from: previousURL, to: targetURL)
       indexDocument(ref, appState.documentSession.text, appState)
       return true
     } catch {

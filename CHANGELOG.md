@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Relaunch restored the wrong session: the pending "Recovered Untitled" crash draft claimed the one window a launch brings back, its dirty buffer then blocked document selection, and the file the user was actually reading was dropped entirely. The document the previous session had frontmost is now persisted and restored first; a pending crash draft comes back in a window of its own, so neither half of the session is lost.
+- Relaunch reopened the same stale document on every launch, whatever the user had worked on. Quit tears every window down and each close hands key status to a surviving sibling, so the restore record was rewritten by a window activation nobody triggered — always by the oldest window, i.e. the one the previous launch had restored. The record now ignores teardown, and closing a document (⌘W, "Close from Open Files", closing its window) retires it instead of leaving it to come back forever. Save As follows the document to its new path.
 
 ## [0.4.2] - 2026-07-22
 

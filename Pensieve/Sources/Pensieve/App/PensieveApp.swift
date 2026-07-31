@@ -235,6 +235,9 @@ struct DocumentWindowRootView: View {
           return
         }
         controller.savePendingChangesOnClose()
+        // A closed document window is no longer "where the user was": drop the
+        // relaunch record it owns, unless this close is app teardown.
+        controller.noteWindowWillClose()
         CommandSurfaceContext.shared.release(controller: controller)
         DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
