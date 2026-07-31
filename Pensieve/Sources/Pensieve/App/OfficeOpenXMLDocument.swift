@@ -14,6 +14,13 @@ enum OfficeOpenXMLDocument {
     return ZipArchive.write(entries: writer.entries())
   }
 
+  /// Read one package part out of a written archive. Lets callers — tests and
+  /// diagnostics — assert on the emitted OOXML instead of only on round-tripped
+  /// markdown, which hides layout geometry entirely.
+  static func part(named name: String, in data: Data) throws -> Data? {
+    try ZipArchive(data: data).data(for: name)
+  }
+
   static func readMarkdown(_ data: Data) throws -> String {
     let archive = try ZipArchive(data: data)
     guard let documentXML = try archive.data(for: "word/document.xml") else {
@@ -271,12 +278,19 @@ private struct WordDocumentWriter {
     """
   )
 
+  // Every `w:lvl` MUST carry `w:pPr/w:ind`. A level without it leaves the list
+  // paragraph's text indent undefined, and consumers (reproduced in Pages,
+  // which is the default .docx handler on a Mac without Office) resolve it to
+  // roughly the full text column — every list paragraph then collapses into a
+  // two-character sliver hugging the right margin and drags the rest of the
+  // document across dozens of near-empty pages. `w:lvlJc` alone does not fix
+  // it; the indent is the load-bearing part.
   private static let numbering = xmlData(
     """
     <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-      <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl></w:abstractNum>
-      <w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+      <w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="hybridMultilevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>
+      <w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="hybridMultilevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>
       <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
       <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
     </w:numbering>
