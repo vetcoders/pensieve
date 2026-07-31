@@ -8,11 +8,39 @@ import SwiftUI
 /// `.navigation` empty so the document title leads, then document/dispatch →
 /// history → editing → view → preview runtime → assistants. Declaration order
 /// is the only ordering authority. Each semantic family is a labeled native
-/// toolbar group with a system `ControlGroup`; macOS owns width compression and
-/// overflow. There is no app-authored ellipsis taxonomy and no spacer pretending
-/// to prove visual separation. Raw format buttons stay inline whenever the
-/// buffer is editable, matching the floating selection bar and the Format app
-/// menu without adding formatter logic.
+/// toolbar group; macOS owns width compression and overflow. There is no
+/// app-authored ellipsis taxonomy and no spacer pretending to prove visual
+/// separation. Raw format buttons stay inline whenever the buffer is editable,
+/// matching the floating selection bar and the Format app menu without adding
+/// formatter logic.
+///
+/// What may share a `ControlGroup` is NOT a styling choice — a toolbar
+/// `ControlGroup` is bridged into ONE `NSSegmentedControl`, and AppKit derives
+/// that control's tracking mode and its per-segment behaviour from the WHOLE
+/// group. Three measured rules follow (see `EditorToolbarBridgeTests`, which
+/// pins each of them against the live bridge):
+///
+///   * A `Picker` must NOT sit inside a `ControlGroup`. A segmented picker
+///     cannot nest inside a segmented control: the bridge folds the entire
+///     picker into a SINGLE DISABLED segment carrying the picker's title. That
+///     is exactly what made the mode control read as a dead, greyed-out "Mode"
+///     chip that answered no click.
+///   * Momentary actions (plain `Button`s) must NOT share a `ControlGroup` with
+///     a `Toggle`. One `Toggle` in the group puts the whole control in
+///     `.selectAny` tracking, so every format button starts behaving like a
+///     sticky on/off chip — the click lights the segment and the lit segment
+///     then lies about a state the action does not have.
+///   * A `ControlGroup` contributes NOTHING to the toolbar's clipped-items
+///     ("»") menu — the bridged group carries no menu-form representation, and
+///     labelling the `ControlGroup` does not add one (measured). A family whose
+///     ENTIRE content sits in a `ControlGroup` therefore vanishes silently once
+///     the window is too narrow. Controls declared directly in the
+///     `ToolbarItemGroup` (the mode picker, the appearance menu, reload,
+///     rewrite) do carry menu forms and keep the overflow menu populated.
+///
+/// Toggle-only `ControlGroup`s stay: their on-state chip is what
+/// `WindowChromeRecipe.assertToolbarChipTint` paints from the active skin, and
+/// that paint needs the segmented bridge.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -83,6 +111,8 @@ struct EditorToolbelt: ToolbarContent {
       ToolbarItemGroup {
         ControlGroup {
           richMarkdownToggle
+        }
+        ControlGroup {
           formatButtons
         }
       } label: {
@@ -91,20 +121,18 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     ToolbarItemGroup {
-      ControlGroup {
-        modePicker
+      modePicker
 
-        if Self.showsAppearanceControls(for: appState.mode) {
-          AppearanceToolbarMenu(themeManager: themeManager)
-        }
+      if Self.showsAppearanceControls(for: appState.mode) {
+        AppearanceToolbarMenu(themeManager: themeManager)
       }
     } label: {
       Label("View", systemImage: "rectangle.split.2x1")
     }
 
     ToolbarItemGroup {
+      reloadButton
       ControlGroup {
-        reloadButton
         autoReloadToggle
         scrollSyncToggle
       }
@@ -116,8 +144,8 @@ struct EditorToolbelt: ToolbarContent {
       ControlGroup {
         dictationToggle
         autocompleteToggle
-        rewriteMenu
       }
+      rewriteMenu
     } label: {
       Label("Assistants", systemImage: "sparkles")
     }
@@ -243,6 +271,10 @@ struct EditorToolbelt: ToolbarContent {
     }
     // 5.2: a labeled segmented control (Source · Split · Preview · Focus) — the
     // active mode reads from the filled capsule and its title, not a dimmed icon.
+    //
+    // Declared DIRECTLY in the toolbar group, never inside a `ControlGroup`:
+    // nested in one, the bridge collapses this whole picker into a single
+    // disabled "Mode" segment (measured — the dead control the operator met).
     .pickerStyle(.segmented)
     .help("Editor layout")
     .frame(minWidth: 300)
@@ -255,6 +287,11 @@ struct EditorToolbelt: ToolbarContent {
   /// button — no custom backgrounds, borders, or chip shapes — so the row is
   /// styled by the system exactly like the neighboring navigation and trailing
   /// clusters (template glyphs, hover/press highlight, chevron overflow).
+  ///
+  /// These are momentary actions, so they get a `ControlGroup` of their OWN —
+  /// sharing one with the Rich Markdown toggle put the bridged segmented
+  /// control in `.selectAny` tracking and turned every format button into a
+  /// sticky chip that stayed lit after the click.
   private var formatButtons: some View {
     ForEach(MarkdownFormat.allCases) { format in
       Button {
