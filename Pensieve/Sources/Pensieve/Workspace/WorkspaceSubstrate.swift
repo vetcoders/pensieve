@@ -37,7 +37,13 @@ struct WorkspaceValidationResult: @unchecked Sendable {
   var scans: [WorkspaceScan]
   var fingerprint: TreeFingerprint?
   var verdict: WorkspaceCacheVerdict?
+  /// Baseline to restore on a valid skip: the PERSISTED `.md` signature when one exists (it
+  /// matches the live index), else the freshly stated one.
   var searchSignature: WorkspaceSignature?
+  /// The `.md` signature of the tree that was just walked. This is the one a cold reindex must
+  /// diff against the persisted baseline — using `searchSignature` there compares the persisted
+  /// signature with itself and reports an empty delta for a genuinely changed workspace.
+  var currentSignature: WorkspaceSignature?
 }
 
 /// Immutable validation configuration shared with detached open jobs. The cache store is itself
@@ -114,9 +120,11 @@ final class WorkspaceSubstrate: @unchecked Sendable {
       try Task.checkCancellation()
 
       probe(.searchSignature)
-      let searchSignature =
-        store.readSearchSignature(for: identity)
-        ?? FolderManager.signature(from: scans)
+      // One stat pass over the walked documents, off the main actor, feeding BOTH roles: the
+      // freshly measured signature (what the reindex diffs) and the baseline the valid-skip
+      // path restores (the persisted one when it exists — it matches the live index).
+      let currentSignature = FolderManager.signature(from: scans)
+      let searchSignature = store.readSearchSignature(for: identity) ?? currentSignature
       try Task.checkCancellation()
 
       if persistPresentationCache, case .valid = verdict {
@@ -132,7 +140,8 @@ final class WorkspaceSubstrate: @unchecked Sendable {
         scans: scans,
         fingerprint: fingerprint,
         verdict: verdict,
-        searchSignature: searchSignature
+        searchSignature: searchSignature,
+        currentSignature: currentSignature
       )
     }
   }
