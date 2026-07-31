@@ -34,7 +34,8 @@ Pensieve keeps Markdown as the source of truth while making exchange with Word-f
 
 The existing HTML and PDF export options remain available in the File menu. **File → Export
 PDF…** paginates onto real pages — A4 or US Letter depending on your region, with 0.75in
-margins.
+margins — and reproduces the reading theme the preview pane is currently showing, in either
+its light or dark variant.
 
 ## Requirements
 
