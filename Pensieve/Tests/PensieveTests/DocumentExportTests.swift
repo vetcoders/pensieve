@@ -45,6 +45,59 @@ final class DocumentExportTests: XCTestCase {
     )
   }
 
+  /// The preview's base size is a user setting, so absolute point thresholds
+  /// misfired: 16pt body text containing one bold phrase shipped as a Heading3
+  /// and Word rendered whole paragraphs as bold headings.
+  func testDOCXKeepsBodyParagraphsWithBoldPhrasesOutOfHeadingStyles() throws {
+    let html = """
+      <html><body style="font-size: 16px">
+        <h1 style="font-size: 32px">Tytuł</h1>
+        <h2 style="font-size: 24px">Sekcja</h2>
+        <p style="font-size: 16px">Akapit z <strong>pogrubieniem</strong> w środku.</p>
+      </body></html>
+      """
+    let data = try DocumentTransfer.docxData(fromHTML: html, baseURL: nil)
+    let part = try XCTUnwrap(
+      try OfficeOpenXMLDocument.part(named: "word/document.xml", in: data))
+    let document = try XCTUnwrap(String(data: part, encoding: .utf8))
+
+    let paragraphs = document.components(separatedBy: "<w:p>").dropFirst()
+    let body = try XCTUnwrap(paragraphs.first { $0.contains("Akapit z ") })
+    XCTAssertFalse(body.contains("<w:pStyle"), "body text must not be styled as a heading: \(body)")
+
+    XCTAssertTrue(
+      paragraphs.contains { $0.contains("Tytuł") && $0.contains("w:val=\"Heading1\"") },
+      document
+    )
+    XCTAssertTrue(
+      paragraphs.contains { $0.contains("Sekcja") && $0.contains("w:val=\"Heading2\"") },
+      document
+    )
+  }
+
+  /// AppKit's HTML importer writes ordered markers as "\t1\t"; leaving them in
+  /// the run text printed them next to the numbering Word draws itself.
+  func testDOCXDropsTheImportersOrderedListMarkerText() throws {
+    let data = try DocumentTransfer.docxData(
+      fromHTML: "<ol><li>Pierwszy krok</li><li>Drugi krok</li></ol>",
+      baseURL: nil
+    )
+    let part = try XCTUnwrap(
+      try OfficeOpenXMLDocument.part(named: "word/document.xml", in: data))
+    let document = try XCTUnwrap(String(data: part, encoding: .utf8))
+
+    XCTAssertTrue(document.contains("<w:numId w:val=\"2\"/>"), "ordered list keeps its numbering")
+    XCTAssertFalse(
+      document.contains("<w:t xml:space=\"preserve\"> 1 </w:t>"),
+      "the importer's marker must not survive as body text: \(document)"
+    )
+    XCTAssertTrue(document.contains("Pierwszy krok"), document)
+
+    let markdown = try OfficeOpenXMLDocument.readMarkdown(data)
+    XCTAssertTrue(markdown.contains("1. Pierwszy krok"), markdown)
+    XCTAssertFalse(markdown.contains("1. 1 Pierwszy"), markdown)
+  }
+
   @MainActor
   func testRenderDocumentBuildsStandalonePreviewHTMLForActiveSession() {
     let sourceURL = URL(fileURLWithPath: "/tmp/pensieve-export/Daily.md")
