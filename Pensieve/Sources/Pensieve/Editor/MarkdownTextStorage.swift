@@ -6,7 +6,35 @@ class MarkdownTextStorage: NSTextContentStorage {
   private var highlightWorkItem: DispatchWorkItem?
   private var pendingHighlightRange: NSRange?
   private var pendingRequiresFullRefresh = false
+  private var pendingRethemeCompletion = false
   private var lastProcessedString = ""
+
+  /// Delay before a scheduled highlight pass runs. Shared by the typing debounce
+  /// and the deferred retheme pass so the two can never drift apart. It must be a
+  /// TIMER, not a bare `main.async`: a block enqueued on the main queue is drained
+  /// in the same run-loop iteration that queued it, i.e. before Core Animation
+  /// commits the frame — which would put the full pass back in front of the
+  /// repaint it is supposed to follow.
+  private static let highlightRefreshDelay: DispatchTimeInterval = .milliseconds(70)
+
+  /// Character range the operator is actually looking at, supplied by the host
+  /// surface. Injected rather than read out of layout in here so the storage
+  /// keeps no view dependency and the viewport-first retheme is provable
+  /// headless. `nil` means "layout has not established a viewport yet" (the
+  /// launch ordering, where the surface is themed before it has a window), and
+  /// then a retheme falls back to the plain synchronous full pass.
+  var visibleRangeProvider: (() -> NSRange?)?
+
+  /// Fired once a DEFERRED retheme's full-document pass has run. A full refresh
+  /// strips `.backgroundColor` document-wide, which is where the find-match
+  /// washes live; with the pass deferred it lands AFTER `applyTheme` already
+  /// repainted them, so the surface needs a second chance to put them back.
+  var onRethemeCompleted: (() -> Void)?
+
+  /// Full-document refresh passes performed so far. Exposed so the perf pins can
+  /// prove what the timings say: a skin switch on a large document must not run
+  /// one synchronously, and a burst of switches must collapse into ONE.
+  private(set) var fullRefreshCount = 0
 
   /// Cached, document-order list of every ``` fence line's `NSRange`.
   ///
@@ -42,8 +70,65 @@ class MarkdownTextStorage: NSTextContentStorage {
     didSet {
       highlighter.tokens = tokens
       codeBlockHighlighter.tokens = tokens
-      refreshHighlighting()
+      rethemeHighlighting()
     }
+  }
+
+  /// Documents at or below this length re-colour in ONE synchronous pass. A full
+  /// reset + both highlighters measured ~0.7 µs per character in a debug build
+  /// (860 ms for a 1.27 MB draft), so 20 000 characters is roughly a single
+  /// 60 Hz frame: below it deferring buys no repaint and only adds a hop.
+  static let synchronousRethemeCharacterBudget = 20_000
+
+  /// Re-colours the document for a newly applied palette.
+  ///
+  /// A live skin switch used to call `refreshHighlighting()` — reset the base
+  /// attributes and re-run BOTH highlighters over the WHOLE document,
+  /// synchronously on the main thread. Measured on the running app that is
+  /// 860 ms for a 1.27 MB draft, so the source pane's pixels trailed the click by
+  /// seconds while the preview, a `WKWebView` rendered out of process, repainted
+  /// at once. That asymmetry is the whole "preview switches, source stays on the
+  /// old skin" report; clicking through skins queued one such pass per click and
+  /// stacked them into 3.5–4.5 s.
+  ///
+  /// So: repaint what is on screen now, defer the rest. The viewport is widened
+  /// to whole paragraphs and to any code block it touches — the same context the
+  /// full pass would give it, so the visible text is not coloured as prose for
+  /// the duration of the deferral — and re-highlighted inline. The
+  /// full-document pass then rides the existing debounced work item, which also
+  /// coalesces a burst of switches into a single full pass.
+  private func rethemeHighlighting() {
+    guard let textStorage = textStorage else { return }
+    let string = textStorage.string as NSString
+    guard string.length > Self.synchronousRethemeCharacterBudget,
+      let visibleRange = visibleRangeProvider?(),
+      clampedRange(visibleRange, textLength: string.length).length > 0
+    else {
+      refreshHighlighting()
+      return
+    }
+
+    let viewportRange = clampedRange(visibleRange, textLength: string.length)
+    let scopedRange = codeBlockAwareRange(
+      for: scopedHighlightRange(for: viewportRange, in: string))
+    refreshHighlighting(in: scopedRange)
+    scheduleFullRethemeRefresh()
+  }
+
+  /// Queues the rest of the document behind the viewport repaint. Cancels any
+  /// pending pass first, so eight clicks in a row cost one full refresh instead
+  /// of eight.
+  private func scheduleFullRethemeRefresh() {
+    highlightWorkItem?.cancel()
+    pendingHighlightRange = nil
+    pendingRequiresFullRefresh = true
+    pendingRethemeCompletion = true
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.applyScheduledHighlightingRefresh()
+    }
+    highlightWorkItem = workItem
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.highlightRefreshDelay, execute: workItem)
   }
 
   /// The source panel's base face for the active tokens and font size. Every
@@ -120,12 +205,19 @@ class MarkdownTextStorage: NSTextContentStorage {
       self?.applyScheduledHighlightingRefresh()
     }
     highlightWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(70), execute: workItem)
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.highlightRefreshDelay, execute: workItem)
   }
 
   private func applyScheduledHighlightingRefresh() {
     guard !pendingRequiresFullRefresh else {
+      // Read before the refresh: it clears the pending state, completion flag
+      // included.
+      let completesARetheme = pendingRethemeCompletion
       refreshHighlighting()
+      if completesARetheme {
+        onRethemeCompleted?()
+      }
       return
     }
 
@@ -144,10 +236,12 @@ class MarkdownTextStorage: NSTextContentStorage {
     highlightWorkItem = nil
     pendingHighlightRange = nil
     pendingRequiresFullRefresh = false
+    pendingRethemeCompletion = false
     // Full refresh can follow a wholesale text replacement (document load,
     // font/syntax toggle), so invalidate the fence cache here too.
     fenceLineRangesCache = nil
     guard let textStorage = textStorage else { return }
+    fullRefreshCount += 1
     let fullRange = NSRange(location: 0, length: textStorage.length)
 
     // Prevent recursive processEditing calls for attribute changes

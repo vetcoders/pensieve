@@ -556,6 +556,19 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     bindAutocomplete()
     bindRewritePreview()
+    // Viewport seam for a live skin switch: the storage re-colours what is on
+    // screen synchronously and defers the rest of the document, so it has to be
+    // able to ask what "on screen" currently is. Wired BEFORE the first
+    // `applyTheme` so no retheme can ever run without it.
+    textContentStorage.visibleRangeProvider = { [weak self] in
+      self?.textView.visibleCharacterRange
+    }
+    // The deferred half of that switch runs a full refresh, which strips
+    // `.backgroundColor` document-wide — the attribute the find washes live in —
+    // and lands after `applyTheme` already repainted them once.
+    textContentStorage.onRethemeCompleted = { [weak self] in
+      self?.reapplyFindHighlights()
+    }
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
     applyTheme(skin)
@@ -654,13 +667,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.backgroundColor = tokens.source.nsColor
     textView.applyTheme(tokens, baseSize: textContentStorage.fontSize)
     textContentStorage.tokens = tokens
-    // Pushing tokens runs a FULL highlight refresh, which strips
-    // `.backgroundColor` document-wide — the attribute the find-match washes
-    // live in. `updateFind` will not repaint them (unchanged query + non-empty
-    // matches short-circuits), so the matches would stay invisible until the
-    // operator retyped the query. Repaint from the cached matches instead of
-    // clearing them: clearing would also drop the active-match index and the
-    // scroll position the operator is reading.
+    // Pushing tokens re-highlights, which strips `.backgroundColor` — the
+    // attribute the find-match washes live in. `updateFind` will not repaint
+    // them (unchanged query + non-empty matches short-circuits), so the matches
+    // would stay invisible until the operator retyped the query. Repaint from
+    // the cached matches instead of clearing them: clearing would also drop the
+    // active-match index and the scroll position the operator is reading.
+    //
+    // This covers the pass that just ran inline. On a large document only the
+    // viewport is repainted here and the rest of the refresh is deferred, so the
+    // storage calls us back through `onRethemeCompleted` to do it again once the
+    // full pass has landed.
     reapplyFindHighlights()
     applyWindowChrome(for: theme)
   }

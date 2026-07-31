@@ -23,6 +23,26 @@ class MarkdownTextView: NSTextView {
     super.undoManager ?? fallbackUndoManager
   }
 
+  /// Character range currently laid out in the viewport, or `nil` while layout
+  /// has not established one yet (before the first viewport pass, or while the
+  /// surface has no window at all — the launch ordering, where the skin is
+  /// applied before the view is hosted).
+  ///
+  /// This is what lets a live skin switch repaint the visible text first and
+  /// defer the rest of the document; see `MarkdownTextStorage.rethemeHighlighting`.
+  var visibleCharacterRange: NSRange? {
+    guard let layoutManager = textLayoutManager,
+      let contentManager = layoutManager.textContentManager,
+      let viewportRange = layoutManager.textViewportLayoutController.viewportRange
+    else { return nil }
+
+    let documentStart = contentManager.documentRange.location
+    let location = contentManager.offset(from: documentStart, to: viewportRange.location)
+    let end = contentManager.offset(from: documentStart, to: viewportRange.endLocation)
+    guard location != NSNotFound, end != NSNotFound, end >= location else { return nil }
+    return NSRange(location: location, length: end - location)
+  }
+
   /// The window undo manager our entries land in, captured while attached so we can
   /// scrub them on detach. See `viewWillMove(toWindow:)` for why `self.window` is not a
   /// reliable source at detach time.
