@@ -165,13 +165,42 @@ final class ToolbarBridgeRig {
   /// keeps the sink itself honest, and
   /// `testAClobberedFormIsRepairedOnAWindowUpdate` keeps the repair trigger
   /// honest.
+  ///
+  /// It RETRIES, because one pass is provably not enough: the state change also
+  /// schedules a SwiftUI rebuild, and nothing orders that rebuild before the
+  /// pass. Land it after — inside the very settle the check verifies from — and
+  /// a single shot authors the menus, watches SwiftUI take them straight back,
+  /// and reports a toolbar that "never converged" at a width where nothing was
+  /// even clipped. That is the CI failure, reproduced on demand by
+  /// `testOverflowSyncSurvivesARebuildThatLandsAfterThePass`.
+  ///
+  /// So each attempt re-runs the pass and re-verifies AFTER settling, and the
+  /// loop ends when the toolbar has gone quiet and the menus agree with it. The
+  /// bound is a failure, never a pass: an overflow menu that never converges
+  /// fails the test rather than timing out into a green.
   @discardableResult
-  func syncOverflowMenus() -> Bool {
-    let families = toolbelt.overflowFamilies
-    window.update()
-    ToolbarOverflowRecipe.assertOverflowMenus(on: window, families: families)
-    settle(0.05)
-    return overflowMatches(toolbelt.overflowFamilies)
+  func syncOverflowMenus(attempts: Int = 40) -> Bool {
+    for _ in 0..<attempts {
+      window.update()
+      ToolbarOverflowRecipe.assertOverflowMenus(on: window, families: toolbelt.overflowFamilies)
+      settle(0.02)
+      if overflowMatches(toolbelt.overflowFamilies) { return true }
+    }
+    return false
+  }
+
+  /// Everything a failing overflow assertion needs to name its own cause on a
+  /// machine nobody can attach a debugger to: the geometry the rig actually got
+  /// (not the one it asked for), whether the window is really on screen, how
+  /// much of the toolbar macOS is showing, and who owns each group's menu form.
+  var overflowDiagnostics: String {
+    let forms = itemGroups.map {
+      $0.menuFormRepresentation?.identifier?.rawValue ?? "<swiftui-derived>"
+    }
+    return
+      "window frame=\(window.frame) visible=\(window.isVisible) "
+      + "toolbarItems=\(toolbar?.items.count ?? -1) visibleItems=\(visibleItemCount) "
+      + "families=\(toolbelt.overflowFamilies.count) forms=\(forms)"
   }
 
   /// The mode picker is the only `.selectOne` control in this toolbar.
