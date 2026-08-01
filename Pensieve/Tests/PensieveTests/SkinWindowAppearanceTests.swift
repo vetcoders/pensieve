@@ -60,6 +60,57 @@ final class SkinWindowAppearanceTests: XCTestCase {
     }
   }
 
+  /// A PAIRED skin is not an adaptive one, and this is the pin that says so.
+  ///
+  /// It reads as a distinction without a difference — the resolved half always
+  /// agrees with the system, so "pin the half" and "follow the system" paint the
+  /// same chrome — right up until something else resolves the scene on its own.
+  /// That is what shipped in build 446: the pair declared no preference, and the
+  /// operator got a window whose titlebar, sidebar and editor were dark while
+  /// the trailing toolbar families came back light. The very split this suite's
+  /// header describes for Parchment, and for the very reason line 49 names:
+  /// a `preferredColorScheme(nil)` is a neutered declaration.
+  ///
+  /// Both halves are driven, so the pin discriminates on any machine: one leg
+  /// always disagrees with whatever the host is set to.
+  @MainActor
+  func testAPairedSkinPinsTheHostWindowToTheHalfTheSystemChose() throws {
+    for dark in [true, false] {
+      try withSystemAppearance(dark: dark) {
+        let (window, _, _) = hostSkinRoot(.typewriter)
+        defer { window.contentView = nil }
+        XCTAssertEqual(
+          window.appearance?.name, dark ? .darkAqua : .aqua,
+          "the \(dark ? "dark" : "light") half must own the whole window —"
+            + " an unpinned scene leaves the toolbar free to resolve the other one")
+      }
+    }
+  }
+
+  /// A pinned half is only honest if it MOVES. Pinning made the window's
+  /// appearance a function of the system setting rather than of the skin alone,
+  /// so "Typewriter still follows your Mac" now rests on the pin being re-derived
+  /// when the setting changes — nothing else re-dresses an already-hosted window.
+  ///
+  /// The flip is driven on an ALREADY HOSTED window and nothing here touches the
+  /// view tree, so what this proves is the manager's own system-appearance
+  /// observation reaching the declaration.
+  @MainActor
+  func testAPairedWindowFollowsALiveSystemFlip() throws {
+    try withSystemAppearance(dark: true) {
+      let (window, _, _) = hostSkinRoot(.typewriter)
+      defer { window.contentView = nil }
+      XCTAssertEqual(window.appearance?.name, .darkAqua)
+
+      NSApplication.shared.appearance = NSAppearance(named: .aqua)
+      for _ in 0..<40 where window.appearance?.name != .aqua { settle(window) }
+      XCTAssertEqual(
+        window.appearance?.name, .aqua,
+        "flipping the Mac to light must take the window with it — a pin that never"
+          + " moves is a skin that stopped following the setting it reads")
+    }
+  }
+
   /// The adaptive skins must NOT pin the window: they are the ones that are
   /// supposed to follow the system setting.
   @MainActor
