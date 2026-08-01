@@ -410,18 +410,29 @@ final class AppController: ObservableObject {
     // tab/window. If it is THIS window's active doc, run the dirty-session guard
     // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
     // force-save) so the sidebar close never silently drops unsaved edits.
-    closeOpenDocument(identity: .file(id.standardizedFileURL))
+    //
+    // Closing the WINDOW is not the whole intent here. This affordance retires
+    // the file from the LIST, so it must also leave the working set a relaunch
+    // restores from — and only when the close actually went through, so a
+    // cancelled Save/Discard/Cancel forgets nothing.
+    let url = id.standardizedFileURL
+    guard closeOpenDocument(identity: .file(url)) else { return }
+    documentStore.forgetOpenFile(url, into: appState)
   }
 
-  func closeOpenDocument(identity: DocumentIdentity) {
+  @discardableResult
+  func closeOpenDocument(identity: DocumentIdentity) -> Bool {
     // Open Files mirrors EVERY window's documents, so this close may target a
     // document owned by another window. Run the dirty guard in the OWNING
     // window's session — guarding only the caller's would force-close the
     // target, letting its close hook stash a recovery draft and skip the
     // Save/Discard/Cancel prompt. Fall back to self when no owner is registered.
     let owner = documentWindowRegistry.controller(for: identity) ?? self
-    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
+    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else {
+      return false
+    }
     documentWindowRegistry.closeDocument(identity)
+    return true
   }
 
   /// Runs this window's dirty-session guard when `identity` is its active
@@ -490,6 +501,14 @@ final class AppController: ObservableObject {
 
     for (owner, resolution) in deferred {
       owner.applyDeferredDirtySessionResolution(resolution)
+    }
+    // Phase 2 also retires the FILES from the working set, for the same reason
+    // the single-row close does: this affordance empties the Open Files list,
+    // and a list the next launch refills was never emptied. Inside phase 2, so
+    // a Cancel in phase 1 still forgets nothing.
+    for identity in identities {
+      guard case .file(let url) = identity else { continue }
+      documentStore.forgetOpenFile(url, into: appState)
     }
     documentWindowRegistry.closeAllDocumentWindows()
   }

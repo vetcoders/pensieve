@@ -2601,6 +2601,27 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
+  /// The user closed this file OUT of Open Files — the list itself, not just a
+  /// window onto it. Retires it from the WORKING SET a relaunch restores from.
+  ///
+  /// Closing a document window is deliberately NOT this: a window is a view of
+  /// a file, and quitting with files open has to bring them back. Open Files is
+  /// the file list, so removing a row from it is the user saying "stop carrying
+  /// this one". Those two intents were previously served by the same code path,
+  /// which is why the second one did nothing that outlived the process: the row
+  /// disappeared with the window, and the next launch read a working set nobody
+  /// had told.
+  ///
+  /// Two stores hold that answer and both have to hear it, or whichever one is
+  /// missed reseeds the other on the next launch: the in-memory `openFiles`
+  /// working set, shared across windows, and the persisted file bookmarks,
+  /// which are what a relaunch actually reads.
+  func forgetOpenFile(_ url: URL, into appState: AppState) {
+    let standardizedURL = url.standardizedFileURL
+    appState.openFiles.removeAll { $0.url.standardizedFileURL == standardizedURL }
+    bookmarkStore.removeFile(url: standardizedURL)
+  }
+
   @discardableResult
   func restoreRecoveredDraft(into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
