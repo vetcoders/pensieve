@@ -189,6 +189,16 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   case porcelain
   /// One mono family everywhere, achromatic.
   case typewriter
+  // TEMPORARY — test-build line only, remove after the operator picks.
+  //
+  // The same skin as `typewriter` down to the byte, except for the ONE thing
+  // still undecided: the window chrome mode. `typewriter` pins `.light` (the
+  // titlebar draws light controls over the dark backing); this one pins `.dark`
+  // and takes the titlebar backing to the mockup's `#171717`. Shipped as a
+  // second picker entry so both can be compared live in the same build. Delete
+  // this case, its `displayName`/`systemImage` arms, its token table entry and
+  // the `skinCSS` fall-through once the decision lands.
+  case typewriterDarkChrome = "typewriter-dark-chrome"
 
   var id: String { rawValue }
 
@@ -201,6 +211,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .ink: return "Ink"
     case .porcelain: return "Porcelain"
     case .typewriter: return "Typewriter"
+    // TEMPORARY — see the case declaration.
+    case .typewriterDarkChrome: return "Maszynopis (ciemny chrome)"
     }
   }
 
@@ -214,6 +226,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .ink: return "drop.fill"
     case .porcelain: return "cross.case"
     case .typewriter: return "keyboard"
+    // TEMPORARY — see the case declaration.
+    case .typewriterDarkChrome: return "keyboard.fill"
     }
   }
 
@@ -410,6 +424,37 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       // glyph rides it at 5.10:1 and it lifts off the #1c1c1c titlebar backing
       // at 3.34:1. The lighter steps cannot carry the glyph (#a8a8a8 is 2.38:1),
       // the darker ones dissolve into the backing.
+      chromeAccent: ColorSpec(hex: "#6e6e6e"),
+      muted: ColorSpec(hex: "#6e6e6e"),
+      warning: ColorSpec(hex: "#6e6e6e"),
+      srcHeading: ColorSpec(hex: "#f2f2f2"),
+      srcListMarker: ColorSpec(hex: "#d4d4d4"),
+      srcInlineCode: ColorSpec(hex: "#d4d4d4"),
+      srcLink: ColorSpec(hex: "#d4d4d4"),
+      srcQuote: ColorSpec(hex: "#8a8a8a"),
+      srcStrike: ColorSpec(hex: "#8a8a8a"),
+      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
+      srcGutter: ColorSpec(hex: "#525252"),
+      srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
+      previewFamily: "Spline Sans Mono",
+      previewHeadingFamily: "Spline Sans Mono",
+      monoFamily: "Spline Sans Mono"
+    ),
+    // TEMPORARY — test-build line only, remove after the operator picks.
+    //
+    // Byte-identical to `.typewriter` except for the two values that carry the
+    // undecided axis: `mode` flips `.light` → `.dark` (the window and the
+    // preview take `darkAqua`, so the titlebar draws dark controls), and
+    // `source` — which IS the titlebar backing (`titlebarGlassBackingColor`) —
+    // moves to the mockup's `#171717`. Everything else is copied verbatim so
+    // the only difference the operator sees is the chrome.
+    .typewriterDarkChrome: ThemeTokens(
+      mode: .dark,
+      source: ColorSpec(hex: "#171717"),
+      border: ColorSpec(hex: "#e6e6e6"),
+      codeBackground: ColorSpec(hex: "#2b2b2b"),
+      text: ColorSpec(hex: "#d4d4d4"),
+      accent: ColorSpec(hex: "#1c1c1c"),
       chromeAccent: ColorSpec(hex: "#6e6e6e"),
       muted: ColorSpec(hex: "#6e6e6e"),
       warning: ColorSpec(hex: "#6e6e6e"),

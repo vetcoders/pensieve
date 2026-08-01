@@ -1030,6 +1030,15 @@ final class PreviewWebView: NSView {
         }
         """
 
+    // TEMPORARY — test-build line only, remove after the operator picks.
+    //
+    // The demo variant differs from `.typewriter` only in window chrome, so it
+    // reuses that skin's stylesheet verbatim and carries its own overlay marker
+    // (the exhaustiveness pin reads one marker per raw value).
+    case .typewriterDarkChrome:
+      return skinCSS(for: .typewriter)
+        + "\n/* vc-skin:typewriter-dark-chrome — typewriter's reading surface, dark window chrome */"
+
     case .typewriter:
       return """
         /* vc-skin:typewriter — one mono family everywhere, achromatic, centred heads */
