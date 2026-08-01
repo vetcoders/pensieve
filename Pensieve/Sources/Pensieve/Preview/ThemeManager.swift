@@ -99,12 +99,13 @@ final class ThemeManager: ObservableObject {
   /// for on this surface:
   ///
   ///   * It writes NOTHING that feeds the property it observes. The reaction is
-  ///     a counter bump; the chrome pass downstream writes a window appearance
-  ///     of `nil` for a paired skin (the window is supposed to follow the
-  ///     system) and never touches `NSApp.appearance`. There is no edge for the
-  ///     observation to re-trigger on, so the appearance loop that `7908bfd`
-  ///     fixed cannot form here — and the edge-triggered `assertedAppearances`
-  ///     table still guards the write itself.
+  ///     a counter bump; the chrome pass downstream writes the resolved half to
+  ///     the WINDOW and never touches `NSApp.appearance`, which is the only
+  ///     property `effectiveAppearance` here is derived from. That separation is
+  ///     what makes the pin safe: a paired skin now answers `.aqua`/`.darkAqua`
+  ///     rather than `nil`, and it still cannot re-trigger its own observation.
+  ///     So the appearance loop that `7908bfd` fixed cannot form here — and the
+  ///     edge-triggered `assertedAppearances` table still guards the write.
   ///   * It repaints nothing synchronously inside the callback. The bump is
   ///     dispatched onto the next main-queue turn and the ordinary SwiftUI
   ///     update path does the work, which is the same shape `d721f55`/`ce4397f`

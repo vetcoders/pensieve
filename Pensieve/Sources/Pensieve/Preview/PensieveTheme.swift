@@ -218,13 +218,26 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   }
 
   /// Explicit appearance to pin on the WINDOW, or `nil` for the themes that
-  /// follow the system setting.
+  /// carry no light/dark answer of their own.
   ///
-  /// A PAIRED skin returns `nil`: the window is meant to follow the system,
-  /// because following it is how the pair chooses its half in the first place.
-  /// Pinning here would be the app arguing with the setting it is reading.
+  /// A PAIRED skin pins the half it RESOLVED — it does not return `nil`. The
+  /// difference looks academic (the resolved half agrees with the system, so
+  /// both spellings paint the same chrome) and is not: `nil` means "no
+  /// preference", which leaves SwiftUI to resolve the scene's colour scheme on
+  /// its own, INDEPENDENTLY of the token accessor that already read the setting.
+  /// Two independent readers of one setting is a fracture waiting for a pass
+  /// that only one of them sees, and it shipped as one: on build 446 the
+  /// operator's trailing toolbar families came back LIGHT — glyphs, glass and
+  /// chip tint — inside a window whose titlebar, sidebar and editor were all
+  /// dark. The 445 test build, whose typewriter pinned `.darkAqua` outright
+  /// under the same system setting and the same white sheet, showed one
+  /// uniformly dark toolbar; the pin was the only difference between them.
+  ///
+  /// So the pair states its answer instead of declining to. It still follows the
+  /// setting — `tokens` is what resolves the half, and `ThemeManager` re-reads
+  /// it on every system flip — but every consumer, SwiftUI included, now gets
+  /// that ONE answer rather than deriving a second one.
   var appearanceName: NSAppearance.Name? {
-    if Self.pairedPalettes[self] != nil { return nil }
     switch tokens.mode {
     case .light: return .aqua
     case .dark: return .darkAqua

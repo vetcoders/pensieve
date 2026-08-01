@@ -8,13 +8,17 @@ import XCTest
 /// system light/dark setting. Every invariant that shape introduces is pinned
 /// here, and the ones that must NOT follow the system — the paper, the export —
 /// are pinned twice, once under each setting.
-final class TypewriterPairTests: XCTestCase {
+extension XCTestCase {
   /// Drives the real system input rather than a test-only hook: the app's own
   /// appearance is what `SystemAppearance` reads, so setting it exercises the
   /// same path the operator's System Settings toggle does. Restored afterwards,
   /// because it is process-wide state.
+  ///
+  /// Shared, because more than one suite has to ask a paired skin the same
+  /// question under both settings — and a second copy of this would be a second
+  /// chance to get "which half am I on" wrong.
   @MainActor
-  private func withSystemAppearance(dark: Bool, _ body: () throws -> Void) rethrows {
+  func withSystemAppearance(dark: Bool, _ body: () throws -> Void) rethrows {
     let previous = NSApplication.shared.appearance
     NSApplication.shared.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     defer { NSApplication.shared.appearance = previous }
@@ -22,6 +26,9 @@ final class TypewriterPairTests: XCTestCase {
       SystemAppearance.isDark, dark, "the rig failed to put the app in the requested appearance")
     try body()
   }
+}
+
+final class TypewriterPairTests: XCTestCase {
 
   // MARK: - The pair itself
 
@@ -74,19 +81,28 @@ final class TypewriterPairTests: XCTestCase {
 
   // MARK: - What must NOT follow the system
 
-  /// The window follows the setting (that is how the pair picks its half), but
+  /// The window tracks the setting (that is how the pair picks its half), but
   /// the paper does not: the sheet is white on both sides, so pinning it light
   /// is what keeps `gfm.css` — and Mermaid, which reads the media query from JS
   /// — from dressing a white page as a dark one.
+  ///
+  /// The window's half is STATED, not left open. "No preference" tracks the
+  /// system just as well until something else resolves the scene on its own —
+  /// which is what split the operator's toolbar in half on build 446 (see
+  /// `PensieveTheme.appearanceName`). Both spellings agree with the setting;
+  /// only this one leaves nothing to be resolved twice.
   @MainActor
-  func testTheWindowFollowsTheSystemButThePaperDoesNot() throws {
+  func testTheWindowTakesTheSystemsHalfWhileThePaperStaysLight() throws {
     for dark in [true, false] {
+      let wanted: NSAppearance.Name = dark ? .darkAqua : .aqua
       try withSystemAppearance(dark: dark) {
-        XCTAssertNil(
-          PensieveTheme.typewriter.appearanceName,
-          "a paired skin must not pin the window; it is meant to follow the system")
-        XCTAssertNil(WindowChromeRecipe.windowAppearance(for: .typewriter))
-        XCTAssertNil(WindowChromeRecipe.preferredColorScheme(for: .typewriter))
+        XCTAssertEqual(
+          PensieveTheme.typewriter.appearanceName, wanted,
+          "a paired skin must state the half it resolved, not decline to answer")
+        XCTAssertEqual(WindowChromeRecipe.windowAppearance(for: .typewriter)?.name, wanted)
+        XCTAssertEqual(
+          WindowChromeRecipe.preferredColorScheme(for: .typewriter), dark ? .dark : .light,
+          "SwiftUI must be handed the same half, or it resolves its own")
 
         XCTAssertEqual(
           PensieveTheme.typewriter.readingSurfaceAppearanceName, .aqua,
