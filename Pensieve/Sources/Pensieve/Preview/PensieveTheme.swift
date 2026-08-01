@@ -404,8 +404,13 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       text: ColorSpec(hex: "#d4d4d4"),
       accent: ColorSpec(hex: "#1c1c1c"),
       // The ink IS this skin's surface (#1c1c1c), so a chip painted with it
-      // would be invisible. Ribbon red is the one warm mark a typewriter owns.
-      chromeAccent: ColorSpec(hex: "#a8342a"),
+      // would be invisible. This skin carries no hue at all — its whole palette
+      // is one grey ramp (#e6e6e6 · #a8a8a8 · #6e6e6e · #1c1c1c · #171717) — so
+      // the fill is the one ramp step that clears both legibility pins: a white
+      // glyph rides it at 5.10:1 and it lifts off the #1c1c1c titlebar backing
+      // at 3.34:1. The lighter steps cannot carry the glyph (#a8a8a8 is 2.38:1),
+      // the darker ones dissolve into the backing.
+      chromeAccent: ColorSpec(hex: "#6e6e6e"),
       muted: ColorSpec(hex: "#6e6e6e"),
       warning: ColorSpec(hex: "#6e6e6e"),
       srcHeading: ColorSpec(hex: "#f2f2f2"),
