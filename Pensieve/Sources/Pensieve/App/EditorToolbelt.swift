@@ -36,11 +36,22 @@ import SwiftUI
 ///     ENTIRE content sits in a `ControlGroup` therefore vanishes silently once
 ///     the window is too narrow. Controls declared directly in the
 ///     `ToolbarItemGroup` (the mode picker, the appearance menu, reload,
-///     rewrite) do carry menu forms and keep the overflow menu populated.
+///     rewrite) do carry menu forms.
 ///
 /// Toggle-only `ControlGroup`s stay: their on-state chip is what
 /// `WindowChromeRecipe.assertToolbarChipTint` paints from the active skin, and
-/// that paint needs the segmented bridge.
+/// that paint needs the segmented bridge. What they cost — an unreachable
+/// family once the window clips it — is paid back by `overflowFamilies` below,
+/// which `ToolbarOverflowRecipe` writes into the group's menu form. Two
+/// measured facts make that the only workable repair: the clipped-items menu is
+/// built from the GROUP's form and never from its subitems', and a clipped item
+/// is removed from the window's view tree, so there is no bridged control left
+/// to drive by then — the menu has to act on the model directly.
+///
+/// Toolbar WIDTH is a correctness property here, not taste: every point a
+/// control takes moves the width at which macOS starts hiding families into the
+/// "»" menu. `EditorToolbarWidthBudgetTests` holds the total to a budget derived
+/// from the operator's working window.
 ///
 /// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
 /// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
@@ -234,6 +245,177 @@ struct EditorToolbelt: ToolbarContent {
     return families
   }
 
+  // MARK: - Overflow
+
+  /// What each family loses when the window clips it, in declaration order —
+  /// the input `ToolbarOverflowRecipe` writes into the "»" menu.
+  ///
+  /// Only the families whose controls sit in a `ControlGroup` are described
+  /// here, and they are described because the bridge gives that group NO menu
+  /// form: a clipped toggle family is otherwise unreachable, which is what put
+  /// scroll sync, auto reload, dictation and AI autocomplete out of the
+  /// operator's reach at 1450pt. The view family is deliberately absent — its
+  /// mode picker and appearance menu are declared directly in the toolbar group
+  /// and already carry working menu forms, and an empty command list is the
+  /// recipe's "leave AppKit's own form alone".
+  ///
+  /// This list pairs with the control declarations below rather than generating
+  /// them. `EditorToolbarOverflowTests` pins the pairing against the LIVE
+  /// bridge — same count per family, same on/off state as the lit segments,
+  /// same effect when fired — so the two cannot drift apart silently.
+  @MainActor
+  var overflowFamilies: [ToolbarOverflowFamily] {
+    Self.visibleToolbarFamilyOrder(for: appState.mode, hasEditableBuffer: hasEditableBuffer)
+      .map { family in
+        ToolbarOverflowFamily(
+          identifier: family, title: Self.familyTitle(family), commands: commands(for: family))
+      }
+  }
+
+  static func familyTitle(_ family: ToolbarFamilyIdentifier) -> String {
+    switch family {
+    case .documentDispatch: return "Document"
+    case .history: return "History"
+    case .editing: return "Editing"
+    case .view: return "View"
+    case .previewRuntime: return "Preview Runtime"
+    case .assistants: return "Assistants"
+    }
+  }
+
+  @MainActor
+  private func commands(for family: ToolbarFamilyIdentifier) -> [ToolbarOverflowCommand] {
+    let appState = self.appState
+    let controller = self.controller
+    switch family {
+    case .documentDispatch:
+      return [
+        ToolbarOverflowCommand(
+          id: Self.shareIdentifier, title: "Share", systemImage: "square.and.arrow.up",
+          isEnabled: { appState.documentHasEditableBuffer },
+          perform: { DocumentSharing.share(session: appState.documentSession) }),
+        ToolbarOverflowCommand(
+          id: Self.dispatchIdentifier, title: "Dispatch to Agent", systemImage: "paperplane",
+          isEnabled: { [isDispatchDisabled] in !isDispatchDisabled },
+          perform: onDispatchToAgent),
+      ]
+
+    case .history:
+      return ToolbarResponderHistoryState.Action.allCases.map { action in
+        ToolbarOverflowCommand(
+          id: action.accessibilityIdentifier, title: action.label,
+          systemImage: action.systemImage,
+          // Read at menu-open time from the responder that owns the undo stack,
+          // the same source the toolbar's own history state mirrors.
+          isEnabled: {
+            let availability = ToolbarResponderHistoryState.availability(
+              for: NSApp.keyWindow?.firstResponder)
+            return action == .undo ? availability.canUndo : availability.canRedo
+          },
+          perform: { NSApp.sendAction(action.selector, to: nil, from: nil) })
+      }
+
+    case .editing:
+      return [
+        ToolbarOverflowCommand(
+          id: Self.richMarkdownToggleIdentifier, title: "Rich Markdown",
+          systemImage: "textformat.alt",
+          isOn: { appState.richMarkdownEnabled },
+          perform: { controller.toggleRichMarkdown() })
+      ]
+        + MarkdownFormat.allCases.map { format in
+          ToolbarOverflowCommand(
+            id: format.toolbarAccessibilityIdentifier, title: format.label,
+            systemImage: format.systemImageName,
+            perform: { controller.applyMarkdownFormat(format) })
+        }
+
+    case .view:
+      // Authored like the rest, and for a reason the width fix created: with
+      // ICON segments the picker's bridged menu form comes back UNNAMED
+      // (measured — the derived group form reads "" with two blank children,
+      // where titled segments used to derive "Mode / Graphite"). An unnamed
+      // entry in the "»" menu is as unreachable as a missing one.
+      let themeManager = self.themeManager
+      var commands = [
+        ToolbarOverflowCommand(
+          id: Self.modePickerIdentifier, title: "Mode", systemImage: "rectangle.split.2x1",
+          children: EditorMode.allCases.map { mode in
+            ToolbarOverflowCommand(
+              id: "\(Self.modePickerIdentifier).\(mode.rawValue)", title: mode.label,
+              systemImage: mode.systemImage,
+              isOn: { appState.mode == mode },
+              perform: { controller.setMode(mode) })
+          })
+      ]
+      guard Self.showsAppearanceControls(for: appState.mode) else { return commands }
+      commands.append(
+        ToolbarOverflowCommand(
+          id: "\(Self.appearanceIdentifier).flavor", title: "Markdown Flavor",
+          systemImage: "text.badge.checkmark",
+          children: ThemeManager.Theme.allCases.map { flavor in
+            ToolbarOverflowCommand(
+              id: "\(Self.appearanceIdentifier).flavor.\(flavor.rawValue)",
+              title: flavor.displayName, systemImage: "text.badge.checkmark",
+              isOn: { themeManager.current == flavor },
+              perform: { themeManager.current = flavor })
+          }))
+      commands.append(
+        ToolbarOverflowCommand(
+          id: "\(Self.appearanceIdentifier).skin", title: "Theme", systemImage: "diamond.fill",
+          children: PensieveTheme.allCases.map { skin in
+            ToolbarOverflowCommand(
+              id: "\(Self.appearanceIdentifier).skin.\(skin.rawValue)", title: skin.displayName,
+              systemImage: skin.systemImage,
+              isOn: { themeManager.skin == skin },
+              perform: { themeManager.skin = skin })
+          }))
+      return commands
+
+    case .previewRuntime:
+      return [
+        ToolbarOverflowCommand(
+          id: Self.reloadIdentifier, title: "Reload Preview", systemImage: "arrow.clockwise",
+          isEnabled: { appState.documentHasEditableBuffer },
+          perform: { appState.requestPreviewRefresh() }),
+        ToolbarOverflowCommand(
+          id: Self.autoReloadIdentifier, title: "Auto Reload Preview",
+          systemImage: "arrow.triangle.2.circlepath",
+          isOn: { appState.previewAutoReload },
+          perform: { appState.previewAutoReload.toggle() }),
+        ToolbarOverflowCommand(
+          id: Self.scrollSyncIdentifier, title: "Scroll Sync", systemImage: "arrow.up.and.down",
+          isEnabled: { appState.documentHasEditableBuffer },
+          isOn: { appState.scrollSyncEnabled },
+          perform: { appState.scrollSyncEnabled.toggle() }),
+      ]
+
+    case .assistants:
+      return [
+        ToolbarOverflowCommand(
+          id: Self.dictationIdentifier, title: "Dictation", systemImage: "waveform.circle",
+          isOn: { controller.isTranscriptionTaflaVisible },
+          perform: { controller.toggleTranscriptionTafla() }),
+        ToolbarOverflowCommand(
+          id: Self.autocompleteIdentifier, title: "AI Autocomplete", systemImage: "sparkles",
+          isOn: { appState.aiAutocompleteEnabled },
+          perform: { appState.aiAutocompleteEnabled.toggle() }),
+        ToolbarOverflowCommand(
+          id: Self.rewriteIdentifier, title: "Rewrite with AI", systemImage: "wand.and.stars",
+          isEnabled: { appState.documentHasEditableBuffer && appState.mode != .preview },
+          children: RewriteIntent.allCases.map { intent in
+            ToolbarOverflowCommand(
+              id: "\(Self.rewriteIdentifier).\(intent)", title: intent.label,
+              systemImage: "wand.and.stars",
+              isEnabled: { appState.documentHasEditableBuffer && appState.mode != .preview },
+              perform: {
+                appState.pendingAIRewriteCommand = AIRewriteCommand(action: .request(intent))
+              })
+          }),
+      ]
+    }
+  }
+
   // MARK: - Subgroups
 
   private var shareButton: some View {
@@ -265,19 +447,28 @@ struct EditorToolbelt: ToolbarContent {
     ) {
       ForEach(EditorMode.allCases) { mode in
         Label(mode.label, systemImage: mode.systemImage)
-          .labelStyle(.titleAndIcon)
+          .labelStyle(.iconOnly)
+          .help(mode.label)
           .tag(mode)
       }
     }
-    // 5.2: a labeled segmented control (Source · Split · Preview · Focus) — the
-    // active mode reads from the filled capsule and its title, not a dimmed icon.
+    // 5.2: a segmented control (Source · Split · Preview · Focus) — the active
+    // mode reads from the filled capsule, not a dimmed icon.
     //
     // Declared DIRECTLY in the toolbar group, never inside a `ControlGroup`:
     // nested in one, the bridge collapses this whole picker into a single
     // disabled "Mode" segment (measured — the dead control the operator met).
+    //
+    // ICON segments, and no width floor. Titled segments plus a 300pt floor
+    // made this ONE control 300pt of a ~1096pt toolbar (measured), which pushed
+    // the clipping threshold up past 1450pt and dropped the three trailing
+    // families — mode, preview runtime, assistants — into the "»" menu at a
+    // normal working width. Icon-only brings the control to ~148pt and the
+    // toolbar to 944pt, moving the threshold down to ~1200pt (measured in
+    // `EditorToolbarWidthBudgetTests`). The mode names are not lost: they stay
+    // on the per-segment tooltips and in the picker's own overflow menu form.
     .pickerStyle(.segmented)
     .help("Editor layout")
-    .frame(minWidth: 300)
     .accessibilityIdentifier(Self.modePickerIdentifier)
   }
 
