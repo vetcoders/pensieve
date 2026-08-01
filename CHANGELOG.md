@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, ribbon red on Typewriter. `Default` and `Raw` keep the accent chosen in System Settings.
+- The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, mid grey on Typewriter — which stays achromatic, one step up its own grey ramp. `Default` and `Raw` keep the accent chosen in System Settings.
 
 ### Fixed
 

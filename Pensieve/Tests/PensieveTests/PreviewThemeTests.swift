@@ -152,13 +152,14 @@ final class PreviewThemeTests: XCTestCase {
   /// sync, dictation, autocomplete) fill from `chromeAccent`, not from the
   /// system accent. Where the link ink is already fill-strength the token
   /// repeats it verbatim; graphite/ink deepen their pale link, and typewriter
-  /// needs a value of its own because its link ink IS its titlebar backing.
+  /// needs a value of its own because its link ink IS its titlebar backing —
+  /// a step up its own grey ramp, not a hue.
   func testChromeAccentTokenIsFillStrengthPerTheme() {
     XCTAssertEqual(PensieveTheme.parchment.tokens.chromeAccent.css, "#9a5b28")
     XCTAssertEqual(PensieveTheme.graphite.tokens.chromeAccent.css, "#3d6f7d")
     XCTAssertEqual(PensieveTheme.ink.tokens.chromeAccent.css, "#6a5fae")
     XCTAssertEqual(PensieveTheme.porcelain.tokens.chromeAccent.css, "#0f6f6c")
-    XCTAssertEqual(PensieveTheme.typewriter.tokens.chromeAccent.css, "#a8342a")
+    XCTAssertEqual(PensieveTheme.typewriter.tokens.chromeAccent.css, "#6e6e6e")
 
     // Adaptive skins keep the accent the user picked in System Settings, so
     // `default`/`raw` are the ONLY skins where the chips may read system blue.
@@ -169,7 +170,36 @@ final class PreviewThemeTests: XCTestCase {
     // Fixed skins resolve their own hex — no system fallback leaks in.
     XCTAssertEqual(
       PensieveTheme.typewriter.tokens.chromeAccent.nsColor,
-      ColorSpec.nsColor(fromHex: "#a8342a"))
+      ColorSpec.nsColor(fromHex: "#6e6e6e"))
+  }
+
+  /// Typewriter is achromatic by design: the mockup that arbitrates this skin
+  /// declares "zero colour", and the whole palette is one grey ramp
+  /// (`#e6e6e6 · #a8a8a8 · #6e6e6e · #1c1c1c · #171717`). The walk reflects over
+  /// EVERY colour token the skin declares rather than a hand-listed subset, so a
+  /// hue smuggled back into any of them — the ribbon red `#a8342a` the chrome
+  /// accent used to carry — fails here instead of shipping.
+  func testTypewriterSkinCarriesNoChromaticToken() {
+    var walked = 0
+    for child in Mirror(reflecting: PensieveTheme.typewriter.tokens).children {
+      // Module-qualified: bare `ColorSpec` collides with the Carbon QuickDraw
+      // struct AppKit drags in, and a cast has no static member to disambiguate.
+      guard let spec = child.value as? Pensieve.ColorSpec else { continue }
+      walked += 1
+      let srgb = spec.nsColor.usingColorSpace(.sRGB) ?? spec.nsColor
+      let name = child.label ?? "<unlabelled>"
+      XCTAssertEqual(
+        srgb.redComponent, srgb.greenComponent, accuracy: 0.001,
+        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+      XCTAssertEqual(
+        srgb.greenComponent, srgb.blueComponent, accuracy: 0.001,
+        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+    }
+    // The reflection actually saw the table — without this the loop would pass
+    // vacuously if `ThemeTokens` ever stopped yielding its specs. A new colour
+    // token has to bump this count, which is the review gate: it must land on
+    // the ramp before it lands in the skin.
+    XCTAssertEqual(walked, 17, "unexpected colour-token count on the typewriter skin")
   }
 
   /// The two legibility invariants a filled chip has to satisfy on every fixed

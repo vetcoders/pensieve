@@ -324,7 +324,7 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
     XCTAssertEqual(
       WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter),
-      ColorSpec.nsColor(fromHex: "#a8342a"))
+      ColorSpec.nsColor(fromHex: "#6e6e6e"))
     // Adaptive skins still follow the accent picked in System Settings.
     XCTAssertEqual(
       WindowChromeRecipe.toolbarChipBezelColor(for: .default), NSColor.controlAccentColor)
