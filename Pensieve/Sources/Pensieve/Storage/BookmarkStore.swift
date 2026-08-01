@@ -253,6 +253,30 @@ final class BookmarkStore {
     return url
   }
 
+  /// Drops ONE file's bookmark, because the user closed that file out of Open
+  /// Files. Without it a close is only ever a close of the WINDOW: the working
+  /// set the next launch restores from still names the file, so it comes back —
+  /// and comes back on every launch after that, since nothing else ever prunes
+  /// this key.
+  ///
+  /// Identity is the RESOLVED path — the same identity the dedup below writes
+  /// under — so a file bookmarked through a different path spelling is still
+  /// recognised as the one being closed.
+  ///
+  /// The "unresolvable ≠ garbage" rule from that method holds here in the
+  /// opposite direction and matters more: an entry we cannot resolve today (an
+  /// unplugged volume) is KEPT, because failing to identify a bookmark must
+  /// never be a reason to silently forget a file the user did not close.
+  func removeFile(url: URL) {
+    let target = url.standardizedFileURL.path
+    let remaining = fileBookmarkData.filter { bookmark in
+      guard let path = resolvedPath(for: bookmark) else { return true }
+      return path != target
+    }
+    defaults.set(remaining, forKey: fileBookmarksKey)
+    stopAccess(to: url.standardizedFileURL)
+  }
+
   func clear(into appState: AppState, error: String? = nil) {
     stopAllAccess()
     defaults.removeObject(forKey: legacyFolderBookmarkKey)
@@ -271,6 +295,16 @@ final class BookmarkStore {
     }
 
     activeAccess[url] = url.startAccessingSecurityScopedResource()
+  }
+
+  /// Releases the security-scoped access this store took for one file. Keyed by
+  /// the URL `activate` recorded, so a spelling that never granted access is a
+  /// no-op rather than an unbalanced stop.
+  private func stopAccess(to url: URL) {
+    guard let accessWasGranted = activeAccess.removeValue(forKey: url) else { return }
+    if accessWasGranted {
+      url.stopAccessingSecurityScopedResource()
+    }
   }
 
   private func stopAllAccess() {

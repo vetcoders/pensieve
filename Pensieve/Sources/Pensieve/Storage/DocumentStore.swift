@@ -2686,6 +2686,29 @@ final class DocumentStore {
     bookmarkStore.clearActiveDocument(ifMatching: url)
   }
 
+  /// The user closed this file OUT of Open Files — the list itself, not just a
+  /// window onto it. Retires it from the WORKING SET a relaunch restores from.
+  ///
+  /// Closing a document window is deliberately NOT this: a window is a view of
+  /// a file, and quitting with files open has to bring them back. Open Files is
+  /// the file list, so removing a row from it is the user saying "stop carrying
+  /// this one". Those two intents were previously served by the same code path,
+  /// which is why the second one did nothing that outlived the process: the row
+  /// disappeared with the window, and the next launch read a working set nobody
+  /// had told.
+  ///
+  /// Three stores hold that answer and all three have to hear it, or whichever
+  /// one is missed reseeds the others on the next launch:
+  ///   * the in-memory `openFiles` working set, shared across windows;
+  ///   * the persisted file bookmarks, which are what a relaunch actually reads;
+  ///   * the "reopen this on launch" record, if this file still owns it.
+  func forgetOpenFile(_ url: URL, into appState: AppState) {
+    let standardizedURL = url.standardizedFileURL
+    appState.openFiles.removeAll { $0.url.standardizedFileURL == standardizedURL }
+    bookmarkStore.removeFile(url: standardizedURL)
+    noteActiveDocumentClosed(standardizedURL)
+  }
+
   /// Reopens the document a relaunch is restoring into a still-empty window.
   /// Deliberately refuses a window that already carries a buffer: restoration
   /// may never overwrite live content.
