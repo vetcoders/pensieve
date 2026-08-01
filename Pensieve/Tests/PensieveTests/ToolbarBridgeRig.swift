@@ -189,6 +189,27 @@ final class ToolbarBridgeRig {
     return false
   }
 
+  /// Waits for the APP's OWN machinery to settle — the sink's deferred pass and
+  /// the window-update repair — without the test authoring anything itself.
+  ///
+  /// The difference from `syncOverflowMenus` matters: this one never calls the
+  /// pass, so a pin whose claim is "production wires the overflow menus up on
+  /// its own" keeps that claim intact while dropping the assumption that
+  /// production has already finished by the time the rig's initializer returns.
+  /// It has not, necessarily — SwiftUI can re-derive a group's menu form after
+  /// the sink ran, and it re-derives exactly the family whose CONTENT it
+  /// rewrites, which is why the view family (its appearance control is labelled
+  /// with the live skin name) was the only one a CI runner ever caught derived.
+  @discardableResult
+  func awaitOverflowConvergence(attempts: Int = 40) -> Bool {
+    for _ in 0..<attempts {
+      if overflowMatches(toolbelt.overflowFamilies) { return true }
+      window.update()
+      settle(0.02)
+    }
+    return overflowMatches(toolbelt.overflowFamilies)
+  }
+
   /// Everything a failing overflow assertion needs to name its own cause on a
   /// machine nobody can attach a debugger to: the geometry the rig actually got
   /// (not the one it asked for), whether the window is really on screen, how

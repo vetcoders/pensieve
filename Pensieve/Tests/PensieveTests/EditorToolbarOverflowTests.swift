@@ -28,6 +28,10 @@ final class EditorToolbarOverflowTests: XCTestCase {
     let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
     defer { rig.tearDown() }
 
+    // Production's own triggers only — this never runs the pass, so the claim
+    // stays "the app authors these without a test asking".
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
+
     let families = rig.toolbelt.overflowFamilies
     XCTAssertEqual(
       rig.itemGroups.count, families.count,
@@ -194,6 +198,18 @@ final class EditorToolbarOverflowTests: XCTestCase {
       XCTAssertLessThan(rig.visibleItemCount, declared, "the narrow leg must clip something")
     }
 
+    // Establish the baseline before asserting on it. Construction settles once,
+    // but SwiftUI can still re-derive a group's menu form after the sink ran —
+    // and it re-derives the view family specifically, because that is the group
+    // whose content it rewrites. Waiting on production's own triggers (this
+    // never calls the pass) is the difference between a scenario that starts
+    // from a known toolbar and one that starts from whatever the machine
+    // happened to finish.
+    XCTAssertTrue(
+      rig.awaitOverflowConvergence(),
+      "the toolbar never reached agreement with its overflow menus at \(Int(width))pt — "
+        + rig.overflowDiagnostics)
+
     let theme = try XCTUnwrap(
       Self.authoredItem(named: "Theme", in: rig),
       "no authored Theme entry at \(Int(width))pt — " + rig.overflowDiagnostics)
@@ -267,6 +283,53 @@ final class EditorToolbarOverflowTests: XCTestCase {
     XCTAssertNotNil(
       Self.authoredItem(named: "Mode", in: rig),
       "the menu converged but has no Mode entry — " + rig.overflowDiagnostics)
+  }
+
+  /// The CI shape, reproduced exactly: at 900pt the view family is behind the
+  /// chevron AND is the only group SwiftUI re-derives, because its appearance
+  /// control is labelled with the live skin name. The runner caught five of six
+  /// families authored and that one back on SwiftUI's derived form — which for
+  /// an icon-segment picker is a blank title over blank children, i.e. an
+  /// overflow entry the operator cannot read or reach.
+  ///
+  /// Clipping is not what breaks it and this pins that too: the other two
+  /// clipped families must stay authored throughout, exactly as they did on the
+  /// runner.
+  @MainActor
+  func testALateRederiveOfTheClippedViewFamilyIsRecovered() throws {
+    let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests", width: 900)
+    defer { rig.tearDown() }
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
+    XCTAssertLessThan(rig.visibleItemCount, rig.itemGroups.count, "the view family must be clipped")
+
+    let viewIdentifier = ToolbarOverflowRecipe.formIdentifier(for: .view)
+    let viewGroup = try XCTUnwrap(
+      rig.itemGroups.first { $0.menuFormRepresentation?.identifier == viewIdentifier },
+      "no authored view family to re-derive — " + rig.overflowDiagnostics)
+    // Exactly what SwiftUI hands back for an icon-segment picker: no title, and
+    // one blank child per formed subitem.
+    let derived = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let submenu = NSMenu(title: "")
+    submenu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+    submenu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+    derived.submenu = submenu
+    viewGroup.menuFormRepresentation = derived
+
+    XCTAssertNil(
+      Self.authoredItem(named: "Theme", in: rig), "the re-derive did not take the view family")
+    XCTAssertNotNil(
+      Self.authoredItem(named: "Reload Preview", in: rig),
+      "a clipped family that SwiftUI did NOT rewrite must keep its authored form — "
+        + rig.overflowDiagnostics)
+
+    XCTAssertTrue(
+      rig.awaitOverflowConvergence(),
+      "production never took the view family back from SwiftUI's derived form — "
+        + rig.overflowDiagnostics)
+    XCTAssertNotNil(
+      Self.authoredItem(named: "Theme", in: rig),
+      "the view family converged without its theme picker — " + rig.overflowDiagnostics)
+    XCTAssertNotNil(Self.authoredItem(named: "Mode", in: rig), rig.overflowDiagnostics)
   }
 
   /// The repair trigger itself, driven by the cycle the app really uses.
