@@ -305,6 +305,28 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// rather than one palette or a set of semantic colours.
   var isPaired: Bool { Self.pairedPalettes[self] != nil }
 
+  /// Identity of the palette actually PAINTED — which is not the same thing as
+  /// the skin the operator picked.
+  ///
+  /// A paired skin is ONE enum case carrying TWO palettes, so `PensieveTheme`
+  /// alone cannot tell "the half changed" from "nothing changed". Any re-theme
+  /// memo keyed on the bare enum therefore stops working the moment a pair is
+  /// selected: the operator flips the Mac to light, `tokens` starts answering
+  /// with the light half, and the memo — still holding `.typewriter` — decides
+  /// there is nothing to repaint. That is measured, not theoretical: it left the
+  /// source panel black inside an otherwise fully light window.
+  ///
+  /// Unpaired skins read no system setting, so their identity deliberately
+  /// ignores it: they keep memoizing exactly as before and a system flip costs
+  /// them no repaint at all.
+  var paintedIdentity: PaintedSkin { paintedIdentity(underDarkSystem: SystemAppearance.isDark) }
+
+  /// The same identity with the system setting passed in rather than read, so a
+  /// test can walk both halves without touching the host.
+  func paintedIdentity(underDarkSystem isDark: Bool) -> PaintedSkin {
+    PaintedSkin(skin: self, isDarkHalf: isPaired && isDark)
+  }
+
   // MARK: - Migration
 
   /// Fresh installs default to `graphite`. Known raw values pass through;
@@ -562,6 +584,22 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       )
     )
   ]
+}
+
+/// What a surface last PAINTED, as a value that changes whenever the painted
+/// colours change — including a paired skin's half, which the enum alone hides.
+///
+/// This exists to be a memo key. Re-theming a live editor is expensive enough
+/// that it must not run on every SwiftUI pass (that cost is what `d721f55` /
+/// `ce4397f` settled), so the passes that re-theme are gated on "did the palette
+/// change" — and the gate needs an identity that is true to the palette rather
+/// than to the menu item.
+struct PaintedSkin: Equatable {
+  let skin: PensieveTheme
+  /// Only ever true for a paired skin. An unpaired skin's palette does not read
+  /// the system setting, so recording it would invent a difference that has no
+  /// repaint behind it.
+  let isDarkHalf: Bool
 }
 
 /// Which half of a paired skin the machine is asking for.
