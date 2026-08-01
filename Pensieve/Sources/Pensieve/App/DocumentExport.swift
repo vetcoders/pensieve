@@ -176,6 +176,12 @@ private final class PDFExportJob: NSObject, WKNavigationDelegate {
     self.outputURL = outputURL
     self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 794, height: 1123))
     super.init()
+    // An export is a sheet of paper, not a window. Left unpinned this offscreen
+    // WebView follows the exporting MACHINE's setting, so the same document
+    // printed from a dark Mac and a light one came out differently — and a
+    // paired skin, whose page is white on both sides, would export a dark PDF
+    // purely because of where it was exported from.
+    webView.appearance = WindowChromeRecipe.exportAppearance(for: document.skin)
     webView.navigationDelegate = self
   }
 

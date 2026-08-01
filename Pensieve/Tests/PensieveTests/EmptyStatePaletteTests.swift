@@ -65,16 +65,38 @@ final class EmptyStatePaletteTests: XCTestCase {
     }
   }
 
-  /// Typewriter's accent IS its source surface — a deliberate collision, because
-  /// that accent was drawn for the light window chrome (see `ThemeContrast`). The
-  /// wordmark falls back to another token from the SAME theme, never an invented
-  /// hex, and never to an accent that would paint itself invisible.
-  func testWordmarkFallsBackWhenTheAccentCollidesWithTheSurface() {
-    let palette = EmptyStatePalette(theme: .typewriter)
-    let tokens = PensieveTheme.typewriter.tokens
+  /// Typewriter's ink accent all but disappears on its DARK half's surface —
+  /// `#1c1c1c` on `#171717` — because that accent is tuned as ink for the paper,
+  /// not as a fill for the chrome. The wordmark falls back to another token from
+  /// the SAME theme, never an invented hex, and never to an accent that would
+  /// paint itself invisible.
+  ///
+  /// Driven under both system settings, because the skin is a pair: the same
+  /// accent that has to fall back on the dark half is perfectly legible on the
+  /// light one, and a fallback that fired on BOTH would be throwing away a
+  /// colour the operator chose.
+  @MainActor
+  func testWordmarkFallsBackOnlyOnTheHalfWhereTheAccentWouldVanish() {
+    let previous = NSApplication.shared.appearance
+    defer { NSApplication.shared.appearance = previous }
 
-    XCTAssertTrue(WindowChromeRecipe.colorsMatch(tokens.accent.nsColor, tokens.source.nsColor))
-    XCTAssertTrue(WindowChromeRecipe.colorsMatch(palette.wordmark, tokens.text.nsColor))
+    NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+    let darkTokens = PensieveTheme.typewriter.tokens
+    XCTAssertLessThan(
+      ThemeContrast.ratio(darkTokens.accent.nsColor, darkTokens.source.nsColor) ?? .infinity,
+      ThemeContrast.minimumTextContrast,
+      "the dark half's accent must be the unreadable-on-surface case this guards")
+    XCTAssertTrue(
+      WindowChromeRecipe.colorsMatch(
+        EmptyStatePalette(theme: .typewriter).wordmark, darkTokens.text.nsColor),
+      "the wordmark must fall back to the theme's own body ink on the dark half")
+
+    NSApplication.shared.appearance = NSAppearance(named: .aqua)
+    let lightTokens = PensieveTheme.typewriter.tokens
+    XCTAssertTrue(
+      WindowChromeRecipe.colorsMatch(
+        EmptyStatePalette(theme: .typewriter).wordmark, lightTokens.accent.nsColor),
+      "on the light half the accent carries — falling back there would discard it for nothing")
   }
 
   /// A skin whose accent reads fine on its own surface keeps it.

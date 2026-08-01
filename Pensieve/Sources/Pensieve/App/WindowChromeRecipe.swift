@@ -198,6 +198,21 @@ enum WindowChromeRecipe {
     theme.appearanceName.map { NSAppearance(named: $0) } ?? nil
   }
 
+  /// The appearance the READING SURFACE wants — the preview WebView and the
+  /// exported sheet. Identical to `windowAppearance` for every skin except a
+  /// PAIRED one, whose window follows the system while its paper stays white on
+  /// both sides. Derived from the theme rather than re-deciding here, so the two
+  /// answers cannot drift.
+  static func readingSurfaceAppearance(for theme: PensieveTheme) -> NSAppearance? {
+    theme.readingSurfaceAppearanceName.map { NSAppearance(named: $0) } ?? nil
+  }
+
+  /// The appearance to render an EXPORT under. A paired skin exports its light
+  /// half from a dark machine too: the page is paper, and paper is white.
+  static func exportAppearance(for theme: PensieveTheme) -> NSAppearance? {
+    theme.exportAppearanceName.map { NSAppearance(named: $0) } ?? nil
+  }
+
   /// The same demand expressed at the SwiftUI level, which is the ONLY level a
   /// scene-owned window respects — see `pensieveSkinAppearance`. Derived from
   /// `windowAppearance` rather than from the token table a second time, so the

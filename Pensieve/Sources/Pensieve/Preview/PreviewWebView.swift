@@ -137,7 +137,11 @@ final class PreviewWebView: NSView {
   func applyThemeChrome(for skin: PensieveTheme) {
     assertedSkin = skin
 
-    let appearance = WindowChromeRecipe.windowAppearance(for: skin)
+    // The SHEET's appearance, not the window's. They are the same answer for
+    // every skin except a paired one, whose window follows the system while its
+    // paper stays white on both sides — letting the WebView follow the system
+    // there would hand a white page the dark half of `gfm.css`.
+    let appearance = WindowChromeRecipe.readingSurfaceAppearance(for: skin)
     if self.appearance?.name != appearance?.name {
       self.appearance = appearance
     }
