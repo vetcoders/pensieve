@@ -58,8 +58,21 @@ final class ThemeManager: ObservableObject {
     self.current =
       defaults.string(forKey: "pensieve.preview.flavor")
       .flatMap(Theme.init(rawValue:)) ?? .markdown
-    self.skin = PensieveTheme.resolve(
-      persistedRawValue: defaults.string(forKey: "pensieve.preview.skin"))
+    let persistedSkin = defaults.string(forKey: "pensieve.preview.skin")
+    let resolvedSkin = PensieveTheme.resolve(persistedRawValue: persistedSkin)
+    self.skin = resolvedSkin
+
+    // A migration that only lives in memory is not a migration. `skin`'s
+    // `didSet` does not fire for the assignment above — Swift skips property
+    // observers during initialisation — so a retired name (`glass` → `ink`)
+    // stays in the store until the operator happens to pick a skin by hand:
+    // every launch re-migrates the same dead value, and anything else reading
+    // the raw key still sees a skin this build no longer has. Settle it where
+    // it is resolved. A fresh install writes nothing: no key means no choice
+    // yet, and defaulting to graphite is not the operator picking graphite.
+    if let persistedSkin, persistedSkin != resolvedSkin.rawValue {
+      persist(\.skinKey, resolvedSkin.rawValue)
+    }
   }
 
   func css(for theme: Theme) -> String {

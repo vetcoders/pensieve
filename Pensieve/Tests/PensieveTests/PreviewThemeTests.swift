@@ -614,6 +614,37 @@ final class PreviewThemeTests: XCTestCase {
 
     XCTAssertEqual(ThemeManager(defaults: defaults).skin, .ink)
   }
+
+  /// The migration has to reach the store, not just the running instance: a
+  /// resolve-only migration leaves the retired name on disk until the operator
+  /// picks a skin by hand.
+  func testThemeManagerWritesTheMigratedSkinBackToDefaults() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.writeback")
+    defaults.set("glass", forKey: "pensieve.preview.skin")
+
+    _ = ThemeManager(defaults: defaults)
+
+    XCTAssertEqual(
+      defaults.string(forKey: "pensieve.preview.skin"), PensieveTheme.ink.rawValue,
+      "the retired name must not survive the migration that replaced it")
+  }
+
+  /// …and nothing else moves: a skin this build still answers to is left exactly
+  /// as the operator stored it, and a fresh install stays unwritten — no key
+  /// means no choice yet, so defaulting to graphite must not look like a pick.
+  func testThemeManagerLeavesANonMigratedSkinKeyAlone() {
+    let current = makeEphemeralDefaults(prefix: "pensieve.preview.skin.nomigration")
+    current.set(PensieveTheme.parchment.rawValue, forKey: "pensieve.preview.skin")
+    _ = ThemeManager(defaults: current)
+    XCTAssertEqual(
+      current.string(forKey: "pensieve.preview.skin"), PensieveTheme.parchment.rawValue)
+
+    let fresh = makeEphemeralDefaults(prefix: "pensieve.preview.skin.freshwriteback")
+    _ = ThemeManager(defaults: fresh)
+    XCTAssertNil(
+      fresh.string(forKey: "pensieve.preview.skin"),
+      "a fresh install has made no choice to persist")
+  }
 }
 
 private let headingScaleExpectations = [
