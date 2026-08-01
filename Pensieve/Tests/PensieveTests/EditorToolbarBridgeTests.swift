@@ -159,7 +159,7 @@ final class EditorToolbarBridgeTests: XCTestCase {
       controller = AppController(appState: appState)
       themeManager = ThemeManager(defaults: defaults)
 
-      window = NSWindow(
+      window = UnconstrainedWindow(
         contentRect: NSRect(x: 0, y: 0, width: 1600, height: 800),
         styleMask: WindowChromeRecipe.documentStyleMask,
         backing: .buffered,
@@ -236,6 +236,17 @@ final class EditorToolbarBridgeTests: XCTestCase {
     /// share of the control width; every assertion reads back what AppKit
     /// actually selected instead of trusting that estimate.
     func click(_ control: NSSegmentedControl, segment: Int) {
+      // `toolbarSegmentedControls` reads `toolbar.items`, which still hands back
+      // a control the toolbar has CLIPPED into the "»" overflow — and a clipped
+      // control is not in the window's view tree, so a synthesized click has
+      // nothing to land on. Say that out loud instead of letting it read as
+      // "the action is not wired".
+      guard control.window === window else {
+        XCTFail(
+          "the toolbar clipped this control into the overflow menu: the rig window is "
+            + "\(window.frame.width)pt wide, too narrow to host every family")
+        return
+      }
       let share = control.bounds.width / CGFloat(max(1, control.segmentCount))
       let center = NSPoint(
         x: control.bounds.minX + (CGFloat(segment) + 0.5) * share,
@@ -260,6 +271,25 @@ final class EditorToolbarBridgeTests: XCTestCase {
       NSApp.postEvent(up, atStart: true)
       window.sendEvent(down)
     }
+  }
+}
+
+/// A rig window that keeps the width it asks for.
+///
+/// AppKit constrains an ordered-in window to the screen it lands on, and it
+/// constrains the WIDTH too: measured on this rig, a requested 1600pt comes back
+/// as 1512pt on a 1512pt display. That silent shrink is what makes this rig
+/// machine-dependent — below roughly 1200pt this toolbar clips the Mode family
+/// into the "»" overflow, and a clipped control is detached from the window
+/// (`control.window == nil`), so the synthesized click lands nowhere while every
+/// structural assertion still passes. That is precisely the shape of the CI
+/// failure ("clicking the mode picker changed nothing") on a runner whose
+/// virtual display is far smaller than an operator's: the toolbar was never
+/// given the width the rig declared. The window is still parked offscreen at
+/// zero alpha, so a frame no screen can hold costs the operator nothing.
+private final class UnconstrainedWindow: NSWindow {
+  override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+    frameRect
   }
 }
 

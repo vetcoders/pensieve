@@ -24,10 +24,20 @@ final class EmptyStatePaletteTests: XCTestCase {
         WindowChromeRecipe.colorsMatch(
           palette.background, WindowChromeRecipe.titlebarGlassBackingColor(for: theme)),
         "\(theme.rawValue): the pane and the titlebar glass must agree on one surface")
-      XCTAssertFalse(
-        WindowChromeRecipe.colorsMatch(palette.background, .windowBackgroundColor)
-          && theme.tokens.mode != nil,
-        "\(theme.rawValue): a fixed skin must not fall back to the system window colour")
+      // The fallback this pin exists for is a SOURCE, not a value: a dynamic
+      // system catalog colour instead of the skin's own token. Comparing the two
+      // by value cannot tell them apart — measured on macOS 26,
+      // `windowBackgroundColor` resolves to pure white in every light appearance,
+      // which is porcelain's `#ffffff` exactly, so the value compare fired on any
+      // machine that happened to be in light mode (a green run on a dark-mode Mac,
+      // red on the CI runner, from one identical commit). A resolved token is
+      // component-based; `windowBackgroundColor` is `.catalog` in every
+      // appearance, so this reads the difference the assertion actually means.
+      if theme.tokens.mode != nil {
+        XCTAssertNotEqual(
+          palette.background.type, .catalog,
+          "\(theme.rawValue): a fixed skin must not fall back to a dynamic system colour")
+      }
     }
   }
 
