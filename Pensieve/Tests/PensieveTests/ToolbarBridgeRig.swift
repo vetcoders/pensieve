@@ -133,6 +133,47 @@ final class ToolbarBridgeRig {
     return found
   }
 
+  /// Does every authored family currently describe the toolbar it is attached
+  /// to — right identity, right contents?
+  func overflowMatches(_ families: [ToolbarOverflowFamily]) -> Bool {
+    let groups = itemGroups
+    guard groups.count == families.count else { return false }
+    for (group, family) in zip(groups, families) where !family.commands.isEmpty {
+      let form = group.menuFormRepresentation
+      guard form?.identifier == ToolbarOverflowRecipe.formIdentifier(for: family.identifier),
+        form?.submenu?.items.map(\.title) == family.commands.map(\.title)
+      else { return false }
+    }
+    return true
+  }
+
+  /// Brings the overflow menus up to date the way the app does, but on the
+  /// test's schedule instead of SwiftUI's.
+  ///
+  /// The app has two triggers and a headless run drives neither reliably: the
+  /// sink runs on a SwiftUI body re-evaluation, and the clobber repair runs on
+  /// `NSWindow.didUpdateNotification`. Measured on this rig: once a group's form
+  /// is taken away, WAITING NEVER RESTORES IT — a test run posts no window
+  /// update cycle of its own, so `settle()` can spin for half a second and still
+  /// read a toolbar in SwiftUI's incomplete state. That is the whole reason a
+  /// test that re-reads the menu after a state change was machine-dependent.
+  ///
+  /// So this posts the real window update AND runs the same pass the sink runs,
+  /// then reports whether the menus actually converged. A scenario test using it
+  /// is asserting on menu CONTENT and ACTIONS, not on a scheduler:
+  /// `testEveryControlGroupFamilyGetsAnAuthoredOverflowEntry` never calls it and
+  /// keeps the sink itself honest, and
+  /// `testAClobberedFormIsRepairedOnAWindowUpdate` keeps the repair trigger
+  /// honest.
+  @discardableResult
+  func syncOverflowMenus() -> Bool {
+    let families = toolbelt.overflowFamilies
+    window.update()
+    ToolbarOverflowRecipe.assertOverflowMenus(on: window, families: families)
+    settle(0.05)
+    return overflowMatches(toolbelt.overflowFamilies)
+  }
+
   /// The mode picker is the only `.selectOne` control in this toolbar.
   func modePickerControl() -> NSSegmentedControl? {
     WindowChromeRecipe.toolbarSegmentedControls(in: window)
