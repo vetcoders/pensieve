@@ -239,7 +239,8 @@ enum DocumentExport {
   /// `NSApp.effectiveAppearance` unconditionally would print the half of the
   /// theme the reader is *not* looking at whenever the two disagree.
   static func exportAppearance(for skin: PensieveTheme = .default) -> NSAppearance {
-    WindowChromeRecipe.windowAppearance(for: skin) ?? NSApplication.shared.effectiveAppearance
+    WindowChromeRecipe.readingSurfaceAppearance(for: skin)
+      ?? NSApplication.shared.effectiveAppearance
   }
 
   nonisolated static func colorVariant(for appearance: NSAppearance) -> PreviewColorVariant {

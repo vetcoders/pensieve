@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typewriter now follows your Mac's light/dark setting**, and it does it with two palettes of its own rather than by turning into a system theme. Set your Mac to dark and the window is the dark one — `#171717` titlebar over a dark source panel; set it to light and the same skin turns the window and the source panel white. The **page stays white either way**: the sheet is what you are reading, and it is paper in both halves, so the preview never follows the window into dark. Switching the system setting re-dresses open windows live, and an exported PDF is always the light sheet — exporting from a dark Mac no longer produced a dark document. Both halves stay on Typewriter's one grey ramp with no colour at all. A theme saved as Typewriter stays Typewriter; there is nothing to re-pick.
 - The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, mid grey on Typewriter — which stays achromatic, one step up its own grey ramp. `Default` and `Raw` keep the accent chosen in System Settings.
 
 ### Fixed

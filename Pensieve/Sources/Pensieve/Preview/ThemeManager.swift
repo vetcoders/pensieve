@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Loads preview CSS bundles from release-safe resource locations and caches them.
@@ -47,8 +48,23 @@ final class ThemeManager: ObservableObject {
     didSet { persist(\.skinKey, skin.rawValue) }
   }
 
+  /// Bumped when the system light/dark setting flips.
+  ///
+  /// A PAIRED skin resolves its tokens from that setting, and nothing else in
+  /// the app changes when the setting does: `skin` is still the same case, so no
+  /// `@Published` fires and every view holding this object keeps the palette it
+  /// already drew. This counter is that missing signal — one published bump, and
+  /// the ordinary update path re-reads the tokens exactly the way it does after
+  /// the operator picks a skin by hand.
+  ///
+  /// It is a COUNTER rather than a stored appearance so there is no second copy
+  /// of the system setting to go stale; `SystemAppearance.isDark` stays the only
+  /// place that answer is read.
+  @Published private(set) var systemAppearanceGeneration: Int = 0
+
   private let defaults: UserDefaults
   private var cache: [Theme: String] = [:]
+  private var appearanceObservation: NSKeyValueObservation?
 
   private let flavorKey = "pensieve.preview.flavor"
   private let skinKey = "pensieve.preview.skin"
@@ -58,8 +74,55 @@ final class ThemeManager: ObservableObject {
     self.current =
       defaults.string(forKey: "pensieve.preview.flavor")
       .flatMap(Theme.init(rawValue:)) ?? .markdown
-    self.skin = PensieveTheme.resolve(
-      persistedRawValue: defaults.string(forKey: "pensieve.preview.skin"))
+    let persistedSkin = defaults.string(forKey: "pensieve.preview.skin")
+    let resolvedSkin = PensieveTheme.resolve(persistedRawValue: persistedSkin)
+    self.skin = resolvedSkin
+
+    // A migration that only lives in memory is not a migration. `skin`'s
+    // `didSet` does not fire for the assignment above — Swift skips property
+    // observers during initialisation — so a retired name (`glass` → `ink`, or
+    // one of the throwaway typewriter demo values → the pair) stays in the store
+    // until the operator happens to pick a skin by hand: every launch
+    // re-migrates the same dead value, and anything else reading the raw key
+    // still sees a skin this build no longer has. Settle it where it is
+    // resolved. A fresh install writes nothing: no key means no choice yet, and
+    // defaulting to graphite is not the operator picking graphite.
+    if let persistedSkin, persistedSkin != resolvedSkin.rawValue {
+      persist(\.skinKey, resolvedSkin.rawValue)
+    }
+
+    observeSystemAppearance()
+  }
+
+  /// Watches the system light/dark setting for the paired skins.
+  ///
+  /// Two things this deliberately does NOT do, both of them lessons already paid
+  /// for on this surface:
+  ///
+  ///   * It writes NOTHING that feeds the property it observes. The reaction is
+  ///     a counter bump; the chrome pass downstream writes a window appearance
+  ///     of `nil` for a paired skin (the window is supposed to follow the
+  ///     system) and never touches `NSApp.appearance`. There is no edge for the
+  ///     observation to re-trigger on, so the appearance loop that `7908bfd`
+  ///     fixed cannot form here — and the edge-triggered `assertedAppearances`
+  ///     table still guards the write itself.
+  ///   * It repaints nothing synchronously inside the callback. The bump is
+  ///     dispatched onto the next main-queue turn and the ordinary SwiftUI
+  ///     update path does the work, which is the same shape `d721f55`/`ce4397f`
+  ///     settled for a live skin switch: a re-theme that runs through the normal
+  ///     cycle instead of walking every surface from inside a notification.
+  ///
+  /// Unpaired skins read no system setting, so they are filtered out before the
+  /// bump rather than being re-rendered for a change that cannot affect them.
+  private func observeSystemAppearance() {
+    appearanceObservation = NSApplication.shared.observe(
+      \.effectiveAppearance, options: [.new]
+    ) { [weak self] _, _ in
+      DispatchQueue.main.async {
+        guard let self, self.skin.isPaired else { return }
+        self.systemAppearanceGeneration &+= 1
+      }
+    }
   }
 
   func css(for theme: Theme) -> String {

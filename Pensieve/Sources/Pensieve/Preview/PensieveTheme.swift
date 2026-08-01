@@ -189,41 +189,6 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   case porcelain
   /// One mono family everywhere, achromatic.
   case typewriter
-  // TEMPORARY — test-build line only, remove after the operator picks.
-  //
-  // The same skin as `typewriter` down to the byte, except for the ONE thing
-  // still undecided: the window chrome mode. `typewriter` pins `.light` (the
-  // titlebar draws light controls over the dark backing); this one pins `.dark`
-  // and takes the titlebar backing to the mockup's `#171717`. Shipped as a
-  // second picker entry so both can be compared live in the same build. Delete
-  // this case, its `displayName`/`systemImage` arms, its token table entry and
-  // the `skinCSS` fall-through once the decision lands.
-  case typewriterDarkChrome = "typewriter-dark-chrome"
-  // TEMPORARY — test-build line only, remove after the operator picks.
-  //
-  // The two candidate shapes for the LIGHT half of the Typewriter pair. The
-  // decided direction is one "Maszynopis" paired to the system setting: system
-  // dark keeps today's dark-chrome variant 1:1, system light gets one of these.
-  // Both carry the same light window and the same light SOURCE panel, so the
-  // only thing the operator is choosing between them is the preview:
-  //
-  //   * `typewriterLightMirror` — the dual-truth reflected. Light frame, light
-  //     source, DARK preview: the preview takes over the roles today's DARK
-  //     source panel plays (#1c1c1c page, #d4d4d4 body, #f2f2f2 heads).
-  //   * `typewriterLightPaper` — one light sheet all the way through. Same light
-  //     frame and source, and today's light typewriter preview verbatim.
-  //
-  // Known demo limitation, deliberately not fixed for a throwaway pair: the
-  // mirror pins `.light` for the WINDOW (that is the point of it), and the
-  // preview appearance rides the same axis, so Mermaid — which reads
-  // `prefers-color-scheme` in JS, out of reach of a CSS overlay — still draws
-  // its light diagram theme on the mirror's dark page. The CSS side is complete.
-  //
-  // Delete both cases, their `displayName`/`systemImage` arms, their token table
-  // entries and their `skinCSS` branches once the decision lands; the pair
-  // mechanism itself belongs on the themes line, not here.
-  case typewriterLightMirror = "typewriter-light-mirror"
-  case typewriterLightPaper = "typewriter-light-paper"
 
   var id: String { rawValue }
 
@@ -236,10 +201,6 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .ink: return "Ink"
     case .porcelain: return "Porcelain"
     case .typewriter: return "Typewriter"
-    // TEMPORARY — see the case declaration.
-    case .typewriterDarkChrome: return "Maszynopis (ciemny chrome)"
-    case .typewriterLightMirror: return "Maszynopis jasny — lustro"
-    case .typewriterLightPaper: return "Maszynopis jasny — kartka"
     }
   }
 
@@ -253,19 +214,17 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .ink: return "drop.fill"
     case .porcelain: return "cross.case"
     case .typewriter: return "keyboard"
-    // TEMPORARY — see the case declaration.
-    case .typewriterDarkChrome: return "keyboard.fill"
-    case .typewriterLightMirror: return "circle.lefthalf.filled"
-    case .typewriterLightPaper: return "doc.plaintext"
     }
   }
 
-  /// Explicit appearance to pin on the preview WebView (and the source panel's
-  /// caret), or `nil` for the adaptive themes that follow the system setting.
-  /// Single-mode themes carry no `@media (prefers-color-scheme:)` in their CSS,
-  /// so the WebView appearance is the only thing that keeps the flavour bundle
-  /// (`gfm.css`) from flipping the base the other way.
+  /// Explicit appearance to pin on the WINDOW, or `nil` for the themes that
+  /// follow the system setting.
+  ///
+  /// A PAIRED skin returns `nil`: the window is meant to follow the system,
+  /// because following it is how the pair chooses its half in the first place.
+  /// Pinning here would be the app arguing with the setting it is reading.
   var appearanceName: NSAppearance.Name? {
+    if Self.pairedPalettes[self] != nil { return nil }
     switch tokens.mode {
     case .light: return .aqua
     case .dark: return .darkAqua
@@ -273,7 +232,65 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     }
   }
 
-  var tokens: ThemeTokens { Self.tokenTable[self] ?? Self.adaptiveTokens }
+  /// Appearance for the READING SURFACE — the preview WebView and anything that
+  /// renders the same sheet, export included.
+  ///
+  /// Split from `appearanceName` for the pair alone, and for a reason the pair
+  /// creates: its two palettes dress the WINDOW and the SOURCE panel, but the
+  /// sheet is white in BOTH halves. Letting the WebView follow the system would
+  /// hand a white page the dark half of `gfm.css` (and the dark Mermaid theme,
+  /// which reads `prefers-color-scheme` from JS where no stylesheet can reach
+  /// it). Pinning the surface light keeps the paper the same paper in both
+  /// halves, which is the decision this skin exists to express.
+  ///
+  /// Unpaired skins answer exactly as before.
+  var readingSurfaceAppearanceName: NSAppearance.Name? {
+    guard let pair = Self.pairedPalettes[self] else { return appearanceName }
+    switch pair.light.mode {
+    case .dark: return .darkAqua
+    default: return .aqua
+    }
+  }
+
+  /// Tokens for the half that is live right now.
+  ///
+  /// For a paired skin this reads the system setting, which makes it the ONLY
+  /// token accessor that is not a pure function of the enum. Everything that
+  /// must not depend on the machine's current setting — export above all — goes
+  /// through `exportTokens` or `tokens(underDarkSystem:)` instead.
+  var tokens: ThemeTokens {
+    if let pair = Self.pairedPalettes[self] {
+      return SystemAppearance.isDark ? pair.dark : pair.light
+    }
+    return Self.tokenTable[self] ?? Self.adaptiveTokens
+  }
+
+  /// The same resolution, with the system setting passed in rather than read.
+  /// Pure, so a test can drive both halves without touching the host.
+  func tokens(underDarkSystem isDark: Bool) -> ThemeTokens {
+    if let pair = Self.pairedPalettes[self] { return isDark ? pair.dark : pair.light }
+    return Self.tokenTable[self] ?? Self.adaptiveTokens
+  }
+
+  /// Tokens for an EXPORTED document, which is a sheet of paper and not a
+  /// window: a paired skin always exports its light half, whatever the machine
+  /// it was exported from was set to. A dark PDF would be a regression, not a
+  /// feature — the page is white in both halves of the pair on screen too.
+  var exportTokens: ThemeTokens {
+    if let pair = Self.pairedPalettes[self] { return pair.light }
+    return tokens
+  }
+
+  /// Appearance to pin while rendering an export. Same reasoning as
+  /// `exportTokens`, applied to the media queries in the flavour bundle.
+  var exportAppearanceName: NSAppearance.Name? {
+    if Self.pairedPalettes[self] != nil { return .aqua }
+    return appearanceName
+  }
+
+  /// True when this skin is two fixed palettes paired to the system setting
+  /// rather than one palette or a set of semantic colours.
+  var isPaired: Bool { Self.pairedPalettes[self] != nil }
 
   // MARK: - Migration
 
@@ -300,6 +317,14 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     "pergament": .parchment,
     "klinika": .porcelain,
     "maszynopis": .typewriter,
+    // The three throwaway picker entries the test-build line carried while the
+    // operator chose the light half by eye. They never shipped as raw values
+    // here, but a machine that ran those builds has one of them persisted — and
+    // every one of them was a Typewriter, so they land on the pair rather than
+    // dropping the operator back on the GitHub default.
+    "typewriter-dark-chrome": .typewriter,
+    "typewriter-light-mirror": .typewriter,
+    "typewriter-light-paper": .typewriter,
   ]
 
   // MARK: - Token tables
@@ -439,134 +464,106 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       previewHeadingFamily: "IBM Plex Sans",
       monoFamily: "IBM Plex Mono"
     ),
-    .typewriter: ThemeTokens(
-      mode: .light,
-      source: ColorSpec(hex: "#1c1c1c"),
-      border: ColorSpec(hex: "#e6e6e6"),
-      codeBackground: ColorSpec(hex: "#2b2b2b"),
-      text: ColorSpec(hex: "#d4d4d4"),
-      accent: ColorSpec(hex: "#1c1c1c"),
-      // The ink IS this skin's surface (#1c1c1c), so a chip painted with it
-      // would be invisible. This skin carries no hue at all — its whole palette
-      // is one grey ramp (#e6e6e6 · #a8a8a8 · #6e6e6e · #1c1c1c · #171717) — so
-      // the fill is the one ramp step that clears both legibility pins: a white
-      // glyph rides it at 5.10:1 and it lifts off the #1c1c1c titlebar backing
-      // at 3.34:1. The lighter steps cannot carry the glyph (#a8a8a8 is 2.38:1),
-      // the darker ones dissolve into the backing.
-      chromeAccent: ColorSpec(hex: "#6e6e6e"),
-      muted: ColorSpec(hex: "#6e6e6e"),
-      warning: ColorSpec(hex: "#6e6e6e"),
-      srcHeading: ColorSpec(hex: "#f2f2f2"),
-      srcListMarker: ColorSpec(hex: "#d4d4d4"),
-      srcInlineCode: ColorSpec(hex: "#d4d4d4"),
-      srcLink: ColorSpec(hex: "#d4d4d4"),
-      srcQuote: ColorSpec(hex: "#8a8a8a"),
-      srcStrike: ColorSpec(hex: "#8a8a8a"),
-      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
-      srcGutter: ColorSpec(hex: "#525252"),
-      srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
-      previewFamily: "Spline Sans Mono",
-      previewHeadingFamily: "Spline Sans Mono",
-      monoFamily: "Spline Sans Mono"
-    ),
-    // TEMPORARY — test-build line only, remove after the operator picks.
-    //
-    // Byte-identical to `.typewriter` except for the two values that carry the
-    // undecided axis: `mode` flips `.light` → `.dark` (the window and the
-    // preview take `darkAqua`, so the titlebar draws dark controls), and
-    // `source` — which IS the titlebar backing (`titlebarGlassBackingColor`) —
-    // moves to the mockup's `#171717`. Everything else is copied verbatim so
-    // the only difference the operator sees is the chrome.
-    .typewriterDarkChrome: ThemeTokens(
-      mode: .dark,
-      source: ColorSpec(hex: "#171717"),
-      border: ColorSpec(hex: "#e6e6e6"),
-      codeBackground: ColorSpec(hex: "#2b2b2b"),
-      text: ColorSpec(hex: "#d4d4d4"),
-      accent: ColorSpec(hex: "#1c1c1c"),
-      chromeAccent: ColorSpec(hex: "#6e6e6e"),
-      muted: ColorSpec(hex: "#6e6e6e"),
-      warning: ColorSpec(hex: "#6e6e6e"),
-      srcHeading: ColorSpec(hex: "#f2f2f2"),
-      srcListMarker: ColorSpec(hex: "#d4d4d4"),
-      srcInlineCode: ColorSpec(hex: "#d4d4d4"),
-      srcLink: ColorSpec(hex: "#d4d4d4"),
-      srcQuote: ColorSpec(hex: "#8a8a8a"),
-      srcStrike: ColorSpec(hex: "#8a8a8a"),
-      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
-      srcGutter: ColorSpec(hex: "#525252"),
-      srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
-      previewFamily: "Spline Sans Mono",
-      previewHeadingFamily: "Spline Sans Mono",
-      monoFamily: "Spline Sans Mono"
-    ),
-    // TEMPORARY — test-build line only, remove after the operator picks.
-    //
-    // The two light candidates carry an IDENTICAL native side: same light
-    // window (`mode: .light`, so the titlebar draws dark controls), same white
-    // titlebar backing, same light source panel. That is deliberate — with the
-    // chrome and the source held fixed, the only thing left to choose between
-    // them is the preview, which is what the two `skinCSS` branches differ in.
-    //
-    // Every value is the same ROLE the dark typewriter source plays, read from
-    // the other end of the one grey ramp (`#ffffff · #e6e6e6 · #a8a8a8 ·
-    // #6e6e6e · #1c1c1c · #171717`): body ink instead of body paper, a mid-grey
-    // gutter instead of a dim one, headings one step past the body instead of
-    // one step before it. Zero hue, like the skin it pairs with.
-    //
-    // `chromeAccent` stays `#6e6e6e` and it is re-measured, not inherited: on
-    // this skin the chip sits on a WHITE titlebar backing rather than `#1c1c1c`.
-    // The same ramp step happens to clear both pins from the other side —
-    // a white glyph rides it at 5.10:1, and it lifts off white at 5.10:1 too.
-    // The lighter steps still cannot carry the glyph (`#a8a8a8` is 2.38:1) and
-    // the darker ones (`#1c1c1c`, `#171717`) would be near-black chips.
-    .typewriterLightMirror: ThemeTokens(
-      mode: .light,
-      source: ColorSpec(hex: "#ffffff"),
-      border: ColorSpec(hex: "#e6e6e6"),
-      codeBackground: ColorSpec(hex: "#e6e6e6"),
-      text: ColorSpec(hex: "#1c1c1c"),
-      accent: ColorSpec(hex: "#1c1c1c"),
-      chromeAccent: ColorSpec(hex: "#6e6e6e"),
-      muted: ColorSpec(hex: "#6e6e6e"),
-      warning: ColorSpec(hex: "#6e6e6e"),
-      srcHeading: ColorSpec(hex: "#171717"),
-      srcListMarker: ColorSpec(hex: "#1c1c1c"),
-      srcInlineCode: ColorSpec(hex: "#1c1c1c"),
-      srcLink: ColorSpec(hex: "#1c1c1c"),
-      srcQuote: ColorSpec(hex: "#6e6e6e"),
-      srcStrike: ColorSpec(hex: "#6e6e6e"),
-      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
-      srcGutter: ColorSpec(hex: "#a8a8a8"),
-      srcCurrentLine: ColorSpec(hex: "#1c1c1c"),
-      previewFamily: "Spline Sans Mono",
-      previewHeadingFamily: "Spline Sans Mono",
-      monoFamily: "Spline Sans Mono"
-    ),
-    // TEMPORARY — see `.typewriterLightMirror`. Byte-identical native side; the
-    // pair differs only in the preview stylesheet.
-    .typewriterLightPaper: ThemeTokens(
-      mode: .light,
-      source: ColorSpec(hex: "#ffffff"),
-      border: ColorSpec(hex: "#e6e6e6"),
-      codeBackground: ColorSpec(hex: "#e6e6e6"),
-      text: ColorSpec(hex: "#1c1c1c"),
-      accent: ColorSpec(hex: "#1c1c1c"),
-      chromeAccent: ColorSpec(hex: "#6e6e6e"),
-      muted: ColorSpec(hex: "#6e6e6e"),
-      warning: ColorSpec(hex: "#6e6e6e"),
-      srcHeading: ColorSpec(hex: "#171717"),
-      srcListMarker: ColorSpec(hex: "#1c1c1c"),
-      srcInlineCode: ColorSpec(hex: "#1c1c1c"),
-      srcLink: ColorSpec(hex: "#1c1c1c"),
-      srcQuote: ColorSpec(hex: "#6e6e6e"),
-      srcStrike: ColorSpec(hex: "#6e6e6e"),
-      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
-      srcGutter: ColorSpec(hex: "#a8a8a8"),
-      srcCurrentLine: ColorSpec(hex: "#1c1c1c"),
-      previewFamily: "Spline Sans Mono",
-      previewHeadingFamily: "Spline Sans Mono",
-      monoFamily: "Spline Sans Mono"
-    ),
   ]
+
+  /// Skins that are TWO fixed palettes paired to the system setting instead of
+  /// one palette (the other fixed skins) or a set of semantic colours
+  /// (`default`/`raw`, which follow the system by never naming a colour).
+  ///
+  /// This is the third thing a theme can be, and it exists because Typewriter
+  /// asks a question the other two shapes cannot answer: the operator wants the
+  /// skin to follow her machine, but she does not want the system's colours —
+  /// she wants HER two, one per side. So the skin declares a pair, the system
+  /// setting picks the half, and every colour is still ours.
+  ///
+  /// What stays constant across the pair is as deliberate as what changes. The
+  /// sheet is white on BOTH sides — that is the decision this skin encodes, and
+  /// it is why `readingSurfaceAppearanceName` and `exportTokens` refuse to
+  /// follow the system the way the window does. What flips is the window's own
+  /// dress: the titlebar backing and the source panel, dark ink on the dark
+  /// side, dark ink on white on the light side.
+  ///
+  /// Both halves are the one grey ramp (`#ffffff · #e6e6e6 · #a8a8a8 · #6e6e6e ·
+  /// #1c1c1c · #171717`) and carry no hue at all, which
+  /// `testTypewriterPairIsAchromaticOnBothHalves` walks token by token.
+  static let pairedPalettes: [PensieveTheme: (light: ThemeTokens, dark: ThemeTokens)] = [
+    .typewriter: (
+      // System LIGHT — the whole window is the page. White titlebar backing,
+      // white source panel, ink body, mid-grey numbers, heads one step past the
+      // body: the same ROLES the dark half plays, read from the other end of
+      // the ramp.
+      light: ThemeTokens(
+        mode: .light,
+        source: ColorSpec(hex: "#ffffff"),
+        border: ColorSpec(hex: "#e6e6e6"),
+        codeBackground: ColorSpec(hex: "#e6e6e6"),
+        text: ColorSpec(hex: "#1c1c1c"),
+        accent: ColorSpec(hex: "#1c1c1c"),
+        // Measured against THIS half's backing, not inherited from the other:
+        // the chip sits on white here and on `#171717` there. `#6e6e6e` is the
+        // one ramp step that clears both pins from both sides — a white glyph
+        // rides it at 5.10:1, it lifts off white at 5.10:1 and off `#171717` at
+        // 3.52:1. `#a8a8a8` still cannot carry the glyph (2.38:1), and the two
+        // darkest steps would be near-black chips on a white titlebar.
+        chromeAccent: ColorSpec(hex: "#6e6e6e"),
+        muted: ColorSpec(hex: "#6e6e6e"),
+        warning: ColorSpec(hex: "#6e6e6e"),
+        srcHeading: ColorSpec(hex: "#171717"),
+        srcListMarker: ColorSpec(hex: "#1c1c1c"),
+        srcInlineCode: ColorSpec(hex: "#1c1c1c"),
+        srcLink: ColorSpec(hex: "#1c1c1c"),
+        srcQuote: ColorSpec(hex: "#6e6e6e"),
+        srcStrike: ColorSpec(hex: "#6e6e6e"),
+        srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
+        srcGutter: ColorSpec(hex: "#a8a8a8"),
+        srcCurrentLine: ColorSpec(hex: "#1c1c1c"),
+        previewFamily: "Spline Sans Mono",
+        previewHeadingFamily: "Spline Sans Mono",
+        monoFamily: "Spline Sans Mono"
+      ),
+      // System DARK — the dark chrome the operator compared against and kept,
+      // 1:1: `#171717` titlebar backing over a dark source panel, white sheet
+      // opposite it.
+      dark: ThemeTokens(
+        mode: .dark,
+        source: ColorSpec(hex: "#171717"),
+        border: ColorSpec(hex: "#e6e6e6"),
+        codeBackground: ColorSpec(hex: "#2b2b2b"),
+        text: ColorSpec(hex: "#d4d4d4"),
+        accent: ColorSpec(hex: "#1c1c1c"),
+        chromeAccent: ColorSpec(hex: "#6e6e6e"),
+        muted: ColorSpec(hex: "#6e6e6e"),
+        warning: ColorSpec(hex: "#6e6e6e"),
+        srcHeading: ColorSpec(hex: "#f2f2f2"),
+        srcListMarker: ColorSpec(hex: "#d4d4d4"),
+        srcInlineCode: ColorSpec(hex: "#d4d4d4"),
+        srcLink: ColorSpec(hex: "#d4d4d4"),
+        srcQuote: ColorSpec(hex: "#8a8a8a"),
+        srcStrike: ColorSpec(hex: "#8a8a8a"),
+        srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
+        srcGutter: ColorSpec(hex: "#525252"),
+        srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
+        previewFamily: "Spline Sans Mono",
+        previewHeadingFamily: "Spline Sans Mono",
+        monoFamily: "Spline Sans Mono"
+      )
+    )
+  ]
+}
+
+/// Which half of a paired skin the machine is asking for.
+///
+/// Reads the live `effectiveAppearance` rather than a cached flag, so there is
+/// nothing to invalidate and nothing to get stale: a paired skin's tokens are
+/// simply a function of the setting at the moment they are read. What still
+/// needs a nudge is SwiftUI — a system flip changes no `@Published` value on its
+/// own — and that nudge lives in `ThemeManager`, deliberately away from here.
+enum SystemAppearance {
+  static var isDark: Bool { isDark(NSApplication.shared.effectiveAppearance) }
+
+  /// Split out so a test can ask the same question of an appearance it built
+  /// itself, without driving the whole application's setting.
+  static func isDark(_ appearance: NSAppearance) -> Bool {
+    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+  }
 }
