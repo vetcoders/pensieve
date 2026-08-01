@@ -180,26 +180,104 @@ final class PreviewThemeTests: XCTestCase {
   /// hue smuggled back into any of them — the ribbon red `#a8342a` the chrome
   /// accent used to carry — fails here instead of shipping.
   func testTypewriterSkinCarriesNoChromaticToken() {
-    var walked = 0
-    for child in Mirror(reflecting: PensieveTheme.typewriter.tokens).children {
-      // Module-qualified: bare `ColorSpec` collides with the Carbon QuickDraw
-      // struct AppKit drags in, and a cast has no static member to disambiguate.
-      guard let spec = child.value as? Pensieve.ColorSpec else { continue }
-      walked += 1
-      let srgb = spec.nsColor.usingColorSpace(.sRGB) ?? spec.nsColor
-      let name = child.label ?? "<unlabelled>"
-      XCTAssertEqual(
-        srgb.redComponent, srgb.greenComponent, accuracy: 0.001,
-        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
-      XCTAssertEqual(
-        srgb.greenComponent, srgb.blueComponent, accuracy: 0.001,
-        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+    // The whole typewriter family, not just the one case: the dark-chrome demo
+    // and the two light candidates are the same skin seen from different points
+    // on the ramp, so "zero colour" is a property of all of them or of none.
+    // TEMPORARY entries are listed here on purpose — a demo the operator judges
+    // by eye is exactly where a stray hue would slip through unnoticed.
+    for skin in [
+      PensieveTheme.typewriter, .typewriterDarkChrome, .typewriterLightMirror,
+      .typewriterLightPaper,
+    ] {
+      var walked = 0
+      for child in Mirror(reflecting: skin.tokens).children {
+        // Module-qualified: bare `ColorSpec` collides with the Carbon QuickDraw
+        // struct AppKit drags in, and a cast has no static member to disambiguate.
+        guard let spec = child.value as? Pensieve.ColorSpec else { continue }
+        walked += 1
+        let srgb = spec.nsColor.usingColorSpace(.sRGB) ?? spec.nsColor
+        let name = child.label ?? "<unlabelled>"
+        XCTAssertEqual(
+          srgb.redComponent, srgb.greenComponent, accuracy: 0.001,
+          "\(skin.rawValue) token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+        XCTAssertEqual(
+          srgb.greenComponent, srgb.blueComponent, accuracy: 0.001,
+          "\(skin.rawValue) token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+      }
+      // The reflection actually saw the table — without this the loop would pass
+      // vacuously if `ThemeTokens` ever stopped yielding its specs. A new colour
+      // token has to bump this count, which is the review gate: it must land on
+      // the ramp before it lands in the skin.
+      XCTAssertEqual(walked, 17, "unexpected colour-token count on \(skin.rawValue)")
     }
-    // The reflection actually saw the table — without this the loop would pass
-    // vacuously if `ThemeTokens` ever stopped yielding its specs. A new colour
-    // token has to bump this count, which is the review gate: it must land on
-    // the ramp before it lands in the skin.
-    XCTAssertEqual(walked, 17, "unexpected colour-token count on the typewriter skin")
+  }
+
+  /// The light candidates are one skin seen from two sides, so their NATIVE half
+  /// — window mode, titlebar backing, source panel, gutter, chrome — has to be
+  /// byte-identical. If they ever drift, the operator is no longer choosing
+  /// between two previews; she is choosing between two different skins, and the
+  /// comparison this demo exists for stops being valid.
+  ///
+  /// TEMPORARY — delete with the demo entries.
+  func testBothLightTypewriterCandidatesShareOneNativeSide() {
+    let mirror = PensieveTheme.typewriterLightMirror.tokens
+    let paper = PensieveTheme.typewriterLightPaper.tokens
+
+    XCTAssertEqual(mirror.mode, .light)
+    XCTAssertEqual(paper.mode, .light)
+    for (name, lhs, rhs) in [
+      ("source", mirror.source, paper.source),
+      ("border", mirror.border, paper.border),
+      ("codeBackground", mirror.codeBackground, paper.codeBackground),
+      ("text", mirror.text, paper.text),
+      ("accent", mirror.accent, paper.accent),
+      ("chromeAccent", mirror.chromeAccent, paper.chromeAccent),
+      ("srcHeading", mirror.srcHeading, paper.srcHeading),
+      ("srcGutter", mirror.srcGutter, paper.srcGutter),
+      ("srcCurrentLine", mirror.srcCurrentLine, paper.srcCurrentLine),
+    ] {
+      XCTAssertEqual(lhs.css, rhs.css, "\(name) differs between the two light candidates")
+    }
+
+    // The light source panel really is the light end of the ramp, not a copy of
+    // the dark one: white paper, ink body, mid-grey numbers, heads a step past
+    // the body — the same roles the dark panel plays, mirrored.
+    XCTAssertEqual(mirror.source.css, "#ffffff")
+    XCTAssertEqual(mirror.text.css, "#1c1c1c")
+    XCTAssertEqual(mirror.srcGutter.css, "#a8a8a8")
+    XCTAssertEqual(mirror.srcHeading.css, "#171717")
+
+    // ...and the preview is the ONLY thing that separates them.
+    XCTAssertNotEqual(
+      PreviewWebView.skinCSS(for: .typewriterLightMirror),
+      PreviewWebView.skinCSS(for: .typewriterLightPaper))
+  }
+
+  /// The mirror's page is the dark source panel's surface, and its body/heads
+  /// are that panel's ink. Pinned as values because "dark preview" is the whole
+  /// point of this candidate — a sheet that drifted light would make the demo
+  /// answer a question the operator did not ask.
+  ///
+  /// TEMPORARY — delete with the demo entries.
+  func testMirrorCandidateRendersTheDarkReadingSurface() {
+    let css = PreviewWebView.skinCSS(for: .typewriterLightMirror)
+    XCTAssertTrue(css.contains("--vc-preview-page-background"))
+    XCTAssertTrue(css.contains("--vc-preview-typewriter-mirror-bg: #1c1c1c"))
+    XCTAssertTrue(css.contains("--vc-preview-text: #d4d4d4"))
+    XCTAssertTrue(
+      css.contains("color: #f2f2f2 !important"), "heads take the dark panel's heading ink")
+    XCTAssertFalse(css.contains("prefers-color-scheme"), "single-mode skins must not branch")
+
+    // The base block's light values for these three would otherwise survive under
+    // this skin's LIGHT window appearance and land light-on-dark.
+    for token in ["--vc-preview-code-shadow", "--vc-preview-diagram-error-bg"] {
+      XCTAssertTrue(css.contains(token), "\(token) must be re-declared for the dark page")
+    }
+
+    // The paper candidate is the light sheet, unchanged.
+    let paper = PreviewWebView.skinCSS(for: .typewriterLightPaper)
+    XCTAssertTrue(paper.contains("--vc-preview-typewriter-bg: #ffffff"))
+    XCTAssertTrue(paper.contains("--vc-preview-text: #1c1c1c"))
   }
 
   /// The two legibility invariants a filled chip has to satisfy on every fixed
@@ -211,7 +289,14 @@ final class PreviewThemeTests: XCTestCase {
   /// that catches a skin reusing an ink token: the exact failure typewriter's
   /// `accent == source` would have shipped.
   func testChromeAccentStaysLegibleAgainstGlyphAndTitlebarBacking() {
-    for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter] {
+    // The TEMPORARY demo entries are measured too, and they are the reason this
+    // loop is not just "the shipping skins": the light candidates put the SAME
+    // `#6e6e6e` chip on a WHITE titlebar backing instead of `#1c1c1c`, which is
+    // a different measurement even though it is the same token value.
+    for skin in [
+      PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter, .typewriterDarkChrome,
+      .typewriterLightMirror, .typewriterLightPaper,
+    ] {
       let fill = WindowChromeRecipe.toolbarChipBezelColor(for: skin)
       let glyphContrast = Self.contrastRatio(fill, WindowChromeRecipe.toolbarChipGlyphColor)
       XCTAssertGreaterThanOrEqual(

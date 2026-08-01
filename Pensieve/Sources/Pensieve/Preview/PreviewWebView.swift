@@ -1039,6 +1039,159 @@ final class PreviewWebView: NSView {
       return skinCSS(for: .typewriter)
         + "\n/* vc-skin:typewriter-dark-chrome — typewriter's reading surface, dark window chrome */"
 
+    // TEMPORARY — test-build line only, remove after the operator picks.
+    //
+    // "Kartka": one light sheet all the way through. The preview is today's
+    // typewriter sheet verbatim — what makes this a candidate is the LIGHT
+    // source panel next to it, which lives in the token table, not here.
+    case .typewriterLightPaper:
+      return skinCSS(for: .typewriter)
+        + "\n/* vc-skin:typewriter-light-paper — typewriter's light sheet, light source panel */"
+
+    // TEMPORARY — test-build line only, remove after the operator picks.
+    //
+    // "Lustro": the dual truth reflected. The preview takes over every role the
+    // DARK typewriter source panel plays today — `#1c1c1c` page, `#d4d4d4` body,
+    // `#f2f2f2` heads, `#2b2b2b` code wash — while the source panel opposite it
+    // goes light. Same ramp, same family, same centred heads: only the side of
+    // the ramp each panel sits on is swapped.
+    //
+    // Written out rather than derived from the typewriter sheet because every
+    // colour token flips; only the typography rules would have survived a reuse.
+    // It also re-declares `code-shadow` and the two `diagram-error-*` tokens,
+    // which the light typewriter sheet leaves to the base block — under this
+    // skin's LIGHT window appearance those would otherwise stay light on a dark
+    // page. Mermaid's own theme still reads `prefers-color-scheme` from JS and
+    // is out of a stylesheet's reach; that is the known demo limitation named on
+    // the enum case.
+    case .typewriterLightMirror:
+      return """
+        /* vc-skin:typewriter-light-mirror — mono everywhere, achromatic, dark page under a light window */
+        :root {
+          --vc-preview-text: #d4d4d4;
+          --vc-preview-muted: #a8a8a8;
+          --vc-preview-border: #6e6e6e;
+          --vc-preview-code-bg: #2b2b2b;
+          --vc-preview-code-shadow: none;
+          --vc-preview-link: #d4d4d4;
+          --vc-preview-row-alt: #171717;
+          --vc-preview-mark-bg: #e6e6e6;
+          --vc-preview-mark-text: #1c1c1c;
+          --vc-preview-math-bg: #171717;
+          --vc-preview-diagram-bg: #171717;
+          --vc-preview-diagram-error-bg: #2b2b2b;
+          --vc-preview-diagram-error-text: #e6e6e6;
+          --vc-preview-danger: #d4d4d4;
+          --vc-preview-warning: #a8a8a8;
+          --vc-preview-positive: #d4d4d4;
+          --vc-preview-typewriter-mirror-bg: #1c1c1c;
+          --vc-preview-page-background: var(--vc-preview-typewriter-mirror-bg);
+        }
+        /* Jedna rodzina na wszystko — to jest cały motyw. */
+        .markdown-body,
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6,
+        .markdown-body pre, .markdown-body code, .markdown-body tt,
+        .markdown-body table {
+          font-family: "Spline Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        }
+        .markdown-body {
+          max-width: 700px;
+          font-size: 0.96em;
+          line-height: 1.72;
+          color: var(--vc-preview-text) !important;
+        }
+        /* Hierarchia z wagi i światła, nie z rozmiaru: wyśrodkowane, ledwo większe.
+           Nagłówki idą o krok jaśniej od tekstu — lustro roli `srcHeading`. */
+        .markdown-body h1, .markdown-body h2, .markdown-body h3,
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+          text-align: center;
+          font-weight: 700;
+          letter-spacing: 0;
+          color: #f2f2f2 !important;
+          border-bottom: 0 !important;
+          margin-top: 2.1em;
+          margin-bottom: 1.05em;
+        }
+        .markdown-body h1 { font-size: 1.22em; }
+        .markdown-body h2 { font-size: 1.12em; }
+        .markdown-body h3 { font-size: 1.04em; }
+        .markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 1em; }
+        /* Linki bez barwy — sam podkreślnik. */
+        .markdown-body a {
+          color: var(--vc-preview-text) !important;
+          text-decoration: none;
+          border-bottom: 1px solid #6e6e6e;
+        }
+        .markdown-body :not(pre) > code, .markdown-body tt {
+          background: var(--vc-preview-code-bg) !important;
+          color: var(--vc-preview-text) !important;
+          padding: 1px 4px;
+        }
+        .markdown-body pre {
+          background: #2b2b2b !important;
+          box-shadow: none;
+          border-radius: 0;
+        }
+        .markdown-body pre code {
+          color: var(--vc-preview-text) !important;
+        }
+        /* Checkbox jako rysowany kwadrat — ta sama figura, druga strona rampy. */
+        .markdown-body .task-list-item-checkbox {
+          appearance: none;
+          -webkit-appearance: none;
+          width: 13px;
+          height: 13px;
+          border: 1.5px solid #6e6e6e;
+          border-radius: 3px;
+          background: transparent;
+          vertical-align: -2px;
+        }
+        .markdown-body .task-list-item-checkbox:checked {
+          background: var(--vc-preview-text);
+          border-color: var(--vc-preview-text);
+        }
+        .markdown-body .task-list-item-checkbox:checked::after {
+          content: "";
+          display: block;
+          width: 100%;
+          height: 100%;
+          background: #1c1c1c;
+          clip-path: polygon(18% 52%, 40% 74%, 84% 26%, 92% 36%, 40% 88%, 10% 60%);
+        }
+        .markdown-body table {
+          border: 0 !important;
+          border-top: 1px solid var(--vc-preview-border) !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          border-collapse: collapse;
+          font-size: 0.94em;
+        }
+        .markdown-body thead th {
+          background: transparent !important;
+          border: 0 !important;
+          border-bottom: 1px solid var(--vc-preview-border) !important;
+          font-weight: 700;
+          text-align: left;
+          color: var(--vc-preview-text) !important;
+        }
+        .markdown-body tbody tr {
+          background: transparent !important;
+          border-top: 1px solid var(--vc-preview-border) !important;
+        }
+        .markdown-body table td, .markdown-body table th {
+          border-left: 0 !important;
+          border-right: 0 !important;
+        }
+        .markdown-body blockquote {
+          color: var(--vc-preview-muted) !important;
+          border-left: 2px solid #6e6e6e !important;
+        }
+        .markdown-body hr {
+          background: var(--vc-preview-border) !important;
+          border: 0 !important;
+        }
+        """
+
     case .typewriter:
       return """
         /* vc-skin:typewriter — one mono family everywhere, achromatic, centred heads */

@@ -199,6 +199,31 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   // this case, its `displayName`/`systemImage` arms, its token table entry and
   // the `skinCSS` fall-through once the decision lands.
   case typewriterDarkChrome = "typewriter-dark-chrome"
+  // TEMPORARY — test-build line only, remove after the operator picks.
+  //
+  // The two candidate shapes for the LIGHT half of the Typewriter pair. The
+  // decided direction is one "Maszynopis" paired to the system setting: system
+  // dark keeps today's dark-chrome variant 1:1, system light gets one of these.
+  // Both carry the same light window and the same light SOURCE panel, so the
+  // only thing the operator is choosing between them is the preview:
+  //
+  //   * `typewriterLightMirror` — the dual-truth reflected. Light frame, light
+  //     source, DARK preview: the preview takes over the roles today's DARK
+  //     source panel plays (#1c1c1c page, #d4d4d4 body, #f2f2f2 heads).
+  //   * `typewriterLightPaper` — one light sheet all the way through. Same light
+  //     frame and source, and today's light typewriter preview verbatim.
+  //
+  // Known demo limitation, deliberately not fixed for a throwaway pair: the
+  // mirror pins `.light` for the WINDOW (that is the point of it), and the
+  // preview appearance rides the same axis, so Mermaid — which reads
+  // `prefers-color-scheme` in JS, out of reach of a CSS overlay — still draws
+  // its light diagram theme on the mirror's dark page. The CSS side is complete.
+  //
+  // Delete both cases, their `displayName`/`systemImage` arms, their token table
+  // entries and their `skinCSS` branches once the decision lands; the pair
+  // mechanism itself belongs on the themes line, not here.
+  case typewriterLightMirror = "typewriter-light-mirror"
+  case typewriterLightPaper = "typewriter-light-paper"
 
   var id: String { rawValue }
 
@@ -213,6 +238,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .typewriter: return "Typewriter"
     // TEMPORARY — see the case declaration.
     case .typewriterDarkChrome: return "Maszynopis (ciemny chrome)"
+    case .typewriterLightMirror: return "Maszynopis jasny — lustro"
+    case .typewriterLightPaper: return "Maszynopis jasny — kartka"
     }
   }
 
@@ -228,6 +255,8 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
     case .typewriter: return "keyboard"
     // TEMPORARY — see the case declaration.
     case .typewriterDarkChrome: return "keyboard.fill"
+    case .typewriterLightMirror: return "circle.lefthalf.filled"
+    case .typewriterLightPaper: return "doc.plaintext"
     }
   }
 
@@ -467,6 +496,74 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
       srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
       srcGutter: ColorSpec(hex: "#525252"),
       srcCurrentLine: ColorSpec(hex: "#e8e8e8"),
+      previewFamily: "Spline Sans Mono",
+      previewHeadingFamily: "Spline Sans Mono",
+      monoFamily: "Spline Sans Mono"
+    ),
+    // TEMPORARY — test-build line only, remove after the operator picks.
+    //
+    // The two light candidates carry an IDENTICAL native side: same light
+    // window (`mode: .light`, so the titlebar draws dark controls), same white
+    // titlebar backing, same light source panel. That is deliberate — with the
+    // chrome and the source held fixed, the only thing left to choose between
+    // them is the preview, which is what the two `skinCSS` branches differ in.
+    //
+    // Every value is the same ROLE the dark typewriter source plays, read from
+    // the other end of the one grey ramp (`#ffffff · #e6e6e6 · #a8a8a8 ·
+    // #6e6e6e · #1c1c1c · #171717`): body ink instead of body paper, a mid-grey
+    // gutter instead of a dim one, headings one step past the body instead of
+    // one step before it. Zero hue, like the skin it pairs with.
+    //
+    // `chromeAccent` stays `#6e6e6e` and it is re-measured, not inherited: on
+    // this skin the chip sits on a WHITE titlebar backing rather than `#1c1c1c`.
+    // The same ramp step happens to clear both pins from the other side —
+    // a white glyph rides it at 5.10:1, and it lifts off white at 5.10:1 too.
+    // The lighter steps still cannot carry the glyph (`#a8a8a8` is 2.38:1) and
+    // the darker ones (`#1c1c1c`, `#171717`) would be near-black chips.
+    .typewriterLightMirror: ThemeTokens(
+      mode: .light,
+      source: ColorSpec(hex: "#ffffff"),
+      border: ColorSpec(hex: "#e6e6e6"),
+      codeBackground: ColorSpec(hex: "#e6e6e6"),
+      text: ColorSpec(hex: "#1c1c1c"),
+      accent: ColorSpec(hex: "#1c1c1c"),
+      chromeAccent: ColorSpec(hex: "#6e6e6e"),
+      muted: ColorSpec(hex: "#6e6e6e"),
+      warning: ColorSpec(hex: "#6e6e6e"),
+      srcHeading: ColorSpec(hex: "#171717"),
+      srcListMarker: ColorSpec(hex: "#1c1c1c"),
+      srcInlineCode: ColorSpec(hex: "#1c1c1c"),
+      srcLink: ColorSpec(hex: "#1c1c1c"),
+      srcQuote: ColorSpec(hex: "#6e6e6e"),
+      srcStrike: ColorSpec(hex: "#6e6e6e"),
+      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
+      srcGutter: ColorSpec(hex: "#a8a8a8"),
+      srcCurrentLine: ColorSpec(hex: "#1c1c1c"),
+      previewFamily: "Spline Sans Mono",
+      previewHeadingFamily: "Spline Sans Mono",
+      monoFamily: "Spline Sans Mono"
+    ),
+    // TEMPORARY — see `.typewriterLightMirror`. Byte-identical native side; the
+    // pair differs only in the preview stylesheet.
+    .typewriterLightPaper: ThemeTokens(
+      mode: .light,
+      source: ColorSpec(hex: "#ffffff"),
+      border: ColorSpec(hex: "#e6e6e6"),
+      codeBackground: ColorSpec(hex: "#e6e6e6"),
+      text: ColorSpec(hex: "#1c1c1c"),
+      accent: ColorSpec(hex: "#1c1c1c"),
+      chromeAccent: ColorSpec(hex: "#6e6e6e"),
+      muted: ColorSpec(hex: "#6e6e6e"),
+      warning: ColorSpec(hex: "#6e6e6e"),
+      srcHeading: ColorSpec(hex: "#171717"),
+      srcListMarker: ColorSpec(hex: "#1c1c1c"),
+      srcInlineCode: ColorSpec(hex: "#1c1c1c"),
+      srcLink: ColorSpec(hex: "#1c1c1c"),
+      srcQuote: ColorSpec(hex: "#6e6e6e"),
+      srcStrike: ColorSpec(hex: "#6e6e6e"),
+      srcHighlightBackground: ColorSpec(hex: "#e6e6e6"),
+      srcGutter: ColorSpec(hex: "#a8a8a8"),
+      srcCurrentLine: ColorSpec(hex: "#1c1c1c"),
       previewFamily: "Spline Sans Mono",
       previewHeadingFamily: "Spline Sans Mono",
       monoFamily: "Spline Sans Mono"
