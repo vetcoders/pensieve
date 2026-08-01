@@ -18,13 +18,14 @@ extension XCTestCase {
   /// question under both settings — and a second copy of this would be a second
   /// chance to get "which half am I on" wrong.
   @MainActor
-  func withSystemAppearance(dark: Bool, _ body: () throws -> Void) rethrows {
+  @discardableResult
+  func withSystemAppearance<T>(dark: Bool, _ body: () throws -> T) rethrows -> T {
     let previous = NSApplication.shared.appearance
     NSApplication.shared.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     defer { NSApplication.shared.appearance = previous }
     XCTAssertEqual(
       SystemAppearance.isDark, dark, "the rig failed to put the app in the requested appearance")
-    try body()
+    return try body()
   }
 }
 

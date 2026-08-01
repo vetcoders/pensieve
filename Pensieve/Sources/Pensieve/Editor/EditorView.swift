@@ -248,7 +248,7 @@ struct EditorRepresentable: NSViewRepresentable {
       aiAutocompleteEnabled: aiAutocompleteEnabled,
       documentID: documentID
     )
-    context.coordinator.lastAppliedSkin = skin
+    context.coordinator.rethemeMemo.record(skin.paintedIdentity)
     surface.onTextChanged = { newText in
       self.text = newText
       self.isDirty = true
@@ -291,11 +291,17 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
     surface.onRewritePreviewChanged = onRewritePreviewChanged
     surface.configureDocument(id: documentID)
-    // Re-theme only on an actual skin change. Pushing tokens re-runs a full
-    // highlight refresh, so doing it on every keystroke re-render would be the
-    // per-keystroke hang the perf pins guard against.
-    if context.coordinator.lastAppliedSkin != skin {
-      context.coordinator.lastAppliedSkin = skin
+    // Re-theme only when the palette actually changed. Pushing tokens re-runs a
+    // full highlight refresh, so doing it on every keystroke re-render would be
+    // the per-keystroke hang the perf pins guard against.
+    //
+    // The key is the PAINTED identity, not the skin the operator picked. Those
+    // were the same thing until a skin gained two palettes: on a paired skin the
+    // enum stays `.typewriter` while the Mac moves between the halves, so a memo
+    // keyed on the enum answers "nothing changed" to the one change that matters
+    // and leaves the source panel painted in the other half — a black pane in a
+    // fully light window, which is exactly what the operator saw.
+    if context.coordinator.rethemeMemo.needsReapply(skin.paintedIdentity) {
       surface.applyTheme(skin)
     }
     // Keep the host window's appearance + titlebar backing in lockstep with the
@@ -357,15 +363,40 @@ struct EditorRepresentable: NSViewRepresentable {
     }
   }
 
+  /// Remembers what the source panel is currently painted in, so the expensive
+  /// re-theme runs on a palette change and on nothing else.
+  ///
+  /// A value type on purpose: the whole failure this replaces was a memo whose
+  /// key was subtly weaker than the thing it guarded, and a key that can be
+  /// exercised on its own is a key that can be pinned across a full
+  /// dark → light → dark cycle without a SwiftUI host.
+  struct RethemeMemo {
+    private var painted: PaintedSkin?
+
+    /// True when `candidate` differs from what was last painted — and records it
+    /// in the same step, so a caller cannot ask and then forget to commit.
+    mutating func needsReapply(_ candidate: PaintedSkin) -> Bool {
+      guard painted != candidate else { return false }
+      painted = candidate
+      return true
+    }
+
+    /// Records a palette applied by someone else (the surface themes itself in
+    /// its initialiser, before `updateNSView` ever runs).
+    mutating func record(_ applied: PaintedSkin) {
+      painted = applied
+    }
+  }
+
   func makeCoordinator() -> Coordinator {
     Coordinator()
   }
 
   final class Coordinator {
     var surface: MarkdownEditorSurface?
-    /// Last skin pushed to the surface, so `updateNSView` re-themes only on a
-    /// real change and never re-runs the highlight pass per keystroke.
-    var lastAppliedSkin: PensieveTheme?
+    /// Guards the surface re-theme, so `updateNSView` re-themes only on a real
+    /// palette change and never re-runs the highlight pass per keystroke.
+    var rethemeMemo = RethemeMemo()
     private var lastAppliedFormattingCommandID: UUID?
     private var lastAppliedRewriteCommandID: UUID?
     private var lastAppliedFindCommandID: UUID?
