@@ -196,7 +196,7 @@ final class EditorToolbarOverflowTests: XCTestCase {
 
     let theme = try XCTUnwrap(
       Self.authoredItem(named: "Theme", in: rig),
-      "no authored Theme entry at \(Int(width))pt")
+      "no authored Theme entry at \(Int(width))pt — " + rig.overflowDiagnostics)
     XCTAssertEqual(theme.submenu?.items.map(\.title), PensieveTheme.allCases.map(\.displayName))
     let wantedSkin = try XCTUnwrap(PensieveTheme.allCases.last { $0 != rig.themeManager.skin })
     let skinItem = try XCTUnwrap(theme.submenu?.items.first { $0.title == wantedSkin.displayName })
@@ -214,23 +214,59 @@ final class EditorToolbarOverflowTests: XCTestCase {
     // its authored forms are back in agreement — never after a bare sleep.
     XCTAssertTrue(
       rig.syncOverflowMenus(),
-      "the overflow menus never came back into agreement with the toolbar at \(Int(width))pt")
+      "the overflow menus never came back into agreement with the toolbar at \(Int(width))pt — "
+        + rig.overflowDiagnostics)
 
     // Switching to focus mode takes the appearance control off the toolbar
     // (`showsAppearanceControls`), so the authored menu has to follow the
     // toolbar rather than describe a control that is no longer there.
     let mode = try XCTUnwrap(
-      Self.authoredItem(named: "Mode", in: rig), "no authored Mode entry at \(Int(width))pt")
+      Self.authoredItem(named: "Mode", in: rig),
+      "no authored Mode entry at \(Int(width))pt — " + rig.overflowDiagnostics)
     XCTAssertEqual(mode.submenu?.items.map(\.title), EditorMode.allCases.map(\.label))
     let modeItem = try XCTUnwrap(mode.submenu?.items.first { $0.title == EditorMode.focus.label })
     Self.fire(modeItem)
     XCTAssertEqual(
       rig.appState.mode, .focus, "the » menu's mode entry did not change the editor layout")
 
-    XCTAssertTrue(rig.syncOverflowMenus(), "the overflow menus did not follow the mode switch")
+    XCTAssertTrue(
+      rig.syncOverflowMenus(),
+      "the overflow menus did not follow the mode switch — " + rig.overflowDiagnostics)
     XCTAssertNil(
       Self.authoredItem(named: "Theme", in: rig),
       "focus mode has no preview surface to dress, but the » menu still offers its theme picker")
+  }
+
+  /// The ordering that made CI red while this machine stayed green.
+  ///
+  /// A state change schedules a SwiftUI rebuild, and nothing says the rebuild
+  /// lands before the overflow pass runs. On a slower runner it landed AFTER —
+  /// inside the settle the check verifies from — so a single-shot sync authored
+  /// the menus, watched SwiftUI take them straight back, and reported failure at
+  /// a 1600pt window where nothing was even clipped. Forcing that ordering here
+  /// (the clobber is scheduled to land mid-settle) reproduces the runner exactly
+  /// and keeps the retry honest: with one attempt this fails, as it did on CI.
+  @MainActor
+  func testOverflowSyncSurvivesARebuildThatLandsAfterThePass() throws {
+    let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
+    defer { rig.tearDown() }
+    XCTAssertTrue(rig.overflowMatches(rig.toolbelt.overflowFamilies), rig.overflowDiagnostics)
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+      MainActor.assumeIsolated {
+        for group in rig.itemGroups {
+          group.menuFormRepresentation = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        }
+      }
+    }
+
+    XCTAssertTrue(
+      rig.syncOverflowMenus(),
+      "a rebuild landing after the pass must be repaired by the next attempt, not reported as a "
+        + "toolbar that never converges — " + rig.overflowDiagnostics)
+    XCTAssertNotNil(
+      Self.authoredItem(named: "Mode", in: rig),
+      "the menu converged but has no Mode entry — " + rig.overflowDiagnostics)
   }
 
   /// The repair trigger itself, driven by the cycle the app really uses.
