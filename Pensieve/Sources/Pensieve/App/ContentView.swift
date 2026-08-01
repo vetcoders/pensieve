@@ -46,22 +46,12 @@ struct ContentView: View {
           for: appState.documentURL, workspaceRoots: appState.workspaceRoots)
         : ""
     )
-    .toolbar {
-      EditorToolbelt(
-        appState: appState,
-        controller: controller,
-        themeManager: themeManager,
-        onDispatchToAgent: {
-          controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
-        },
-        isDispatchDisabled:
-          !appState.documentHasEditableBuffer
-          || !SandboxCapabilities.allowsExternalAgentDispatch(),
-        dispatchHelp:
-          SandboxCapabilities.allowsExternalAgentDispatch()
-          ? "Dispatch to Agent"
-          : SandboxCapabilities.dispatchUnavailableExplanation)
-    }
+    .toolbar { toolbelt }
+    // The clipped-items ("»") menu the bridge cannot build on its own. Anchored
+    // in the content, not the toolbar: a clipped item leaves the view tree, so a
+    // sink living inside the toolbar would stop running exactly when the
+    // overflow menu becomes the only way to reach a family.
+    .background(ToolbarOverflowSink(families: toolbelt.overflowFamilies))
     // The ONE dispatch surface: every route (toolbar, Agents menu, sidebar)
     // lands as this window's pendingDispatchIntent and presents here, in the
     // window that raised it. `.sheet(item:)` keys presentation on the intent
@@ -112,6 +102,26 @@ struct ContentView: View {
       providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
       evaluateProviderOnboarding()
     }
+  }
+
+  /// Built once per pass and used twice — as the toolbar's content and as the
+  /// source of its overflow menu — so the two can never describe different
+  /// toolbars.
+  private var toolbelt: EditorToolbelt {
+    EditorToolbelt(
+      appState: appState,
+      controller: controller,
+      themeManager: themeManager,
+      onDispatchToAgent: {
+        controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
+      },
+      isDispatchDisabled:
+        !appState.documentHasEditableBuffer
+        || !SandboxCapabilities.allowsExternalAgentDispatch(),
+      dispatchHelp:
+        SandboxCapabilities.allowsExternalAgentDispatch()
+        ? "Dispatch to Agent"
+        : SandboxCapabilities.dispatchUnavailableExplanation)
   }
 
   private var dispatchIntentBinding: Binding<DispatchIntent?> {
