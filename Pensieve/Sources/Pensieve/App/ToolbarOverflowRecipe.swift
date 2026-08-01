@@ -112,6 +112,8 @@ enum ToolbarOverflowRecipe {
       controllers.setObject(controller, forKey: window)
     }
 
+    controller.attach(to: window, families: families)
+
     var corrected = false
     for (group, family) in zip(groups, families) where !family.commands.isEmpty {
       if controller.apply(family, to: group) { corrected = true }
@@ -155,6 +157,75 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// throw away the menu AppKit may be showing; comparing shape (not live
   /// state, which the validation pass refreshes) keeps a steady state silent.
   private var signatures: [EditorToolbelt.ToolbarFamilyIdentifier: [String]] = [:]
+
+  /// The last families this window was asserted with, kept so a repair can run
+  /// WITHOUT a SwiftUI pass to hand them over again.
+  private var families: [ToolbarOverflowFamily] = []
+  /// The form identity each family should be wearing, built once per attach.
+  /// `formIdentifier` interpolates a string, and the repair check runs on every
+  /// window update cycle — which on a typing pass is often — so it reads a
+  /// cached value instead of rebuilding six of them per keystroke.
+  private var wantedIdentifiers: [NSUserInterfaceItemIdentifier] = []
+  private weak var window: NSWindow?
+  private var windowObserver: NSObjectProtocol?
+
+  /// Watches the window for a toolbar that came back wearing SwiftUI's derived
+  /// form again.
+  ///
+  /// The sink alone is not enough, and that is measured, not assumed: a form
+  /// taken away between two SwiftUI passes is NEVER restored by waiting — the
+  /// pass runs on a body re-evaluation and on nothing else, so a rebuild that no
+  /// body update follows leaves the "»" menu silently back to the incomplete
+  /// state this recipe exists to replace. This is the same shape
+  /// `WindowChromeRecipe` documents for the titlebar backing and the chip tint;
+  /// the difference is only that the editor's representable re-runs often enough
+  /// to hide it, and this pass does not.
+  ///
+  /// `didUpdate` fires on every window update cycle, so the handler stays a
+  /// pointer-cheap identifier check and rebuilds nothing while the forms are
+  /// still ours.
+  func attach(to window: NSWindow, families: [ToolbarOverflowFamily]) {
+    self.families = families
+    wantedIdentifiers = families.map { ToolbarOverflowRecipe.formIdentifier(for: $0.identifier) }
+    guard self.window !== window else { return }
+    self.window = window
+    if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
+    windowObserver = NotificationCenter.default.addObserver(
+      forName: NSWindow.didUpdateNotification, object: window, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated {
+        _ = self?.repairClobberedForms()
+      }
+    }
+  }
+
+  deinit {
+    if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
+  }
+
+  /// Re-applies only the families whose group is no longer carrying our form.
+  /// Deliberately does NOT re-derive the commands: the closures already captured
+  /// the window's `AppState`/`AppController`, so a repair between SwiftUI passes
+  /// acts on exactly the state the operator is looking at.
+  @discardableResult
+  func repairClobberedForms() -> Bool {
+    guard let window, let toolbar = window.toolbar else { return false }
+    let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
+    guard groups.count == families.count, groups.count == wantedIdentifiers.count,
+      !groups.isEmpty
+    else { return false }
+
+    var repaired = false
+    for (index, group) in groups.enumerated() {
+      let family = families[index]
+      guard !family.commands.isEmpty,
+        group.menuFormRepresentation?.identifier != wantedIdentifiers[index]
+      else { continue }
+      signatures[family.identifier] = nil
+      if apply(family, to: group) { repaired = true }
+    }
+    return repaired
+  }
 
   @discardableResult
   func apply(_ family: ToolbarOverflowFamily, to group: NSToolbarItemGroup) -> Bool {
