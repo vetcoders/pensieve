@@ -99,6 +99,25 @@ final class PreviewThemeTests: XCTestCase {
     }
   }
 
+  /// Asserts a token fact against BOTH halves of the Typewriter pair.
+  ///
+  /// `tokens` resolves a paired skin against the LIVE system setting, so a pin
+  /// written against it states a fact about the machine the suite happens to run
+  /// on. Every value pinned here is currently shared by both halves — which is
+  /// exactly why reading `tokens` looked safe, and exactly why it would have
+  /// gone quietly machine-dependent the day one half moved.
+  private func assertOnBothTypewriterHalves(
+    _ what: String, file: StaticString = #filePath, line: UInt = #line,
+    _ holds: (ThemeTokens) -> Bool
+  ) {
+    for isDark in [true, false] {
+      XCTAssertTrue(
+        holds(PensieveTheme.typewriter.tokens(underDarkSystem: isDark)),
+        "\(what) differs on the \(isDark ? "dark" : "light") half of the typewriter pair",
+        file: file, line: line)
+    }
+  }
+
   // MARK: - semantic status tokens live in the base block
 
   func testBaseBlockDefinesSemanticStatusTokensInBothModes() {
@@ -124,7 +143,7 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertEqual(PensieveTheme.graphite.tokens.warning.css, "#c49a72")
     XCTAssertEqual(PensieveTheme.ink.tokens.warning.css, "#c8b07a")
     XCTAssertEqual(PensieveTheme.porcelain.tokens.warning.css, "#7a4a12")
-    XCTAssertEqual(PensieveTheme.typewriter.tokens.warning.css, "#6e6e6e")
+    assertOnBothTypewriterHalves("warning") { $0.warning.css == "#6e6e6e" }
     XCTAssertEqual(PensieveTheme.default.tokens.warning.css, "#9a6700")
     // Fixed themes resolve the same hex to their NSColor, so the marker colour
     // is the parsed token, not a system fallback.
@@ -141,7 +160,7 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertEqual(PensieveTheme.graphite.tokens.accent.css, "#86b8c4")
     XCTAssertEqual(PensieveTheme.ink.tokens.accent.css, "#8a7fc8")
     XCTAssertEqual(PensieveTheme.porcelain.tokens.accent.css, "#0f6f6c")
-    XCTAssertEqual(PensieveTheme.typewriter.tokens.accent.css, "#1c1c1c")
+    assertOnBothTypewriterHalves("accent") { $0.accent.css == "#1c1c1c" }
     // Adaptive: live linkColor, GitHub base as the CSS fallback.
     XCTAssertEqual(PensieveTheme.default.tokens.accent.css, "#0969da")
     XCTAssertEqual(PensieveTheme.default.tokens.accent.nsColor, NSColor.linkColor)
@@ -159,7 +178,7 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertEqual(PensieveTheme.graphite.tokens.chromeAccent.css, "#3d6f7d")
     XCTAssertEqual(PensieveTheme.ink.tokens.chromeAccent.css, "#6a5fae")
     XCTAssertEqual(PensieveTheme.porcelain.tokens.chromeAccent.css, "#0f6f6c")
-    XCTAssertEqual(PensieveTheme.typewriter.tokens.chromeAccent.css, "#6e6e6e")
+    assertOnBothTypewriterHalves("chromeAccent") { $0.chromeAccent.css == "#6e6e6e" }
 
     // Adaptive skins keep the accent the user picked in System Settings, so
     // `default`/`raw` are the ONLY skins where the chips may read system blue.
@@ -168,9 +187,9 @@ final class PreviewThemeTests: XCTestCase {
     }
 
     // Fixed skins resolve their own hex — no system fallback leaks in.
-    XCTAssertEqual(
-      PensieveTheme.typewriter.tokens.chromeAccent.nsColor,
-      ColorSpec.nsColor(fromHex: "#6e6e6e"))
+    assertOnBothTypewriterHalves("chromeAccent resolves its own hex") {
+      $0.chromeAccent.nsColor == ColorSpec.nsColor(fromHex: "#6e6e6e")
+    }
   }
 
   /// Typewriter is achromatic by design: the mockup that arbitrates this skin
@@ -251,7 +270,7 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertEqual(PensieveTheme.graphite.tokens.muted.css, "#848484")
     XCTAssertEqual(PensieveTheme.ink.tokens.muted.css, "#8590a0")
     XCTAssertEqual(PensieveTheme.porcelain.tokens.muted.css, "#667079")
-    XCTAssertEqual(PensieveTheme.typewriter.tokens.muted.css, "#6e6e6e")
+    assertOnBothTypewriterHalves("muted") { $0.muted.css == "#6e6e6e" }
     XCTAssertEqual(PensieveTheme.default.tokens.muted.css, "#57606a")
     XCTAssertEqual(PensieveTheme.default.tokens.muted.nsColor, NSColor.secondaryLabelColor)
   }

@@ -210,35 +210,63 @@ final class SyntaxHighlighterTests: XCTestCase {
     XCTAssertEqual(backgroundColor(storage, at: at), NSColor.systemYellow.withAlphaComponent(0.35))
   }
 
-  /// Typewriter's mark wash (`#e6e6e6`) is one step from its body text
-  /// (`#d4d4d4`) — ≈1.2:1, a highlight that erases what it marks. The marked
-  /// span must fall back to the theme's own `source` token (an inverted stamp)
-  /// and clear the WCAG non-text threshold.
-  func testHighlightForegroundFallsBackWhenTheWashSwallowsTheTextColour() {
-    let tokens = PensieveTheme.typewriter.tokens
-    let md = "x ==marked== y"
-    let storage = NSTextStorage(string: md)
-    let fullRange = NSRange(location: 0, length: (md as NSString).length)
+  /// The mark wash against the body ink, on BOTH halves of the Typewriter pair —
+  /// which is to say in a dark office and a light one, because that is what
+  /// picks the half.
+  ///
+  /// On the DARK half the wash (`#e6e6e6`) is one step from the body text
+  /// (`#d4d4d4`) — ≈1.2:1, a highlight that erases what it marks — so the marked
+  /// span falls back to the theme's own `source` token and reads as an inverted
+  /// stamp. On the LIGHT half the same wash carries `#1c1c1c` ink at ≈13.7:1, so
+  /// there is nothing to fall back FROM and the span keeps the body colour.
+  ///
+  /// The half is passed in rather than read from the machine. `tokens` resolves
+  /// a paired skin against the LIVE system setting, so a test that reads it is
+  /// measuring the Mac it happens to run on: this pair of assertions used to
+  /// pass on a dark laptop and fail on a light CI runner, describing the same
+  /// correct product either way.
+  func testHighlightForegroundHonoursTheWashOnBothHalvesOfThePair() {
+    for isDark in [true, false] {
+      let tokens = PensieveTheme.typewriter.tokens(underDarkSystem: isDark)
+      let half = isDark ? "dark" : "light"
+      let md = "x ==marked== y"
+      let storage = NSTextStorage(string: md)
+      let fullRange = NSRange(location: 0, length: (md as NSString).length)
 
-    let syntax = SyntaxHighlighter()
-    syntax.baseFontSize = fontSize
-    syntax.tokens = tokens
+      let syntax = SyntaxHighlighter()
+      syntax.baseFontSize = fontSize
+      syntax.tokens = tokens
 
-    storage.beginEditing()
-    syntax.resetBaseAttributes(storage, range: fullRange)
-    syntax.highlight(storage, range: fullRange)
-    storage.endEditing()
+      storage.beginEditing()
+      syntax.resetBaseAttributes(storage, range: fullRange)
+      syntax.highlight(storage, range: fullRange)
+      storage.endEditing()
 
-    let at = index(of: "marked", in: md)
-    XCTAssertEqual(backgroundColor(storage, at: at), tokens.srcHighlightBackground.nsColor)
-    XCTAssertEqual(color(storage, at: at), tokens.source.nsColor)
-    XCTAssertNotEqual(
-      color(storage, at: at), tokens.text.nsColor,
-      "the body text colour is invisible on this theme's wash")
-    let ratio = ThemeContrast.ratio(
-      tokens.source.nsColor, tokens.srcHighlightBackground.nsColor)
-    XCTAssertNotNil(ratio)
-    XCTAssertGreaterThanOrEqual(ratio ?? 0, ThemeContrast.minimumTextContrast)
+      let at = index(of: "marked", in: md)
+      XCTAssertEqual(
+        backgroundColor(storage, at: at), tokens.srcHighlightBackground.nsColor, "\(half) half")
+
+      let painted = color(storage, at: at)
+      if isDark {
+        XCTAssertEqual(
+          painted, tokens.source.nsColor,
+          "\(half) half: the wash swallows the body ink, so the stamp must invert")
+        XCTAssertNotEqual(
+          painted, tokens.text.nsColor,
+          "\(half) half: the body text colour is invisible on this wash")
+      } else {
+        XCTAssertEqual(
+          painted, tokens.text.nsColor,
+          "\(half) half: the body ink carries on this wash — falling back would discard it")
+      }
+
+      // Whatever it chose, what it chose has to be readable on the wash.
+      let ratio = ThemeContrast.ratio(painted ?? .clear, tokens.srcHighlightBackground.nsColor)
+      XCTAssertNotNil(ratio, "\(half) half")
+      XCTAssertGreaterThanOrEqual(
+        ratio ?? 0, ThemeContrast.minimumTextContrast,
+        "\(half) half: the marked span is not legible on its own wash")
+    }
   }
 
   /// Every other fixed palette already reads on its own wash, so the marked span
@@ -380,28 +408,51 @@ final class SyntaxHighlighterTests: XCTestCase {
       tokens.muted.nsColor)
   }
 
-  /// Typewriter's accent (`#1c1c1c`) IS its source surface — correct for the
-  /// chrome, invisible in the editor. Keywords must fall back to the theme's
-  /// strong neutral instead of painting code the colour of the panel.
-  func testFencedKeywordsFallBackWhenTheAccentCollidesWithTheSourceSurface() {
-    let tokens = PensieveTheme.typewriter.tokens
-    let md = "```swift\nfunc greet() {}\n```"
-    let storage = NSTextStorage(string: md)
-    let fullRange = NSRange(location: 0, length: (md as NSString).length)
+  /// Fenced keywords on BOTH halves of the Typewriter pair.
+  ///
+  /// Typewriter's accent is `#1c1c1c` on both sides, but what that means depends
+  /// on the half it lands on. On the DARK half it is all but the source surface
+  /// itself (`#171717`) — correct for the chrome, invisible in the editor — so
+  /// keywords fall back to the theme's strong neutral. On the LIGHT half the
+  /// same ink sits on white at ≈17:1, so the accent is exactly right and keeping
+  /// it is the correct answer.
+  ///
+  /// Driven from an explicit half for the same reason as the wash pin above: a
+  /// test that reads `tokens` on a paired skin is measuring the machine, and
+  /// this one used to disagree with CI purely because the two ran in different
+  /// office lighting.
+  func testFencedKeywordsStayLegibleOnBothHalvesOfThePair() {
+    for isDark in [true, false] {
+      let tokens = PensieveTheme.typewriter.tokens(underDarkSystem: isDark)
+      let half = isDark ? "dark" : "light"
+      let md = "```swift\nfunc greet() {}\n```"
+      let storage = NSTextStorage(string: md)
+      let fullRange = NSRange(location: 0, length: (md as NSString).length)
 
-    let codeBlocks = CodeBlockHighlighter()
-    codeBlocks.baseFontSize = fontSize
-    codeBlocks.tokens = tokens
+      let codeBlocks = CodeBlockHighlighter()
+      codeBlocks.baseFontSize = fontSize
+      codeBlocks.tokens = tokens
 
-    storage.beginEditing()
-    codeBlocks.highlight(storage, range: fullRange)
-    storage.endEditing()
+      storage.beginEditing()
+      codeBlocks.highlight(storage, range: fullRange)
+      storage.endEditing()
 
-    let at = index(of: "func", in: md)
-    XCTAssertEqual(color(storage, at: at), tokens.srcHeading.nsColor)
-    XCTAssertNotEqual(
-      color(storage, at: at), tokens.source.nsColor,
-      "keywords must never be painted in the source surface colour")
+      let at = index(of: "func", in: md)
+      let painted = color(storage, at: at)
+      XCTAssertEqual(
+        painted, isDark ? tokens.srcHeading.nsColor : tokens.accent.nsColor,
+        "\(half) half: keyword ink")
+      XCTAssertNotEqual(
+        painted, tokens.source.nsColor,
+        "\(half) half: keywords must never be painted in the source surface colour")
+
+      // The invariant underneath both branches: whatever it picked, it reads.
+      let ratio = ThemeContrast.ratio(painted ?? .clear, tokens.source.nsColor)
+      XCTAssertNotNil(ratio, "\(half) half")
+      XCTAssertGreaterThanOrEqual(
+        ratio ?? 0, ThemeContrast.minimumTextContrast,
+        "\(half) half: keywords are not legible on the source surface")
+    }
   }
 
   /// Live-switch pin: pushing new tokens onto the SAME highlighter instance must
