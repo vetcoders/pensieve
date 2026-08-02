@@ -105,6 +105,61 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
       "a vanished root must be dropped silently (startup state, not a user error)")
   }
 
+  /// THE PIN, on the exact production sequence. `activate` filed the grant
+  /// under the URL as GIVEN while `removeFile` released it under
+  /// `url.standardizedFileURL` — and those are two different keys on the
+  /// commonest path there is. A relaunch restore activates the
+  /// bookmark-RESOLVED URL, which arrives `/private`-prefixed
+  /// (`/private/var/folders/…`), and `standardizedFileURL` STRIPS that prefix.
+  /// So the stop looked up a key that was never written, found nothing, and the
+  /// security-scoped grant leaked until the process exited.
+  func testClosingARestoredFileReleasesItsSecurityScopedGrant() throws {
+    let noteURL = folder.appendingPathComponent("scoped.md")
+    try "scoped".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let writer = BookmarkStore(defaults: defaults)
+    try writer.persistFile(url: noteURL, into: AppState())
+
+    // A fresh store over the same defaults = the relaunch path: restore
+    // resolves each bookmark and activates the RESOLVED URL.
+    let reader = BookmarkStore(defaults: defaults)
+    let restored = reader.restoreWorkspace(into: AppState())
+    let resolvedURL = try XCTUnwrap(restored.fileURLs.first)
+    XCTAssertEqual(reader.activeSecurityScopeCount, 1, "the restore must take the grant")
+    // The premise, asserted rather than assumed: with one spelling this pin
+    // would pass on the broken code and prove nothing.
+    XCTAssertNotEqual(
+      resolvedURL, resolvedURL.standardizedFileURL,
+      "the resolved bookmark is already canonical here, so this pin cannot see the bug")
+
+    reader.removeFile(url: resolvedURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      reader.activeSecurityScopeCount, 0,
+      "the security-scoped grant survived the close — taken under the resolved spelling,"
+        + " released under the standardized one, so it leaks for the rest of the process")
+  }
+
+  /// THE CONTROL LEG. The already-canonical spelling must keep balancing, and a
+  /// URL this store never granted must still be a no-op rather than an
+  /// unbalanced stop.
+  func testACanonicalCloseStillBalancesAndAnUnknownOneStaysANoOp() throws {
+    let noteURL = folder.standardizedFileURL.appendingPathComponent("canonical.md")
+    try "canonical".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let store = BookmarkStore(defaults: defaults)
+    try store.persistFile(url: noteURL, into: AppState())
+    XCTAssertEqual(store.activeSecurityScopeCount, 1)
+
+    store.removeFile(url: folder.appendingPathComponent("never-opened.md"))
+    XCTAssertEqual(
+      store.activeSecurityScopeCount, 1,
+      "closing a file this store never granted must not release someone else's access")
+
+    store.removeFile(url: noteURL)
+    XCTAssertEqual(store.activeSecurityScopeCount, 0)
+  }
+
   func testFailedWorkspaceReplacementPreservesPreviouslyPersistedRoots() throws {
     let store = BookmarkStore(defaults: defaults)
     let state = AppState()

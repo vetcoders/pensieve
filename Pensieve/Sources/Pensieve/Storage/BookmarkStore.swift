@@ -8,7 +8,21 @@ final class BookmarkStore {
   private let legacyFolderBookmarkKey = "Pensieve.openFolder.bookmark"
   private let rootBookmarksKey = "Pensieve.workspace.rootBookmarks"
   private let fileBookmarksKey = "Pensieve.workspace.fileBookmarks"
-  private var activeAccess: [URL: Bool] = [:]
+
+  /// One live security-scoped grant: the URL access was actually STARTED on
+  /// (start/stop must balance on the same object) and whether the start
+  /// succeeded. Filed under the standardized URL — see `stopAccess(to:)`.
+  private struct ActiveAccess {
+    let exactURL: URL
+    let wasGranted: Bool
+  }
+
+  private var activeAccess: [URL: ActiveAccess] = [:]
+
+  /// How many security-scoped grants this store is still holding. A leaked
+  /// grant has no observable effect until the process exits, so this is the
+  /// only seam a test can measure the balance through.
+  var activeSecurityScopeCount: Int { activeAccess.count }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -211,26 +225,39 @@ final class BookmarkStore {
   }
 
   private func activate(_ url: URL) {
-    if activeAccess[url] != nil {
+    let key = url.standardizedFileURL
+    if activeAccess[key] != nil {
       return
     }
 
-    activeAccess[url] = url.startAccessingSecurityScopedResource()
+    activeAccess[key] = ActiveAccess(
+      exactURL: url,
+      wasGranted: url.startAccessingSecurityScopedResource()
+    )
   }
 
-  /// Releases the security-scoped access this store took for one file. Keyed by
-  /// the URL `activate` recorded, so a spelling that never granted access is a
-  /// no-op rather than an unbalanced stop.
+  /// Releases the security-scoped access this store took for one file.
+  ///
+  /// Keyed by the STANDARDIZED URL, and it has to be: `activate` is called with
+  /// whatever spelling reached it — `persistFile` passes the caller's raw URL,
+  /// and `restoreURLs` passes the bookmark-RESOLVED URL, which for anything
+  /// under `/tmp` or `/var` differs from its standardized form. `removeFile`
+  /// has always stopped with the standardized URL, so a grant taken under a
+  /// non-canonical spelling was never found and leaked until process exit.
+  ///
+  /// The stop itself still goes through the EXACT URL that was activated:
+  /// start/stop must balance on the same object, so canonicalizing the key is
+  /// not licence to canonicalize the call.
   private func stopAccess(to url: URL) {
-    guard let accessWasGranted = activeAccess.removeValue(forKey: url) else { return }
-    if accessWasGranted {
-      url.stopAccessingSecurityScopedResource()
+    guard let access = activeAccess.removeValue(forKey: url.standardizedFileURL) else { return }
+    if access.wasGranted {
+      access.exactURL.stopAccessingSecurityScopedResource()
     }
   }
 
   private func stopAllAccess() {
-    for (url, accessWasGranted) in activeAccess where accessWasGranted {
-      url.stopAccessingSecurityScopedResource()
+    for access in activeAccess.values where access.wasGranted {
+      access.exactURL.stopAccessingSecurityScopedResource()
     }
     activeAccess.removeAll()
   }
