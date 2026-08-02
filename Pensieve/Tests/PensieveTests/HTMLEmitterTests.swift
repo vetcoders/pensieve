@@ -172,6 +172,30 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertTrue(html.contains("[~] literal"), html)
   }
 
+  /// The source check asked the WRONG question: "is the first byte a
+  /// backslash?" A backslash is not the only way to reach a `[` that the author
+  /// did not type — cmark decodes character references during inline parsing, so
+  /// `&#91;~] wip` arrives in the AST as a pristine `[~] wip` whose first source
+  /// byte is `&`. That is not a backslash, so the old test said "not escaped"
+  /// and promoted a task GFM would never promote. Ask the positive question
+  /// instead: the marker counts only when the source really begins with `[`.
+  func testEntityEncodedMarkerStaysProseInsteadOfBecomingATask() {
+    let html = render("- &#91;~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
+  /// THE CONTROL LEG for the positive test. Turning "not a backslash" into "is a
+  /// `[`" must not disarm the plainly written marker beside it.
+  func testAPlainlyWrittenMarkerStillPromotesBesideAnEncodedOne() {
+    let html = render("- &#91;~] encoded\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] encoded"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
   /// GFM's own escaped checkbox is unaffected — the byte-parity guard for the
   /// two states cmark already owns.
   func testEscapedGFMCheckboxStillRendersAsProse() {

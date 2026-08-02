@@ -222,9 +222,10 @@ struct HTMLEmitter: MarkupVisitor {
     var inlines = Array(paragraph.inlineChildren)
     guard var text = inlines.first as? Text, text.string.hasPrefix(Self.inProgressMarker)
     else { return nil }
-    // cmark strips the backslash while building the Text node, so an escaped
-    // marker is indistinguishable from a real one in the AST — ask the source.
-    guard !isEscaped(text) else { return nil }
+    // cmark resolves escapes AND character references while building the Text
+    // node, so a marker the author never wrote is indistinguishable from a real
+    // one in the AST — ask the source.
+    guard sourceOpensWithLiteralBracket(text) else { return nil }
     let remainder = text.string.dropFirst(Self.inProgressMarker.count)
     guard remainder.first.map(\.isWhitespace) ?? true else { return nil }
 
@@ -242,16 +243,23 @@ struct HTMLEmitter: MarkupVisitor {
     return children
   }
 
-  /// True when the inline's first source character is a backslash — i.e. what
-  /// looks like a marker in the AST was written `\[~]` and is prose.
+  /// True when the inline really begins with the `[` byte its AST text claims.
   ///
-  /// Without a source range (source positions disabled, or a `source` that does
-  /// not match the parsed string) the answer is "not escaped", which is the
+  /// Deliberately a POSITIVE test rather than "is the first byte a backslash?".
+  /// A backslash is not the only route to a `[` the author never typed: cmark
+  /// decodes character references during inline parsing, so `&#91;~] wip`
+  /// reaches the AST as a pristine `[~] wip` whose first source byte is `&`.
+  /// Enumerating the ways to spell a bracket is a losing game — requiring the
+  /// literal byte covers every one of them at once.
+  ///
+  /// Without a resolvable source byte (source positions disabled, or a `source`
+  /// that does not match the parsed string) the answer is "allow", which is the
   /// behaviour that predates this check.
-  private mutating func isEscaped(_ inline: some InlineMarkup) -> Bool {
-    guard let start = inline.range?.lowerBound else { return false }
+  private mutating func sourceOpensWithLiteralBracket(_ inline: some InlineMarkup) -> Bool {
+    guard let start = inline.range?.lowerBound else { return true }
     if sourceIndex == nil { sourceIndex = SourceIndex(source) }
-    return sourceIndex?.byte(at: start) == UInt8(ascii: "\\")
+    guard let index = sourceIndex, let byte = index.byte(at: start) else { return true }
+    return byte == UInt8(ascii: "[")
   }
 
   /// `source` as UTF-8 bytes plus each line's start offset, so a cmark
