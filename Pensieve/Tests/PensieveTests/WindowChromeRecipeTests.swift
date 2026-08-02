@@ -421,6 +421,217 @@ final class WindowChromeRecipeTests: XCTestCase {
       chips.selectedSegmentBezelColor,
       WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
   }
+
+  // MARK: - Native tab bar
+
+  /// `VibrantDark` and `DarkAqua` are the same SIDE. Comparing raw names would
+  /// call an already-correct vibrant tab bar a disagreement and rewrite it on
+  /// every pass — flattening its glass and never converging.
+  func testAppearancePolarityFoldsTheVibrantVariantsOntoTwoAnswers() {
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(NSAppearance(named: .vibrantDark)), .darkAqua)
+    XCTAssertEqual(WindowChromeRecipe.appearancePolarity(NSAppearance(named: .darkAqua)), .darkAqua)
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(NSAppearance(named: .vibrantLight)), .aqua)
+    XCTAssertEqual(WindowChromeRecipe.appearancePolarity(NSAppearance(named: .aqua)), .aqua)
+    XCTAssertNil(WindowChromeRecipe.appearancePolarity(nil))
+  }
+
+  /// A correction keeps the material it found. A glass node that had chosen
+  /// `VibrantLight` is put back to `VibrantDark`; a flat one to `DarkAqua`.
+  func testACorrectionKeepsTheVibrancyItFound() {
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .darkAqua, preservingVibrancyOf: NSAppearance(named: .vibrantLight))?.name,
+      .vibrantDark,
+      "flattening a glass node to DarkAqua would drop the material the tab bar is made of")
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .aqua, preservingVibrancyOf: NSAppearance(named: .vibrantDark))?.name,
+      .vibrantLight)
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .darkAqua, preservingVibrancyOf: NSAppearance(named: .aqua))?.name,
+      .darkAqua)
+  }
+
+  /// The side the tab bar must agree with comes from the SKIN when the skin
+  /// names one, and from the window only for the adaptive skins.
+  ///
+  /// Skin-first is load-bearing, not tidiness: a skin switch is one of the
+  /// moments the tab bar is rebuilt, and `window.effectiveAppearance` can still
+  /// be reporting the outgoing half while that happens — so a window-first read
+  /// would pin the new tab bar to the skin being left.
+  @MainActor
+  func testTabBarPolarityPrefersTheSkinAndFallsBackToTheWindow() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    window.appearance = NSAppearance(named: .darkAqua)
+    XCTAssertEqual(
+      WindowChromeRecipe.tabBarPolarity(on: window, for: .parchment), .aqua,
+      "a light skin's tab bar must be light even while the window still reads dark")
+
+    XCTAssertEqual(
+      WindowChromeRecipe.tabBarPolarity(on: window, for: .default), .darkAqua,
+      "an adaptive skin names no appearance, so the window is the only answer left")
+    window.appearance = NSAppearance(named: .aqua)
+    XCTAssertEqual(WindowChromeRecipe.tabBarPolarity(on: window, for: .default), .aqua)
+  }
+
+  /// THE REGRESSION PIN for the tab bar.
+  ///
+  /// What it models is the state an operator photographed: a native tab pill
+  /// over the white preview column rendering light on a dark window. The
+  /// TRIGGER is not reproducible below the window server — a glass view resolves
+  /// against composited luminance, and a headless probe with a white content
+  /// column produced no flip at all (the same limit `bdbb816` recorded for the
+  /// toolbar platters). So the flip is INJECTED, exactly as measured on the
+  /// probe: the tab bar's glass nodes carrying an explicitly-set `VibrantLight`
+  /// while the window is `darkAqua`.
+  ///
+  /// Injecting the state is honest here because the state is what was measured
+  /// on the real app, and because the defect is TRANSIENT: the tab bar is
+  /// rebuilt out from under any one-shot pin (every window in the group carries
+  /// its own accessory, and selecting a tab hands the newly visible one a glass
+  /// node with no appearance of its own). What has to be true is that production
+  /// puts a wrong-sided tab bar back, on demand, as often as AppKit hands it
+  /// one — and that is exactly what this asserts.
+  @MainActor
+  func testAFlippedTabBarIsPutBackOnTheWindowsSide() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+    window.appearance = NSAppearance(named: .darkAqua)
+
+    // The measured shape: a track-level glass node and one per tab pill, each
+    // having self-selected the wrong side.
+    let track = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 28))
+    let leading = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+    let trailing = NSView(frame: NSRect(x: 300, y: 0, width: 300, height: 24))
+    track.addSubview(leading)
+    track.addSubview(trailing)
+    for view in [track, leading, trailing] {
+      view.appearance = NSAppearance(named: .vibrantLight)
+    }
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertTabBarAppearance(
+        on: window, for: .ink, tabBarViews: [track, leading, trailing]))
+    for view in [track, leading, trailing] {
+      XCTAssertEqual(
+        view.appearance?.name, .vibrantDark,
+        "a tab pill that self-selected light over the preview column stays light — nothing "
+          + "re-asserts the window's side on the tab bar")
+    }
+
+    // Converged: an already-correct tab bar is not touched again, so this is
+    // safe on a window update cycle.
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(
+        on: window, for: .ink, tabBarViews: [track, leading, trailing]),
+      "a second pass rewrote an already-correct tab bar — that is the write loop, on a "
+        + "notification the window itself posts")
+
+    // And a node already on the right side keeps its exact material.
+    let vibrant = NSView(frame: .zero)
+    vibrant.appearance = NSAppearance(named: .vibrantDark)
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(on: window, for: .ink, tabBarViews: [vibrant]))
+    XCTAssertEqual(vibrant.appearance?.name, .vibrantDark)
+  }
+
+  /// A window with no visible tab bar has nothing to correct, and must say so
+  /// rather than report a correction on every pass — `assertWindowChrome` folds
+  /// this answer into its own converged/not result.
+  @MainActor
+  func testTabBarAssertionIsSilentWithoutATabBar() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    XCTAssertTrue(WindowChromeRecipe.tabBarSelfSelectingViews(in: window).isEmpty)
+    XCTAssertFalse(WindowChromeRecipe.assertTabBarAppearance(on: window, for: .parchment))
+  }
+
+  /// THE END-TO-END PIN: a REAL native tab group, the real AppKit view tree, and
+  /// the production entry point with no seam.
+  ///
+  /// The pin above drives the polarity rules against a known view shape; this
+  /// one proves the other half — that the walk actually FINDS AppKit's tab bar
+  /// (`titlebarAccessoryViewControllers` → `NSTabBar` → the glass nodes that set
+  /// their own appearance), that the `isTabBarVisible` gate lets it through, and
+  /// that `assertWindowChrome` runs it. Nothing here names a private class: the
+  /// flip is injected onto whatever nodes the walk itself returns, so the pin
+  /// cannot pass by agreeing with a hard-coded view hierarchy.
+  @MainActor
+  func testARealTabGroupsFlippedGlassIsRepairedThroughAssertWindowChrome() throws {
+    func makeWindow(_ title: String) -> NSWindow {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false)
+      WindowChromeRecipe.apply(to: window, title: title)
+      window.contentView = NSView(frame: .zero)
+      return window
+    }
+
+    let leading = makeWindow("dont_forget_about")
+    let trailing = makeWindow("Recovered Untitled.md")
+    defer {
+      for window in [leading, trailing] {
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+      }
+    }
+    for window in [leading, trailing] { window.appearance = NSAppearance(named: .darkAqua) }
+    // Parked far offscreen at zero alpha: still laid out, never on a screen an
+    // operator is looking at.
+    leading.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+    leading.alphaValue = 0
+    leading.makeKeyAndOrderFront(nil)
+    leading.addTabbedWindow(trailing, ordered: .above)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+
+    let found = WindowChromeRecipe.tabBarSelfSelectingViews(in: leading)
+    guard leading.tabGroup?.isTabBarVisible == true, !found.isEmpty else {
+      throw XCTSkip("headless host did not build a native tab bar")
+    }
+
+    // Inject the measured symptom onto the real nodes.
+    for view in found { view.appearance = NSAppearance(named: .vibrantLight) }
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(found.first?.appearance), .aqua,
+      "premise: the tab bar is now on the wrong side, like the pill over the preview column")
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertWindowChrome(on: leading, for: .ink),
+      "the window chrome pass did not reach the native tab bar at all")
+    for view in WindowChromeRecipe.tabBarSelfSelectingViews(in: leading) {
+      XCTAssertEqual(
+        WindowChromeRecipe.appearancePolarity(view.appearance), .darkAqua,
+        "a self-selected light tab bar survived the chrome pass on a dark window")
+    }
+
+    // Converged: the same pass over an already-correct tab bar writes nothing,
+    // which is what makes it safe on every window update cycle.
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(on: leading, for: .ink),
+      "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
+  }
 }
 
 /// Minimal toolbar delegate handing back two view-backed items — the AppKit
