@@ -39,13 +39,13 @@ final class ThemeManager: ObservableObject {
   }
 
   @Published var current: Theme {
-    didSet { persist(\.flavorKey, current.rawValue) }
+    didSet { persist(Self.flavorKey, current.rawValue) }
   }
 
   /// Active reading-surface skin. App-wide like the flavor so every window and
   /// the toolbar picker agree on one selection.
   @Published var skin: PensieveTheme {
-    didSet { persist(\.skinKey, skin.rawValue) }
+    didSet { persist(Self.skinKey, skin.rawValue) }
   }
 
   /// Bumped when the system light/dark setting flips.
@@ -66,16 +66,100 @@ final class ThemeManager: ObservableObject {
   private var cache: [Theme: String] = [:]
   private var appearanceObservation: NSKeyValueObservation?
 
-  private let flavorKey = "pensieve.preview.flavor"
-  private let skinKey = "pensieve.preview.skin"
+  static let flavorKey = "pensieve.preview.flavor"
+  static let skinKey = "pensieve.preview.skin"
+
+  /// Where this preferences container came from, decided once and written down.
+  ///
+  /// The skin key alone cannot say. `guard let raw else { return .graphite }`
+  /// reads a missing `pensieve.preview.skin` as "fresh install, take the new
+  /// default" — but the builds before this one resolved that same absence to
+  /// `.default`, and `skin`'s `didSet` does not fire during `init`, so an
+  /// operator who has been reading on Default since before this build and never
+  /// touched the picker has no key either. Left alone, shipping this build would
+  /// silently re-theme her to Graphite on first launch.
+  ///
+  /// So the container is classified instead, once, on the first launch that
+  /// knows how to ask.
+  enum InstallOrigin: String {
+    /// Nothing of Pensieve's was in the container: a genuinely new install,
+    /// which takes this build's fresh-install default.
+    case fresh
+    /// A previous build had already written here. Absent a skin key, that
+    /// operator was on Default and never chose otherwise; she keeps it.
+    case upgrade
+
+    /// Skin for an install carrying NO `pensieve.preview.skin` key.
+    var skinWithoutAChoice: PensieveTheme {
+      switch self {
+      case .fresh: return .graphite
+      case .upgrade: return .default
+      }
+    }
+  }
+
+  /// The one-time marker. Its presence is what makes the classification stable:
+  /// once this build starts writing keys of its own, the container stops looking
+  /// fresh, and re-deriving the answer on a later launch would flip it.
+  static let installOriginKey = "pensieve.install.origin"
+
+  /// Keys a build BEFORE this one could have left behind.
+  ///
+  /// Not one of them is guaranteed — every single one is written from a `didSet`
+  /// or from an explicit action, and Swift skips property observers during
+  /// `init`, so this app writes NOTHING on a launch where the operator changes
+  /// nothing. The test is therefore "any of these", not "one particular one",
+  /// and it still cannot see an install that was launched, never touched, and
+  /// never opened a file. That residue is the honest limit of a marker
+  /// introduced after the fact: there is no earlier evidence to read.
+  static let priorContainerKeys = [
+    flavorKey,
+    "pensieve.sidebar.tab",
+    "Pensieve.sidebarSortOrder",
+    "Pensieve.dispatch.lastRunRootPath",
+    "Pensieve.workspace.rootBookmarks",
+    "Pensieve.workspace.fileBookmarks",
+    "Pensieve.openFolder.bookmark",
+    "Pensieve.previewAutoReload",
+    "Pensieve.tableTidyOnPaste",
+    "Pensieve.asciiSafeTables",
+    "Pensieve.aiAutocompleteEnabled",
+    "Pensieve.scrollSyncEnabled",
+    // AppKit's own Open-Recent history, which it writes for us whenever a
+    // document is opened — the widest net available for "this install was used".
+    "NSRecentDocumentRecords",
+  ]
+
+  /// Classifies the container and remembers the answer. Idempotent: after the
+  /// first call the marker is read back rather than re-derived.
+  @discardableResult
+  static func installOrigin(defaults: UserDefaults) -> InstallOrigin {
+    if let known = defaults.string(forKey: installOriginKey)
+      .flatMap(InstallOrigin.init(rawValue:))
+    {
+      return known
+    }
+
+    let usedBefore =
+      defaults.object(forKey: skinKey) != nil
+      || priorContainerKeys.contains { defaults.object(forKey: $0) != nil }
+    let origin: InstallOrigin = usedBefore ? .upgrade : .fresh
+    defaults.set(origin.rawValue, forKey: installOriginKey)
+    return origin
+  }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.current =
-      defaults.string(forKey: "pensieve.preview.flavor")
+      defaults.string(forKey: Self.flavorKey)
       .flatMap(Theme.init(rawValue:)) ?? .markdown
-    let persistedSkin = defaults.string(forKey: "pensieve.preview.skin")
-    let resolvedSkin = PensieveTheme.resolve(persistedRawValue: persistedSkin)
+
+    // Classify BEFORE this instance writes anything of its own — the migration
+    // write-back below lands in the same container the classification reads.
+    let origin = Self.installOrigin(defaults: defaults)
+    let persistedSkin = defaults.string(forKey: Self.skinKey)
+    let resolvedSkin = PensieveTheme.resolve(
+      persistedRawValue: persistedSkin, withoutAChoice: origin.skinWithoutAChoice)
     self.skin = resolvedSkin
 
     // A migration that only lives in memory is not a migration. `skin`'s
@@ -84,10 +168,11 @@ final class ThemeManager: ObservableObject {
     // stays in the store until the operator happens to pick a skin by hand:
     // every launch re-migrates the same dead value, and anything else reading
     // the raw key still sees a skin this build no longer has. Settle it where
-    // it is resolved. A fresh install writes nothing: no key means no choice
-    // yet, and defaulting to graphite is not the operator picking graphite.
+    // it is resolved. No skin key still means no choice yet — resolving one is
+    // not the operator picking one — so an install without a stored skin gets
+    // no skin written, whichever way `installOrigin` classified it.
     if let persistedSkin, persistedSkin != resolvedSkin.rawValue {
-      persist(\.skinKey, resolvedSkin.rawValue)
+      persist(Self.skinKey, resolvedSkin.rawValue)
     }
 
     observeSystemAppearance()
@@ -134,7 +219,7 @@ final class ThemeManager: ObservableObject {
     return loaded
   }
 
-  private func persist(_ key: KeyPath<ThemeManager, String>, _ value: String) {
-    defaults.set(value, forKey: self[keyPath: key])
+  private func persist(_ key: String, _ value: String) {
+    defaults.set(value, forKey: key)
   }
 }

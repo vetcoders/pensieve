@@ -366,11 +366,23 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
 
   // MARK: - Migration
 
-  /// Fresh installs default to `graphite`. Known raw values pass through;
-  /// legacy values from the pre-consolidation set map to their nearest
-  /// survivor; anything else falls back to the GitHub `default`.
-  static func resolve(persistedRawValue raw: String?) -> PensieveTheme {
-    guard let raw else { return .graphite }
+  /// Known raw values pass through; legacy values from the pre-consolidation set
+  /// map to their nearest survivor; anything else falls back to the GitHub
+  /// `default`.
+  ///
+  /// NO value is the one case this function cannot answer on its own. It used to
+  /// mean "fresh install", and the fresh-install default is `graphite` — but the
+  /// shipped builds resolved a missing key to `default`, and `skin`'s `didSet`
+  /// does not fire during `init`, so an operator who has been reading on
+  /// `Default` since before this build has no key either. Both look identical
+  /// from here. `withoutAChoice` is that decision, made by the caller that can
+  /// see the whole preferences container (`ThemeManager.installOrigin`); the
+  /// `graphite` default keeps this a pure fresh-install answer for callers with
+  /// nothing else to go on.
+  static func resolve(
+    persistedRawValue raw: String?, withoutAChoice fallback: PensieveTheme = .graphite
+  ) -> PensieveTheme {
+    guard let raw else { return fallback }
     if let known = PensieveTheme(rawValue: raw) { return known }
     return legacyMigration[raw] ?? .default
   }
