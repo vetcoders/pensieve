@@ -167,6 +167,15 @@ final class AppController: ObservableObject {
   /// the file that was just created.
   var currentDocumentIdentity: DocumentIdentity? { appState.documentSession.identity }
 
+  /// True while a Word/PDF conversion started in this window is still running.
+  /// The same "does this window hold live work" question the sweep asks — and
+  /// an import is the one kind of live work that shows up NOWHERE else: the
+  /// conversion runs off the main actor, so the session is still empty, and the
+  /// initial load is already marked resolved, so the accessor publishes no
+  /// document identity and the tab is filed back as an empty launcher. Reaping
+  /// it deallocates the window's controller and the conversion is discarded.
+  var hasPendingImportWork: Bool { documentImportTask != nil }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a

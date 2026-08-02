@@ -728,14 +728,17 @@ final class DocumentWindowRegistry: ObservableObject {
       && !windowsByDocumentID.values.contains { $0.window === window }
   }
 
-  /// Whether the session driving `window` holds work, or is still resolving
-  /// whether it will. Windows with no registered controller (untracked AppKit
-  /// windows, tests without a controller) report false and stay sweepable.
+  /// Whether the session driving `window` holds work, is still resolving
+  /// whether it will, or has work in flight that has not reached the session
+  /// yet. Windows with no registered controller (untracked AppKit windows,
+  /// tests without a controller) report false and stay sweepable.
   private func windowHoldsLiveWork(_ window: NSWindow) -> Bool {
     guard let controller = controllersByWindow[ObjectIdentifier(window)]?.controller else {
       return false
     }
-    return controller.hasEditableBuffer || controller.isAwaitingLaunchRestore
+    return controller.hasEditableBuffer
+      || controller.isAwaitingLaunchRestore
+      || controller.hasPendingImportWork
   }
 
   /// Files `window` as a content window even though no document identity backs

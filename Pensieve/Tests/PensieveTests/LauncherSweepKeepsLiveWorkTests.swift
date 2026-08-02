@@ -122,6 +122,70 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
         + "launcher instead of just delaying its cleanup")
   }
 
+  // ── (e) the tab still converting a Word/PDF source survives the sweep ────
+  //
+  // Opening a PDF/DOCX while another document is on screen routes the source
+  // to its OWN factory tab. That tab's root runs `openInitialDocument`, which
+  // kicks off `importDocument` — off the main actor, so it returns with the
+  // session still empty — and immediately marks the initial load resolved. The
+  // accessor's next pass therefore publishes no identity at all, and the
+  // registry files the tab BACK as an empty launcher. Nothing in the sweep's
+  // "does this window hold live work" question could see the conversion: no
+  // editable buffer, and the launch decision is long settled. If the user
+  // switched back to the first tab while a large document converted, the sweep
+  // closed the import tab, released its weakly-held controller, and the
+  // conversion result was discarded without a word.
+  @MainActor
+  func testSweepKeepsATabWhoseImportIsStillConverting() async throws {
+    let harness = try Harness(self)
+    let sourceURL = try harness.writeWordDocument(named: "Zalacznik.docx", heading: "Umowa")
+
+    // A document is already on screen, so the DOCX takes `openFile`'s registry
+    // branch instead of loading in place.
+    let readingWindow = harness.openDocumentWindow(at: harness.documentURL)
+    let importWindow = harness.openImportTab(for: sourceURL)
+    let importing = harness.attachController(to: importWindow)
+
+    // What `DocumentWindowRootView.openInitialDocument` does for that tab.
+    importing.controller.start(restoringWorkspace: false)
+    importing.controller.openFileInCurrentWindow(url: sourceURL)
+    XCTAssertFalse(
+      importing.appState.documentSession.hasEditableBuffer,
+      "the conversion already finished, so this pin is not exercising an in-flight import")
+
+    // ...and what the accessor publishes on its next pass: the session is still
+    // empty and the initial load is marked resolved, so no identity at all —
+    // the reclassification that files this tab back as an empty launcher.
+    harness.registry.attach(importWindow, documentID: nil)
+
+    // The user switched back to the first tab, so the import tab is not key.
+    harness.fireSweep()
+
+    XCTAssertFalse(
+      harness.wasClosed(importWindow),
+      "the sweep reaped the tab that was still converting the user's document — the "
+        + "conversion had nowhere left to land and was discarded silently")
+    XCTAssertFalse(harness.wasClosed(readingWindow))
+
+    // The other half of the promise: the tab survived AND the conversion
+    // arrives in it.
+    try await waitForImportToSettle(importing.controller)
+    XCTAssertTrue(
+      importing.appState.documentSession.text.contains("Umowa"),
+      "the tab survived the sweep but the conversion never landed in it")
+  }
+
+  /// Waits for the conversion to settle. The import hops back to the main actor
+  /// to publish its result, so this only has to give the main actor room.
+  @MainActor
+  private func waitForImportToSettle(_ controller: AppController) async throws {
+    for _ in 0..<200 {
+      guard controller.hasPendingImportWork else { return }
+      try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTFail("the import never settled")
+  }
+
   // ── harness ──────────────────────────────────────────────────────────────
 
   /// Mutable state the registry's injected closures write into. It has to be a
@@ -131,6 +195,9 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     var closedWindows: [NSWindow] = []
     var liveWindows: [NSWindow] = []
     var firedCount = 0
+    /// Native tab mutation is refused by default here (the legs below do not
+    /// need it); the factory-tab helper turns it on for the one call that does.
+    var canMutateTabs = false
   }
 
   private struct Session {
@@ -168,7 +235,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
 
       let journal = self.journal
       registry = DocumentWindowRegistry(
-        canMutateWindowTabs: { false },
+        canMutateWindowTabs: { journal.canMutateTabs },
         scheduleDeferredMainWork: { _ in },
         scheduleLauncherWindowSweep: { journal.pendingSweeps.append($0) },
         mergeWindowIntoTabs: { _, _ in },
@@ -209,6 +276,31 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
       registry.makeDocumentWindow = { _ in window }
       registry.openLauncherWindow()
       registry.makeDocumentWindow = nil
+      return window
+    }
+
+    /// A real Word source, so the conversion the pin waits for is the real one.
+    func writeWordDocument(named name: String, heading: String) throws -> URL {
+      let url = folder.appendingPathComponent(name)
+      let data = try DocumentTransfer.docxData(
+        fromHTML: "<h1>\(heading)</h1><p>Conversion the user must not lose.</p>",
+        baseURL: nil)
+      try data.write(to: url, options: .atomic)
+      return url
+    }
+
+    /// The factory tab an import SOURCE routes into when a document is already
+    /// on screen — built through the REAL `registry.open`, so the tab begins
+    /// life registered as a content window for the source URL and the pin
+    /// exercises the demotion rather than assuming it.
+    func openImportTab(for url: URL) -> NSWindow {
+      let window = Self.makeWindow(title: url.lastPathComponent)
+      journal.liveWindows.append(window)
+      journal.canMutateTabs = true
+      registry.makeDocumentWindow = { _ in window }
+      registry.open(DocumentRef(id: url, isAdHoc: true))
+      registry.makeDocumentWindow = nil
+      journal.canMutateTabs = false
       return window
     }
 
