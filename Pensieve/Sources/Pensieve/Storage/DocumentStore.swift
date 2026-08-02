@@ -46,6 +46,10 @@ final class FolderManager {
   private let metadataStore: WorkspaceMetadataStore
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
+  /// The live tab chain across EVERY window. Consulted when the persisted
+  /// bookmark set is rebuilt, because the working set alone does not know which
+  /// documents other windows still have open.
+  private let documentWindowRegistry: DocumentWindowRegistry
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
   private let workspaceValidationProbe: WorkspaceSubstrate.ValidationProbe
@@ -100,6 +104,7 @@ final class FolderManager {
     metadataStore: WorkspaceMetadataStore = .shared,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
+    documentWindowRegistry: DocumentWindowRegistry? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
     workspaceValidationProbe: @escaping WorkspaceSubstrate.ValidationProbe = { _ in },
@@ -114,6 +119,7 @@ final class FolderManager {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
+    self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.cancellableBuilder
     self.workspaceSubstrate = workspaceSubstrate
     self.workspaceValidationProbe = workspaceValidationProbe
@@ -1030,7 +1036,7 @@ final class FolderManager {
       $0.url.standardizedFileURL != targetRoot.url.standardizedFileURL
     }
     let survivingRootURLs = survivingRoots.map(\.url)
-    let openFileURLs = appState.openFiles.map(\.url)
+    let openFileURLs = fileBookmarkURLsToKeep(survivingRootURLs: survivingRootURLs, in: appState)
     let retainedExclusions = appState.excludedWorkspacePaths.filter {
       !WorkspaceExclusion.isScoped($0, to: standardizedURL)
     }
@@ -1052,6 +1058,46 @@ final class FolderManager {
     if let bookmarkError {
       appState.lastError = bookmarkError
     }
+  }
+
+  /// Every file that must keep its security-scoped bookmark when the persisted
+  /// workspace is rewritten.
+  ///
+  /// `openFiles` is the PERSISTENCE truth — the ad-hoc rows a relaunch brings
+  /// back — but it is not the set of files the app currently has open. It is
+  /// capped at `WorkspaceStore.maxOpenFiles` and pruned whenever a root takes a
+  /// file over, so a document living in ANOTHER window's tab can be missing from
+  /// it entirely. Rebuilding the GLOBAL bookmark set from the working set alone
+  /// therefore revoked that window's sandbox access without telling anyone, and
+  /// after the next launch its file could no longer be reopened.
+  ///
+  /// The registry's tab chain is the UI truth across every window, so it fills
+  /// exactly that gap. It is a union, never a replacement: a file the user
+  /// consciously closed sits in neither source, so nothing is resurrected.
+  ///
+  /// Two kinds of open tab are deliberately left out of the file set:
+  /// - documents already covered by a SURVIVING root bookmark. They keep their
+  ///   access through the root, and persisting them as file bookmarks would come
+  ///   back as spurious ad-hoc working-set rows on the next launch.
+  /// - documents whose file no longer exists. `replaceWorkspace` is all-or-
+  ///   nothing, so one unbookmarkable URL would throw the entire rewrite away
+  ///   and leave the just-removed root persisted.
+  private func fileBookmarkURLsToKeep(survivingRootURLs: [URL], in appState: AppState) -> [URL] {
+    var urls = appState.openFiles.map(\.url)
+    var seenPaths = Set(urls.map { $0.standardizedFileURL.path })
+    let standardizedRoots = survivingRootURLs.map(\.standardizedFileURL)
+
+    for url in documentWindowRegistry.openTabDocumentIDs {
+      let standardizedURL = url.standardizedFileURL
+      guard seenPaths.insert(standardizedURL.path).inserted,
+        !standardizedRoots.contains(where: { WorkspaceScanner.contains(standardizedURL, in: $0) }),
+        FileManager.default.fileExists(atPath: standardizedURL.path)
+      else {
+        continue
+      }
+      urls.append(standardizedURL)
+    }
+    return urls
   }
 
   /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
