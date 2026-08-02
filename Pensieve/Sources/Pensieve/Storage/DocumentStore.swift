@@ -1450,6 +1450,14 @@ final class FolderManager {
       .map { $0.standardizedFileURL }
       .filter { seenOpenFileURLs.insert($0).inserted }
       .map { DocumentRef(id: $0, isAdHoc: true) }
+    // THE CAP APPLIES TO WHAT A LAUNCH INHERITS, not only to what a session
+    // grows. The restored set is every bookmark that survived — for an install
+    // that predates the paired prune below, that is every ad-hoc file ever
+    // opened and not explicitly closed — and the startup restore now opens the
+    // working set for real, one tab per ref. Nothing in-session can repair such
+    // a key; only the restore can, so the newest `maxOpenFiles` are kept here
+    // and the rest lose their bookmarks with their rows.
+    pruneOpenFiles(into: appState)
     appState.lastError = nil
   }
 
@@ -1983,8 +1991,15 @@ final class FolderManager {
     }
   }
 
+  /// The working-set prune, and the bookmark side of it. `persistFile` only ever
+  /// grows the key, and before this the only things that shrank it were an
+  /// explicit close and the removal of a root — so an eviction here left a
+  /// bookmark the next launch would restore into a row the cap had already
+  /// rejected.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 }
 
@@ -2999,8 +3014,13 @@ final class DocumentStore {
     appState.selectedDocumentID = ref.id
   }
 
+  /// Same contract as `FolderManager`'s: whatever the cap drops out of the list
+  /// also leaves the persisted set, so the two never disagree about what the
+  /// working set is.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 
   private static func promptForDirtyUntitledSession(
@@ -3054,9 +3074,17 @@ final class DocumentStore {
   }
 }
 
+/// Trims the working set to its declared size and RETURNS what it dropped, so
+/// the caller can take the evicted files out of the persisted set too. A
+/// bookmark with no row is the same invisible state as a row with no window: the
+/// next launch resolves it, restores it, and — since the startup restore opens
+/// the working set for real — hands the user a tab for a file they stopped using
+/// months ago.
 @MainActor
-private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
-  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
+private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil)
+  -> [DocumentRef]
+{
+  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return [] }
 
   let activePath = (protectedID ?? appState.selectedDocumentID)?.path
   var protected: DocumentRef?
@@ -3068,9 +3096,11 @@ private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protec
   }
 
   let allowedCount = WorkspaceStore.maxOpenFiles - (protected == nil ? 0 : 1)
+  let evicted = Array(candidates.dropLast(min(max(allowedCount, 0), candidates.count)))
   candidates = Array(candidates.suffix(max(allowedCount, 0)))
   if let protected {
     candidates.append(protected)
   }
   appState.openFiles = candidates
+  return evicted
 }

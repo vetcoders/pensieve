@@ -191,13 +191,26 @@ final class BookmarkStore {
   /// because failing to identify a bookmark must never be a reason to silently
   /// forget a file the user did not close.
   func removeFile(url: URL) {
-    let target = url.standardizedFileURL.path
+    removeFiles(urls: [url])
+  }
+
+  /// Drops SEVERAL files' bookmarks in one pass, because the working-set prune
+  /// evicts a whole tail at once — a launch inheriting a key that accumulated
+  /// past the cap can drop dozens.
+  ///
+  /// One pass rather than one `removeFile` per URL: identity is the resolved
+  /// path, and resolving a bookmark is not free, so the per-file form would
+  /// re-resolve the entire key once per eviction. Same rules as the single form
+  /// in every other respect, including "unresolvable ≠ garbage".
+  func removeFiles(urls: [URL]) {
+    guard !urls.isEmpty else { return }
+    let targets = Set(urls.map(\.standardizedFileURL.path))
     let remaining = fileBookmarkData.filter { bookmark in
       guard let path = resolvedPath(for: bookmark) else { return true }
-      return path != target
+      return !targets.contains(path)
     }
     defaults.set(remaining, forKey: fileBookmarksKey)
-    stopAccess(to: url.standardizedFileURL)
+    for url in urls { stopAccess(to: url.standardizedFileURL) }
   }
 
   private func resolvedPath(for bookmark: Data) -> String? {
