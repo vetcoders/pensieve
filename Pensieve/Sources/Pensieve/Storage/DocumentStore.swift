@@ -853,14 +853,25 @@ final class FolderManager {
       return
     }
 
-    if let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
-    } else {
-      appState.selectedDocumentID = nil
-      appState.activeDocumentURL = nil
-      appState.activeDocumentText = ""
-      appState.activeDocumentDirty = false
-    }
+    // Nothing to re-select: the empty state, never a substitute document. This
+    // used to fall back to `documents.first` — the same fallback the restore
+    // path carried, with the same two failure modes. A session with nothing
+    // open (which, since a launch stopped picking for the user, is what an
+    // untouched session looks like) had a document opened FOR it by the next
+    // file event that happened to reach the watcher. And a user whose document
+    // left the workspace — trashed, or its folder excluded — got a neighbouring
+    // file in the editor they had not asked to change; `removeReferences` has
+    // already cleared the selection by then, so this branch was free to fill it.
+    //
+    // The paths that legitimately move a selection never reach here: rename and
+    // move re-point `selectedDocumentID` through `replaceReferences` BEFORE
+    // scheduling the refresh, so the document is found by the branch above, and
+    // create/duplicate select the new document themselves. Nor does opening a
+    // different workspace, which is the cold path.
+    appState.selectedDocumentID = nil
+    appState.activeDocumentURL = nil
+    appState.activeDocumentText = ""
+    appState.activeDocumentDirty = false
   }
 
   func addExcludedURLs(_ urls: [URL], into appState: AppState) {
