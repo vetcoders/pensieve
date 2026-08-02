@@ -244,10 +244,28 @@ final class BookmarkStore {
   /// `RecoveryStore.claimDraftForRestore` uses. Without it every restoring
   /// window would reopen the same document, and the pending crash draft would
   /// have no window left to come back in.
+  ///
+  /// CONSUMES the record, because a claim is a hand-off and not a standing
+  /// instruction. The in-process latch alone made the key immortal: once a
+  /// document had been active, every later launch claimed the same path, so a
+  /// file that got in there by accident (see `selectRestoredDocument`) came back
+  /// forever and no amount of closing it helped — the close only clears the
+  /// record when that document still owns it, and the app is quite capable of
+  /// rewriting it in between.
+  ///
+  /// Consuming costs the live session nothing: `loadClean` re-publishes the
+  /// document the moment the restored window shows it, and every key activation
+  /// re-publishes it again, so a quit with that document frontmost restores it
+  /// on the next launch exactly as before. Only a launch that opens NOTHING
+  /// leaves the record empty — which is the honest answer to "nothing was open".
+  ///
+  /// A record naming a file that is gone from disk is dropped too: it can never
+  /// restore anything, and leaving it would keep it in the way of the next one.
   func claimActiveDocumentForRestore() -> URL? {
     guard !hasHandedOutActiveDocument else { return nil }
     hasHandedOutActiveDocument = true
     guard let path = defaults.string(forKey: activeDocumentKey) else { return nil }
+    defaults.removeObject(forKey: activeDocumentKey)
     let url = URL(fileURLWithPath: path).standardizedFileURL
     guard isExistingFile(url) else { return nil }
     return url

@@ -1889,6 +1889,25 @@ final class FolderManager {
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
   }
 
+  /// Re-selects the document this window was already on after the workspace
+  /// collection is rebuilt — and NOTHING else.
+  ///
+  /// It used to fall back to `documents.first` when there was no previous
+  /// selection, which on a launch is always. That is how a file the operator had
+  /// not touched in two weeks became the one open document after a launch, with
+  /// no bookmark of its own anywhere in the working set: nothing restored it, the
+  /// app picked it. `documents.first` is not "the most recent" — the scan sorts
+  /// folders before files and each group alphabetically, then walks depth-first,
+  /// so it is the first Markdown file inside the alphabetically-first folder
+  /// chain. The load then wrote that file to the reopen record, which the next
+  /// launch claimed before the workspace was even scanned, and the resurrection
+  /// carried itself from there.
+  ///
+  /// An empty session therefore stays empty. What the user left open comes back
+  /// through the two stores that actually record it — the file bookmarks behind
+  /// Open Files, and the reopen record `AppController.start` claims — and a
+  /// launch with neither shows the launcher, which is what "nothing was open"
+  /// looks like.
   private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
     guard !appState.documentSession.isDirty else { return }
 
@@ -1903,8 +1922,6 @@ final class FolderManager {
       let ref = documents.first(where: { $0.id == previousSelection })
     {
       DocumentStore.shared.select(ref: ref, into: appState)
-    } else if let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
     } else {
       appState.selectedDocumentID = nil
       appState.activeDocumentURL = nil

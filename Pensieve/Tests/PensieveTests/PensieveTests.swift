@@ -572,6 +572,8 @@ final class PensieveSmokeTests: XCTestCase {
       appState.documents.map { $0.url.resolvingSymlinksInPath() },
       [noteURL.resolvingSymlinksInPath()]
     )
+    selectDocument(at: noteURL, in: appState)
+
     XCTAssertEqual(
       appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
     XCTAssertEqual(appState.activeDocumentText, "initial")
@@ -1170,11 +1172,14 @@ final class PensieveSmokeTests: XCTestCase {
     await manager.waitForPendingWorkspaceBuild()
 
     XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
-    XCTAssertEqual(
-      appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
-    XCTAssertEqual(appState.activeDocumentText, "launch-search-token")
+    XCTAssertNil(
+      appState.selectedDocumentID,
+      "the restore publishes the tree and indexes it; opening a document is the user's move")
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [noteURL.standardizedFileURL])
+
+    selectDocument(at: noteURL, in: appState)
+    XCTAssertEqual(appState.activeDocumentText, "launch-search-token")
     bookmarkStore.clear(into: appState)
   }
 
@@ -1471,6 +1476,7 @@ final class PensieveSmokeTests: XCTestCase {
     )
 
     manager.open(url: folder, into: appState)
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     appState.activeDocumentText = "dirty local edit"
@@ -2496,6 +2502,7 @@ final class PensieveSmokeTests: XCTestCase {
       watcherDebounceMilliseconds: 10)
 
     manager.open(url: folder, into: appState)
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     appState.activeDocumentText = "dirty local edit"
@@ -3313,6 +3320,7 @@ final class PensieveSmokeTests: XCTestCase {
       watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }))
     manager.open(url: folder, into: appState)
     await manager.waitForPendingWorkspaceBuild()
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     // The reload happens after the scheduled off-main reconcile publishes, not synchronously.
@@ -4513,6 +4521,8 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertTrue(
       appState.documents.contains { $0.url.standardizedFileURL == textURL.standardizedFileURL })
+    selectDocument(at: textURL, in: appState)
+
     XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, textURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "plain-token original")
 
