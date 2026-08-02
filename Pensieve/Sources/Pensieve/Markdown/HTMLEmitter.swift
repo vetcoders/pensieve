@@ -207,6 +207,9 @@ struct HTMLEmitter: MarkupVisitor {
   /// preview still receives a real task-list item.
   private static let inProgressMarker = "[~]"
 
+  /// The marker as the SOURCE must spell it — all three bytes, literally.
+  private static let inProgressMarkerBytes = Array(inProgressMarker.utf8)
+
   /// Returns the item's children with a leading `[~]` marker stripped, or `nil`
   /// when the item is not an in-progress task.
   ///
@@ -225,7 +228,7 @@ struct HTMLEmitter: MarkupVisitor {
     // cmark resolves escapes AND character references while building the Text
     // node, so a marker the author never wrote is indistinguishable from a real
     // one in the AST — ask the source.
-    guard sourceOpensWithLiteralBracket(text) else { return nil }
+    guard sourceOpensWithLiteralMarker(text) else { return nil }
     let remainder = text.string.dropFirst(Self.inProgressMarker.count)
     guard remainder.first.map(\.isWhitespace) ?? true else { return nil }
 
@@ -243,23 +246,32 @@ struct HTMLEmitter: MarkupVisitor {
     return children
   }
 
-  /// True when the inline really begins with the `[` byte its AST text claims.
+  /// True when the inline really begins with the whole `[~]` its AST text claims.
   ///
   /// Deliberately a POSITIVE test rather than "is the first byte a backslash?".
-  /// A backslash is not the only route to a `[` the author never typed: cmark
+  /// A backslash is not the only route to a marker the author never typed: cmark
   /// decodes character references during inline parsing, so `&#91;~] wip`
   /// reaches the AST as a pristine `[~] wip` whose first source byte is `&`.
-  /// Enumerating the ways to spell a bracket is a losing game — requiring the
-  /// literal byte covers every one of them at once.
+  /// Enumerating the ways to spell a character is a losing game — requiring the
+  /// literal bytes covers every one of them at once.
   ///
-  /// Without a resolvable source byte (source positions disabled, or a `source`
+  /// And it has to be ALL THREE bytes. Checking only the opening `[` left the
+  /// other two free to be spelled any way at all: `- [&#126;] wip` and
+  /// `- [~&#93; wip` open with a real bracket, cmark decodes the reference, and a
+  /// leading `Text` reading `[~] wip` arrives with the one byte this asked about
+  /// in perfect order. The marker is a three-character token, so the source is
+  /// asked for the three-character token.
+  ///
+  /// Without resolvable source bytes (source positions disabled, or a `source`
   /// that does not match the parsed string) the answer is "allow", which is the
   /// behaviour that predates this check.
-  private mutating func sourceOpensWithLiteralBracket(_ inline: some InlineMarkup) -> Bool {
+  private mutating func sourceOpensWithLiteralMarker(_ inline: some InlineMarkup) -> Bool {
     guard let start = inline.range?.lowerBound else { return true }
     if sourceIndex == nil { sourceIndex = SourceIndex(source) }
-    guard let index = sourceIndex, let byte = index.byte(at: start) else { return true }
-    return byte == UInt8(ascii: "[")
+    guard let index = sourceIndex,
+      let written = index.bytes(at: start, count: Self.inProgressMarkerBytes.count)
+    else { return true }
+    return written.elementsEqual(Self.inProgressMarkerBytes)
   }
 
   /// `source` as UTF-8 bytes plus each line's start offset, so a cmark
@@ -297,12 +309,14 @@ struct HTMLEmitter: MarkupVisitor {
       self.lineStarts = lineStarts
     }
 
-    func byte(at location: SourceLocation) -> UInt8? {
+    /// The `count` source bytes starting at `location`, or nil when the location
+    /// does not resolve or the source ends before that many bytes are available.
+    func bytes(at location: SourceLocation, count: Int) -> ArraySlice<UInt8>? {
       guard location.line >= 1, location.line <= lineStarts.count, location.column >= 1
       else { return nil }
       let offset = lineStarts[location.line - 1] + location.column - 1
-      guard offset < bytes.count else { return nil }
-      return bytes[offset]
+      guard offset + count <= bytes.count else { return nil }
+      return bytes[offset..<(offset + count)]
     }
   }
 

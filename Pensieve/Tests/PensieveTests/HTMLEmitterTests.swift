@@ -196,6 +196,54 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertTrue(html.contains(">real</p>"), html)
   }
 
+  /// The opening byte was only ONE THIRD of the marker. Checking `[` alone left
+  /// the other two characters free to be spelled any way at all: `- [&#126;] wip`
+  /// and `- [~&#93; wip` both open with a literal `[`, and cmark decodes the
+  /// reference so a leading `Text` reading `[~] wip` reaches the emitter — the
+  /// check said yes and prose was promoted to an in-progress checkbox GFM would
+  /// never recognize. The source has to carry all three bytes, not the first one.
+  func testMarkerWithAnEncodedInteriorCharacterStaysProse() {
+    for markdown in ["- [&#126;] wip", "- [~&#93; wip"] {
+      let html = render(markdown)
+      XCTAssertFalse(html.contains("task-list-item"), "\(markdown) → \(html)")
+      XCTAssertFalse(html.contains("data-vc-task-state"), "\(markdown) → \(html)")
+      XCTAssertTrue(html.contains("[~] wip"), "\(markdown) → \(html)")
+    }
+  }
+
+  /// CONTROL LEG. `- [~&#93;] wip` decodes to `[~]] wip`, which the trailing-byte
+  /// rule ALREADY kept as prose (the character after the marker is `]`, not
+  /// whitespace) — so it is green before this cut and has to stay green after it.
+  /// It is here because that rule stops being the thing protecting it the moment
+  /// the marker check changes shape.
+  func testEncodedClosingBracketBesideARealOneStaysProse() {
+    let html = render("- [~&#93;] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~]] wip"), html)
+  }
+
+  /// CONTROL LEG. Demanding all three bytes must not disarm the marker anyone
+  /// actually writes — the plain one still promotes, beside an encoded sibling in
+  /// the same list.
+  func testPlainMarkerStillPromotesBesideAnEncodedInterior() {
+    let html = render("- [&#126;] encoded\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] encoded"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// CONTROL LEG. The earlier finding's case — an encoded OPENING bracket — is
+  /// still prose. Widening the check from one byte to three must keep what the
+  /// one-byte check already caught.
+  func testEncodedOpeningBracketIsStillProseUnderTheWiderCheck() {
+    let html = render("- &#91;~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
   /// The source index counted a line start only at `\n`, but cmark treats a
   /// LONE CR as a line ending too and advances its line numbers accordingly. In
   /// a CR-only document the index therefore ran one line short at every marker:
