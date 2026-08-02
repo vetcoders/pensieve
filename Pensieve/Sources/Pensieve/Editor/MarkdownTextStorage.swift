@@ -112,6 +112,11 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// keystrokes. `nil` means "stale / not yet built" — rebuild on next use.
   private var fenceLineRangesCache: [NSRange]?
 
+  /// Whether the fence cache is currently warm. Exposed so a pin can tell
+  /// "rebased" from "dropped": both leave the colours right, but dropping puts
+  /// the O(document) rescan back on every keystroke.
+  var hasCachedFenceLineRanges: Bool { fenceLineRangesCache != nil }
+
   var syntaxHighlightingEnabled: Bool = true {
     didSet {
       refreshHighlighting()
@@ -363,9 +368,22 @@ class MarkdownTextStorage: NSTextContentStorage {
       pendingRequiresFullRefresh = true
       pendingHighlightRange = nil
       // A fence line was touched/created/deleted, so the cached fence set is
-      // stale. Drop it; it rebuilds lazily on the next `codeBlockAwareRange`.
+      // stale. Drop it; it rebuilds lazily on the next `codeBlockAwareScope`.
       fenceLineRangesCache = nil
-    } else if !pendingRequiresFullRefresh {
+    } else {
+      // The fence set did not CHANGE, but a length-changing edit moved where it
+      // lives. The sweep cursor right above is rebased for exactly this reason
+      // and the cache was not, so every offset in it stayed short by `delta`
+      // forever: the expansion then started mid-code or stopped before the real
+      // closing fence, `CodeBlockHighlighter` found no complete block, and the
+      // code kept the prose reset.
+      //
+      // Rebased rather than dropped. Dropping on every length-changing edit
+      // reinstates the O(document) fence rescan per keystroke that the cache
+      // exists to prevent.
+      rebaseFenceLineRangesCache(editedRange: editedRange, delta: delta)
+    }
+    if !requiresFullRefresh, !pendingRequiresFullRefresh {
       adjustPendingHighlightRange(
         for: editedRange,
         delta: delta,
@@ -384,6 +402,24 @@ class MarkdownTextStorage: NSTextContentStorage {
     highlightWorkItem = workItem
     DispatchQueue.main.asyncAfter(
       deadline: .now() + Self.highlightRefreshDelay, execute: workItem)
+  }
+
+  /// Shifts every cached fence line that sits AFTER the edit by `delta`.
+  ///
+  /// Only reached when `editTouchesFence` said no, which is a stronger statement
+  /// than it looks: that check covers the whole paragraph range around the edit,
+  /// so no cached fence can STRADDLE `editedRange`. Every fence is therefore
+  /// wholly before it (unmoved) or wholly after it (shifted), and the single
+  /// comparison below classifies both correctly.
+  private func rebaseFenceLineRangesCache(editedRange: NSRange, delta: Int) {
+    guard delta != 0, var cached = fenceLineRangesCache, !cached.isEmpty else { return }
+    let textLength = textStorage?.length ?? 0
+    for index in cached.indices where cached[index].location >= editedRange.location {
+      cached[index] = clampedRange(
+        NSRange(location: max(0, cached[index].location + delta), length: cached[index].length),
+        textLength: textLength)
+    }
+    fenceLineRangesCache = cached
   }
 
   private func applyScheduledHighlightingRefresh() {

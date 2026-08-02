@@ -84,6 +84,15 @@ final class EditorThemeRepaintTests: XCTestCase {
     content.onRethemeCompleted = previous
   }
 
+  /// Lets the 70 ms typing debounce fire. The fence-block expansion — and so the
+  /// fence cache — is built by the DEBOUNCED pass, not by the keystroke, so a
+  /// pin that reads the cache straight after an edit reads it before it exists.
+  private func settleTypingDebounce() {
+    let settled = expectation(description: "typing debounce settled")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { settled.fulfill() }
+    wait(for: [settled], timeout: 5.0)
+  }
+
   /// First offset still carrying `skin`'s text colour, walking EVERY attribute
   /// run rather than sampling. A strided spot check steps straight over a
   /// one-character gap, which is precisely what an off-by-one in the sweep's
@@ -326,6 +335,86 @@ final class EditorThemeRepaintTests: XCTestCase {
       textColor(in: storage, at: deepKeyword.location),
       srgb(PensieveTheme.ink.tokens.accent.nsColor),
       "code inside the fence came out on the prose palette after the sweep")
+  }
+
+  /// The cached fence set has to MOVE when the text before it does.
+  ///
+  /// `fenceLineRangesCache` was invalidated only on a fence-touching edit or a
+  /// full refresh. A length-changing edit that touched no fence line — typing a
+  /// paragraph at the top of a document whose code block is at the bottom —
+  /// therefore left every cached offset short by the accumulated delta, forever.
+  /// The expansion then started mid-code or stopped before the real closing
+  /// fence, `CodeBlockHighlighter`'s `(?s)```(.*?)\n(.*?)``` ` found no complete
+  /// block, and the code kept the prose reset.
+  ///
+  /// The sweep cursor immediately above the cache in `scheduleHighlightingRefresh`
+  /// was already rebased for exactly this reason; the cache was not.
+  /// The fence is LARGE on purpose. A block small enough to fit inside one chunk
+  /// is rescued by that chunk's own fence regex whatever the cache says, so it
+  /// would prove nothing; a block bigger than the chunk ceiling is coloured
+  /// solely from the cached fence coordinates, which is the thing under test.
+  @MainActor
+  func testTypingAheadOfAFenceDoesNotStrandItsCachedOffsets() {
+    let text =
+      String(repeating: "body text paragraph\n\n", count: 2_000)
+      + "```swift\n"
+      + String(repeating: "func greet() { let s = \"hi\" }\n", count: 4_000)
+      + "```\n"
+    let (content, storage) = makeStorage(text: text, skin: .parchment)
+    content.visibleRangeProvider = { NSRange(location: 0, length: 400) }
+
+    // A keystroke well clear of the fence builds the cache in the first place —
+    // a cache that was never built cannot go stale, and would prove nothing.
+    storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "x")
+    settleTypingDebounce()
+    XCTAssertTrue(content.hasCachedFenceLineRanges, "precondition: the cache is warm")
+
+    // ~200 characters of typing at the TOP, one keystroke at a time, none of
+    // them anywhere near a fence line.
+    for _ in 0..<200 {
+      storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "y")
+    }
+
+    content.rethemeChunkTimeBudget = 0.0005
+    content.tokens = PensieveTheme.ink.tokens
+    drainDeferredRefresh(content)
+
+    // Sampled at the LAST keyword — deepest inside the block, furthest from any
+    // boundary a chunk could have got right by accident.
+    let ns = storage.string as NSString
+    let keywordAt = ns.range(
+      of: "func", options: .backwards, range: NSRange(location: 0, length: ns.length)
+    ).location
+    XCTAssertNotEqual(keywordAt, NSNotFound)
+    XCTAssertEqual(
+      textColor(in: storage, at: keywordAt),
+      srgb(PensieveTheme.ink.tokens.accent.nsColor),
+      "the fence's cached offsets never moved with the text, so the block was"
+        + " read from the wrong line and its code lost the code palette")
+  }
+
+  /// Control leg: rebasing must not become "drop the cache". The cache exists to
+  /// keep an O(document) fence rescan off the keystroke path, and a fix that
+  /// invalidated on every length-changing edit would put it straight back.
+  @MainActor
+  func testTypingAheadOfAFenceKeepsTheCacheWarm() {
+    let text =
+      String(repeating: "body text paragraph\n\n", count: 2_000)
+      + "```swift\nfunc greet() {}\n```\n"
+    let (content, storage) = makeStorage(text: text, skin: .parchment)
+
+    storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "x")
+    settleTypingDebounce()
+    XCTAssertTrue(content.hasCachedFenceLineRanges, "precondition: the cache is warm")
+
+    for _ in 0..<50 {
+      storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "y")
+    }
+
+    XCTAssertTrue(
+      content.hasCachedFenceLineRanges,
+      "a plain keystroke dropped the fence cache — that is the per-keystroke"
+        + " O(document) rescan the cache was introduced to remove")
   }
 
   /// Decision (d), settled by measurement rather than taste: the first chunk
