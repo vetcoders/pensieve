@@ -52,6 +52,58 @@ final class EmptyStateRecentLabelsTests: XCTestCase {
       ["notes — a", "notes — b"])
   }
 
+  /// ONE parent is not always enough. Two projects each holding a `README.md`
+  /// under a folder of the same name — `/a/project/README.md` and
+  /// `/b/project/README.md` — both rendered "README — project", so the rows were
+  /// as indistinguishable as the bare basenames they replaced. The suffix grows
+  /// until the rows actually differ.
+  func testIdenticalParentsGrowTheSuffixUntilTheRowsDiffer() {
+    XCTAssertEqual(
+      labels(["/a/project/README.md", "/b/project/README.md"]),
+      ["README — a/project", "README — b/project"])
+  }
+
+  /// CONTROL: the suffix is SHORTEST, and it is chosen per colliding name. A
+  /// group that separates on one component keeps one component even while
+  /// another group in the same slice needs two — growing everything to the
+  /// longest would make the whole list pay for one ambiguity.
+  func testSuffixLengthIsChosenPerNameNotForTheWholeSlice() {
+    XCTAssertEqual(
+      labels([
+        "/a/project/README.md", "/b/project/README.md",
+        "/one/NOTES.md", "/two/NOTES.md",
+      ]),
+      ["README — a/project", "README — b/project", "NOTES — one", "NOTES — two"])
+  }
+
+  /// CONTROL: paths that agree ALL THE WAY UP have no suffix that separates
+  /// them, so the search stops as soon as growing stops helping and keeps the
+  /// SHORT label. Terminating, and no long path grown for a difference that does
+  /// not exist.
+  func testPathsIdenticalToTheRootDegradeInsteadOfLooping() {
+    XCTAssertEqual(
+      labels(["/a/project/README.md", "/a/project/README.md"]),
+      ["README — project", "README — project"])
+  }
+
+  /// CONTROL: "stop when growing stops helping" is not "stop at the first
+  /// twins". Two of these three are the same path and can never separate, but the
+  /// third can — so the suffix still grows to the length that separates what is
+  /// separable.
+  func testGrowthContinuesWhileItSeparatesAnyoneAtAll() {
+    XCTAssertEqual(
+      labels(["/a/project/README.md", "/a/project/README.md", "/b/project/README.md"]),
+      ["README — a/project", "README — a/project", "README — b/project"])
+  }
+
+  /// CONTROL: a row whose path runs out before its rival's still separates on
+  /// what it has — the shorter path IS the difference.
+  func testAShorterPathSeparatesOnWhatItHas() {
+    XCTAssertEqual(
+      labels(["/project/README.md", "/deep/project/README.md"]),
+      ["README — project", "README — deep/project"])
+  }
+
   func testEmptySliceProducesNoLabels() {
     XCTAssertEqual(labels([]), [])
   }

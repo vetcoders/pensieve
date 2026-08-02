@@ -149,28 +149,70 @@ struct EmptyStateShortcuts: View {
 /// identical `README` buttons, and the only thing telling them apart was a hover
 /// tooltip, which a keyboard or VoiceOver user never gets.
 ///
-/// So the parent folder joins the label, but ONLY on the rows that need it.
-/// Suffixing every row would make the ordinary case — six distinct names — noisier
-/// for nothing. Uniqueness is judged inside the VISIBLE slice, because that is the
-/// set a reader is comparing; a name that repeats further down a history this view
-/// never draws is not an ambiguity anyone can see.
+/// So the path joins the label, but ONLY on the rows that need it and only as
+/// much of it as they need. Suffixing every row would make the ordinary case —
+/// six distinct names — noisier for nothing. Uniqueness is judged inside the
+/// VISIBLE slice, because that is the set a reader is comparing; a name that
+/// repeats further down a history this view never draws is not an ambiguity
+/// anyone can see.
+///
+/// One parent is not always enough, which is what the first cut of this helper
+/// assumed. `/a/project/README.md` and `/b/project/README.md` both answered
+/// "README — project" and stayed exactly as indistinguishable as the bare
+/// basenames they replaced. So the suffix GROWS — one path component at a time,
+/// per colliding name — until the rows differ.
 enum EmptyStateRecentLabels {
-  /// Between the name and the folder that disambiguates it.
+  /// Between the name and the path that disambiguates it.
   static let separator = " — "
 
   static func labels(for urls: [URL]) -> [String] {
     let names = urls.map { $0.deletingPathExtension().lastPathComponent }
-    var occurrences: [String: Int] = [:]
-    for name in names { occurrences[name, default: 0] += 1 }
+    var rowsByName: [String: [Int]] = [:]
+    for (index, name) in names.enumerated() { rowsByName[name, default: []].append(index) }
 
-    return zip(urls, names).map { url, name in
-      guard occurrences[name, default: 0] > 1 else { return name }
-      // A file at a volume root has no folder name to add; leave it alone
-      // rather than append a bare "/".
-      let parent = url.deletingLastPathComponent().lastPathComponent
-      guard !parent.isEmpty, parent != "/" else { return name }
-      return name + separator + parent
+    // Parent components, root first, with the volume root itself dropped: it is
+    // not a folder name anyone reads, and a file sitting at the root has no
+    // disambiguator to offer at all.
+    let parents = urls.map { url in
+      url.deletingLastPathComponent().pathComponents.filter { $0 != "/" }
     }
+
+    var labels = names
+    for (name, rows) in rowsByName where rows.count > 1 {
+      let depth = separatingDepth(for: rows.map { parents[$0] })
+      for row in rows {
+        let suffix = parents[row].suffix(depth).joined(separator: "/")
+        labels[row] = suffix.isEmpty ? name : name + separator + suffix
+      }
+    }
+    return labels
+  }
+
+  /// How many trailing path components the colliding rows need in order to read
+  /// as different rows.
+  ///
+  /// Grows while growing still separates SOMEONE. Two conditions end it: every
+  /// row is already distinct (the answer, and the shortest one), or a longer
+  /// suffix produced no more distinct values than the last — which is what
+  /// happens when paths agree all the way up to the volume root. That second
+  /// condition is what makes this terminate on identical paths, and it is
+  /// deliberately not "stop at the first duplicate": a slice can hold one pair
+  /// that can never separate and a third row that can, and the third row still
+  /// gets its difference.
+  private static func separatingDepth(for parents: [[String]]) -> Int {
+    let deepest = parents.map(\.count).max() ?? 0
+    guard deepest > 0 else { return 0 }
+
+    var best = 1
+    var bestDistinct = 0
+    for depth in 1...deepest {
+      let distinct = Set(parents.map { $0.suffix(depth).joined(separator: "/") }).count
+      guard distinct > bestDistinct else { break }
+      best = depth
+      bestDistinct = distinct
+      if distinct == parents.count { break }
+    }
+    return best
   }
 }
 
