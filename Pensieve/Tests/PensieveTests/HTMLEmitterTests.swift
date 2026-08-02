@@ -124,7 +124,8 @@ final class HTMLEmitterTests: XCTestCase {
   /// either ordered delimiter.
   func testNumberedListItemsAreTasksToo() {
     for markdown in ["1. [x] done", "1. [ ] todo", "1) [x] done"] {
-      XCTAssertTrue(render(markdown).contains("task-list-item"), "\(markdown) → \(render(markdown))")
+      let html = render(markdown)
+      XCTAssertTrue(html.contains("task-list-item"), "\(markdown) → \(html)")
     }
     let inProgress = render("1. [~] wip")
     XCTAssertTrue(inProgress.contains("data-vc-task-state=\"in-progress\""), inProgress)
