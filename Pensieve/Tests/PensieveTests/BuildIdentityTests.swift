@@ -70,6 +70,33 @@ final class BuildIdentityTests: XCTestCase {
     }
   }
 
+  /// Sudden termination lets the system SIGKILL the app instead of asking it to
+  /// quit. That skips BOTH halves of the shutdown contract: the unsaved-work
+  /// prompt pass in `applicationShouldTerminate` — the only veto point a Dock
+  /// quit or a logout ever reaches — and `applicationWillTerminate`, which
+  /// carries `FolderManager.flushWorkingSet()`. Measured on a staged bundle:
+  /// with this key true, `applicationWillTerminate` never fired at all.
+  ///
+  /// This is a bundle DECLARATION, so no in-process seam can pin the behavior —
+  /// the runtime gate on a staged `.app` is the real evidence. What this test
+  /// pins is that flipping the declaration back (e.g. to speed up logout) has to
+  /// be a conscious act that also deletes this pin, not a quiet plist edit.
+  func testBundleNeverAdvertisesSuddenTermination() throws {
+    let templateURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // PensieveTests/
+      .deletingLastPathComponent()  // Tests/
+      .deletingLastPathComponent()  // package root
+      .appendingPathComponent("Resources/Info.plist")
+    let data = try Data(contentsOf: templateURL)
+    let info = try XCTUnwrap(
+      PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        as? [String: Any])
+
+    XCTAssertEqual(
+      info["NSSupportsSuddenTermination"] as? Bool, false,
+      "an app holding unsaved user work must never advertise that it is safe to kill unasked")
+  }
+
   func testPackageAndPublicDocsAgreeOnMacOS15Support() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()

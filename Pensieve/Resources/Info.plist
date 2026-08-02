@@ -60,8 +60,17 @@
     <true/>
     <key>NSSupportsAutomaticTermination</key>
     <true/>
+    <!-- MUST stay false. Sudden termination lets the system SIGKILL the app
+         instead of asking it to quit, which skips BOTH halves of our shutdown
+         contract: applicationShouldTerminate (the unsaved-work prompt pass, the
+         only veto point a Dock quit or logout ever reaches) and
+         applicationWillTerminate (FolderManager.flushWorkingSet, the last
+         writable moment for the Open Files working set). Measured on a staged
+         bundle: with this true, applicationWillTerminate never fired at all.
+         An app holding unsaved user work cannot advertise that it is safe to
+         kill without notice. -->
     <key>NSSupportsSuddenTermination</key>
-    <true/>
+    <false/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Pensieve needs access to your microphone to transcribe your speech into text.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
