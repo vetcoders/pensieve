@@ -137,4 +137,101 @@ final class EditorFindWashTests: XCTestCase {
 
     XCTAssertNil(sampled, "a chunk repaint washed text that is not a find match")
   }
+
+  // MARK: - T7: the ink on the wash
+
+  /// THE contrast pin. Every skin, both halves of the pair, both washes.
+  ///
+  /// The washes used to be written as `.backgroundColor` alone, leaving the
+  /// foreground on whatever the highlighter had painted. Measured here before
+  /// the fix: Graphite's body ink lands at 2.15:1 on the active match's
+  /// composited orange and 2.96:1 on the passive yellow, Ink's at 2.40:1
+  /// active, Typewriter's dark half at 2.18:1 active — all under the repo's own
+  /// `ThemeContrast.minimumTextContrast`. A dark skin's find results were the
+  /// hardest text in the document to read.
+  ///
+  /// The appearance is pinned explicitly on both sides rather than read from
+  /// the machine: the adaptive skins carry live semantic colours, so a test
+  /// that just calls `tokens` is measuring the Mac it happens to run on.
+  func testEveryFindWashCarriesLegibleInkOnEverySkin() {
+    for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
+      guard let appearance = NSAppearance(named: appearanceName) else {
+        XCTFail("no appearance \(appearanceName.rawValue)")
+        continue
+      }
+      appearance.performAsCurrentDrawingAppearance {
+        for skin in PensieveTheme.allCases {
+          for isDark in [false, true] {
+            let tokens = skin.tokens(underDarkSystem: isDark)
+            let palette = MarkdownEditorSurface.findWashes(for: tokens)
+            let label = "\(skin.rawValue) half=\(isDark ? "dark" : "light")"
+              + " appearance=\(appearanceName.rawValue)"
+
+            for (name, wash) in [("passive", palette.passive), ("active", palette.active)] {
+              let composited = MarkdownEditorSurface.compositedFindWash(
+                wash.background, over: tokens.source.nsColor)
+              let ratio = ThemeContrast.ratio(wash.foreground, composited)
+              XCTAssertNotNil(ratio, "\(label) \(name): unmeasurable ink")
+              XCTAssertGreaterThanOrEqual(
+                ratio ?? 0, ThemeContrast.minimumTextContrast,
+                "\(label) \(name): find match is not legible on its own wash")
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /// Control leg: the ink swap must not fire wholesale. On the LIGHT fixed
+  /// palettes the body ink already carries both washes comfortably, so swapping
+  /// to `source` there would throw away the theme's own text colour for nothing.
+  func testLightPalettesKeepTheirBodyInkOnTheWash() {
+    for skin in [PensieveTheme.parchment, .porcelain] {
+      let tokens = skin.tokens
+      let palette = MarkdownEditorSurface.findWashes(for: tokens)
+      XCTAssertEqual(palette.passive.foreground, tokens.text.nsColor, skin.rawValue)
+      XCTAssertEqual(palette.active.foreground, tokens.text.nsColor, skin.rawValue)
+    }
+  }
+
+  /// Control leg: co-writing the ink must be REVERSIBLE. Ending a find session
+  /// has to give the highlighter's own colours back — otherwise every former
+  /// match keeps the wash ink on the bare surface, which on a dark skin is the
+  /// pane colour, i.e. invisible text.
+  @MainActor
+  func testEndingAFindSessionGivesTheHighlighterInkBack() {
+    let text = "# needle heading\n\nplain needle body\n"
+    let (surface, window) = makeHostedSurface(text: text)
+    defer { window.contentView = nil }
+    surface.applyTheme(.graphite)
+
+    let ns = surface.textStorage.string as NSString
+    let headingMatch = ns.range(of: "needle")
+    let bodyMatch = ns.range(of: "needle", options: [], range: NSRange(location: 20, length: ns.length - 20))
+    XCTAssertNotEqual(bodyMatch.location, NSNotFound)
+
+    func ink(_ at: Int) -> NSColor? {
+      surface.textStorage.attribute(.foregroundColor, at: at, effectiveRange: nil) as? NSColor
+    }
+    let headingInkBefore = ink(headingMatch.location)
+    let bodyInkBefore = ink(bodyMatch.location)
+    XCTAssertNotNil(headingInkBefore)
+    XCTAssertNotEqual(
+      headingInkBefore, bodyInkBefore,
+      "precondition: the two matches start on DIFFERENT highlighter colours")
+
+    surface.updateFind(query: "needle", visible: true)
+    XCTAssertNotEqual(
+      ink(headingMatch.location), headingInkBefore,
+      "precondition: the wash actually changed the ink")
+
+    surface.clearFindHighlights()
+
+    XCTAssertEqual(
+      ink(headingMatch.location), headingInkBefore,
+      "the heading kept the find ink after the session ended")
+    XCTAssertEqual(
+      ink(bodyMatch.location), bodyInkBefore,
+      "the body text kept the find ink after the session ended")
+  }
 }

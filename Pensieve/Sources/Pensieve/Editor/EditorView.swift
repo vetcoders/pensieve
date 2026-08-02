@@ -486,6 +486,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
   private var lastCenteredLine: Int?
   private var findQuery = ""
+  /// `.foregroundColor` runs the find washes painted over, captured at paint
+  /// time so a teardown can restore them without a highlight pass per match.
+  private var inkUnderFindWashes: [(range: NSRange, color: NSColor?)] = []
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
@@ -1308,9 +1311,15 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     guard !touched.isEmpty else { return }
 
+    // The highlighter just repainted `range`, so the ink snapshot for it is
+    // stale AND the colour sitting there now is the correct one — drop the old
+    // entries before capturing fresh ones underneath the wash.
+    inkUnderFindWashes.removeAll { NSIntersectionRange($0.range, range).length > 0 }
+
     textStorage.beginEditing()
+    let palette = Self.findWashes(for: activeTokens)
     for (index, match) in touched {
-      paintFindWash(over: match, isActive: index == activeFindMatchIndex)
+      paintFindWash(over: match, isActive: index == activeFindMatchIndex, palette: palette)
     }
     textStorage.endEditing()
   }
@@ -1446,8 +1455,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // thread once per match.
     textStorage.beginEditing()
     removeFindHighlights()
+    let palette = Self.findWashes(for: activeTokens)
     for (index, range) in findMatches.enumerated() {
-      paintFindWash(over: range, isActive: index == activeFindMatchIndex)
+      paintFindWash(over: range, isActive: index == activeFindMatchIndex, palette: palette)
     }
     textStorage.endEditing()
   }
@@ -1458,14 +1468,117 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   ///
   /// The one place a wash is written, so the full repaint and the per-chunk one
   /// can never disagree about what a match looks like. Caller owns the edit
-  /// transaction.
-  private func paintFindWash(over range: NSRange, isActive: Bool) {
-    let wash = isActive ? Self.activeFindWash : Self.passiveFindWash
-    textStorage.addAttribute(.backgroundColor, value: wash, range: range)
+  /// transaction and supplies the resolved palette, so the contrast arithmetic
+  /// runs once per pass rather than once per match.
+  private func paintFindWash(over range: NSRange, isActive: Bool, palette: FindWashPalette) {
+    let wash = isActive ? palette.active : palette.passive
+    // Capture what the highlighter had put here BEFORE the wash ink covers it,
+    // so a teardown can give it back without re-running a highlight pass.
+    textStorage.enumerateAttribute(.foregroundColor, in: range, options: []) {
+      value, subrange, _ in
+      inkUnderFindWashes.append((subrange, value as? NSColor))
+    }
+    textStorage.addAttribute(.backgroundColor, value: wash.background, range: range)
+    textStorage.addAttribute(.foregroundColor, value: wash.foreground, range: range)
   }
 
+  /// Puts the highlighter's own `.foregroundColor` back under every wash this
+  /// surface painted, then forgets them.
+  ///
+  /// Ranges are validated against the CURRENT length: a teardown can follow a
+  /// text change that shortened the document, and painting past the end raises.
+  private func restoreInkUnderFindWashes() {
+    guard !inkUnderFindWashes.isEmpty else { return }
+    let length = textStorage.length
+    for entry in inkUnderFindWashes where NSMaxRange(entry.range) <= length {
+      if let color = entry.color {
+        textStorage.addAttribute(.foregroundColor, value: color, range: entry.range)
+      } else {
+        textStorage.removeAttribute(.foregroundColor, range: entry.range)
+      }
+    }
+    inkUnderFindWashes.removeAll(keepingCapacity: true)
+  }
+
+  /// A find wash and the ink that has to stay readable on it.
+  struct FindWash: Equatable {
+    let background: NSColor
+    let foreground: NSColor
+  }
+
+  struct FindWashPalette: Equatable {
+    let passive: FindWash
+    let active: FindWash
+  }
+
+  /// The washes stay on the system accents rather than theme tokens: a find hit
+  /// should read as a find hit in every skin, and stay distinguishable from the
+  /// theme's own `==mark==` wash, which is a different statement about the text.
+  /// The SKIN then decides the ink that goes on top.
   static let passiveFindWash = NSColor.systemYellow.withAlphaComponent(0.50)
   static let activeFindWash = NSColor.systemOrange.withAlphaComponent(0.80)
+
+  /// Resolves both washes for a skin.
+  ///
+  /// The washes used to be written as `.backgroundColor` alone, leaving the
+  /// foreground on whatever the highlighter had painted. Measured on this
+  /// machine, that put Graphite's body ink at 2.15:1 on the active match's
+  /// composited orange and 2.96:1 on the passive yellow, and Ink's at 2.40:1
+  /// active — all under the repo's own `ThemeContrast.minimumTextContrast` of 3.
+  /// A dark skin's find results were the hardest text in the document to read.
+  ///
+  /// Resolved per pass rather than cached because the adaptive skins carry LIVE
+  /// semantic colours: a cached answer would freeze whichever appearance was
+  /// current when it was built. That is also why there is no `tokens.mode`
+  /// guard here — unlike the highlighter's colour caches, nothing outlives the
+  /// pass.
+  static func findWashes(for tokens: ThemeTokens) -> FindWashPalette {
+    FindWashPalette(
+      passive: FindWash(
+        background: passiveFindWash,
+        foreground: findWashInk(on: passiveFindWash, tokens: tokens)),
+      active: FindWash(
+        background: activeFindWash,
+        foreground: findWashInk(on: activeFindWash, tokens: tokens)))
+  }
+
+  /// Ink for `wash` over the skin's source surface: the theme's body text when
+  /// it carries the composited wash, otherwise the theme's `source` — the far
+  /// pole of the SAME palette, so the match reads as an inverted stamp. Two
+  /// tokens from one theme, never an invented per-theme hex: the shape
+  /// `SyntaxHighlighter.legibleHighlightText` and `CodeBlockHighlighter`'s
+  /// accent guard already use.
+  static func findWashInk(on wash: NSColor, tokens: ThemeTokens) -> NSColor {
+    let surface = compositedFindWash(wash, over: tokens.source.nsColor)
+    let text = tokens.text.nsColor
+    if ThemeContrast.isLegible(text, on: surface) { return text }
+
+    let source = tokens.source.nsColor
+    // Neither pole proven legible (an unmeasurable pattern colour, say): take
+    // whichever measures better, and keep the body ink when nothing measures.
+    guard let textRatio = ThemeContrast.ratio(text, surface),
+      let sourceRatio = ThemeContrast.ratio(source, surface)
+    else { return text }
+    return sourceRatio > textRatio ? source : text
+  }
+
+  /// `wash` composited over an opaque `surface`. The wash is translucent, so
+  /// measuring ink against the wash alone would answer a question nobody asked —
+  /// what the operator looks at is the blend.
+  static func compositedFindWash(_ wash: NSColor, over surface: NSColor) -> NSColor {
+    guard let top = wash.usingColorSpace(.sRGB),
+      let bottom = surface.usingColorSpace(.sRGB)
+    else { return wash }
+    let alpha = top.alphaComponent
+    func blend(_ over: CGFloat, _ under: CGFloat) -> CGFloat {
+      over * alpha + under * (1 - alpha)
+    }
+    return NSColor(
+      srgbRed: blend(top.redComponent, bottom.redComponent),
+      green: blend(top.greenComponent, bottom.greenComponent),
+      blue: blend(top.blueComponent, bottom.blueComponent),
+      alpha: 1)
+  }
 
   private func removeFindHighlights() {
     // Find highlights only exist when there are matches. Skip the whole-document
@@ -1476,6 +1589,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // per-keystroke "text reflows/jumps at a fixed scroll origin" bug, which is
     // independent of syntax highlighting (hence disabling rich markdown never
     // helped).
+    // The washes co-write `.foregroundColor` — a wash the body ink cannot carry
+    // would otherwise hide exactly what it marks — so taking them down has to
+    // give the highlighter's own colour back. Unconditional: the ink outlives a
+    // match set that has already been emptied.
+    restoreInkUnderFindWashes()
     guard !findMatches.isEmpty else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
     textStorage.removeAttribute(.backgroundColor, range: fullRange)
