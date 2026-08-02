@@ -163,7 +163,10 @@ final class CommandSurfaceContextTests: XCTestCase {
   func testARootIgnoresAnotherWindowsKeyTransition() {
     let mine = Self.makeParkedWindow()
     let other = Self.makeParkedWindow()
-    defer { mine.close(); other.close() }
+    defer {
+      mine.close()
+      other.close()
+    }
 
     XCTAssertFalse(CommandSurfaceAdoption.shouldAdopt(rootWindow: mine, keyWindow: other))
     XCTAssertTrue(CommandSurfaceAdoption.shouldAdopt(rootWindow: mine, keyWindow: mine))
@@ -206,7 +209,10 @@ final class CommandSurfaceContextTests: XCTestCase {
 
     let leftBehindWindow = Self.makeParkedWindow()
     let lookedAtWindow = Self.makeParkedWindow()
-    defer { leftBehindWindow.close(); lookedAtWindow.close() }
+    defer {
+      leftBehindWindow.close()
+      lookedAtWindow.close()
+    }
 
     // The first tab is key and owns the surface.
     Self.windowDidBecomeKey(
