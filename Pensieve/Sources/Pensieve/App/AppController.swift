@@ -176,6 +176,42 @@ final class AppController: ObservableObject {
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
+    reopenRestoredOpenFiles()
+  }
+
+  /// Reopens the ad-hoc files the user left open at quit.
+  ///
+  /// `prepareWorkspaceShell` runs synchronously inside the restore above, so
+  /// `appState.openFiles` is already populated when it returns — and for a long
+  /// time that was mistaken for "the files came back". They did not. Open Files
+  /// renders from the WINDOW REGISTRY (`windowRegistry.openDocuments`), and the
+  /// only production caller of `DocumentWindowRegistry.open` is
+  /// `requestOpenDocumentWindow`, which the launch path never invoked. So a file
+  /// left open at quit returned as a model entry with no window, no tab and no
+  /// sidebar row: from the user's side it did not come back at all.
+  ///
+  /// Only AD-HOC refs qualify. Workspace documents live in the sidebar tree, and
+  /// `applyWorkspaceScans` deliberately keeps them out of Open Files rather than
+  /// listing them twice.
+  private func reopenRestoredOpenFiles() {
+    let alreadyOpen = Set(documentWindowRegistry.openDocuments.map(\.identity))
+    var pending = appState.openFiles.filter { ref in
+      ref.isAdHoc && !alreadyOpen.contains(.file(ref.id.standardizedFileURL))
+    }
+    guard !pending.isEmpty else { return }
+
+    // This is the launch window and it is still empty, so the first restored
+    // document belongs IN it. Routing every ref to the factory instead would
+    // spawn a window per file and leave this one to be reaped — a visible flash
+    // in the commonest case of exactly one file. Mirrors `openFile`, which also
+    // loads in place when the window holds nothing.
+    if !appState.documentSession.hasEditableBuffer {
+      documentStore.load(ref: pending.removeFirst(), into: appState)
+    }
+    guard let requestOpenDocumentWindow else { return }
+    for ref in pending {
+      requestOpenDocumentWindow(ref)
+    }
   }
 
   func openFolder(url: URL) {

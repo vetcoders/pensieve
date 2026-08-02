@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 
@@ -36,16 +37,20 @@ final class LaunchOpensNothingTests: XCTestCase {
     let relaunched = try harness.relaunch()
 
     XCTAssertNil(
-      relaunched.selectedDocumentID,
+      relaunched.appState.selectedDocumentID,
       "the launch selected a document the user never opened — `documents.first` is not a"
         + " session, it is whatever the scanner happened to reach first")
     XCTAssertNil(
-      relaunched.documentSession.url,
+      relaunched.appState.documentSession.url,
       "worse than selected: it was LOADED, so the window came back showing a file the user"
         + " had not opened")
     XCTAssertTrue(
-      relaunched.openFiles.isEmpty,
+      relaunched.appState.openFiles.isEmpty,
       "an empty working set must stay empty across a launch")
+    XCTAssertTrue(
+      relaunched.registry.openDocuments.isEmpty,
+      "an empty session must open no window and no tab — reopening the working set must not"
+        + " become a reason to manufacture documents nobody asked for")
   }
 
   /// THE CONTROL LEG. The same harness, one file actually left open — it MUST
@@ -57,6 +62,13 @@ final class LaunchOpensNothingTests: XCTestCase {
   /// drops workspace documents from Open Files rather than listing them twice.
   /// Open Files is the ad-hoc working set, so that is what the control has to
   /// exercise.
+  /// The `openFiles` half of this leg passed for a long time while the user saw
+  /// nothing come back — because `openFiles` is a MODEL list, and the Open Files
+  /// sidebar renders from `windowRegistry.openDocuments`. `prepareWorkspaceShell`
+  /// filled the model and stopped; the only production caller of
+  /// `DocumentWindowRegistry.open` is `requestOpenDocumentWindow`, which the
+  /// launch path never invoked. So the assertion below was pinning exactly the
+  /// broken state. The registry assertion is what makes it a real control leg.
   func testAFileLeftOpenAtQuitStillComesBack() throws {
     let harness = try makeHarness()
     let keptURL = try harness.writeLooseNote(named: "kept.md")
@@ -67,8 +79,37 @@ final class LaunchOpensNothingTests: XCTestCase {
 
     let relaunched = try harness.relaunch()
     XCTAssertTrue(
-      relaunched.openFiles.contains { $0.url.standardizedFileURL == keptURL },
+      relaunched.appState.openFiles.contains { $0.url.standardizedFileURL == keptURL },
       "quitting with a file open must bring it back")
+    XCTAssertEqual(
+      relaunched.appState.documentSession.url?.standardizedFileURL, keptURL,
+      "the launch window is empty, so the restored document belongs IN it rather than in a"
+        + " second window that leaves this one to be reaped")
+    XCTAssertTrue(
+      relaunched.registry.openDocuments.contains { $0.identity == .file(keptURL) },
+      "the file came back only in the model: no window, no tab, and no Open Files row — from"
+        + " the user's side it did not come back at all")
+  }
+
+  /// The second and later files take the other branch — the real
+  /// `requestOpenDocumentWindow` route — so they arrive as their own document
+  /// windows/tabs rather than being silently dropped after the first.
+  func testEveryFileLeftOpenComesBackNotJustTheFirst() throws {
+    let harness = try makeHarness()
+    let firstURL = try harness.writeLooseNote(named: "first.md")
+    let secondURL = try harness.writeLooseNote(named: "second.md")
+    try harness.openWorkspace()
+
+    let session = AppState()
+    XCTAssertNotNil(harness.manager.registerOpenFile(url: firstURL, into: session))
+    XCTAssertNotNil(harness.manager.registerOpenFile(url: secondURL, into: session))
+
+    let relaunched = try harness.relaunch()
+
+    let reopened = Set(relaunched.registry.openDocuments.map(\.identity))
+    XCTAssertEqual(
+      reopened, [.file(firstURL), .file(secondURL)],
+      "a working set of two files must come back as two open documents")
   }
 
   /// The measurement behind "first is not most recent", kept as a pin because it
@@ -108,14 +149,26 @@ final class LaunchOpensNothingTests: XCTestCase {
 
     let defaults = makeEphemeralDefaults(prefix: "PensieveLaunchOpensNothing")
     let bookmarkStore = BookmarkStore(defaults: defaults)
-    return LaunchHarness(
+    let harness = LaunchHarness(
       root: root,
       support: support,
       loose: loose,
       defaults: defaults,
       manager: makeManager(support: support, bookmarkStore: bookmarkStore),
-      makeManager: makeManager
+      makeManager: makeManager,
+      makeStore: makeStore
     )
+    addTeardownBlock {
+      await MainActor.run { harness.closeWindows() }
+    }
+    return harness
+  }
+
+  private func makeStore(support: URL, bookmarkStore: BookmarkStore) -> DocumentStore {
+    makeTestDocumentStore(
+      indexDatabase: IndexDatabase(
+        databaseURL: support.appendingPathComponent("store-\(UUID().uuidString).db")),
+      bookmarkStore: bookmarkStore)
   }
 
   private func makeManager(support: URL, bookmarkStore: BookmarkStore) -> FolderManager {
@@ -132,14 +185,47 @@ final class LaunchOpensNothingTests: XCTestCase {
   }
 }
 
+/// One relaunch, as the user meets it: the session state AND the window
+/// registry the Open Files sidebar actually renders from.
 @MainActor
-private struct LaunchHarness {
+private struct RelaunchedSession {
+  let appState: AppState
+  let registry: DocumentWindowRegistry
+}
+
+@MainActor
+private final class LaunchHarness {
   let root: URL
   let support: URL
   let loose: URL
   let defaults: UserDefaults
   let manager: FolderManager
   let makeManager: (URL, BookmarkStore) -> FolderManager
+  let makeStore: (URL, BookmarkStore) -> DocumentStore
+  private var windows: [NSWindow] = []
+
+  init(
+    root: URL,
+    support: URL,
+    loose: URL,
+    defaults: UserDefaults,
+    manager: FolderManager,
+    makeManager: @escaping (URL, BookmarkStore) -> FolderManager,
+    makeStore: @escaping (URL, BookmarkStore) -> DocumentStore
+  ) {
+    self.root = root
+    self.support = support
+    self.loose = loose
+    self.defaults = defaults
+    self.manager = manager
+    self.makeManager = makeManager
+    self.makeStore = makeStore
+  }
+
+  func closeWindows() {
+    for window in windows { window.close() }
+    windows.removeAll()
+  }
 
   @discardableResult
   func writeNote(named name: String, in folder: String? = nil) throws -> URL {
@@ -173,10 +259,69 @@ private struct LaunchHarness {
     manager.open(url: root, into: appState)
   }
 
-  /// The next launch: brand-new stores reading the same persisted defaults.
-  func relaunch() throws -> AppState {
+  /// The next launch: brand-new stores reading the same persisted defaults,
+  /// driven through the REAL entry point (`AppController.start`) rather than
+  /// through `FolderManager` alone. That distinction is the whole point — the
+  /// model list and the window registry disagreed for a long time, and only the
+  /// registry is what the user sees.
+  func relaunch() throws -> RelaunchedSession {
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      closeWindow: { $0.close() }
+    )
+    // The window the app starts in, registered as the launcher exactly the way
+    // a cold start does; every LATER window comes from the factory.
+    let launcherWindow = makeWindow()
+    registry.makeDocumentWindow = { _ in launcherWindow }
+    registry.openLauncherWindow()
+    registry.makeDocumentWindow = { [weak self] _ in self?.makeWindow() }
+
     let appState = AppState()
-    makeManager(support, BookmarkStore(defaults: defaults)).restoreLastFolder(into: appState)
-    return appState
+    let controller = AppController(
+      appState: appState,
+      folderManager: makeManager(support, bookmarkStore),
+      documentStore: makeStore(support, bookmarkStore),
+      indexDatabase: IndexDatabase(
+        databaseURL: support.appendingPathComponent("launch-\(UUID().uuidString).db")),
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+    registry.registerController(controller, for: launcherWindow)
+
+    controller.start(restoringWorkspace: true)
+
+    // What SwiftUI's `DocumentWindowAccessor` publishes for the launch window,
+    // spelled out: a headless test has no render pass, so nothing else would
+    // ever tell the registry what this window ended up holding. Every value is
+    // read from the session — the simulation reports the state, it does not
+    // invent it, so a launch that loaded nothing still registers as a launcher.
+    registry.attach(
+      launcherWindow,
+      identity: appState.documentSession.identity,
+      documentID: appState.selectedDocumentID,
+      title: appState.documentSession.displayTitle,
+      representedURL: appState.documentSession.url,
+      isDirty: appState.documentSession.isDirty,
+      hasEditableBuffer: appState.documentSession.hasEditableBuffer)
+
+    return RelaunchedSession(appState: appState, registry: registry)
+  }
+
+  private func makeWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    windows.append(window)
+    return window
   }
 }
