@@ -142,6 +142,38 @@ struct EmptyStateShortcuts: View {
   }
 }
 
+/// Row labels for the recent-documents list.
+///
+/// The list shows basenames, which is what makes it readable — and ambiguous the
+/// moment two of them agree: two `README.md` from different folders were two
+/// identical `README` buttons, and the only thing telling them apart was a hover
+/// tooltip, which a keyboard or VoiceOver user never gets.
+///
+/// So the parent folder joins the label, but ONLY on the rows that need it.
+/// Suffixing every row would make the ordinary case — six distinct names — noisier
+/// for nothing. Uniqueness is judged inside the VISIBLE slice, because that is the
+/// set a reader is comparing; a name that repeats further down a history this view
+/// never draws is not an ambiguity anyone can see.
+enum EmptyStateRecentLabels {
+  /// Between the name and the folder that disambiguates it.
+  static let separator = " — "
+
+  static func labels(for urls: [URL]) -> [String] {
+    let names = urls.map { $0.deletingPathExtension().lastPathComponent }
+    var occurrences: [String: Int] = [:]
+    for name in names { occurrences[name, default: 0] += 1 }
+
+    return zip(urls, names).map { url, name in
+      guard occurrences[name, default: 0] > 1 else { return name }
+      // A file at a volume root has no folder name to add; leave it alone
+      // rather than append a bare "/".
+      let parent = url.deletingLastPathComponent().lastPathComponent
+      guard !parent.isEmpty, parent != "/" else { return name }
+      return name + separator + parent
+    }
+  }
+}
+
 /// The recent documents list, read from the system Open-Recent authority via
 /// `RecentDocumentsStore`. Clicking a row reopens it through the same path as
 /// the File ▸ Open Recent menu. Renders nothing when the history is empty.
@@ -152,6 +184,7 @@ struct EmptyStateRecents: View {
 
   var body: some View {
     let items = Array(store.recentDocuments.prefix(limit))
+    let labels = EmptyStateRecentLabels.labels(for: items)
     if !items.isEmpty {
       VStack(alignment: .leading, spacing: 6) {
         Text("Recent")
@@ -160,14 +193,14 @@ struct EmptyStateRecents: View {
           .tracking(1)
           .foregroundStyle(.secondary)
 
-        ForEach(items, id: \.self) { url in
+        ForEach(Array(items.enumerated()), id: \.element) { index, url in
           Button {
             controller.openRecentDocument(url: url)
           } label: {
             HStack(spacing: 6) {
               Image(systemName: "doc.text")
                 .foregroundStyle(.secondary)
-              Text(url.deletingPathExtension().lastPathComponent)
+              Text(labels[index])
                 .lineLimit(1)
               Spacer(minLength: 4)
             }
