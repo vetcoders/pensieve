@@ -566,6 +566,19 @@ final class DocumentWindowRegistry: ObservableObject {
     controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
   }
 
+  /// Every window controller still alive, deduplicated. `TerminationSequence` flushes each window's
+  /// pending edit through these directly instead of waiting for `NSWindow.willCloseNotification`:
+  /// `applicationWillTerminate` runs BEFORE window teardown, so on a Dock quit or a logout that
+  /// per-window hook fires after the app has already decided it is done — far too late to be the
+  /// app's final save. Dead weak entries are dropped here rather than left to accumulate.
+  func liveDocumentControllers() -> [AppController] {
+    controllersByWindow = controllersByWindow.filter { $0.value.controller != nil }
+    var seen: Set<ObjectIdentifier> = []
+    return controllersByWindow.values.compactMap(\.controller).filter {
+      seen.insert(ObjectIdentifier($0)).inserted
+    }
+  }
+
   /// The controller owning the window that currently shows `identity`, so a
   /// cross-window close routes its dirty guard through the target's own session.
   func controller(for identity: DocumentIdentity) -> AppController? {
@@ -660,6 +673,11 @@ final class DocumentWindowRegistry: ObservableObject {
     scheduleLauncherWindowSweep { [weak self] in
       guard let self else { return }
       launcherSweepPending = false
+      // A sweep is a DEFERRED `asyncAfter`: it cannot be cancelled, so one armed just before the
+      // quit fires INSIDE the termination sequence's pumped run loop. Closing a window there posts
+      // `willCloseNotification`, which runs a save — a brand-new managed write arriving after the
+      // sequence already flushed and drained. The quit tears every window down by itself anyway.
+      guard !isTerminating else { return }
       let activeWindow = launcherSweepSparedWindow?.window
       purgeClosedLauncherWindows()
       let allWindows = applicationWindows()
@@ -756,6 +774,9 @@ final class DocumentWindowRegistry: ObservableObject {
   private func reconcileLauncherWindows() {
     scheduleLauncherWindowSweep { [weak self] in
       guard let self else { return }
+      // Same reason as the sweep in `closeEmptyLauncherWindows`: an uncancellable deferred reap must
+      // not close windows — and so trigger saves — while the termination sequence is running.
+      guard !isTerminating else { return }
       purgeClosedLauncherWindows()
       let preferredLauncher = preferredLauncherID.flatMap { self.launcherWindows[$0]?.window }
       let shouldCloseAllLaunchers =

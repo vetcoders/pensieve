@@ -12,18 +12,18 @@ import XCTest
 /// would not survive a sandboxed relaunch.
 @MainActor
 final class BookmarkStoreSecurityScopeTests: XCTestCase {
-  private var suiteName = ""
   private var defaults: UserDefaults!
   private var folder: URL!
 
   override func setUp() async throws {
     // Suite cleanup (domain + backing plist) is registered as a teardown
-    // block by the helper.
-    let suite = makeEphemeralDefaultsSuite(prefix: "BookmarkStoreSecurityScopeTests")
-    suiteName = suite.suiteName
-    defaults = suite.defaults
+    // block by the helper. The suite name is an absolute path (a domain
+    // identifier, not a display name), so the scratch folder gets its own
+    // unique name rather than reusing it.
+    defaults = makeEphemeralDefaults(prefix: "BookmarkStoreSecurityScopeTests")
     folder = FileManager.default.temporaryDirectory
-      .appendingPathComponent(suiteName, isDirectory: true)
+      .appendingPathComponent(
+        "BookmarkStoreSecurityScopeTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   }
 

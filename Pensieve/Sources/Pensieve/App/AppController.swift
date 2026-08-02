@@ -283,6 +283,21 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Termination command from `TerminationSequence` (quiescence phase), routed through the registry's
+  /// live controllers.
+  ///
+  /// The import task has a semantic boundary in the middle of it. Before publication it is a
+  /// CONVERSION: a Word/PDF file read on a detached task into a temporary Markdown string, owned by
+  /// nobody, and cancelling it loses nothing. After publication it mutates the document session AND
+  /// persists a recovery draft — managed persistence, which must not appear after the flush phase has
+  /// already run. Cancelling here settles both halves at once: the task re-checks `Task.isCancelled`
+  /// between the conversion and the publication, and this call and that check are both on the main
+  /// actor, so there is no interleaving in which a cancelled import still publishes.
+  func quiesceForTermination() {
+    documentImportTask?.cancel()
+    documentImportTask = nil
+  }
+
   @discardableResult
   func createMarkdownFile(url: URL) -> Bool {
     guard documentStore.prepareForDocumentSwitch(appState: appState) else {
@@ -549,6 +564,12 @@ final class AppController: ObservableObject {
     return didSave
   }
 
+  /// The custom "Quit Pensieve" menu item's guard: settle THIS window's dirty session and report
+  /// whether the quit may proceed. Storage hygiene is deliberately NOT here any more — this item is
+  /// one of several quit paths, and the one it shares with all the others
+  /// (`applicationWillTerminate` → `TerminationSequence`) owns the save → index drain → checkpoint
+  /// ordering for every one of them. A second checkpoint fired from here would run BEFORE the final
+  /// window saves, which is precisely the ordering the sequence exists to prevent.
   @discardableResult
   func applicationShouldTerminate() -> Bool {
     documentStore.prepareForDocumentSwitch(appState: appState)
@@ -562,6 +583,13 @@ final class AppController: ObservableObject {
   @discardableResult
   func savePendingChangesOnClose() -> Bool {
     documentStore.savePendingChangesOnClose(appState: appState)
+  }
+
+  /// When this window's session was last edited, on the process-wide `EditRecency` scale. Read by
+  /// `TerminationSequence.flushPendingWindowSaves` to decide which of two windows over the SAME file
+  /// writes its bytes LAST.
+  var lastEditGeneration: UInt64 {
+    appState.lastEditGeneration
   }
 
   /// Closes the active document session without exiting Pensieve.
@@ -1199,11 +1227,17 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Handed over through `scheduleIndexWrite` rather than a bare `Task`, for the same reason the save
+  /// tail is: a bare task joins the index's supersede chain only several suspensions later, so
+  /// between "the document was created" and "the write reached the chain" it is invisible to
+  /// `drainPendingIndexWrites()`. This was the ONE index writer in the app with no handle at all —
+  /// create a document, quit immediately, and the quit could neither wait for it nor know it existed.
+  /// Now it is visible from the moment it is created; the termination latch still backs it up.
   private func reindexCreatedDocument(at url: URL) {
     let ref = appState.documentRef(for: url.standardizedFileURL)
     let indexDatabase = indexDatabase
     let appState = appState
-    Task {
+    indexDatabase.scheduleIndexWrite {
       _ = await indexDatabase.reindexInBackground(documents: [ref], appState: appState)
     }
   }
