@@ -121,7 +121,12 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   func testStartPublishesPendingDraftsToTheLauncher() throws {
     let harness = try makeRestoreHarness(documentNames: [])
-    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
+    let seeded = try harness.recoveryStore.saveDraft(
+      id: nil, title: "Untitled.md", text: "crash draft")
+    // Writing a draft claims it for the buffer that produced it. A draft left
+    // behind by a CRASH has no such buffer — the process died with the claim —
+    // and only an unclaimed draft is offered on the launcher.
+    harness.recoveryStore.markDraftClosed(id: seeded.id)
 
     harness.controller.start(intent: .coldLaunch)
 
