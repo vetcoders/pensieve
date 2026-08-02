@@ -4429,6 +4429,146 @@ final class PensieveSmokeTests: XCTestCase {
       "the recovery draft must survive — a deferred Discard can't leak past an I/O abort")
   }
 
+  /// THE PIN. "Clear Open Files" snapshots identities BEFORE phase 1 — but
+  /// phase 1 can change one. Saving a dirty untitled draft runs `saveAs`, which
+  /// appends a NEW `.file` ref to `openFiles` and persists a bookmark for it,
+  /// while the snapshot still holds that window's old `.untitled(UUID)`. The
+  /// retire sweep guards on `case .file`, skipped the untitled entry, and the
+  /// file the user had just created survived both the Open Files list and the
+  /// `fileBookmarks` default — so the affordance that promises to empty the list
+  /// left an entry in it, and the next launch reopened the file.
+  @MainActor
+  func testClearOpenFilesRetiresAFileSavedDuringThePassItself() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSavedInPass-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+
+    let savedURL = folder.appendingPathComponent("rescued.md").standardizedFileURL
+    let bookmarkDefaults = makeEphemeralDefaults(prefix: "PensieveClearSavedInPass")
+    let bookmarkStore = BookmarkStore(defaults: bookmarkDefaults)
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      dirtyUntitledPrompt: { _ in .save },
+      savePanelURLProvider: { _ in savedURL })
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "work with no name yet"
+    appState.activeDocumentDirty = true
+    let untitledIdentity = try XCTUnwrap(appState.windowModel.documentIdentity)
+    XCTAssertTrue(
+      registry.attach(
+        window, identity: untitledIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(controller, for: window)
+
+    controller.clearOpenFiles()
+
+    // The Save happened, so the premise holds: there IS a new file to retire.
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, savedURL,
+      "the fixture never took the Save branch, so this pin proves nothing")
+    XCTAssertFalse(closedWindows.isEmpty, "an uncancelled pass must close the window")
+
+    XCTAssertTrue(
+      appState.openFiles.isEmpty,
+      "the file saved DURING the pass stayed in Open Files — retiring by the pre-prompt"
+        + " snapshot cannot see an identity the prompt itself created")
+    let reopened = BookmarkStore(defaults: bookmarkDefaults).restoreWorkspace(into: AppState())
+    XCTAssertTrue(
+      reopened.fileURLs.isEmpty,
+      "the bookmark persisted by the in-pass Save survived, so the next launch reopens a file"
+        + " the user just cleared")
+  }
+
+  /// CONTROL LEG. Retiring by the owner's CURRENT identity must stay inside the
+  /// same transaction: when a LATER window cancels, the pass applies nothing and
+  /// forgets nothing — including the file an earlier window saved. Its bytes are
+  /// the documented non-rollback, but the working set is not touched.
+  @MainActor
+  func testAFileSavedDuringACancelledPassIsNotRetired() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSavedCancel-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let saveWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      saveWindow.close()
+      cancelWindow.close()
+    }
+
+    let savedURL = folder.appendingPathComponent("rescued.md").standardizedFileURL
+    let bookmarkDefaults = makeEphemeralDefaults(prefix: "PensieveClearSavedCancel")
+    let bookmarkStore = BookmarkStore(defaults: bookmarkDefaults)
+    let saveState = AppState()
+    let saveStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      dirtyUntitledPrompt: { _ in .save },
+      savePanelURLProvider: { _ in savedURL })
+    let saveController = AppController(
+      appState: saveState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: saveStore,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(saveController.createUntitledDocument())
+    saveState.activeDocumentText = "work with no name yet"
+    saveState.activeDocumentDirty = true
+    let saveIdentity = try XCTUnwrap(saveState.windowModel.documentIdentity)
+
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        saveWindow, identity: saveIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(saveController, for: saveWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    saveController.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    XCTAssertTrue(
+      saveState.openFiles.contains { $0.url.standardizedFileURL == savedURL },
+      "a cancelled pass must forget nothing — the in-pass Save's file stays in the working set")
+    let reopened = BookmarkStore(defaults: bookmarkDefaults).restoreWorkspace(into: AppState())
+    XCTAssertEqual(
+      reopened.fileURLs.map(\.standardizedFileURL), [savedURL],
+      "a cancelled pass must leave the persisted bookmark intact")
+  }
+
   @MainActor
   private static func makeCrossWindowRegistry(
     closeWindow: @escaping @MainActor (NSWindow) -> Void

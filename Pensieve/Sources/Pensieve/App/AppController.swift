@@ -131,6 +131,13 @@ final class AppController: ObservableObject {
   /// identity and the window would look like an empty launcher forever.
   var hasEditableBuffer: Bool { appState.documentSession.hasEditableBuffer }
 
+  /// The identity this window's session holds RIGHT NOW — which is not
+  /// necessarily the identity a caller snapshotted before prompting it. A Save
+  /// on a dirty untitled draft turns `.untitled(UUID)` into `.file(url)` inside
+  /// the prompt, and anything retiring by the pre-prompt snapshot then misses
+  /// the file that was just created.
+  var currentDocumentIdentity: DocumentIdentity? { appState.documentSession.identity }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a
@@ -553,6 +560,14 @@ final class AppController: ObservableObject {
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
+    // Phase 1 can CHANGE a window's identity: Save on a dirty untitled draft
+    // runs `saveAs`, which appends a NEW `.file` ref to `openFiles` and persists
+    // a bookmark for it. The snapshot still holds that window's OLD
+    // `.untitled(UUID)`, and the retire sweep below skips anything that is not
+    // `.file` — so the file the user had just saved survived both the Open Files
+    // list and the `fileBookmarks` default, and the next launch reopened it.
+    // Retire by each owner's identity as it stands AFTER its resolution.
+    var retiredIdentities = identities
     for identity in identities {
       // An unresolvable owner aborts the WHOLE sweep, exactly like a Cancel:
       // closing the rest while one window's session was never guarded is the
@@ -562,6 +577,11 @@ final class AppController: ObservableObject {
         return
       }
       deferred.append((owner, resolution))
+      if let settledIdentity = owner.currentDocumentIdentity,
+        !retiredIdentities.contains(settledIdentity)
+      {
+        retiredIdentities.append(settledIdentity)
+      }
     }
 
     for (owner, resolution) in deferred {
@@ -571,7 +591,7 @@ final class AppController: ObservableObject {
     // the single-row close does: this affordance empties the Open Files list,
     // and a list the next launch refills was never emptied. Inside phase 2, so
     // a Cancel in phase 1 still forgets nothing.
-    for identity in identities {
+    for identity in retiredIdentities {
       guard case .file(let url) = identity else { continue }
       documentStore.forgetOpenFile(url, into: appState)
     }
