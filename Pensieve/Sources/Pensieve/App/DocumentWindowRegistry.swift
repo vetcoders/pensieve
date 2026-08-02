@@ -67,6 +67,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// Set once the app starts quitting so the last document window's close does
   /// not resurrect a launcher mid-termination.
   private var isTerminating = false
+  /// Set when a quit prompt pass has already run AND consented for the terminate
+  /// request currently in flight. One-shot: `consumeTerminationPassLatch()`
+  /// disarms it on read.
+  private var hasSettledTerminationPass = false
   /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure? {
     didSet {
@@ -589,6 +593,65 @@ final class DocumentWindowRegistry: ObservableObject {
     return controllersByWindow.values.compactMap(\.controller).filter {
       seen.insert(ObjectIdentifier($0)).inserted
     }
+  }
+
+  /// The controller that should DRIVE a quit prompt pass. The pass asks EVERY
+  /// registered window regardless of who drives it; the driver only decides which
+  /// window is asked LAST, so the frontmost one wins — its prompt then reads as
+  /// "the window you quit from".
+  ///
+  /// A quit from the Dock menu, an AppleScript `quit` or a logout has no firing
+  /// window at all, which is exactly why this cannot be sourced from the ⌘Q menu
+  /// item's focused controller: any registered controller resolves the identical
+  /// set. `nil` means no document window is live — a quit with nothing to ask
+  /// about.
+  func terminationPassDriver() -> AppController? {
+    let frontmost = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+    if let frontmost,
+      let controller = controllersByWindow[ObjectIdentifier(frontmost)]?.controller
+    {
+      return controller
+    }
+    return liveDocumentControllers().first
+  }
+
+  /// Records that the unsaved-work pass for the terminate request now in flight
+  /// has ALREADY run and consented. ⌘Q runs the pass inside its own menu item and
+  /// only then calls `NSApplication.terminate(_:)`; without this the AppKit hook
+  /// would run a second pass and ask every window twice.
+  ///
+  /// Armed only on CONSENT, never on Cancel: a cancelled pass must leave the next
+  /// terminate request to ask again from scratch.
+  func armTerminationPassLatch() {
+    hasSettledTerminationPass = true
+  }
+
+  /// Reads the latch and immediately disarms it, so it covers exactly ONE
+  /// terminate request. A latch that outlived its request would let the NEXT
+  /// Dock quit through unprompted — the same silent-loss shape this whole path
+  /// exists to close.
+  func consumeTerminationPassLatch() -> Bool {
+    defer { hasSettledTerminationPass = false }
+    return hasSettledTerminationPass
+  }
+
+  /// The app's answer to a terminate request, wherever it came from: the Dock
+  /// menu's "Quit", an AppleScript `quit`, a logout, or ⌘Q's own
+  /// `NSApplication.terminate(_:)`.
+  ///
+  /// The pass is fully synchronous — `DocumentStore` resolves each dirty session
+  /// through `NSAlert.runModal()` — so this answers in ONE shot with
+  /// `.terminateNow` / `.terminateCancel`. No `.terminateLater` handshake is
+  /// needed, and none is wired: `.terminateLater` obliges the app to call
+  /// `reply(toApplicationShouldTerminate:)` exactly once on every path, an
+  /// obligation nothing here can drop or double-fire because it never takes it on.
+  func resolveTerminationRequest() -> NSApplication.TerminateReply {
+    // ⌘Q already asked, in the menu item, and every window consented. Asking
+    // again here would prompt each window twice for a single quit.
+    if consumeTerminationPassLatch() { return .terminateNow }
+    // No live document window means nothing can hold unsaved work.
+    guard let driver = terminationPassDriver() else { return .terminateNow }
+    return driver.applicationShouldTerminate() ? .terminateNow : .terminateCancel
   }
 
   /// The controller owning the window that currently shows `identity`, so a

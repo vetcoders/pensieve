@@ -259,6 +259,30 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  /// The veto point for EVERY quit that does not come from the ⌘Q menu item: the
+  /// Dock menu's "Quit", an AppleScript `quit`, a logout, a restart. Those reach
+  /// `NSApplication.terminate(_:)` with no firing window, so before this hook
+  /// existed they skipped the unsaved-work pass entirely and every window fell to
+  /// its teardown path — which can stash a recovery draft but has no veto point
+  /// and can never ask. With auto-save off a dirty FILE-BACKED buffer gets no
+  /// draft either, so the edit was simply gone.
+  ///
+  /// Verified at runtime on macOS 26 (Darwin 25.6), staged bundle, 2026-08-02:
+  /// `NSApp.delegate` is SwiftUI's own `SwiftUI.AppDelegate` proxy, NOT this
+  /// object — but it FORWARDS `applicationShouldTerminate(_:)` to the
+  /// `@NSApplicationDelegateAdaptor` instance, and a file probe written from
+  /// inside this method landed on an AppleScript quit. ⌘Q keeps its own pass in
+  /// `Commands.swift` (unchanged) because `NSApplication.terminate(_:)` does NOT
+  /// reliably reach this hook — `NSSupportsSuddenTermination` is true in
+  /// `Info.plist`, and a programmatic terminate can exit the process outright.
+  /// Moving the pass OFF the menu item is therefore a data-loss regression, which
+  /// is what the 2026-07-29 attempt hit.
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    MainActor.assumeIsolated {
+      DocumentWindowRegistry.shared.resolveTerminationRequest()
+    }
+  }
+
   func applicationWillTerminate(_ notification: Notification) {
     MainActor.assumeIsolated {
       // This notification is the one termination hook the app actually receives:

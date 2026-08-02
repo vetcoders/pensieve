@@ -3155,8 +3155,12 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     let recoveryStore = RecoveryStore(
       directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
-    _ = try recoveryStore.saveDraft(
+    let seededDraft = try recoveryStore.saveDraft(
       id: nil, title: "Recovered Untitled.md", text: "settledlaunchneedle from the previous session")
+    // Writing a draft claims it for the window that produced it. This one came
+    // from a PREVIOUS session, so release the claim — that is the state a draft
+    // left behind by a crash is actually in, and the only one the launcher lists.
+    recoveryStore.markDraftClosed(id: seededDraft.id)
 
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
     let store = DocumentStore(
