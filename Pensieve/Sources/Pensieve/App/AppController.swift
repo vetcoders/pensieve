@@ -8,6 +8,32 @@ private enum DocumentImportOutcome: Sendable {
   case failure(String)
 }
 
+/// The application's ONE startup restore, as a process-wide fact.
+///
+/// Bringing the working set back is something the APPLICATION does once, when
+/// it starts — not something every window that runs
+/// `start(restoringWorkspace:)` does. Every launcher takes that same path: the
+/// one the registry re-opens after the last document window closes, and the one
+/// a Dock reopen makes. And a native window close deliberately LEAVES the file
+/// in the working set (only "Close from Open Files" retires it), so a
+/// per-controller gate meant closing the last document immediately reopened it
+/// — the user could not close it at all.
+///
+/// Production shares `.shared`; a test that simulates a launch holds its own
+/// instance, because "once per process" is otherwise once per test BUNDLE.
+@MainActor
+final class ApplicationStartupRestore {
+  static let shared = ApplicationStartupRestore()
+
+  private var isUnclaimed = true
+
+  /// True for the FIRST caller in this process, false for every one after it.
+  func claimStartupRestore() -> Bool {
+    defer { isUnclaimed = false }
+    return isUnclaimed
+  }
+}
+
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
@@ -17,6 +43,7 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let documentWindowRegistry: DocumentWindowRegistry
+  private let startupRestore: ApplicationStartupRestore
   let recentDocuments: RecentDocumentsStore
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
@@ -88,6 +115,7 @@ final class AppController: ObservableObject {
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
+    startupRestore: ApplicationStartupRestore = .shared,
     recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
@@ -111,6 +139,7 @@ final class AppController: ObservableObject {
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
+    self.startupRestore = startupRestore
     self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
     self.workflowCapabilitiesProvider = workflowCapabilitiesProvider
@@ -167,6 +196,10 @@ final class AppController: ObservableObject {
     // Untitled", and the dirty untitled session then blocked the load of the
     // document the window was opened for.
     guard restoringWorkspace else { return }
+    // Claim the application's one startup restore BEFORE anything else in this
+    // branch can return early: whichever window gets here first IS the launch,
+    // and every launcher after it must be an empty launcher.
+    let isApplicationStartupRestore = startupRestore.claimStartupRestore()
     if documentStore.restoreRecoveredDraft(into: appState) {
       // This window now holds unsaved work with no URL behind it, so the
       // registry cannot classify it from the document identity the accessor
@@ -176,10 +209,14 @@ final class AppController: ObservableObject {
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
+    guard isApplicationStartupRestore else { return }
     reopenRestoredOpenFiles()
   }
 
-  /// Reopens the ad-hoc files the user left open at quit.
+  /// Reopens the ad-hoc files the user left open at quit. THE APPLICATION'S
+  /// STARTUP ONLY — see `ApplicationStartupRestore`; a launcher that appears
+  /// later in the same process must open nothing, or closing the last document
+  /// window immediately brings it back.
   ///
   /// `prepareWorkspaceShell` runs synchronously inside the restore above, so
   /// `appState.openFiles` is already populated when it returns — and for a long

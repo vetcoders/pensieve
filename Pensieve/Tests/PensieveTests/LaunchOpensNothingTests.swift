@@ -112,6 +112,40 @@ final class LaunchOpensNothingTests: XCTestCase {
       "a working set of two files must come back as two open documents")
   }
 
+  /// CLOSING THE LAST DOCUMENT MUST CLOSE IT.
+  ///
+  /// A native window close deliberately LEAVES the file in the working set —
+  /// only "Close from Open Files" retires it — and the registry re-opens a
+  /// launcher after the last document window goes, so the app is never left
+  /// windowless. That replacement launcher's root runs the very same
+  /// `start(restoringWorkspace: true)` as the launch one did. With the reopen
+  /// gated per controller, the launcher immediately reloaded the file the user
+  /// had just closed: the last document could not be closed at all without
+  /// first removing its Open Files row.
+  func testClosingTheLastDocumentDoesNotImmediatelyReopenIt() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    try harness.openWorkspace()
+
+    let session = AppState()
+    XCTAssertNotNil(harness.manager.registerOpenFile(url: keptURL, into: session))
+
+    let launched = try harness.relaunch()
+    XCTAssertEqual(
+      launched.appState.documentSession.url?.standardizedFileURL, keptURL,
+      "the launch never opened the document, so closing it would prove nothing")
+
+    let replacement = harness.closeWindowAdoptingTheReplacementLauncher(launched.window)
+
+    XCTAssertNil(
+      replacement.appState.documentSession.url,
+      "closing the last document reopened it in the replacement launcher — from the user's"
+        + " side the window simply refuses to close")
+    XCTAssertTrue(
+      replacement.registry.openDocuments.isEmpty,
+      "the document the user just closed came straight back as an open document row")
+  }
+
   /// The measurement behind "first is not most recent", kept as a pin because it
   /// is the reason the resurrected file looked arbitrary: folders sort before
   /// files, each group alphabetically, and the walk is depth-first.
@@ -185,12 +219,14 @@ final class LaunchOpensNothingTests: XCTestCase {
   }
 }
 
-/// One relaunch, as the user meets it: the session state AND the window
-/// registry the Open Files sidebar actually renders from.
+/// One window's session, as the user meets it: the session state, the window
+/// registry the Open Files sidebar actually renders from, and the window
+/// itself so a test can close it the way the user does.
 @MainActor
 private struct RelaunchedSession {
   let appState: AppState
   let registry: DocumentWindowRegistry
+  let window: NSWindow
 }
 
 @MainActor
@@ -203,6 +239,15 @@ private final class LaunchHarness {
   let makeManager: (URL, BookmarkStore) -> FolderManager
   let makeStore: (URL, BookmarkStore) -> DocumentStore
   private var windows: [NSWindow] = []
+  /// The launched process's registry and its once-per-process startup-restore
+  /// decision, kept so a SECOND window in the same process (the launcher the
+  /// registry re-opens after the last document closes) shares both — which is
+  /// the whole point of the pin that uses them.
+  private var registry: DocumentWindowRegistry?
+  private var startupRestore: ApplicationStartupRestore?
+  private var bookmarkStore: BookmarkStore?
+  /// What `scheduleDeferredMainWork` would run 0.1s later in production.
+  private var deferredMainWork: [() -> Void] = []
 
   init(
     root: URL,
@@ -268,13 +313,19 @@ private final class LaunchHarness {
     let bookmarkStore = BookmarkStore(defaults: defaults)
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { _ in },
+      scheduleDeferredMainWork: { [weak self] work in self?.deferredMainWork.append(work) },
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       closeWindow: { $0.close() }
     )
+    self.bookmarkStore = bookmarkStore
+    self.registry = registry
+    // ONE launch, so ONE startup restore — shared by every window this process
+    // goes on to build, exactly as the production singleton is.
+    self.startupRestore = ApplicationStartupRestore()
+
     // The window the app starts in, registered as the launcher exactly the way
     // a cold start does; every LATER window comes from the factory.
     let launcherWindow = makeWindow()
@@ -282,6 +333,37 @@ private final class LaunchHarness {
     registry.openLauncherWindow()
     registry.makeDocumentWindow = { [weak self] _ in self?.makeWindow() }
 
+    return adoptRootView(for: launcherWindow)
+  }
+
+  /// The user closing the last document window. AppKit's close reaches the
+  /// registry, which — so the app is never left windowless — re-opens a
+  /// launcher through the factory; that launcher's root then runs the same
+  /// `start(restoringWorkspace: true)` as the launch one. Returns the
+  /// REPLACEMENT launcher's session.
+  func closeWindowAdoptingTheReplacementLauncher(_ window: NSWindow) -> RelaunchedSession {
+    guard let registry else {
+      preconditionFailure("relaunch() first: there is no launched process to close a window in")
+    }
+    let windowsBefore = windows.count
+    window.close()
+    registry.handleWindowClosed(window, tombstonePolicy: .reusableWindow)
+    runDeferredMainWork()
+    guard windows.count > windowsBefore, let replacement = windows.last else {
+      preconditionFailure(
+        "closing the last document window left the app windowless — the registry never"
+          + " re-opened a launcher, so this pin is not exercising the reported path")
+    }
+    return adoptRootView(for: replacement)
+  }
+
+  /// Everything `DocumentWindowRootView` does for one window: build the
+  /// session and controller, publish the controller to the registry, run the
+  /// launch decision, and report back what the window ended up holding.
+  private func adoptRootView(for window: NSWindow) -> RelaunchedSession {
+    guard let registry, let bookmarkStore, let startupRestore else {
+      preconditionFailure("relaunch() first: there is no launched process to build a window in")
+    }
     let appState = AppState()
     let controller = AppController(
       appState: appState,
@@ -289,20 +371,21 @@ private final class LaunchHarness {
       documentStore: makeStore(support, bookmarkStore),
       indexDatabase: IndexDatabase(
         databaseURL: support.appendingPathComponent("launch-\(UUID().uuidString).db")),
-      documentWindowRegistry: registry
+      documentWindowRegistry: registry,
+      startupRestore: startupRestore
     )
     controller.requestOpenDocumentWindow = { registry.open($0) }
-    registry.registerController(controller, for: launcherWindow)
+    registry.registerController(controller, for: window)
 
     controller.start(restoringWorkspace: true)
 
-    // What SwiftUI's `DocumentWindowAccessor` publishes for the launch window,
+    // What SwiftUI's `DocumentWindowAccessor` publishes for this window,
     // spelled out: a headless test has no render pass, so nothing else would
     // ever tell the registry what this window ended up holding. Every value is
     // read from the session — the simulation reports the state, it does not
     // invent it, so a launch that loaded nothing still registers as a launcher.
     registry.attach(
-      launcherWindow,
+      window,
       identity: appState.documentSession.identity,
       documentID: appState.selectedDocumentID,
       title: appState.documentSession.displayTitle,
@@ -310,7 +393,15 @@ private final class LaunchHarness {
       isDirty: appState.documentSession.isDirty,
       hasEditableBuffer: appState.documentSession.hasEditableBuffer)
 
-    return RelaunchedSession(appState: appState, registry: registry)
+    return RelaunchedSession(appState: appState, registry: registry, window: window)
+  }
+
+  /// Runs what production would run 0.1s after the close, and nothing that the
+  /// run itself enqueues — one turn of the main queue, not a spin to fixpoint.
+  private func runDeferredMainWork() {
+    let pending = deferredMainWork
+    deferredMainWork.removeAll()
+    for work in pending { work() }
   }
 
   private func makeWindow() -> NSWindow {
