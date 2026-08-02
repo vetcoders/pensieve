@@ -499,6 +499,144 @@ private struct SkinAppearanceModifier: ViewModifier {
       content
       .preferredColorScheme(chrome.window)
       .toolbarColorScheme(chrome.toolbar, for: .windowToolbar)
+      // The AppKit half of the same contract. Declared here rather than left to
+      // the editor because the editor is not a thing every window has — see
+      // `WindowChromeSink`.
+      .background(WindowChromeSink(theme: themeManager.skin))
+  }
+}
+
+/// Runs the window-chrome pass for the window hosting this root.
+///
+/// A hidden zero-size view rather than a lifecycle hook, for the same reasons
+/// `ToolbarOverflowSink` is one: the pass needs a WINDOW, and it has to run
+/// again after every toolbar re-bridge.
+///
+/// Why it exists at all — two measured gaps, one mechanism:
+///
+///   * `assertWindowChrome` had exactly two production callers: the editor's
+///     representable and the preview's WebView. A window that hosts NEITHER
+///     never received the pass at all, so its toggle chips kept AppKit's
+///     `controlAccentColor` fill. That is not a hypothetical window — it is the
+///     launcher / empty-workspace window, which is what an operator meets on a
+///     cold start and what "New Window" gives her.
+///   * On a window that DOES host an editor the pass runs, and still loses.
+///     Measured on `ToolbarBridgeRig` (typewriter, wanted `#6e6e6e`): after a
+///     skin switch the chip bezel reads `nil` at +50 ms, +350 ms and +1.35 s.
+///     The re-bridge the switch itself causes — the appearance picker's label
+///     carries the skin name, so switching skins always rebuilds the toolbar —
+///     lands AFTER the editor's pass and takes the bezel with it, and WAITING
+///     NEVER RESTORES IT: only the next unrelated SwiftUI pass repaints. So the
+///     chips were right up until the operator picked a skin, which is the first
+///     moment they are supposed to be visible at all.
+///
+/// The adaptive skins hid both halves for as long as they were the default:
+/// their `chromeAccent` IS `controlAccentColor`, so an unpainted chip and a
+/// correctly painted one are the same pixels. The report reads "it breaks after
+/// switching to Typewriter" for exactly that reason.
+///
+/// Hence three triggers, and none of them a repaint storm:
+///
+///   * the SwiftUI pass, which covers a skin change (the modifier observes the
+///     manager) and every rebuild of the root;
+///   * one runloop turn later, which is where both the first toolbar build and
+///     the skin switch's re-bridge land;
+///   * every window update cycle — the same `NSWindow.didUpdateNotification`
+///     repair `ToolbarOverflowController` runs, for the same measured reason.
+///
+/// The update-cycle trigger deliberately re-asserts the CHIP TINT ONLY, not the
+/// whole chrome. `selectedSegmentBezelColor` round-trips faithfully (measured:
+/// 45 consecutive passes correct once and stay silent, and the write does not
+/// re-drive the SwiftUI graph), so a per-update compare-and-set converges. The
+/// window appearance does not round-trip on a scene-owned window, and driving
+/// that off a notification the window itself posts is how a write loop becomes
+/// the 99% CPU start-up hang `assertedAppearances` exists to prevent. The
+/// appearance and the titlebar backing therefore stay on the bounded SwiftUI
+/// passes, exactly where the editor already drives them.
+struct WindowChromeSink: NSViewRepresentable {
+  let theme: PensieveTheme
+
+  /// Holds the window observation across SwiftUI passes. A representable is a
+  /// value type, so the live theme is copied in on every `configure` and read
+  /// back out by a notification that fires between passes.
+  @MainActor
+  final class Coordinator {
+    var theme: PensieveTheme = .default
+    private weak var window: NSWindow?
+    private var observer: NSObjectProtocol?
+
+    func observe(_ window: NSWindow?) {
+      guard self.window !== window else { return }
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+      observer = nil
+      self.window = window
+      guard let window else { return }
+      observer = NotificationCenter.default.addObserver(
+        forName: NSWindow.didUpdateNotification, object: window, queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          guard let self, let window = self.window else { return }
+          WindowChromeRecipe.assertToolbarChipTint(on: window, for: self.theme)
+        }
+      }
+    }
+
+    func assertChrome() {
+      guard let window else { return }
+      WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
+    }
+
+    deinit {
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+  }
+
+  /// A plain `NSView` plus a dispatch is a timing heuristic: a window that
+  /// arrives later than that turn, with no further SwiftUI update behind it,
+  /// would never be asserted. `viewDidMoveToWindow()` is AppKit's guaranteed
+  /// signal that the window slot changed — the same belt `DocumentWindowAccessor`
+  /// wears.
+  final class SinkView: NSView {
+    var onWindowChanged: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      onWindowChanged?()
+    }
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  func makeNSView(context: Context) -> NSView {
+    let view = SinkView(frame: .zero)
+    view.isHidden = true
+    configure(view, coordinator: context.coordinator)
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    guard let view = nsView as? SinkView else { return }
+    configure(view, coordinator: context.coordinator)
+  }
+
+  private func configure(_ view: SinkView, coordinator: Coordinator) {
+    // Reinstalled on every pass so the callback closes over THIS pass's theme.
+    coordinator.theme = theme
+    view.onWindowChanged = { [weak view] in
+      guard let view else { return }
+      coordinator.observe(view.window)
+      coordinator.assertChrome()
+    }
+    coordinator.observe(view.window)
+    coordinator.assertChrome()
+    // The first update lands before the bridge has built the toolbar items, and
+    // a skin switch's re-bridge lands after this body ran; one turn later both
+    // are settled.
+    DispatchQueue.main.async { [weak view] in
+      guard let view else { return }
+      coordinator.observe(view.window)
+      coordinator.assertChrome()
+    }
   }
 }
 
