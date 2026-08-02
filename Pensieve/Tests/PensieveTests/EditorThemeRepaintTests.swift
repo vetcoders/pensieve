@@ -84,6 +84,56 @@ final class EditorThemeRepaintTests: XCTestCase {
     content.onRethemeCompleted = previous
   }
 
+  /// Runs `body` and then drives the deferred sweep it starts to completion by
+  /// RUNNING each chunk as the storage schedules it, instead of waiting out one
+  /// real timer per chunk.
+  ///
+  /// `drainDeferredRefresh` above waits on the sweep's own timers, which is the
+  /// honest thing to do when the sweep is a handful of chunks. It stops being
+  /// honest at scale: the fenced fixture below sweeps in ~200 chunks, so the
+  /// timers alone are >3 s of wall clock before a single character is painted,
+  /// and the painting on top of that is hardware-dependent. Wrapping all of it
+  /// in an expectation with a fixed timeout makes the pin a bet on how fast the
+  /// machine is — a bet that passed here in 7 s and lost on a CI runner at 20 s.
+  ///
+  /// Nothing about the sweep's SHAPE changes: the same chunks run, in the same
+  /// order, each still measured with a real clock, and the storage still decides
+  /// how many there are. Only the waiting is removed.
+  ///
+  /// Chunks are queued rather than performed where they are scheduled, because
+  /// each chunk schedules its successor from inside itself — performing inline
+  /// would nest the entire sweep on one stack.
+  @MainActor
+  private func sweepDeterministically(
+    _ content: MarkdownTextStorage, _ body: () -> Void
+  ) {
+    var queued: [DispatchWorkItem] = []
+    content.scheduleRethemeChunk = { _, work in queued.append(work) }
+    defer { content.scheduleRethemeChunk = MarkdownTextStorage.timerRethemeChunkScheduler }
+
+    body()
+
+    // The cursor advances by at least one character per chunk, so a terminating
+    // sweep cannot need more turns than the document has characters. The cap
+    // turns a sweep that does NOT terminate into a failure rather than a hang —
+    // the job the expectation's timeout used to do, stated in a unit that does
+    // not vary with the machine.
+    let ceiling = (content.textStorage?.length ?? 0) + 2
+    var turns = 0
+    while !queued.isEmpty {
+      let work = queued.removeFirst()
+      turns += 1
+      guard turns <= ceiling else {
+        return XCTFail("the deferred sweep scheduled \(turns) chunks without finishing")
+      }
+      guard !work.isCancelled else { continue }
+      work.perform()
+    }
+    XCTAssertFalse(
+      content.isRethemeSweepInFlight,
+      "the pump ran out of chunks while the sweep still had ranges to paint")
+  }
+
   /// Lets the 70 ms typing debounce fire. The fence-block expansion — and so the
   /// fence cache — is built by the DEBOUNCED pass, not by the keystroke, so a
   /// pin that reads the cache straight after an edit reads it before it exists.
@@ -299,30 +349,38 @@ final class EditorThemeRepaintTests: XCTestCase {
   /// document in one block, which is precisely what the chunking replaced.
   /// Clamped, the worst chunk is 223 ms and the steady state ~18 ms.
   ///
-  /// The residual 223 ms is the FIRST chunk, sized from `seedSecondsPerCharacter`
-  /// before any measurement of this document exists, and it is dominated by a
-  /// per-chunk cost that is O(document) rather than O(chunk) — each pass bridges
-  /// the whole `NSString` to a `String` and re-copies `lastProcessedString`. That
-  /// is a separate finding, not this one, so the duration bound here is set from
-  /// the measurement rather than from the frame budget; the LENGTH assertion
-  /// below states the same contract deterministically.
+  /// The pin is stated in CHARACTERS, not milliseconds. Duration is the property
+  /// that actually matters, but on this fixture it is not a property of the code
+  /// under test alone: the residual worst chunk is the FIRST one, sized from
+  /// `seedSecondsPerCharacter` before any measurement of this document exists,
+  /// and its cost is dominated by a per-chunk overhead that is O(document)
+  /// rather than O(chunk) — every pass bridges the whole `NSString` to a
+  /// `String` and re-copies `lastProcessedString`. That is a separate finding.
+  /// A wall-clock bound loose enough to survive it on any machine would no
+  /// longer distinguish 223 ms from the 2315 ms it is supposed to catch; a bound
+  /// tight enough to catch it fails on a slower box. The earlier cut of this pin
+  /// picked `budget * 20` = 333 ms against a measured 223–283 ms — 1.2x of
+  /// headroom — and CI duly went red on it.
+  ///
+  /// So the bound is the chunk ceiling, which is the same contract said
+  /// deterministically: whatever a chunk costs, the expansion may not hand one a
+  /// range larger than the chunking is allowed to plan. Unbounded, the fence
+  /// hands a single chunk all 608 KB and the assertion fails by a factor of two
+  /// regardless of how fast the machine is.
   @MainActor
   func testALargeFencedBlockCannotWidenAChunkPastItsBudget() {
     let (content, storage) = makeStorage(text: makeHugeFencedDocument(), skin: .parchment)
     content.visibleRangeProvider = { NSRange(location: 0, length: 400) }
 
-    content.tokens = PensieveTheme.ink.tokens
-    drainDeferredRefresh(content)
+    sweepDeterministically(content) {
+      content.tokens = PensieveTheme.ink.tokens
+    }
 
     XCTAssertGreaterThan(content.rethemeChunkCount, 2, "the sweep must actually be cut up")
     XCTAssertLessThanOrEqual(
       content.longestRethemeChunkLength, MarkdownTextStorage.maximumRethemeChunkLength,
       "the fenced block handed one chunk \(content.longestRethemeChunkLength) characters —"
         + " the expansion is unbounded again")
-    XCTAssertLessThan(
-      content.longestRethemeChunkDuration, content.rethemeChunkTimeBudget * 20,
-      "a fenced block widened a chunk into the blocking pass the sweep replaced"
-        + " — measured \(Int(content.longestRethemeChunkDuration * 1000)) ms")
 
     // Control leg: bounding the chunk must not cost the CODE PALETTE. Sampled
     // deep inside the fence, well past any chunk boundary the sweep could have
@@ -423,26 +481,52 @@ final class EditorThemeRepaintTests: XCTestCase {
   /// perceptible rides on the first chunk — but every millisecond it waits is a
   /// millisecond added to the tail, which is what the operator hits when
   /// scrolling straight after a switch.
+  ///
+  /// Read off the SCHEDULER rather than off the clock. The earlier cut timed the
+  /// first chunk with a `Date()` and gave it 50 ms, which is three times the
+  /// 16.7 ms delay it was measuring — thin enough that a loaded runner failing
+  /// to service one timer promptly would have failed the pin without anything
+  /// being wrong. The delay the storage ASKS for is the property under test, and
+  /// it is exact.
   @MainActor
   func testTheSweepStartsOnTheFrameBudgetNotTheTypingDebounce() {
     let (content, _) = makeStorage(text: makeLargeDocument(), skin: .parchment)
     content.visibleRangeProvider = { NSRange(location: 0, length: 400) }
 
-    let started = Date()
-    var firstChunkLatency: TimeInterval = .infinity
-    let sawFirstChunk = whenOnMain(
-      "first chunk ran",
-      { content.rethemeChunkCount >= 1 },
-      { firstChunkLatency = Date().timeIntervalSince(started) })
+    var delays: [TimeInterval] = []
+    var queued: [DispatchWorkItem] = []
+    content.scheduleRethemeChunk = { delay, work in
+      delays.append(delay)
+      queued.append(work)
+    }
+    defer { content.scheduleRethemeChunk = MarkdownTextStorage.timerRethemeChunkScheduler }
 
     content.tokens = PensieveTheme.ink.tokens
-    wait(for: [sawFirstChunk], timeout: 5.0)
-    drainDeferredRefresh(content)
 
-    XCTAssertLessThan(
-      firstChunkLatency, 0.05,
-      "the sweep must start on the frame budget (~16 ms), not on the 70 ms"
-        + " typing debounce — measured \(Int(firstChunkLatency * 1000)) ms")
+    // Synchronously, on the switch itself. This is the half a clock cannot see:
+    // a cut that parked `startRethemeSweep` behind a debounce of its own would
+    // still schedule the first chunk one frame after THAT, and a latency bound
+    // could only catch it by being tight enough to be flaky.
+    XCTAssertEqual(
+      delays.count, 1,
+      "the switch must schedule the first chunk itself — anything queued in"
+        + " between is delay added to every skin click")
+    XCTAssertEqual(
+      delays.first ?? .infinity, content.rethemeChunkTimeBudget, accuracy: 1e-9,
+      "the first chunk must wait one frame budget (~16 ms), not the 70 ms typing"
+        + " debounce — asked for \(Int((delays.first ?? 0) * 1000)) ms")
+
+    // And every later chunk rides the same budget, so the tail is not paced by
+    // some other timer either.
+    var turns = 0
+    while !queued.isEmpty, turns < 10_000 {
+      let work = queued.removeFirst()
+      turns += 1
+      if !work.isCancelled { work.perform() }
+    }
+    XCTAssertEqual(
+      delays.filter { abs($0 - content.rethemeChunkTimeBudget) > 1e-9 }, [],
+      "a chunk asked for a delay that is not the frame budget")
   }
 
   /// Coverage under many chunks: with a tight budget the sweep is cut into a

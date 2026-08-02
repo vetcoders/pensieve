@@ -99,6 +99,27 @@ class MarkdownTextStorage: NSTextContentStorage {
 
   static let defaultRethemeChunkTimeBudget: TimeInterval = 1.0 / 60.0
 
+  /// How the next chunk of a deferred sweep gets onto the main thread, and after
+  /// how long. Production always uses the timer below — see
+  /// `scheduleNextRethemeChunk` for why it may not be a bare `main.async`.
+  ///
+  /// Injected the way `DocumentWindowRegistry` injects its launcher sweep, so a
+  /// pin can DRIVE the sweep instead of waiting it out. A sweep is one timer per
+  /// chunk and a big document is hundreds of chunks, so waiting on the real
+  /// timers puts seconds of pure delay in front of an expectation — and an
+  /// expectation with a fixed timeout around a hardware-dependent duration is a
+  /// bet on how fast the machine is, not a pin. It also lets a pin read back the
+  /// DELAY the storage asked for, which is the deterministic form of "the first
+  /// chunk rides the frame budget, not the typing debounce".
+  var scheduleRethemeChunk: (TimeInterval, DispatchWorkItem) -> Void =
+    MarkdownTextStorage.timerRethemeChunkScheduler
+
+  /// The production scheduler, named so a pin that swaps it can put it back.
+  static let timerRethemeChunkScheduler: (TimeInterval, DispatchWorkItem) -> Void = {
+    delay, work in
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
   /// Measured on the running app: ~0.7 µs per character for a full reset + both
   /// highlighters in a debug build (860 ms for a 1.27 MB draft).
   static let seedSecondsPerCharacter: TimeInterval = 0.7e-6
@@ -242,8 +263,7 @@ class MarkdownTextStorage: NSTextContentStorage {
       self?.applyNextRethemeChunk()
     }
     rethemeWorkItem = workItem
-    DispatchQueue.main.asyncAfter(
-      deadline: .now() + rethemeChunkTimeBudget, execute: workItem)
+    scheduleRethemeChunk(rethemeChunkTimeBudget, workItem)
   }
 
   private func applyNextRethemeChunk() {
