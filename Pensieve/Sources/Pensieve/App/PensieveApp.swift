@@ -220,9 +220,22 @@ struct DocumentWindowRootView: View {
       // focused values go silent.
       .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) {
         notification in
-        guard let keyWindow = notification.object as? NSWindow, keyWindow === currentWindow else {
-          return
-        }
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: currentWindow, keyWindow: notification.object as? NSWindow)
+        else { return }
+        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+      }
+      // Second half of the same rule. The accessor above is coalesced and
+      // async, so a factory-built native tab is regularly key BEFORE this root
+      // knows which window is its own — and `didBecomeKey` has already fired
+      // and will not fire again. Without this trigger such a tab never adopts,
+      // and the fallback keeps serving the PREVIOUS tab's session.
+      .onChange(of: currentWindow) { _, resolvedWindow in
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: resolvedWindow, keyWindow: NSApp.keyWindow)
+        else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
       // App-wide save-on-close guard. Every window (factory-built document tab AND
