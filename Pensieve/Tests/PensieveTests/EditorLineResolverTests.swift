@@ -195,9 +195,13 @@ final class EditorLineResolverTests: XCTestCase {
   /// of main thread purely to move a gutter marker. Anchored, the same 200 moves
   /// touch a handful of characters each.
   ///
-  /// The budget is deliberately loose (two orders of magnitude of slack against
-  /// the measured full-scan cost) so it reads as "not O(document)" rather than
-  /// as a benchmark of the machine it runs on.
+  /// The budget is a MEASURED one, taken on the machine running the test rather
+  /// than written down in milliseconds. One full scan of this fixture is timed
+  /// here and the 200 anchored moves must together cost less than that single
+  /// scan. The old walk did 200 of them, so it fails by more than two orders of
+  /// magnitude on any hardware; an absolute bound instead asserts how fast the
+  /// runner is, and reads as passing for a regression that merely halved the
+  /// scan rather than removing it.
   @MainActor
   func testTwoHundredCaretMovesDoNotRescanTheDocument() {
     let text = String(repeating: "body text paragraph line here\n", count: 36_000)
@@ -215,9 +219,16 @@ final class EditorLineResolverTests: XCTestCase {
     }
     let elapsed = Date().timeIntervalSince(started)
 
+    // The baseline: exactly the work ONE unanchored call had to do. Timed after
+    // the loop so a cold cache cannot flatter the thing under test.
+    let scanStarted = Date()
+    _ = naiveLineIndex(ns, offset: ns.length)
+    let oneFullScan = Date().timeIntervalSince(scanStarted)
+
     XCTAssertLessThan(
-      elapsed, 0.05,
-      "200 caret moves took \(Int(elapsed * 1000)) ms — the resolver is rescanning"
-        + " the document instead of the span it moved across")
+      elapsed, oneFullScan,
+      "200 caret moves cost \(Int(elapsed * 1000)) ms against \(Int(oneFullScan * 1000)) ms"
+        + " for a SINGLE full scan — the resolver is rescanning the document"
+        + " instead of the span it moved across")
   }
 }
