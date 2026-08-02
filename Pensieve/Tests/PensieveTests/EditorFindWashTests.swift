@@ -164,8 +164,9 @@ final class EditorFindWashTests: XCTestCase {
           for isDark in [false, true] {
             let tokens = skin.tokens(underDarkSystem: isDark)
             let palette = MarkdownEditorSurface.findWashes(for: tokens)
-            let label = "\(skin.rawValue) half=\(isDark ? "dark" : "light")"
-              + " appearance=\(appearanceName.rawValue)"
+            let half = isDark ? "dark" : "light"
+            let label =
+              "\(skin.rawValue) half=\(half) appearance=\(appearanceName.rawValue)"
 
             for (name, wash) in [("passive", palette.passive), ("active", palette.active)] {
               let composited = MarkdownEditorSurface.compositedFindWash(
@@ -207,7 +208,8 @@ final class EditorFindWashTests: XCTestCase {
 
     let ns = surface.textStorage.string as NSString
     let headingMatch = ns.range(of: "needle")
-    let bodyMatch = ns.range(of: "needle", options: [], range: NSRange(location: 20, length: ns.length - 20))
+    let bodyMatch = ns.range(
+      of: "needle", options: [], range: NSRange(location: 20, length: ns.length - 20))
     XCTAssertNotEqual(bodyMatch.location, NSNotFound)
 
     func ink(_ at: Int) -> NSColor? {
