@@ -56,6 +56,36 @@ final class MarkdownFormatterTests: XCTestCase {
     XCTAssertEqual(quote?.replacement, "\n> ")
   }
 
+  /// `- [~]wip` is NOT a task anywhere else in the app — the highlighter leaves
+  /// it as a plain bullet and `HTMLEmitter` renders it as one — so Return must
+  /// not open a checkbox under it. The line falls through to the unordered-list
+  /// rule and continues as the bullet it actually is.
+  func testReturnOnABracketWithoutASeparatorContinuesAPlainBullet() {
+    for line in ["- [~]wip", "- [x]wip", "- [ ]wip"] {
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, "\n- ", line)
+    }
+  }
+
+  /// Control leg: a WELL-FORMED marker still continues as a task, in all three
+  /// states and with the bracket at end of line. The lookahead must tighten the
+  /// pattern, not disable it.
+  func testReturnOnAWellFormedTaskMarkerStillOpensACheckbox() {
+    for line in ["- [~] wip", "- [x] done", "* [ ] todo", "+ [X] shouted"] {
+      let marker = String(line.prefix(1))
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, "\n\(marker) [ ] ", line)
+    }
+  }
+
   func testTypingReturnOnEmptyMarkdownMarkerExitsTheContainer() {
     let conversion = MarkdownFormatter.autoconversion(
       in: "- ",

@@ -86,7 +86,14 @@ enum MarkdownFormatter {
   private enum AutoconversionPatterns {
     /// `[~]` ("in progress") continues like the other two states — Return on a
     /// `- [~] …` line opens the next item as an empty `- [ ] `, not a bare dash.
-    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX~]\]\s*(.*)$"#)
+    ///
+    /// The `(?=\s|$)` is the same separator the highlighter and `HTMLEmitter`
+    /// demand: `\s*` alone matches empty, so `- [~]wip` — a plain bullet
+    /// everywhere else in the app — reached the marker closure and Return
+    /// continued it as a task. A lookahead rather than a consuming group so the
+    /// capture-group numbering the closure indexes stays exactly as it was; the
+    /// line then falls through to `unorderedList` and continues as a bullet.
+    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX~]\](?=\s|$)\s*(.*)$"#)
     static let unorderedList = compile(#"^(\s*)([-*+])\s+(.*)$"#)
     static let orderedList = compile(#"^(\s*)(\d+)([.)])\s+(.*)$"#)
     static let blockquote = compile(#"^(\s*)>\s?(.*)$"#)
