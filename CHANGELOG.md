@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Released app binaries no longer carry absolute `LC_RPATH` entries. The linker baked the builder's `Vendor/qube-ffi/<profile>` checkout path (plus the Xcode toolchain path) into every shipped binary, and dyld searched those _before_ `@executable_path/../Frameworks` — so on a machine where the builder's path happened to exist, the app loaded a qube-ffi dylib from outside its own bundle. The release pipeline now strips every absolute rpath before signing, refuses to sign or package a bundle where one survives, and verifies that each remaining `@rpath` dependency still resolves inside the bundle.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
