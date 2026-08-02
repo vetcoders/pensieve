@@ -113,10 +113,19 @@ enum DocumentExport {
   ) -> PreviewDocument? {
     guard session.hasEditableBuffer else { return nil }
 
+    // `skin` carries a default so the pre-skin constructors kept compiling —
+    // which silently made EVERY export a `.default` one. Two things followed
+    // from that single omitted argument: the exported HTML carried the default
+    // skin's CSS block (so Typewriter, Ink and Parchment reached no export path
+    // at all — not PDF, not HTML, not DOCX), and `PreviewDocument.skin` came
+    // back `.default`, whose `exportAppearanceName` is nil, so `PDFExportJob`
+    // pinned nothing and the PDF followed the EXPORTING MAC's light/dark
+    // setting. The skin the operator is reading is the skin she exports.
     let request = PreviewRenderRequest(
       markdown: session.text,
       fontSize: fontSize,
       theme: theme,
+      skin: themeManager.skin,
       documentURL: session.url
     )
     return PreviewPipeline(themeManager: themeManager).makeDocument(for: request)
