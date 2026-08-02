@@ -26,7 +26,14 @@ class SyntaxHighlighter {
     /// `- [~]wip` as a checkbox while the preview renders it as a plain bullet —
     /// two panes disagreeing about the same line. GFM is on the emitter's side:
     /// a task marker needs a separator after the bracket.
-    static let taskCheckbox = compile(#"(?m)^\s{0,3}[-*+]\s+\[[ xX~]\](?=\s|$)"#)
+    ///
+    /// ORDERED markers count for the same reason. GFM hangs the checkbox off the
+    /// list ITEM, not off the bullet — `HTMLEmitter.visitListItem` promotes
+    /// ordered items too — so a pattern that knew only `-`/`*`/`+` left
+    /// `1. [~] wip` as prose in the source pane while the preview drew a real
+    /// checkbox. Both delimiters (`.` and `)`) are here because cmark accepts
+    /// both.
+    static let taskCheckbox = compile(#"(?m)^\s{0,3}(?:[-*+]|\d+[.)])\s+\[[ xX~]\](?=\s|$)"#)
     static let unorderedList = compile(#"(?m)^\s{0,3}[-*+](?=\s+)"#)
     static let orderedList = compile(#"(?m)^\s{0,3}\d+\.(?=\s+)"#)
     static let heading = compile("(?m)^#{1,6}\\s+.*$")

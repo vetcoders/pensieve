@@ -118,6 +118,19 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertFalse(html.contains("checked />"), html)
   }
 
+  /// THE REFERENCE the editor panes have to agree with. GFM puts task markers on
+  /// list items, not on bullets: `visitListItem` runs for ordered items too, so a
+  /// numbered task is a real checkbox in the preview — in every state and with
+  /// either ordered delimiter.
+  func testNumberedListItemsAreTasksToo() {
+    for markdown in ["1. [x] done", "1. [ ] todo", "1) [x] done"] {
+      XCTAssertTrue(render(markdown).contains("task-list-item"), "\(markdown) → \(render(markdown))")
+    }
+    let inProgress = render("1. [~] wip")
+    XCTAssertTrue(inProgress.contains("data-vc-task-state=\"in-progress\""), inProgress)
+    XCTAssertFalse(inProgress.contains("[~]"), inProgress)
+  }
+
   func testInProgressTaskKeepsInlineChildrenAndNestedBlocks() {
     let html = render("- [~] **bold** tail\n  - [~] inner")
     XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 2, html)

@@ -86,6 +86,48 @@ final class MarkdownFormatterTests: XCTestCase {
     }
   }
 
+  /// Return on a NUMBERED task opens the next numbered task, not a bare `2. `.
+  /// The preview already draws `1. [~] wip` as a checkbox (GFM hangs the marker
+  /// off the list item, so `HTMLEmitter.visitListItem` promotes ordered items
+  /// too), so continuing it as a plain ordered item made the editor drop a task
+  /// the reader can see.
+  func testReturnOnANumberedTaskOpensTheNextNumberedTask() {
+    for (line, expected) in [
+      ("1. [~] wip", "\n2. [ ] "),
+      ("1. [x] done", "\n2. [ ] "),
+      ("  9. [ ] todo", "\n  10. [ ] "),
+      ("3) [X] shouted", "\n4) [ ] "),
+    ] {
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, expected, line)
+    }
+  }
+
+  /// CONTROL: the numbered form obeys the same two limits as the bullet form —
+  /// a bracket with no separator is not a task (it continues as the ordinary
+  /// ordered item it is), and an EMPTY task exits the container instead of
+  /// opening another one.
+  func testNumberedTaskRespectsTheSeparatorAndTheEmptyMarkerExit() {
+    let noSeparator = MarkdownFormatter.autoconversion(
+      in: "1. [~]wip",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(noSeparator?.replacement, "\n2. ")
+
+    let empty = MarkdownFormatter.autoconversion(
+      in: "1. [ ] ",
+      range: NSRange(location: 7, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(empty?.range, NSRange(location: 0, length: 7))
+    XCTAssertEqual(empty?.replacement, "")
+  }
+
   func testTypingReturnOnEmptyMarkdownMarkerExitsTheContainer() {
     let conversion = MarkdownFormatter.autoconversion(
       in: "- ",

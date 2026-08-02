@@ -230,6 +230,34 @@ final class SyntaxHighlighterTests: XCTestCase {
     }
   }
 
+  /// A NUMBERED task is a task. GFM hangs the checkbox off the list ITEM, not
+  /// off the bullet — `HTMLEmitter.visitListItem` runs for ordered items too — so
+  /// the preview draws `1. [~] wip` as an in-progress checkbox while the source
+  /// pane, which accepted only `-`/`*`/`+`, left it as prose. Both ordered
+  /// delimiters count, because cmark accepts both.
+  func testNumberedTaskCheckboxGetsTheSameMarkerTreatment() {
+    let semibold = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold)
+    for md in ["1. [~] wip\n", "1. [x] done\n", "12. [ ] todo\n", "2) [x] done\n"] {
+      let storage = highlighted(md)
+      let at = index(of: "[", in: md)
+      XCTAssertEqual(font(storage, at: at), semibold, md)
+      XCTAssertEqual(color(storage, at: at), NSColor.secondaryLabelColor, md)
+    }
+  }
+
+  /// CONTROL: the separator rule the bullet form obeys is not weakened for the
+  /// numbered form. `1. [~]wip` is a plain ordered item in the preview, so the
+  /// bracket must stay unstyled here as well.
+  func testNumberedCheckboxAlsoNeedsASeparatorAfterTheBracket() {
+    let semibold = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold)
+    for md in ["1. [~]wip\n", "1. [x]wip\n", "1. [ ]wip\n"] {
+      let storage = highlighted(md)
+      let at = index(of: "[", in: md)
+      XCTAssertNotEqual(font(storage, at: at), semibold, md)
+      XCTAssertNotEqual(color(storage, at: at), NSColor.secondaryLabelColor, md)
+    }
+  }
+
   /// Control leg: the tightened pattern must not stop matching a WELL-FORMED
   /// marker, in any of the three states or at end of line without a trailing
   /// space.
