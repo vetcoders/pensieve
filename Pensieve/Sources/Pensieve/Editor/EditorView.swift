@@ -600,6 +600,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textContentStorage.onRethemeCompleted = { [weak self] in
       self?.reapplyFindHighlights()
     }
+    // …and every SCOPED pass strips it over the range it repaints. The sweep
+    // starts at offset 0 and rides one chunk per frame, so waiting for the
+    // completion above left matches near the top of the document unwashed for
+    // the whole length of the sweep. Repaint per chunk instead.
+    textContentStorage.onHighlightingRepainted = { [weak self] range in
+      self?.reapplyFindHighlights(in: range)
+    }
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
     applyTheme(skin)
@@ -1284,6 +1291,30 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     applyFindHighlights()
   }
 
+  /// The same repaint, restricted to the matches a PARTIAL highlight pass
+  /// touched.
+  ///
+  /// The deferred retheme sweep repaints the document one chunk per frame, and
+  /// every chunk resets `.backgroundColor` over its own range. Repainting the
+  /// whole cached match set on each of those chunks would be quadratic on a
+  /// document with many matches, so only the matches intersecting the painted
+  /// range are put back — which is exactly the set that just lost its wash.
+  func reapplyFindHighlights(in range: NSRange) {
+    guard !findMatches.isEmpty else { return }
+    let length = textStorage.length
+    guard findMatches.allSatisfy({ NSMaxRange($0) <= length }) else { return }
+    let touched = findMatches.enumerated().filter {
+      NSIntersectionRange($0.element, range).length > 0
+    }
+    guard !touched.isEmpty else { return }
+
+    textStorage.beginEditing()
+    for (index, match) in touched {
+      paintFindWash(over: match, isActive: index == activeFindMatchIndex)
+    }
+    textStorage.endEditing()
+  }
+
   func clearFindHighlights() {
     removeFindHighlights()
     findMatches = []
@@ -1415,20 +1446,26 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // thread once per match.
     textStorage.beginEditing()
     removeFindHighlights()
-    // Clear, high-contrast find shading: every match gets a yellow wash so it is
-    // obvious in the document, and the active match an orange one so it stands
-    // out from the rest of the hits.
-    let passiveColor = NSColor.systemYellow.withAlphaComponent(0.50)
-    let activeColor = NSColor.systemOrange.withAlphaComponent(0.80)
     for (index, range) in findMatches.enumerated() {
-      textStorage.addAttribute(
-        .backgroundColor,
-        value: index == activeFindMatchIndex ? activeColor : passiveColor,
-        range: range
-      )
+      paintFindWash(over: range, isActive: index == activeFindMatchIndex)
     }
     textStorage.endEditing()
   }
+
+  /// Clear, high-contrast find shading: every match gets a yellow wash so it is
+  /// obvious in the document, and the active match an orange one so it stands
+  /// out from the rest of the hits.
+  ///
+  /// The one place a wash is written, so the full repaint and the per-chunk one
+  /// can never disagree about what a match looks like. Caller owns the edit
+  /// transaction.
+  private func paintFindWash(over range: NSRange, isActive: Bool) {
+    let wash = isActive ? Self.activeFindWash : Self.passiveFindWash
+    textStorage.addAttribute(.backgroundColor, value: wash, range: range)
+  }
+
+  static let passiveFindWash = NSColor.systemYellow.withAlphaComponent(0.50)
+  static let activeFindWash = NSColor.systemOrange.withAlphaComponent(0.80)
 
   private func removeFindHighlights() {
     // Find highlights only exist when there are matches. Skip the whole-document

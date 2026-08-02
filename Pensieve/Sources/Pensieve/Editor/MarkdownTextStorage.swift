@@ -30,6 +30,20 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// repainted them, so the surface needs a second chance to put them back.
   var onRethemeCompleted: (() -> Void)?
 
+  /// Fired after a SCOPED pass repaints `range`, with the range it painted.
+  ///
+  /// A scoped pass runs `resetBaseAttributes` over its range, which strips
+  /// `.backgroundColor` — the attribute the find-match washes live in. The
+  /// deferred sweep starts at offset 0 and walks the document one chunk per
+  /// frame, so a find session with matches near the TOP lost its washes on the
+  /// first chunk and, with `onRethemeCompleted` as the only signal, got them
+  /// back only after the LAST one. On a large document that is the whole length
+  /// of the sweep with the matches invisible.
+  ///
+  /// Scoped, so the surface repaints only the matches the pass actually touched
+  /// rather than the whole cached set on every chunk.
+  var onHighlightingRepainted: ((NSRange) -> Void)?
+
   /// Full-document refresh passes performed so far. Exposed so the perf pins can
   /// prove what the timings say: a skin switch on a large document must not run
   /// one synchronously, and a burst of switches must collapse into ONE.
@@ -421,6 +435,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
     textStorage.endEditing()
     lastProcessedString = textStorage.string
+    onHighlightingRepainted?(scopedRange)
   }
 
   private func postEditRange(
