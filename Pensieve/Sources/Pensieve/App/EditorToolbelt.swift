@@ -184,9 +184,20 @@ struct EditorToolbelt: ToolbarContent {
     let standardized = url.standardizedFileURL
     let parentPath = standardized.deletingLastPathComponent().path
 
-    if let root = workspaceRoots.first(where: {
-      standardized.path.hasPrefix($0.url.standardizedFileURL.path + "/")
-    }) {
+    // INNERMOST containing root wins, not the first one added. Roots can nest —
+    // `mergedRoots` dedupes on the exact path only, so adding `/w` and then
+    // `/w/proj` leaves both in the list — and insertion order then decided the
+    // crumb: the same document read `proj › a` or `w › proj › a` purely by which
+    // folder the operator happened to open first. Longest matching path is the
+    // one the file actually lives in; this mirrors `publishKnownWorkspaceItem`,
+    // which already resolves nesting exactly this way.
+    if let root =
+      workspaceRoots
+      .filter({ standardized.path.hasPrefix($0.url.standardizedFileURL.path + "/") })
+      .max(by: {
+        $0.url.standardizedFileURL.path.count < $1.url.standardizedFileURL.path.count
+      })
+    {
       // Crumb from the root's own name down to the containing folder.
       let rootParent = root.url.standardizedFileURL.deletingLastPathComponent().path
       let relative =

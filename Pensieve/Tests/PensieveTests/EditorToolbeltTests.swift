@@ -126,6 +126,41 @@ final class EditorToolbeltTests: XCTestCase {
     XCTAssertEqual(EditorToolbelt.breadcrumbSubtitle(for: nil, workspaceRoots: []), "")
   }
 
+  /// Roots can nest — `mergedRoots` dedupes on the exact path only, so opening
+  /// `/w` and then `/w/proj` leaves BOTH in the list. `first(where:)` then let
+  /// insertion order pick the crumb: the same document read `proj › a` or
+  /// `w › proj › a` purely by which folder the operator happened to open first.
+  /// The innermost containing root is the one the file actually lives in, so
+  /// the answer must be identical in either order.
+  func testBreadcrumbUsesTheInnermostRootRegardlessOfInsertionOrder() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let inner = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, inner]),
+      "proj › a",
+      "the parent root was added first and won — the crumb depends on open order, not on"
+        + " where the document lives")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [inner, outer]),
+      "proj › a")
+  }
+
+  /// CONTROL LEG. Preferring the longest match must not start claiming files
+  /// that merely SHARE A PREFIX with a root: `/w/projector` is not inside
+  /// `/w/proj`, and a document under it belongs to the root that does contain
+  /// it.
+  func testALongerRootThatOnlySharesAPrefixDoesNotClaimTheDocument() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let sibling = WorkspaceRoot(id: URL(fileURLWithPath: "/w/projector-notes"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, sibling]),
+      "w › proj › a")
+  }
+
   // MARK: - Titlebar order contract
 
   func testTitlebarOrderSeparatesShareDispatchAndStartsEditRowWithRichMarkdownToggle() {
