@@ -96,6 +96,28 @@ final class EmptyStateRecentLabelsTests: XCTestCase {
       ["README — a/project", "README — a/project", "README — b/project"])
   }
 
+  /// A PLATEAU IS NOT THE END. `/a/shared/project/README.md` and
+  /// `/b/shared/project/README.md` stay identical at one component AND at two —
+  /// the difference is at three. The first growth loop read the flat step as
+  /// proof that no ancestor could ever separate them and stopped there, so both
+  /// rows rendered "README — project" again. Distinctness can arrive later, so
+  /// the search runs to the deepest parent and keeps the shortest depth that
+  /// separated the most rows.
+  func testSuffixGrowsPastAPlateauOfSharedParents() {
+    XCTAssertEqual(
+      labels(["/a/shared/project/README.md", "/b/shared/project/README.md"]),
+      ["README — a/shared/project", "README — b/shared/project"])
+  }
+
+  /// CONTROL for the same scan: running to the deepest parent must not make the
+  /// suffix longer than it needs to be. These separate at ONE component, and the
+  /// deeper levels — which are also distinct — must not win over it.
+  func testScanningDeeperStillReturnsTheShortestSeparatingSuffix() {
+    XCTAssertEqual(
+      labels(["/one/x/a/README.md", "/two/y/b/README.md"]),
+      ["README — a", "README — b"])
+  }
+
   /// CONTROL: a row whose path runs out before its rival's still separates on
   /// what it has — the shorter path IS the difference.
   func testAShorterPathSeparatesOnWhatItHas() {

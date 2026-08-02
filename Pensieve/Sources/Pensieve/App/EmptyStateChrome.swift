@@ -191,14 +191,18 @@ enum EmptyStateRecentLabels {
   /// How many trailing path components the colliding rows need in order to read
   /// as different rows.
   ///
-  /// Grows while growing still separates SOMEONE. Two conditions end it: every
-  /// row is already distinct (the answer, and the shortest one), or a longer
-  /// suffix produced no more distinct values than the last — which is what
-  /// happens when paths agree all the way up to the volume root. That second
-  /// condition is what makes this terminate on identical paths, and it is
-  /// deliberately not "stop at the first duplicate": a slice can hold one pair
-  /// that can never separate and a third row that can, and the third row still
-  /// gets its difference.
+  /// Every depth is measured, and the SHORTEST one that reached the highest
+  /// distinct count wins. Only one thing ends the scan early: every row is
+  /// already distinct, which no longer suffix can improve on.
+  ///
+  /// It deliberately does NOT stop at a depth that added nothing. Shared
+  /// ancestry comes in plateaus — `/a/shared/project/README.md` and
+  /// `/b/shared/project/README.md` are identical at one component AND at two,
+  /// and differ only at three — so reading a flat step as "no ancestor can ever
+  /// separate these" left both rows rendering "README — project", exactly the
+  /// ambiguity this helper exists to remove. Distinctness can arrive later, so
+  /// the search runs to the deepest parent; `deepest` bounds it, which is what
+  /// makes it terminate on paths that agree all the way to the volume root.
   private static func separatingDepth(for parents: [[String]]) -> Int {
     let deepest = parents.map(\.count).max() ?? 0
     guard deepest > 0 else { return 0 }
@@ -207,7 +211,7 @@ enum EmptyStateRecentLabels {
     var bestDistinct = 0
     for depth in 1...deepest {
       let distinct = Set(parents.map { $0.suffix(depth).joined(separator: "/") }).count
-      guard distinct > bestDistinct else { break }
+      guard distinct > bestDistinct else { continue }
       best = depth
       bestDistinct = distinct
       if distinct == parents.count { break }
