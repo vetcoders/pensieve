@@ -166,6 +166,100 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(fileExists(draft.url))
   }
 
+  // MARK: - One draft, one window
+
+  /// Two empty launcher surfaces (a plain launcher window and a "+"-tab one)
+  /// used to list — and both adopt — the same draft. The first adoption takes
+  /// the draft off every other surface, and a surface still holding the stale
+  /// row is refused instead of building a second buffer on the same file.
+  @MainActor
+  func testAdoptingADraftTakesItOffEveryOtherLauncherSurface() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder), recoveryStore: store)
+    let draft = try seedDraft(in: store, text: "crash text", ageInDays: 0)
+
+    let adopting = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: adopting))
+
+    XCTAssertTrue(
+      documentStore.recoveredDrafts().isEmpty,
+      "a draft another window is editing is still offered on the launcher")
+
+    // The second surface renders from a list captured before the claim, so it
+    // still has the row and can still press Open.
+    let second = AppState()
+    XCTAssertFalse(
+      documentStore.openRecoveredDraft(draft, into: second),
+      "a second window adopted a draft that is already open elsewhere")
+    XCTAssertFalse(second.documentSession.hasEditableBuffer, "the refusal built a second buffer")
+    XCTAssertEqual(second.activeDocumentText, "")
+    // Refusing decides nothing: the window that owns the draft keeps it.
+    XCTAssertEqual(adopting.activeDocumentText, "crash text")
+    XCTAssertEqual(adopting.documentSession.recoveryID, draft.id)
+    XCTAssertTrue(fileExists(draft.url), "the refusal deleted a draft that is being edited")
+  }
+
+  /// The immortal-draft half of the bug: the refused surface must not be able
+  /// to write the retired recovery ID back to disk after the adopting window
+  /// saved the work away.
+  @MainActor
+  func testARefusedSurfaceCannotResurrectADraftTheOwnerSavedAway() throws {
+    let folder = try makeTemporaryFolder()
+    let targetURL = folder.appendingPathComponent("rescued.md")
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savePanelURLProvider: { _ in targetURL })
+    let draft = try seedDraft(in: store, text: "crash text", ageInDays: 0)
+
+    let adopting = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: adopting))
+    let refused = AppState()
+    XCTAssertFalse(documentStore.openRecoveredDraft(draft, into: refused))
+
+    XCTAssertTrue(documentStore.saveRecoveredDraftAs(draft, into: adopting))
+    XCTAssertFalse(fileExists(draft.url))
+
+    // The refused surface still holds the stale draft value. Nothing it can do
+    // recreates that file, because it never got a buffer carrying the ID.
+    refused.activeDocumentText = "typed into an empty window"
+    documentStore.documentDidChange(appState: refused)
+    XCTAssertFalse(documentStore.savePendingChangesOnClose(appState: refused))
+
+    XCTAssertFalse(fileExists(draft.url), "the refused surface resurrected the saved-away draft")
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
+    XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), "crash text")
+  }
+
+  /// The claim is a loan, not a consumption: a window that closes WITHOUT
+  /// deciding hands the draft back, and the launcher may offer it again.
+  @MainActor
+  func testClosingWithoutDecidingReturnsTheDraftToTheLauncher() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder), recoveryStore: store)
+    let draft = try seedDraft(in: store, text: "crash text", ageInDays: 0)
+    let adopting = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: adopting))
+    XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
+
+    // The window goes away with the draft still unnamed — the teardown flush
+    // rewrites it and releases the claim.
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: adopting))
+
+    XCTAssertEqual(documentStore.recoveredDrafts().map(\.id), [draft.id])
+    let reopened = AppState()
+    XCTAssertTrue(
+      documentStore.openRecoveredDraft(draft, into: reopened),
+      "a released draft stayed unadoptable")
+    XCTAssertEqual(reopened.activeDocumentText, "crash text")
+  }
+
   /// The safety net that lets a new document stay off disk entirely: a draft
   /// the user never named still survives the window closing on it. Its content
   /// goes to the recovery store — never into the workspace folder — and comes

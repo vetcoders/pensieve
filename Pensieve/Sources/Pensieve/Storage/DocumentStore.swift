@@ -2839,8 +2839,11 @@ final class DocumentStore {
   /// Every unhandled crash draft, newest first. The launcher's Recovered Drafts
   /// section is the ONLY route from here into a window — nothing adopts a draft
   /// on its own any more.
+  ///
+  /// A draft another window is already editing is not "unhandled": it is live
+  /// work with a window on it, so it drops off every other launcher surface.
   func recoveredDrafts() -> [RecoveryDraft] {
-    recoveryStore.loadDrafts()
+    recoveryStore.unclaimedDrafts()
   }
 
   /// Launch sweep for the recovery directory (age + count retention).
@@ -2857,9 +2860,17 @@ final class DocumentStore {
   /// holds a buffer — the section that offers this is only shown in an empty
   /// one, and silently replacing a document would be the very hijack W2-D
   /// removes.
+  ///
+  /// Refuses a draft ANOTHER window already adopted too. `recoveredDrafts()`
+  /// stops offering a claimed draft, but a launcher rendered before the claim
+  /// still holds the stale row: adopting it would put two buffers on one
+  /// recovery ID, autosaving over each other, with a Save As… in one undone by
+  /// the other's next autosave recreating the file. Refusing is a no-op — the
+  /// caller refreshes and the stale row disappears.
   @discardableResult
   func openRecoveredDraft(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
+    guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
 
     self.appState = appState
     autosaver.cancel()

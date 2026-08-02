@@ -667,6 +667,11 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     let draft = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    // The buffer that wrote the draft is gone — in production the crash takes
+    // the whole process (and with it the in-process open-draft claim) before
+    // anything can offer the draft again. A draft still held by a live buffer
+    // is deliberately unadoptable; see `RecoveredDraftsTests`.
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
     let restoredState = AppState()
     XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: restoredState))
     XCTAssertTrue(restoredState.documentSession.isUntitled)

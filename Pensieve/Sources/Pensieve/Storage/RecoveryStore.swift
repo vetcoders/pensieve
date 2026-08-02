@@ -115,6 +115,19 @@ final class RecoveryStore {
     openDraftIDs.contains(id)
   }
 
+  /// Every draft NO live buffer is holding — the only ones a launcher may
+  /// offer. A window adopting a draft claims it, and an empty window elsewhere
+  /// (a second launcher, a "+" tab) must stop listing it from that moment on:
+  /// two buffers on one recovery ID autosave over each other, and a Save As… in
+  /// one is undone by the other's next autosave recreating the file.
+  ///
+  /// The claim is deliberately in-process only. A crash takes it with the
+  /// process, which is the point — the file on disk outlives it and is offered
+  /// again on the next launch.
+  func unclaimedDrafts() -> [RecoveryDraft] {
+    loadDrafts().filter { !openDraftIDs.contains($0.id) }
+  }
+
   // MARK: - Retention
 
   /// Launch sweep: drops drafts nobody came back for. Returns the IDs actually
