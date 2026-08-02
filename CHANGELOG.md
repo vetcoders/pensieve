@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Filesystem-watcher rescan storm on busy workspace roots (observed at 550–800% CPU on an iCloud Drive root). The debounced refresh only looked coalesced: a new event cancelled the refresh _handle_, but the tree walk itself ran in a detached task that cancellation could never reach, so every surviving event batch started an additional full-workspace walk while the superseded ones kept running and then discarded their results. Watcher refreshes are now single-flight — events arriving during a walk collapse into exactly one follow-up pass instead of one walk each — and cancelling a refresh now actually stops its walk. External edits arriving mid-walk still reach the sidebar and the search index.
+
 ## [0.4.2] - 2026-07-22
 
 ### Added
