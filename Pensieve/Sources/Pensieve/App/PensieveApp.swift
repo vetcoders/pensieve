@@ -225,6 +225,11 @@ struct DocumentWindowRootView: View {
             rootWindow: currentWindow, keyWindow: notification.object as? NSWindow)
         else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+        // Frontmost window == the document a relaunch must bring back. Without
+        // this the persisted value would only track the last document OPENED,
+        // so simply switching back to an older tab before quitting restored the
+        // wrong one.
+        controller.noteWindowBecameKey()
       }
       // Second half of the same rule. The accessor above is coalesced and
       // async, so a factory-built native tab is regularly key BEFORE this root
@@ -237,11 +242,6 @@ struct DocumentWindowRootView: View {
             rootWindow: resolvedWindow, keyWindow: NSApp.keyWindow)
         else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
-        // Frontmost window == the document a relaunch must bring back. Without
-        // this the persisted value would only track the last document OPENED,
-        // so simply switching back to an older tab before quitting restored the
-        // wrong one.
-        controller.noteWindowBecameKey()
       }
       // App-wide save-on-close guard. Every window (factory-built document tab AND
       // state-restored WindowGroup scene) shares this root, and every close
