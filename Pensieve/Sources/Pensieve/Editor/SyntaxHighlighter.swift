@@ -59,6 +59,15 @@ class SyntaxHighlighter {
     let italicObliqueness: CGFloat
     let semibold: NSFont
     let inlineCode: NSFont
+    /// Bold heading faces for levels 1…6, indexed `level - 1`.
+    ///
+    /// Headings used to be built inline as `NSFont.systemFont(ofSize:weight:)` —
+    /// proportional SF — while every other face in the panel went through
+    /// `MonoFontResolver`, so a theme that ships its own monospace family got it
+    /// everywhere EXCEPT its headings. Sized here rather than in the pass for
+    /// the same reason as every other face: the resolver must never be asked to
+    /// construct a font per match.
+    let headings: [NSFont]
 
     init(size: CGFloat, family: String) {
       self.size = size
@@ -70,6 +79,18 @@ class SyntaxHighlighter {
       let italic = MonoFontResolver.italicFont(family: family, size: size)
       self.italic = italic.font
       self.italicObliqueness = italic.obliqueness
+      self.headings = (1...6).map { level in
+        MonoFontResolver.font(
+          family: family,
+          size: size + CGFloat((7 - level) * 2),
+          weight: .bold)
+      }
+    }
+
+    /// Heading face for a 1…6 markdown level. Clamped rather than trusting the
+    /// caller: the pattern guarantees the range, the array must not depend on it.
+    func heading(level: Int) -> NSFont {
+      headings[min(max(level, 1), headings.count) - 1]
     }
   }
 
@@ -248,9 +269,7 @@ class SyntaxHighlighter {
       guard let match = match else { return }
       let matchedString = string.substring(with: match.range)
       let level = matchedString.prefix(while: { $0 == "#" }).count
-      let size = baseFontSize + CGFloat((7 - level) * 2)
-      let font = NSFont.systemFont(ofSize: size, weight: .bold)
-      textStorage.addAttribute(.font, value: font, range: match.range)
+      textStorage.addAttribute(.font, value: fonts.heading(level: level), range: match.range)
       textStorage.addAttribute(.foregroundColor, value: colors.heading, range: match.range)
     }
 

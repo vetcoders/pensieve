@@ -79,6 +79,56 @@ final class SyntaxHighlighterTests: XCTestCase {
       "heading font should carry the bold trait")
   }
 
+  /// Headings must come out of the SAME family as the rest of the panel.
+  ///
+  /// They were built inline as `NSFont.systemFont(ofSize:weight:.bold)` —
+  /// proportional SF — while base/bold/italic/code all went through
+  /// `MonoFontResolver` with `tokens.monoFamily`, so every theme that ships its
+  /// own monospace face got it everywhere except its headings. The existing
+  /// heading pins only checked size + bold trait, which SF satisfies too.
+  func testHeadingUsesTheThemeMonospaceFamilyAtEveryLevel() {
+    let systemFamily = NSFont.systemFont(ofSize: fontSize, weight: .bold).familyName
+    for skin in [PensieveTheme.ink, .parchment, .porcelain, .graphite] {
+      let tokens = skin.tokens
+      XCTAssertFalse(tokens.monoFamily.isEmpty, "\(skin.rawValue) ships no family to check")
+      for level in 1...6 {
+        let md = String(repeating: "#", count: level) + " Title\n"
+        let storage = NSTextStorage(string: md)
+        let fullRange = NSRange(location: 0, length: (md as NSString).length)
+
+        let syntax = SyntaxHighlighter()
+        syntax.baseFontSize = fontSize
+        syntax.tokens = tokens
+
+        storage.beginEditing()
+        syntax.resetBaseAttributes(storage, range: fullRange)
+        syntax.highlight(storage, range: fullRange)
+        storage.endEditing()
+
+        let at = index(of: "Title", in: md)
+        let painted = font(storage, at: at)
+        // A bundled family registers its weights as sibling families
+        // ("IBM Plex Mono SemiBold"), so the assertion is the family STEM, not
+        // an exact name — what must not happen is landing on proportional SF.
+        XCTAssertTrue(
+          painted?.familyName?.hasPrefix(tokens.monoFamily) ?? false,
+          "\(skin.rawValue) h\(level): heading is in \(painted?.familyName ?? "nil"),"
+            + " not the theme's \(tokens.monoFamily)")
+        XCTAssertNotEqual(
+          painted?.familyName, systemFamily,
+          "\(skin.rawValue) h\(level): heading fell back to the proportional system face")
+        // Control leg: switching family must not cost the level's own size or
+        // weight — the hierarchy the headings exist to express.
+        XCTAssertEqual(
+          painted?.pointSize, fontSize + CGFloat((7 - level) * 2),
+          "\(skin.rawValue) h\(level)")
+        XCTAssertTrue(
+          painted.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } ?? false,
+          "\(skin.rawValue) h\(level): heading lost its bold trait")
+      }
+    }
+  }
+
   func testHeadingLevelControlsSize() {
     let md = "### Sub\n"
     let storage = highlighted(md)
