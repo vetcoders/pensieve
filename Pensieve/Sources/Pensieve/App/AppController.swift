@@ -248,11 +248,6 @@ final class AppController: ObservableObject {
       return
     }
 
-    if DocumentTransfer.isImportable(standardizedURL) {
-      importDocument(url: standardizedURL)
-      return
-    }
-
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
       noteRecentDocumentIfOpened(standardizedURL)
       return
@@ -261,8 +256,10 @@ final class AppController: ObservableObject {
     // The registry route below bypasses registerOpenFile (the destination
     // window registers the file during its own load), so unsupported types
     // must be rejected HERE — otherwise they would open an empty tab whose
-    // load is refused only afterwards.
-    guard WorkspaceScanner.isMarkdownFile(standardizedURL) else {
+    // load is refused only afterwards. Import SOURCES (Word/PDF) are not
+    // Markdown but ARE openable, so they pass this gate too.
+    let isImportable = DocumentTransfer.isImportable(standardizedURL)
+    guard isImportable || WorkspaceScanner.isMarkdownFile(standardizedURL) else {
       appState.lastError = WorkspaceScanner.unsupportedOpenMessage
       return
     }
@@ -271,9 +268,21 @@ final class AppController: ObservableObject {
     // THIS window's working set first — the destination window registers it
     // during its own load, and a premature registration leaves the
     // originating sidebar permanently listing a file it never displays.
+    //
+    // Import sources route here for the SAME reason every other open does: an
+    // import replaces this window's session wholesale (`restoreUntitled`), so
+    // running it against a window that already shows a document silently threw
+    // that document away and left the conversion sitting under its title. The
+    // destination tab performs the import itself via `openFileInCurrentWindow`.
     if appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
+      return
+    }
+
+    // This window is empty, so the import is safe to run in place.
+    if isImportable {
+      importDocument(url: standardizedURL)
       return
     }
 
@@ -505,13 +514,34 @@ final class AppController: ObservableObject {
     // document owned by another window. Run the dirty guard in the OWNING
     // window's session — guarding only the caller's would force-close the
     // target, letting its close hook stash a recovery draft and skip the
-    // Save/Discard/Cancel prompt. Fall back to self when no owner is registered.
-    let owner = documentWindowRegistry.controller(for: identity) ?? self
+    // Save/Discard/Cancel prompt.
+    guard let owner = closeOwner(for: identity) else { return false }
     guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else {
       return false
     }
     documentWindowRegistry.closeDocument(identity)
     return true
+  }
+
+  /// Resolves the window that OWNS `identity` for a cross-window close.
+  ///
+  /// `self` is a valid answer ONLY when this window actually shows that
+  /// document. Falling back to `self` unconditionally was unsafe: the
+  /// registry's identity→window map is written from the COALESCED, async
+  /// window accessor, so there is a real window in which a live tab has no
+  /// registered controller yet. In that window the fallback handed the guard to
+  /// a session that does not hold the document —
+  /// `confirmDirtySession…` sees a mismatched identity, answers "nothing to
+  /// guard", and the close proceeds with NO prompt against the window that did
+  /// hold unsaved work. Refusing is the safe answer: nothing closes, nothing is
+  /// discarded, and the caller can retry once the registration lands.
+  private func closeOwner(for identity: DocumentIdentity) -> AppController? {
+    if let owner = documentWindowRegistry.controller(for: identity) { return owner }
+    guard appState.windowModel.documentIdentity == identity.standardized else {
+      DebugTrace.log("close -> refused: no registered owner for \(identity)")
+      return nil
+    }
+    return self
   }
 
   /// Runs this window's dirty-session guard when `identity` is its active
@@ -571,7 +601,10 @@ final class AppController: ObservableObject {
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
     for identity in identities {
-      let owner = documentWindowRegistry.controller(for: identity) ?? self
+      // An unresolvable owner aborts the WHOLE sweep, exactly like a Cancel:
+      // closing the rest while one window's session was never guarded is the
+      // data loss this pass exists to prevent.
+      guard let owner = closeOwner(for: identity) else { return }
       guard let resolution = owner.confirmDirtySessionForExternalClose(identity: identity) else {
         return
       }
