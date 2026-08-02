@@ -273,8 +273,25 @@ struct HTMLEmitter: MarkupVisitor {
     init(_ source: String) {
       let bytes = Array(source.utf8)
       var lineStarts = [0]
-      for (offset, byte) in bytes.enumerated() where byte == UInt8(ascii: "\n") {
-        lineStarts.append(offset + 1)
+      for (offset, byte) in bytes.enumerated() {
+        // cmark ends a line on LF, on CRLF, AND on a lone CR — and its
+        // `SourceLocation.line` counts all three. Counting only LF left a
+        // CR-only document knowing exactly one line, so every lookup past the
+        // first ran off the end of `lineStarts`, answered nil, and the caller
+        // fell back to "allow" — promoting markers the author had escaped.
+        // Nothing normalizes lone CR on the render path, so the index is where
+        // this has to be right.
+        //
+        // The CR half of a CRLF must NOT open a line of its own: that would
+        // shift every later offset one byte early and break the documents that
+        // already worked.
+        if byte == UInt8(ascii: "\n") {
+          lineStarts.append(offset + 1)
+        } else if byte == UInt8(ascii: "\r"),
+          offset + 1 == bytes.count || bytes[offset + 1] != UInt8(ascii: "\n")
+        {
+          lineStarts.append(offset + 1)
+        }
       }
       self.bytes = bytes
       self.lineStarts = lineStarts

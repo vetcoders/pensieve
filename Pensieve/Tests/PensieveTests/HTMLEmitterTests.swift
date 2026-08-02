@@ -196,6 +196,40 @@ final class HTMLEmitterTests: XCTestCase {
     XCTAssertTrue(html.contains(">real</p>"), html)
   }
 
+  /// The source index counted a line start only at `\n`, but cmark treats a
+  /// LONE CR as a line ending too and advances its line numbers accordingly. In
+  /// a CR-only document the index therefore ran one line short at every marker:
+  /// `byte(at:)` resolved past the end and answered nil, the check fell back to
+  /// "allow", and an escaped marker was promoted. Nothing normalizes lone CR on
+  /// the render path, so a document saved by a classic-Mac-era tool (or pasted
+  /// out of one) hit this directly.
+  func testEscapedMarkerStaysProseInACROnlyDocument() {
+    let html = render("intro\r\r- first\r- \\[~] literal\r")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+  }
+
+  /// CONTROL LEG (a): the same CR-only document must still promote a marker the
+  /// author DID write, or "treat CR as a line ending" would have degenerated
+  /// into "never promote anything in a CR document".
+  func testRealMarkerStillPromotesInACROnlyDocument() {
+    let html = render("intro\r\r- first\r- [~] real\r")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+  }
+
+  /// CONTROL LEG (b): CRLF must not gain a second line start from its CR half —
+  /// that would push every later offset one byte early and break the documents
+  /// that already worked.
+  func testEscapeDetectionSurvivesCRLFLineEndings() {
+    let html = render("intro\r\n\r\n- first\r\n- [~] real\r\n  - \\[~] literal\r\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
   /// GFM's own escaped checkbox is unaffected — the byte-parity guard for the
   /// two states cmark already owns.
   func testEscapedGFMCheckboxStillRendersAsProse() {
