@@ -38,7 +38,12 @@ final class ToolbarBridgeRig {
     }
   }
 
-  init(defaults: UserDefaults, width: CGFloat = 1600) {
+  /// `hostsEditor: false` models the window this app builds MOST often and
+  /// tests least: the launcher / empty workspace — sidebar and an empty detail
+  /// pane, the same toolbar, and no editor and no preview anywhere in the tree.
+  /// Every AppKit-side chrome pass this app had used to hang off one of those
+  /// two panes, so that window received none of it.
+  init(defaults: UserDefaults, width: CGFloat = 1600, hostsEditor: Bool = true) {
     appState = AppState(defaults: defaults)
     appState.documentSession = .untitled()
     appState.documentSession.text = "hello brave new world"
@@ -56,7 +61,13 @@ final class ToolbarBridgeRig {
     let hosting = NSHostingView(
       rootView: AnyView(
         ToolbarBridgeHost(
-          appState: appState, controller: controller, themeManager: themeManager)))
+          appState: appState, controller: controller, themeManager: themeManager,
+          hostsEditor: hostsEditor
+        )
+        // The chrome contract every production window root carries
+        // (`DocumentWindowRootView`). A rig that left it off would be modelling
+        // a window this app never builds.
+        .pensieveSkinAppearance(themeManager)))
     // The same bridge the factory tab path uses to carry `.toolbar` content
     // from a SwiftUI root into an AppKit window.
     hosting.sceneBridgingOptions = [.toolbars, .title]
@@ -321,8 +332,11 @@ extension XCTestCase {
   /// at all: with no `NSToolbar` there is nothing for these suites to read, and
   /// a failure there would be about the environment, not the toolbelt.
   @MainActor
-  func makeToolbarRig(prefix: String, width: CGFloat = 1600) throws -> ToolbarBridgeRig {
-    let rig = ToolbarBridgeRig(defaults: makeEphemeralDefaults(prefix: prefix), width: width)
+  func makeToolbarRig(prefix: String, width: CGFloat = 1600, hostsEditor: Bool = true) throws
+    -> ToolbarBridgeRig
+  {
+    let rig = ToolbarBridgeRig(
+      defaults: makeEphemeralDefaults(prefix: prefix), width: width, hostsEditor: hostsEditor)
     guard rig.window.toolbar != nil else {
       rig.tearDown()
       throw XCTSkip("headless window did not bridge a SwiftUI toolbar")
@@ -339,6 +353,7 @@ private struct ToolbarBridgeHost: View {
   var appState: AppState
   @ObservedObject var controller: AppController
   @ObservedObject var themeManager: ThemeManager
+  var hostsEditor: Bool = true
 
   private var toolbelt: EditorToolbelt {
     EditorToolbelt(
@@ -351,6 +366,16 @@ private struct ToolbarBridgeHost: View {
   }
 
   var body: some View {
+    if !hostsEditor {
+      return AnyView(
+        Color.clear
+          .toolbar { toolbelt }
+          .background(ToolbarOverflowSink(families: toolbelt.overflowFamilies)))
+    }
+    return AnyView(editorBody)
+  }
+
+  private var editorBody: some View {
     @Bindable var bindable = appState
     return EditorRepresentable(
       text: Binding(

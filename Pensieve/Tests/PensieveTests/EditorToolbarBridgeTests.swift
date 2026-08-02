@@ -127,6 +127,129 @@ final class EditorToolbarBridgeTests: XCTestCase {
     }
   }
 
+  /// THE EDITOR-LESS PIN. A window with no editor and no preview anywhere in its
+  /// tree still has toggle chips, and they still have to come from the skin.
+  ///
+  /// This is the launcher / empty-workspace window, and it used to receive NO
+  /// AppKit chrome pass at all: `assertWindowChrome` had exactly two production
+  /// callers, `EditorView`'s representable and `PreviewWebView`, so a window
+  /// hosting neither kept AppKit's `controlAccentColor` fill on every chip under
+  /// every skin.
+  ///
+  /// Typewriter, not an adaptive skin, because an adaptive skin's `chromeAccent`
+  /// IS `controlAccentColor` — under `.default` an unpainted chip and a correctly
+  /// painted one are the same pixels, and this pin would pass on the bug.
+  @MainActor
+  func testAnEditorLessWindowStillGetsTheSkinsChipTint() throws {
+    let rig = try makeRig(hostsEditor: false)
+    defer { rig.tearDown() }
+
+    XCTAssertNil(
+      rig.textView(),
+      "premise: this rig must host no editor — otherwise the editor's own chrome pass "
+        + "is what paints the chips and the pin proves nothing")
+
+    rig.themeManager.skin = .typewriter
+    let chips = try awaitChipGroups(rig)
+    for group in chips {
+      XCTAssertEqual(
+        group.selectedSegmentBezelColor?.usingColorSpace(.sRGB),
+        WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter).usingColorSpace(.sRGB),
+        "a window with no editor and no preview never received the chrome pass, so its "
+          + "chips stayed on AppKit's system accent")
+    }
+  }
+
+  /// THE SKIN-SWITCH PIN, on a window that DOES host an editor.
+  ///
+  /// The editor asserts the chrome on every update pass, and that was still not
+  /// enough: switching skins rebuilds the toolbar (the appearance picker's label
+  /// carries the skin name), the re-bridge lands AFTER the editor's pass, and it
+  /// takes `selectedSegmentBezelColor` back to `nil`. Measured on this rig before
+  /// the sink existed: the bezel reads `nil` at +50 ms, +350 ms and +1.35 s after
+  /// the switch, and only an UNRELATED later SwiftUI pass ever repaints it. So
+  /// the chips were correct right up until the operator picked a skin — the first
+  /// moment a non-system chip colour is visible at all.
+  @MainActor
+  func testASkinSwitchLeavesTheChipsPaintedWithoutAFurtherEdit() throws {
+    let rig = try makeRig()
+    defer { rig.tearDown() }
+
+    rig.themeManager.skin = .typewriter
+    let chips = try awaitChipGroups(rig)
+    for group in chips {
+      XCTAssertEqual(
+        group.selectedSegmentBezelColor?.usingColorSpace(.sRGB),
+        WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter).usingColorSpace(.sRGB),
+        "the skin switch's own toolbar re-bridge cleared the chip tint and nothing "
+          + "re-asserted it — waiting never restores it, only the next unrelated edit does")
+    }
+  }
+
+  /// The REPAIR TRIGGER, pinned on its own.
+  ///
+  /// The two pins above prove the outcome; this one proves which mechanism
+  /// delivers it. A chip cleared BETWEEN SwiftUI passes — which is exactly what a
+  /// toolbar re-bridge does — must come back on a window update cycle, with no
+  /// SwiftUI pass anywhere in between. Without the window observation the sink's
+  /// only triggers are a body re-evaluation and the runloop turn after it, and a
+  /// clobber that lands later than that would stay on screen until the operator
+  /// happened to type. Same shape, same trigger and same measured reason as
+  /// `ToolbarOverflowController.repairClobberedForms`.
+  @MainActor
+  func testAChipClearedBetweenPassesIsRepairedOnAWindowUpdate() throws {
+    let rig = try makeRig(hostsEditor: false)
+    defer { rig.tearDown() }
+
+    rig.themeManager.skin = .typewriter
+    let chips = try awaitChipGroups(rig)
+
+    for group in chips { group.selectedSegmentBezelColor = nil }
+    // No SwiftUI pass: only the update cycle the window posts on its own.
+    for _ in 0..<40 {
+      if chips.allSatisfy({ $0.selectedSegmentBezelColor != nil }) { break }
+      rig.window.update()
+      rig.settle(0.02)
+    }
+
+    for group in chips {
+      XCTAssertEqual(
+        group.selectedSegmentBezelColor?.usingColorSpace(.sRGB),
+        WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter).usingColorSpace(.sRGB),
+        "a chip cleared between SwiftUI passes was never repaired — the sink is not "
+          + "watching the window, so a re-bridge outlives the next runloop turn")
+    }
+  }
+
+  /// Settles the toolbar and hands back the chip groups, WITHOUT the test
+  /// authoring a chrome pass of its own: only the window update cycles the app
+  /// already runs are driven, so what converges here is production's own repair.
+  ///
+  /// It gives up on a bound rather than timing out into a green — a chip that
+  /// never converges fails the pin.
+  @MainActor
+  private func awaitChipGroups(_ rig: ToolbarBridgeRig) throws -> [NSSegmentedControl] {
+    func groups() -> [NSSegmentedControl] {
+      WindowChromeRecipe.toolbarSegmentedControls(in: rig.window)
+        .filter(WindowChromeRecipe.isToggleChipGroup)
+    }
+    let wanted = WindowChromeRecipe.toolbarChipBezelColor(for: rig.themeManager.skin)
+    for _ in 0..<40 {
+      let found = groups()
+      if !found.isEmpty,
+        found.allSatisfy({ WindowChromeRecipe.colorsMatch($0.selectedSegmentBezelColor, wanted) })
+      {
+        break
+      }
+      rig.window.update()
+      rig.settle(0.02)
+    }
+    let found = groups()
+    XCTAssertFalse(
+      found.isEmpty, "premise: this toolbar must carry at least one paintable chip group")
+    return found
+  }
+
   // MARK: - Overflow menu
 
   @MainActor
@@ -150,7 +273,7 @@ final class EditorToolbarBridgeTests: XCTestCase {
   // MARK: - Rig
 
   @MainActor
-  private func makeRig() throws -> ToolbarBridgeRig {
-    try makeToolbarRig(prefix: "EditorToolbarBridgeTests")
+  private func makeRig(hostsEditor: Bool = true) throws -> ToolbarBridgeRig {
+    try makeToolbarRig(prefix: "EditorToolbarBridgeTests", hostsEditor: hostsEditor)
   }
 }
