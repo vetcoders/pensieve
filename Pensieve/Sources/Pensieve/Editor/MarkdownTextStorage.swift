@@ -44,6 +44,15 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// rather than the whole cached set on every chunk.
   var onHighlightingRepainted: ((NSRange) -> Void)?
 
+  /// Fired after every CHARACTER edit, with the lowest offset the edit touched
+  /// and the change in length.
+  ///
+  /// For consumers holding offset-keyed caches. The caret→line resolver keys an
+  /// anchor on it: text below the reported offset is untouched, so an anchor at
+  /// or before it survives, and only one further back has to be thrown away.
+  /// Attribute-only edits do not fire it — a repaint moves no text.
+  var onCharactersEdited: ((_ location: Int, _ delta: Int) -> Void)?
+
   /// Full-document refresh passes performed so far. Exposed so the perf pins can
   /// prove what the timings say: a skin switch on a large document must not run
   /// one synchronously, and a burst of switches must collapse into ONE.
@@ -343,6 +352,7 @@ class MarkdownTextStorage: NSTextContentStorage {
         requiresFullRefresh: requiresFullRefresh
       )
       lastProcessedString = textStorage.string
+      onCharactersEdited?(editedRange.location, delta)
     }
   }
 

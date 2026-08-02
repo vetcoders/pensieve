@@ -485,6 +485,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Logical line index (newline count before the caret) at the last typewriter
   /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
   private var lastCenteredLine: Int?
+  /// Anchor for `lineIndex(forUTF16Offset:)`: a (offset, line) pair that holds
+  /// while the text in `[0, offset)` is unchanged. Parked on a LINE START
+  /// whenever a resolve crosses a separator, so typing — which edits at or after
+  /// the line start, backspace included — never invalidates it.
+  private var lineAnchorOffset = 0
+  private var lineAnchorLine = 0
   private var findQuery = ""
   /// `.foregroundColor` runs the find washes painted over, captured at paint
   /// time so a teardown can restore them without a highlight pass per match.
@@ -609,6 +615,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // the whole length of the sweep. Repaint per chunk instead.
     textContentStorage.onHighlightingRepainted = { [weak self] range in
       self?.reapplyFindHighlights(in: range)
+    }
+    // The caret→line resolver caches an anchor keyed on the text before it. Only
+    // the storage sees every character edit — direct mutations included — so the
+    // invalidation is driven from there rather than from the delegate callbacks.
+    textContentStorage.onCharactersEdited = { [weak self] location, _ in
+      self?.invalidateLineAnchor(editedAt: location)
     }
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
@@ -1171,19 +1183,115 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.reflectScrolledClipView(scrollView.contentView)
   }
 
-  /// Logical line index = number of newlines before `offset`. Layout-free and
-  /// stable across same-line horizontal edits — the property the typewriter
-  /// re-center guard needs and the caret-glyph rect does not have.
-  private func lineIndex(forUTF16Offset offset: Int) -> Int {
+  /// Logical line index = number of PARAGRAPH SEPARATORS before `offset`.
+  /// Layout-free and stable across same-line horizontal edits — the property the
+  /// typewriter re-center guard needs and the caret-glyph rect does not have.
+  ///
+  /// Two things were wrong with the walk this replaces.
+  ///
+  /// It rescanned from offset 0 on EVERY call. `updateGutterCurrentLine` runs it
+  /// from `notifySelectionChanged` and again, unconditionally, from `update(…)`
+  /// on every SwiftUI pass — twice per keystroke — and Focus mode's
+  /// `centerCaretLineIfNeeded` makes three. Measured in a debug test build,
+  /// 200 caret moves on a 1.08 MB document cost 1436 ms through this method
+  /// (~7 ms a call), i.e. 14–21 ms of main thread per keystroke purely to move a
+  /// gutter marker; the bare counting loop alone is 4.1 ms. It is now anchored: a caret
+  /// move counts separators only over the span between the last resolved
+  /// position and this one, which for typing on one line is nothing at all.
+  ///
+  /// And it counted 0x0A alone, while the gutter numbers one row per
+  /// `NSTextLayoutFragment`. Measured on a real `NSTextLayoutManager` in this
+  /// package, `"alpha\rbeta\rgamma"` is THREE fragments and U+2029 likewise,
+  /// both of which the old count read as line 0. Nothing normalises line endings
+  /// on load — `DocumentStore.loadClean` reads the bytes as they are — so a
+  /// CR-only file put the whole document on line 1.
+  ///
+  /// The separator set is the measured one, not the intuitive one: U+2028,
+  /// U+0085, U+000B and U+000C each yield ONE fragment in the same harness, so
+  /// none of them starts a row here. See `EditorLineResolverTests`, which
+  /// asserts this against the layout manager rather than against a list.
+  func lineIndex(forUTF16Offset offset: Int) -> Int {
     let ns = textStorage.string as NSString
     let clamped = min(max(offset, 0), ns.length)
-    var line = 0
-    var i = 0
-    while i < clamped {
-      if ns.character(at: i) == 0x0A { line += 1 }
-      i += 1
+    if lineAnchorOffset > ns.length {
+      resetLineAnchor()
     }
-    return line
+
+    if clamped >= lineAnchorOffset {
+      let scan = Self.paragraphSeparators(in: ns, from: lineAnchorOffset, to: clamped)
+      lineAnchorLine += scan.count
+      // Park the anchor on the START of the line the caret landed on. A caret
+      // position would be lost by the very next backspace (which edits at
+      // caret-1, i.e. BELOW the anchor); a line start survives every edit on
+      // that line, which is what typing is.
+      if let lineStart = scan.lastSeparatorEnd {
+        lineAnchorOffset = lineStart
+      }
+    } else {
+      let scan = Self.paragraphSeparators(in: ns, from: clamped, to: lineAnchorOffset)
+      lineAnchorLine = max(0, lineAnchorLine - scan.count)
+      // Moving BACKWARDS gives no line start for free — finding one would mean
+      // scanning back from `clamped`, which is the walk being removed. The
+      // caret offset is a perfectly valid anchor, just a more fragile one.
+      lineAnchorOffset = clamped
+    }
+    return lineAnchorLine
+  }
+
+  private func resetLineAnchor() {
+    lineAnchorOffset = 0
+    lineAnchorLine = 0
+  }
+
+  /// Drops the anchor when an edit landed BELOW it. At or above it, the text in
+  /// `[0, lineAnchorOffset)` is untouched and the anchor still answers correctly.
+  private func invalidateLineAnchor(editedAt location: Int) {
+    guard lineAnchorOffset > location else { return }
+    resetLineAnchor()
+  }
+
+  struct ParagraphSeparatorScan {
+    let count: Int
+    /// Offset just past the LAST separator in the window, i.e. the start of the
+    /// line the window ends on. `nil` when the window crossed none.
+    let lastSeparatorEnd: Int?
+  }
+
+  /// Counts the paragraph separators in `[start, end)`.
+  ///
+  /// CR, LF and CRLF, plus U+2029. CRLF is ONE separator, not two — see the
+  /// fragment counts in `EditorLineResolverTests`.
+  static func paragraphSeparators(in string: NSString, from start: Int, to end: Int)
+    -> ParagraphSeparatorScan
+  {
+    guard end > start, start >= 0, end <= string.length else {
+      return ParagraphSeparatorScan(count: 0, lastSeparatorEnd: nil)
+    }
+    var count = 0
+    var lastSeparatorEnd: Int?
+    var index = start
+    // A window opening ON the LF of a CRLF would count the pair a second time:
+    // the CR that owns it sits just outside, and already counted it.
+    if index > 0, string.character(at: index) == 0x0A,
+      string.character(at: index - 1) == 0x0D
+    {
+      index += 1
+    }
+    while index < end {
+      let unit = string.character(at: index)
+      if unit == 0x0D {
+        count += 1
+        if index + 1 < string.length, string.character(at: index + 1) == 0x0A {
+          index += 1
+        }
+        lastSeparatorEnd = index + 1
+      } else if unit == 0x0A || unit == 0x2029 {
+        count += 1
+        lastSeparatorEnd = index + 1
+      }
+      index += 1
+    }
+    return ParagraphSeparatorScan(count: count, lastSeparatorEnd: lastSeparatorEnd)
   }
 
   static func centeredScrollY(
