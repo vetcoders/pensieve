@@ -225,6 +225,55 @@ enum WindowChromeRecipe {
     }
   }
 
+  /// Everything a skin DECLARES to SwiftUI about a window's chrome: the scheme
+  /// for the window, and the scheme for its toolbar. Two fields, ONE decision —
+  /// see `SkinChrome`.
+  static func skinChrome(for theme: PensieveTheme) -> SkinChrome {
+    let scheme = preferredColorScheme(for: theme)
+    return SkinChrome(window: scheme, toolbar: scheme)
+  }
+
+  /// The window scheme and the TOOLBAR scheme, together, because leaving the
+  /// second one unstated is not a neutral default — it is a hand-off.
+  ///
+  /// On macOS 26 a toolbar is glass, and each `NSToolbarPlatterView` picks its
+  /// OWN appearance from the luminance of the content composited beneath it
+  /// unless the toolbar states a scheme. A window can therefore be `.darkAqua`
+  /// from top to bottom and still hand individual pills a light appearance —
+  /// which is exactly what this app does to itself, because a PAIRED skin pins
+  /// its reading surface white in BOTH halves (`readingSurfaceAppearanceName`).
+  /// The white sheet sits under the trailing half of the toolbar, so AppKit
+  /// dresses the pills over it for a light background.
+  ///
+  /// Measured on an isolated probe (own bundle id, own support dir, typewriter,
+  /// system dark, one document open in split mode, window 1300 wide with the
+  /// editor/preview divider at x=764):
+  ///
+  ///   * WITHOUT a declared toolbar scheme — window `darkAqua`, `NSTitlebarView`
+  ///     and `NSToolbarView` `VibrantDark`, and then every platter from x=913
+  ///     rightwards (plus the clipped-items `»` indicator at x=1252) carrying an
+  ///     EXPLICITLY SET `VibrantLight`. Every platter whose centre falls over the
+  ///     preview column, and no other. That is the reported symptom: dark
+  ///     titlebar, dark leading families, white trailing pills.
+  ///   * WITH it — the same window, the same document, every platter
+  ///     `DarkAqua`, none carrying an appearance of its own.
+  ///
+  /// The launcher window has no preview and reproduced nothing, which is why the
+  /// bug looked like it came and went with the document rather than with a
+  /// commit: it is not a regression from the live-flip fix, and the same mix is
+  /// visible in probe captures taken on the code before it.
+  ///
+  /// Stating the scheme is the supported way out and is idempotent — unlike
+  /// writing appearances onto the platters ourselves, which would re-enter the
+  /// never-converging write loop `assertedAppearances` exists to prevent.
+  struct SkinChrome: Equatable {
+    /// `nil` means "follow the system", which is what the adaptive skins want.
+    let window: ColorScheme?
+    /// Always the SAME answer as `window`. A skin that declares its window dark
+    /// and leaves its toolbar to guess is the defect above, spelled out.
+    let toolbar: ColorScheme?
+  }
+
   /// The appearance we last WROTE to a window, keyed weakly by that window so an
   /// entry disappears with the window it describes.
   ///
@@ -431,6 +480,11 @@ extension View {
   /// property there would repaint the panes on a switch and leave the sidebar and
   /// titlebar on the previous skin. Owning the observation here means applying
   /// the modifier is the whole contract; the caller cannot get it half right.
+  ///
+  /// It declares the TOOLBAR's scheme alongside the window's, from the one
+  /// `SkinChrome` value, because on macOS 26 a toolbar left unstated resolves
+  /// its glass per pill against whatever is composited under it — see
+  /// `SkinChrome` for the measurement.
   func pensieveSkinAppearance(_ themeManager: ThemeManager) -> some View {
     modifier(SkinAppearanceModifier(themeManager: themeManager))
   }
@@ -440,7 +494,11 @@ private struct SkinAppearanceModifier: ViewModifier {
   @ObservedObject var themeManager: ThemeManager
 
   func body(content: Content) -> some View {
-    content.preferredColorScheme(WindowChromeRecipe.preferredColorScheme(for: themeManager.skin))
+    let chrome = WindowChromeRecipe.skinChrome(for: themeManager.skin)
+    return
+      content
+      .preferredColorScheme(chrome.window)
+      .toolbarColorScheme(chrome.toolbar, for: .windowToolbar)
   }
 }
 
