@@ -164,6 +164,64 @@ class CodeBlockHighlighter {
     return fresh
   }
 
+  /// A fenced block whose extent the CALLER already knows.
+  ///
+  /// `Patterns.fence` has to see a COMPLETE ```…``` inside the range it is
+  /// handed, so a repaint covering only a SLICE of a block finds nothing and
+  /// leaves that code on the prose palette. `MarkdownTextStorage` clamps a block
+  /// too big to repaint whole out of its chunk — swallowing a megabyte fence to
+  /// recolour a screenful of it is the single blocking pass the chunked sweep
+  /// exists to prevent — and hands the block's extent over here instead.
+  struct BlockSlice: Equatable {
+    /// Opening fence through closing fence.
+    let blockRange: NSRange
+    /// The code between the two fences.
+    let codeRange: NSRange
+    /// Lowercased info string off the opening fence.
+    let language: String
+  }
+
+  /// Paints `range ∩ block` as code without needing the fence regex to find the
+  /// block first.
+  ///
+  /// The language rules run over whole LINES of the slice: several of them are
+  /// anchored (`//.*$`, `#.*$`, `^\s*.*?:`), so a slice that cut a line in half
+  /// would let them match from the middle of a token. A construct spanning more
+  /// lines than the slice (a Python docstring straddling a chunk edge) can still
+  /// be coloured as its parts — a bounded cosmetic cost at a chunk seam, paid
+  /// instead of a whole-block repaint.
+  func highlight(_ textStorage: NSTextStorage, range: NSRange, in block: BlockSlice) {
+    let string = textStorage.string as NSString
+    let document = NSRange(location: 0, length: string.length)
+    let painted = NSIntersectionRange(NSIntersectionRange(range, block.blockRange), document)
+    guard painted.length > 0 else { return }
+
+    let colors = self.colors()
+    textStorage.addAttribute(.foregroundColor, value: colors.base, range: painted)
+
+    guard let rules = Patterns.languageRules[block.language] else { return }
+    let code = NSIntersectionRange(block.codeRange, document)
+    var slice = NSIntersectionRange(painted, code)
+    guard slice.length > 0 else { return }
+    slice = NSIntersectionRange(string.lineRange(for: slice), code)
+    guard slice.length > 0 else { return }
+
+    let codeString = string.substring(with: slice)
+    let sliceStart = slice.location
+    let sliceRange = NSRange(location: 0, length: (codeString as NSString).length)
+    for rule in rules {
+      let color = colors.color(for: rule.role)
+      rule.regex.enumerateMatches(in: codeString, options: [], range: sliceRange) { match, _, _ in
+        guard let match = match else { return }
+        textStorage.addAttribute(
+          .foregroundColor,
+          value: color,
+          range: NSRange(
+            location: sliceStart + match.range.location, length: match.range.length))
+      }
+    }
+  }
+
   func highlight(_ textStorage: NSTextStorage, range: NSRange) {
     let string = textStorage.string as NSString
     let fullRange = NSRange(location: 0, length: string.length)

@@ -31,6 +31,15 @@ final class EditorThemeRepaintTests: XCTestCase {
     String(repeating: "body text paragraph\n\n", count: 10_000)
   }
 
+  /// One ```swift fence far larger than a chunk. The whole point is that the
+  /// block cannot be repainted inside a frame, so the expansion has to stop at
+  /// the ceiling instead of swallowing it.
+  private func makeHugeFencedDocument() -> String {
+    "```swift\n"
+      + String(repeating: "func greet() { let s = \"hi\" } // note\n", count: 16_000)
+      + "```\n\nbody text paragraph\n"
+  }
+
   private func makeStorage(text: String, skin: PensieveTheme)
     -> (MarkdownTextStorage, NSTextStorage)
   {
@@ -265,6 +274,58 @@ final class EditorThemeRepaintTests: XCTestCase {
     XCTAssertLessThan(
       content.longestRethemeChunkDuration, content.rethemeChunkTimeBudget * 4,
       "a chunk that outgrows its budget is the blocking pass again, just smaller")
+  }
+
+  /// A large fenced block must not smuggle the blocking pass back in.
+  ///
+  /// `codeBlockAwareRange` used to union the WHOLE fence onto a chunk that had
+  /// already been sized to the time budget, with no cap, and then run
+  /// `refreshHighlighting` over the result synchronously — a reset, twelve
+  /// markdown regexes, the fence regex, the per-language rules and a substring
+  /// copy of the entire block, all in one frame. The existing budget pin above
+  /// cannot see it: its filler is fence-free.
+  ///
+  /// Measured on THIS fixture (608 KB fence, debug build): unbounded, the sweep
+  /// is TWO chunks and the worst holds the main thread for 2315 ms — the whole
+  /// document in one block, which is precisely what the chunking replaced.
+  /// Clamped, the worst chunk is 223 ms and the steady state ~18 ms.
+  ///
+  /// The residual 223 ms is the FIRST chunk, sized from `seedSecondsPerCharacter`
+  /// before any measurement of this document exists, and it is dominated by a
+  /// per-chunk cost that is O(document) rather than O(chunk) — each pass bridges
+  /// the whole `NSString` to a `String` and re-copies `lastProcessedString`. That
+  /// is a separate finding, not this one, so the duration bound here is set from
+  /// the measurement rather than from the frame budget; the LENGTH assertion
+  /// below states the same contract deterministically.
+  @MainActor
+  func testALargeFencedBlockCannotWidenAChunkPastItsBudget() {
+    let (content, storage) = makeStorage(text: makeHugeFencedDocument(), skin: .parchment)
+    content.visibleRangeProvider = { NSRange(location: 0, length: 400) }
+
+    content.tokens = PensieveTheme.ink.tokens
+    drainDeferredRefresh(content)
+
+    XCTAssertGreaterThan(content.rethemeChunkCount, 2, "the sweep must actually be cut up")
+    XCTAssertLessThanOrEqual(
+      content.longestRethemeChunkLength, MarkdownTextStorage.maximumRethemeChunkLength,
+      "the fenced block handed one chunk \(content.longestRethemeChunkLength) characters —"
+        + " the expansion is unbounded again")
+    XCTAssertLessThan(
+      content.longestRethemeChunkDuration, content.rethemeChunkTimeBudget * 20,
+      "a fenced block widened a chunk into the blocking pass the sweep replaced"
+        + " — measured \(Int(content.longestRethemeChunkDuration * 1000)) ms")
+
+    // Control leg: bounding the chunk must not cost the CODE PALETTE. Sampled
+    // deep inside the fence, well past any chunk boundary the sweep could have
+    // aligned with by luck.
+    let ns = storage.string as NSString
+    let deepKeyword = ns.range(
+      of: "func", options: .backwards, range: NSRange(location: 0, length: ns.length))
+    XCTAssertNotEqual(deepKeyword.location, NSNotFound)
+    XCTAssertEqual(
+      textColor(in: storage, at: deepKeyword.location),
+      srgb(PensieveTheme.ink.tokens.accent.nsColor),
+      "code inside the fence came out on the prose palette after the sweep")
   }
 
   /// Decision (d), settled by measurement rather than taste: the first chunk

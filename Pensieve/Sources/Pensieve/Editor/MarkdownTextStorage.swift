@@ -69,6 +69,13 @@ class MarkdownTextStorage: NSTextContentStorage {
   private(set) var rethemeChunkCount = 0
   private(set) var longestRethemeChunkDuration: TimeInterval = 0
 
+  /// Longest RANGE any single chunk painted. The duration above is the property
+  /// that matters but it is a wall-clock measurement on a shared machine; this
+  /// is the same contract stated deterministically, and it is what a fenced
+  /// block used to blow open — the expansion could hand one chunk the entire
+  /// block however big it was.
+  private(set) var longestRethemeChunkLength = 0
+
   /// Whether a sweep still has ranges to paint. Exposed so a pin can land an
   /// edit at a moment that is provably MID-sweep instead of guessing a delay.
   var isRethemeSweepInFlight: Bool { rethemeSweepCursor != nil }
@@ -166,9 +173,9 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
 
     let viewportRange = clampedRange(visibleRange, textLength: string.length)
-    let scopedRange = codeBlockAwareRange(
+    let scope = codeBlockAwareScope(
       for: scopedHighlightRange(for: viewportRange, in: string))
-    refreshHighlighting(in: scopedRange)
+    refreshHighlighting(in: scope)
     startRethemeSweep()
   }
 
@@ -195,6 +202,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     rethemeSweepCursor = 0
     rethemeChunkCount = 0
     longestRethemeChunkDuration = 0
+    longestRethemeChunkLength = 0
     scheduleNextRethemeChunk()
   }
 
@@ -243,14 +251,16 @@ class MarkdownTextStorage: NSTextContentStorage {
     let planned = clampedRange(
       NSRange(location: cursor, length: plannedRethemeChunkLength()),
       textLength: string.length)
-    let chunk = codeBlockAwareRange(for: scopedHighlightRange(for: planned, in: string))
+    let scope = codeBlockAwareScope(for: scopedHighlightRange(for: planned, in: string))
+    let chunk = scope.range
 
     let started = Date()
-    refreshHighlighting(in: chunk)
+    refreshHighlighting(in: scope)
     let elapsed = Date().timeIntervalSince(started)
 
     rethemeChunkCount += 1
     longestRethemeChunkDuration = max(longestRethemeChunkDuration, elapsed)
+    longestRethemeChunkLength = max(longestRethemeChunkLength, chunk.length)
     if chunk.length > 0 {
       // Smoothed, so one noisy sample (a chunk that happened to straddle a big
       // fenced block) cannot halve or double every chunk that follows.
@@ -361,9 +371,11 @@ class MarkdownTextStorage: NSTextContentStorage {
         delta: delta,
         textLength: textStorage?.length ?? 0
       )
-      let codeBlockRange = codeBlockAwareRange(for: scopedRange)
+      // The fenced-block expansion is deferred to the apply, not folded in
+      // here: it is bounded by the chunk ceiling, and a ceiling applied to each
+      // of a burst of keystrokes and then unioned would not be a ceiling.
       pendingHighlightRange =
-        pendingHighlightRange.map { NSUnionRange($0, codeBlockRange) } ?? codeBlockRange
+        pendingHighlightRange.map { NSUnionRange($0, scopedRange) } ?? scopedRange
     }
 
     let workItem = DispatchWorkItem { [weak self] in
@@ -387,7 +399,7 @@ class MarkdownTextStorage: NSTextContentStorage {
 
     pendingHighlightRange = nil
     highlightWorkItem = nil
-    refreshHighlighting(in: scopedRange)
+    refreshHighlighting(in: codeBlockAwareScope(for: scopedRange))
   }
 
   func refreshHighlighting() {
@@ -422,16 +434,25 @@ class MarkdownTextStorage: NSTextContentStorage {
     }
   }
 
-  private func refreshHighlighting(in range: NSRange) {
+  private func refreshHighlighting(in scope: HighlightScope) {
     guard let textStorage = textStorage else { return }
     let string = textStorage.string as NSString
-    let scopedRange = clampedRange(range, textLength: string.length)
+    let scopedRange = clampedRange(scope.range, textLength: string.length)
 
     textStorage.beginEditing()
     highlighter.resetBaseAttributes(textStorage, range: scopedRange)
     if syntaxHighlightingEnabled {
       highlighter.highlight(textStorage, range: scopedRange)
-      codeBlockHighlighter.highlight(textStorage, range: scopedRange)
+      // Only where a COMPLETE fence can exist — see `rangesOutsidePartialBlocks`.
+      for piece in scope.rangesOutsidePartialBlocks(in: scopedRange) {
+        codeBlockHighlighter.highlight(textStorage, range: piece)
+      }
+      // Blocks the range only slices. The fence regex above cannot see them, so
+      // without this pass the code inside a big fence would keep the prose
+      // reset the chunk had just applied.
+      for block in scope.partialBlocks {
+        codeBlockHighlighter.highlight(textStorage, range: scopedRange, in: block)
+      }
     }
     textStorage.endEditing()
     lastProcessedString = textStorage.string
@@ -463,13 +484,76 @@ class MarkdownTextStorage: NSTextContentStorage {
     return string.paragraphRange(for: contextRange)
   }
 
-  private func codeBlockAwareRange(for range: NSRange) -> NSRange {
-    guard let textStorage = textStorage else { return range }
+  /// A range to repaint, plus any fenced block it lies inside that is too big to
+  /// repaint whole.
+  struct HighlightScope {
+    let range: NSRange
+    /// Blocks the range only partly covers, so `CodeBlockHighlighter` can still
+    /// colour the slice as code without its fence regex finding the block.
+    let partialBlocks: [CodeBlockHighlighter.BlockSlice]
+
+    init(range: NSRange, partialBlocks: [CodeBlockHighlighter.BlockSlice] = []) {
+      self.range = range
+      self.partialBlocks = partialBlocks
+    }
+
+    /// `range` minus every partial block, in document order.
+    ///
+    /// The fence regex must NOT be run over a slice of a block it cannot
+    /// complete. `(?s)```(.*?)\n(.*?)``` ` is lazy on both groups, so with no
+    /// closing fence inside the slice it retries the tail scan from every line
+    /// start in it — measured on the fenced fixture, that alone cost ~288 ms per
+    /// chunk, WORSE than the unbounded expansion the clamp replaced. The blocks
+    /// are disjoint and appended in document order, so the complement is one
+    /// walk.
+    func rangesOutsidePartialBlocks(in range: NSRange) -> [NSRange] {
+      guard !partialBlocks.isEmpty else { return [range] }
+      var pieces: [NSRange] = []
+      var cursor = range.location
+      let end = NSMaxRange(range)
+      for block in partialBlocks {
+        let blocked = NSIntersectionRange(block.blockRange, range)
+        guard blocked.length > 0 else { continue }
+        if blocked.location > cursor {
+          pieces.append(NSRange(location: cursor, length: blocked.location - cursor))
+        }
+        cursor = max(cursor, NSMaxRange(blocked))
+      }
+      if cursor < end {
+        pieces.append(NSRange(location: cursor, length: end - cursor))
+      }
+      return pieces
+    }
+  }
+
+  /// Widens `range` to cover any fenced block it touches — but never past the
+  /// chunk ceiling.
+  ///
+  /// The union used to be unbounded, on a range that had ALREADY been sized to
+  /// `maximumRethemeChunkLength`, and then ran through `refreshHighlighting`
+  /// synchronously. One ```swift fence bigger than a chunk therefore put the
+  /// whole fence on the main thread in a single go — a reset, twelve markdown
+  /// regexes, the fence regex, the per-language rules and a substring copy of
+  /// the entire block. That is the blocking pass the chunked sweep was written
+  /// to remove, reintroduced by the very expansion meant to keep the colours
+  /// right.
+  ///
+  /// So: a block that fits is still swallowed whole (it is cheap, and the fence
+  /// regex needs the complete block); a block that does not is left OUT of the
+  /// repaint range and reported as a partial instead, which colours the slice
+  /// from its known extent and language.
+  private func codeBlockAwareScope(for range: NSRange) -> HighlightScope {
+    guard let textStorage = textStorage else { return HighlightScope(range: range) }
     let string = textStorage.string as NSString
     var result = clampedRange(range, textLength: string.length)
 
     let fences = fenceLineRanges(in: string)
-    guard fences.count >= 2 else { return result }
+    guard fences.count >= 2 else { return HighlightScope(range: result) }
+
+    // The ceiling never shrinks a range the caller already asked for; it only
+    // stops the EXPANSION from growing one.
+    let ceiling = max(result.length, plannedRethemeChunkLength())
+    var partialBlocks: [CodeBlockHighlighter.BlockSlice] = []
 
     // Fences pair in document order: index 0 opens, 1 closes, 2 opens, ... .
     // A complete code block spans [open.location, NSMaxRange(close)). Blocks
@@ -498,13 +582,43 @@ class MarkdownTextStorage: NSTextContentStorage {
       }
 
       if rangesTouchOrIntersect(blockRange, result) {
-        result = NSUnionRange(result, blockRange)
+        let union = NSUnionRange(result, blockRange)
+        if union.length <= ceiling {
+          result = union
+        } else if let slice = blockSlice(open: open, close: close, in: string) {
+          partialBlocks.append(slice)
+        }
       }
 
       openerIndex += 2
     }
 
-    return result
+    return HighlightScope(range: result, partialBlocks: partialBlocks)
+  }
+
+  /// The (block, code, language) triple for a fenced block, read straight off
+  /// its fence lines — the same information `CodeBlockHighlighter`'s regex would
+  /// extract if the repaint range were wide enough to contain the whole block.
+  private func blockSlice(open: NSRange, close: NSRange, in string: NSString)
+    -> CodeBlockHighlighter.BlockSlice?
+  {
+    let codeStart = NSMaxRange(open)
+    let codeEnd = close.location
+    guard codeEnd > codeStart else { return nil }
+
+    let infoRange = lineContentRange(from: open, in: string)
+    // Drop the indent and the run of backticks, whatever its length: `isFenceLine`
+    // accepts three OR MORE, and a fixed three would read "`swift" off a ````
+    // fence and match no language table.
+    let language = string.substring(with: infoRange)
+      .drop(while: { $0 == "`" || $0 == " " || $0 == "\t" })
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+
+    return CodeBlockHighlighter.BlockSlice(
+      blockRange: NSRange(location: open.location, length: NSMaxRange(close) - open.location),
+      codeRange: NSRange(location: codeStart, length: codeEnd - codeStart),
+      language: language)
   }
 
   /// Returns the cached document-order fence-line ranges, rebuilding the cache
