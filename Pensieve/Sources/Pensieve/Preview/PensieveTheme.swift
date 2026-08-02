@@ -146,6 +146,43 @@ struct ThemeTokens {
   /// Monospace family (source panel, code).
   let monoFamily: String
 
+  /// The accent as CHROME must paint it — the one answer every chrome surface
+  /// asks for instead of reading `accent` raw.
+  ///
+  /// A fixed palette is free to pick an accent that collides with its own
+  /// surface, and one does on purpose: typewriter's dark half sets
+  /// `accent: #1c1c1c` over a `#171717` backing, because that accent is INK for
+  /// the white preview sheet the pair keeps on BOTH halves. Painted raw on the
+  /// window chrome — the sidebar's selected-file glyph, its selection wash and
+  /// its 2 px leading bar, the empty-state wordmark — that ink is invisible.
+  ///
+  /// So the accent is measured against the surface it will actually be painted
+  /// on and demoted to another token from the SAME theme (the body ink) when it
+  /// cannot be seen — never to an invented per-theme hex, which is the rule the
+  /// source-panel highlighters already follow.
+  ///
+  /// The surface is `source`, for two reasons rather than convenience. It is the
+  /// token this app already backs its own window chrome with
+  /// (`WindowChromeRecipe.titlebarGlassBackingColor`), and it is what the
+  /// detail-pane empty state paints. The sidebar keeps the system sidebar
+  /// MATERIAL instead of this token, but that material follows the appearance
+  /// the skin pins (`appearanceName`, itself derived from `mode`), so it lands
+  /// within a step or two of `source` on every skin — near enough that a colour
+  /// which cannot be seen on one cannot be seen on the other.
+  ///
+  /// An UNMEASURABLE pair keeps the accent: the adaptive skins' catalog colours
+  /// (`linkColor` on `textBackgroundColor`) resolve per appearance at draw time
+  /// and cannot be ratioed here, and they are legible by construction.
+  var legibleAccent: NSColor {
+    let accent = accent.nsColor
+    if let ratio = ThemeContrast.ratio(accent, source.nsColor),
+      ratio < ThemeContrast.minimumTextContrast
+    {
+      return text.nsColor
+    }
+    return accent
+  }
+
   /// Resolves a bundled family name to an `NSFont`, or the system font of the
   /// same size when the name is empty (adaptive themes) or the family did not
   /// register in this process. Keeps native chrome legible without the bundled

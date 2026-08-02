@@ -640,7 +640,16 @@ struct SidebarView: View {
 
   // MARK: - Theme chrome (5.1)
 
-  private var themeAccent: Color { Color(themeManager.skin.tokens.accent.nsColor) }
+  /// The accent every sidebar row actually gets — the selected-file glyph, the
+  /// selection wash, the 2 px leading bar and the selected Open Files row.
+  ///
+  /// It is `ThemeTokens.legibleAccent` rather than the raw token because the
+  /// sidebar is painted on the window CHROME, not on the reading surface the
+  /// accent was tuned for; see that property. Named and static so the pin can
+  /// measure the value the rows are handed instead of re-deriving it.
+  static func chromeAccentColor(for tokens: ThemeTokens) -> NSColor { tokens.legibleAccent }
+
+  private var themeAccent: Color { Color(Self.chromeAccentColor(for: themeManager.skin.tokens)) }
   private var themeMuted: Color { Color(themeManager.skin.tokens.muted.nsColor) }
   private var themeText: Color { Color(themeManager.skin.tokens.text.nsColor) }
   private var themeBorder: Color { Color(themeManager.skin.tokens.border.nsColor) }

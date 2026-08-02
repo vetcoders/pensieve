@@ -48,17 +48,10 @@ struct EmptyStatePalette {
 
     // A fixed palette is free to collide by design: typewriter's accent IS its
     // source surface, because that accent was drawn for the light window chrome.
-    // Fall back to another token from the SAME theme rather than an invented hex
-    // — the rule the source-panel highlighters already follow. An UNMEASURABLE
-    // pair keeps the accent: the adaptive skins' catalog colours (`linkColor` on
-    // `textBackgroundColor`) resolve per appearance at draw time and cannot be
-    // ratioed here, and they are legible by construction.
-    let accent = tokens.accent.nsColor
-    if let ratio = ThemeContrast.ratio(accent, surface), ratio < ThemeContrast.minimumTextContrast {
-      wordmark = tokens.text.nsColor
-    } else {
-      wordmark = accent
-    }
+    // The fallback that guards it lives on `ThemeTokens` now — the sidebar paints
+    // the same accent on the same skin, and two copies of this measurement would
+    // be two places for it to drift.
+    wordmark = tokens.legibleAccent
   }
 }
 
@@ -76,7 +69,11 @@ struct EmptyStateWordmark: View {
     let family = tokens.previewHeadingFamily
     Text("Pensieve")
       .font(family.isEmpty ? .system(size: size, weight: .semibold) : .custom(family, size: size))
-      .foregroundStyle(Color(palette?.wordmark ?? tokens.accent.nsColor))
+      // No palette means the SIDEBAR's empty state, which sits on the system
+      // sidebar material rather than the skin's pane — and takes the same
+      // guarded accent, not the raw token that vanishes on typewriter's dark
+      // half.
+      .foregroundStyle(Color(palette?.wordmark ?? tokens.legibleAccent))
       .accessibilityIdentifier("pensieve.emptyState.wordmark")
   }
 }
