@@ -316,7 +316,18 @@ final class AppController: ObservableObject {
     // running it against a window that already shows a document silently threw
     // that document away and left the conversion sitting under its title. The
     // destination tab performs the import itself via `openFileInCurrentWindow`.
-    if appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow {
+    //
+    // A CONVERSION IN FLIGHT OCCUPIES THIS WINDOW TOO. It runs off the main
+    // actor and leaves the session empty until it lands, so a multi-file open —
+    // Finder multi-select, a Dock drop — answered "empty, use this window" for
+    // every URL after the first: a second import called `documentImportTask?
+    // .cancel()` and the user's first file vanished without a word, while a
+    // Markdown URL loaded into the session the pending conversion was about to
+    // overwrite. `hasEditableBuffer` cannot see that work; `hasPendingImportWork`
+    // is what says this window is spoken for.
+    if appState.documentSession.hasEditableBuffer || hasPendingImportWork,
+      let requestOpenDocumentWindow
+    {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
       return

@@ -63,6 +63,111 @@ final class DocumentIdentityCrossWireTests: XCTestCase {
     XCTAssertTrue(routed.isEmpty, "an empty window imports in place, it does not open a tab")
   }
 
+  /// An empty launcher handed SEVERAL files at once — a Finder multi-select, a
+  /// Dock drop, `open -a` with a list — sees them one URL at a time. The first,
+  /// a DOCX, converts off the main actor, so this window's session is still
+  /// empty when the second URL arrives and the routing question answered "empty,
+  /// import in place" a second time: `importDocument` cancelled the first
+  /// conversion and the user's first file vanished without a word. Pending
+  /// import work occupies this window exactly as an editable buffer does.
+  func testASecondImportDuringAnInFlightOneGetsItsOwnTab() async throws {
+    let root = try makeTemporaryDirectory()
+    let first = root.appendingPathComponent("umowa.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Umowa</h1>", baseURL: nil)
+      .write(to: first, options: .atomic)
+    let second = root.appendingPathComponent("zalacznik.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Zalacznik</h1>", baseURL: nil)
+      .write(to: second, options: .atomic)
+
+    let appState = AppState()
+    let controller = makeController(appState: appState)
+    var routed: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { routed.append($0) }
+
+    controller.openFile(url: first)
+    XCTAssertTrue(
+      controller.hasPendingImportWork,
+      "the conversion already finished, so this pin is not exercising an in-flight import")
+    XCTAssertTrue(routed.isEmpty, "the first file belongs in the empty launcher")
+
+    controller.openFile(url: second)
+
+    XCTAssertEqual(
+      routed.map(\.id.lastPathComponent), ["zalacznik.docx"],
+      "the second source must get its own tab instead of cancelling the conversion running here")
+
+    try await waitForImportToSettle(controller)
+    XCTAssertTrue(
+      appState.documentSession.text.contains("Umowa"),
+      "the first file's conversion was dropped by the second open")
+  }
+
+  /// The other half of the same race: a MARKDOWN URL arriving during the
+  /// conversion loaded straight into the session the import was about to
+  /// overwrite, so the file the user could see for a moment was replaced by the
+  /// conversion the instant it landed.
+  func testAMarkdownOpenDuringAnInFlightImportGetsItsOwnTab() async throws {
+    let root = try makeTemporaryDirectory()
+    let source = root.appendingPathComponent("umowa.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Umowa</h1>", baseURL: nil)
+      .write(to: source, options: .atomic)
+    let note = root.appendingPathComponent("note.md")
+    try "the file the user opened second".write(to: note, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let controller = makeController(appState: appState)
+    var routed: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { routed.append($0) }
+
+    controller.openFile(url: source)
+    XCTAssertTrue(controller.hasPendingImportWork)
+
+    controller.openFile(url: note)
+
+    XCTAssertEqual(
+      routed.map(\.id.lastPathComponent), ["note.md"],
+      "a document opened during a conversion must not land in the window the conversion owns")
+
+    try await waitForImportToSettle(controller)
+    XCTAssertTrue(appState.documentSession.text.contains("Umowa"), appState.documentSession.text)
+  }
+
+  /// CONTROL: occupancy ends when the import does. A window whose conversion has
+  /// settled is the ordinary occupied window — and one that never had an import
+  /// at all still opens in place.
+  func testAWindowIsFreeAgainOnceTheImportSettles() async throws {
+    let root = try makeTemporaryDirectory()
+    let source = root.appendingPathComponent("umowa.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Umowa</h1>", baseURL: nil)
+      .write(to: source, options: .atomic)
+    let note = root.appendingPathComponent("note.md")
+    try "opened after the conversion".write(to: note, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    let controller = makeController(appState: appState)
+    controller.openFile(url: source)
+    try await waitForImportToSettle(controller)
+    XCTAssertFalse(controller.hasPendingImportWork)
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+
+    var routed: [DocumentRef] = []
+    controller.requestOpenDocumentWindow = { routed.append($0) }
+    controller.openFile(url: note)
+    XCTAssertEqual(
+      routed.map(\.id.lastPathComponent), ["note.md"],
+      "the settled conversion is an ordinary document — the next open is a tab")
+  }
+
+  /// Waits for the conversion to settle. The import hops back to the main actor
+  /// to publish its result, so this only has to give the main actor room.
+  private func waitForImportToSettle(_ controller: AppController) async throws {
+    for _ in 0..<400 {
+      guard controller.hasPendingImportWork else { return }
+      try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTFail("the import never settled")
+  }
+
   /// The reorder must not start accepting types Pensieve cannot open.
   func testAnUnsupportedTypeIsStillRefusedBeforeAnyRouting() throws {
     let root = try makeTemporaryDirectory()
