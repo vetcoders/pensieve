@@ -20,7 +20,13 @@ class SyntaxHighlighter {
     static let horizontalRule = compile(#"(?m)^\s{0,3}([-*_])(?:\s*\1){2,}\s*$"#)
     /// `[~]` is the third state ("in progress") the preview draws as a diamond;
     /// the source panel gives it the same checkbox token as `[ ]`/`[x]`.
-    static let taskCheckbox = compile(#"(?m)^\s{0,3}[-*+]\s+\[[ xX~]\]"#)
+    ///
+    /// The trailing `(?=\s|$)` is what the EMITTER requires (`HTMLEmitter`'s task
+    /// pattern ends in `(?:\s|$)`), so without it the source pane styles
+    /// `- [~]wip` as a checkbox while the preview renders it as a plain bullet —
+    /// two panes disagreeing about the same line. GFM is on the emitter's side:
+    /// a task marker needs a separator after the bracket.
+    static let taskCheckbox = compile(#"(?m)^\s{0,3}[-*+]\s+\[[ xX~]\](?=\s|$)"#)
     static let unorderedList = compile(#"(?m)^\s{0,3}[-*+](?=\s+)"#)
     static let orderedList = compile(#"(?m)^\s{0,3}\d+\.(?=\s+)"#)
     static let heading = compile("(?m)^#{1,6}\\s+.*$")

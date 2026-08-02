@@ -162,6 +162,36 @@ final class SyntaxHighlighterTests: XCTestCase {
       font(storage, at: at), NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold))
   }
 
+  /// A task marker needs a separator after the bracket, exactly like the emitter
+  /// demands (`HTMLEmitter` drops the marker unless the remainder starts with
+  /// whitespace or is empty). Without the trailing lookahead the source pane
+  /// styled `- [~]wip` as a checkbox while the preview rendered a plain bullet —
+  /// the two panes describing the same line differently.
+  func testCheckboxNeedsASeparatorAfterTheBracket() {
+    let semibold = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold)
+    for md in ["- [~]wip\n", "- [x]wip\n", "- [ ]wip\n"] {
+      let storage = highlighted(md)
+      // Index 2 is the `[`: inside the bracket, past the `-` the plain
+      // unordered-list rule legitimately still claims.
+      XCTAssertNotEqual(
+        font(storage, at: 2), semibold,
+        "\(md) has no separator after the bracket — the preview renders a bullet")
+      XCTAssertNotEqual(color(storage, at: 2), NSColor.secondaryLabelColor, md)
+    }
+  }
+
+  /// Control leg: the tightened pattern must not stop matching a WELL-FORMED
+  /// marker, in any of the three states or at end of line without a trailing
+  /// space.
+  func testCheckboxStillMatchesWithASeparatorOrAtEndOfLine() {
+    let semibold = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold)
+    for md in ["- [~] wip\n", "- [x] done\n", "- [ ] todo\n", "- [x]\n", "- [ ]"] {
+      let storage = highlighted(md)
+      XCTAssertEqual(font(storage, at: 2), semibold, md)
+      XCTAssertEqual(color(storage, at: 2), NSColor.secondaryLabelColor, md)
+    }
+  }
+
   func testEmptyAndCheckedCheckboxesStillMatchAfterThirdState() {
     for md in ["- [ ] todo\n", "* [x] done\n", "+ [X] shouted\n"] {
       let storage = highlighted(md)
