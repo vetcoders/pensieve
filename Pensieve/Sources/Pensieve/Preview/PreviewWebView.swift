@@ -1179,6 +1179,32 @@ final class PreviewWebView: NSView {
     })();
     """
 
+  /// Renders the `.mermaid` blocks, dressed in the SKIN's colours.
+  ///
+  /// The palette used to come from `matchMedia('(prefers-color-scheme: dark)')`,
+  /// which made the script a SECOND reader of the light/dark setting behind the
+  /// stylesheet's back — and the two readers disagree exactly where it shows.
+  /// A standalone HTML export carries its skin's CSS but nothing that pins the
+  /// appearance, so Typewriter opened on a dark Mac drew a dark diagram box on
+  /// its white sheet, and Graphite on a light Mac drew the mirror image. The
+  /// in-app WebView hid it: `readingSurfaceAppearanceName` pins the appearance
+  /// there, so both readers happened to agree.
+  ///
+  /// So the script stops asking the machine and reads the page instead — the
+  /// `--vc-preview-*` tokens the skin block already defines, resolved by the
+  /// engine that owns the cascade. One source of truth, and it keeps working for
+  /// the adaptive skins for free: `default`/`raw` name no colour of their own,
+  /// their tokens carry the `@media` branch, and so the diagram still follows
+  /// the viewer — because the SHEET does.
+  ///
+  /// The mapping is the one the surrounding CSS already applies to `.mermaid`,
+  /// so the SVG and its container cannot disagree: the container's background is
+  /// the diagram surface, labels are forced to `--vc-preview-text` and edges to
+  /// `--vc-preview-muted`, and node outlines join the edges on that same line
+  /// colour rather than inventing a third value. The fallbacks are the base
+  /// block's light values — unreachable while the stylesheet is present, and a
+  /// degrade to the established GitHub surface rather than to Mermaid's own
+  /// default if it ever is not.
   static let mermaidBootstrapScript: String = """
     (function() {
       const diagrams = Array.from(document.querySelectorAll('.mermaid'));
@@ -1198,23 +1224,19 @@ final class PreviewWebView: NSView {
         return;
       }
 
-      const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-      const themeVariables = dark ? {
-        background: '#18181b',
-        primaryColor: '#27272a',
-        primaryTextColor: '#f0f0f0',
-        primaryBorderColor: '#71717a',
-        lineColor: '#a1a1aa',
-        secondaryColor: '#1f2937',
-        tertiaryColor: '#111827'
-      } : {
-        background: '#ffffff',
-        primaryColor: '#f6f8fa',
-        primaryTextColor: '#1f2328',
-        primaryBorderColor: '#8c959f',
-        lineColor: '#57606a',
-        secondaryColor: '#eef6ff',
-        tertiaryColor: '#ffffff'
+      const skinTokens = window.getComputedStyle(document.documentElement);
+      function skinToken(name, fallback) {
+        const value = skinTokens.getPropertyValue(name).trim();
+        return value || fallback;
+      }
+      const themeVariables = {
+        background: skinToken('--vc-preview-diagram-bg', '#ffffff'),
+        primaryColor: skinToken('--vc-preview-code-bg', '#f6f8fa'),
+        primaryTextColor: skinToken('--vc-preview-text', '#1f2328'),
+        primaryBorderColor: skinToken('--vc-preview-muted', '#57606a'),
+        lineColor: skinToken('--vc-preview-muted', '#57606a'),
+        secondaryColor: skinToken('--vc-preview-row-alt', '#f6f8fa'),
+        tertiaryColor: skinToken('--vc-preview-border', '#d0d7de')
       };
 
       try {
