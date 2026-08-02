@@ -269,6 +269,15 @@ struct DocumentWindowRootView: View {
     controller.requestOpenRecoveredDraftWindow = {
       DocumentWindowRegistry.shared.openLauncherWindow()
     }
+    // A window that adopted the crash draft holds real work behind no URL, so
+    // nothing else would ever reclassify it out of "launcher".
+    controller.requestPromoteWindowToContent = {
+      guard let currentWindow else { return }
+      DocumentWindowRegistry.shared.markWindowAsContent(currentWindow)
+    }
+    controller.requestLauncherSweepReconcile = {
+      DocumentWindowRegistry.shared.reconcileLaunchersAfterRestoreSettled()
+    }
   }
 
   /// Document identity reported to the window registry. Before the initial
