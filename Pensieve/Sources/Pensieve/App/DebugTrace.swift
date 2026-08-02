@@ -7,9 +7,34 @@ import Foundation
 enum DebugTrace {
   static let isEnabled = ProcessInfo.processInfo.environment["PENSIEVE_TRACE"] == "1"
 
+  /// Optional file sink. A GUI bundle's `NSLog` output is not reachable from a
+  /// shell, so `PENSIEVE_TRACE_FILE=<path>` mirrors every line into a file the
+  /// harness can read. Nil unless tracing is on AND the path is set.
+  private static let fileSink: FileHandle? = {
+    guard isEnabled,
+      let path = ProcessInfo.processInfo.environment["PENSIEVE_TRACE_FILE"],
+      !path.isEmpty
+    else { return nil }
+    if !FileManager.default.fileExists(atPath: path) {
+      FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    guard let handle = FileHandle(forWritingAtPath: path) else { return nil }
+    handle.seekToEndOfFile()
+    return handle
+  }()
+  private static let sinkLock = NSLock()
+
   static func log(_ message: @autoclosure () -> String) {
     guard isEnabled else { return }
-    NSLog("%@", "[pensieve-trace] \(message())")
+    let text = message()
+    NSLog("%@", "[pensieve-trace] \(text)")
+    guard let fileSink else { return }
+    sinkLock.lock()
+    defer { sinkLock.unlock() }
+    let stamp = Date().timeIntervalSince1970
+    if let data = String(format: "%.3f %@\n", stamp, text).data(using: .utf8) {
+      fileSink.write(data)
+    }
   }
 
   /// Subscribes to the window lifecycle notifications that matter when
