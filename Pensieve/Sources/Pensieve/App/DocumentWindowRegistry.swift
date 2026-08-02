@@ -712,12 +712,43 @@ final class DocumentWindowRegistry: ObservableObject {
     // nothing. Stale group-member launchers (no longer key) ARE reaped, or
     // they accumulate as empty "Pensieve" tabs during tab churn.
     if (window.tabbedWindows?.count ?? 1) > 1 && window.isKeyWindow { return false }
+    // Registry bookkeeping is not evidence of emptiness. A window holding a
+    // recovered crash draft has no URL, so the accessor never publishes a
+    // document identity and it stays filed as a "launcher" — the sweep used to
+    // reap it 0.2s after the draft landed in it. A window still waiting for its
+    // launch restore is the mirror case: the document IS coming, it just has
+    // not reached the accessor yet, and on a slow workspace the timer wins.
+    // Ask the session what it actually holds before reaping anything.
+    if windowHoldsLiveWork(window) { return false }
     let isTrackedLauncher = launcherWindows[windowID]?.window === window
     let isUntrackedLauncher =
       includingUntracked && window.title == "Pensieve" && window.representedURL == nil
     guard isTrackedLauncher || isUntrackedLauncher else { return false }
     return contentWindows[windowID]?.window == nil
       && !windowsByDocumentID.values.contains { $0.window === window }
+  }
+
+  /// Whether the session driving `window` holds work, or is still resolving
+  /// whether it will. Windows with no registered controller (untracked AppKit
+  /// windows, tests without a controller) report false and stay sweepable.
+  private func windowHoldsLiveWork(_ window: NSWindow) -> Bool {
+    guard let controller = controllersByWindow[ObjectIdentifier(window)]?.controller else {
+      return false
+    }
+    return controller.hasEditableBuffer || controller.isAwaitingLaunchRestore
+  }
+
+  /// Files `window` as a content window even though no document identity backs
+  /// it. Used when a window adopts a recovery draft: the work is real, the URL
+  /// is not, and only the session knows.
+  func markWindowAsContent(_ window: NSWindow) {
+    markContentWindow(window)
+  }
+
+  /// Re-runs the launcher sweep after a window's launch decision settles, so a
+  /// window protected while restoring is re-evaluated once the answer is known.
+  func reconcileLaunchersAfterRestoreSettled() {
+    reconcileLauncherWindows()
   }
 
   private func isLiveApplicationWindow(_ window: NSWindow) -> Bool {

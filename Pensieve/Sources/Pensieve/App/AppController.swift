@@ -64,6 +64,13 @@ final class AppController: ObservableObject {
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
+  /// Marks this window as holding content the sweep must not reap. Called when
+  /// the window adopts a recovery draft, which carries no URL for the accessor
+  /// to publish. Unwired (tests, headless) is harmless: nothing sweeps there.
+  var requestPromoteWindowToContent: (() -> Void)?
+  /// Re-runs the launcher sweep once this window's launch decision settles, so
+  /// protecting an in-flight restore delays the reap instead of cancelling it.
+  var requestLauncherSweepReconcile: (() -> Void)?
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -117,9 +124,29 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Whether this window's session holds work the user could lose — an
+  /// untitled draft or a loaded document. The window registry's launcher sweep
+  /// asks this, because registry bookkeeping alone cannot see it: a recovered
+  /// crash draft has no URL, so the accessor never publishes a document
+  /// identity and the window would look like an empty launcher forever.
+  var hasEditableBuffer: Bool { appState.documentSession.hasEditableBuffer }
+
+  /// True until this window's launch-time restore resolves. A window waiting
+  /// for its document must not be reaped as an "empty launcher" just because
+  /// the document has not reached the accessor yet — the sweep fires on a
+  /// timer and would otherwise win that race on a slow workspace.
+  private(set) var isAwaitingLaunchRestore = true
+
   func start(restoringWorkspace: Bool = true) {
     guard !didStart else { return }
     didStart = true
+    // Whatever this window turns out to be, its launch decision is settled by
+    // the time `start` returns. Clearing the flag re-runs the sweep, so a
+    // genuinely empty launcher is still reaped — just one pass later.
+    defer {
+      isAwaitingLaunchRestore = false
+      requestLauncherSweepReconcile?()
+    }
 
     // Warm the index OFF the main thread. Opening the GRDB pool + running migrations (incl. the FTS5
     // content-link rebuild) on main here was the launch-time beachball; the workspace-restore path
@@ -134,6 +161,11 @@ final class AppController: ObservableObject {
     // document the window was opened for.
     guard restoringWorkspace else { return }
     if documentStore.restoreRecoveredDraft(into: appState) {
+      // This window now holds unsaved work with no URL behind it, so the
+      // registry cannot classify it from the document identity the accessor
+      // publishes — it would stay a "launcher" and the sweep would reap it.
+      // Promote it explicitly, at the moment of adoption.
+      requestPromoteWindowToContent?()
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
