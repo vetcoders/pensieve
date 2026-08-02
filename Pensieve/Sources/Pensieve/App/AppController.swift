@@ -669,6 +669,12 @@ final class AppController: ObservableObject {
     // work) must leave the index exactly as the still-running session expects it. Bounded so a long
     // in-flight reindex write cannot beachball the quit.
     indexDatabase.checkpointOnTerminate()
+    // This pass has SETTLED, so the AppKit terminate hook must not run a second
+    // one. ⌘Q reaches that hook through its own `NSApplication.terminate(_:)`
+    // moments from now; the latch is one-shot and covers only that request.
+    // Reached only on consent — a Cancel returned above and left it disarmed, so
+    // the next terminate request still asks.
+    documentWindowRegistry.armTerminationPassLatch()
     return true
   }
 
