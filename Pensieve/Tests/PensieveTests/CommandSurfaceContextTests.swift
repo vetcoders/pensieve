@@ -155,6 +155,152 @@ final class CommandSurfaceContextTests: XCTestCase {
     XCTAssertTrue(resolved?.controller === fallbackController)
   }
 
+  // MARK: - Native tab switches
+
+  /// Both triggers filter by window identity: a key transition belonging to a
+  /// DIFFERENT window must never make this root adopt.
+  @MainActor
+  func testARootIgnoresAnotherWindowsKeyTransition() {
+    let mine = Self.makeParkedWindow()
+    let other = Self.makeParkedWindow()
+    defer { mine.close(); other.close() }
+
+    XCTAssertFalse(CommandSurfaceAdoption.shouldAdopt(rootWindow: mine, keyWindow: other))
+    XCTAssertTrue(CommandSurfaceAdoption.shouldAdopt(rootWindow: mine, keyWindow: mine))
+  }
+
+  /// A root that does not yet know its own window cannot adopt — the accessor
+  /// callback is what supplies it, and it is async.
+  @MainActor
+  func testARootWithoutItsWindowYetCannotAdopt() {
+    let window = Self.makeParkedWindow()
+    defer { window.close() }
+
+    XCTAssertFalse(CommandSurfaceAdoption.shouldAdopt(rootWindow: nil, keyWindow: window))
+    XCTAssertFalse(CommandSurfaceAdoption.shouldAdopt(rootWindow: window, keyWindow: nil))
+  }
+
+  /// THE CROSS-WIRE PIN. The f_013 constellation: the user leaves a file-backed
+  /// tab for a second tab in the same group. The second tab's window becomes
+  /// key BEFORE its root's (coalesced, async) accessor reports that window, so
+  /// the key notification is filtered out; the accessor lands a moment later.
+  ///
+  /// With only the key-notification trigger the second tab never adopts. Focus
+  /// then goes silent — routine during native tab switches and menu tracking —
+  /// and `CommandTargetResolution` falls back to the LAST-adopted pair, which
+  /// is still the first tab. A model-side edit taken while the user looks at
+  /// the second tab therefore lands in the FIRST tab's session: the buffer the
+  /// chrome is not showing.
+  @MainActor
+  func testAnEditAfterATabSwitchLandsInTheTabTheUserIsLookingAt() {
+    let surface = CommandSurfaceContext()
+
+    let leftBehind = AppState()
+    let leftBehindController = AppController(appState: leftBehind)
+    leftBehind.documentSession.text = "left-behind"
+
+    let lookedAt = AppState()
+    let lookedAtController = AppController(appState: lookedAt)
+    lookedAt.documentSession.createUntitled()
+    lookedAt.documentSession.text = "looked-at"
+
+    let leftBehindWindow = Self.makeParkedWindow()
+    let lookedAtWindow = Self.makeParkedWindow()
+    defer { leftBehindWindow.close(); lookedAtWindow.close() }
+
+    // The first tab is key and owns the surface.
+    Self.windowDidBecomeKey(
+      leftBehindWindow, surface: surface, appState: leftBehind,
+      controller: leftBehindController, rootWindow: leftBehindWindow)
+    XCTAssertTrue(surface.appState === leftBehind)
+
+    // The user switches. The new tab's window becomes key, but its root has not
+    // yet been told which window is its own, so the identity filter drops it.
+    Self.windowDidBecomeKey(
+      lookedAtWindow, surface: surface, appState: lookedAt,
+      controller: lookedAtController, rootWindow: nil)
+    // ...and the notification never fires again. The ONLY remaining chance to
+    // adopt is the accessor resolving this root's window while it is key.
+    Self.accessorResolvedWindow(
+      lookedAtWindow, surface: surface, appState: lookedAt,
+      controller: lookedAtController, keyWindow: lookedAtWindow)
+
+    // Focus is extinguished, so the menu resolves through the fallback.
+    guard
+      let target = CommandTargetResolution.resolve(
+        focusedState: Optional<AppState>.none,
+        focusedController: Optional<AppController>.none,
+        fallbackState: surface.appState,
+        fallbackController: surface.controller)
+    else {
+      return XCTFail("the command surface resolved no target at all")
+    }
+
+    // A model-side edit, exactly as a menu/paste action performs it.
+    target.state.documentSession.text = "pasted"
+    target.state.documentSession.isDirty = true
+
+    XCTAssertEqual(
+      lookedAt.documentSession.text, "pasted",
+      "the edit must land in the session whose tab the user is looking at")
+    XCTAssertEqual(
+      leftBehind.documentSession.text, "left-behind",
+      "the tab the user navigated away from must not receive the edit")
+    XCTAssertFalse(
+      leftBehind.documentSession.isDirty,
+      "the left-behind session must not be dirtied by another tab's edit")
+  }
+
+  /// Trigger 1, mirroring `.onReceive(didBecomeKeyNotification)`: a key
+  /// transition, filtered against the window this root currently knows about.
+  @MainActor
+  private static func windowDidBecomeKey(
+    _ keyWindow: NSWindow,
+    surface: CommandSurfaceContext,
+    appState: AppState,
+    controller: AppController,
+    rootWindow: NSWindow?
+  ) {
+    guard CommandSurfaceAdoption.shouldAdopt(rootWindow: rootWindow, keyWindow: keyWindow) else {
+      return
+    }
+    surface.adopt(appState: appState, controller: controller)
+  }
+
+  /// Trigger 2, mirroring `.onChange(of: currentWindow)`: the accessor finally
+  /// reports this root's window, which is checked against the window that is
+  /// key AT THAT MOMENT.
+  @MainActor
+  private static func accessorResolvedWindow(
+    _ rootWindow: NSWindow,
+    surface: CommandSurfaceContext,
+    appState: AppState,
+    controller: AppController,
+    keyWindow: NSWindow?
+  ) {
+    guard CommandSurfaceAdoption.shouldAdopt(rootWindow: rootWindow, keyWindow: keyWindow) else {
+      return
+    }
+    surface.adopt(appState: appState, controller: controller)
+  }
+
+  /// Parked far offscreen and fully transparent: these windows exist only as
+  /// identities for the adoption rule, and must never flash on a display.
+  @MainActor
+  private static func makeParkedWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: -9000, y: -9000, width: 200, height: 120),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: true)
+    window.alphaValue = 0
+    // This initializer defaults to `isReleasedWhenClosed = true`; the `close()`
+    // in each test's `defer` would then over-release an ARC-owned window and
+    // segfault the whole test process.
+    window.isReleasedWhenClosed = false
+    return window
+  }
+
   func testNoRootAtAllResolvesToNothing() {
     let resolved = CommandTargetResolution.resolve(
       focusedState: Optional<NSObject>.none,
