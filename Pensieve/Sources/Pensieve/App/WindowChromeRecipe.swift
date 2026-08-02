@@ -192,6 +192,133 @@ enum WindowChromeRecipe {
     return corrected
   }
 
+  // MARK: - Native tab bar
+
+  /// Light or dark, with the vibrant variants folded onto the two answers that
+  /// matter. `VibrantDark` and `DarkAqua` are the same SIDE — comparing raw
+  /// names would call them a disagreement and rewrite a tab bar that was already
+  /// right, taking its vibrancy with it.
+  static func appearancePolarity(_ appearance: NSAppearance?) -> NSAppearance.Name? {
+    appearance?.bestMatch(from: [.aqua, .darkAqua])
+  }
+
+  /// The side the whole window is on, as the tab bar has to agree with it.
+  ///
+  /// Taken from the SKIN first and from the window only for the adaptive skins,
+  /// which name no appearance of their own. Skin-first is not a stylistic choice:
+  /// a skin switch is one of the moments the tab bar is rebuilt, and during it
+  /// `window.effectiveAppearance` can still be reporting the outgoing half — so
+  /// reading the window there would pin the tab bar to the skin being left.
+  static func tabBarPolarity(on window: NSWindow, for theme: PensieveTheme) -> NSAppearance.Name? {
+    appearancePolarity(windowAppearance(for: theme))
+      ?? appearancePolarity(window.effectiveAppearance)
+  }
+
+  /// The same side as `polarity`, keeping whatever vibrancy the view had chosen
+  /// for itself. A glass node that picked `VibrantLight` is put back to
+  /// `VibrantDark`, not to a flat `DarkAqua` that would drop the material.
+  static func matchingAppearance(
+    for polarity: NSAppearance.Name, preservingVibrancyOf current: NSAppearance?
+  ) -> NSAppearance? {
+    let vibrant = current?.name == .vibrantLight || current?.name == .vibrantDark
+    switch polarity {
+    case .darkAqua: return NSAppearance(named: vibrant ? .vibrantDark : .darkAqua)
+    default: return NSAppearance(named: vibrant ? .vibrantLight : .aqua)
+    }
+  }
+
+  /// Every view inside the window's NATIVE TAB BAR that carries an appearance of
+  /// its OWN — the self-selectors, and the only nodes worth inspecting.
+  ///
+  /// The tab bar is not part of the toolbar. It is a separate
+  /// `NSTitlebarAccessoryViewController` AppKit builds and owns, so
+  /// `toolbarColorScheme` — the declaration `bdbb816` added to stop the toolbar
+  /// platters reading the paper — provably does not reach it. Measured on a
+  /// two-tab probe (window `darkAqua`, split dark|white content):
+  ///
+  ///   accessory[0] NSTitlebarAccessoryViewController (layout .bottom)
+  ///     NSTabBar                              set=—            eff=VibrantDark
+  ///       NSTabBarTrackView                   set=—            eff=VibrantDark
+  ///         NSLessExpensiveSubduedGlassEffectView  set=VibrantDark  ← SET
+  ///           …
+  ///             NSTabButton                   set=—            eff=VibrantDark
+  ///               NSGlassEffectView           set=—            eff=VibrantDark
+  ///
+  /// and declaring an appearance on the ACCESSORY VIEW does not reach the node
+  /// that set its own: with the accessory declared `aqua`, `NSTabBar` and
+  /// `NSTabBarTrackView` moved to `Aqua` while the glass view stayed on its own
+  /// `VibrantDark`. An ancestor declaration is therefore not a fix here, which is
+  /// the difference from the toolbar — there AppKit offered a supported lever,
+  /// and for the tab bar it offers none.
+  static func tabBarSelfSelectingViews(in window: NSWindow) -> [NSView] {
+    guard window.tabGroup?.isTabBarVisible == true else { return [] }
+
+    var found: [NSView] = []
+    func collect(from view: NSView) {
+      if view.appearance != nil { found.append(view) }
+      for subview in view.subviews { collect(from: subview) }
+    }
+    for controller in window.titlebarAccessoryViewControllers {
+      guard hostsTabBar(controller.view) else { continue }
+      collect(from: controller.view)
+    }
+    return found
+  }
+
+  private static func hostsTabBar(_ view: NSView) -> Bool {
+    if String(describing: type(of: view)) == "NSTabBar" { return true }
+    return view.subviews.contains(where: hostsTabBar)
+  }
+
+  /// Puts any tab-bar glass that has self-selected the WRONG SIDE back on the
+  /// window's. Returns `true` when something had to be corrected.
+  ///
+  /// The reported symptom is a native tab pill positioned over the preview
+  /// column rendering light/cream on a dark window while its neighbour over the
+  /// editor column stays dark — the same defect `bdbb816` measured on the
+  /// toolbar platters, on a surface that fix could not reach. It is TRANSIENT
+  /// (both pills measured dark at 14:50, the right one light at 14:51:49),
+  /// because the tab bar is rebuilt out from under any one-shot pin: measured on
+  /// the probe, EVERY window in the group carries its own accessory, and
+  /// selecting the other tab moves the populated tab bar to that window and
+  /// hands it back a glass node with NO appearance of its own — free to
+  /// self-select from whatever is composited beneath it.
+  ///
+  /// Only nodes that disagree in POLARITY are written, so a tab bar that is
+  /// already on the right side is not touched at all and keeps its exact
+  /// material. Measured on the probe: flipping the three glass nodes to
+  /// `VibrantLight` costs ONE repair pass of three writes, and the next 19
+  /// passes correct nothing — the write round-trips, so a compare-and-set
+  /// converges here. That is what makes this safe to re-assert from a window
+  /// update cycle, unlike `NSWindow.appearance` on a scene-owned window, which
+  /// does not round-trip and whose per-pass rewrite is the 99% CPU start-up hang
+  /// `assertedAppearances` exists to prevent. These are AppKit's own titlebar
+  /// accessory views; no SwiftUI scene owns them and none writes an answer back.
+  ///
+  /// `tabBarViews` exists so the polarity rules can be driven against a known
+  /// view shape. It defaults to the real walk, and the end-to-end pin
+  /// (`testARealTabGroupsFlippedGlassIsRepairedThroughAssertWindowChrome`) goes
+  /// through `assertWindowChrome` with the default, so the discovery half is
+  /// never left unproven by the seam.
+  @discardableResult
+  static func assertTabBarAppearance(
+    on window: NSWindow, for theme: PensieveTheme, tabBarViews: [NSView]? = nil
+  ) -> Bool {
+    guard let polarity = tabBarPolarity(on: window, for: theme) else { return false }
+    var corrected = false
+
+    for view in tabBarViews ?? tabBarSelfSelectingViews(in: window) {
+      guard appearancePolarity(view.appearance) != polarity else { continue }
+      guard
+        let wanted = matchingAppearance(for: polarity, preservingVibrancyOf: view.appearance)
+      else { continue }
+      view.appearance = wanted
+      corrected = true
+    }
+
+    return corrected
+  }
+
   /// The window appearance a skin demands: its fixed light/dark, or `nil` for
   /// the adaptive skins, which follow the system setting.
   static func windowAppearance(for theme: PensieveTheme) -> NSAppearance? {
@@ -375,6 +502,12 @@ enum WindowChromeRecipe {
       corrected = true
     }
 
+    // The native tab bar is chrome too, and it is the one surface the SwiftUI
+    // scheme declaration cannot reach at all — see `assertTabBarAppearance`.
+    if assertTabBarAppearance(on: window, for: theme) {
+      corrected = true
+    }
+
     return corrected
   }
 
@@ -544,15 +677,21 @@ private struct SkinAppearanceModifier: ViewModifier {
 ///   * every window update cycle — the same `NSWindow.didUpdateNotification`
 ///     repair `ToolbarOverflowController` runs, for the same measured reason.
 ///
-/// The update-cycle trigger deliberately re-asserts the CHIP TINT ONLY, not the
-/// whole chrome. `selectedSegmentBezelColor` round-trips faithfully (measured:
-/// 45 consecutive passes correct once and stay silent, and the write does not
-/// re-drive the SwiftUI graph), so a per-update compare-and-set converges. The
-/// window appearance does not round-trip on a scene-owned window, and driving
-/// that off a notification the window itself posts is how a write loop becomes
-/// the 99% CPU start-up hang `assertedAppearances` exists to prevent. The
-/// appearance and the titlebar backing therefore stay on the bounded SwiftUI
-/// passes, exactly where the editor already drives them.
+/// The update-cycle trigger deliberately re-asserts the CHIP TINT and the TAB
+/// BAR ONLY, not the whole chrome. Both round-trip faithfully — measured, 45
+/// consecutive passes for `selectedSegmentBezelColor` and 19 for the tab bar's
+/// glass, correcting once and staying silent after — so a per-update
+/// compare-and-set converges, and neither write re-drives the SwiftUI graph.
+/// Both are also the two surfaces AppKit rebuilds BETWEEN SwiftUI passes (a
+/// toolbar re-bridge, a tab selection), which is exactly what a pass-driven
+/// trigger cannot catch.
+///
+/// The window appearance is the opposite case and stays off this trigger: it
+/// does not round-trip on a scene-owned window, and driving that off a
+/// notification the window itself posts is how a write loop becomes the 99% CPU
+/// start-up hang `assertedAppearances` exists to prevent. The appearance and the
+/// titlebar backing therefore stay on the bounded SwiftUI passes, exactly where
+/// the editor already drives them.
 struct WindowChromeSink: NSViewRepresentable {
   let theme: PensieveTheme
 
@@ -577,6 +716,7 @@ struct WindowChromeSink: NSViewRepresentable {
         MainActor.assumeIsolated {
           guard let self, let window = self.window else { return }
           WindowChromeRecipe.assertToolbarChipTint(on: window, for: self.theme)
+          WindowChromeRecipe.assertTabBarAppearance(on: window, for: self.theme)
         }
       }
     }
