@@ -10,6 +10,7 @@ final class DocumentWindowModel {
   private static let asciiSafeTablesKey = "Pensieve.asciiSafeTables"
   private static let aiAutocompleteEnabledKey = "Pensieve.aiAutocompleteEnabled"
   private static let scrollSyncEnabledKey = "Pensieve.scrollSyncEnabled"
+  private static let showAllFilesInSidebarKey = "Pensieve.showAllFilesInSidebar"
   private let defaults: UserDefaults
 
   var selectedDocumentID: DocumentRef.ID?
@@ -46,6 +47,20 @@ final class DocumentWindowModel {
   /// (the moment a document loads, `documentIdentity` is non-nil and the real
   /// `persistentID` takes over), so no unbounded empty-window records accrue.
   private let windowInstanceID = UUID()
+
+  /// Counts the conscious closes this window has performed (File > Close, the
+  /// sidebar's close, the tab "×" answering the save question). Restoration
+  /// flows capture it when they start and refuse to select a document if it
+  /// moved while they were walking the workspace — no restoration may reverse a
+  /// close the user asked for. A counter rather than a flag: a flag would also
+  /// block the NEXT open the user performs, a generation only blocks the flow
+  /// that was already in flight.
+  private(set) var documentCloseGeneration: Int = 0
+
+  /// Records that this window's document was closed on purpose.
+  func noteConsciousDocumentClose() {
+    documentCloseGeneration &+= 1
+  }
 
   var aiDocumentID: String {
     documentIdentity?.persistentID ?? "window:\(windowInstanceID.uuidString.lowercased())"
@@ -167,6 +182,14 @@ final class DocumentWindowModel {
   }
   var previewRefreshToken: Int = 0
   var sidebarVisible: Bool = true
+  /// Whether non-markdown ("foreign") files show up greyed-out in the sidebar.
+  /// Off by default: on a real vault the scanner-emitted `.foreignFile` nodes
+  /// are visual noise at scale, so they stay hidden until explicitly requested.
+  var showAllFilesInSidebar: Bool {
+    didSet {
+      defaults.set(showAllFilesInSidebar, forKey: Self.showAllFilesInSidebarKey)
+    }
+  }
   var lastError: String?
 
   init(defaults: UserDefaults = .standard) {
@@ -195,6 +218,11 @@ final class DocumentWindowModel {
       self.scrollSyncEnabled = false
     } else {
       self.scrollSyncEnabled = defaults.bool(forKey: Self.scrollSyncEnabledKey)
+    }
+    if defaults.object(forKey: Self.showAllFilesInSidebarKey) == nil {
+      self.showAllFilesInSidebar = false
+    } else {
+      self.showAllFilesInSidebar = defaults.bool(forKey: Self.showAllFilesInSidebarKey)
     }
     // Seed the metadata mirrors from the initial (empty) session. didSet does
     // not fire during init, so prime them explicitly to stay consistent.

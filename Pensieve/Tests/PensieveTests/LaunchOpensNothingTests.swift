@@ -112,13 +112,66 @@ final class LaunchOpensNothingTests: XCTestCase {
       "a working set of two files must come back as two open documents")
   }
 
+  /// ONE FILE IS ONE TAB, however many times the working set names it.
+  ///
+  /// The operator's `fileBookmarks` held fifteen entries for twelve files —
+  /// three of them recorded twice — and the restore turns each entry into a
+  /// request for a window.
+  ///
+  /// This leg passes on the build that HAS the duplicated key, because
+  /// `prepareWorkspaceShell` de-duplicates the live list before the reopen ever
+  /// sees it; the defect it belongs to lives further down, in the store that
+  /// kept the duplicate across launches (`StartupRestoreWorkingSetHygieneTests`)
+  /// and in the reopen's own habit of trusting the list it was handed. It is
+  /// kept as the CONTRACT pin for the whole path: exactly one of those three
+  /// layers has to be wrong for the user to get two tabs on one document, and
+  /// this is the only place that would notice.
+  func testAWorkingSetThatNamesOneFileTwiceComesBackAsOneDocument() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    let repeatedURL = try harness.writeLooseNote(named: "repeated.md")
+    try harness.openWorkspace()
+    try harness.persistWorkingSet([keptURL, repeatedURL, repeatedURL])
+
+    let relaunched = try harness.relaunch()
+
+    XCTAssertEqual(
+      relaunched.appState.openFiles.map(\.url.standardizedFileURL), [keptURL, repeatedURL],
+      "the duplicate reached the working set, and every ref in it is a window the launch asks"
+        + " for")
+    XCTAssertEqual(
+      relaunched.registry.openDocuments.count, 2,
+      "one document came back as two tabs")
+  }
+
+  /// THE TRASH IS DEAD. A file the user threw away still exists on disk and its
+  /// bookmark still resolves, so nothing in the restore's existence checks
+  /// stopped it — the launch faithfully reopened a document that is, from the
+  /// user's side, deleted.
+  func testAFileTheUserThrewAwayDoesNotComeBack() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    let trashedURL = try harness.writeTrashedNote(named: "thrown-away.md")
+    try harness.openWorkspace()
+    try harness.persistWorkingSet([keptURL, trashedURL])
+
+    let relaunched = try harness.relaunch()
+
+    XCTAssertEqual(
+      relaunched.appState.openFiles.map(\.url.standardizedFileURL), [keptURL],
+      "a file in the Trash came back into the working set")
+    XCTAssertEqual(
+      relaunched.registry.openDocuments.map(\.identity), [.file(keptURL)],
+      "the launch reopened a document the user had thrown away")
+  }
+
   /// CLOSING THE LAST DOCUMENT MUST CLOSE IT.
   ///
   /// A native window close deliberately LEAVES the file in the working set —
   /// only "Close from Open Files" retires it — and the registry re-opens a
   /// launcher after the last document window goes, so the app is never left
   /// windowless. That replacement launcher's root runs the very same
-  /// `start(restoringWorkspace: true)` as the launch one did. With the reopen
+  /// `start(intent: .coldLaunch)` as the launch one did. With the reopen
   /// gated per controller, the launcher immediately reloaded the file the user
   /// had just closed: the last document could not be closed at all without
   /// first removing its Open Files row.
@@ -144,6 +197,46 @@ final class LaunchOpensNothingTests: XCTestCase {
     XCTAssertTrue(
       replacement.registry.openDocuments.isEmpty,
       "the document the user just closed came straight back as an open document row")
+  }
+
+  /// RESTORE-ON-LAUNCH OFF MEANS THE FILES STAY SHUT — including the ones the
+  /// launch reopens through the WINDOW REGISTRY, which is the half the user
+  /// actually sees. The setting promises "no workspace, no open files", and the
+  /// working set is restored by a different step from the workspace, so the
+  /// control leg above (`testAFileLeftOpenAtQuitStillComesBack`) is the only
+  /// thing that makes this measurable at all.
+  ///
+  /// The Dock-reopen launcher is the trap, and it is why `start` claims the
+  /// application's one startup restore BEFORE it consults the setting. The gate
+  /// fires on `.coldLaunch` only — by design, so the Dock still rebuilds the
+  /// workspace — but the reopen behind it is gated on the startup CLAIM, not on
+  /// the intent. Take the claim after the gate and a declining cold launch
+  /// leaves it unclaimed for the next launcher to pick up: click the Dock icon
+  /// and every file the user had just turned off comes back.
+  func testColdLaunchWithRestoreOffReopensNoFilesInAnyWindow() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    try harness.openWorkspace()
+
+    let session = AppState()
+    XCTAssertNotNil(harness.manager.registerOpenFile(url: keptURL, into: session))
+    harness.launchSettings.restoreSessionOnLaunch = false
+
+    let launched = try harness.relaunch()
+    XCTAssertNil(
+      launched.appState.documentSession.url,
+      "a cold launch with restore off must open no document")
+    XCTAssertTrue(
+      launched.registry.openDocuments.isEmpty,
+      "the file came back as an open document despite the setting")
+
+    let dockLauncher = harness.openDockReopenLauncher()
+    XCTAssertNil(
+      dockLauncher.appState.documentSession.url,
+      "the Dock-reopen launcher inherited the startup reopen the user had turned off")
+    XCTAssertTrue(
+      dockLauncher.registry.openDocuments.isEmpty,
+      "clicking the Dock icon brought back the files the setting had just declined")
   }
 
   /// The measurement behind "first is not most recent", kept as a pin because it
@@ -174,7 +267,11 @@ final class LaunchOpensNothingTests: XCTestCase {
     let root = container.appendingPathComponent("Workspace", isDirectory: true)
     let support = container.appendingPathComponent("Support", isDirectory: true)
     let loose = container.appendingPathComponent("Loose", isDirectory: true)
-    for directory in [root, support, loose] {
+    // A Trash of this fixture's own. The real one is never touched, and the
+    // product rule is about the LOCATION — `~/.Trash`, a volume's `.Trashes` —
+    // not about one particular path.
+    let trash = container.appendingPathComponent(".Trash", isDirectory: true)
+    for directory in [root, support, loose, trash] {
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
     addTeardownBlock {
@@ -187,7 +284,10 @@ final class LaunchOpensNothingTests: XCTestCase {
       root: root,
       support: support,
       loose: loose,
+      trash: trash,
       defaults: defaults,
+      launchSettings: LaunchSettings(
+        defaults: makeEphemeralDefaults(prefix: "PensieveLaunchOpensNothingLaunchSettings")),
       manager: makeManager(support: support, bookmarkStore: bookmarkStore),
       makeManager: makeManager,
       makeStore: makeStore
@@ -234,7 +334,11 @@ private final class LaunchHarness {
   let root: URL
   let support: URL
   let loose: URL
+  let trash: URL
   let defaults: UserDefaults
+  /// The restore-on-launch preference this simulated process launches under.
+  /// Its own defaults suite, so flipping it never reaches the workspace keys.
+  let launchSettings: LaunchSettings
   let manager: FolderManager
   let makeManager: (URL, BookmarkStore) -> FolderManager
   let makeStore: (URL, BookmarkStore) -> DocumentStore
@@ -253,7 +357,9 @@ private final class LaunchHarness {
     root: URL,
     support: URL,
     loose: URL,
+    trash: URL,
     defaults: UserDefaults,
+    launchSettings: LaunchSettings,
     manager: FolderManager,
     makeManager: @escaping (URL, BookmarkStore) -> FolderManager,
     makeStore: @escaping (URL, BookmarkStore) -> DocumentStore
@@ -261,7 +367,9 @@ private final class LaunchHarness {
     self.root = root
     self.support = support
     self.loose = loose
+    self.trash = trash
     self.defaults = defaults
+    self.launchSettings = launchSettings
     self.manager = manager
     self.makeManager = makeManager
     self.makeStore = makeStore
@@ -286,6 +394,24 @@ private final class LaunchHarness {
   @discardableResult
   func writeLooseNote(named name: String) throws -> URL {
     try write(name: name, in: loose)
+  }
+
+  /// A loose note the user then threw away: still on disk, still resolvable
+  /// from its bookmark, and — as far as Pensieve is concerned — gone.
+  @discardableResult
+  func writeTrashedNote(named name: String) throws -> URL {
+    try write(name: name, in: trash)
+  }
+
+  /// Seeds the persisted working set the way an older build could leave it:
+  /// one file recorded twice. The key is a cross-process contract, so a pin
+  /// for the state it can be found in has to name it.
+  func persistWorkingSet(_ urls: [URL]) throws {
+    let bookmarks = try urls.map {
+      try $0.bookmarkData(
+        options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+    defaults.set(bookmarks, forKey: "Pensieve.workspace.fileBookmarks")
   }
 
   private func write(name: String, in directory: URL) throws -> URL {
@@ -329,9 +455,9 @@ private final class LaunchHarness {
     // The window the app starts in, registered as the launcher exactly the way
     // a cold start does; every LATER window comes from the factory.
     let launcherWindow = makeWindow()
-    registry.makeDocumentWindow = { _ in launcherWindow }
-    registry.openLauncherWindow()
-    registry.makeDocumentWindow = { [weak self] _ in self?.makeWindow() }
+    registry.makeDocumentWindow = { _, _ in launcherWindow }
+    registry.openLauncherWindow(intent: .coldLaunch)
+    registry.makeDocumentWindow = { [weak self] _, _ in self?.makeWindow() }
 
     return adoptRootView(for: launcherWindow)
   }
@@ -339,7 +465,7 @@ private final class LaunchHarness {
   /// The user closing the last document window. AppKit's close reaches the
   /// registry, which — so the app is never left windowless — re-opens a
   /// launcher through the factory; that launcher's root then runs the same
-  /// `start(restoringWorkspace: true)` as the launch one. Returns the
+  /// `start(intent: .coldLaunch)` as the launch one. Returns the
   /// REPLACEMENT launcher's session.
   func closeWindowAdoptingTheReplacementLauncher(_ window: NSWindow) -> RelaunchedSession {
     guard let registry else {
@@ -357,10 +483,20 @@ private final class LaunchHarness {
     return adoptRootView(for: replacement)
   }
 
+  /// The user clicking the Dock icon later in the SAME process, with the
+  /// workspace already launched. `DocumentWindowRegistry` puts that launcher
+  /// back on `.dockReopen`, which is a different intent from the launch — so it
+  /// is the window that would inherit an unclaimed startup restore.
+  func openDockReopenLauncher() -> RelaunchedSession {
+    adoptRootView(for: makeWindow(), intent: .dockReopen)
+  }
+
   /// Everything `DocumentWindowRootView` does for one window: build the
   /// session and controller, publish the controller to the registry, run the
   /// launch decision, and report back what the window ended up holding.
-  private func adoptRootView(for window: NSWindow) -> RelaunchedSession {
+  private func adoptRootView(for window: NSWindow, intent: LaunchIntent = .coldLaunch)
+    -> RelaunchedSession
+  {
     guard let registry, let bookmarkStore, let startupRestore else {
       preconditionFailure("relaunch() first: there is no launched process to build a window in")
     }
@@ -371,13 +507,14 @@ private final class LaunchHarness {
       documentStore: makeStore(support, bookmarkStore),
       indexDatabase: IndexDatabase(
         databaseURL: support.appendingPathComponent("launch-\(UUID().uuidString).db")),
+      launchSettings: launchSettings,
       documentWindowRegistry: registry,
       startupRestore: startupRestore
     )
     controller.requestOpenDocumentWindow = { registry.open($0) }
     registry.registerController(controller, for: window)
 
-    controller.start(restoringWorkspace: true)
+    controller.start(intent: intent)
 
     // What SwiftUI's `DocumentWindowAccessor` publishes for this window,
     // spelled out: a headless test has no render pass, so nothing else would

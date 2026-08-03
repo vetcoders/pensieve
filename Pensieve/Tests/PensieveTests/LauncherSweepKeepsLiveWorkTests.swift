@@ -28,15 +28,21 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     let draftWindow = harness.openLauncherWindow()
 
     // The draft lands in the launcher window through the real adoption path:
-    // real work, no URL behind it, so only the explicit promotion can reclassify
-    // the window out of "launcher".
+    // the user picking it out of the launcher's Recovered Drafts section, which
+    // is the ONLY adoption route left (nothing claims a draft at launch any
+    // more). Real work, no URL behind it, so only the explicit promotion can
+    // reclassify the window out of "launcher".
     harness.stashRecoveryDraft(text: "unsaved crash draft")
     let draft = harness.attachController(to: draftWindow)
     let registry = harness.registry
     draft.controller.requestPromoteWindowToContent = {
       registry.markWindowAsContent(draftWindow)
     }
-    draft.controller.start(restoringWorkspace: true)
+    draft.controller.start(intent: .coldLaunch)
+    let recovered = try XCTUnwrap(
+      draft.controller.recoveredDrafts.first,
+      "the launcher must LIST the stashed draft before the user can open it")
+    XCTAssertTrue(draft.controller.openRecoveredDraft(recovered))
     XCTAssertEqual(
       draft.appState.documentSession.text, "unsaved crash draft",
       "the window under test never adopted the draft, so the pin proves nothing")
@@ -82,7 +88,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     // nothing at all.
     let emptyLauncher = harness.openLauncherWindow()
     let launcher = harness.attachController(to: emptyLauncher)
-    launcher.controller.start(restoringWorkspace: true)
+    launcher.controller.start(intent: .coldLaunch)
     XCTAssertFalse(
       launcher.appState.documentSession.hasEditableBuffer,
       "this launcher picked something up, so it is not the empty-launcher control leg")
@@ -113,7 +119,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     XCTAssertFalse(harness.wasClosed(launcherWindow))
 
     // The restore settles with nothing to show and asks for another sweep.
-    launcher.controller.start(restoringWorkspace: true)
+    launcher.controller.start(intent: .coldLaunch)
     harness.fireSweep()
 
     XCTAssertTrue(
@@ -147,7 +153,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     let importing = harness.attachController(to: importWindow)
 
     // What `DocumentWindowRootView.openInitialDocument` does for that tab.
-    importing.controller.start(restoringWorkspace: false)
+    importing.controller.start(intent: .explicitDocument)
     importing.controller.openFileInCurrentWindow(url: sourceURL)
     XCTAssertFalse(
       importing.appState.documentSession.hasEditableBuffer,
@@ -273,8 +279,8 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
     func openLauncherWindow() -> NSWindow {
       let window = Self.makeWindow()
       journal.liveWindows.append(window)
-      registry.makeDocumentWindow = { _ in window }
-      registry.openLauncherWindow()
+      registry.makeDocumentWindow = { _, _ in window }
+      registry.openLauncherWindow(intent: .coldLaunch)
       registry.makeDocumentWindow = nil
       return window
     }
@@ -297,7 +303,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
       let window = Self.makeWindow(title: url.lastPathComponent)
       journal.liveWindows.append(window)
       journal.canMutateTabs = true
-      registry.makeDocumentWindow = { _ in window }
+      registry.makeDocumentWindow = { _, _ in window }
       registry.open(DocumentRef(id: url, isAdHoc: true))
       registry.makeDocumentWindow = nil
       journal.canMutateTabs = false

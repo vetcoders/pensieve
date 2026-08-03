@@ -35,13 +35,15 @@ struct FlattenedWorkspaceRow: Identifiable, Hashable {
 /// require re-flattening.
 func flattenWorkspaceTree(
   _ roots: [WorkspaceNode],
-  expandedNodeIDs: Set<WorkspaceNode.ID>
+  expandedNodeIDs: Set<WorkspaceNode.ID>,
+  includeForeignFiles: Bool = false
 ) -> [FlattenedWorkspaceRow] {
   var rows: [FlattenedWorkspaceRow] = []
   appendFlattenedWorkspaceRows(
     roots,
     depth: 0,
     expandedNodeIDs: expandedNodeIDs,
+    includeForeignFiles: includeForeignFiles,
     into: &rows
   )
   return rows
@@ -51,9 +53,17 @@ private func appendFlattenedWorkspaceRows(
   _ nodes: [WorkspaceNode],
   depth: Int,
   expandedNodeIDs: Set<WorkspaceNode.ID>,
+  includeForeignFiles: Bool,
   into rows: inout [FlattenedWorkspaceRow]
 ) {
   for node in nodes {
+    // Foreign (non-markdown) nodes are always emitted by the scanner so scan
+    // results stay cache-coherent regardless of the toggle; visibility is
+    // filtered here instead, which is what makes the toggle instant (no rescan).
+    if node.kind == .foreignFile, !includeForeignFiles {
+      continue
+    }
+
     if node.kind == .document {
       rows.append(FlattenedWorkspaceRow(node: node, depth: depth, isExpanded: false))
       continue
@@ -67,6 +77,7 @@ private func appendFlattenedWorkspaceRows(
       children,
       depth: depth + 1,
       expandedNodeIDs: expandedNodeIDs,
+      includeForeignFiles: includeForeignFiles,
       into: &rows
     )
   }

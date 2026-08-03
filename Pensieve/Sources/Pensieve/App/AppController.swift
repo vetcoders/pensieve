@@ -12,12 +12,13 @@ private enum DocumentImportOutcome: Sendable {
 ///
 /// Bringing the working set back is something the APPLICATION does once, when
 /// it starts — not something every window that runs
-/// `start(restoringWorkspace:)` does. Every launcher takes that same path: the
+/// `start(intent:)` does. Every launcher takes that same path: the
 /// one the registry re-opens after the last document window closes, and the one
-/// a Dock reopen makes. And a native window close deliberately LEAVES the file
-/// in the working set (only "Close from Open Files" retires it), so a
-/// per-controller gate meant closing the last document immediately reopened it
-/// — the user could not close it at all.
+/// a Dock reopen makes. And closing a WINDOW deliberately leaves its files in
+/// the working set — retiring a file is what closing the DOCUMENT does (⌘W, a
+/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — so a
+/// per-controller gate meant closing the last document window immediately
+/// reopened it: the user could not close it at all.
 ///
 /// Production shares `.shared`; a test that simulates a launch holds its own
 /// instance, because "once per process" is otherwise once per test BUNDLE.
@@ -37,11 +38,23 @@ final class ApplicationStartupRestore {
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+  /// Confirms dropping a crash draft for good. Synchronous like the folder
+  /// trash question: nothing is being torn down, so a plain alert is enough.
+  typealias DraftDiscardConfirmation = @MainActor (RecoveryDraft) -> Bool
+  /// Asks the save question for a close and reports the answer back. Async by
+  /// construction: the production surface is a window-modal sheet, which can
+  /// only answer later. Tests inject a closure that answers immediately.
+  typealias SaveChangesConfirmation =
+    @MainActor (
+      DocumentClosePrompt, DocumentSession, NSWindow?,
+      @escaping @MainActor (SaveChangesResponse) -> Void
+    ) -> Void
 
   private let appState: AppState
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let launchSettings: LaunchSettings
   private let documentWindowRegistry: DocumentWindowRegistry
   private let startupRestore: ApplicationStartupRestore
   let recentDocuments: RecentDocumentsStore
@@ -50,6 +63,18 @@ final class AppController: ObservableObject {
   private let importsFoldersInBackground: Bool
   private let workspaceSearchDebounceNanoseconds: UInt64
   private let confirmFolderTrash: FolderTrashConfirmation
+  private let confirmSaveChanges: SaveChangesConfirmation
+  private let confirmDiscardDraft: DraftDiscardConfirmation
+  /// Unhandled crash drafts, newest first — the model behind the launcher's
+  /// "Recovered Drafts" section. Empty means the section is not shown at all.
+  @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
+  /// Resolves the window the close sheet must hang off. Wired per window by
+  /// the document root view; `NSApp.keyWindow` is the fallback for scenes that
+  /// never reported one.
+  var hostWindowProvider: (@MainActor () -> NSWindow?)?
+  /// One close question at a time per window — a second ⌘W while the sheet is
+  /// up must not stack another sheet on the same document.
+  private var isConfirmingClose = false
   let agentWorkflows: [String] = [
     "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
     "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
@@ -90,6 +115,18 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  /// The launch restore's bulk route. One call for the WHOLE working set, so
+  /// the registry can join every tab to the group and bring exactly one window
+  /// front at the end instead of paying a full window presentation — and the
+  /// tab-group frame sync that comes with it — per restored file. Unwired
+  /// (tests, headless) falls back to the per-file route.
+  var requestOpenRestoredDocumentWindows: (([DocumentRef]) -> Void)?
+  /// Tells the registry a document is already on screen in THIS window, so
+  /// nothing orders a window front for it afterwards. The launch window loads
+  /// the first restored file into itself; its attach lands asynchronously, and
+  /// without this the registry counts that as the document's first presentation
+  /// and pulls this window in front of the tab the restore just fronted.
+  var requestNoteDocumentAlreadyOnScreen: ((URL) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
   /// Marks this window as holding content the sweep must not reap. Called when
   /// the window adopts a recovery draft, which carries no URL for the accessor
@@ -114,6 +151,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    launchSettings: LaunchSettings? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
     startupRestore: ApplicationStartupRestore = .shared,
     recentDocuments: RecentDocumentsStore? = nil,
@@ -132,12 +170,31 @@ final class AppController: ObservableObject {
       alert.addButton(withTitle: "Move to Trash")
       alert.addButton(withTitle: "Cancel")
       return alert.runModal() == .alertFirstButtonReturn
+    },
+    confirmSaveChanges: @escaping SaveChangesConfirmation = { prompt, session, window, respond in
+      SaveChangesSheet.present(
+        prompt: prompt,
+        session: session,
+        in: window,
+        completion: respond)
+    },
+    confirmDiscardDraft: @escaping DraftDiscardConfirmation = { draft in
+      let alert = NSAlert()
+      alert.messageText = "Discard this recovered draft?"
+      alert.informativeText =
+        "\"\(draft.previewSnippet)\" has never been saved to a file. Discarding it cannot be undone."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Discard")
+      alert.addButton(withTitle: "Cancel")
+      alert.buttons[1].keyEquivalent = "\u{1b}"
+      return alert.runModal() == .alertFirstButtonReturn
     }
   ) {
     self.appState = appState
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.launchSettings = launchSettings ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.startupRestore = startupRestore
     self.recentDocuments = recentDocuments ?? .shared
@@ -148,6 +205,8 @@ final class AppController: ObservableObject {
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
     self.confirmFolderTrash = confirmFolderTrash
+    self.confirmSaveChanges = confirmSaveChanges
+    self.confirmDiscardDraft = confirmDiscardDraft
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -191,7 +250,12 @@ final class AppController: ObservableObject {
   /// timer and would otherwise win that race on a slow workspace.
   private(set) var isAwaitingLaunchRestore = true
 
-  func start(restoringWorkspace: Bool = true) {
+  /// Boots THIS window according to why it was opened. The intent answers the
+  /// one restore question left — rebuild the workspace — instead of the single
+  /// `restoringWorkspace` boolean that used to conflate it with picking a
+  /// document and claiming the crash draft (and treated a launcher reborn
+  /// mid-session exactly like a cold launch).
+  func start(intent: LaunchIntent = .coldLaunch) {
     guard !didStart else { return }
     didStart = true
     // Whatever this window turns out to be, its launch decision is settled by
@@ -202,30 +266,31 @@ final class AppController: ObservableObject {
       requestLauncherSweepReconcile?()
     }
 
+    // Crash drafts are surfaced, never adopted: this only fills the launcher's
+    // Recovered Drafts list.
+    refreshRecoveredDrafts()
+
     // Warm the index OFF the main thread. Opening the GRDB pool + running migrations (incl. the FTS5
     // content-link rebuild) on main here was the launch-time beachball; the workspace-restore path
     // also opens lazily, so this is just an early, non-blocking warm-up.
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
-    // Recovery drafts belong to the plain-launch restore path ONLY. A window
-    // started for a specific document (`restoringWorkspace: false` — a new
-    // document tab, an explicit file launch) must keep its buffer empty:
-    // adopting the pending draft here hijacked every new tab with "Recovered
-    // Untitled", and the dirty untitled session then blocked the load of the
-    // document the window was opened for.
-    guard restoringWorkspace else { return }
+    guard intent.restoresWorkspace else { return }
     // Claim the application's one startup restore BEFORE anything else in this
     // branch can return early: whichever window gets here first IS the launch,
     // and every launcher after it must be an empty launcher.
     let isApplicationStartupRestore = startupRestore.claimStartupRestore()
-    if documentStore.restoreRecoveredDraft(into: appState) {
-      // This window now holds unsaved work with no URL behind it, so the
-      // registry cannot classify it from the document identity the accessor
-      // publishes — it would stay a "launcher" and the sweep would reap it.
-      // Promote it explicitly, at the moment of adoption.
-      requestPromoteWindowToContent?()
-      appState.lastError = nil
-    }
+
+    // The toggle governs LAUNCH only: a cold launch with it off lands on the
+    // clean launcher, but Dock reopen / the tab bar's "+" still rebuild the
+    // workspace they always did — those never asked to restore a whole
+    // session, only to put a launcher back. Persisted bookmarks are untouched
+    // either way; only this auto-invoke is skipped. The claim above is taken
+    // FIRST on purpose: a declining cold launch is still the application's one
+    // startup restore, so the launcher that appears later cannot inherit the
+    // document reopen the user just turned off.
+    if intent == .coldLaunch, !launchSettings.restoreSessionOnLaunch { return }
+
     folderManager.restoreLastFolderInBackground(into: appState)
     guard isApplicationStartupRestore else { return }
     reopenRestoredOpenFiles()
@@ -249,9 +314,18 @@ final class AppController: ObservableObject {
   /// `applyWorkspaceScans` deliberately keeps them out of Open Files rather than
   /// listing them twice.
   private func reopenRestoredOpenFiles() {
-    let alreadyOpen = Set(documentWindowRegistry.openDocuments.map(\.identity))
-    var pending = appState.openFiles.filter { ref in
-      ref.isAdHoc && !alreadyOpen.contains(.file(ref.id.standardizedFileURL))
+    // ONE identity set for the whole pass, seeded with what is already open and
+    // grown as refs are taken. Computing "already open" once and then trusting
+    // the working set to hold each file at most once was a duplicate tab
+    // waiting to happen: a persisted set that names the same file twice — which
+    // `BookmarkStore` used to produce, since a bookmark blob is not a stable
+    // identity for the file it points at — asked the registry to open it twice
+    // before either request had registered a window.
+    var claimed = Set(documentWindowRegistry.openDocuments.map(\.identity))
+    var pending: [DocumentRef] = []
+    for ref in appState.openFiles where ref.isAdHoc {
+      guard claimed.insert(.file(ref.id.standardizedFileURL)).inserted else { continue }
+      pending.append(ref)
     }
     guard !pending.isEmpty else { return }
 
@@ -261,7 +335,25 @@ final class AppController: ObservableObject {
     // in the commonest case of exactly one file. Mirrors `openFile`, which also
     // loads in place when the window holds nothing.
     if !appState.documentSession.hasEditableBuffer {
-      documentStore.load(ref: pending.removeFirst(), into: appState)
+      let inPlace = pending.removeFirst()
+      documentStore.load(ref: inPlace, into: appState)
+      // This window is on screen and now shows `inPlace` — the restore never
+      // has to order anything for it. Say so BEFORE the bulk route runs: this
+      // window's own attach is asynchronous and lands after the pass has
+      // fronted its last tab, and the registry would read it as the document's
+      // first presentation and front this window instead. The user left a
+      // different tab in front; that is the one that must come back in front.
+      requestNoteDocumentAlreadyOnScreen?(inPlace.id)
+    }
+    guard !pending.isEmpty else { return }
+
+    // The bulk route exists because the per-file one cost a full window
+    // presentation — and AppKit's tab-group frame sync, which lays out every
+    // tab already in the group — for each restored file. See
+    // `DocumentWindowRegistry.openRestoredDocuments`.
+    if let requestOpenRestoredDocumentWindows {
+      requestOpenRestoredDocumentWindows(pending)
+      return
     }
     guard let requestOpenDocumentWindow else { return }
     for ref in pending {
@@ -580,31 +672,59 @@ final class AppController: ObservableObject {
 
   func closeOpenFile(id: DocumentRef.ID) {
     // Open Files mirrors the live tab group, so closing from the list closes the
-    // tab/window. If it is THIS window's active doc, run the dirty-session guard
-    // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
-    // force-save) so the sidebar close never silently drops unsaved edits.
+    // tab/window. If it is THIS window's active doc it goes through the same
+    // conscious close as ⌘W — one lifecycle, whichever gesture triggers it.
     //
     // Closing the WINDOW is not the whole intent here. This affordance retires
     // the file from the LIST, so it must also leave the working set a relaunch
     // restores from — and only when the close actually went through, so a
-    // cancelled Save/Discard/Cancel forgets nothing.
+    // cancelled Save / Don't Save / Cancel forgets nothing. The conscious close
+    // answers asynchronously, so the retire hangs off its completion rather
+    // than a synchronous return.
     let url = id.standardizedFileURL
-    guard closeOpenDocument(identity: .file(url)) else { return }
-    documentStore.forgetOpenFile(url, into: appState)
+    closeOpenDocument(identity: .file(url)) { [weak self] didClose in
+      guard let self, didClose else { return }
+      self.documentStore.forgetOpenFile(url, into: self.appState)
+    }
   }
 
+  /// Closes `identity` wherever it lives, running the conscious close in the
+  /// OWNING window's session.
+  ///
+  /// The return value answers "was the close ACCEPTED": `false` means it was
+  /// refused outright because no window owns the identity (see `closeOwner`).
+  /// Whether an accepted close actually went through is reported by
+  /// `completion`, which fires after the Save / Don't Save / Cancel sheet is
+  /// answered and is therefore asynchronous whenever a decision is needed.
   @discardableResult
-  func closeOpenDocument(identity: DocumentIdentity) -> Bool {
+  func closeOpenDocument(
+    identity: DocumentIdentity,
+    completion: (@MainActor (Bool) -> Void)? = nil
+  ) -> Bool {
     // Open Files mirrors EVERY window's documents, so this close may target a
-    // document owned by another window. Run the dirty guard in the OWNING
-    // window's session — guarding only the caller's would force-close the
+    // document owned by another window. Route the close DECISION to the OWNING
+    // window's session — prompting only the caller's would force-close the
     // target, letting its close hook stash a recovery draft and skip the
-    // Save/Discard/Cancel prompt.
-    guard let owner = closeOwner(for: identity) else { return false }
-    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else {
+    // Save / Don't Save / Cancel prompt.
+    guard let owner = closeOwner(for: identity) else {
+      completion?(false)
       return false
     }
-    documentWindowRegistry.closeDocument(identity)
+    // When the identity is not the owner's active document there is no live
+    // dirty session to guard, so the tab is torn down directly.
+    guard owner.appState.windowModel.documentIdentity == identity.standardized else {
+      documentWindowRegistry.closeDocument(identity)
+      completion?(true)
+      return true
+    }
+    owner.closeActiveDocument { [weak self] didClose in
+      guard let self else {
+        completion?(false)
+        return
+      }
+      if didClose { self.documentWindowRegistry.closeDocument(identity) }
+      completion?(didClose)
+    }
     return true
   }
 
@@ -629,29 +749,28 @@ final class AppController: ObservableObject {
     return self
   }
 
-  /// Runs this window's dirty-session guard when `identity` is its active
-  /// document. Returns `false` only when the untitled Save/Discard/Cancel
-  /// prompt was cancelled, so the caller aborts the close.
-  func confirmDirtySessionClearBeforeExternalClose(identity: DocumentIdentity) -> Bool {
-    guard appState.windowModel.documentIdentity == identity.standardized else { return true }
-    return documentStore.select(ref: nil, into: appState)
+  /// Phase-1 confirm for THIS window's session, the single source of truth for
+  /// every multi-window pass that can still be cancelled after this window has
+  /// answered — "Clear Open Files" and ⌘Q alike. Runs the NON-DESTRUCTIVE decide
+  /// half: a Save writes its bytes (a write is not a loss, and a failed I/O is
+  /// the last thing that can still abort the pass), while a Discard is only
+  /// RECORDED, never applied. Returns `nil` when the user cancelled, which the
+  /// caller must read as "apply nothing, close nothing".
+  func confirmDirtySessionForDeferredClose() -> DocumentStore.DirtySessionResolution? {
+    documentStore.confirmDirtySessionForExternalClose(appState: appState)
   }
 
-  /// Phase-1 confirm sibling of `confirmDirtySessionClearBeforeExternalClose`,
-  /// used by the multi-window "Clear Open Files" pass. When `identity` is this
-  /// window's active document it runs the NON-DESTRUCTIVE decide half and hands
-  /// back the resolution — a Discard is only RECORDED, not applied — so a Cancel
-  /// raised on a LATER window can abort with nothing lost. Returns `nil` when
-  /// the user cancelled. When `identity` is not this window's active doc it is a
-  /// no-op reporting `.settled`.
+  /// The "Clear Open Files" entry point: the same phase-1 confirm, gated on the
+  /// pass actually targeting this window's active document. When `identity` is
+  /// not this window's active doc it is a no-op reporting `.settled`.
   func confirmDirtySessionForExternalClose(
     identity: DocumentIdentity
   ) -> DocumentStore.DirtySessionResolution? {
     guard appState.windowModel.documentIdentity == identity.standardized else { return .settled }
-    return documentStore.confirmDirtySessionForExternalClose(appState: appState)
+    return confirmDirtySessionForDeferredClose()
   }
 
-  /// Phase-2 apply for the "Clear Open Files" pass: performs the destructive
+  /// Phase-2 apply for a deferred multi-window pass: performs the destructive
   /// step phase 1 deferred for this window — dropping an untitled draft the user
   /// chose to Discard and marking it clean. `.settled` is a no-op.
   func applyDeferredDirtySessionResolution(_ resolution: DocumentStore.DirtySessionResolution) {
@@ -682,6 +801,23 @@ final class AppController: ObservableObject {
     //   resurrects and no stale `isDirty` trips the teardown save hook, THEN
     //   close the windows. No explicit per-window clear is needed: closing a
     //   window discards its `AppState` (and thus its session) outright.
+    //
+    // DELIBERATE DIVERGENCE from the conscious-close work landing in this same
+    // stack: the Save/Don't Save/Cancel SHEET (`closeActiveDocument`,
+    // `DocumentCloseDecision`, `SaveChangesSheet`) is NOT used here. That path is
+    // asynchronous and asks about ONE window; this pass has to resolve EVERY
+    // owning window and stay atomic, which the callback form cannot express
+    // today. Routing Clear Open Files through the sheet would have reinstated the
+    // single-window guard and with it the silent-loss bug this collect/apply
+    // shape exists to prevent.
+    //
+    // The quit path (`applicationShouldTerminate`) now shares these primitives:
+    // it was the other multi-window pass carrying the identical non-atomic
+    // defect, and it collects-then-applies through the same
+    // `confirmDirtySessionForDeferredClose` / `applyDeferredDirtySessionResolution`
+    // pair. FOLLOW-UP, still open but no longer a data-loss one: drive both
+    // passes through the sheet, so they are visually consistent with the rest of
+    // the close surface.
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
@@ -786,7 +922,51 @@ final class AppController: ObservableObject {
   /// window saves, which is precisely the ordering the sequence exists to prevent.
   @discardableResult
   func applicationShouldTerminate() -> Bool {
-    documentStore.prepareForDocumentSwitch(appState: appState)
+    // ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
+    // from. Other windows would otherwise exit through their teardown path,
+    // which has no veto point left and can only stash a recovery draft, never
+    // ask.
+    //
+    // ATOMIC COLLECT-THEN-APPLY, on the same primitives "Clear Open Files"
+    // uses — a quit is the other multi-window pass a LATE Cancel can abort:
+    //
+    //   Phase 1 (COLLECT) — ask every window and RECORD its resolution without
+    //   performing any deferred destruction. A Save does write bytes (not a
+    //   loss, and the last step a failed I/O can still abort the quit on), but
+    //   a Discard is only remembered: its recovery draft stays on disk and its
+    //   buffer stays dirty. If ANY window cancels, apply nothing and quit
+    //   nothing — every window is exactly as it was, and an untitled Discard
+    //   answered earlier in this same pass is still recoverable.
+    //
+    //   Phase 2 (APPLY) — only once EVERY window consented, run the deferred
+    //   Discards. Fusing the two (the old `prepareForDocumentSwitch` per
+    //   window) meant a "Don't Save" in one window physically deleted its
+    //   recovery draft and cleared `isDirty` BEFORE a later window's Cancel
+    //   aborted the quit — leaving a still-rendered buffer that no longer
+    //   survives a crash and that the next ⌘Q/close no longer asks about.
+    //
+    // Self is asked LAST so the firing window's own prompt is the final word,
+    // exactly as before.
+    var deferred: [(controller: AppController, resolution: DocumentStore.DirtySessionResolution)] =
+      []
+    let others = documentWindowRegistry.liveDocumentControllers().filter { $0 !== self }
+    for controller in others {
+      guard let resolution = controller.confirmDirtySessionForDeferredClose() else { return false }
+      deferred.append((controller, resolution))
+    }
+    guard let ownResolution = confirmDirtySessionForDeferredClose() else { return false }
+    deferred.append((self, ownResolution))
+
+    for (controller, resolution) in deferred {
+      controller.applyDeferredDirtySessionResolution(resolution)
+    }
+    // This pass has SETTLED, so the AppKit terminate hook must not run a second
+    // one. ⌘Q reaches that hook through its own `NSApplication.terminate(_:)`
+    // moments from now; the latch is one-shot and covers only that request.
+    // Reached only on consent — a Cancel returned above and left it disarmed, so
+    // the next terminate request still asks.
+    documentWindowRegistry.armTerminationPassLatch()
+    return true
   }
 
   /// Save-on-close guard for THIS window's session. Routed from the shared
@@ -811,13 +991,181 @@ final class AppController: ObservableObject {
     appState.lastEditGeneration
   }
 
-  /// Closes the active document session without exiting Pensieve.
-  /// Dirty sessions are routed through the existing save semantics in
-  /// `DocumentStore.select(ref:nil:into:)` before the session is cleared,
-  /// so the window stays alive and reverts to its empty state.
+  /// Closes the active document session without exiting Pensieve — the window
+  /// stays alive and reverts to its empty state.
+  ///
+  /// A normal close is a CONSCIOUS lifecycle: unsaved work asks
+  /// `Save / Don't Save / Cancel` (`Save As…` for a draft that has no file
+  /// yet) instead of being silently written, silently dropped, or left for
+  /// crash recovery to guess at. Nothing untouched or already-saved asks
+  /// anything. `completion` reports whether the document actually closed; it
+  /// fires after the sheet is answered, so it is asynchronous whenever the
+  /// close needs a decision.
+  ///
+  /// This is the SINGLE-DOCUMENT close (⌘W / File ▸ Close, and the owning
+  /// window's half of "Close from Open Files"), so a close that goes through
+  /// also retires the file from the Open Files working set — operator decision
+  /// 2026-08-03. The window stays alive and reverts to the launcher; the file
+  /// is out of the session and does not come back on the next launch. A Cancel
+  /// (or a failed save) never reaches the retirement: `finishClose` returns
+  /// before it.
+  func closeActiveDocument(completion: (@MainActor (Bool) -> Void)? = nil) {
+    let decision = documentStore.closeDecision(appState: appState)
+
+    guard let prompt = decision.prompt else {
+      // Bind the result FIRST: `completion?(finishClose(…))` would skip the
+      // close entirely whenever the caller passed no completion, because
+      // optional chaining never evaluates the argument of a nil call.
+      let didClose = documentStore.finishClose(
+        decision: decision, response: nil, appState: appState, retiring: .now)
+      refreshRecoveredDrafts()
+      completion?(didClose)
+      return
+    }
+
+    // A sheet is already asking about this very document — treat the extra ⌘W
+    // as a no-op rather than stacking a second question on the same buffer.
+    guard !isConfirmingClose else {
+      completion?(false)
+      return
+    }
+
+    isConfirmingClose = true
+    let session = appState.documentSession
+    confirmSaveChanges(prompt, session, hostWindowProvider?() ?? Self.currentKeyWindow()) {
+      [weak self] response in
+      guard let self else { return }
+      self.isConfirmingClose = false
+      let didClose = self.documentStore.finishClose(
+        decision: decision, response: response, appState: self.appState, retiring: .now)
+      self.refreshRecoveredDrafts()
+      completion?(didClose)
+    }
+  }
+
+  /// Whether THIS window may close on the red close button or a tab's "×".
+  /// Mirrors the ⌘W conscious lifecycle (`closeActiveDocument`) but ends by
+  /// closing the WINDOW instead of reverting it to the empty state — the red
+  /// button means "this window goes away". Returns true when AppKit may tear the
+  /// window down immediately (nothing unsaved, or auto-save owns the file, in
+  /// which case the `willCloseNotification` teardown flushes it). Returns false
+  /// when a Save / Don't Save / Cancel sheet is now up: on Save or Don't Save the
+  /// window is closed programmatically once the answer lands; on Cancel — or a
+  /// failed save — it stays exactly as it was, so no unsaved work is lost to a
+  /// close the user did not confirm.
   @discardableResult
-  func closeActiveDocument() -> Bool {
-    documentStore.select(ref: nil, into: appState)
+  func windowShouldClose(_ window: NSWindow) -> Bool {
+    let decision = documentStore.closeDecision(appState: appState)
+    guard let prompt = decision.prompt else {
+      // closeWithoutPrompting / saveWithoutPrompting: nothing to ask. Let the
+      // normal teardown run — for an auto-save-owned file it flushes on close.
+      // The session is still intact here, so the document this close settles is
+      // read now and retired only if the close turns out to be a TAB close.
+      if let closingURL = appState.documentSession.url {
+        retireDocumentIfOnlyThisTabCloses(url: closingURL, window: window)
+      }
+      return true
+    }
+
+    // A sheet is already asking about this very document — treat the extra close
+    // as a no-op rather than stacking a second question on the same buffer.
+    guard !isConfirmingClose else { return false }
+
+    isConfirmingClose = true
+    let session = appState.documentSession
+    confirmSaveChanges(prompt, session, hostWindowProvider?() ?? Self.currentKeyWindow()) {
+      [weak self, weak window] response in
+      guard let self else { return }
+      self.isConfirmingClose = false
+      let didClose = self.documentStore.finishClose(
+        decision: decision, response: response, appState: self.appState,
+        // Reported only by a close that went through, and only after the save
+        // branches — a draft that earned its path through "Save As…" is retired
+        // under that new location, exactly like the ⌘W route.
+        retiring: .deferred { [weak self, weak window] closedURL in
+          guard let self, let window else { return }
+          self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+        })
+      self.refreshRecoveredDrafts()
+      // Only a settled close (saved or discarded) tears the window down; its
+      // `willCloseNotification` guard is a no-op on the now-clean session. Cancel
+      // or a failed save leaves the window — and its buffer — intact.
+      guard didClose else { return }
+      window?.close()
+    }
+    return false
+  }
+
+  /// Retires the document from the Open Files working set, but ONLY when this
+  /// close is one tab leaving a window that stays open.
+  ///
+  /// The operator's 2026-08-03 rule is about closing a DOCUMENT: ⌘W and a tab's
+  /// "×" take the file out of the session for good. Closing a WINDOW is not
+  /// that decision — it takes every tab in it down at once, and the files it
+  /// held must still be there on the next launch (the same reason termination
+  /// never retires). AppKit hands both gestures to `windowShouldClose`
+  /// identically, so the registry resolves the SCOPE — see
+  /// `DocumentWindowRegistry.resolveCloseScope`, which answers once the close
+  /// has settled and the surviving tabs can be counted.
+  private func retireDocumentIfOnlyThisTabCloses(url: URL, window: NSWindow) {
+    documentWindowRegistry.resolveCloseScope(for: window) { [weak self] scope in
+      guard let self, scope == .tab else { return }
+      self.documentStore.forgetOpenFile(url, into: self.appState)
+    }
+  }
+
+  // MARK: - Recovered drafts (launcher surface)
+
+  /// Re-reads the recovery directory. Called whenever the launcher section
+  /// appears and after every action that can change the list, so the view never
+  /// shows a draft that is already gone.
+  func refreshRecoveredDrafts() {
+    recoveredDrafts = documentStore.recoveredDrafts()
+  }
+
+  /// `Open`: adopt the draft into this (empty) window. The draft stays on disk
+  /// until it is saved or discarded — opening is not deciding.
+  @discardableResult
+  func openRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
+    let didOpen = documentStore.openRecoveredDraft(draft, into: appState)
+    if didOpen {
+      // This window now holds unsaved work with no URL behind it, so the
+      // registry cannot classify it from the document identity the accessor
+      // publishes — it would stay a "launcher" and the sweep would reap the
+      // user's recovered work moments after they asked for it. Promote it
+      // explicitly, at the moment of adoption. This is the ONLY adoption route
+      // left: nothing claims a draft at launch any more.
+      requestPromoteWindowToContent?()
+    }
+    refreshRecoveredDrafts()
+    return didOpen
+  }
+
+  /// `Save As…`: pick a location, write the draft there, retire it. A cancelled
+  /// panel leaves everything untouched.
+  @discardableResult
+  func saveRecoveredDraftAs(_ draft: RecoveryDraft) -> Bool {
+    let didSave = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    refreshRecoveredDrafts()
+    return didSave
+  }
+
+  /// `Discard`: drop the draft after the user confirms. Returns whether it was
+  /// actually discarded.
+  @discardableResult
+  func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
+    guard confirmDiscardDraft(draft) else { return false }
+    documentStore.discardRecoveredDraft(draft)
+    refreshRecoveredDrafts()
+    return true
+  }
+
+  /// `NSApp` is an implicitly unwrapped global that stays nil until something
+  /// instantiates the application — reading `.keyWindow` off it traps in a
+  /// headless test process. Ask only once the app object exists.
+  private static func currentKeyWindow() -> NSWindow? {
+    guard let app = NSApp else { return nil }
+    return app.keyWindow
   }
 
   func selectDocument(id: DocumentRef.ID?) {

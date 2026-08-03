@@ -6,19 +6,51 @@ struct RecoveryDraft: Equatable, Identifiable {
   let title: String
   let text: String
   let updatedAt: Date
+
+  /// One-line gist for the Recovered Drafts list. The draft file carries no
+  /// name of its own, so the first non-empty line is the only thing that tells
+  /// two crash drafts apart.
+  var previewSnippet: String {
+    let firstLine =
+      text
+      .split(separator: "\n", omittingEmptySubsequences: false)
+      .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+
+    guard let firstLine, !firstLine.isEmpty else { return "Empty draft" }
+    guard firstLine.count > Self.snippetLimit else { return firstLine }
+    return String(firstLine.prefix(Self.snippetLimit)) + "…"
+  }
+
+  private static let snippetLimit = 80
 }
 
 final class RecoveryStore {
   static let shared = RecoveryStore()
 
+  /// How long an unhandled draft survives. A draft is a crash artifact, not an
+  /// archive: past this age it is noise the user never came back for, and the
+  /// launch sweep drops it.
+  static let draftRetentionInterval: TimeInterval = 30 * 24 * 60 * 60
+
+  /// Hard ceiling on stored drafts. Oldest fall out first, so a long-running
+  /// crash loop cannot grow the Recovered Drafts list without bound.
+  static let maximumDraftCount = 20
+
   private let directoryURL: URL
   private let fileManager: FileManager
+
+  /// Drafts a window is holding open and editing RIGHT NOW. Retention never
+  /// touches these: sweeping a draft out from under the buffer that owns it
+  /// would delete live work whose only copy is that file.
+  private var openDraftIDs: Set<UUID> = []
 
   init(directoryURL: URL? = nil, fileManager: FileManager = .default) {
     self.fileManager = fileManager
     self.directoryURL = directoryURL ?? Self.defaultDirectoryURL(fileManager: fileManager)
   }
 
+  @discardableResult
   func saveDraft(id existingID: UUID?, title: String, text: String) throws -> RecoveryDraft {
     let id = existingID ?? UUID()
     try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -30,6 +62,14 @@ final class RecoveryStore {
     // process boundary and EVERY recovered draft came back called
     // "Recovered Untitled.md", no matter what the user had been working on.
     try? Data(resolvedTitle.utf8).write(to: titleURL(for: id), options: .atomic)
+    // Writing a draft IS the claim: the buffer that produced it is live.
+    openDraftIDs.insert(id)
+    // Only a BRAND NEW draft can push the list past the cap. Re-saving the same
+    // draft is the autosave hot path — it must not re-read the whole directory
+    // every 1.5 s of typing.
+    if existingID == nil {
+      enforceDraftCap()
+    }
     return RecoveryDraft(
       id: id,
       url: url,
@@ -38,20 +78,6 @@ final class RecoveryStore {
       updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date()
     )
   }
-
-  /// Hand out the newest pending draft AT MOST ONCE per store. All production
-  /// windows share `RecoveryStore.shared`, and every restoring window — a
-  /// state-restored scene, a relaunched launcher — asks for the draft on
-  /// start; without the single-handout rule each of them adopted the same
-  /// draft, multiplying one crash draft into a flood of dirty "Untitled"
-  /// windows.
-  func claimDraftForRestore() -> RecoveryDraft? {
-    guard !hasHandedOutRestoreDraft, let draft = loadDrafts().first else { return nil }
-    hasHandedOutRestoreDraft = true
-    return draft
-  }
-
-  private var hasHandedOutRestoreDraft = false
 
   func loadDrafts() -> [RecoveryDraft] {
     guard
@@ -70,8 +96,102 @@ final class RecoveryStore {
 
   func deleteDraft(id: UUID?) {
     guard let id else { return }
+    openDraftIDs.remove(id)
+    removeDraftFiles(id: id)
+  }
+
+  /// Drops BOTH files a draft is made of. Retention used to remove only the
+  /// `.md`, so every launch sweep left the `.title` sidecar behind — invisible
+  /// (the directory listing only reads `.md`) and never collected by anything,
+  /// so the recovery directory grew a permanent orphan per pruned draft.
+  /// Measured on a seeded run: 26 drafts in, 20 `.md` and 26 `.title` out.
+  private func removeDraftFiles(id: UUID) {
     try? fileManager.removeItem(at: draftURL(for: id))
     try? fileManager.removeItem(at: titleURL(for: id))
+  }
+
+  // MARK: - Claim tracking
+
+  /// Records that a window adopted this draft into a live buffer.
+  func markDraftOpen(id: UUID?) {
+    guard let id else { return }
+    openDraftIDs.insert(id)
+  }
+
+  /// Records that the buffer holding this draft is gone (closed, saved,
+  /// discarded). The draft file itself is untouched — only its protection from
+  /// retention ends.
+  func markDraftClosed(id: UUID?) {
+    guard let id else { return }
+    openDraftIDs.remove(id)
+  }
+
+  func isDraftOpen(id: UUID) -> Bool {
+    openDraftIDs.contains(id)
+  }
+
+  /// Every draft NO live buffer is holding — the only ones a launcher may
+  /// offer. A window adopting a draft claims it, and an empty window elsewhere
+  /// (a second launcher, a "+" tab) must stop listing it from that moment on:
+  /// two buffers on one recovery ID autosave over each other, and a Save As… in
+  /// one is undone by the other's next autosave recreating the file.
+  ///
+  /// The claim is deliberately in-process only. A crash takes it with the
+  /// process, which is the point — the file on disk outlives it and is offered
+  /// again on the next launch.
+  func unclaimedDrafts() -> [RecoveryDraft] {
+    loadDrafts().filter { !openDraftIDs.contains($0.id) }
+  }
+
+  // MARK: - Retention
+
+  /// Launch sweep: drops drafts nobody came back for. Returns the IDs actually
+  /// removed so callers can report what retention did.
+  ///
+  /// Two rules, both bounded by the open-draft claim: anything older than
+  /// `draftRetentionInterval` goes, and whatever survives is trimmed to
+  /// `maximumDraftCount` newest-first.
+  @discardableResult
+  func pruneDrafts(now: Date = Date()) -> [UUID] {
+    let drafts = loadDrafts()
+    var removed: [UUID] = []
+
+    let expired = drafts.filter { draft in
+      !openDraftIDs.contains(draft.id)
+        && now.timeIntervalSince(draft.updatedAt) > Self.draftRetentionInterval
+    }
+    for draft in expired {
+      removeDraftFiles(id: draft.id)
+      removed.append(draft.id)
+    }
+
+    let expiredIDs = Set(removed)
+    removed.append(
+      contentsOf: trimToCap(drafts.filter { !expiredIDs.contains($0.id) }))
+    return removed
+  }
+
+  /// Applies the count cap to the newest-first draft list, skipping open ones.
+  @discardableResult
+  private func trimToCap(_ draftsNewestFirst: [RecoveryDraft]) -> [UUID] {
+    guard draftsNewestFirst.count > Self.maximumDraftCount else { return [] }
+
+    var removed: [UUID] = []
+    // Walk oldest-first so the ones that fall out are genuinely the stalest,
+    // and stop as soon as the list fits — an open draft that cannot be dropped
+    // simply keeps its slot.
+    var remaining = draftsNewestFirst.count
+    for draft in draftsNewestFirst.reversed() where remaining > Self.maximumDraftCount {
+      guard !openDraftIDs.contains(draft.id) else { continue }
+      removeDraftFiles(id: draft.id)
+      removed.append(draft.id)
+      remaining -= 1
+    }
+    return removed
+  }
+
+  private func enforceDraftCap() {
+    _ = trimToCap(loadDrafts())
   }
 
   private func loadDraft(from url: URL) -> RecoveryDraft? {

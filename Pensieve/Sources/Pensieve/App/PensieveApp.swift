@@ -12,6 +12,12 @@ struct PensieveApp: App {
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
   private let providerSettings: ProviderSettings
+  /// The auto-save preference the Settings window edits. The SAME instance the
+  /// document store consults, so a flip reaches every open document immediately.
+  private let savingSettings: DocumentSavingSettings
+  /// The restore-on-launch preference the Settings window edits. The SAME
+  /// instance `AppController.start(intent:)` consults on the next cold launch.
+  private let launchSettings: LaunchSettings
 
   init() {
     // Register the bundled OFL theme fonts into this process's font environment
@@ -23,6 +29,8 @@ struct PensieveApp: App {
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
     providerSettings = ProviderSettings.shared
+    savingSettings = DocumentSavingSettings.shared
+    launchSettings = LaunchSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -35,8 +43,8 @@ struct PensieveApp: App {
       launchIntentCoordinator: launchIntentCoordinator,
       themeManager: themeManager
     )
-    DocumentWindowRegistry.shared.makeDocumentWindow = { ref in
-      return factory.makeWindow(for: ref)
+    DocumentWindowRegistry.shared.makeDocumentWindow = { ref, intent in
+      return factory.makeWindow(for: ref, intent: intent)
     }
   }
 
@@ -54,7 +62,10 @@ struct PensieveApp: App {
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
-        initialDocument: nil
+        initialDocument: nil,
+        // The scene SwiftUI auto-presents at process start IS the cold launch —
+        // the one intent that brings the previous session back whole.
+        launchIntent: .coldLaunch
       )
     }
     // Opt OUT of external events here too, not just on the value-based group
@@ -93,7 +104,9 @@ struct PensieveApp: App {
         workspaceStore: workspaceStore,
         launchIntentCoordinator: launchIntentCoordinator,
         themeManager: themeManager,
-        initialDocument: document.wrappedValue
+        initialDocument: document.wrappedValue,
+        // A scene in this group exists FOR its document, restored or not.
+        launchIntent: .explicitDocument
       )
     }
     // Never let SwiftUI spawn a fresh WindowGroup scene per external event:
@@ -105,7 +118,11 @@ struct PensieveApp: App {
     .pensieveDocumentWindowChrome()
 
     Settings {
-      ProviderSettingsView(settings: providerSettings)
+      PensieveSettingsView(
+        providerSettings: providerSettings,
+        savingSettings: savingSettings,
+        launchSettings: launchSettings
+      )
     }
   }
 }
@@ -115,6 +132,10 @@ struct DocumentWindowRootView: View {
   let launchIntentCoordinator: LaunchIntentCoordinator
   let themeManager: ThemeManager
   let initialDocument: DocumentRef?
+  /// Why THIS window came into existence. Fixed at construction and never
+  /// re-read from shared state, so a second window born a moment later cannot
+  /// change what this one restores.
+  let launchIntent: LaunchIntent
 
   // AppState is @Observable now → @State, not @StateObject.
   @State private var appState: AppState
@@ -127,12 +148,14 @@ struct DocumentWindowRootView: View {
     workspaceStore: WorkspaceStore,
     launchIntentCoordinator: LaunchIntentCoordinator,
     themeManager: ThemeManager,
-    initialDocument: DocumentRef?
+    initialDocument: DocumentRef?,
+    launchIntent: LaunchIntent
   ) {
     self.workspaceStore = workspaceStore
     self.launchIntentCoordinator = launchIntentCoordinator
     self.themeManager = themeManager
     self.initialDocument = initialDocument
+    self.launchIntent = launchIntent
 
     let appState = AppState(workspaceStore: workspaceStore)
     _appState = State(wrappedValue: appState)
@@ -182,6 +205,17 @@ struct DocumentWindowRootView: View {
           // Publish this window's owning controller so a cross-window "Close
           // from Open Files" routes its dirty guard through this session.
           DocumentWindowRegistry.shared.registerController(controller, for: window)
+          // Give the red close button / tab "×" the same conscious Save / Don't
+          // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
+          // flush. EVERY window this app can build gets it, not just the
+          // factory-built ones: the launcher scene SwiftUI auto-presents at
+          // every cold start is an `AppKitWindow`, and it is the window the
+          // restored session, a cold-start Finder open and ⌘N all land in. See
+          // `ConsciousCloseHook` for how a window whose class and delegate
+          // belong to SwiftUI is reached.
+          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow in
+            controller?.windowShouldClose(closingWindow) ?? true
+          }
         }
       )
       .frame(
@@ -199,7 +233,8 @@ struct DocumentWindowRootView: View {
         if let initialDocument {
           openInitialDocument(initialDocument)
         } else {
-          launchIntentCoordinator.startWhenLaunchIntentsSettle(controller: controller)
+          launchIntentCoordinator.startWhenLaunchIntentsSettle(
+            controller: controller, intent: launchIntent)
         }
       }
       .onChange(of: initialDocument?.id) { _, _ in
@@ -263,6 +298,15 @@ struct DocumentWindowRootView: View {
     controller.requestOpenDocumentWindow = { ref in
       DocumentWindowRegistry.shared.open(ref)
     }
+    // The close confirmation is a sheet on THIS window, not an app-modal
+    // alert: ⌘W on one document tab must leave every other document usable.
+    controller.hostWindowProvider = { currentWindow }
+    controller.requestOpenRestoredDocumentWindows = { refs in
+      DocumentWindowRegistry.shared.openRestoredDocuments(refs)
+    }
+    controller.requestNoteDocumentAlreadyOnScreen = { documentID in
+      DocumentWindowRegistry.shared.noteDocumentAlreadyOnScreen(documentID)
+    }
     controller.requestCloseCurrentWindowIfEmpty = {
       // "Empty" has to mean idle, not merely bufferless: a window reading a large
       // document off the main actor is showing an opening placeholder for a file
@@ -303,7 +347,7 @@ struct DocumentWindowRootView: View {
       return
     }
     loadedInitialDocumentID = ref.id.standardizedFileURL
-    controller.start(restoringWorkspace: false)
+    controller.start(intent: .explicitDocument)
     controller.openFileInCurrentWindow(url: ref.url)
     // openFileInCurrentWindow loads synchronously: on success
     // selectedDocumentID is set, on failure it stays nil. Either way the

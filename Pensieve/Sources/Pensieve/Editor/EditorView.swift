@@ -573,11 +573,23 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       name: NSView.boundsDidChangeNotification,
       object: scrollView.contentView
     )
+    // Deliberately registered WITHOUT an `object:` filter. The manager our undo
+    // entries actually land in is the WINDOW's (`MarkdownTextView.undoManager`
+    // resolves up the responder chain), and at init time this surface has no
+    // window yet — `textView.undoManager` answers with the private
+    // `fallbackUndoManager`. Pinning the observer to that object registered us
+    // on a manager the user never undoes through, so `editorWillUndo` never
+    // fired once the editor was hosted and the opaque continuation survived
+    // every Cmd+Z. Re-registering on `viewDidMoveToWindow` would mean tracking
+    // one more teardown path across the close/detach seams (see the scrub guard
+    // in `MarkdownTextView`); listening broadly and discriminating on identity
+    // needs no lifecycle bookkeeping at all — the guard below reads the CURRENT
+    // manager on every notification, so a window change is followed for free.
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(editorWillUndo(_:)),
       name: .NSUndoManagerWillUndoChange,
-      object: textView.undoManager
+      object: nil
     )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
@@ -621,6 +633,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // invalidation is driven from there rather than from the delegate callbacks.
     textContentStorage.onCharactersEdited = { [weak self] location, _ in
       self?.invalidateLineAnchor(editedAt: location)
+    }
+    // The gutter no longer counts its row numbers off the enumeration (which is
+    // what forced every repaint to lay out the whole document); it starts at the
+    // first VISIBLE fragment and asks what number that row carries. Answering
+    // from the anchored resolver keeps a scroll paying for the span it moved
+    // across. The anchor is shared with the caret, so a viewport far away from
+    // the caret makes the two queries alternate over the gap — that costs at
+    // worst one layout-free scan, which is what an unshared gutter would pay on
+    // EVERY draw, and typing (caret on screen) keeps both queries adjacent.
+    textView.gutter?.lineNumberForUTF16Offset = { [weak self] offset in
+      (self?.lineIndex(forUTF16Offset: offset) ?? 0) + 1
     }
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
@@ -789,6 +812,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scheduleScrollSyncSample()
   }
 
+  /// Drops the provider-side continuation before an undo rewrites the document
+  /// the accepted turns were built on. Every undo manager in the process posts
+  /// here (the observer carries no `object:` filter — see `init`), so the
+  /// identity check against the manager this editor currently undoes through is
+  /// the whole filter: it is re-read per notification, so it follows the surface
+  /// from the windowless fallback manager to whichever window hosts it.
   @objc private func editorWillUndo(_ notification: Notification) {
     guard notification.object as? UndoManager === textView.undoManager else { return }
     autocompleteController.invalidateContinuation()

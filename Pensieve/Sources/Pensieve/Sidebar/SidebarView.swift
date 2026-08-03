@@ -66,7 +66,7 @@ struct SidebarView: View {
     }
     .onChange(of: appState.pendingSidebarRenameURL) { _, url in
       guard let url else { return }
-      beginRename(url: url, currentName: url.lastPathComponent)
+      beginRename(url: url, currentName: WorkspaceScanner.renamePrefill(for: url))
       appState.pendingSidebarRenameURL = nil
     }
   }
@@ -449,6 +449,26 @@ struct SidebarView: View {
           .frame(width: 5, height: 5)
           .accessibilityLabel("Edited")
       }
+      // Hover close: the ⌘W / context-menu close is undiscoverable, so surface
+      // a standard sidebar × on hover. It routes through the SAME decision path
+      // as "Close from Open Files" — a dirty document still asks Save / Don't
+      // Save / Cancel via its owning window. Kept in layout at zero opacity when
+      // not hovered so the row width does not jump; hit-testing is disabled then
+      // so it cannot be clicked while invisible.
+      Button {
+        controller.closeOpenDocument(identity: descriptor.identity)
+      } label: {
+        Image(systemName: "xmark")
+          .font(.caption2.weight(.semibold))
+          .foregroundColor(.secondary)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .opacity(hovered ? 1 : 0)
+      .allowsHitTesting(hovered)
+      .help("Close from Open Files")
+      .accessibilityLabel("Close")
+      .accessibilityIdentifier("pensieve.sidebar.openFiles.close")
     }
     .padding(.horizontal, 6)
     .help(descriptor.fileURL?.path ?? descriptor.displayTitle)
@@ -464,7 +484,11 @@ struct SidebarView: View {
   /// on-screen rows instead of eagerly building the entire expanded subtree.
   /// Walks only expanded branches (O(visible)).
   private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
-    flattenWorkspaceTree(appState.sortedWorkspaceTree, expandedNodeIDs: expandedNodeIDs)
+    flattenWorkspaceTree(
+      appState.sortedWorkspaceTree,
+      expandedNodeIDs: expandedNodeIDs,
+      includeForeignFiles: appState.showAllFilesInSidebar
+    )
   }
 
   @ViewBuilder
@@ -500,6 +524,11 @@ struct SidebarView: View {
         }
         return NSItemProvider()
       }
+    } else if node.kind == .foreignFile {
+      foreignFileRow(node, depth: row.depth)
+        .contextMenu {
+          nodeContextMenu(for: node)
+        }
     } else {
       Button {
         if let url = node.url {
@@ -547,7 +576,7 @@ struct SidebarView: View {
       Image(systemName: "folder")
         .foregroundStyle(themeMuted)
 
-      renameableTitle(for: node.url, title: node.name)
+      renameableTitle(for: node.url, title: node.name, isFolder: true)
         .font(rowTitleFont)
     }
     .padding(.horizontal, 6)
@@ -585,6 +614,26 @@ struct SidebarView: View {
     )
     .contentShape(Rectangle())
     .background(selectionBackground(isSelected))
+  }
+
+  /// A regular file outside the markdown allow-list: visible so it never looks deleted,
+  /// but greyed-out and inert — no open-on-click, no expand/collapse chevron. The full
+  /// filename (extension included) is shown, unlike a document row which shows the stem.
+  private func foreignFileRow(_ node: WorkspaceNode, depth: Int) -> some View {
+    HStack {
+      Image(systemName: "doc.text")
+        .foregroundColor(.secondary)
+      Text(node.name)
+        .lineLimit(1)
+        .foregroundColor(.secondary)
+    }
+    .padding(.leading, CGFloat(depth) * 14 + 15)
+    .padding(.vertical, 4)
+    .padding(.horizontal, 6)
+    .help(node.url?.path ?? node.name)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .contentShape(Rectangle())
+    .opacity(0.6)
   }
 
   private var searchText: Binding<String> {
@@ -686,31 +735,39 @@ struct SidebarView: View {
   }
 
   @ViewBuilder
-  private func renameableTitle(for url: URL?, title: String) -> some View {
+  private func renameableTitle(for url: URL?, title: String, isFolder: Bool = false) -> some View {
     if let url, renamingURL?.standardizedFileURL == url.standardizedFileURL {
-      HStack(spacing: 4) {
-        InlineRenameField(
-          text: $renameText,
-          focusToken: renameFocusToken,
-          accessibilityIdentifier: "pensieve.sidebar.renameField",
-          onCommit: {
-            commitRename(url)
-          },
-          onCancel: {
-            cancelRename()
-          }
-        )
-        .frame(maxWidth: .infinity)
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 4) {
+          InlineRenameField(
+            text: $renameText,
+            focusToken: renameFocusToken,
+            accessibilityIdentifier: "pensieve.sidebar.renameField",
+            onCommit: {
+              commitRename(url)
+            },
+            onCancel: {
+              cancelRename()
+            }
+          )
+          .frame(maxWidth: .infinity)
 
-        Button {
-          cancelRename()
-        } label: {
-          Image(systemName: "xmark.circle.fill")
+          Button {
+            cancelRename()
+          } label: {
+            Image(systemName: "xmark.circle.fill")
+          }
+          .buttonStyle(.borderless)
+          .help("Cancel Rename")
+          .accessibilityLabel("Cancel Rename")
+          .accessibilityIdentifier("pensieve.sidebar.cancelRename")
         }
-        .buttonStyle(.borderless)
-        .help("Cancel Rename")
-        .accessibilityLabel("Cancel Rename")
-        .accessibilityIdentifier("pensieve.sidebar.cancelRename")
+
+        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: renameText, isFolder: isFolder) {
+          Text("Will be shown as non-markdown")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+        }
       }
     } else {
       Text(title)
@@ -755,7 +812,7 @@ struct SidebarView: View {
     Divider()
 
     Button("Rename") {
-      beginRename(url: doc.url, currentName: doc.url.lastPathComponent)
+      beginRename(url: doc.url, currentName: WorkspaceScanner.renamePrefill(for: doc.url))
     }
 
     Button("Duplicate") {
@@ -818,7 +875,7 @@ struct SidebarView: View {
         Divider()
 
         Button("Rename") {
-          beginRename(url: url, currentName: url.lastPathComponent)
+          beginRename(url: url, currentName: WorkspaceScanner.renamePrefill(for: url))
         }
 
         Button("Duplicate") {
@@ -844,6 +901,22 @@ struct SidebarView: View {
         Button("Copy Path") {
           copyPath(url.path)
         }
+      }
+    } else if node.kind == .foreignFile, let url = node.url {
+      if url.pathExtension.isEmpty {
+        Button("Add .md Extension") {
+          _ = controller.renameItem(url: url, to: url.lastPathComponent + ".md")
+        }
+
+        Divider()
+      }
+
+      Button("Reveal in Finder") {
+        revealInFinder(url)
+      }
+
+      Button("Copy Path") {
+        copyPath(url.path)
       }
     } else if let url = node.url {
       Button("New File") {

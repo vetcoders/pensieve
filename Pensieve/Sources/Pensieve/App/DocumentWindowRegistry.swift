@@ -17,6 +17,32 @@ enum WindowCloseTombstonePolicy {
   case factoryWindow
 }
 
+/// How a freshly opened document window joins the app.
+enum DocumentWindowPresentation {
+  /// The user asked for this document NOW: its tab goes in front and the app
+  /// activates. Every interactive open uses this.
+  case activateNow
+  /// Bulk restore: the tab joins the group BEHIND the selected one and is never
+  /// made key, so it never becomes the selected tab and the tabs already in the
+  /// group are not resized around it. The caller orders the final window front
+  /// once, so the end state is the same as a run of `activateNow` opens —
+  /// without re-laying-out every tab already in the group on the way there.
+  case joinTabGroupInBackground
+}
+
+/// How much a close that arrived through one window actually closed.
+///
+/// The Open Files working set turns on this distinction: retiring a document is
+/// a decision about the DOCUMENT (the user closed this file), while a window
+/// going away is a decision about the WINDOW and leaves every file it held in
+/// the set the next launch restores.
+enum DocumentCloseScope {
+  /// One tab left a window that is still open.
+  case tab
+  /// The window itself went away, taking every tab in it along.
+  case window
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -28,7 +54,12 @@ final class DocumentWindowRegistry: ObservableObject {
   /// attaches the returned window as a native tab BEFORE first presentation,
   /// which makes the legacy standalone-window flash impossible by
   /// construction.
-  typealias DocumentWindowFactoryClosure = @MainActor (DocumentRef?) -> NSWindow?
+  ///
+  /// The `LaunchIntent` travels WITH the build request rather than through a
+  /// registry-wide "current intent" field: the window is built synchronously
+  /// but its SwiftUI root starts up later, so two launchers in flight would
+  /// read a shared field that had already moved on.
+  typealias DocumentWindowFactoryClosure = @MainActor (DocumentRef?, LaunchIntent) -> NSWindow?
 
   private var windowsByDocumentID: [URL: WeakWindow] = [:]
   private var launcherWindows: [ObjectIdentifier: WeakWindow] = [:]
@@ -57,11 +88,24 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  /// The launch restore's queue: refs still waiting for their tab, the window
+  /// the pass will order front when the queue drains, and whether a step is
+  /// already booked for a later run-loop turn.
+  private var pendingRestoreRefs: [DocumentRef] = []
+  private var restoreFrontmostWindow: WeakWindow?
+  private var restoreStepScheduled = false
+  /// Documents that reached the screen without the registry presenting them —
+  /// see `noteDocumentAlreadyOnScreen`. Consumed by the attach that reports one.
+  private var documentsAlreadyOnScreen: Set<URL> = []
   private var launcherReopenPending = false
   private var launcherReopenAwaitingFactory = false
   /// Set once the app starts quitting so the last document window's close does
   /// not resurrect a launcher mid-termination.
   private var isTerminating = false
+  /// Set when a quit prompt pass has already run AND consented for the terminate
+  /// request currently in flight. One-shot: `consumeTerminationPassLatch()`
+  /// disarms it on read.
+  private var hasSettledTerminationPass = false
   /// Observers and factory bindings.
   var makeDocumentWindow: DocumentWindowFactoryClosure? {
     didSet {
@@ -80,10 +124,11 @@ final class DocumentWindowRegistry: ObservableObject {
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
   /// the Dock with no visible windows, or during cold start if SwiftUI does not
-  /// provide one automatically.
-  func openLauncherWindow() {
+  /// provide one automatically. The caller states WHICH of those it is; the
+  /// intent decides how much of the previous session the launcher brings back.
+  func openLauncherWindow(intent: LaunchIntent) {
     guard let factory = makeDocumentWindow else { return }
-    if let launcher = factory(nil) {
+    if let launcher = factory(nil, intent) {
       registerLauncher(launcher)
       orderAndActivateWindow(launcher)
     }
@@ -92,11 +137,25 @@ final class DocumentWindowRegistry: ObservableObject {
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
+  /// Hands the next restored tab to a LATER run-loop turn. See
+  /// `openRestoredDocuments`: one insertion is main-thread work the app cannot
+  /// interrupt, and the window is already on screen while the rest arrive.
+  private let scheduleRestoreStep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
+  /// Same merge, ordered BEHIND the target: the window joins the tab group
+  /// without becoming the selected tab. AppKit only displays the selected tab,
+  /// so a window merged this way is never laid out until the user switches to
+  /// it — which is what makes a twelve-file restore cost twelve window
+  /// constructions instead of twelve full SwiftUI layout + preview renders.
+  private let mergeWindowIntoTabsBehind: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
+  /// The windows sharing `window`'s native tab group, `window` included. A seam
+  /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
+  /// and the tab-vs-window close scope is decided from exactly this list.
+  private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
 
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
@@ -110,8 +169,21 @@ final class DocumentWindowRegistry: ObservableObject {
         Task { @MainActor in work() }
       }
     },
+    // A TIMER hop, not `DispatchQueue.main.async`: the main queue's run-loop
+    // source drains the blocks enqueued while it is draining, so a chain of
+    // `async` steps can run back to back inside ONE turn and never let the app
+    // service an event. A deadline in the future forces the run loop around.
+    scheduleRestoreStep: @escaping (@escaping DeferredMainWork) -> Void = { work in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+        Task { @MainActor in work() }
+      }
+    },
     mergeWindowIntoTabs: @escaping @MainActor (NSWindow, NSWindow) -> Void = { target, window in
       target.addTabbedWindow(window, ordered: .above)
+    },
+    mergeWindowIntoTabsBehind: @escaping @MainActor (NSWindow, NSWindow) -> Void = {
+      target, window in
+      target.addTabbedWindow(window, ordered: .below)
     },
     orderAndActivateWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.makeKeyAndOrderFront(nil)
@@ -124,15 +196,21 @@ final class DocumentWindowRegistry: ObservableObject {
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
     },
+    tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
+      window.tabbedWindows ?? [window]
+    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
     self.scheduleDeferredMainWork = scheduleDeferredMainWork
     self.scheduleLauncherWindowSweep = scheduleLauncherWindowSweep
+    self.scheduleRestoreStep = scheduleRestoreStep
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
+    self.mergeWindowIntoTabsBehind = mergeWindowIntoTabsBehind
     self.orderAndActivateWindow = orderAndActivateWindow
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
+    self.tabGroupWindows = tabGroupWindows
     self.closeWindow = closeWindow
     self.makeDocumentWindow = makeDocumentWindow
   }
@@ -144,11 +222,100 @@ final class DocumentWindowRegistry: ObservableObject {
   /// already as a tab. The per-window SwiftUI scene cold-starts AFTER
   /// presentation, inside the tab, behind the in-tab startup spinner.
   func open(_ ref: DocumentRef) {
+    open(ref, presentation: .activateNow)
+  }
+
+  /// The launch restore's bulk open — every ad-hoc file the user left open at
+  /// quit, in one pass.
+  ///
+  /// Opening them one interactive `open(_:)` at a time was the launch
+  /// beachball. Each of those calls makes its window the selected tab, and
+  /// AppKit answers a tab-group insertion by syncing the frames of the windows
+  /// ALREADY in the group to the newcomer
+  /// (`-[NSWindowStackController _syncInactiveTabWindowSizesToWindow:]`); every
+  /// one of those frame changes forces a synchronous full layout of that tab's
+  /// view tree, and a Pensieve document window lays out to a complete Markdown
+  /// preview render. Twelve restored files therefore paid a quadratic number of
+  /// full renders on the main thread before the app drew anything — minutes, on
+  /// a workspace the size of the operator's.
+  ///
+  /// So the restore joins the tab group WITHOUT selecting each tab, and orders
+  /// the last one front once at the end. Same files, same order, same window in
+  /// front when the dust settles.
+  ///
+  /// That removed the quadratic term and NOT the beachball. Measured on the
+  /// staged build (twelve ad-hoc files, window on screen at t+0.7s, first event
+  /// serviced at t+8.6s): `_syncInactiveTabWindowSizesToWindow:` ends in an
+  /// explicit `CA::Transaction::commit()`, and a CoreAnimation commit runs the
+  /// PROCESS-WIDE layout pass — so the newcomer's own hosting view, brand new
+  /// and entirely dirty, is laid out synchronously inside the insertion whether
+  /// or not its tab is selected. A tab behind the selected one does not "wait
+  /// to be looked at": it pays its first full SwiftUI layout the moment it
+  /// joins the group, ~0.6s of it. Twelve of those back to back is ONE
+  /// uninterruptible main-thread block, and by then the window is already on
+  /// screen — which is what the operator sees as a frozen app.
+  ///
+  /// The cost per tab is the tab's own first layout and is not this pass's to
+  /// avoid. The freeze is: so the queue is drained ONE tab per run-loop turn.
+  /// The app services events between tabs, the window stays alive while the
+  /// rest of the working set arrives, and the pass still ends in exactly one
+  /// ordering.
+  func openRestoredDocuments(_ refs: [DocumentRef]) {
+    pendingRestoreRefs.append(contentsOf: refs)
+    guard !restoreStepScheduled else { return }
+    openNextRestoredDocument()
+  }
+
+  /// Records a document as ALREADY on screen in a window the registry did not
+  /// present. The launch window loads the first restored file into ITSELF
+  /// rather than spawning a tab for it: that window is up from the start, but
+  /// its SwiftUI accessor attaches asynchronously — late enough to land after
+  /// this pass has fronted its last tab. Without the note, `completeAttach`
+  /// reads that attach as the document's first presentation and pulls the
+  /// launch window in front of the tab the restore deliberately chose.
+  ///
+  /// A note describes exactly ONE presentation and the attach reporting it
+  /// consumes it, so a later close-and-reopen of the same document is a genuine
+  /// first presentation again.
+  func noteDocumentAlreadyOnScreen(_ documentID: URL) {
+    documentsAlreadyOnScreen.insert(documentID.standardizedFileURL)
+  }
+
+  private func openNextRestoredDocument() {
+    restoreStepScheduled = false
+    if !pendingRestoreRefs.isEmpty {
+      let ref = pendingRestoreRefs.removeFirst()
+      if let window = open(ref, presentation: .joinTabGroupInBackground) {
+        restoreFrontmostWindow = WeakWindow(window)
+      }
+    }
+    guard !pendingRestoreRefs.isEmpty else {
+      finishRestorePass()
+      return
+    }
+    restoreStepScheduled = true
+    scheduleRestoreStep { [weak self] in
+      self?.openNextRestoredDocument()
+    }
+  }
+
+  private func finishRestorePass() {
+    let frontmost = restoreFrontmostWindow?.window
+    restoreFrontmostWindow = nil
+    guard let frontmost else { return }
+    orderAndActivateWindow(frontmost)
+  }
+
+  @discardableResult
+  private func open(
+    _ ref: DocumentRef,
+    presentation: DocumentWindowPresentation
+  ) -> NSWindow? {
     let documentID = ref.id.standardizedFileURL
     let identity = DocumentIdentity.file(documentID).standardized
     guard canMutateWindowTabs() else {
-      deferOpen(ref, documentID: documentID)
-      return
+      deferOpen(ref, documentID: documentID, presentation: presentation)
+      return nil
     }
 
     if let existing = windowsByIdentity[identity]?.window {
@@ -159,9 +326,11 @@ final class DocumentWindowRegistry: ObservableObject {
         DebugTrace.log(
           "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
         mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
-        orderAndActivateWindow(existing)
+        if presentation == .activateNow {
+          orderAndActivateWindow(existing)
+        }
         closeEmptyLauncherWindows(except: existing)
-        return
+        return existing
       }
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
       windowsByDocumentID.removeValue(forKey: documentID)
@@ -172,11 +341,11 @@ final class DocumentWindowRegistry: ObservableObject {
 
     guard let makeDocumentWindow else {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> no window factory wired")
-      return
+      return nil
     }
-    guard let window = makeDocumentWindow(ref) else {
+    guard let window = makeDocumentWindow(ref, .explicitDocument) else {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned nil")
-      return
+      return nil
     }
     DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory created window")
 
@@ -193,14 +362,36 @@ final class DocumentWindowRegistry: ObservableObject {
       isDirty: false,
       window: window)
 
+    var didJoinTabGroup = false
     if let target = currentMergeTarget(), target !== window {
       prepareTabbedWindow(target)
       prepareTabbedWindow(window)
-      mergeWindowIntoTabs(target, window)
+      // Every window in a tab group ends up sharing one frame — AppKit enforces
+      // that on each insertion, and enforces it by RESIZING the windows already
+      // in the group, which lays each of their view trees out synchronously.
+      // The factory hands us a window sized to its own recipe, so that sync had
+      // something to do on every single open. Adopting the target's frame here
+      // — before the window has ever been shown, while its hosting view still
+      // has nothing laid out — leaves the group already consistent and the sync
+      // with nothing to resize.
+      window.setFrame(target.frame, display: false)
+      switch presentation {
+      case .activateNow:
+        mergeWindowIntoTabs(target, window)
+      case .joinTabGroupInBackground:
+        mergeWindowIntoTabsBehind(target, window)
+      }
+      didJoinTabGroup = true
       DebugTrace.log("merged '\(window.title)' into '\(target.title)' before first presentation")
     }
-    orderAndActivateWindow(window)
+    // A window with no group to join has no other way onto the screen: order it
+    // front even during a restore, or the file "came back" into an invisible
+    // window. With a group, the restore's own final ordering is the only one.
+    if presentation == .activateNow || !didJoinTabGroup {
+      orderAndActivateWindow(window)
+    }
     closeEmptyLauncherWindows(except: window)
+    return window
   }
 
   /// The single close lifecycle for factory callbacks and process-wide AppKit
@@ -256,6 +447,12 @@ final class DocumentWindowRegistry: ObservableObject {
   /// finishes the in-progress close; suppressed during termination so Quit is
   /// never fought by a resurrected launcher, and a no-op when any other document
   /// or launcher window is still alive.
+  ///
+  /// The replacement launcher starts with `.dockReopen`: the user emptied the
+  /// app on purpose, so the workspace comes back but no document is picked for
+  /// them. Starting it as a cold launch is what made `Close` on the last
+  /// document look like a no-op — the launcher immediately absorbed
+  /// `documents.first` back in.
   private func requestLauncherReopenIfAppWouldBeWindowless() {
     guard !isTerminating, !launcherReopenPending else { return }
     guard !hasContentWindow else {
@@ -280,7 +477,7 @@ final class DocumentWindowRegistry: ObservableObject {
         $0.window?.contentView != nil
       }
       guard !hasLiveDocumentWindow else { return }
-      self.openLauncherWindow()
+      self.openLauncherWindow(intent: .dockReopen)
     }
   }
 
@@ -311,7 +508,7 @@ final class DocumentWindowRegistry: ObservableObject {
       }
       return
     }
-    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil) else {
+    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil, .newUntitledTab) else {
       DebugTrace.log("newUntitledTab -> no window factory wired")
       return
     }
@@ -472,7 +669,13 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
-    if orderedDocumentIDs.insert(documentID).inserted {
+    // A window that started showing a document without going through `open()`
+    // has no other way of getting in front — unless it is already there, which
+    // is what a note says. Both facts are consumed here: the ordering record is
+    // taken either way, the activation only when nobody put it on screen first.
+    let isFirstPresentation = orderedDocumentIDs.insert(documentID).inserted
+    let wasAlreadyOnScreen = documentsAlreadyOnScreen.remove(documentID) != nil
+    if isFirstPresentation, !wasAlreadyOnScreen {
       orderAndActivateWindow(window)
     }
     closeEmptyLauncherWindows(except: window)
@@ -566,6 +769,54 @@ final class DocumentWindowRegistry: ObservableObject {
     controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
   }
 
+  /// Whether `window` is still a live, registered document window. The root
+  /// view drops its registration on `willCloseNotification`, so this is the
+  /// app's own answer to "did that window survive the close", independent of
+  /// AppKit's tab-group bookkeeping.
+  func hasRegisteredController(for window: NSWindow) -> Bool {
+    controllersByWindow[ObjectIdentifier(window)]?.controller != nil
+  }
+
+  /// Answers what a close that arrived through `window` actually took with it.
+  ///
+  /// AppKit routes the tab's "×" and the window's red button through the SAME
+  /// `performClose`, so the gesture cannot be read at the moment it fires. The
+  /// scope can: a tab leaving a window that stays open leaves its SIBLING tabs
+  /// registered, while a window close takes the whole group down in the same
+  /// pass. So the sibling list is captured now and read back once the close has
+  /// settled — if any sibling is still a live document window, one tab left a
+  /// live window (`.tab`); otherwise the window itself went away (`.window`).
+  ///
+  /// A window with no tab siblings is `.window` by construction, answered
+  /// synchronously: closing the only document window IS closing a window, and
+  /// there is nothing to wait for. So is EVERY close once the app is
+  /// terminating: quit tears every window down at the same time, and reading
+  /// that as the user closing documents would empty the working set the next
+  /// launch restores from.
+  func resolveCloseScope(
+    for window: NSWindow,
+    then report: @escaping @MainActor (DocumentCloseScope) -> Void
+  ) {
+    guard !isTerminating else {
+      report(.window)
+      return
+    }
+    let siblings = tabGroupWindows(window).filter { $0 !== window }
+    guard !siblings.isEmpty else {
+      report(.window)
+      return
+    }
+    scheduleDeferredMainWork { [weak self] in
+      guard let self else { return }
+      guard !self.isTerminating else {
+        report(.window)
+        return
+      }
+      let groupSurvived = siblings.contains { self.hasRegisteredController(for: $0) }
+      report(groupSurvived ? .tab : .window)
+    }
+  }
+
   /// Every window controller still alive, deduplicated. `TerminationSequence` flushes each window's
   /// pending edit through these directly instead of waiting for `NSWindow.willCloseNotification`:
   /// `applicationWillTerminate` runs BEFORE window teardown, so on a Dock quit or a logout that
@@ -577,6 +828,65 @@ final class DocumentWindowRegistry: ObservableObject {
     return controllersByWindow.values.compactMap(\.controller).filter {
       seen.insert(ObjectIdentifier($0)).inserted
     }
+  }
+
+  /// The controller that should DRIVE a quit prompt pass. The pass asks EVERY
+  /// registered window regardless of who drives it; the driver only decides which
+  /// window is asked LAST, so the frontmost one wins — its prompt then reads as
+  /// "the window you quit from".
+  ///
+  /// A quit from the Dock menu, an AppleScript `quit` or a logout has no firing
+  /// window at all, which is exactly why this cannot be sourced from the ⌘Q menu
+  /// item's focused controller: any registered controller resolves the identical
+  /// set. `nil` means no document window is live — a quit with nothing to ask
+  /// about.
+  func terminationPassDriver() -> AppController? {
+    let frontmost = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+    if let frontmost,
+      let controller = controllersByWindow[ObjectIdentifier(frontmost)]?.controller
+    {
+      return controller
+    }
+    return liveDocumentControllers().first
+  }
+
+  /// Records that the unsaved-work pass for the terminate request now in flight
+  /// has ALREADY run and consented. ⌘Q runs the pass inside its own menu item and
+  /// only then calls `NSApplication.terminate(_:)`; without this the AppKit hook
+  /// would run a second pass and ask every window twice.
+  ///
+  /// Armed only on CONSENT, never on Cancel: a cancelled pass must leave the next
+  /// terminate request to ask again from scratch.
+  func armTerminationPassLatch() {
+    hasSettledTerminationPass = true
+  }
+
+  /// Reads the latch and immediately disarms it, so it covers exactly ONE
+  /// terminate request. A latch that outlived its request would let the NEXT
+  /// Dock quit through unprompted — the same silent-loss shape this whole path
+  /// exists to close.
+  func consumeTerminationPassLatch() -> Bool {
+    defer { hasSettledTerminationPass = false }
+    return hasSettledTerminationPass
+  }
+
+  /// The app's answer to a terminate request, wherever it came from: the Dock
+  /// menu's "Quit", an AppleScript `quit`, a logout, or ⌘Q's own
+  /// `NSApplication.terminate(_:)`.
+  ///
+  /// The pass is fully synchronous — `DocumentStore` resolves each dirty session
+  /// through `NSAlert.runModal()` — so this answers in ONE shot with
+  /// `.terminateNow` / `.terminateCancel`. No `.terminateLater` handshake is
+  /// needed, and none is wired: `.terminateLater` obliges the app to call
+  /// `reply(toApplicationShouldTerminate:)` exactly once on every path, an
+  /// obligation nothing here can drop or double-fire because it never takes it on.
+  func resolveTerminationRequest() -> NSApplication.TerminateReply {
+    // ⌘Q already asked, in the menu item, and every window consented. Asking
+    // again here would prompt each window twice for a single quit.
+    if consumeTerminationPassLatch() { return .terminateNow }
+    // No live document window means nothing can hold unsaved work.
+    guard let driver = terminationPassDriver() else { return .terminateNow }
+    return driver.applicationShouldTerminate() ? .terminateNow : .terminateCancel
   }
 
   /// The controller owning the window that currently shows `identity`, so a
@@ -619,12 +929,16 @@ final class DocumentWindowRegistry: ObservableObject {
       || rhs.tabbedWindows?.contains { $0 === lhs } == true
   }
 
-  private func deferOpen(_ ref: DocumentRef, documentID: URL) {
+  private func deferOpen(
+    _ ref: DocumentRef,
+    documentID: URL,
+    presentation: DocumentWindowPresentation
+  ) {
     guard deferredOpenDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self] in
       guard let self else { return }
       deferredOpenDocumentIDs.remove(documentID)
-      open(ref)
+      open(ref, presentation: presentation)
     }
   }
 

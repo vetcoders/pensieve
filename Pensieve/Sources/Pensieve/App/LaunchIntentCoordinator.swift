@@ -9,10 +9,30 @@ final class LaunchIntentCoordinator: ObservableObject {
 
   private let settleDelayNanoseconds: UInt64
   private weak var controller: AppController?
+  /// Resolves the controller a file open should target when the cold-start
+  /// launcher controller above is gone. ⌘O / File ▸ Open File act on the
+  /// window the user is actually looking at, resolved through
+  /// `CommandSurfaceContext`; a Finder/`open`/Dock file drop must land in that
+  /// SAME window, not vanish. `controller` is only ever set by the cold-start
+  /// settle path (launcher windows), never by a document window, so once the
+  /// original launcher closed a later external open was routed at a released
+  /// weak-ref and SILENTLY DROPPED — the app just kept showing the previously
+  /// opened document. Falling back to the focused controller closes that hole
+  /// while leaving cold launch (launcher attached, no window key yet) unchanged.
+  private let focusedControllerProvider: @MainActor () -> AppController?
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
-  private var hasExplicitURLIntent = false
+  /// Set when launch URLs were actually opened into a window and CONSUMED by
+  /// the next start decision.
+  ///
+  /// Its predecessor (`hasExplicitURLIntent`) was never reset: a session that
+  /// had once been launched from the Finder suppressed workspace restore for
+  /// every window it opened afterwards, for the lifetime of the process. Two
+  /// visually identical sessions then behaved differently on Close depending on
+  /// how the app had been started hours earlier. One file open is an intent for
+  /// ONE launch, so it is spent on that launch.
+  private var didOpenLaunchDocuments = false
 
   /// One-way switch set by `quiesceForTermination()`.
   ///
@@ -25,8 +45,22 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// the next scene that settles, which during a quit is a scene the pumped run loop can still build.
   private var isQuiescedForTermination = false
 
-  init(settleDelayNanoseconds: UInt64 = 0) {
+  init(
+    settleDelayNanoseconds: UInt64 = 0,
+    focusedControllerProvider: @escaping @MainActor () -> AppController? = {
+      CommandSurfaceContext.shared.controller
+    }
+  ) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
+    self.focusedControllerProvider = focusedControllerProvider
+  }
+
+  /// The controller an incoming file open should be routed to: the cold-start
+  /// launcher controller while it is alive (keeps the launch-document settle
+  /// path intact), otherwise the window the user is currently focused on. Never
+  /// resolves to a released weak-ref, so an external open is never dropped.
+  private var openTargetController: AppController? {
+    controller ?? focusedControllerProvider()
   }
 
   /// Termination command, issued by `TerminationSequence` in the quiescence phase (see the phase Q
@@ -49,8 +83,13 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.removeAll()
   }
 
+  /// Starts `controller` once any launch URLs have settled. `intent` is the one
+  /// the window was BUILT with; a file-open event that arrives before the
+  /// settle upgrades this single launch to `.explicitDocument` — the window is
+  /// showing that file, so it must not also restore a session around it.
   func startWhenLaunchIntentsSettle(
     controller: AppController,
+    intent: LaunchIntent,
     onStartupDecision: @escaping StartupDecisionHandler = {}
   ) {
     guard !isQuiescedForTermination else { return }
@@ -70,7 +109,7 @@ final class LaunchIntentCoordinator: ObservableObject {
       guard !self.isQuiescedForTermination else { return }
 
       self.drainPendingURLs()
-      controller.start(restoringWorkspace: !self.hasExplicitURLIntent)
+      controller.start(intent: self.consumeLaunchDocumentOpen() ? .explicitDocument : intent)
       self.finishStartupDecision()
     }
   }
@@ -82,14 +121,15 @@ final class LaunchIntentCoordinator: ObservableObject {
     guard !isQuiescedForTermination else { return }
     guard !urls.isEmpty else { return }
 
-    hasExplicitURLIntent = true
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
-    controller?.start(restoringWorkspace: false)
-    if controller != nil {
-      finishStartupDecision()
-    }
+    guard let target = openTargetController else { return }
+    // The URLs already landed in this window; spend the launch-document intent
+    // here so the NEXT window is judged on its own.
+    _ = consumeLaunchDocumentOpen()
+    target.start(intent: .explicitDocument)
+    finishStartupDecision()
   }
 
   func waitForStartupDecision() async {
@@ -107,11 +147,23 @@ final class LaunchIntentCoordinator: ObservableObject {
     handler?()
   }
 
+  /// Whether launch documents were opened and not yet accounted for, resetting
+  /// the record as it answers.
+  private func consumeLaunchDocumentOpen() -> Bool {
+    let didOpen = didOpenLaunchDocuments
+    didOpenLaunchDocuments = false
+    return didOpen
+  }
+
   private func drainPendingURLs() {
-    guard let controller, !pendingURLs.isEmpty else { return }
+    guard let controller = openTargetController, !pendingURLs.isEmpty else { return }
 
     let urls = pendingURLs
     pendingURLs.removeAll()
+    // Draining is what makes this launch an explicit-document launch. It can
+    // happen the moment a controller attaches — before the settle task runs —
+    // so the fact is recorded here rather than inferred at the start decision.
+    didOpenLaunchDocuments = true
 
     let supportedFileURLs = urls.filter(isSupportedLaunchFile)
     let unsupportedURLs = urls.filter { !isSupportedLaunchFile($0) }
@@ -153,10 +205,35 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   var terminationFolderManagerOverride: FolderManager?
   var terminationAutosaverOverride: Autosaver?
   var terminationLaunchIntentCoordinatorOverride: LaunchIntentCoordinator?
+  /// Launch-sweep injection seam, same shape as the termination ones above.
+  /// Production leaves it `nil` and sweeps `RecoveryStore.shared`; a test points
+  /// it at a temp directory so the LAUNCH sweep can be driven for real without
+  /// touching the operator's own crash drafts.
+  var launchRecoveryStoreOverride: RecoveryStore?
+
+  /// The application's ONE retention sweep for crash drafts, run at the one
+  /// moment nothing can be holding a draft open: drafts nobody came back for
+  /// within 30 days go, and whatever survives is capped. Recovery is a safety
+  /// net, not an archive.
+  ///
+  /// It lives HERE, on `applicationDidFinishLaunching`, and not in
+  /// `AppController.start`: `start` runs once per WINDOW (every launcher, every
+  /// Dock reopen, every "+" tab), while retention is a once-per-process fact,
+  /// and this hook is also the only launch point guaranteed to run BEFORE any
+  /// window can adopt a draft. Verified at runtime on macOS 26 (Darwin 25.6),
+  /// debug build, 2026-08-03: the `@NSApplicationDelegateAdaptor` instance does
+  /// receive `applicationDidFinishLaunching`, and the sweep dropped 6 of 26
+  /// seeded drafts (1 expired + 5 over the cap) before the launcher appeared.
+  @discardableResult
+  func pruneRecoveredDraftsOnLaunch() -> [UUID] {
+    (launchRecoveryStoreOverride ?? .shared).pruneDrafts()
+  }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
+
+    pruneRecoveredDraftsOnLaunch()
 
     // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
@@ -195,7 +272,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       await Task.yield()
       if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
         if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-          DocumentWindowRegistry.shared.openLauncherWindow()
+          DocumentWindowRegistry.shared.openLauncherWindow(intent: .coldLaunch)
         } else {
           NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
         }
@@ -203,6 +280,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  /// Clicking the Dock icon with no windows open reopens an EMPTY launcher.
+  /// Closing every document is a conscious act; reactivating the app is not a
+  /// request to undo it, so nothing is selected back into the new window.
   func applicationShouldHandleReopen(
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
@@ -210,7 +290,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     guard !flag else { return true }
     Task { @MainActor in
       if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-        DocumentWindowRegistry.shared.openLauncherWindow()
+        DocumentWindowRegistry.shared.openLauncherWindow(intent: .dockReopen)
       } else {
         NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
       }
@@ -221,6 +301,30 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   func application(_ application: NSApplication, open urls: [URL]) {
     Task { @MainActor in
       LaunchIntentCoordinator.shared.handle(urls: urls)
+    }
+  }
+
+  /// The veto point for EVERY quit that does not come from the ⌘Q menu item: the
+  /// Dock menu's "Quit", an AppleScript `quit`, a logout, a restart. Those reach
+  /// `NSApplication.terminate(_:)` with no firing window, so before this hook
+  /// existed they skipped the unsaved-work pass entirely and every window fell to
+  /// its teardown path — which can stash a recovery draft but has no veto point
+  /// and can never ask. With auto-save off a dirty FILE-BACKED buffer gets no
+  /// draft either, so the edit was simply gone.
+  ///
+  /// Verified at runtime on macOS 26 (Darwin 25.6), staged bundle, 2026-08-02:
+  /// `NSApp.delegate` is SwiftUI's own `SwiftUI.AppDelegate` proxy, NOT this
+  /// object — but it FORWARDS `applicationShouldTerminate(_:)` to the
+  /// `@NSApplicationDelegateAdaptor` instance, and a file probe written from
+  /// inside this method landed on an AppleScript quit. ⌘Q keeps its own pass in
+  /// `Commands.swift` (unchanged) because `NSApplication.terminate(_:)` does NOT
+  /// reliably reach this hook — `NSSupportsSuddenTermination` is true in
+  /// `Info.plist`, and a programmatic terminate can exit the process outright.
+  /// Moving the pass OFF the menu item is therefore a data-loss regression, which
+  /// is what the 2026-07-29 attempt hit.
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    MainActor.assumeIsolated {
+      DocumentWindowRegistry.shared.resolveTerminationRequest()
     }
   }
 
