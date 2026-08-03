@@ -37,7 +37,20 @@ struct WorkspaceValidationResult: @unchecked Sendable {
   var scans: [WorkspaceScan]
   var fingerprint: TreeFingerprint?
   var verdict: WorkspaceCacheVerdict?
+  /// The baseline to restore into `lastWorkspaceSignature`: the persisted signature when there is
+  /// one, the walk's own signature otherwise. Deliberately lossy — a caller that needs to know
+  /// WHICH of the two it got must read the two fields below.
   var searchSignature: WorkspaceSignature?
+  /// The persisted `.md` signature alone, `nil` when this workspace has never had one written.
+  ///
+  /// Round 21, finding 1. `searchSignature` above collapses "the index agrees with the tree" and "we
+  /// had nothing to compare it against" into one value, which is fine for restoring a baseline and
+  /// wrong for a SKIP decision: the persisted signature is the only cold-start artifact written
+  /// AFTER its index write succeeded, so it is the only one that can corroborate the manifest's
+  /// fingerprint — which is written BEFORE. See `FolderManager.persistedIndexAgreesWithTree`.
+  var persistedSearchSignature: WorkspaceSignature?
+  /// The `.md` signature derived from THIS walk, so the skip gate can compare without re-scanning.
+  var currentSearchSignature: WorkspaceSignature?
 }
 
 /// Immutable validation configuration shared with detached open jobs. The cache store is itself
@@ -114,9 +127,9 @@ final class WorkspaceSubstrate: @unchecked Sendable {
       try Task.checkCancellation()
 
       probe(.searchSignature)
-      let searchSignature =
-        store.readSearchSignature(for: identity)
-        ?? FolderManager.signature(from: scans)
+      let persistedSearchSignature = store.readSearchSignature(for: identity)
+      let currentSearchSignature = FolderManager.signature(from: scans)
+      let searchSignature = persistedSearchSignature ?? currentSearchSignature
       try Task.checkCancellation()
 
       if persistPresentationCache, case .valid = verdict {
@@ -132,7 +145,9 @@ final class WorkspaceSubstrate: @unchecked Sendable {
         scans: scans,
         fingerprint: fingerprint,
         verdict: verdict,
-        searchSignature: searchSignature
+        searchSignature: searchSignature,
+        persistedSearchSignature: persistedSearchSignature,
+        currentSearchSignature: currentSearchSignature
       )
     }
   }

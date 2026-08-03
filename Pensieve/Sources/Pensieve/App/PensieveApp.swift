@@ -20,6 +20,11 @@ struct PensieveApp: App {
   private let launchSettings: LaunchSettings
 
   init() {
+    // Register the bundled OFL theme fonts into this process's font environment
+    // before any view builds. Idempotent and non-fatal — a missing/failed font
+    // never blocks launch; the skin CSS fallback chains cover absence.
+    BundledFonts.registerOnce()
+
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
@@ -160,6 +165,12 @@ struct DocumentWindowRootView: View {
 
   var body: some View {
     ContentView(hostWindow: $currentWindow)
+      // Every window this app can build — the scene-owned launcher (which is
+      // where restoration puts the recovered document), a state-restored
+      // WindowGroup scene, and every factory-built native tab — shares THIS
+      // root, so declaring the skin's appearance once here is what makes a
+      // light skin light on all of them, chrome included.
+      .pensieveSkinAppearance(themeManager)
       .environment(appState)
       .environmentObject(controller)
       .environmentObject(controller.transcriptionService)
@@ -194,6 +205,17 @@ struct DocumentWindowRootView: View {
           // Publish this window's owning controller so a cross-window "Close
           // from Open Files" routes its dirty guard through this session.
           DocumentWindowRegistry.shared.registerController(controller, for: window)
+          // Give the red close button / tab "×" the same conscious Save / Don't
+          // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
+          // flush. EVERY window this app can build gets it, not just the
+          // factory-built ones: the launcher scene SwiftUI auto-presents at
+          // every cold start is an `AppKitWindow`, and it is the window the
+          // restored session, a cold-start Finder open and ⌘N all land in. See
+          // `ConsciousCloseHook` for how a window whose class and delegate
+          // belong to SwiftUI is reached.
+          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow in
+            controller?.windowShouldClose(closingWindow) ?? true
+          }
         }
       )
       .frame(
@@ -233,20 +255,32 @@ struct DocumentWindowRootView: View {
       // focused values go silent.
       .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) {
         notification in
-        guard let keyWindow = notification.object as? NSWindow, keyWindow === currentWindow else {
-          return
-        }
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: currentWindow, keyWindow: notification.object as? NSWindow)
+        else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
-      // App-wide close guard. Every window (factory-built document tab AND
+      // Second half of the same rule. The accessor above is coalesced and
+      // async, so a factory-built native tab is regularly key BEFORE this root
+      // knows which window is its own — and `didBecomeKey` has already fired
+      // and will not fire again. Without this trigger such a tab never adopts,
+      // and the fallback keeps serving the PREVIOUS tab's session.
+      .onChange(of: currentWindow) { _, resolvedWindow in
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: resolvedWindow, keyWindow: NSApp.keyWindow)
+        else { return }
+        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+      }
+      // App-wide save-on-close guard. Every window (factory-built document tab AND
       // state-restored WindowGroup scene) shares this root, and every close
       // trigger — red close button, the tab's "×", the sidebar "Close from Open
       // Files", or ⌘W falling through to a native window close — posts
       // `willCloseNotification` for the closing window. Filtering to THIS window's
       // `currentWindow` flushes only its own session, synchronously, before the
       // window/`AppState` tears down — closing the ≤1.5s autosave-debounce data
-      // loss without touching the window delegate SwiftUI owns — and retires the
-      // document from the Open Files working set.
+      // loss without touching the window delegate SwiftUI owns.
       .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
         notification in
         guard let closingWindow = notification.object as? NSWindow,
@@ -254,7 +288,7 @@ struct DocumentWindowRootView: View {
         else {
           return
         }
-        controller.documentWindowWillClose()
+        controller.savePendingChangesOnClose()
         CommandSurfaceContext.shared.release(controller: controller)
         DocumentWindowRegistry.shared.unregisterController(for: closingWindow)
       }
@@ -267,9 +301,24 @@ struct DocumentWindowRootView: View {
     // The close confirmation is a sheet on THIS window, not an app-modal
     // alert: ⌘W on one document tab must leave every other document usable.
     controller.hostWindowProvider = { currentWindow }
+    controller.requestOpenRestoredDocumentWindows = { refs in
+      DocumentWindowRegistry.shared.openRestoredDocuments(refs)
+    }
+    controller.requestNoteDocumentAlreadyOnScreen = { documentID in
+      DocumentWindowRegistry.shared.noteDocumentAlreadyOnScreen(documentID)
+    }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
+    }
+    // A window that adopted the crash draft holds real work behind no URL, so
+    // nothing else would ever reclassify it out of "launcher".
+    controller.requestPromoteWindowToContent = {
+      guard let currentWindow else { return }
+      DocumentWindowRegistry.shared.markWindowAsContent(currentWindow)
+    }
+    controller.requestLauncherSweepReconcile = {
+      DocumentWindowRegistry.shared.reconcileLaunchersAfterRestoreSettled()
     }
   }
 

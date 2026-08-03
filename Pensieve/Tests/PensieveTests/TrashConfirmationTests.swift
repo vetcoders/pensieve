@@ -331,6 +331,24 @@ final class LockedCounter: @unchecked Sendable {
   }
 }
 
+/// Counts scanner walks, which is how a test proves a workspace producer did — or did NOT — arm.
+/// Every refresh path (`scheduleExplicitRefresh`, `performWatcherRefresh`, the open-flow build) runs
+/// its walk through the injected builder, so an invocation is the arming made observable; asserting
+/// on the count is what turns "no refresh armed after quiescence" into a measurement instead of a
+/// claim about a private task handle.
+final class CountingWorkspaceBuilder: @unchecked Sendable {
+  private let counter = LockedCounter()
+
+  var invocations: Int { counter.value }
+
+  func reset() { counter.reset() }
+
+  lazy var builder: WorkspaceScanner.Builder = { [counter] roots, exclusions in
+    counter.add(1)
+    return WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+  }
+}
+
 final class BlockingWorkspaceBuilder: @unchecked Sendable {
   private let release = DispatchSemaphore(value: 0)
 

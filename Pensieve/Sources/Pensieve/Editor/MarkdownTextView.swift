@@ -23,20 +23,78 @@ class MarkdownTextView: NSTextView {
     super.undoManager ?? fallbackUndoManager
   }
 
+  /// Character range currently laid out in the viewport, or `nil` while layout
+  /// has not established one yet (before the first viewport pass, or while the
+  /// surface has no window at all — the launch ordering, where the skin is
+  /// applied before the view is hosted).
+  ///
+  /// This is what lets a live skin switch repaint the visible text first and
+  /// defer the rest of the document; see `MarkdownTextStorage.rethemeHighlighting`.
+  var visibleCharacterRange: NSRange? {
+    guard let layoutManager = textLayoutManager,
+      let contentManager = layoutManager.textContentManager,
+      let viewportRange = layoutManager.textViewportLayoutController.viewportRange
+    else { return nil }
+
+    let documentStart = contentManager.documentRange.location
+    let location = contentManager.offset(from: documentStart, to: viewportRange.location)
+    let end = contentManager.offset(from: documentStart, to: viewportRange.endLocation)
+    guard location != NSNotFound, end != NSNotFound, end >= location else { return nil }
+    return NSRange(location: location, length: end - location)
+  }
+
   /// The window undo manager our entries land in, captured while attached so we can
   /// scrub them on detach. See `viewWillMove(toWindow:)` for why `self.window` is not a
   /// reliable source at detach time.
   private weak var attachedWindowUndoManager: UndoManager?
 
+  /// Every object this editor's undo entries are registered AGAINST, so a detach can
+  /// scrub all of them off the window's undo manager.
+  ///
+  /// `self` is only one of them, and not the dangerous one. AppKit's typing undo does
+  /// NOT target the text view: it registers `_undoRedoTextOperation:` against the
+  /// **text storage** (`-[NSTextStorage _undoRedoTextOperation:]` — the selector sitting
+  /// in `x1` of crash report build 528, and the method NSTextView does not even
+  /// implement). Scrubbing only `self`, as the first version of this guard did, therefore
+  /// left every keystroke's entry in place and the SIGSEGV survived the fix.
+  ///
+  /// The TextKit 2 objects are reached through `textContentStorage`, never through the
+  /// TextKit 1 `textStorage` / `layoutManager` compatibility accessors: touching those on
+  /// a TextKit 2 view can force the whole surface back into the legacy layout path.
+  /// Each surface builds its own storage/layout stack (`MarkdownEditorSurface.init`), so
+  /// nothing here is shared with another live editor.
+  private var undoTargets: [AnyObject] {
+    var targets: [AnyObject] = [self]
+    if let textContentStorage {
+      targets.append(textContentStorage)
+      if let storage = textContentStorage.textStorage {
+        targets.append(storage)
+      }
+    }
+    if let textLayoutManager {
+      targets.append(textLayoutManager)
+    }
+    return targets
+  }
+
+  private func scrubUndoEntries(from manager: UndoManager?) {
+    guard let manager else { return }
+    for target in undoTargets {
+      manager.removeAllActions(withTarget: target)
+    }
+  }
+
   /// Detach guard for the window's undo stack.
   ///
-  /// This view registers undo actions with a target of `self` into the WINDOW's undo
-  /// manager — both implicitly (AppKit typing-undo via `allowsUndo`) and explicitly
-  /// (`registerSmartPasteUndo`). That manager lives with the window, not the view, and
-  /// holds its targets `unsafe-unretained`. When SwiftUI tears this representable down
-  /// and rebuilds it, the old view is freed while its entries stay in the window's
-  /// manager — so the first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke →
-  /// objc_msgSend` onto a dangling pointer (the SIGSEGV in crash report 2026-07-19).
+  /// This editor registers undo actions into the WINDOW's undo manager — implicitly
+  /// (AppKit typing-undo via `allowsUndo`, targeting the text storage) and explicitly
+  /// (`registerSmartPasteUndo`, targeting `self`). That manager lives with the window,
+  /// not with the editor, and holds its targets `unsafe-unretained`. When SwiftUI tears
+  /// this representable down and rebuilds it — a live skin switch does exactly that —
+  /// the old view and its storage are freed while their entries stay in the surviving
+  /// window's manager. The first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke
+  /// → objc_msgSend` onto a dangling pointer (SIGSEGV, crash reports 2026-07-19 and
+  /// build 528).
   ///
   /// Clearing on `deinit` cannot fix this: by then `super.undoManager` is already `nil`,
   /// so we would scrub the `fallbackUndoManager` and miss the window's real one. Nor can
@@ -44,9 +102,14 @@ class MarkdownTextView: NSTextView {
   /// removed, the superview chain is already severed by the time this descendant's
   /// `viewWillMove` fires, so `self.window` resolves to `nil`. We therefore scrub the
   /// manager captured in `viewDidMoveToWindow` while the view was still attached.
+  ///
+  /// This is the single seam every close path funnels through: SwiftUI teardown removes
+  /// the scroll view from its superview, and `DocumentWindow.close()` (Cmd+W, the tab ×,
+  /// the red button, and the quit sweep alike) nils the window's `contentView` one runloop
+  /// turn later — both send `viewWillMove(toWindow: nil)` down the whole subtree.
   override func viewWillMove(toWindow newWindow: NSWindow?) {
     if newWindow !== window {
-      (window?.undoManager ?? attachedWindowUndoManager)?.removeAllActions(withTarget: self)
+      scrubUndoEntries(from: window?.undoManager ?? attachedWindowUndoManager)
     }
     super.viewWillMove(toWindow: newWindow)
   }
@@ -83,9 +146,51 @@ class MarkdownTextView: NSTextView {
     // (proportional system) font and visibly "pops" to monospace only once the debounced
     // highlight pass re-applies attributes — the font-jump the operator saw per keystroke.
     // `EditorRepresentable.update` keeps these in sync when the font size changes.
-    let baseFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    // No theme has landed yet, so `monoFamily` is empty and this resolves to the
+    // system monospaced face; `applyTheme` swaps in the skin's family.
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: 14)
     font = baseFont
     typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
+  }
+
+  /// Monospace family the active theme dresses the source panel in
+  /// (`ThemeTokens.monoFamily`). Empty until a theme lands — and empty for the
+  /// adaptive skins — which resolves to the system monospaced face.
+  private(set) var monoFamily: String = ""
+
+  /// Applies the active theme to the editor surface: the pane background is the
+  /// theme `source`, the caret + typing colour follow the theme `text`, the pane
+  /// takes the theme's monospace family, and the gutter receives its own
+  /// source-panel tokens. Called from `MarkdownEditorSurface` on setup and
+  /// whenever the skin changes.
+  ///
+  /// The family has to land here, not only in the highlighter: `font` and
+  /// `typingAttributes` are what freshly typed characters are drawn with before
+  /// the debounced highlight pass reaches them, so leaving them on the previous
+  /// family would make every keystroke flash the old face.
+  ///
+  /// `baseSize` is passed in rather than read back from `font`. `NSTextView.font`
+  /// is a *rendered* attribute — it answers with the font of the FIRST character,
+  /// which the highlighter has already grown to a heading size on any document
+  /// that opens with `#` (h1 is `baseFontSize + 12`). Deriving the base face from
+  /// it made every live skin switch re-seed the caret at heading size, so the
+  /// next character typed came out 26 pt on a 14 pt document. The authority is
+  /// the storage's own base size, which is what the highlighter lays down.
+  func applyTheme(_ tokens: ThemeTokens, baseSize: CGFloat) {
+    let source = tokens.source.nsColor
+    let text = tokens.text.nsColor
+    drawsBackground = true
+    backgroundColor = source
+    insertionPointColor = text
+    monoFamily = tokens.monoFamily
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: baseSize)
+    font = baseFont
+    var attributes = typingAttributes
+    attributes[.font] = baseFont
+    attributes[.foregroundColor] = text
+    typingAttributes = attributes
+    autocompleteGhostField?.font = baseFont
+    gutter?.applyTokens(tokens)
   }
 
   func setupGutter(layoutManager: NSTextLayoutManager) {
@@ -172,7 +277,7 @@ class MarkdownTextView: NSTextView {
       addSubview(ghostField)
     }
     ghostField.stringValue = suggestion
-    ghostField.font = font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ghostField.font = font ?? MonoFontResolver.font(family: monoFamily, size: 14)
     ghostField.sizeToFit()
     ghostField.setFrameOrigin(
       autocompleteGhostOrigin(caretLocation: caretLocation, size: ghostField.frame.size))

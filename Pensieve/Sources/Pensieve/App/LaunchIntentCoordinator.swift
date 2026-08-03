@@ -23,8 +23,39 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// ONE launch, so it is spent on that launch.
   private var didOpenLaunchDocuments = false
 
+  /// One-way switch set by `quiesceForTermination()`.
+  ///
+  /// Cancelling `startupTask` is not enough on its own, and never was. The task's only suspension is
+  /// `try? await Task.sleep(...)`, so a cancellation raised there is SWALLOWED by the `try?` and the
+  /// body runs on to `controller.start` regardless — and with the production settle delay of 0 the
+  /// body has no suspension point at all, so a cancel issued before it is scheduled cannot stop it
+  /// either. The latch is what actually stops it. It is ONE-WAY because
+  /// `startWhenLaunchIntentsSettle` re-arms the task on every call: a lone cancel would be undone by
+  /// the next scene that settles, which during a quit is a scene the pumped run loop can still build.
+  private var isQuiescedForTermination = false
+
   init(settleDelayNanoseconds: UInt64 = 0) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
+  }
+
+  /// Termination command, issued by `TerminationSequence` in the quiescence phase (see the phase Q
+  /// inventory there — this type is a member of it, not a second owner of the phase state).
+  ///
+  /// This coordinator is a producer OF producers: `controller.start` restores the workspace and
+  /// creates fresh validation, build, watcher, manifest and index work. Left alive, a startup task
+  /// that has not settled yet runs inside the quit's own pumped run loop and rebuilds exactly what
+  /// phase Q has just stopped — and a manifest/cache commit that lands while its post-latch index
+  /// write is refused leaves the launch metadata ahead of FTS for the next cold start's skip
+  /// decision.
+  ///
+  /// Idempotent, and nothing may re-arm afterwards — which is what keeps the drain that follows a
+  /// wait for a FINITE set of work rather than a target this coordinator keeps moving.
+  func quiesceForTermination() {
+    isQuiescedForTermination = true
+    startupTask?.cancel()
+    startupTask = nil
+    startupDecisionHandler = nil
+    pendingURLs.removeAll()
   }
 
   /// Starts `controller` once any launch URLs have settled. `intent` is the one
@@ -36,6 +67,7 @@ final class LaunchIntentCoordinator: ObservableObject {
     intent: LaunchIntent,
     onStartupDecision: @escaping StartupDecisionHandler = {}
   ) {
+    guard !isQuiescedForTermination else { return }
     attach(controller: controller)
     startupDecisionHandler = onStartupDecision
     startupTask?.cancel()
@@ -45,6 +77,12 @@ final class LaunchIntentCoordinator: ObservableObject {
         try? await Task.sleep(nanoseconds: self.settleDelayNanoseconds)
       }
 
+      // Re-checked HERE, after the settle, and not only at arming time. This is the window the
+      // arming guard cannot cover: the task was armed while the app was running and is scheduled to
+      // run later, so the quit that arrives in between reaches it only through this check. See
+      // `isQuiescedForTermination` for why the `cancel()` above does not close it.
+      guard !self.isQuiescedForTermination else { return }
+
       self.drainPendingURLs()
       controller.start(intent: self.consumeLaunchDocumentOpen() ? .explicitDocument : intent)
       self.finishStartupDecision()
@@ -52,6 +90,10 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 
   func handle(urls: [URL]) {
+    // Same latch, same reason: this path calls `controller.start` too, and `application(_:open:)`
+    // hands the URLs over through a `Task`, so a Finder/Dock open that arrives as the app is quitting
+    // lands inside the pumped run loop.
+    guard !isQuiescedForTermination else { return }
     guard !urls.isEmpty else { return }
 
     pendingURLs.append(contentsOf: urls)
@@ -130,14 +172,43 @@ final class LaunchIntentCoordinator: ObservableObject {
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   private var traceObservers: [NSObjectProtocol] = []
 
+  /// Termination-path injection seams. Production leaves both `nil` and uses the app-wide
+  /// singletons; a unit test sets them so it can drive the REAL `applicationWillTerminate` entry
+  /// point against a temp database without mutating process-global state other tests share.
+  var terminationWindowRegistryOverride: DocumentWindowRegistry?
+  var terminationIndexDatabaseOverride: IndexDatabase?
+  var terminationFolderManagerOverride: FolderManager?
+  var terminationAutosaverOverride: Autosaver?
+  var terminationLaunchIntentCoordinatorOverride: LaunchIntentCoordinator?
+  /// Launch-sweep injection seam, same shape as the termination ones above.
+  /// Production leaves it `nil` and sweeps `RecoveryStore.shared`; a test points
+  /// it at a temp directory so the LAUNCH sweep can be driven for real without
+  /// touching the operator's own crash drafts.
+  var launchRecoveryStoreOverride: RecoveryStore?
+
+  /// The application's ONE retention sweep for crash drafts, run at the one
+  /// moment nothing can be holding a draft open: drafts nobody came back for
+  /// within 30 days go, and whatever survives is capped. Recovery is a safety
+  /// net, not an archive.
+  ///
+  /// It lives HERE, on `applicationDidFinishLaunching`, and not in
+  /// `AppController.start`: `start` runs once per WINDOW (every launcher, every
+  /// Dock reopen, every "+" tab), while retention is a once-per-process fact,
+  /// and this hook is also the only launch point guaranteed to run BEFORE any
+  /// window can adopt a draft. Verified at runtime on macOS 26 (Darwin 25.6),
+  /// debug build, 2026-08-03: the `@NSApplicationDelegateAdaptor` instance does
+  /// receive `applicationDidFinishLaunching`, and the sweep dropped 6 of 26
+  /// seeded drafts (1 expired + 5 over the cap) before the launcher appeared.
+  @discardableResult
+  func pruneRecoveredDraftsOnLaunch() -> [UUID] {
+    (launchRecoveryStoreOverride ?? .shared).pruneDrafts()
+  }
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
 
-    // Retention sweep for crash drafts, at the one moment nothing holds one
-    // open: drafts nobody came back for within 30 days go, and the rest are
-    // capped. Recovery is a safety net, not an archive.
-    RecoveryStore.shared.pruneDrafts()
+    pruneRecoveredDraftsOnLaunch()
 
     // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
@@ -208,12 +279,46 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  func applicationWillTerminate(_ notification: Notification) {
-    // The last document window closing during Quit must not resurrect a
-    // launcher; tell the registry the app is going away before its windows tear
-    // down.
+  /// The veto point for EVERY quit that does not come from the ⌘Q menu item: the
+  /// Dock menu's "Quit", an AppleScript `quit`, a logout, a restart. Those reach
+  /// `NSApplication.terminate(_:)` with no firing window, so before this hook
+  /// existed they skipped the unsaved-work pass entirely and every window fell to
+  /// its teardown path — which can stash a recovery draft but has no veto point
+  /// and can never ask. With auto-save off a dirty FILE-BACKED buffer gets no
+  /// draft either, so the edit was simply gone.
+  ///
+  /// Verified at runtime on macOS 26 (Darwin 25.6), staged bundle, 2026-08-02:
+  /// `NSApp.delegate` is SwiftUI's own `SwiftUI.AppDelegate` proxy, NOT this
+  /// object — but it FORWARDS `applicationShouldTerminate(_:)` to the
+  /// `@NSApplicationDelegateAdaptor` instance, and a file probe written from
+  /// inside this method landed on an AppleScript quit. ⌘Q keeps its own pass in
+  /// `Commands.swift` (unchanged) because `NSApplication.terminate(_:)` does NOT
+  /// reliably reach this hook — `NSSupportsSuddenTermination` is true in
+  /// `Info.plist`, and a programmatic terminate can exit the process outright.
+  /// Moving the pass OFF the menu item is therefore a data-loss regression, which
+  /// is what the 2026-07-29 attempt hit.
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     MainActor.assumeIsolated {
-      DocumentWindowRegistry.shared.beginTermination()
+      DocumentWindowRegistry.shared.resolveTerminationRequest()
+    }
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    MainActor.assumeIsolated {
+      // This notification is the one termination hook the app actually receives:
+      // `applicationShouldTerminate(_:)` on THIS delegate is never invoked under
+      // `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so wiring anything
+      // there would have looked right and done nothing. Every quit path — Dock, logout, shutdown,
+      // the custom ⌘Q item — arrives here, which is why the whole termination contract (final
+      // window saves → index drain → truncating checkpoint) has exactly one owner and it hangs off
+      // this call. See `TerminationSequence`.
+      TerminationSequence(
+        registry: terminationWindowRegistryOverride ?? .shared,
+        indexDatabase: terminationIndexDatabaseOverride ?? .shared,
+        folderManager: terminationFolderManagerOverride,
+        autosaver: terminationAutosaverOverride,
+        launchIntentCoordinator: terminationLaunchIntentCoordinatorOverride
+      ).runBlockingMainRunLoop()
     }
   }
 }
