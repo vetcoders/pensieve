@@ -196,7 +196,8 @@ final class RecentDocumentsTests: XCTestCase {
     harness.controller.requestOpenDocumentWindow = { _ in }
     let coordinator = LaunchIntentCoordinator()
     coordinator.handle(urls: [alpha])
-    coordinator.startWhenLaunchIntentsSettle(controller: harness.controller)
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: harness.controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(harness.appState.selectedDocumentID, alpha)

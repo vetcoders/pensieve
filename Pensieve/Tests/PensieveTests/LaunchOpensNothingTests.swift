@@ -171,7 +171,7 @@ final class LaunchOpensNothingTests: XCTestCase {
   /// only "Close from Open Files" retires it — and the registry re-opens a
   /// launcher after the last document window goes, so the app is never left
   /// windowless. That replacement launcher's root runs the very same
-  /// `start(restoringWorkspace: true)` as the launch one did. With the reopen
+  /// `start(intent: .coldLaunch)` as the launch one did. With the reopen
   /// gated per controller, the launcher immediately reloaded the file the user
   /// had just closed: the last document could not be closed at all without
   /// first removing its Open Files row.
@@ -408,9 +408,9 @@ private final class LaunchHarness {
     // The window the app starts in, registered as the launcher exactly the way
     // a cold start does; every LATER window comes from the factory.
     let launcherWindow = makeWindow()
-    registry.makeDocumentWindow = { _ in launcherWindow }
-    registry.openLauncherWindow()
-    registry.makeDocumentWindow = { [weak self] _ in self?.makeWindow() }
+    registry.makeDocumentWindow = { _, _ in launcherWindow }
+    registry.openLauncherWindow(intent: .coldLaunch)
+    registry.makeDocumentWindow = { [weak self] _, _ in self?.makeWindow() }
 
     return adoptRootView(for: launcherWindow)
   }
@@ -418,7 +418,7 @@ private final class LaunchHarness {
   /// The user closing the last document window. AppKit's close reaches the
   /// registry, which — so the app is never left windowless — re-opens a
   /// launcher through the factory; that launcher's root then runs the same
-  /// `start(restoringWorkspace: true)` as the launch one. Returns the
+  /// `start(intent: .coldLaunch)` as the launch one. Returns the
   /// REPLACEMENT launcher's session.
   func closeWindowAdoptingTheReplacementLauncher(_ window: NSWindow) -> RelaunchedSession {
     guard let registry else {
@@ -456,7 +456,7 @@ private final class LaunchHarness {
     controller.requestOpenDocumentWindow = { registry.open($0) }
     registry.registerController(controller, for: window)
 
-    controller.start(restoringWorkspace: true)
+    controller.start(intent: .coldLaunch)
 
     // What SwiftUI's `DocumentWindowAccessor` publishes for this window,
     // spelled out: a headless test has no render pass, so nothing else would

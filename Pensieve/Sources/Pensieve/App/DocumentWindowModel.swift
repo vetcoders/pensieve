@@ -45,6 +45,20 @@ final class DocumentWindowModel {
   /// `persistentID` takes over), so no unbounded empty-window records accrue.
   private let windowInstanceID = UUID()
 
+  /// Counts the conscious closes this window has performed (File > Close, the
+  /// sidebar's close, the tab "×" answering the save question). Restoration
+  /// flows capture it when they start and refuse to select a document if it
+  /// moved while they were walking the workspace — no restoration may reverse a
+  /// close the user asked for. A counter rather than a flag: a flag would also
+  /// block the NEXT open the user performs, a generation only blocks the flow
+  /// that was already in flight.
+  private(set) var documentCloseGeneration: Int = 0
+
+  /// Records that this window's document was closed on purpose.
+  func noteConsciousDocumentClose() {
+    documentCloseGeneration &+= 1
+  }
+
   var aiDocumentID: String {
     documentIdentity?.persistentID ?? "window:\(windowInstanceID.uuidString.lowercased())"
   }
