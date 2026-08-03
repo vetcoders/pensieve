@@ -180,15 +180,35 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   var terminationFolderManagerOverride: FolderManager?
   var terminationAutosaverOverride: Autosaver?
   var terminationLaunchIntentCoordinatorOverride: LaunchIntentCoordinator?
+  /// Launch-sweep injection seam, same shape as the termination ones above.
+  /// Production leaves it `nil` and sweeps `RecoveryStore.shared`; a test points
+  /// it at a temp directory so the LAUNCH sweep can be driven for real without
+  /// touching the operator's own crash drafts.
+  var launchRecoveryStoreOverride: RecoveryStore?
+
+  /// The application's ONE retention sweep for crash drafts, run at the one
+  /// moment nothing can be holding a draft open: drafts nobody came back for
+  /// within 30 days go, and whatever survives is capped. Recovery is a safety
+  /// net, not an archive.
+  ///
+  /// It lives HERE, on `applicationDidFinishLaunching`, and not in
+  /// `AppController.start`: `start` runs once per WINDOW (every launcher, every
+  /// Dock reopen, every "+" tab), while retention is a once-per-process fact,
+  /// and this hook is also the only launch point guaranteed to run BEFORE any
+  /// window can adopt a draft. Verified at runtime on macOS 26 (Darwin 25.6),
+  /// debug build, 2026-08-03: the `@NSApplicationDelegateAdaptor` instance does
+  /// receive `applicationDidFinishLaunching`, and the sweep dropped 6 of 26
+  /// seeded drafts (1 expired + 5 over the cap) before the launcher appeared.
+  @discardableResult
+  func pruneRecoveredDraftsOnLaunch() -> [UUID] {
+    (launchRecoveryStoreOverride ?? .shared).pruneDrafts()
+  }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
 
-    // Retention sweep for crash drafts, at the one moment nothing holds one
-    // open: drafts nobody came back for within 30 days go, and the rest are
-    // capped. Recovery is a safety net, not an archive.
-    RecoveryStore.shared.pruneDrafts()
+    pruneRecoveredDraftsOnLaunch()
 
     // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene

@@ -127,6 +127,93 @@ final class RecoveredDraftsTests: XCTestCase {
     }
   }
 
+  // MARK: - The sweep on the LAUNCH path
+
+  /// Retention is only worth anything if something actually RUNS it, and the
+  /// store's API is not evidence that anything does. This drives the
+  /// application's own launch entry point — `PensieveAppDelegate`, the
+  /// `@NSApplicationDelegateAdaptor` instance every launch goes through — and
+  /// then reads the result back through the LAUNCHER surface
+  /// (`AppController.recoveredDrafts`), which is where the user meets it.
+  ///
+  /// The three properties in one pass: an over-retention draft goes, the cap is
+  /// applied to what survives, and the draft a window is holding open right now
+  /// is exempt from both.
+  @MainActor
+  func testTheLaunchSweepDropsStaleAndOverCapDraftsAndNeverTheOpenOne() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+
+    // Everything is seeded OPEN so the write-time cap cannot evict mid-loop:
+    // what the sweep does is the thing under test, and the claims are released
+    // right after — except the one draft that stays open on purpose.
+    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40, keepOpen: true)
+    // Oldest first, so the ones the cap drops are the ones seeded first.
+    var overCap: [RecoveryDraft] = []
+    for index in 0..<25 {
+      overCap.append(
+        try seedDraft(
+          in: store, text: "draft \(index)", ageInDays: Double(25 - index), keepOpen: true))
+    }
+    // Ancient AND the very oldest in the list: retention would take it twice
+    // over if the open-draft claim did not outrank both rules.
+    let openDraft = try seedDraft(
+      in: store, text: "being edited right now", ageInDays: 400, keepOpen: true)
+    store.markDraftClosed(id: stale.id)
+    for draft in overCap { store.markDraftClosed(id: draft.id) }
+
+    let delegate = PensieveAppDelegate()
+    delegate.launchRecoveryStoreOverride = store
+    let removed = Set(delegate.pruneRecoveredDraftsOnLaunch())
+
+    XCTAssertTrue(removed.contains(stale.id), "the launch sweep kept a 40-day-old draft")
+    // 27 seeded − 1 expired = 26, trimmed to the cap of 20: the six oldest
+    // sweepable drafts go, and the open one keeps its slot.
+    for dropped in overCap.prefix(6) {
+      XCTAssertTrue(
+        removed.contains(dropped.id), "the launch sweep did not apply the count cap")
+      XCTAssertFalse(fileExists(dropped.url))
+    }
+    XCTAssertFalse(
+      removed.contains(openDraft.id),
+      "the launch sweep dropped the draft a window is editing — the only copy of that work")
+    XCTAssertTrue(fileExists(openDraft.url))
+    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
+
+    // …and the launcher the user lands on shows exactly what survived, minus
+    // the one already claimed by a window.
+    let controller = makeController(in: folder, recoveryStore: store, confirmsDiscard: false)
+    controller.refreshRecoveredDrafts()
+    let offered = Set(controller.recoveredDrafts.map(\.id))
+    XCTAssertFalse(offered.contains(stale.id))
+    XCTAssertFalse(offered.contains(openDraft.id), "a claimed draft is not an unhandled one")
+    XCTAssertEqual(offered.count, RecoveryStore.maximumDraftCount - 1)
+  }
+
+  /// A draft is two files — the `.md` and the `.title` sidecar holding its
+  /// name — and retention used to remove only the first. The orphan was
+  /// invisible (the directory listing reads `.md` only) and nothing ever
+  /// collected it, so the recovery directory grew one dead file per pruned
+  /// draft, on every launch, forever.
+  @MainActor
+  func testTheLaunchSweepTakesTheTitleSidecarWithTheDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40)
+    let fresh = try seedDraft(in: store, text: "five days old", ageInDays: 5)
+
+    let delegate = PensieveAppDelegate()
+    delegate.launchRecoveryStoreOverride = store
+    delegate.pruneRecoveredDraftsOnLaunch()
+
+    let recoveryDirectory = stale.url.deletingLastPathComponent()
+    let sidecars = try FileManager.default.contentsOfDirectory(atPath: recoveryDirectory.path)
+      .filter { $0.hasSuffix(".title") }
+    XCTAssertEqual(
+      sidecars, ["\(fresh.id.uuidString).title"],
+      "the swept draft left its title sidecar behind as a permanent orphan")
+  }
+
   // MARK: - Open
 
   @MainActor
