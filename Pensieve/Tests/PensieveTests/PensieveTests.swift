@@ -63,15 +63,18 @@ final class PensieveSmokeTests: XCTestCase {
     let codeRange = nsText.range(of: "`code`")
     let linkRange = nsText.range(of: "[link](https://example.com)")
 
+    // Default (adaptive) theme tokens: heading + inline code are neutral
+    // labelColor, links follow the linkColor token — the retired garish accents
+    // (systemGreen/Pink/controlAccentColor) no longer appear.
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: linkRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.controlAccentColor)
+      NSColor.linkColor)
     XCTAssertEqual(
       storage.attribute(.underlineStyle, at: linkRange.location, effectiveRange: nil) as? Int,
       NSUnderlineStyle.single.rawValue)
@@ -95,18 +98,20 @@ final class PensieveSmokeTests: XCTestCase {
     let taskMarker = nsText.range(of: "- [x]")
     let strikeRange = nsText.range(of: "~~removed~~")
 
+    // Default (adaptive) theme: list markers/checkboxes share the srcListMarker
+    // token (secondaryLabelColor), not systemBlue.
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: unorderedMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: orderedMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: taskMarker.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemBlue)
+      NSColor.secondaryLabelColor)
     XCTAssertEqual(
       storage.attribute(.strikethroughStyle, at: strikeRange.location, effectiveRange: nil) as? Int,
       NSUnderlineStyle.single.rawValue)
@@ -139,11 +144,11 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: editedHeadingRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemGreen)
+      NSColor.labelColor)
     XCTAssertEqual(
       storage.attribute(.backgroundColor, at: updatedFarHeadingRange.location, effectiveRange: nil)
         as? NSColor,
@@ -178,15 +183,15 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: returnRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: stringRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemRed)
+      PensieveTheme.default.tokens.srcInlineCode.nsColor)
   }
 
   @MainActor
@@ -210,7 +215,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: plainRange.location, effectiveRange: nil) as? NSColor,
       NSColor.textColor)
@@ -252,7 +257,7 @@ final class PensieveSmokeTests: XCTestCase {
       let range = updatedText.range(of: token)
       XCTAssertEqual(
         storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor,
-        NSColor.systemPink,
+        PensieveTheme.default.tokens.accent.nsColor,
         "in-block line \(token) must stay code-highlighted across cached edits")
     }
   }
@@ -292,7 +297,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: insideRange.location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
   }
 
   /// Invariant 3: deleting a ``` fence line takes the full-refresh path and the
@@ -314,7 +319,7 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(
         .foregroundColor, at: nsText.range(of: "let value").location, effectiveRange: nil)
         as? NSColor,
-      NSColor.systemPink)
+      PensieveTheme.default.tokens.accent.nsColor)
 
     // Delete the opening fence line (including its trailing newline).
     let openingLine = nsText.range(of: "```swift\n")
@@ -327,7 +332,7 @@ final class PensieveSmokeTests: XCTestCase {
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil))
     XCTAssertNotEqual(
       storage.attribute(.foregroundColor, at: letRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink,
+      PensieveTheme.default.tokens.accent.nsColor,
       "removing the opening fence must drop code highlighting from the former block body")
   }
 
@@ -356,7 +361,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertEqual(
       storage.attribute(.foregroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor,
-      NSColor.systemPink)
+      NSColor.labelColor)
   }
 
   @MainActor
@@ -567,6 +572,8 @@ final class PensieveSmokeTests: XCTestCase {
       appState.documents.map { $0.url.resolvingSymlinksInPath() },
       [noteURL.resolvingSymlinksInPath()]
     )
+    selectDocument(at: noteURL, in: appState)
+
     XCTAssertEqual(
       appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
     XCTAssertEqual(appState.activeDocumentText, "initial")
@@ -1165,11 +1172,14 @@ final class PensieveSmokeTests: XCTestCase {
     await manager.waitForPendingWorkspaceBuild()
 
     XCTAssertEqual(appState.documents.map(\.url), [noteURL.standardizedFileURL])
-    XCTAssertEqual(
-      appState.selectedDocumentID?.resolvingSymlinksInPath(), noteURL.resolvingSymlinksInPath())
-    XCTAssertEqual(appState.activeDocumentText, "launch-search-token")
+    XCTAssertNil(
+      appState.selectedDocumentID,
+      "the restore publishes the tree and indexes it; opening a document is the user's move")
     XCTAssertEqual(
       appState.workspaceSearchResults.map(\.document.id), [noteURL.standardizedFileURL])
+
+    selectDocument(at: noteURL, in: appState)
+    XCTAssertEqual(appState.activeDocumentText, "launch-search-token")
     bookmarkStore.clear(into: appState)
   }
 
@@ -1466,6 +1476,7 @@ final class PensieveSmokeTests: XCTestCase {
     )
 
     manager.open(url: folder, into: appState)
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     appState.activeDocumentText = "dirty local edit"
@@ -2491,6 +2502,7 @@ final class PensieveSmokeTests: XCTestCase {
       watcherDebounceMilliseconds: 10)
 
     manager.open(url: folder, into: appState)
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     appState.activeDocumentText = "dirty local edit"
@@ -3308,6 +3320,7 @@ final class PensieveSmokeTests: XCTestCase {
       watcher: FileWatcher(sourceFactory: { @Sendable in InertWatcherEventSource() }))
     manager.open(url: folder, into: appState)
     await manager.waitForPendingWorkspaceBuild()
+    selectDocument(at: noteURL, in: appState)
     XCTAssertEqual(appState.documentSession.text, "clean original")
 
     // The reload happens after the scheduled off-main reconcile publishes, not synchronously.
@@ -4416,6 +4429,146 @@ final class PensieveSmokeTests: XCTestCase {
       "the recovery draft must survive — a deferred Discard can't leak past an I/O abort")
   }
 
+  /// THE PIN. "Clear Open Files" snapshots identities BEFORE phase 1 — but
+  /// phase 1 can change one. Saving a dirty untitled draft runs `saveAs`, which
+  /// appends a NEW `.file` ref to `openFiles` and persists a bookmark for it,
+  /// while the snapshot still holds that window's old `.untitled(UUID)`. The
+  /// retire sweep guards on `case .file`, skipped the untitled entry, and the
+  /// file the user had just created survived both the Open Files list and the
+  /// `fileBookmarks` default — so the affordance that promises to empty the list
+  /// left an entry in it, and the next launch reopened the file.
+  @MainActor
+  func testClearOpenFilesRetiresAFileSavedDuringThePassItself() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSavedInPass-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+
+    let savedURL = folder.appendingPathComponent("rescued.md").standardizedFileURL
+    let bookmarkDefaults = makeEphemeralDefaults(prefix: "PensieveClearSavedInPass")
+    let bookmarkStore = BookmarkStore(defaults: bookmarkDefaults)
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      dirtyUntitledPrompt: { _ in .save },
+      savePanelURLProvider: { _ in savedURL })
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "work with no name yet"
+    appState.activeDocumentDirty = true
+    let untitledIdentity = try XCTUnwrap(appState.windowModel.documentIdentity)
+    XCTAssertTrue(
+      registry.attach(
+        window, identity: untitledIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(controller, for: window)
+
+    controller.clearOpenFiles()
+
+    // The Save happened, so the premise holds: there IS a new file to retire.
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, savedURL,
+      "the fixture never took the Save branch, so this pin proves nothing")
+    XCTAssertFalse(closedWindows.isEmpty, "an uncancelled pass must close the window")
+
+    XCTAssertTrue(
+      appState.openFiles.isEmpty,
+      "the file saved DURING the pass stayed in Open Files — retiring by the pre-prompt"
+        + " snapshot cannot see an identity the prompt itself created")
+    let reopened = BookmarkStore(defaults: bookmarkDefaults).restoreWorkspace(into: AppState())
+    XCTAssertTrue(
+      reopened.fileURLs.isEmpty,
+      "the bookmark persisted by the in-pass Save survived, so the next launch reopens a file"
+        + " the user just cleared")
+  }
+
+  /// CONTROL LEG. Retiring by the owner's CURRENT identity must stay inside the
+  /// same transaction: when a LATER window cancels, the pass applies nothing and
+  /// forgets nothing — including the file an earlier window saved. Its bytes are
+  /// the documented non-rollback, but the working set is not touched.
+  @MainActor
+  func testAFileSavedDuringACancelledPassIsNotRetired() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearSavedCancel-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let saveWindow = Self.makeControllerlessWindow()
+    let cancelWindow = Self.makeControllerlessWindow()
+    defer {
+      saveWindow.close()
+      cancelWindow.close()
+    }
+
+    let savedURL = folder.appendingPathComponent("rescued.md").standardizedFileURL
+    let bookmarkDefaults = makeEphemeralDefaults(prefix: "PensieveClearSavedCancel")
+    let bookmarkStore = BookmarkStore(defaults: bookmarkDefaults)
+    let saveState = AppState()
+    let saveStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      dirtyUntitledPrompt: { _ in .save },
+      savePanelURLProvider: { _ in savedURL })
+    let saveController = AppController(
+      appState: saveState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: saveStore,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(saveController.createUntitledDocument())
+    saveState.activeDocumentText = "work with no name yet"
+    saveState.activeDocumentDirty = true
+    let saveIdentity = try XCTUnwrap(saveState.windowModel.documentIdentity)
+
+    let cancelState = AppState()
+    let cancelController = AppController(
+      appState: cancelState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtyUntitledPrompt: { _ in .cancel }),
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(cancelController.createUntitledDocument())
+    cancelState.activeDocumentText = "unsaved"
+    cancelState.activeDocumentDirty = true
+    let cancelIdentity = try XCTUnwrap(cancelState.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        saveWindow, identity: saveIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    XCTAssertTrue(
+      registry.attach(
+        cancelWindow, identity: cancelIdentity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(saveController, for: saveWindow)
+    registry.registerController(cancelController, for: cancelWindow)
+
+    saveController.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "a cancelled pass must close NOTHING")
+    XCTAssertTrue(
+      saveState.openFiles.contains { $0.url.standardizedFileURL == savedURL },
+      "a cancelled pass must forget nothing — the in-pass Save's file stays in the working set")
+    let reopened = BookmarkStore(defaults: bookmarkDefaults).restoreWorkspace(into: AppState())
+    XCTAssertEqual(
+      reopened.fileURLs.map(\.standardizedFileURL), [savedURL],
+      "a cancelled pass must leave the persisted bookmark intact")
+  }
+
   @MainActor
   private static func makeCrossWindowRegistry(
     closeWindow: @escaping @MainActor (NSWindow) -> Void
@@ -4508,6 +4661,8 @@ final class PensieveSmokeTests: XCTestCase {
 
     XCTAssertTrue(
       appState.documents.contains { $0.url.standardizedFileURL == textURL.standardizedFileURL })
+    selectDocument(at: textURL, in: appState)
+
     XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, textURL.standardizedFileURL)
     XCTAssertEqual(appState.activeDocumentText, "plain-token original")
 

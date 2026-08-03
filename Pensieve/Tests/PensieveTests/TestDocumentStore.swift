@@ -32,4 +32,29 @@ extension XCTestCase {
       selfWriteObserver: selfWriteObserver
     )
   }
+
+  /// The user picking a document, spelled out.
+  ///
+  /// Opening a workspace no longer selects anything by itself — see
+  /// `LaunchOpensNothingTests` for why a launch that picks its own document is
+  /// a bug and not a convenience. Tests that need an open document therefore
+  /// have to open one, through the same shared store every sidebar selection
+  /// and workspace path goes through.
+  @MainActor
+  @discardableResult
+  func selectDocument(
+    at url: URL,
+    in appState: AppState,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) -> Bool {
+    let target = url.standardizedFileURL
+    guard
+      let ref = appState.allDocuments.first(where: { $0.url.standardizedFileURL == target })
+    else {
+      XCTFail("no document at \(target.path) to select", file: file, line: line)
+      return false
+    }
+    return DocumentStore.shared.select(ref: ref, into: appState)
+  }
 }

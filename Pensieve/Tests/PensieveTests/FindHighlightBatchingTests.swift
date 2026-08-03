@@ -76,6 +76,41 @@ final class FindHighlightBatchingTests: XCTestCase {
     XCTAssertNotNil(attr, "batched find pass no longer applies match highlights")
   }
 
+  /// A live theme switch pushes new tokens onto the highlighter, which runs a
+  /// full refresh and strips `.backgroundColor` document-wide — the attribute the
+  /// find washes live in. `updateFind` then short-circuits on the unchanged
+  /// query, so without an explicit repaint every match silently disappears while
+  /// the find bar still reports "1 of N".
+  @MainActor
+  func test_theme_switch_keeps_find_match_highlights() throws {
+    let (surface, window) = makeHostedSurface(text: "needle in the hay.\nand needle again.\n")
+    defer { window.contentView = nil }
+
+    surface.updateFind(query: "needle", visible: true)
+    surface.selectFindMatch(direction: .forward)
+
+    let firstMatch = (surface.textStorage.string as NSString).range(of: "needle")
+    XCTAssertNotEqual(firstMatch.location, NSNotFound)
+    let washBefore =
+      surface.textStorage.attribute(
+        .backgroundColor, at: firstMatch.location, effectiveRange: nil) as? NSColor
+    XCTAssertNotNil(washBefore, "find pass must wash the match before the theme switch")
+
+    surface.applyTheme(.parchment)
+
+    let washAfter =
+      surface.textStorage.attribute(
+        .backgroundColor, at: firstMatch.location, effectiveRange: nil) as? NSColor
+    XCTAssertEqual(
+      washAfter, washBefore,
+      "the find-match wash must survive a live theme switch — the highlight "
+        + "refresh clears .backgroundColor and updateFind will not repaint it")
+
+    // The session itself is intact, not rebuilt: the active match still answers
+    // ⌘G from where the operator left it rather than restarting at match 1.
+    XCTAssertEqual(surface.textView.selectedRange(), firstMatch)
+  }
+
   /// SwiftUI re-renders call `updateFind` with an unchanged query on every
   /// pass (focus changes, published churn). An unchanged find state must not
   /// touch the text storage at all — re-applying thousands of attributes per

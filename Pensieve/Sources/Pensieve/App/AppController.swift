@@ -8,6 +8,32 @@ private enum DocumentImportOutcome: Sendable {
   case failure(String)
 }
 
+/// The application's ONE startup restore, as a process-wide fact.
+///
+/// Bringing the working set back is something the APPLICATION does once, when
+/// it starts — not something every window that runs
+/// `start(restoringWorkspace:)` does. Every launcher takes that same path: the
+/// one the registry re-opens after the last document window closes, and the one
+/// a Dock reopen makes. And a native window close deliberately LEAVES the file
+/// in the working set (only "Close from Open Files" retires it), so a
+/// per-controller gate meant closing the last document immediately reopened it
+/// — the user could not close it at all.
+///
+/// Production shares `.shared`; a test that simulates a launch holds its own
+/// instance, because "once per process" is otherwise once per test BUNDLE.
+@MainActor
+final class ApplicationStartupRestore {
+  static let shared = ApplicationStartupRestore()
+
+  private var isUnclaimed = true
+
+  /// True for the FIRST caller in this process, false for every one after it.
+  func claimStartupRestore() -> Bool {
+    defer { isUnclaimed = false }
+    return isUnclaimed
+  }
+}
+
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
@@ -17,6 +43,7 @@ final class AppController: ObservableObject {
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
   private let documentWindowRegistry: DocumentWindowRegistry
+  private let startupRestore: ApplicationStartupRestore
   let recentDocuments: RecentDocumentsStore
   private let agentPromptLauncher: AgentPromptLaunching
   private let agentWorkspaceRoot: URL?
@@ -64,6 +91,13 @@ final class AppController: ObservableObject {
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
+  /// Marks this window as holding content the sweep must not reap. Called when
+  /// the window adopts a recovery draft, which carries no URL for the accessor
+  /// to publish. Unwired (tests, headless) is harmless: nothing sweeps there.
+  var requestPromoteWindowToContent: (() -> Void)?
+  /// Re-runs the launcher sweep once this window's launch decision settles, so
+  /// protecting an in-flight restore delays the reap instead of cancelling it.
+  var requestLauncherSweepReconcile: (() -> Void)?
 
   convenience init(appState: AppState, importsFoldersInBackground: Bool = false) {
     self.init(
@@ -81,6 +115,7 @@ final class AppController: ObservableObject {
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
+    startupRestore: ApplicationStartupRestore = .shared,
     recentDocuments: RecentDocumentsStore? = nil,
     transcriptionService: TranscriptionService? = nil,
     agentPromptLauncher: AgentPromptLaunching = VibecraftedAgentPromptLauncher(),
@@ -104,6 +139,7 @@ final class AppController: ObservableObject {
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
+    self.startupRestore = startupRestore
     self.recentDocuments = recentDocuments ?? .shared
     self.agentPromptLauncher = agentPromptLauncher
     self.workflowCapabilitiesProvider = workflowCapabilitiesProvider
@@ -117,9 +153,45 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Whether this window's session holds work the user could lose — an
+  /// untitled draft or a loaded document. The window registry's launcher sweep
+  /// asks this, because registry bookkeeping alone cannot see it: a recovered
+  /// crash draft has no URL, so the accessor never publishes a document
+  /// identity and the window would look like an empty launcher forever.
+  var hasEditableBuffer: Bool { appState.documentSession.hasEditableBuffer }
+
+  /// The identity this window's session holds RIGHT NOW — which is not
+  /// necessarily the identity a caller snapshotted before prompting it. A Save
+  /// on a dirty untitled draft turns `.untitled(UUID)` into `.file(url)` inside
+  /// the prompt, and anything retiring by the pre-prompt snapshot then misses
+  /// the file that was just created.
+  var currentDocumentIdentity: DocumentIdentity? { appState.documentSession.identity }
+
+  /// True while a Word/PDF conversion started in this window is still running.
+  /// The same "does this window hold live work" question the sweep asks — and
+  /// an import is the one kind of live work that shows up NOWHERE else: the
+  /// conversion runs off the main actor, so the session is still empty, and the
+  /// initial load is already marked resolved, so the accessor publishes no
+  /// document identity and the tab is filed back as an empty launcher. Reaping
+  /// it deallocates the window's controller and the conversion is discarded.
+  var hasPendingImportWork: Bool { documentImportTask != nil }
+
+  /// True until this window's launch-time restore resolves. A window waiting
+  /// for its document must not be reaped as an "empty launcher" just because
+  /// the document has not reached the accessor yet — the sweep fires on a
+  /// timer and would otherwise win that race on a slow workspace.
+  private(set) var isAwaitingLaunchRestore = true
+
   func start(restoringWorkspace: Bool = true) {
     guard !didStart else { return }
     didStart = true
+    // Whatever this window turns out to be, its launch decision is settled by
+    // the time `start` returns. Clearing the flag re-runs the sweep, so a
+    // genuinely empty launcher is still reaped — just one pass later.
+    defer {
+      isAwaitingLaunchRestore = false
+      requestLauncherSweepReconcile?()
+    }
 
     // Warm the index OFF the main thread. Opening the GRDB pool + running migrations (incl. the FTS5
     // content-link rebuild) on main here was the launch-time beachball; the workspace-restore path
@@ -133,10 +205,59 @@ final class AppController: ObservableObject {
     // Untitled", and the dirty untitled session then blocked the load of the
     // document the window was opened for.
     guard restoringWorkspace else { return }
+    // Claim the application's one startup restore BEFORE anything else in this
+    // branch can return early: whichever window gets here first IS the launch,
+    // and every launcher after it must be an empty launcher.
+    let isApplicationStartupRestore = startupRestore.claimStartupRestore()
     if documentStore.restoreRecoveredDraft(into: appState) {
+      // This window now holds unsaved work with no URL behind it, so the
+      // registry cannot classify it from the document identity the accessor
+      // publishes — it would stay a "launcher" and the sweep would reap it.
+      // Promote it explicitly, at the moment of adoption.
+      requestPromoteWindowToContent?()
       appState.lastError = nil
     }
     folderManager.restoreLastFolderInBackground(into: appState)
+    guard isApplicationStartupRestore else { return }
+    reopenRestoredOpenFiles()
+  }
+
+  /// Reopens the ad-hoc files the user left open at quit. THE APPLICATION'S
+  /// STARTUP ONLY — see `ApplicationStartupRestore`; a launcher that appears
+  /// later in the same process must open nothing, or closing the last document
+  /// window immediately brings it back.
+  ///
+  /// `prepareWorkspaceShell` runs synchronously inside the restore above, so
+  /// `appState.openFiles` is already populated when it returns — and for a long
+  /// time that was mistaken for "the files came back". They did not. Open Files
+  /// renders from the WINDOW REGISTRY (`windowRegistry.openDocuments`), and the
+  /// only production caller of `DocumentWindowRegistry.open` is
+  /// `requestOpenDocumentWindow`, which the launch path never invoked. So a file
+  /// left open at quit returned as a model entry with no window, no tab and no
+  /// sidebar row: from the user's side it did not come back at all.
+  ///
+  /// Only AD-HOC refs qualify. Workspace documents live in the sidebar tree, and
+  /// `applyWorkspaceScans` deliberately keeps them out of Open Files rather than
+  /// listing them twice.
+  private func reopenRestoredOpenFiles() {
+    let alreadyOpen = Set(documentWindowRegistry.openDocuments.map(\.identity))
+    var pending = appState.openFiles.filter { ref in
+      ref.isAdHoc && !alreadyOpen.contains(.file(ref.id.standardizedFileURL))
+    }
+    guard !pending.isEmpty else { return }
+
+    // This is the launch window and it is still empty, so the first restored
+    // document belongs IN it. Routing every ref to the factory instead would
+    // spawn a window per file and leave this one to be reaped — a visible flash
+    // in the commonest case of exactly one file. Mirrors `openFile`, which also
+    // loads in place when the window holds nothing.
+    if !appState.documentSession.hasEditableBuffer {
+      documentStore.load(ref: pending.removeFirst(), into: appState)
+    }
+    guard let requestOpenDocumentWindow else { return }
+    for ref in pending {
+      requestOpenDocumentWindow(ref)
+    }
   }
 
   func openFolder(url: URL) {
@@ -169,11 +290,6 @@ final class AppController: ObservableObject {
       return
     }
 
-    if DocumentTransfer.isImportable(standardizedURL) {
-      importDocument(url: standardizedURL)
-      return
-    }
-
     if appState.selectedDocumentID?.standardizedFileURL == standardizedURL {
       noteRecentDocumentIfOpened(standardizedURL)
       return
@@ -182,8 +298,10 @@ final class AppController: ObservableObject {
     // The registry route below bypasses registerOpenFile (the destination
     // window registers the file during its own load), so unsupported types
     // must be rejected HERE — otherwise they would open an empty tab whose
-    // load is refused only afterwards.
-    guard WorkspaceScanner.isMarkdownFile(standardizedURL) else {
+    // load is refused only afterwards. Import SOURCES (Word/PDF) are not
+    // Markdown but ARE openable, so they pass this gate too.
+    let isImportable = DocumentTransfer.isImportable(standardizedURL)
+    guard isImportable || WorkspaceScanner.isMarkdownFile(standardizedURL) else {
       appState.lastError = WorkspaceScanner.unsupportedOpenMessage
       return
     }
@@ -192,9 +310,32 @@ final class AppController: ObservableObject {
     // THIS window's working set first — the destination window registers it
     // during its own load, and a premature registration leaves the
     // originating sidebar permanently listing a file it never displays.
-    if appState.documentSession.hasEditableBuffer, let requestOpenDocumentWindow {
+    //
+    // Import sources route here for the SAME reason every other open does: an
+    // import replaces this window's session wholesale (`restoreUntitled`), so
+    // running it against a window that already shows a document silently threw
+    // that document away and left the conversion sitting under its title. The
+    // destination tab performs the import itself via `openFileInCurrentWindow`.
+    //
+    // A CONVERSION IN FLIGHT OCCUPIES THIS WINDOW TOO. It runs off the main
+    // actor and leaves the session empty until it lands, so a multi-file open —
+    // Finder multi-select, a Dock drop — answered "empty, use this window" for
+    // every URL after the first: a second import called `documentImportTask?
+    // .cancel()` and the user's first file vanished without a word, while a
+    // Markdown URL loaded into the session the pending conversion was about to
+    // overwrite. `hasEditableBuffer` cannot see that work; `hasPendingImportWork`
+    // is what says this window is spoken for.
+    if appState.documentSession.hasEditableBuffer || hasPendingImportWork,
+      let requestOpenDocumentWindow
+    {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
+      return
+    }
+
+    // This window is empty, so the import is safe to run in place.
+    if isImportable {
+      importDocument(url: standardizedURL)
       return
     }
 
@@ -425,18 +566,50 @@ final class AppController: ObservableObject {
     // tab/window. If it is THIS window's active doc, run the dirty-session guard
     // first (untitled → Save/Discard/Cancel with Cancel aborting; existing →
     // force-save) so the sidebar close never silently drops unsaved edits.
-    closeOpenDocument(identity: .file(id.standardizedFileURL))
+    //
+    // Closing the WINDOW is not the whole intent here. This affordance retires
+    // the file from the LIST, so it must also leave the working set a relaunch
+    // restores from — and only when the close actually went through, so a
+    // cancelled Save/Discard/Cancel forgets nothing.
+    let url = id.standardizedFileURL
+    guard closeOpenDocument(identity: .file(url)) else { return }
+    documentStore.forgetOpenFile(url, into: appState)
   }
 
-  func closeOpenDocument(identity: DocumentIdentity) {
+  @discardableResult
+  func closeOpenDocument(identity: DocumentIdentity) -> Bool {
     // Open Files mirrors EVERY window's documents, so this close may target a
     // document owned by another window. Run the dirty guard in the OWNING
     // window's session — guarding only the caller's would force-close the
     // target, letting its close hook stash a recovery draft and skip the
-    // Save/Discard/Cancel prompt. Fall back to self when no owner is registered.
-    let owner = documentWindowRegistry.controller(for: identity) ?? self
-    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else { return }
+    // Save/Discard/Cancel prompt.
+    guard let owner = closeOwner(for: identity) else { return false }
+    guard owner.confirmDirtySessionClearBeforeExternalClose(identity: identity) else {
+      return false
+    }
     documentWindowRegistry.closeDocument(identity)
+    return true
+  }
+
+  /// Resolves the window that OWNS `identity` for a cross-window close.
+  ///
+  /// `self` is a valid answer ONLY when this window actually shows that
+  /// document. Falling back to `self` unconditionally was unsafe: the
+  /// registry's identity→window map is written from the COALESCED, async
+  /// window accessor, so there is a real window in which a live tab has no
+  /// registered controller yet. In that window the fallback handed the guard to
+  /// a session that does not hold the document —
+  /// `confirmDirtySession…` sees a mismatched identity, answers "nothing to
+  /// guard", and the close proceeds with NO prompt against the window that did
+  /// hold unsaved work. Refusing is the safe answer: nothing closes, nothing is
+  /// discarded, and the caller can retry once the registration lands.
+  private func closeOwner(for identity: DocumentIdentity) -> AppController? {
+    if let owner = documentWindowRegistry.controller(for: identity) { return owner }
+    guard appState.windowModel.documentIdentity == identity.standardized else {
+      DebugTrace.log("close -> refused: no registered owner for \(identity)")
+      return nil
+    }
+    return self
   }
 
   /// Runs this window's dirty-session guard when `identity` is its active
@@ -495,16 +668,40 @@ final class AppController: ObservableObject {
     let identities = documentWindowRegistry.openDocuments.map(\.identity)
 
     var deferred: [(owner: AppController, resolution: DocumentStore.DirtySessionResolution)] = []
+    // Phase 1 can CHANGE a window's identity: Save on a dirty untitled draft
+    // runs `saveAs`, which appends a NEW `.file` ref to `openFiles` and persists
+    // a bookmark for it. The snapshot still holds that window's OLD
+    // `.untitled(UUID)`, and the retire sweep below skips anything that is not
+    // `.file` — so the file the user had just saved survived both the Open Files
+    // list and the `fileBookmarks` default, and the next launch reopened it.
+    // Retire by each owner's identity as it stands AFTER its resolution.
+    var retiredIdentities = identities
     for identity in identities {
-      let owner = documentWindowRegistry.controller(for: identity) ?? self
+      // An unresolvable owner aborts the WHOLE sweep, exactly like a Cancel:
+      // closing the rest while one window's session was never guarded is the
+      // data loss this pass exists to prevent.
+      guard let owner = closeOwner(for: identity) else { return }
       guard let resolution = owner.confirmDirtySessionForExternalClose(identity: identity) else {
         return
       }
       deferred.append((owner, resolution))
+      if let settledIdentity = owner.currentDocumentIdentity,
+        !retiredIdentities.contains(settledIdentity)
+      {
+        retiredIdentities.append(settledIdentity)
+      }
     }
 
     for (owner, resolution) in deferred {
       owner.applyDeferredDirtySessionResolution(resolution)
+    }
+    // Phase 2 also retires the FILES from the working set, for the same reason
+    // the single-row close does: this affordance empties the Open Files list,
+    // and a list the next launch refills was never emptied. Inside phase 2, so
+    // a Cancel in phase 1 still forgets nothing.
+    for identity in retiredIdentities {
+      guard case .file(let url) = identity else { continue }
+      documentStore.forgetOpenFile(url, into: appState)
     }
     documentWindowRegistry.closeAllDocumentWindows()
   }
