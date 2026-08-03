@@ -573,11 +573,23 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       name: NSView.boundsDidChangeNotification,
       object: scrollView.contentView
     )
+    // Deliberately registered WITHOUT an `object:` filter. The manager our undo
+    // entries actually land in is the WINDOW's (`MarkdownTextView.undoManager`
+    // resolves up the responder chain), and at init time this surface has no
+    // window yet — `textView.undoManager` answers with the private
+    // `fallbackUndoManager`. Pinning the observer to that object registered us
+    // on a manager the user never undoes through, so `editorWillUndo` never
+    // fired once the editor was hosted and the opaque continuation survived
+    // every Cmd+Z. Re-registering on `viewDidMoveToWindow` would mean tracking
+    // one more teardown path across the close/detach seams (see the scrub guard
+    // in `MarkdownTextView`); listening broadly and discriminating on identity
+    // needs no lifecycle bookkeeping at all — the guard below reads the CURRENT
+    // manager on every notification, so a window change is followed for free.
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(editorWillUndo(_:)),
       name: .NSUndoManagerWillUndoChange,
-      object: textView.undoManager
+      object: nil
     )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
@@ -796,6 +808,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scheduleScrollSyncSample()
   }
 
+  /// Drops the provider-side continuation before an undo rewrites the document
+  /// the accepted turns were built on. Every undo manager in the process posts
+  /// here (the observer carries no `object:` filter — see `init`), so the
+  /// identity check against the manager this editor currently undoes through is
+  /// the whole filter: it is re-read per notification, so it follows the surface
+  /// from the windowless fallback manager to whichever window hosts it.
   @objc private func editorWillUndo(_ notification: Notification) {
     guard notification.object as? UndoManager === textView.undoManager else { return }
     autocompleteController.invalidateContinuation()
