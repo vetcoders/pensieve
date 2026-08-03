@@ -263,6 +263,12 @@ struct DocumentWindowRootView: View {
     controller.requestOpenDocumentWindow = { ref in
       DocumentWindowRegistry.shared.open(ref)
     }
+    controller.requestOpenRestoredDocumentWindows = { refs in
+      DocumentWindowRegistry.shared.openRestoredDocuments(refs)
+    }
+    controller.requestNoteDocumentAlreadyOnScreen = { documentID in
+      DocumentWindowRegistry.shared.noteDocumentAlreadyOnScreen(documentID)
+    }
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
