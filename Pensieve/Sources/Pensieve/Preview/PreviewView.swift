@@ -39,7 +39,13 @@ struct PreviewView: View {
       scrollSyncCoordinator: scrollSyncCoordinator
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.textBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    // Backdrop behind the transparent WebView. Tied to the theme surface so a
+    // dark skin never flashes a light strip before the page paints, matching
+    // the titlebar backing colour the recipe feeds the chrome.
+    .background(
+      Color(WindowChromeRecipe.titlebarGlassBackingColor(for: themeManager.skin))
+        .ignoresSafeArea(.container, edges: .top)
+    )
     .ignoresSafeArea(.container, edges: .top)
   }
 }
@@ -50,7 +56,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
-  let skin: ThemeManager.PreviewTheme
+  let skin: PensieveTheme
   let themeManager: ThemeManager
   let documentURL: URL?
   let autoReload: Bool
@@ -81,6 +87,13 @@ struct PreviewRepresentable: NSViewRepresentable {
   }
 
   func updateNSView(_ nsView: PreviewWebView, context: Context) {
+    // Chrome is asserted on EVERY pass, outside the render pipeline. Going through
+    // `load(document:)` alone is not enough: the pipeline drops a request equal to
+    // the last applied one, so unchanged content means no document — and in
+    // preview-only mode no `MarkdownEditorSurface` exists to assert the host
+    // window's chrome instead. Compare-and-set inside, so an unchanged skin writes
+    // nothing. Mirrors `EditorRepresentable.updateNSView`.
+    nsView.applyThemeChrome(for: skin)
     context.coordinator.update(scrollSyncCoordinator: scrollSyncCoordinator)
     context.coordinator.submit(request: currentRequest, autoReload: autoReload, initial: false)
   }

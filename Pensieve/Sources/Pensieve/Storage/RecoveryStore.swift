@@ -57,6 +57,11 @@ final class RecoveryStore {
 
     let url = draftURL(for: id)
     try text.write(to: url, atomically: true, encoding: .utf8)
+    let resolvedTitle = title.isEmpty ? Self.fallbackTitle : title
+    // The draft's own name lives in a sidecar. Without it the title died at the
+    // process boundary and EVERY recovered draft came back called
+    // "Recovered Untitled.md", no matter what the user had been working on.
+    try? Data(resolvedTitle.utf8).write(to: titleURL(for: id), options: .atomic)
     // Writing a draft IS the claim: the buffer that produced it is live.
     openDraftIDs.insert(id)
     // Only a BRAND NEW draft can push the list past the cap. Re-saving the same
@@ -68,7 +73,7 @@ final class RecoveryStore {
     return RecoveryDraft(
       id: id,
       url: url,
-      title: title.isEmpty ? "Recovered Untitled.md" : title,
+      title: resolvedTitle,
       text: text,
       updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date()
     )
@@ -93,6 +98,7 @@ final class RecoveryStore {
     guard let id else { return }
     openDraftIDs.remove(id)
     try? fileManager.removeItem(at: draftURL(for: id))
+    try? fileManager.removeItem(at: titleURL(for: id))
   }
 
   // MARK: - Claim tracking
@@ -113,6 +119,19 @@ final class RecoveryStore {
 
   func isDraftOpen(id: UUID) -> Bool {
     openDraftIDs.contains(id)
+  }
+
+  /// Every draft NO live buffer is holding — the only ones a launcher may
+  /// offer. A window adopting a draft claims it, and an empty window elsewhere
+  /// (a second launcher, a "+" tab) must stop listing it from that moment on:
+  /// two buffers on one recovery ID autosave over each other, and a Save As… in
+  /// one is undone by the other's next autosave recreating the file.
+  ///
+  /// The claim is deliberately in-process only. A crash takes it with the
+  /// process, which is the point — the file on disk outlives it and is offered
+  /// again on the next launch.
+  func unclaimedDrafts() -> [RecoveryDraft] {
+    loadDrafts().filter { !openDraftIDs.contains($0.id) }
   }
 
   // MARK: - Retention
@@ -175,14 +194,35 @@ final class RecoveryStore {
     return RecoveryDraft(
       id: id,
       url: url,
-      title: "Recovered Untitled.md",
+      // Drafts written before the sidecar existed have no recorded name, so the
+      // generic fallback still has to hold for them.
+      title: loadTitle(for: id) ?? Self.fallbackTitle,
       text: text,
       updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? .distantPast
     )
   }
 
+  private func loadTitle(for id: UUID) -> String? {
+    guard let data = try? Data(contentsOf: titleURL(for: id)),
+      let title = String(data: data, encoding: .utf8),
+      !title.isEmpty
+    else {
+      return nil
+    }
+    return title
+  }
+
+  static let fallbackTitle = "Recovered Untitled.md"
+
   private func draftURL(for id: UUID) -> URL {
     directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("md")
+  }
+
+  /// Sidecar holding the draft's display name. Deliberately NOT ".md": the
+  /// directory listing treats every `.md` file as a draft, so a sidecar with
+  /// that extension would be handed back as a second, empty draft.
+  private func titleURL(for id: UUID) -> URL {
+    directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("title")
   }
 
   private static func defaultDirectoryURL(fileManager: FileManager) -> URL {

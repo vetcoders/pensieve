@@ -8,10 +8,26 @@ import SwiftUI
 final class DocumentWindow: NSWindow {
   var onNewWindowForTab: ((NSWindow) -> Void)?
   var onClose: ((NSWindow) -> Void)?
+  /// Consulted before the red close button or a tab's "×" tears this window
+  /// down. Returns true to let AppKit proceed, false to keep the window — the
+  /// handler may then run its own async Save / Don't Save / Cancel sheet and
+  /// close the window later once the answer lands.
+  var onShouldClose: ((NSWindow) -> Bool)?
 
   override func newWindowForTab(_ sender: Any?) {
     DebugTrace.log("newWindowForTab '\(title)'")
     onNewWindowForTab?(self)
+  }
+
+  /// The red close button and a tab's "×" both route through `performClose`.
+  /// Give this window's controller the same conscious close lifecycle ⌘W has:
+  /// `onShouldClose` returns false to keep the window (a sheet is now up, or the
+  /// user cancelled) and true to let AppKit tear it down. ⌘W does NOT arrive
+  /// here — the File ▸ Close menu item owns that key and runs
+  /// `closeActiveDocument` directly — so there is no double prompt.
+  override func performClose(_ sender: Any?) {
+    if let onShouldClose, !onShouldClose(self) { return }
+    super.performClose(sender)
   }
 
   override func close() {
@@ -34,6 +50,7 @@ final class DocumentWindow: NSWindow {
       self.contentView = nil
       self.onNewWindowForTab = nil
       self.onClose = nil
+      self.onShouldClose = nil
     }
   }
 }

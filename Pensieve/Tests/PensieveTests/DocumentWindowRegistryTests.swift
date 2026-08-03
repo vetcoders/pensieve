@@ -791,6 +791,88 @@ final class DocumentWindowRegistryTests: XCTestCase {
       "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state")
   }
 
+  /// The launcher sweep is a DEFERRED `asyncAfter`: once armed it cannot be cancelled, so a sweep
+  /// scheduled moments before the user quits fires INSIDE the termination sequence's pumped run loop.
+  /// Reaping a window there posts `NSWindow.willCloseNotification`, whose handler saves the window's
+  /// document — a brand-new managed write arriving after the sequence has already flushed its windows
+  /// and drained the index, i.e. behind the terminal checkpoint. `beginTermination()` already
+  /// suppressed launcher REOPEN; it had to suppress the reap as well.
+  ///
+  /// Both halves are asserted against the same fixture, because "nothing was closed" is only evidence
+  /// if the identical sweep closes something when the app is not terminating.
+  @MainActor
+  func testDeferredLauncherSweepStopsReapingOnceTerminationHasBegun() throws {
+    let running = try makeSweepFixture()
+    defer { running.dispose() }
+    XCTAssertEqual(
+      running.sweeps.count, 1,
+      "fixture precondition: presenting a document must arm exactly one launcher sweep")
+    running.sweeps.removeFirst()()
+    XCTAssertEqual(
+      running.closedIDs, [ObjectIdentifier(running.launcher)],
+      "fixture precondition: while the app is running, the sweep must reap the redundant launcher — "
+        + "otherwise the terminating case below proves nothing")
+
+    let terminating = try makeSweepFixture()
+    defer { terminating.dispose() }
+    XCTAssertEqual(terminating.sweeps.count, 1)
+    terminating.registry.beginTermination()
+    terminating.sweeps.removeFirst()()
+    XCTAssertTrue(
+      terminating.closedIDs.isEmpty,
+      "a sweep that fires during the quit must close nothing: every close posts willCloseNotification, "
+        + "and that save would land after the termination sequence already drained and checkpointed")
+  }
+
+  /// A registry with one redundant empty launcher beside a presented document window, plus captured
+  /// sweep closures — the exact state `closeEmptyLauncherWindows(except:)` arms during a normal open.
+  @MainActor
+  private final class SweepFixture {
+    let registry: DocumentWindowRegistry
+    let launcher: NSWindow
+    let documentWindow: NSWindow
+    var sweeps: [() -> Void] = []
+    var closedIDs: [ObjectIdentifier] = []
+
+    init(launcher: NSWindow, documentWindow: NSWindow, documentID: URL) {
+      self.launcher = launcher
+      self.documentWindow = documentWindow
+      // Built before `registry` so the closures below can capture it; the registry is the only thing
+      // that ever calls them, and it is created on the next line.
+      var recordSweep: ((@escaping () -> Void) -> Void)!
+      var recordClose: ((NSWindow) -> Void)!
+      registry = DocumentWindowRegistry(
+        canMutateWindowTabs: { true },
+        scheduleDeferredMainWork: { _ in },
+        scheduleLauncherWindowSweep: { recordSweep($0) },
+        mergeWindowIntoTabs: { _, _ in },
+        orderAndActivateWindow: { _ in },
+        currentMergeTarget: { nil },
+        applicationWindows: { [launcher, documentWindow] },
+        closeWindow: { recordClose($0) },
+        makeDocumentWindow: { _, _ in documentWindow })
+      recordSweep = { [weak self] work in self?.sweeps.append(work) }
+      recordClose = { [weak self] window in self?.closedIDs.append(ObjectIdentifier(window)) }
+      registry.open(DocumentRef(id: documentID))
+    }
+
+    func dispose() {
+      launcher.close()
+      documentWindow.close()
+    }
+  }
+
+  @MainActor
+  private func makeSweepFixture() throws -> SweepFixture {
+    SweepFixture(
+      // "Pensieve" with no represented URL is what makes it an UNTRACKED empty launcher, the shape
+      // the sweep is allowed to reap.
+      launcher: Self.makeWindow(title: "Pensieve"),
+      documentWindow: Self.makeWindow(),
+      documentID: URL(fileURLWithPath: "/tmp/pensieve-termination-sweep-\(UUID().uuidString).md")
+        .standardizedFileURL)
+  }
+
   @MainActor
   private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(

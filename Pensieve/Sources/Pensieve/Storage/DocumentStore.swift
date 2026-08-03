@@ -14,19 +14,11 @@ struct WorkspaceSelectionContext {
   /// The window's conscious-close counter at start. A different value at the
   /// end means the user closed the document mid-flow.
   let closeGeneration: Int
-  /// Whether the flow may fall back to the first document of the workspace when
-  /// there is nothing else to restore. True for explicit opens and cold
-  /// launches, false for launchers that appear mid-session.
-  let autoSelectsFirstDocument: Bool
 
-  static func capture(
-    from appState: AppState,
-    autoSelectsFirstDocument: Bool = true
-  ) -> WorkspaceSelectionContext {
+  static func capture(from appState: AppState) -> WorkspaceSelectionContext {
     WorkspaceSelectionContext(
       previousSelection: appState.selectedDocumentID,
-      closeGeneration: appState.windowModel.documentCloseGeneration,
-      autoSelectsFirstDocument: autoSelectsFirstDocument)
+      closeGeneration: appState.windowModel.documentCloseGeneration)
   }
 
   /// False once the user consciously closed this window's document after the
@@ -66,13 +58,57 @@ final class FolderManager {
   /// only while its own generation is still current. Without this, a build cancelled by
   /// `applyRefresh` or superseded by an ad-hoc file open left `.opening` on screen forever.
   private var openFlowGeneration: UInt64 = 0
+  /// Bumped by every workspace OPEN, and by nothing else — deliberately not `openFlowGeneration`,
+  /// which a close bumps too. `scheduleIndexMaintenance` captures it so a close's housekeeping can
+  /// answer one question at the moment it matters: "is the index still as quiet as it was when I
+  /// was armed?" See `scheduleIndexMaintenance(after:)`.
+  ///
+  /// Lock-guarded rather than a plain `UInt64` since round 20: the close pass has to ask that
+  /// question a SECOND time, at barrier acquisition, from inside a detached closure that has no main
+  /// actor to read this from. Same shape and same reason as `IndexDatabase`'s `TerminationLatch`,
+  /// with one difference worth naming — a latch is one-way, a generation is not, so this is a
+  /// snapshot/compare rather than a flag.
+  private let workspaceOpenGeneration = WorkspaceOpenGeneration()
   private var watcherRefreshTask: Task<Void, Never>?
   /// Bumped on every `scheduleWatcherRefresh` so `waitForPendingWatcherRefresh` can tell a
   /// completed refresh from one that was cancel-replaced by a newer event mid-await.
-  private var watcherRefreshGeneration: UInt64 = 0
+  ///
+  /// Readable from outside for the same reason `IndexDatabase.terminationRejectedEntryPoints` is:
+  /// `waitForPendingWatcherRefresh()` answers "has the armed refresh finished", and proving that
+  /// NOTHING was armed needs the counter itself — there is no task to await.
+  private(set) var watcherRefreshGeneration: UInt64 = 0
+  /// Single-flight gate for the watcher refresh: set the moment a pass is ARMED and cleared when
+  /// that pass (debounce + walk + apply, plus any coalesced follow-up) has finished. While it is
+  /// set, `scheduleWatcherRefresh` records the event instead of starting a second pass.
+  private var isWatcherRefreshArmed = false
+  /// Set by an event that arrives while a pass is armed or running, and consumed by that pass as
+  /// "run exactly once more". A flag rather than a counter is the whole point: a burst of N events
+  /// buys ONE follow-up walk, not N.
+  private var pendingWatcherRescan = false
+  /// One-way switch set by `quiesceForTermination()`, and the successor half of the watcher
+  /// quiescence. `watcher.stop()` bumps a generation, so an FSEvents batch still on the watcher
+  /// queue is discarded — but the generation is checked on that queue, BEFORE the delivery hops to
+  /// the main actor (`FileWatcher.start(watching:onEvents:)`). A batch that passed the check and
+  /// enqueued its `Task { @MainActor }` a moment before the quit is therefore not retractable by
+  /// `stop()`, and cancelling `watcherRefreshTask` does nothing about it either: cancellation
+  /// applies to the task that exists, not to the one the hop is about to arm. The quit then pumps
+  /// the run loop (`TerminationSequence.runBlockingMainRunLoop()`), which is exactly what gives that
+  /// hop the main actor — after quiescence, after the drain, and in time to arm a fresh 300 ms
+  /// refresh whose scan would ask the index to write behind the terminal checkpoint.
+  ///
+  /// Quit-ONLY, deliberately: `closeWorkspace` also stops the watcher and cancels these tasks, but a
+  /// close is followed by opens that must start watching again. A latch set there would make the
+  /// first workspace switch the last one with a live watcher.
+  private var isQuiescedForTermination = false
   /// Explicit refreshes and workspace-configuration changes use their own off-main reconcile
   /// task so a filesystem event cannot cancel a user-requested refresh.
   private var forcedRefreshTask: Task<Void, Never>?
+  /// Bumped by every explicit refresh this manager actually ARMS, and readable from outside for the
+  /// same reason `watcherRefreshGeneration` is: proving that nothing was armed needs the counter
+  /// itself, because a task that was never created leaves no handle to await. Round 19's trash-route
+  /// latch is what made that distinguishable — the refusal happens before the task exists, so a test
+  /// that watched only the scanner could not tell the arming site's refusal from the task body's.
+  private(set) var forcedRefreshGeneration: UInt64 = 0
   /// Tracks the off-main FTS index write launched by live refresh or cold indexing (incremental
   /// delta OR full fallback). Held so `closeWorkspace` can cancel a still-awaiting update and so
   /// callers can await it. The underlying `pool.write` is a single transaction inside
@@ -538,30 +574,18 @@ final class FolderManager {
   }
 
   /// Rebuilds the persisted workspace (roots, tree, sidebar) for a starting
-  /// window.
-  ///
-  /// `selectsRestoredDocument` is the auto-select axis: only a cold launch
-  /// wants a document picked for it. A launcher that appears mid-session — Dock
-  /// reopen, or the replacement for the last window the user closed — restores
-  /// the workspace WITHOUT choosing a document, so `Close` on the last document
-  /// converges to an empty launcher instead of being absorbed back in.
-  func restoreLastFolderInBackground(
-    into appState: AppState,
-    selectsRestoredDocument: Bool = true
-  ) {
+  /// window. It never picks a document for the user — see
+  /// `selectRestoredDocument`.
+  func restoreLastFolderInBackground(into appState: AppState) {
     let restored = bookmarkStore.restoreWorkspace(into: appState)
     DebugTrace.log(
-      "open restore roots=\(restored.rootURLs.count) files=\(restored.fileURLs.count) "
-        + "autoSelect=\(selectsRestoredDocument)")
+      "open restore roots=\(restored.rootURLs.count) files=\(restored.fileURLs.count)")
     guard !restored.rootURLs.isEmpty || !restored.fileURLs.isEmpty else {
       return
     }
 
     openResolvedWorkspaceInBackground(
-      rootURLs: restored.rootURLs,
-      fileURLs: restored.fileURLs,
-      selectsRestoredDocument: selectsRestoredDocument,
-      into: appState)
+      rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
   }
 
   func waitForPendingWorkspaceBuild() async {
@@ -724,19 +748,61 @@ final class FolderManager {
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
-  /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
-  /// single refresh after a short quiet period, then builds one presentation + search snapshot
-  /// on a background task so foreign filesystem churn never blocks the main actor. Only the
-  /// independent signature comparisons and required publications hop back to the main actor.
-  /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
+  /// Debounced, single-flight, off-main watcher refresh (RC-2). Coalesces a burst of watcher
+  /// events into a single refresh after a short quiet period, then builds one presentation +
+  /// search snapshot on a background task so foreign filesystem churn never blocks the main actor.
+  /// Only the independent signature comparisons and required publications hop back to the main
+  /// actor.
+  ///
+  /// Events arriving while a pass is still in its quiet period are absorbed by that debounce;
+  /// events arriving while its walk is already running buy exactly ONE follow-up pass, however
+  /// many of them there are. Cancel-and-re-arm — what this used to do — only looked like
+  /// coalescing: `cancel()` cannot reach a walk that is already running (see
+  /// `cancellableRefreshSnapshot`), so each surviving event batch added a full-tree walk to the
+  /// ones already burning a core, and nothing bounded the pile except the event rate. A workspace
+  /// whose event source is faster than one walk — an iCloud Drive root materialising placeholders,
+  /// a sync client, a build directory — therefore saturated every core while converging on
+  /// nothing, since each superseded pass discarded its own result.
   func scheduleWatcherRefresh(into appState: AppState) {
+    // The arming site itself, so "no watcher refresh is armed after the quiescence" holds for every
+    // caller rather than for the one hop that is known to reach here today. A cancel covers the task
+    // that exists; only refusal covers its successor.
+    guard !isQuiescedForTermination else { return }
     watcherRefreshGeneration &+= 1
+    guard !isWatcherRefreshArmed else {
+      pendingWatcherRescan = true
+      return
+    }
+    isWatcherRefreshArmed = true
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
       try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
+      guard let self else { return }
+      // A cancelled pass drops the request it absorbed, deliberately: every site that cancels this
+      // task either runs an authoritative reconcile straight behind it (`scheduleExplicitRefresh`)
+      // or is tearing the workspace down (`closeWorkspace`, `quiesceForTermination`).
+      defer {
+        self.isWatcherRefreshArmed = false
+        self.pendingWatcherRescan = false
+      }
+      guard !Task.isCancelled, let appState else { return }
+      await self.runWatcherRefreshPasses(into: appState)
+    }
+  }
+
+  /// The walk/apply loop of one armed watcher refresh, entered after the first debounce has
+  /// elapsed. `pendingWatcherRescan` is cleared BEFORE each walk and re-read after it, which is
+  /// exactly what splits "already covered by this pass" from "needs the next one": an event the
+  /// walk could have seen is absorbed, an event that arrived after it started gets one more pass —
+  /// and that pass is debounced too, so a burst during a walk still costs a single follow-up.
+  private func runWatcherRefreshPasses(into appState: AppState) async {
+    while true {
+      guard !isQuiescedForTermination else { return }
+      pendingWatcherRescan = false
+      await performWatcherRefresh(into: appState)
+      guard !Task.isCancelled, pendingWatcherRescan else { return }
+      try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
       guard !Task.isCancelled else { return }
-      guard let self, let appState else { return }
-      await self.performWatcherRefresh(into: appState)
     }
   }
 
@@ -799,28 +865,49 @@ final class FolderManager {
     scheduleExplicitRefresh(into: appState, forcePresentation: true)
   }
 
+  /// The arming site of the explicit reconcile, latched against the quit for the same reason
+  /// `scheduleWatcherRefresh` is — and, since round 19, for a reason that is not hypothetical.
+  ///
+  /// `moveToTrash` genuinely SUSPENDS before it gets here: it parks on a `withCheckedContinuation`
+  /// around Finder's `recycleItems`, and only the completion brings it back to prune, remove
+  /// references, and ask for this refresh. A quit that begins while it is parked therefore has no
+  /// `forcedRefreshTask` to cancel — there is none yet — and `runBlockingMainRunLoop()` is precisely
+  /// what resumes the continuation. Without this guard the resumed call armed a full replacement scan
+  /// whose `applyRefresh` republishes the tree, commits the workspace manifest and asks the index to
+  /// write, all after the drain had already taken its snapshots. A cancel covers the task that exists;
+  /// only refusal covers its successor.
+  ///
+  /// Round 17 said this method was out of scope because a queued WATCHER hop cannot reach it. That
+  /// remains true and is not what this closes: the trash continuation is a different route in.
+  ///
+  /// Checked in the task BODY as well, because the arming site can be passed a moment before the latch
+  /// closes while the body only starts afterwards — the same "the two halves must not disagree"
+  /// property `quiesceForTermination()` documents. Quit-only, so `moveToTrash` outside termination
+  /// reconciles exactly as before.
   @discardableResult
   private func scheduleExplicitRefresh(
     into appState: AppState,
     forcePresentation: Bool
   ) -> Task<Void, Never>? {
+    guard !isQuiescedForTermination else { return nil }
     guard appState.hasWorkspaceContent else { return nil }
+    forcedRefreshGeneration &+= 1
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
     let task = Task { [weak self, weak appState] in
       guard let self, let appState, appState.hasWorkspaceContent else { return }
+      guard !self.isQuiescedForTermination else { return }
       let roots = appState.workspaceRoots.map(\.url)
       let rootPaths = roots.map { $0.standardizedFileURL.path }
       let exclusions = appState.excludedWorkspacePaths
       let workspaceBuilder = self.workspaceBuilder
 
-      let snapshot = await Task.detached(priority: .userInitiated) {
-        FolderManager.refreshSnapshot(
-          roots: roots,
-          exclusions: exclusions,
-          builder: workspaceBuilder
-        )
-      }.value
+      let snapshot = await FolderManager.cancellableRefreshSnapshot(
+        roots: roots,
+        exclusions: exclusions,
+        builder: workspaceBuilder,
+        priority: .userInitiated
+      )
       guard !Task.isCancelled else { return }
       guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
         appState.excludedWorkspacePaths == exclusions
@@ -838,6 +925,35 @@ final class FolderManager {
     return task
   }
 
+  /// One workspace walk plus every artifact derived from it, run off the main actor in a way that
+  /// cancelling the OWNING task can actually stop.
+  ///
+  /// `Task.detached` inherits nothing — not the actor, not the priority, and not the cancellation.
+  /// Detachment is what keeps the walk off the main actor, but it also put the walk out of reach of
+  /// the handle callers cancel, so `WorkspaceScanner.buildCancellable`'s `Task.checkCancellation()`
+  /// was interrogating a flag nothing could set. A superseded refresh stopped being AWAITED while
+  /// its walk kept a core busy to the end. The cancellation handler is what makes the cancel honest;
+  /// the walk then returns the empty compatibility value its callers already discard.
+  private nonisolated static func cancellableRefreshSnapshot(
+    roots: [URL],
+    exclusions: Set<String>,
+    builder: @escaping WorkspaceScanner.Builder,
+    priority: TaskPriority
+  ) async -> WorkspaceRefreshSnapshot {
+    let walk = Task.detached(priority: priority) {
+      FolderManager.refreshSnapshot(
+        roots: roots,
+        exclusions: exclusions,
+        builder: builder
+      )
+    }
+    return await withTaskCancellationHandler {
+      await walk.value
+    } onCancel: {
+      walk.cancel()
+    }
+  }
+
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
   /// off-main; only delta decisions and publication touch main-actor state.
   private func performWatcherRefresh(into appState: AppState) async {
@@ -847,13 +963,12 @@ final class FolderManager {
     let exclusions = appState.excludedWorkspacePaths
     let workspaceBuilder = workspaceBuilder
 
-    let snapshot = await Task.detached(priority: .utility) {
-      FolderManager.refreshSnapshot(
-        roots: roots,
-        exclusions: exclusions,
-        builder: workspaceBuilder
-      )
-    }.value
+    let snapshot = await FolderManager.cancellableRefreshSnapshot(
+      roots: roots,
+      exclusions: exclusions,
+      builder: workspaceBuilder,
+      priority: .utility
+    )
     guard !Task.isCancelled else { return }
     guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
       appState.excludedWorkspacePaths == exclusions
@@ -936,14 +1051,25 @@ final class FolderManager {
       return
     }
 
-    if let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
-    } else {
-      appState.selectedDocumentID = nil
-      appState.activeDocumentURL = nil
-      appState.activeDocumentText = ""
-      appState.activeDocumentDirty = false
-    }
+    // Nothing to re-select: the empty state, never a substitute document. This
+    // used to fall back to `documents.first` — the same fallback the restore
+    // path carried, with the same two failure modes. A session with nothing
+    // open (which, since a launch stopped picking for the user, is what an
+    // untouched session looks like) had a document opened FOR it by the next
+    // file event that happened to reach the watcher. And a user whose document
+    // left the workspace — trashed, or its folder excluded — got a neighbouring
+    // file in the editor they had not asked to change; `removeReferences` has
+    // already cleared the selection by then, so this branch was free to fill it.
+    //
+    // The paths that legitimately move a selection never reach here: rename and
+    // move re-point `selectedDocumentID` through `replaceReferences` BEFORE
+    // scheduling the refresh, so the document is found by the branch above, and
+    // create/duplicate select the new document themselves. Nor does opening a
+    // different workspace, which is the cold path.
+    appState.selectedDocumentID = nil
+    appState.activeDocumentURL = nil
+    appState.activeDocumentText = ""
+    appState.activeDocumentDirty = false
   }
 
   func addExcludedURLs(_ urls: [URL], into appState: AppState) {
@@ -988,16 +1114,20 @@ final class FolderManager {
 
     if appState.workspaceRoots.count == 1 {
       let indexedPaths = appState.allDocuments.map { $0.url.standardizedFileURL.path }
-      closeWorkspace(into: appState)
+      // The close still has ONE index write coming after it — the delete below. Let it skip its own
+      // maintenance arming so the two cannot race; this path re-arms maintenance behind the delete.
+      closeWorkspace(into: appState, deferringIndexMaintenance: !indexedPaths.isEmpty)
       if !indexedPaths.isEmpty {
         let indexDatabase = indexDatabase
-        indexUpdateTask = Task { [weak appState] in
+        let deleteTask = Task { [weak appState] in
           _ = await indexDatabase.updateSearchIndexInBackground(
             upserting: [],
             deletingPaths: indexedPaths,
             appState: appState
           )
         }
+        indexUpdateTask = deleteTask
+        scheduleIndexMaintenance(after: deleteTask)
       }
       return
     }
@@ -1030,11 +1160,156 @@ final class FolderManager {
     }
   }
 
+  /// Arms the off-main index housekeeping (WAL truncate + page compaction) that follows a close.
+  ///
+  /// Compaction is not order-agnostic — it truncates the WAL and hands free pages back, so running
+  /// it BEFORE a still-outstanding index write truncates a log that write immediately grows again,
+  /// and the resulting frames and free pages then sit there unclaimed: the workspace is gone, so no
+  /// further batch checkpoint is coming to notice them.
+  ///
+  /// Two things can still be owed at that moment, and BOTH are waited for:
+  ///
+  /// - `pendingIndexWork` — a final write this close's CALLER owns and has not handed to the index
+  ///   yet (only `removeRoot`'s last-root delete does this).
+  /// - the index's own queue — `closeWorkspace` cancels `indexUpdateTask`, but that handle is only
+  ///   the WAIT: the write underneath belongs to `IndexDatabase`'s supersede chain and survives the
+  ///   cancellation, and a save's write may not even have joined that chain yet. Ordinary
+  ///   `Close Folder` used to arm this task with nothing to await and compacted straight through
+  ///   a queue that was still moving.
+  ///
+  /// Successive passes CHAIN rather than replace. This handle is the only one there is, so a second
+  /// close arriving before the first close's pass has finished — reopen a workspace, close it again
+  /// — used to drop the older task on the floor: `waitForPendingIndexMaintenance()` then awaited
+  /// only the newest one, while the orphan was still draining and could enter its vacuum + truncate
+  /// after the terminal checkpoint had started, recreating WAL frames behind the operation meant to
+  /// be final. Awaiting the predecessor at the head makes "await the newest" transitively await them
+  /// all, and it preserves the compaction-after-writes ordering above for free: a pass cannot
+  /// truncate a log the previous pass's write is still growing. Cancelling the orphan instead would
+  /// be the wrong half of the cancel/drain distinction — its `barrierWriteWithoutTransaction` is
+  /// accepted work, so cancellation would abandon only the wait, not the vacuum.
+  ///
+  /// …and everything above assumes the pass still lands in the quiet moment it was armed for. It
+  /// need not: `Close Folder` followed by `Open Folder` is an ordinary two-second sequence, no open
+  /// path cancels or awaits this handle, and the waits at the head of the task (the predecessor, the
+  /// caller's final write, the index drain) are exactly where the seconds go. So the `.workspaceClose`
+  /// pass — full-freelist `incremental_vacuum`, a possible one-off `VACUUM`, and a truncate under
+  /// `barrierWriteWithoutTransaction` — used to run INSIDE the next workspace's opening searches, and
+  /// that barrier excludes the pool's reader checkouts (GRDB 6.29.3, measured in round 12). The new
+  /// workspace's first search, backlink and count all wait it out.
+  ///
+  /// The reason is therefore decided at the LAST moment rather than at arm time, and the answer is a
+  /// downgrade rather than a cancellation. Cancelling would drop the WAL bound this pass exists to
+  /// provide; delaying the open on it is worse still. `.workspaceCloseIntoOpenWorkspace` keeps the
+  /// obligation and drops only the exclusion — plain write, fail-fast truncate, backoff ladder — so
+  /// the bound is deferred and still enforced while the new workspace reads freely.
+  ///
+  /// Deciding it in the task (not at arm time) also keeps the quit honest: the LAST close before a
+  /// quit is followed by no open at all, so it still takes the barrier and the WAL→0 promise is
+  /// unconditional. Nothing legitimate can contradict that during a quit either: `TerminationSequence`
+  /// quiesces this manager before it drains, `quiesceForTermination()` stops the watcher and cancels
+  /// every refresh/build task, and the open entry points are main-actor calls the quit's pumped run
+  /// loop has nothing left to deliver — so no bump can arrive between the decision and the barrier
+  /// while the process is closing.
+  ///
+  /// Rounds 16 and 20, in that order, are why the decision is taken TWICE. Round 16 read the
+  /// generation on the main actor immediately before the call and argued no open could slip in,
+  /// because `performMaintenanceInBackground` "only suspends once it reaches its detached work". That
+  /// covered decision→call and nothing after it: round 12 had already measured that the pass parks
+  /// BEFORE `Task.detached { barrier }`, and on the undowngraded path a one-off `VACUUM` conversion —
+  /// seconds of whole-file rewrite — runs inside that detached closure before the lock is taken. An
+  /// `Open Folder` landing in that gap kept a `.workspaceClose` pass claiming a quiet index it no
+  /// longer had. So the exclusion decision is now REVALIDATED at barrier acquisition, from the
+  /// detached closure, through a lock-guarded generation the main actor is not needed to read.
+  ///
+  /// Round 21 closed the last unbounded stretch of that prologue. Between the first revalidation and
+  /// the first byte of the `VACUUM` conversion sits the queue for the pool's SERIALIZED WRITER,
+  /// which a save or a reindex already in flight can hold for as long as it likes; a workspace
+  /// opened during that wait had its own first index writes queued behind a whole-file rewrite. The
+  /// conversion now carries the predicate into its write and reads it with the writer in hand.
+  ///
+  /// Named residual, re-derived: an open that arrives after the pass has already ENTERED its
+  /// barrier, or after the conversion's rewrite has BEGUN, is not retracted — neither is abortable.
+  /// Those windows are now exactly the barrier's own duration and the rewrite's own duration
+  /// (bounded by `IndexDatabase.autoVacuumConversionByteLimit`, measured at roughly 1.3 s at that
+  /// ceiling on an SSD, and paid at most once per database), rather than the whole detached
+  /// prologue.
+  private func scheduleIndexMaintenance(after pendingIndexWork: Task<Void, Never>? = nil) {
+    let indexDatabase = indexDatabase
+    let previous = indexMaintenanceTask
+    // Captured by value, not through `self`: the generation object outlives a deallocated manager and
+    // nothing can bump it once the manager is gone, so "deallocated reads as no open" — the old
+    // behaviour, and the safe one — now holds by construction instead of by an optional fallback.
+    let openGeneration = workspaceOpenGeneration
+    let armedAtOpenGeneration = openGeneration.current
+    indexMaintenanceTask = Task {
+      await previous?.value
+      await pendingIndexWork?.value
+      await indexDatabase.drainPendingIndexWrites()
+      let reopened = openGeneration.hasChanged(since: armedAtOpenGeneration)
+      await indexDatabase.performMaintenanceInBackground(
+        reason: reopened ? .workspaceCloseIntoOpenWorkspace : .workspaceClose,
+        exclusionRemainsWarranted: {
+          !openGeneration.hasChanged(since: armedAtOpenGeneration)
+        })
+    }
+  }
+
+  /// Termination command, issued by `TerminationSequence` in the quiescence phase. Stops every
+  /// workspace-side producer this manager owns, so the drain that follows waits for a FINITE set of
+  /// work instead of chasing a target the watcher keeps moving.
+  ///
+  /// The watcher goes first and it is the load-bearing half: `FileWatcher.stop()` bumps a
+  /// generation, so an FSEvents batch already in flight on the watcher queue is discarded instead of
+  /// being debounced into a fresh refresh during the quit's pumped run loop. The primitive already
+  /// existed — until now only `closeWorkspace` called it, so a quit left FSEvents live to the last
+  /// instruction of the process.
+  ///
+  /// Deliberately does NOT await the detached scans those four tasks may already be running. Every
+  /// one of them re-checks cancellation AND workspace identity after the walk and before it
+  /// publishes or writes (`performWatcherRefresh`, `scheduleExplicitRefresh`, the build task's
+  /// guards), so a cancelled scan can no longer produce an index write. Awaiting them would put a
+  /// full tree walk inside the quit budget and buy nothing.
+  func quiesceForTermination() {
+    // Set BEFORE the stop, in the same synchronous step and with no suspension point between them:
+    // the two halves of the watcher quiescence must not be able to disagree, and a delivery hopping
+    // to the main actor between them would find the latch open. See `isQuiescedForTermination`.
+    isQuiescedForTermination = true
+    watcher.stop()
+    watcherRefreshTask?.cancel()
+    forcedRefreshTask?.cancel()
+    workspaceBuildTask?.cancel()
+    workspaceValidationTask?.cancel()
+  }
+
+  /// Deterministic sync point for the post-close index housekeeping, and the quit's only handle on
+  /// it. Because the maintenance task chains on whatever final index write it was armed behind,
+  /// awaiting this also awaits that write — which is exactly the ordering `removeRoot`'s last-root
+  /// path depends on. And because each pass chains on its PREDECESSOR
+  /// (`scheduleIndexMaintenance(after:)`), awaiting the newest handle transitively awaits every
+  /// older pass still in flight: when this returns, no maintenance is outstanding at all, so the
+  /// terminal checkpoint that follows it cannot be overtaken by an orphaned vacuum.
+  func waitForPendingIndexMaintenance() async {
+    await indexMaintenanceTask?.value
+  }
+
+  /// The newest armed housekeeping pass, exposed by IDENTITY rather than as a wait.
+  ///
+  /// `waitForPendingIndexMaintenance()` answers "is anything owed right now"; the quit's stability
+  /// drain also has to answer "did anything get armed WHILE I was waiting", and the two are different
+  /// questions for the same reason `drainPendingIndexWrites()` tracks its open and its tail by
+  /// identity: a pass armed during a wait is work the waiter accepted and has not waited for yet.
+  /// Reading the handle lets `TerminationSequence` tell "already awaited" from "moved".
+  var pendingIndexMaintenance: Task<Void, Never>? { indexMaintenanceTask }
+
   /// Closes the workspace: cancels any in-flight build, stops the file watcher, clears the
   /// persisted bookmarks and all workspace state, returning to the "No folder open" state.
   /// Protects unsaved work — if the active document has unsaved edits it stays open in the
   /// editor; otherwise the editor is cleared too.
-  func closeWorkspace(into appState: AppState) {
+  ///
+  /// - Parameter deferringIndexMaintenance: pass `true` when the CALLER still owns a final index
+  ///   write and will re-arm the housekeeping behind it via `scheduleIndexMaintenance(after:)`.
+  ///   Only `removeRoot`'s last-root path does this.
+  func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     // Take ownership of the activity display so the cancelled build's terminal clear
@@ -1042,16 +1317,18 @@ final class FolderManager {
     openFlowGeneration &+= 1
     watcherRefreshTask?.cancel()
     forcedRefreshTask?.cancel()
-    // Cancel any still-awaiting off-main index update. The underlying single-transaction
-    // `pool.write` commits wholly or not at all, so this never leaves the index half-written.
+    // Cancel any still-awaiting off-main index update. Only the WAIT is abandoned — the write
+    // itself belongs to `IndexDatabase`'s supersede chain and still runs — but the underlying
+    // single-transaction `pool.write` commits wholly or not at all, so this never leaves the index
+    // half-written. The housekeeping armed below waits for that chain; see
+    // `scheduleIndexMaintenance(after:)`.
     indexUpdateTask?.cancel()
     workspaceIndexWriteTask?.cancel()
-    // Closing a workspace is the quietest moment the index ever gets: no watcher, no pending write.
-    // Bound the WAL and reclaim freed pages here so the storm of a workspace's lifetime does not
-    // survive into the next one.
-    let indexDatabase = indexDatabase
-    indexMaintenanceTask = Task {
-      await indexDatabase.performMaintenanceInBackground(reason: .workspaceClose)
+    // Closing a workspace is the quietest moment the index ever gets: no watcher, and whatever
+    // writes are still queued are drained before the compaction runs. Bound the WAL and reclaim
+    // freed pages here so the storm of a workspace's lifetime does not survive into the next one.
+    if !deferringIndexMaintenance {
+      scheduleIndexMaintenance()
     }
     watcher.stop()
     bookmarkStore.clear(into: appState)
@@ -1080,6 +1357,8 @@ final class FolderManager {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
+    // Before the hot-reopen short-circuit below, so BOTH open shapes are covered by one bump.
+    workspaceOpenGeneration.bump()
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let metadata = metadataStore.load()
     let exclusions = Set(metadata.excludedPaths)
@@ -1143,6 +1422,40 @@ final class FolderManager {
       rootURLs: roots, currentSignature: currentSignature, into: appState)
   }
 
+  /// Whether the PERSISTED `.md` signature still describes the tree the current walk found — the
+  /// corroboration a cold-start valid-skip needs on top of the manifest's tree fingerprint.
+  ///
+  /// Round 21, finding 1. The two cold-start artifacts are written in OPPOSITE orders relative to
+  /// the index write they describe, and only one of them is safe to trust alone:
+  ///
+  /// - the manifest and its tree fingerprint are committed by `commitWorkspaceManifest` BEFORE the
+  ///   paired index write is even handed to `scheduleIndexWrite`, so a quit whose budget closes the
+  ///   termination latch in between rolls the documents/FTS transaction back and leaves the
+  ///   fingerprint on disk describing a tree the index does not hold;
+  /// - the `.md` signature is written by `persistSearchSignature` only AFTER its index write
+  ///   reported success, which is why a failed or abandoned write simply leaves the previous one in
+  ///   place (see `performColdIndex`).
+  ///
+  /// The skip gate used to ask only for `.valid` plus "the index has ANY rows for this workspace",
+  /// and rows left over from the PREVIOUS launch satisfy that. The next cold start then skipped over
+  /// its own repair, and because a skip issues no index write and no manifest re-commit, nothing at
+  /// startup ever revisited it: on an unchanged tree the stale FTS state survived indefinitely.
+  ///
+  /// So the gate now asks the persisted signature the same question `performColdIndex` asks before
+  /// taking ITS skip — the two decisions were making different demands of the same substrate, and
+  /// this gate is the one that suppresses `performColdIndex` entirely. Disagreement, or no persisted
+  /// signature at all, is answered `false`: the caller runs the full cold path, which re-derives the
+  /// index and persists the signature, so the cost of the conservative answer is one reindex on the
+  /// first launch after an abandoned write (or after an upgrade from a pre-signature workspace) and
+  /// warm starts from then on. Fail open, never fail skip.
+  static func persistedIndexAgreesWithTree(
+    persisted: WorkspaceSignature?,
+    current: WorkspaceSignature?
+  ) -> Bool {
+    guard let persisted, let current else { return false }
+    return WorkspaceSignature.delta(from: persisted, to: current).isEmpty
+  }
+
   /// Cold-start skip-gate. On a fresh launch the in-memory tree is empty, so `attemptHotReopen`'s
   /// cold-start short-circuit (STAB-R01 / B-01) hands off to the cold-scan path; this gate then
   /// consults the EXISTING substrate verdict against the persisted `tree-fingerprint.json` so an
@@ -1159,12 +1472,14 @@ final class FolderManager {
   /// - the substrate verdict is genuinely `.valid` (tree-fingerprint match + schema/scanner/
   ///   exclusions/roots/bookmark checks) — NOT a new validity notion;
   /// - the FTS index already has rows for this workspace (empty-index guard, invariant 2): a
-  ///   matching fingerprint over an empty index must still FULL-reindex, never skip.
+  ///   matching fingerprint over an empty index must still FULL-reindex, never skip;
+  /// - the PERSISTED `.md` signature still describes this walk (round 21, finding 1) — see
+  ///   `persistedIndexAgreesWithTree` for why the fingerprint alone cannot answer this.
   ///
   /// On a valid skip it opens the index, restores the in-memory `.md` baseline from the persisted
-  /// signature (so the first in-session edit goes INCREMENTAL, not full) — falling back to the
-  /// current scan's signature if none is persisted — and issues NO index write and NO manifest
-  /// re-commit. No `.indexing` activity is set: the caller clears `workspaceActivity` directly.
+  /// signature (so the first in-session edit goes INCREMENTAL, not full) and issues NO index write
+  /// and NO manifest re-commit. No `.indexing` activity is set: the caller clears
+  /// `workspaceActivity` directly.
   private func attemptColdStartValidSkip(
     scans: [WorkspaceScan],
     rootURLs: [URL],
@@ -1206,13 +1521,24 @@ final class FolderManager {
         return false
       }
 
-      // Restore the in-memory `.md` baseline so the FIRST in-session edit goes INCREMENTAL. Prefer
-      // the persisted signature (matches the live index); fall back to a signature derived from
-      // the walk we already have (re-uses the scan's documents — no extra enumeration). Either way
-      // no index write is issued: the verdict is `.valid`, so the on-disk index already matches.
-      lastWorkspaceSignature =
-        cacheStore.readSearchSignature(for: identity)
-        ?? FolderManager.signature(from: scans)
+      // Round 21, finding 1: the persisted `.md` signature has to CORROBORATE the fingerprint before
+      // this gate may suppress the whole cold path, because the fingerprint is persisted before its
+      // index write and the signature only after it. No persisted signature, or one that no longer
+      // describes this walk, means the full cold path — which repairs. See
+      // `persistedIndexAgreesWithTree`.
+      let persistedSignature = cacheStore.readSearchSignature(for: identity)
+      guard
+        Self.persistedIndexAgreesWithTree(
+          persisted: persistedSignature, current: FolderManager.signature(from: scans)),
+        let persistedSignature
+      else {
+        return false
+      }
+
+      // Restore the in-memory `.md` baseline so the FIRST in-session edit goes INCREMENTAL. It is
+      // the persisted signature by construction now — the guard above refuses the skip without one —
+      // and it matches the live index, which is what the `.valid` verdict plus that agreement mean.
+      lastWorkspaceSignature = persistedSignature
       if persistPresentationCache {
         do {
           try cacheStore.writeWorkspaceScans(scans, for: identity)
@@ -1232,14 +1558,14 @@ final class FolderManager {
   }
 
   private func openResolvedWorkspaceInBackground(
-    rootURLs: [URL],
-    fileURLs: [URL],
-    selectsRestoredDocument: Bool = true,
-    into appState: AppState
+    rootURLs: [URL], fileURLs: [URL], into appState: AppState
   ) {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
+    // The background sibling of the bump in `openResolvedWorkspace` — same reason, and it covers
+    // this path's own hot-reopen branch too.
+    workspaceOpenGeneration.bump()
     let generation = openFlowGeneration
     let label = workspaceLabel(rootURLs: rootURLs, fileURLs: fileURLs)
     let requestedRootPaths = rootURLs.map { $0.standardizedFileURL.path }
@@ -1258,8 +1584,7 @@ final class FolderManager {
     // Preserve the existing/cached tree while ONE detached validation job walks + fingerprints.
     // No substrate validation, scanner build, fingerprint, or signature fallback runs before this
     // method returns to the main actor.
-    let selection = WorkspaceSelectionContext.capture(
-      from: appState, autoSelectsFirstDocument: selectsRestoredDocument)
+    let selection = WorkspaceSelectionContext.capture(from: appState)
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     let restoredPresentationCache =
       !isHotReopen
@@ -1386,7 +1711,16 @@ final class FolderManager {
         )
       else { return }
 
-      if cacheIsValid, indexedCount > 0 {
+      // The background sibling of `attemptColdStartValidSkip`'s gate, and it carries the round-21
+      // corroboration for the same reason: this branch suppresses the manifest commit AND
+      // `performColdIndex` below, so a fingerprint left describing an index write that never
+      // committed would be believed here too. The validation job already read both signatures off
+      // the one walk it owns, so this costs no scan.
+      if cacheIsValid, indexedCount > 0,
+        FolderManager.persistedIndexAgreesWithTree(
+          persisted: validation.persistedSearchSignature,
+          current: validation.currentSearchSignature)
+      {
         self.setOpenActivity(.cacheHit(label), into: appState)
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
@@ -1533,6 +1867,14 @@ final class FolderManager {
       .map { $0.standardizedFileURL }
       .filter { seenOpenFileURLs.insert($0).inserted }
       .map { DocumentRef(id: $0, isAdHoc: true) }
+    // THE CAP APPLIES TO WHAT A LAUNCH INHERITS, not only to what a session
+    // grows. The restored set is every bookmark that survived — for an install
+    // that predates the paired prune below, that is every ad-hoc file ever
+    // opened and not explicitly closed — and the startup restore now opens the
+    // working set for real, one tab per ref. Nothing in-session can repair such
+    // a key; only the restore can, so the newest `maxOpenFiles` are kept here
+    // and the rest lose their bookmarks with their rows.
+    pruneOpenFiles(into: appState)
     appState.lastError = nil
   }
 
@@ -1877,7 +2219,14 @@ final class FolderManager {
         try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
       }
       let documents = appState.documents
-      return Task {
+      // Handed over through `scheduleIndexWrite` rather than a bare `Task` for the same reason the
+      // save tail is: these three calls are `IndexDatabase` WRITES, and a bare task is invisible to
+      // `drainPendingIndexWrites()`. It is not enough that the close path cancels this task —
+      // cancellation abandons the WAIT, not the record build underneath, so a Close Folder or a quit
+      // landing mid-manifest used to drain, checkpoint, and only THEN take these writes' frames,
+      // recreating the WAL the maintenance had just truncated. One mechanism for every writer.
+      let indexDatabase = self.indexDatabase
+      return indexDatabase.scheduleIndexWrite {
         await indexDatabase.upsertWorkspace(
           identity: identity,
           roots: rootURLs,
@@ -1928,12 +2277,28 @@ final class FolderManager {
   /// Decides what an open/restore flow puts on screen once its walk lands,
   /// using only what the flow knew when it STARTED (`selection`).
   ///
-  /// Two guards protect a session the user is responsible for: a dirty buffer
-  /// always wins, and a conscious `Close` that happened while this flow was in
-  /// flight wins too. The second one closes the race the old code had no answer
-  /// for — the validation tail of a workspace opened seconds earlier would
-  /// happily re-select a document into a window the user had just emptied,
-  /// making ⌘W look like it did nothing.
+  /// Re-selects the document this window was already on — and NOTHING else.
+  ///
+  /// It used to fall back to `documents.first` when there was no previous
+  /// selection, which on a launch is always. That is how a file the operator had
+  /// not touched in two weeks became the one open document after a launch, with
+  /// no bookmark of its own anywhere in the working set: nothing restored it, the
+  /// app picked it. `documents.first` is not "the most recent" — the scan sorts
+  /// folders before files and each group alphabetically, then walks depth-first,
+  /// so it is the first Markdown file inside the alphabetically-first folder
+  /// chain.
+  ///
+  /// An empty session therefore stays empty. What the user left open comes back
+  /// through the store that actually records it — the file bookmarks behind Open
+  /// Files — and a launch with none shows the launcher, which is what "nothing
+  /// was open" looks like.
+  ///
+  /// Two further guards protect a session the user is responsible for: a dirty
+  /// buffer always wins, and a conscious `Close` that happened while this flow
+  /// was in flight wins too. The second one closes the race the old code had no
+  /// answer for — the validation tail of a workspace opened seconds earlier
+  /// would happily re-select the previous document into a window the user had
+  /// just emptied, making ⌘W look like it did nothing.
   private func selectRestoredDocument(
     _ selection: WorkspaceSelectionContext,
     into appState: AppState
@@ -1955,8 +2320,6 @@ final class FolderManager {
       let ref = documents.first(where: { $0.id == previousSelection })
     {
       DocumentStore.shared.select(ref: ref, into: appState)
-    } else if selection.autoSelectsFirstDocument, let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
     } else {
       appState.selectedDocumentID = nil
       appState.activeDocumentURL = nil
@@ -1976,6 +2339,11 @@ final class FolderManager {
         let deliveredOffMain = !Thread.isMainThread
         Task { @MainActor in
           guard let self, let appState else { return }
+          // The hop's own generation check, and the one `FileWatcher` cannot give it: its token is
+          // verified on the watcher queue, one line ABOVE this enqueue, so a batch that beat the
+          // quit by a moment arrives here with nothing left to stop it. See
+          // `isQuiescedForTermination`.
+          guard !self.isQuiescedForTermination else { return }
           let rootPaths = appState.workspaceRoots.map {
             FileWatcherEvent.canonicalPath(for: $0.url.path)
           }
@@ -2068,8 +2436,15 @@ final class FolderManager {
     }
   }
 
+  /// The working-set prune, and the bookmark side of it. `persistFile` only ever
+  /// grows the key, and before this the only things that shrank it were an
+  /// explicit close and the removal of a root — so an eviction here left a
+  /// bookmark the next launch would restore into a row the cap had already
+  /// rejected.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 }
 
@@ -2737,7 +3112,12 @@ final class DocumentStore {
         // synchronously on the main actor on every persisted edit (a per-save SQLite stall). Routing
         // it through the off-main `indexInBackground` twin keeps the file write synchronous while the
         // FTS update commits in the background; tests sync on it via `waitForPendingReindex()`.
-        Task {
+        //
+        // Handed over through `scheduleIndexWrite` rather than a bare `Task` so the write stays
+        // TRACKABLE. A bare task joins the supersede chain several suspensions later, which is
+        // invisible to anyone asking "does the index still owe me anything?" — and the quit
+        // sequence has to answer exactly that before it checkpoints the WAL.
+        resolvedIndexDatabase.scheduleIndexWrite {
           await resolvedIndexDatabase.indexInBackground(
             document: ref, body: body, appState: appState)
         }
@@ -2751,13 +3131,43 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
+  /// The user closed this DOCUMENT — retires it from the WORKING SET a relaunch
+  /// restores from, not just from the window that was showing it.
+  ///
+  /// CONTRACT REVERSAL, operator decision 2026-08-03. Until now closing a
+  /// document deliberately did NOT come here: "a window is a view of a file",
+  /// so ⌘W and a tab's "×" left the row in place and the next launch brought
+  /// the file back; only "Close from Open Files" retired it. The operator's
+  /// call is the opposite one — closing a single document explicitly (⌘W /
+  /// File ▸ Close, a tab's "×", "Close from Open Files") takes the file out of
+  /// the session for good.
+  ///
+  /// What still does NOT retire, and must not: closing a whole WINDOW, which
+  /// takes every tab in it down at once, and every termination teardown — quit,
+  /// logout, crash. Those are the paths the next launch is supposed to restore
+  /// from; reading them as "the user closed all of these" would quietly empty
+  /// the working set behind the user's back.
+  ///
+  /// Two stores hold that answer and both have to hear it, or whichever one is
+  /// missed reseeds the other on the next launch: the in-memory `openFiles`
+  /// working set, shared across windows, and the persisted file bookmarks,
+  /// which are what a relaunch actually reads.
+  func forgetOpenFile(_ url: URL, into appState: AppState) {
+    let standardizedURL = url.standardizedFileURL
+    appState.openFiles.removeAll { $0.url.standardizedFileURL == standardizedURL }
+    bookmarkStore.removeFile(url: standardizedURL)
+  }
+
   // MARK: - Recovered drafts
 
   /// Every unhandled crash draft, newest first. The launcher's Recovered Drafts
   /// section is the ONLY route from here into a window — nothing adopts a draft
   /// on its own any more.
+  ///
+  /// A draft another window is already editing is not "unhandled": it is live
+  /// work with a window on it, so it drops off every other launcher surface.
   func recoveredDrafts() -> [RecoveryDraft] {
-    recoveryStore.loadDrafts()
+    recoveryStore.unclaimedDrafts()
   }
 
   /// Launch sweep for the recovery directory (age + count retention).
@@ -2774,12 +3184,20 @@ final class DocumentStore {
   /// holds a buffer — the section that offers this is only shown in an empty
   /// one, and silently replacing a document would be the very hijack W2-D
   /// removes.
+  ///
+  /// Refuses a draft ANOTHER window already adopted too. `recoveredDrafts()`
+  /// stops offering a claimed draft, but a launcher rendered before the claim
+  /// still holds the stale row: adopting it would put two buffers on one
+  /// recovery ID, autosaving over each other, with a Save As… in one undone by
+  /// the other's next autosave recreating the file. Refusing is a no-op — the
+  /// caller refreshes and the stale row disappears.
   @discardableResult
   func openRecoveredDraft(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
+    guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
 
     self.appState = appState
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
     appState.selectedDocumentID = nil
     appState.documentSession.restoreUntitled(
       title: draft.title,
@@ -2841,7 +3259,7 @@ final class DocumentStore {
   }
 
   private func loadClean(ref: DocumentRef, into appState: AppState) {
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
 
     do {
       let text = try String(contentsOf: ref.url, encoding: .utf8)
@@ -2864,7 +3282,7 @@ final class DocumentStore {
     }
 
     guard let ref else {
-      autosaver.cancel()
+      cancelOwnDebouncesOnSessionChange(appState: appState)
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
       return true
@@ -2888,6 +3306,23 @@ final class DocumentStore {
       autoSavesPathedDocuments: savingSettings.autoSavesPathedDocuments)
   }
 
+  /// What a completed close does to the Open Files working set. Stated by the
+  /// caller, because only the caller knows which gesture it serves.
+  enum OpenFilesRetirement {
+    /// Leave the row alone — the close was a window/teardown, and the next
+    /// launch is supposed to bring this file back.
+    case keep
+    /// Retire the document now: an explicit single-document close
+    /// (operator decision 2026-08-03).
+    case now
+    /// Hand the settled location to `report` and let the caller decide. The
+    /// window route needs this: whether its close was one TAB leaving a live
+    /// window or the whole window going down is only knowable a runloop turn
+    /// later, but the url to retire is only knowable HERE, after the save
+    /// branches.
+    case deferred(@MainActor (URL) -> Void)
+  }
+
   /// Second half of the conscious close: applies the user's answer (`nil` when
   /// `decision` needed no prompt) and clears the session when the answer
   /// allows it. Returns whether the document actually closed — `false` means
@@ -2897,11 +3332,16 @@ final class DocumentStore {
   /// Unlike `savePendingChangesOnClose` (the window/tab teardown guard, which
   /// has no veto point left and therefore persists silently), this path is
   /// allowed to refuse: nothing has been torn down yet.
+  ///
+  /// `retiring` states what this close means for the Open Files working set.
+  /// Only the CALLER knows which gesture it is serving, so the store never
+  /// guesses: see `OpenFilesRetirement`.
   @discardableResult
   func finishClose(
     decision: DocumentCloseDecision,
     response: SaveChangesResponse?,
-    appState: AppState
+    appState: AppState,
+    retiring: OpenFilesRetirement = .keep
   ) -> Bool {
     self.appState = appState
 
@@ -2934,12 +3374,21 @@ final class DocumentStore {
       return false
     }
 
-    // Read the URL AFTER the save branches: a draft that went through
-    // "Save As…" only earns its location there, and it is that final location
-    // that leaves the working set.
-    let closedURL = appState.documentSession.url
-
     autosaver.cancel()
+    // The settled location, read AFTER the save branches: a draft that only
+    // earned a path through "Save As…" retires under THAT url, not the nil it
+    // arrived with. A cancelled or failed close returned above, so it forgets
+    // nothing.
+    if let closedURL = appState.documentSession.url {
+      switch retiring {
+      case .keep:
+        break
+      case .now:
+        forgetOpenFile(closedURL, into: appState)
+      case .deferred(let report):
+        report(closedURL)
+      }
+    }
     // Whatever the answer was, no buffer is holding this draft any more, so it
     // stops being exempt from retention. (Discard/Save already removed the file
     // outright; this only releases the claim when one survived.)
@@ -2950,23 +3399,7 @@ final class DocumentStore {
     // walk still in flight captured an older generation and will stand down
     // instead of selecting a document back into this window.
     appState.windowModel.noteConsciousDocumentClose()
-    if let closedURL {
-      forgetOpenFile(url: closedURL, appState: appState)
-    }
     return true
-  }
-
-  /// Drops `url` from the Open Files working set.
-  ///
-  /// Open Files means "open right now", not "opened at some point": a closed
-  /// document leaves the list and comes back only when it is opened again.
-  /// Nothing about the file itself changes — it keeps its place in the
-  /// workspace tree and can be reopened from there. Idempotent, so every close
-  /// route may call it without checking whether some other route got there
-  /// first.
-  func forgetOpenFile(url: URL, appState: AppState) {
-    let standardizedPath = url.standardizedFileURL.path
-    appState.openFiles.removeAll { $0.id.standardizedFileURL.path == standardizedPath }
   }
 
   func save(appState: AppState) {
@@ -2976,7 +3409,7 @@ final class DocumentStore {
   @discardableResult
   func saveAs(appState: AppState, to url: URL) -> Bool {
     self.appState = appState
-    autosaver.cancel()
+    cancelOwnDebouncesOnSessionChange(appState: appState)
 
     guard appState.documentSession.hasEditableBuffer else { return false }
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
@@ -2994,6 +3427,10 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
       recoveryStore.deleteDraft(id: recoveryID)
       appState.lastError = nil
+      // Same publication, same exposure: saving AS an existing file makes our bytes that file's
+      // content, so a settled window already open on it holds a buffer this write has just made
+      // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
+      retireSettledForeignIndexDebounces(for: ref.id, by: appState)
       indexDocument(ref, appState.documentSession.text, appState)
       return true
     } catch {
@@ -3010,6 +3447,10 @@ final class DocumentStore {
       return
     }
     appState.documentSession.isDirty = true
+    // The ONE edit funnel, which is why the last-edit marker is stamped here and nowhere else. It is
+    // what orders the quit's window flush when two windows hold the SAME file — see
+    // `TerminationSequence.flushPendingWindowSaves`.
+    appState.noteEdit()
     scheduleAutosave(appState: appState)
     scheduleIndexUpdate(appState: appState)
   }
@@ -3028,13 +3469,55 @@ final class DocumentStore {
   @discardableResult
   func savePendingChangesOnClose(appState: AppState) -> Bool {
     self.appState = appState
+    // BEFORE the dirty guard, deliberately. A CLEAN session can still be holding a sleeping index
+    // debounce: the 1.5 s autosave already wrote the bytes and marked the buffer clean while the
+    // 5 s index write was still asleep. The old order returned on the guard without ever reaching
+    // the autosaver, so a close (or a quit) inside that window left the FTS row stale with no one
+    // owning the repair.
+    //
+    // FLUSH, not cancel — an armed debounce may belong to a DIFFERENT window than the one closing,
+    // and cancelling it there would drop that window's freshness for good on an ad-hoc document (no
+    // workspace signature ⇒ no cold-open self-heal).
+    //
+    // …with ONE exception, which is why this is not an unconditional flush: a debounce whose OWNER is
+    // still dirty carries an in-memory edit whose bytes are not on disk yet. Flushing it here submits
+    // that text to SQLite BEFORE that owner's file write is even attempted, and no later cancel can
+    // retract an already-scheduled database task — so a write that fails (full volume, revoked
+    // permissions) would leave FTS advertising content that never reached the disk. The rule is about
+    // the OWNER, not about who is closing: a dirty owner's debounce waits for that owner's own
+    // successful save; a clean (or vanished) owner's debounce is owed NOW.
+    //
+    // Round 15 turned that rule from a single-slot decision into a per-owner sweep. It used to be
+    // expressible as one disposition because `Autosaver` held at most one debounce and the only
+    // question was whose it was; now every window may hold one, so the same classification runs over
+    // all of them — clean owners' bodies land here, dirty owners' bodies stay armed, including this
+    // session's own, which the `saveExisting(indexNow: true)` below re-issues after its bytes land.
+    // See `Autosaver.flushIndexDebouncesWithSettledOwners()`.
+    autosaver.flushIndexDebouncesWithSettledOwners()
     guard appState.documentSession.hasEditableBuffer,
       appState.documentSession.isDirty
     else {
       return false
     }
 
-    autosaver.cancel()
+    // Only OUR armed save. The same reasoning as the index debounce above, one debounce over:
+    // cancelling a foreign 1.5 s autosave here deletes the write that the sweep above just deferred
+    // that window's index debounce to — its bytes would then stay in memory while its index write
+    // fires at 5 s over them, which is the FTS-ahead-of-disk ordering this guard exists to forbid,
+    // this time in a RUNNING app. Left armed, a foreign save simply fires on its own schedule; ours
+    // is redundant because `saveExisting(indexNow: true)` below writes the same bytes now, and
+    // cancelling it is what keeps that from becoming a second write.
+    cancelArmedSaveIfOwned(by: appState)
+    // Cancelling the index debounce is right when it is OURS — `saveExisting(indexNow: true)` below
+    // re-issues that write after the bytes land — and wrong when it belongs to another dirty window:
+    // dropping it there would be the cancel this whole guard exists to avoid. Deferred means LEFT
+    // ARMED, not cancelled; that owner's own close still runs the sweep above, and if its window
+    // simply stays open the debounce fires on its own schedule. On quit nothing is stranded either:
+    // `TerminationSequence` runs `savePendingChangesOnClose` for EVERY live controller and only then
+    // calls `Autosaver.quiesceForTermination()`, which flushes whatever survived. Since round 15 the
+    // scoping is structural rather than a comparison: only this session's own entry is reachable
+    // through `ownedBy:`, so there is no longer a case in which a foreign entry could be meant.
+    cancelArmedIndexIfOwned(by: appState)
     if appState.documentSession.isUntitled {
       saveRecoveryDraft(appState: appState)
       // The buffer goes away with the window; the draft it just wrote is a
@@ -3043,7 +3526,105 @@ final class DocumentStore {
       recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       return true
     }
-    return saveExisting(appState: appState, indexNow: true)
+    // A file-backed buffer. Auto-save owns the file only when it is ON: then the
+    // teardown flush keeps that file current, as designed. With auto-save OFF,
+    // writing the file here would be exactly the silent write the setting
+    // forbids — and this teardown path has no veto point left (a raw
+    // `window.close()`, or a SwiftUI-scene close that never reached the
+    // shouldClose sheet). Either way — auto-save off, OR an auto-save write that
+    // FAILED — the buffer must not die with the window: stash it as a recovery
+    // draft and leave the file exactly as it is. Nothing is written behind the
+    // user's back, and nothing is lost.
+    if savingSettings.autoSavesPathedDocuments,
+      saveExisting(appState: appState, indexNow: true)
+    {
+      return true
+    }
+    stashClosingBufferAsRecoveryDraft(appState: appState)
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    return true
+  }
+
+  /// The `Autosaver.cancel()` a session change used to call, with the SAVE half narrowed to this
+  /// window's own debounce.
+  ///
+  /// `Autosaver` holds at most ONE armed save, belonging to the LAST edited session — so loading a
+  /// different document, clearing the session, restoring a draft or saving under a new name would all
+  /// cancel a debounce that may belong to a completely different window. That window's bytes would
+  /// then sit in memory with nothing scheduled to write them, while its index debounce (left armed
+  /// since round 7 precisely to wait for that save) fires at 5 s over text that is not on disk.
+  ///
+  /// The INDEX half is narrowed the same way, and for the symmetrical defect. Window B armed both
+  /// debounces and window A then switches, clears, restores or saves-as; the ownership check above
+  /// preserved B's SAVE, while an unconditional `cancelIndex()` here threw away the index write that
+  /// save exists to publish. B's 1.5 s autosave then lands its edited text through
+  /// `saveExisting(indexNow: false)` and nothing re-issues the FTS row — and for an AD-HOC document
+  /// there is no workspace scan to repair it, so the stale row is permanent.
+  ///
+  /// Cancel, not flush, for our OWN debounce: every caller here is on its way to replace this
+  /// session's document, and the paths that publish text (`saveAs`) index it explicitly afterwards.
+  /// A FOREIGN debounce is left ARMED — not flushed — because flushing it would submit another
+  /// window's unsaved buffer to SQLite ahead of its file write, which is the ordering
+  /// `savePendingChangesOnClose` forbids. Left armed it fires on its own 5 s schedule over bytes its
+  /// owner's surviving autosave has by then written, or is deferred again by that owner's own close.
+  private func cancelOwnDebouncesOnSessionChange(appState: AppState) {
+    cancelArmedSaveIfOwned(by: appState)
+    cancelArmedIndexIfOwned(by: appState)
+  }
+
+  /// Cancels the armed 5 s index debounce ONLY when it belongs to `appState`'s CURRENT document — the
+  /// one this session is about to leave behind. A no-op when nothing is armed, when the session has
+  /// no document (an untitled window never owns an index debounce: `scheduleIndex` is only ever
+  /// called with one), or when the armed owner is another window's document.
+  ///
+  /// Identity is the SESSION, since round 15: only this window's own entry is reachable through
+  /// `ownedBy:`, so two windows on the same file are no longer indistinguishable — round 8's named
+  /// residual, in which one of them could still cancel the other's debounce, is closed. The document
+  /// comparison stays, and now means what it says: cancel only the entry armed for the document this
+  /// session is leaving behind, never a stale one of our own armed for something else, which nothing
+  /// downstream would re-issue.
+  private func cancelArmedIndexIfOwned(by appState: AppState) {
+    guard let armedDocument = autosaver.armedIndexDocument(ownedBy: appState),
+      armedDocument == appState.documentSession.document?.id
+    else { return }
+    autosaver.cancelIndex(ownedBy: appState)
+  }
+
+  /// Retires every OTHER window's armed index debounce over the document `appState` has just written,
+  /// for the owners that are SETTLED. Called by the save paths that publish an index row of their own
+  /// (`saveExisting(indexNow: true)`, `saveAs`), immediately before they publish it.
+  ///
+  /// The defect this closes: two windows on one file. Window A edits, its 1.5 s autosave lands A's
+  /// bytes and marks A CLEAN, and its 5 s index debounce stays armed — correctly, that debounce is
+  /// what publishes A's row. Window B then writes different text to the same file and indexes it now.
+  /// `cancelArmedIndexIfOwned` scopes to B's own entry since round 15, so A's survives, and when it
+  /// fires it publishes A's session buffer over B's row. B's bytes are the file's final content, so
+  /// FTS ends up advertising text that is on nobody's disk, and nothing ever corrects it: A is clean,
+  /// and a clean window has no future save.
+  ///
+  /// That last sentence is exactly where the round 7/15 reservation stops applying. Leaving a foreign
+  /// entry armed is right when its owner is DIRTY — its autosave is still owed and will land and
+  /// correct FTS — and wrong when its owner is settled, for whom no such correction is ever coming.
+  /// So the disposition splits on the owner's LIVE dirtiness, not on whose entry it is.
+  ///
+  /// Retire means CANCEL. See `Autosaver.retireSettledIndexDebounces(for:except:)` for why flushing
+  /// would publish the very body being retired.
+  ///
+  /// This also restores the invariant `savePendingChangesOnClose`'s settled-owner flush already
+  /// assumes — that a settled owner's buffer matches the document on disk. A settled entry could only
+  /// go stale by somebody else writing the file, and every in-app write of that file now passes
+  /// through here.
+  private func retireSettledForeignIndexDebounces(for document: URL, by appState: AppState) {
+    autosaver.retireSettledIndexDebounces(for: document, except: appState)
+  }
+
+  /// Cancels the armed 1.5 s save debounce ONLY when it belongs to `appState`. A no-op when nothing
+  /// is armed, when the debounce belongs to another window, or when its owner is already gone — an
+  /// orphaned body captures its session weakly and no-ops when it fires, so there is nothing to
+  /// cancel on its behalf.
+  private func cancelArmedSaveIfOwned(by appState: AppState) {
+    guard autosaver.armedSaveIsOwned(by: appState) else { return }
+    autosaver.cancelSave(ownedBy: appState)
   }
 
   /// Single-window "settle the dirty session, report whether the user
@@ -3051,8 +3632,9 @@ final class DocumentStore {
   /// guard — force-save a pathed doc, or Save/Discard/Cancel an untitled draft —
   /// without clearing the session, returning `false` only when the untitled
   /// prompt was cancelled. Correct for switching the document within one window,
-  /// where there is no later step that could still abort. A multi-window close
-  /// that CAN be cancelled late must instead split decide from apply via
+  /// where there is no later step that could still abort. A multi-window pass
+  /// that CAN be cancelled late — "Clear Open Files" and ⌘Q — must instead split
+  /// decide from apply via
   /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`.
   @discardableResult
   func prepareForDocumentSwitch(appState: AppState) -> Bool {
@@ -3077,7 +3659,11 @@ final class DocumentStore {
       return
     }
 
-    autosaver.scheduleSave { [weak self, weak appState] in
+    // The owner is the session itself, so any other window can tell "this armed save is mine to
+    // cancel" from "this one belongs to somebody who is still counting on it". The body captures the
+    // same session weakly, so an owner whose window is gone leaves a debounce that owns nothing and
+    // writes nothing. See `Autosaver.armedSaveOwner`.
+    autosaver.scheduleSave(owner: appState) { [weak self, weak appState] in
       guard let self, let appState else { return }
       if appState.documentSession.isUntitled {
         self.saveRecoveryDraft(appState: appState)
@@ -3103,14 +3689,60 @@ final class DocumentStore {
     }
   }
 
+  /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
+  /// tearing down without reaching disk — auto-save is off, or an auto-save write
+  /// just failed. Unlike `saveRecoveryDraft` (untitled), this never clears
+  /// `appState.lastError`: when the stash follows a FAILED save that error must
+  /// stay surfaced (a recovery draft AND a visible error), so the user learns the
+  /// file on disk is stale rather than believing the close saved it.
+  private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
+    guard appState.documentSession.isDirty else { return }
+
+    do {
+      let draft = try recoveryStore.saveDraft(
+        id: appState.documentSession.recoveryID,
+        title: appState.documentSession.displayTitle,
+        text: appState.documentSession.text
+      )
+      appState.documentSession.recoveryID = draft.id
+    } catch {
+      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+    }
+  }
+
   private func scheduleIndexUpdate(appState: AppState) {
-    guard appState.documentSession.document != nil else {
-      autosaver.cancelIndex()
+    guard let armedDocument = appState.documentSession.document else {
+      // An UNTITLED session has nothing of its own armed here: `scheduleIndex` is only ever called
+      // with a document, and every path that drops a session's document (`loadClean`, `select(nil)`,
+      // `restoreRecoveredDraft`) already cancelled this window's debounce on the way. So the only
+      // debounce this branch could ever cancel belongs to ANOTHER window — typing in an untitled
+      // draft would drop a neighbour's pending index write, which for an ad-hoc document is the
+      // permanent loss of searchability the flush-over-cancel rule exists to prevent.
       return
     }
 
-    autosaver.scheduleIndex { [weak self, weak appState] in
+    // The owner is the SESSION — the window — recorded alongside the document the body would write
+    // and a LIVE read of that owner's dirtiness, so any close can tell "this debounce would publish
+    // text that is not on disk yet" from "this debounce owes an already-saved write" without caring
+    // which window is asking. Since round 15 arming here also replaces nothing but this window's own
+    // previous entry: a neighbour typing in the same 5 s keeps its debounce, and so does a second
+    // window open on the SAME file. Both closures capture the same session weakly, so an owner whose
+    // window is gone answers "not dirty" and its orphaned body flushes. See
+    // `savePendingChangesOnClose`.
+    autosaver.scheduleIndex(
+      owner: appState,
+      document: armedDocument.id,
+      ownerIsDirty: { [weak appState] in
+        guard let appState else { return false }
+        return appState.documentSession.hasEditableBuffer && appState.documentSession.isDirty
+      }
+    ) { [weak self, weak appState] in
       guard let self, let appState, let ref = appState.documentSession.document else { return }
+      // Deliberately NOT a `retireSettledForeignIndexDebounces` site, unlike the two save paths. The
+      // retire is licensed by having just written the file: it cancels a neighbour's row because the
+      // row replacing it is built from the bytes now on disk. A debounce publishes an in-memory
+      // buffer without writing anything, so it has no such claim — cancelling a neighbour's entry
+      // from here would be the plain freshness loss the flush-over-cancel rule forbids.
       self.indexDocument(ref, appState.documentSession.text, appState)
     }
   }
@@ -3201,8 +3833,10 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
     case .discardPathedEdit:
       // The pending debounced write must not resurrect the dropped edit; the
-      // file on disk keeps the bytes it already had.
-      autosaver.cancelSave()
+      // file on disk keeps the bytes it already had. Scoped to THIS window's
+      // session — a blanket cancel would also disarm another window's armed
+      // save, which is a data-loss path of its own.
+      autosaver.cancelSave(ownedBy: appState)
       appState.documentSession.isDirty = false
     }
   }
@@ -3228,10 +3862,16 @@ final class DocumentStore {
     applyDirtySessionResolution(resolution, appState: appState)
   }
 
-  /// Settles the current buffer before something replaces it: a document switch,
-  /// a new document, or app termination. Single-window path — decide and apply
-  /// run back to back, because there is no later window whose Cancel could
-  /// abort the pass.
+  /// Settles the current buffer before something replaces it WITHIN this window:
+  /// a document switch or a new document. Single-window path — decide and apply
+  /// run back to back, because nothing later in such a pass can still cancel it.
+  ///
+  /// App termination is deliberately NOT on this path: ⌘Q resolves every window
+  /// and a Cancel in the LAST one aborts the quit, so the fused form would have
+  /// destroyed an earlier window's draft before the pass could be called off.
+  /// That pass runs the split
+  /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`
+  /// pair instead, exactly like "Clear Open Files".
   ///
   /// Auto-save decides who owns a file-backed buffer here as well. With auto-save
   /// on, the switch flushes silently — keeping that file current is Pensieve's
@@ -3262,7 +3902,10 @@ final class DocumentStore {
   @discardableResult
   private func saveExisting(appState: AppState, indexNow: Bool) -> Bool {
     self.appState = appState
-    autosaver.cancelSave()
+    // This write makes THIS session's armed autosave redundant and nobody else's: an ordinary ⌘S in
+    // one window must not delete another window's pending autosave. When this runs as the debounce's
+    // own body the autosaver has already disarmed itself, so the call is simply skipped.
+    cancelArmedSaveIfOwned(by: appState)
 
     guard let url = appState.documentSession.url else { return false }
     let ref = documentRef(for: url, appState: appState)
@@ -3275,7 +3918,23 @@ final class DocumentStore {
       appState.documentSession.isDirty = false
       appState.lastError = nil
       if indexNow {
-        autosaver.cancelIndex()
+        // Only THIS session's debounce, and only when it is armed for the document just written: the
+        // write below supersedes it, so leaving it would duplicate the same row. A debounce armed for
+        // ANOTHER document is superseded by nothing here, and dropping it is the silent loss of
+        // freshness the flush-over-cancel rule forbids — worse, `savePendingChangesOnClose` may have
+        // just DEFERRED exactly that debounce to its owner's own save, and an unconditional cancel
+        // here undid that deferral the moment the closing window's save succeeded.
+        //
+        // Round 15 narrowed the same-document case too. A second window open on this file holds its
+        // OWN entry now, over its own unsaved buffer; this save publishes our bytes, not theirs, so
+        // cancelling their debounce would leave FTS holding our text with nothing scheduled to
+        // correct it once their autosave lands.
+        cancelArmedIndexIfOwned(by: appState)
+        // …and that "once their autosave lands" is a promise only a DIRTY owner keeps. A second
+        // window that is already CLEAN owes no further save, so its armed debounce would fire over a
+        // session buffer this write has just made stale and leave FTS holding text that is on no
+        // disk. Retired here, immediately before we publish the row that supersedes it.
+        retireSettledForeignIndexDebounces(for: ref.id, by: appState)
         indexDocument(ref, appState.documentSession.text, appState)
       }
       return true
@@ -3318,8 +3977,13 @@ final class DocumentStore {
     appState.selectedDocumentID = ref.id
   }
 
+  /// Same contract as `FolderManager`'s: whatever the cap drops out of the list
+  /// also leaves the persisted set, so the two never disagree about what the
+  /// working set is.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 
   /// The switch/termination save question. Asked for a dirty untitled draft in
@@ -3377,9 +4041,47 @@ final class DocumentStore {
   }
 }
 
+/// Lock-guarded counter of workspace OPENS, readable from the detached executor a close pass's
+/// barrier is taken on. See `FolderManager.scheduleIndexMaintenance(after:)` for why the main-actor
+/// `UInt64` it replaced could not serve that read.
+///
+/// Deliberately NOT a one-way latch like `IndexDatabase.TerminationLatch`, and the difference is the
+/// whole reason this is a snapshot/compare: a workspace can open, close and open again, so "has
+/// anything happened since?" is the only question with a stable answer. `hasChanged(since:)` is
+/// monotone for a fixed snapshot, which is what lets the pass ask it twice and trust the second
+/// answer.
+private final class WorkspaceOpenGeneration: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: UInt64 = 0
+
+  var current: UInt64 {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+
+  func bump() {
+    lock.lock()
+    value &+= 1
+    lock.unlock()
+  }
+
+  func hasChanged(since snapshot: UInt64) -> Bool {
+    current != snapshot
+  }
+}
+
+/// Trims the working set to its declared size and RETURNS what it dropped, so
+/// the caller can take the evicted files out of the persisted set too. A
+/// bookmark with no row is the same invisible state as a row with no window: the
+/// next launch resolves it, restores it, and — since the startup restore opens
+/// the working set for real — hands the user a tab for a file they stopped using
+/// months ago.
 @MainActor
-private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
-  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
+private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil)
+  -> [DocumentRef]
+{
+  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return [] }
 
   let activePath = (protectedID ?? appState.selectedDocumentID)?.path
   var protected: DocumentRef?
@@ -3391,9 +4093,11 @@ private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protec
   }
 
   let allowedCount = WorkspaceStore.maxOpenFiles - (protected == nil ? 0 : 1)
+  let evicted = Array(candidates.dropLast(min(max(allowedCount, 0), candidates.count)))
   candidates = Array(candidates.suffix(max(allowedCount, 0)))
   if let protected {
     candidates.append(protected)
   }
   appState.openFiles = candidates
+  return evicted
 }
