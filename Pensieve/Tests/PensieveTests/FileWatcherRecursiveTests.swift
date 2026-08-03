@@ -257,6 +257,100 @@ final class FileWatcherRecursiveTests: XCTestCase {
       "scanner-invisible churn must not schedule a scan")
   }
 
+  /// A walk that is already enumerating cannot be stopped by re-arming the refresh, so an event
+  /// source faster than one walk used to add a full-tree walk per surviving batch — bounded only
+  /// by the event rate. Everything that arrives while a walk is running must collapse into ONE
+  /// follow-up pass, and no two walks may ever overlap.
+  func testEventBurstDuringWalkCollapsesIntoOneFollowUpWalk() async throws {
+    let sandbox = try makeSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    let note = root.appendingPathComponent("note.md")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "body".write(to: note, atomically: true, encoding: .utf8)
+
+    let tracker = FileWatcherSourceTracker()
+    let gate = WatcherWalkGate()
+    let harness = try makeHarness(in: sandbox.support, sourceTracker: tracker, walkGate: gate)
+    let appState = AppState()
+    harness.manager.open(url: root, into: appState)
+    await settleOpen(harness)
+    let source = try XCTUnwrap(tracker.latestSource)
+    let callsAfterOpen = harness.scanProbe.callCount
+
+    gate.close()
+    let parkedWalk = gate.expectationForWalk(1)
+    source.emit([.init(path: note.path, flags: .itemModified)])
+    await yieldWatcherDelivery()
+    await fulfillment(of: [parkedWalk], timeout: 10)
+
+    for index in 0..<5 {
+      source.emit([
+        .init(
+          path: root.appendingPathComponent("burst-\(index).md").path,
+          flags: [.itemIsFile, .itemCreated])
+      ])
+      await settleDebounce()
+    }
+    XCTAssertEqual(
+      gate.enteredWalks, 1,
+      "a running walk must absorb the burst, not be joined by one walk per batch")
+
+    gate.open()
+    await settleWatcher(harness)
+
+    XCTAssertEqual(gate.peakConcurrentWalks, 1, "watcher refresh walks must never overlap")
+    XCTAssertEqual(
+      harness.scanProbe.callCount, callsAfterOpen + 2,
+      "a burst during a walk buys exactly one follow-up walk")
+  }
+
+  /// The other half of the coalescing contract: absorbing a burst must not swallow it. A change the
+  /// parked walk provably could not have enumerated still has to reach the tree and the index —
+  /// through exactly one follow-up pass, not zero and not one per event.
+  func testExternalChangeDuringWalkLandsInExactlyOneFollowUpWalk() async throws {
+    let sandbox = try makeSandbox()
+    let root = sandbox.root.appendingPathComponent("Root", isDirectory: true)
+    let note = root.appendingPathComponent("note.md")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "body".write(to: note, atomically: true, encoding: .utf8)
+
+    let tracker = FileWatcherSourceTracker()
+    let gate = WatcherWalkGate()
+    let harness = try makeHarness(in: sandbox.support, sourceTracker: tracker, walkGate: gate)
+    let appState = AppState()
+    harness.manager.open(url: root, into: appState)
+    await settleOpen(harness)
+    let source = try XCTUnwrap(tracker.latestSource)
+    let callsAfterOpen = harness.scanProbe.callCount
+
+    gate.close()
+    let parkedWalk = gate.expectationForWalk(1)
+    source.emit([.init(path: note.path, flags: .itemModified)])
+    await yieldWatcherDelivery()
+    await fulfillment(of: [parkedWalk], timeout: 10)
+
+    // Created strictly after the parked walk finished enumerating, so only a follow-up pass can
+    // possibly see it.
+    let external = root.appendingPathComponent("external.md")
+    try "external-during-walk-token".write(to: external, atomically: true, encoding: .utf8)
+    source.emit([.init(path: external.path, flags: [.itemIsFile, .itemCreated])])
+    await settleDebounce()
+
+    gate.open()
+    await settleWatcher(harness)
+
+    XCTAssertEqual(
+      harness.scanProbe.callCount, callsAfterOpen + 2,
+      "an external change during a walk must produce exactly one follow-up walk")
+    XCTAssertTrue(containsNode(at: external, in: appState.workspaceTree))
+    XCTAssertEqual(
+      harness.indexDatabase.search(
+        query: "external-during-walk-token", documents: appState.allDocuments
+      ).count,
+      1
+    )
+  }
+
   func testRealFSEventsReportsDepthTwoCreateRenameDeleteAcrossTwoRoots() async throws {
     let sandbox = try makeSandbox()
     let rootA = sandbox.root.appendingPathComponent("Real-A", isDirectory: true)
@@ -335,7 +429,8 @@ final class FileWatcherRecursiveTests: XCTestCase {
 
   private func makeHarness(
     in support: URL,
-    sourceTracker: FileWatcherSourceTracker = FileWatcherSourceTracker()
+    sourceTracker: FileWatcherSourceTracker = FileWatcherSourceTracker(),
+    walkGate: WatcherWalkGate? = nil
   ) throws -> WatcherRefreshHarness {
     let metadataStore = WorkspaceMetadataStore(
       metadataURL: support.appendingPathComponent("workspace.json"))
@@ -357,7 +452,11 @@ final class FileWatcherRecursiveTests: XCTestCase {
       bookmarkStore: bookmarkStore,
       workspaceBuilder: { roots, exclusions in
         scanProbe.record(isMainThread: Thread.isMainThread)
-        return WorkspaceScanner.defaultBuilder(roots, exclusions)
+        let scans = WorkspaceScanner.defaultBuilder(roots, exclusions)
+        // Parked AFTER the enumeration, so a walk holds its refresh open with an already-stale
+        // tree — the state a live workspace is in whenever its walk outlasts the next event.
+        walkGate?.holdAfterWalk()
+        return scans
       },
       workspaceSubstrate: WorkspaceSubstrate(store: cacheStore),
       watcher: watcher,
@@ -375,6 +474,13 @@ final class FileWatcherRecursiveTests: XCTestCase {
     for _ in 0..<5 {
       await Task.yield()
     }
+  }
+
+  /// Injected delay, not load: long enough for the 1 ms debounce of a freshly armed pass to expire
+  /// and reach its walk, so "no second walk started" is a measured absence rather than a race.
+  private func settleDebounce() async {
+    await yieldWatcherDelivery()
+    try? await Task.sleep(nanoseconds: 20_000_000)
   }
 
   private func settleOpen(_ harness: WatcherRefreshHarness) async {
@@ -435,6 +541,88 @@ private final class WatcherScanProbe: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return Array(samples.dropFirst(count))
+  }
+}
+
+/// Holds injected workspace walks open so refresh-pass overlap is observable as logic instead of
+/// CPU. A closed gate parks each walk on a condition (with its own deadline, so a regression fails
+/// the assertion rather than hanging the suite) and records how many walks were in flight at once.
+private final class WatcherWalkGate: @unchecked Sendable {
+  private static let holdTimeout: TimeInterval = 10
+
+  private let condition = NSCondition()
+  private var isOpen = true
+  private var entered = 0
+  private var inFlight = 0
+  private var peak = 0
+  private var entryExpectations: [(index: Int, expectation: XCTestExpectation)] = []
+
+  /// Arms the gate and restarts the counters, so an open flow's own walk is not mistaken for a
+  /// watcher pass.
+  func close() {
+    condition.lock()
+    isOpen = false
+    entered = 0
+    peak = 0
+    condition.unlock()
+  }
+
+  func open() {
+    condition.lock()
+    isOpen = true
+    condition.broadcast()
+    condition.unlock()
+  }
+
+  /// Fulfilled when the `index`-th walk since `close()` has enumerated and parked.
+  func expectationForWalk(_ index: Int) -> XCTestExpectation {
+    let expectation = XCTestExpectation(description: "workspace walk #\(index) parked on the gate")
+    condition.lock()
+    let alreadyEntered = entered >= index
+    if !alreadyEntered {
+      entryExpectations.append((index, expectation))
+    }
+    condition.unlock()
+    if alreadyEntered { expectation.fulfill() }
+    return expectation
+  }
+
+  func holdAfterWalk() {
+    condition.lock()
+    entered += 1
+    inFlight += 1
+    peak = max(peak, inFlight)
+    var reached: [XCTestExpectation] = []
+    entryExpectations.removeAll { entry in
+      guard entry.index <= entered else { return false }
+      reached.append(entry.expectation)
+      return true
+    }
+    let parked = !isOpen
+    condition.unlock()
+    for expectation in reached { expectation.fulfill() }
+
+    condition.lock()
+    if parked {
+      let deadline = Date().addingTimeInterval(Self.holdTimeout)
+      while !isOpen, Date() < deadline {
+        condition.wait(until: deadline)
+      }
+    }
+    inFlight -= 1
+    condition.unlock()
+  }
+
+  var enteredWalks: Int {
+    condition.lock()
+    defer { condition.unlock() }
+    return entered
+  }
+
+  var peakConcurrentWalks: Int {
+    condition.lock()
+    defer { condition.unlock() }
+    return peak
   }
 }
 
