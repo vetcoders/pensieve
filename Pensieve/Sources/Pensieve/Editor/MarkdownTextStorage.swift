@@ -85,6 +85,17 @@ class MarkdownTextStorage: NSTextContentStorage {
   /// block however big it was.
   private(set) var longestRethemeChunkLength = 0
 
+  /// Longest RANGE any single synchronous highlight pass painted, chunked or
+  /// not — the reset, the markdown regexes and the fenced-code rules all run
+  /// over exactly this range, so it is the whole cost of one run-loop turn
+  /// expressed in the one unit that does not vary with the machine.
+  ///
+  /// `longestRethemeChunkLength` above only sees the deferred SWEEP. A pass that
+  /// never entered the sweep — the debounced full refresh a fence-touching edit
+  /// schedules — is invisible to it, which is exactly how an unbounded
+  /// whole-document pass survived next to a chunking pin that was green.
+  private(set) var longestSynchronousHighlightLength = 0
+
   /// Whether a sweep still has ranges to paint. Exposed so a pin can land an
   /// edit at a moment that is provably MID-sweep instead of guessing a delay.
   var isRethemeSweepInFlight: Bool { rethemeSweepCursor != nil }
@@ -505,7 +516,7 @@ class MarkdownTextStorage: NSTextContentStorage {
 
   private func applyScheduledHighlightingRefresh() {
     guard !pendingRequiresFullRefresh else {
-      refreshHighlighting()
+      applyDeferredFullRefresh()
       return
     }
 
@@ -517,6 +528,55 @@ class MarkdownTextStorage: NSTextContentStorage {
     pendingHighlightRange = nil
     highlightWorkItem = nil
     refreshHighlighting(in: codeBlockAwareScope(for: scopedRange))
+  }
+
+  /// The debounced pass an edit that TOUCHED A FENCE schedules, with the cost
+  /// bound the retheme and the load path already had.
+  ///
+  /// This leg used to be a bare `refreshHighlighting()`: reset, twelve markdown
+  /// regexes and the fence regex over the WHOLE document, synchronously, in the
+  /// one run-loop turn the debounce timer fires on. Two independent samples of
+  /// the shipped app (build 617, 17 MB markdown extract) caught the main thread
+  /// inside exactly this call — 2437/2437 samples in
+  /// `CodeBlockHighlighter.highlight(_:range:)` on the open, 2410/2410 in
+  /// `SyntaxHighlighter.applyMarkdownAttributes` on the restore — with the
+  /// neighbouring samples idle. The chunked sweep beside it was working; this
+  /// pass simply never entered it.
+  ///
+  /// It reaches an ordinary open, too, not just typing: the wholesale
+  /// `replaceCharacters` that applies a loaded file runs through `processEditing`
+  /// and reports a fence-touching edit, so the very call that
+  /// `refreshHighlightingAfterFullTextReplacement` was written to keep off the
+  /// main thread was re-queued 70 ms behind it by the debounce.
+  ///
+  /// So: past `LargeDocument.sizeBudget` this becomes the same viewport-first
+  /// repaint plus chunked sweep the other two large-document paths use — every
+  /// kind of work the pass does is bounded by the chunk, because it is the SAME
+  /// scoped pass. Below the gate it stays byte-for-byte the synchronous full
+  /// refresh it always was, which is every ordinary note.
+  private func applyDeferredFullRefresh() {
+    guard let textStorage = textStorage else {
+      refreshHighlighting()
+      return
+    }
+    let length = (textStorage.string as NSString).length
+    guard LargeDocument.isLarge(length) else {
+      refreshHighlighting()
+      return
+    }
+
+    // Cleared here rather than by the pass, because the pass being taken is the
+    // scoped one — leaving the flag set would make the next keystroke schedule
+    // another whole-document refresh for an edit that no longer needs one.
+    pendingRequiresFullRefresh = false
+    pendingHighlightRange = nil
+    highlightWorkItem = nil
+    // Same fallback as the load path, and for the same reason: a debounced pass
+    // can land before layout has established a viewport, and the honest answer
+    // for a document that has not been scrolled is its head.
+    beginViewportFirstHighlighting(
+      fallbackViewport: NSRange(
+        location: 0, length: min(length, Self.synchronousRethemeCharacterBudget)))
   }
 
   func refreshHighlighting() {
@@ -536,6 +596,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     guard let textStorage = textStorage else { return }
     fullRefreshCount += 1
     let fullRange = NSRange(location: 0, length: textStorage.length)
+    longestSynchronousHighlightLength = max(longestSynchronousHighlightLength, fullRange.length)
 
     // Prevent recursive processEditing calls for attribute changes
     textStorage.beginEditing()
@@ -555,6 +616,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     guard let textStorage = textStorage else { return }
     let string = textStorage.string as NSString
     let scopedRange = clampedRange(scope.range, textLength: string.length)
+    longestSynchronousHighlightLength = max(longestSynchronousHighlightLength, scopedRange.length)
 
     textStorage.beginEditing()
     highlighter.resetBaseAttributes(textStorage, range: scopedRange)
