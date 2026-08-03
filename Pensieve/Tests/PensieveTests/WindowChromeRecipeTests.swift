@@ -225,6 +225,127 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(webView.obscuredContentInsets.top, 52)
   }
 
+  // MARK: - The pocket's precondition (scene launcher vs AppKit factory)
+
+  /// The measured discriminator: a full-size-content window with a TRANSPARENT
+  /// titlebar is the shape WebKit refuses to adopt the pocket for. That is the
+  /// scene-owned launcher's shape, and only its preview column was affected —
+  /// AppKit's editor scroll view insets itself either way.
+  func testATransparentTitlebarIsWhatSuppressesTheWebContentPocket() {
+    XCTAssertTrue(
+      WindowChromeRecipe.suppressesAutomaticWebContentInsets(
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        titlebarAppearsTransparent: true),
+      "the scene launcher's shape must be recognised as pocket-suppressing")
+    XCTAssertFalse(
+      WindowChromeRecipe.suppressesAutomaticWebContentInsets(
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        titlebarAppearsTransparent: false),
+      "the AppKit factory's shape adopts the pocket and must not be touched")
+    // Without full-size content there is no band under the chrome to inset in
+    // the first place, so transparency alone is not the defect.
+    XCTAssertFalse(
+      WindowChromeRecipe.suppressesAutomaticWebContentInsets(
+        styleMask: [.titled, .closable, .resizable],
+        titlebarAppearsTransparent: true))
+  }
+
+  /// The correction itself: scene-shaped window gets corrected exactly once,
+  /// factory-shaped window is left ALONE (a window that already adopts the
+  /// pocket must receive zero compensation), and a clobber back to the
+  /// suppressing shape heals — which is what a tab-bar reshuffle or a toolbar
+  /// re-bridge can do.
+  @MainActor
+  func testOnlyThePocketSuppressingWindowIsCorrectedAndItConverges() {
+    func makeWindow() -> NSWindow {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false)
+      WindowChromeRecipe.apply(to: window, title: "Pocket Precondition Probe")
+      return window
+    }
+
+    let scene = makeWindow()
+    let factory = makeWindow()
+    defer {
+      scene.close()
+      factory.close()
+    }
+    // SwiftUI's scene window arrives like this; the AppKit factory keeps
+    // NSWindow's default opaque titlebar.
+    scene.titlebarAppearsTransparent = true
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertOpaqueTitlebarForWebContentInsets(
+        on: scene, osOwnsWebContentInsets: true),
+      "the scene-shaped window was left in the shape WebKit zeroes the pocket for")
+    XCTAssertFalse(scene.titlebarAppearsTransparent)
+    XCTAssertFalse(
+      WindowChromeRecipe.assertOpaqueTitlebarForWebContentInsets(
+        on: scene, osOwnsWebContentInsets: true),
+      "an already-correct window was rewritten — on a per-update trigger that is the loop")
+
+    XCTAssertFalse(
+      WindowChromeRecipe.assertOpaqueTitlebarForWebContentInsets(
+        on: factory, osOwnsWebContentInsets: true),
+      "a healthy factory window must receive NO correction")
+    XCTAssertFalse(factory.titlebarAppearsTransparent)
+
+    // Level-triggered: an external reset back to the suppressing shape is
+    // corrected again, so the launcher heals instead of staying broken for the
+    // rest of the session.
+    scene.titlebarAppearsTransparent = true
+    XCTAssertTrue(
+      WindowChromeRecipe.assertOpaqueTitlebarForWebContentInsets(
+        on: scene, osOwnsWebContentInsets: true))
+    XCTAssertFalse(scene.titlebarAppearsTransparent)
+  }
+
+  /// Before macOS 26 there is no pocket at all — the CSS fallback owns the
+  /// offset there — so the correction must not touch a window on that path.
+  @MainActor
+  func testThePreMacOS26FallbackPathIsLeftAlone() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    WindowChromeRecipe.apply(to: window, title: "Pre-26 Fallback Probe")
+    defer { window.close() }
+    window.titlebarAppearsTransparent = true
+
+    XCTAssertFalse(
+      WindowChromeRecipe.assertOpaqueTitlebarForWebContentInsets(
+        on: window, osOwnsWebContentInsets: false))
+    XCTAssertTrue(window.titlebarAppearsTransparent)
+  }
+
+  /// End to end through the shipping invariant pass, on the OS where the pocket
+  /// exists: the launcher's window shape is repaired by the same call every
+  /// window already makes, so nothing new has to be wired into the scene.
+  @MainActor
+  func testTheSceneLauncherShapeIsRepairedThroughAssertWindowChrome() throws {
+    guard #available(macOS 26.0, *) else {
+      throw XCTSkip("the obscured-content-insets pocket exists from macOS 26")
+    }
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Launcher Shape Probe")
+    window.titlebarAppearsTransparent = true
+
+    WindowChromeRecipe.assertWindowChrome(on: window, for: .ink)
+
+    XCTAssertFalse(
+      window.titlebarAppearsTransparent,
+      "the chrome pass left the launcher in the shape that zeroes the preview's top inset")
+  }
+
   /// On macOS 26 the glass controller must stay silent: the CSS offset
   /// variable keeps its 0px default because the OS pocket owns the offset.
   /// The controller only plumbs the measured height before macOS 26.
