@@ -202,13 +202,14 @@ struct DocumentWindowRootView: View {
           DocumentWindowRegistry.shared.registerController(controller, for: window)
           // Give the red close button / tab "×" the same conscious Save / Don't
           // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
-          // flush. Only factory-built document windows carry the hook; restored
-          // SwiftUI scenes still fall back to the store's teardown guard, which
-          // no longer writes the file behind the user's back.
-          if let documentWindow = window as? DocumentWindow {
-            documentWindow.onShouldClose = { [weak controller] closingWindow in
-              controller?.windowShouldClose(closingWindow) ?? true
-            }
+          // flush. EVERY window this app can build gets it, not just the
+          // factory-built ones: the launcher scene SwiftUI auto-presents at
+          // every cold start is an `AppKitWindow`, and it is the window the
+          // restored session, a cold-start Finder open and ⌘N all land in. See
+          // `ConsciousCloseHook` for how a window whose class and delegate
+          // belong to SwiftUI is reached.
+          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow in
+            controller?.windowShouldClose(closingWindow) ?? true
           }
         }
       )
