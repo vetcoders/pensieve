@@ -20,6 +20,7 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Preview & Two-Way Links:** Rich markdown preview, backlinks, wikilinks, Mermaid, math, and source-first editing.
 - **Split Modes:** `SOURCE` (Cmd+1), `SPLIT` (Cmd+2), `PREVIEW` (Cmd+3), and `FOCUS` (Cmd+4).
 - **Fast Native Core:** Built on Swift 5.9+, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
+- **Staged Opens for Large Files:** documents over ~1 MB are read in the background. The window or tab appears immediately with an `Opening …` placeholder, the visible text is coloured first and the rest of the document follows in frame-sized chunks, so a multi-megabyte note never freezes the app.
 - **Dictation:** Capture speech locally, review continuous transcript text, and insert it at the active Markdown selection with natural spacing and undo.
 - **Agent-Aware Writing:** Current-document dispatch and local AI autocomplete are wired into the native editor.
 - **Word/PDF Transfer Bridge:** Export Markdown to `.docx`; open or import `.docx` and text-based `.pdf` files as editable Markdown drafts.

@@ -14,6 +14,7 @@ extension XCTestCase {
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
+    backgroundTextReader: DocumentStore.BackgroundTextReader? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) -> DocumentStore {
     let recoveryRoot = FileManager.default.temporaryDirectory
@@ -33,6 +34,7 @@ extension XCTestCase {
       indexDocument: indexDocument,
       dirtySessionPrompt: dirtySessionPrompt,
       savePanelURLProvider: savePanelURLProvider,
+      backgroundTextReader: backgroundTextReader,
       selfWriteObserver: selfWriteObserver
     )
   }

@@ -199,15 +199,66 @@ class MarkdownTextStorage: NSTextContentStorage {
   private func rethemeHighlighting() {
     guard let textStorage = textStorage else { return }
     let string = textStorage.string as NSString
-    guard string.length > Self.synchronousRethemeCharacterBudget,
-      let visibleRange = visibleRangeProvider?(),
-      clampedRange(visibleRange, textLength: string.length).length > 0
-    else {
+    guard string.length > Self.synchronousRethemeCharacterBudget else {
+      refreshHighlighting()
+      return
+    }
+    // No fallback viewport on this path, on purpose: a retheme with no
+    // established viewport is a surface that is themed before it is hosted, and
+    // there is nothing on screen to prioritise — the plain synchronous pass is
+    // both correct and cheap there.
+    beginViewportFirstHighlighting(fallbackViewport: nil)
+  }
+
+  /// Re-colours after the document's text was replaced WHOLESALE — an open, an
+  /// external reload, a rewrite that swaps the entire buffer.
+  ///
+  /// The same fix as the retheme, applied to the other pass that used to run the
+  /// whole document synchronously. On a large document that pass IS the freeze:
+  /// at the measured ~0.7 µs per character a megabyte is ~0.7 s on the main
+  /// thread, landing in the same run-loop turn as the wholesale
+  /// `replaceCharacters` and the first preview parse. The retheme path had
+  /// already been cut into a synchronous viewport repaint plus a chunked
+  /// background sweep and was wired only to skin switches; the load path called
+  /// the full pass unconditionally, which is the gap this closes.
+  ///
+  /// Two differences from a retheme, both forced by WHEN this runs. The size gate
+  /// is `LargeDocument`, not the 20 000-character retheme budget, so an ordinary
+  /// document's open is byte-for-byte the pass it always was. And there IS a
+  /// fallback viewport: at load time layout has usually not established one yet,
+  /// and the honest answer for a file that is about to be shown from the top is
+  /// the head of the document.
+  func refreshHighlightingAfterFullTextReplacement() {
+    guard let textStorage = textStorage else { return }
+    let length = (textStorage.string as NSString).length
+    guard LargeDocument.isLarge(length) else {
+      refreshHighlighting()
+      return
+    }
+    beginViewportFirstHighlighting(
+      fallbackViewport: NSRange(
+        location: 0, length: min(length, Self.synchronousRethemeCharacterBudget)))
+  }
+
+  /// Repaint what is on screen now, sweep the rest in frame-sized chunks.
+  ///
+  /// `fallbackViewport` is what to treat as "on screen" when layout has not
+  /// established a viewport; `nil` means "there is no honest answer — fall back
+  /// to the plain synchronous full pass".
+  private func beginViewportFirstHighlighting(fallbackViewport: NSRange?) {
+    guard let textStorage = textStorage else { return }
+    let string = textStorage.string as NSString
+    let laidOut = visibleRangeProvider?().map { clampedRange($0, textLength: string.length) }
+    let viewportRange =
+      (laidOut?.length ?? 0) > 0
+      ? laidOut
+      : fallbackViewport.map { clampedRange($0, textLength: string.length) }
+
+    guard let viewportRange, viewportRange.length > 0 else {
       refreshHighlighting()
       return
     }
 
-    let viewportRange = clampedRange(visibleRange, textLength: string.length)
     let scope = codeBlockAwareScope(
       for: scopedHighlightRange(for: viewportRange, in: string))
     refreshHighlighting(in: scope)

@@ -3070,6 +3070,35 @@ private struct WorkspaceDirectoryEntry: Sendable {
 
 @MainActor
 final class DocumentStore {
+  /// Why a background document read failed, reduced to the message the session
+  /// surfaces.
+  ///
+  /// Its own type rather than the underlying `Error` because this value crosses
+  /// an actor hop and `Error` carries no `Sendable` promise; the message is all
+  /// the apply ever used anyway.
+  struct ReadFailure: Error, Sendable {
+    let localizedMessage: String
+  }
+
+  /// Reads a document's text away from the main actor.
+  ///
+  /// Injected — the precedent is `MarkdownTextStorage.scheduleRethemeChunk` —
+  /// so a pin can DRIVE a staged open instead of racing a real file read: an
+  /// expectation with a fixed timeout wrapped around "the disk is probably done
+  /// by now" is a bet on the machine, not a pin. It is also the only way to hold
+  /// a load open long enough to prove the stale-apply and teardown guards.
+  typealias BackgroundTextReader = @Sendable (URL) async -> Result<String, ReadFailure>
+
+  /// The production read. `nonisolated` is load-bearing, not decoration: it is
+  /// what makes awaiting this from the main actor actually leave it.
+  nonisolated static func readTextFromFileSystem(at url: URL) async -> Result<String, ReadFailure> {
+    do {
+      return .success(try String(contentsOf: url, encoding: .utf8))
+    } catch {
+      return .failure(ReadFailure(localizedMessage: error.localizedDescription))
+    }
+  }
+
   static let shared = DocumentStore(recoveryStore: .shared)
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
@@ -3080,6 +3109,7 @@ final class DocumentStore {
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
   private let dirtySessionPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
+  private let backgroundTextReader: BackgroundTextReader
   private var selfWriteObserver: @MainActor (URL) -> Void
   private weak var appState: AppState?
 
@@ -3093,6 +3123,7 @@ final class DocumentStore {
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
+    backgroundTextReader: BackgroundTextReader? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) {
     let resolvedIndexDatabase = indexDatabase ?? .shared
@@ -3124,6 +3155,7 @@ final class DocumentStore {
       }
     self.dirtySessionPrompt = dirtySessionPrompt ?? Self.promptForDirtySession
     self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL
+    self.backgroundTextReader = backgroundTextReader ?? Self.readTextFromFileSystem(at:)
     self.selfWriteObserver = selfWriteObserver ?? { _ in }
   }
 
@@ -3191,9 +3223,16 @@ final class DocumentStore {
   /// recovery ID, autosaving over each other, with a Save As… in one undone by
   /// the other's next autosave recreating the file. Refusing is a no-op — the
   /// caller refreshes and the stale row disappears.
+  ///
+  /// Refuses a window in the middle of a STAGED OPEN as well. It has no buffer
+  /// yet, but it is not free: it has already claimed the file the user clicked
+  /// and is only waiting for the bytes, so adopting a draft into it would drop
+  /// that file and then have the background read land on top of the draft.
   @discardableResult
   func openRecoveredDraft(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
-    guard !appState.documentSession.hasEditableBuffer else { return false }
+    guard !appState.documentSession.hasEditableBuffer,
+      !appState.documentSession.isLoading
+    else { return false }
     guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
 
     self.appState = appState
@@ -3258,9 +3297,33 @@ final class DocumentStore {
     loadClean(ref: ref, into: appState)
   }
 
+  /// Replaces this window's session with `ref`, synchronously for an ordinary
+  /// document and in two stages for one past `LargeDocument.sizeBudget`.
+  ///
+  /// The dirty guard has ALREADY run by the time anything here executes — every
+  /// caller (`load`, `select`) passes through `saveDirtySessionIfNeeded` first,
+  /// and it is synchronous. That ordering is the contract, not an accident: a
+  /// Save/Discard/Cancel prompt has to be answered before the session it is
+  /// asking about is replaced, and a staged open that scheduled its read first
+  /// would be racing the user's answer with a background write.
   private func loadClean(ref: DocumentRef, into appState: AppState) {
     cancelOwnDebouncesOnSessionChange(appState: appState)
 
+    // Claim the window on BOTH branches. That is what makes an in-flight staged
+    // read lose to whatever the user did next, whether the next thing was another
+    // large file, a small one, or closing the document.
+    let claim = appState.beginDocumentLoad()
+
+    guard LargeDocument.isLargeFile(at: ref.url) else {
+      loadSynchronously(ref: ref, into: appState)
+      return
+    }
+    loadInBackground(ref: ref, claim: claim, into: appState)
+  }
+
+  /// The path every ordinary document still takes, byte for byte what
+  /// `loadClean` did before the size gate existed.
+  private func loadSynchronously(ref: DocumentRef, into appState: AppState) {
     do {
       let text = try String(contentsOf: ref.url, encoding: .utf8)
       appState.selectedDocumentID = ref.id
@@ -3273,6 +3336,56 @@ final class DocumentStore {
     }
   }
 
+  /// Stage one of a large open, in THIS run-loop turn: the window claims the
+  /// file and starts showing an opening placeholder for it. Stage two — the
+  /// bytes — arrives from a background read.
+  ///
+  /// Everything a synchronous open publishes in its own turn is published here
+  /// too: `selectedDocumentID` (which the sidebar highlight, the window
+  /// registry's document mapping and `PensieveApp.openInitialDocument`'s
+  /// resolved-load contract all read) and `documentSession.url` (which
+  /// `AppController.noteRecentDocumentIfOpened` reads to decide whether the open
+  /// actually landed). The ONLY thing that arrives late is the text.
+  private func loadInBackground(ref: DocumentRef, claim: UInt64, into appState: AppState) {
+    appState.selectedDocumentID = ref.id
+    appState.documentSession.beginLoading(document: ref)
+    appState.lastError = nil
+
+    let reader = backgroundTextReader
+    let task = Task { @MainActor [weak appState] in
+      // `reader` is `nonisolated`, so awaiting it hops off the main actor: the
+      // read and the UTF-8 decode of a multi-megabyte file happen there, and only
+      // the apply below comes back.
+      let result = await reader(ref.url)
+
+      // Three guards in one line, and each of them is a bug this repo has shipped
+      // before. `appState == nil`: the window was torn down mid-read, so there is
+      // nothing to apply to and nothing to resurrect — the apply mutates session
+      // state only, it never creates a window or touches the registry. Claim
+      // mismatch: the user opened something else into this window while the read
+      // was in flight, and the newer session must win. Both together also cover
+      // "closed and reopened the same file", which a URL comparison would not.
+      guard let appState, appState.isCurrentDocumentLoad(claim) else { return }
+
+      switch result {
+      case .success(let text):
+        appState.documentSession.load(document: ref, text: text)
+        appState.lastError = nil
+      case .failure(let failure):
+        // Unlike the synchronous path, there is no previous session left to fall
+        // back to — it was released in stage one, which is the price of showing
+        // the right file name immediately. So land somewhere honest: an empty
+        // window carrying the error, not a placeholder spinning forever.
+        appState.documentSession.clear()
+        appState.selectedDocumentID = nil
+        appState.lastError =
+          "Could not load \(ref.url.lastPathComponent): \(failure.localizedMessage)"
+      }
+      appState.finishDocumentLoad(claim)
+    }
+    appState.trackPendingDocumentLoad(task)
+  }
+
   @discardableResult
   func select(ref: DocumentRef?, into appState: AppState) -> Bool {
     self.appState = appState
@@ -3283,6 +3396,10 @@ final class DocumentStore {
 
     guard let ref else {
       cancelOwnDebouncesOnSessionChange(appState: appState)
+      // Closing the document is also an answer to "is that staged open still
+      // wanted?" — no. Without this the read would land afterwards and reopen
+      // the file the user just closed.
+      appState.cancelPendingDocumentLoad()
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
       return true
@@ -3907,7 +4024,16 @@ final class DocumentStore {
     // own body the autosaver has already disarmed itself, so the call is simply skipped.
     cancelArmedSaveIfOwned(by: appState)
 
-    guard let url = appState.documentSession.url else { return false }
+    // Both halves, and the first one is not redundant. A session that has a URL
+    // used to be a session that has bytes; a STAGED open breaks that pairing for
+    // as long as the read runs — it carries the document so the window can name
+    // it, over an empty placeholder buffer. Writing that buffer would truncate
+    // the very file being opened. `saveAs` already gates on exactly this
+    // predicate; for every pre-existing session shape the two guards are
+    // equivalent, because only `.fileBacked` and `.loading` ever carry a URL.
+    guard appState.documentSession.hasEditableBuffer,
+      let url = appState.documentSession.url
+    else { return false }
     let ref = documentRef(for: url, appState: appState)
 
     do {

@@ -308,7 +308,13 @@ struct DocumentWindowRootView: View {
       DocumentWindowRegistry.shared.noteDocumentAlreadyOnScreen(documentID)
     }
     controller.requestCloseCurrentWindowIfEmpty = {
-      guard !appState.documentSession.hasEditableBuffer else { return }
+      // "Empty" has to mean idle, not merely bufferless: a window reading a large
+      // document off the main actor is showing an opening placeholder for a file
+      // the user asked for, and closing it out from under that read is the same
+      // class of bug as reaping it in the launcher sweep.
+      guard !appState.documentSession.hasEditableBuffer,
+        !appState.documentSession.isLoading
+      else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
     }
     // A window that adopted the crash draft holds real work behind no URL, so

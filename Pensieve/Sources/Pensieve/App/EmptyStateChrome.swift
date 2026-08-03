@@ -104,6 +104,85 @@ struct ShortcutKeyCap: View {
   }
 }
 
+/// Click affordance for the empty state's ACTION rows — the ⌘N shortcut row and
+/// every Recent entry.
+///
+/// Both were live buttons carrying `.buttonStyle(.plain)` and nothing else: no
+/// hover wash, no cursor change, and not even the dimming a plain button
+/// normally shows while pressed, because the detail-pane host imposes its own
+/// `foregroundStyle` hierarchy over the whole surface and that is the channel
+/// `.plain` presses through. So a row that reopens a document looked exactly
+/// like the caption text beside it, and the only way to discover it was
+/// clickable was to click it.
+///
+/// The wash is the sidebar's row selection one step quieter — same accent, same
+/// 6 pt radius — so a hover here reads as the same gesture as a hover in the
+/// file tree. `legibleAccent` rather than the raw token for the reason the
+/// sidebar takes it too: these rows can sit on a skin whose accent cannot carry
+/// itself on this surface.
+///
+/// Deliberately layout-neutral. The wash is drawn by a background inset with
+/// NEGATIVE padding rather than by padding the label, so adopting the style
+/// moves no row by a point — the empty state is a centred stack whose width is
+/// its widest child, and a style that grew its rows would re-centre the whole
+/// composition.
+struct EmptyStateRowButtonStyle: ButtonStyle {
+  /// Wash strength for a row's current interaction state. Static so the pin can
+  /// state the affordance contract — a resting row paints nothing, hover and
+  /// pressed are visibly distinct — without rendering SwiftUI.
+  static func fillOpacity(isHovering: Bool, isPressed: Bool) -> Double {
+    if isPressed { return 0.24 }
+    return isHovering ? 0.12 : 0
+  }
+
+  func makeBody(configuration: Configuration) -> some View {
+    RowBody(configuration: configuration)
+  }
+
+  /// The style's body lives in a nested VIEW because a `ButtonStyle` is not one:
+  /// `@EnvironmentObject` (the theme the wash is tinted from) and `@State` (the
+  /// hover flag) only resolve inside the view tree.
+  private struct RowBody: View {
+    @EnvironmentObject private var themeManager: ThemeManager
+    let configuration: ButtonStyleConfiguration
+    @State private var isHovering = false
+
+    var body: some View {
+      let accent = Color(SidebarView.chromeAccentColor(for: themeManager.skin.tokens))
+      configuration.label
+        .contentShape(Rectangle())
+        .background(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(
+              accent.opacity(
+                EmptyStateRowButtonStyle.fillOpacity(
+                  isHovering: isHovering, isPressed: configuration.isPressed))
+            )
+            .padding(EdgeInsets(top: -3, leading: -6, bottom: -3, trailing: -6))
+        )
+        .onHover { hovering in
+          guard hovering != isHovering else { return }
+          isHovering = hovering
+          // AppKit owns the cursor; SwiftUI changes it for no button style on
+          // its own. Push/pop is balanced by the equality guard above plus the
+          // disappear hook below — a row torn down while hovered (a skin
+          // switch rebuilding the stack, a document opening under the pointer)
+          // would otherwise leave the pointing hand stuck app-wide.
+          if hovering {
+            NSCursor.pointingHand.push()
+          } else {
+            NSCursor.pop()
+          }
+        }
+        .onDisappear {
+          guard isHovering else { return }
+          isHovering = false
+          NSCursor.pop()
+        }
+    }
+  }
+}
+
 /// The primary shortcuts, each a key cap + label. New File is the always-safe
 /// action, so its row is a live button; Open File / Open Folder are hints (their
 /// global menu shortcuts still fire). Replaces the single caption sentence the
@@ -123,7 +202,7 @@ struct EmptyStateShortcuts: View {
       } label: {
         shortcutRow("⌘N", "New File")
       }
-      .buttonStyle(.plain)
+      .buttonStyle(EmptyStateRowButtonStyle())
       .accessibilityIdentifier(newFileAccessibilityIdentifier)
 
       shortcutRow("⌘O", "Open File")
@@ -139,6 +218,51 @@ struct EmptyStateShortcuts: View {
         .font(.callout)
         .foregroundStyle(.secondary)
     }
+  }
+}
+
+/// What the document pane shows while a file past `LargeDocument.sizeBudget` is
+/// being read off the main actor.
+///
+/// It is the missing half of the fix, not decoration. Moving the read off the
+/// main thread stops the beachball, but on its own it replaces a frozen window
+/// with a window that looks finished and shows nothing — which reads as "the
+/// click did not register" and invites a second click. The named file plus a
+/// spinner is the signal that the click DID land and the work is this window's.
+///
+/// Mirrors the folder-open affordance (`WorkspaceActivity.opening` +
+/// `WorkspaceActivityMiniView`) deliberately: a workspace and a large document
+/// are the same promise to the user, and they should not be two different
+/// vocabularies. This one is per WINDOW, though — `workspaceActivity` lives on
+/// the shared `WorkspaceStore`, so a spinner driven from there would appear in
+/// every window at once.
+struct DocumentOpeningView: View {
+  @EnvironmentObject private var themeManager: ThemeManager
+  let title: String
+
+  var body: some View {
+    let palette = EmptyStatePalette(theme: themeManager.skin)
+    VStack(spacing: 14) {
+      ProgressView()
+        .controlSize(.small)
+      VStack(spacing: 4) {
+        Text("Opening \(title)")
+          .font(.callout)
+          .foregroundStyle(Color(palette.primaryText))
+          .lineLimit(1)
+          .truncationMode(.middle)
+        Text("Large document — reading in the background")
+          .font(.caption)
+          .foregroundStyle(Color(palette.tertiaryText))
+      }
+    }
+    .padding(32)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(palette.background).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("Opening \(title)")
+    .accessibilityIdentifier("pensieve.documentOpening")
   }
 }
 
@@ -251,7 +375,7 @@ struct EmptyStateRecents: View {
               Spacer(minLength: 4)
             }
           }
-          .buttonStyle(.plain)
+          .buttonStyle(EmptyStateRowButtonStyle())
           .help(RecentDocumentsStore.menuTitle(for: url))
         }
       }

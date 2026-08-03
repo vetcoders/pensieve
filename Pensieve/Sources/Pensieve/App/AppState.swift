@@ -202,6 +202,21 @@ final class AppState {
   var documentURL: URL? { windowModel.documentURL }
   var documentIsDirty: Bool { windowModel.documentIsDirty }
   var aiDocumentID: String { windowModel.aiDocumentID }
+  /// True while this window has claimed a file whose bytes are still being read
+  /// off the main actor. See `DocumentSession.Kind.loading`.
+  var documentIsLoading: Bool { windowModel.documentIsLoading }
+
+  // Staged-open claim, forwarded so `DocumentStore` drives it through the same
+  // façade every other per-window value goes through. See
+  // `DocumentWindowModel.documentLoadClaim`.
+  @discardableResult
+  func beginDocumentLoad() -> UInt64 { windowModel.beginDocumentLoad() }
+  func trackPendingDocumentLoad(_ task: Task<Void, Never>) {
+    windowModel.trackPendingDocumentLoad(task)
+  }
+  func isCurrentDocumentLoad(_ claim: UInt64) -> Bool { windowModel.isCurrentDocumentLoad(claim) }
+  func finishDocumentLoad(_ claim: UInt64) { windowModel.finishDocumentLoad(claim) }
+  func cancelPendingDocumentLoad() { windowModel.cancelPendingDocumentLoad() }
 
   var mode: EditorMode {
     get { windowModel.mode }

@@ -235,6 +235,15 @@ final class AppController: ObservableObject {
   /// it deallocates the window's controller and the conversion is discarded.
   var hasPendingImportWork: Bool { documentImportTask != nil }
 
+  /// True while this window is reading a large document off the main actor.
+  ///
+  /// The twin of `hasPendingImportWork`, and it exists for the identical reason:
+  /// the session has no buffer until the work lands, so `hasEditableBuffer`
+  /// cannot see the window is spoken for. Everything that asks "is this window
+  /// free?" — the registry's launcher sweep, the open router choosing between
+  /// this window and a new tab, the empty-window close — has to ask this too.
+  var hasPendingDocumentLoad: Bool { appState.documentIsLoading }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a
@@ -417,7 +426,15 @@ final class AppController: ObservableObject {
     // Markdown URL loaded into the session the pending conversion was about to
     // overwrite. `hasEditableBuffer` cannot see that work; `hasPendingImportWork`
     // is what says this window is spoken for.
-    if appState.documentSession.hasEditableBuffer || hasPendingImportWork,
+    //
+    // A STAGED OPEN OCCUPIES IT THE SAME WAY, for the same reason: a file past
+    // `LargeDocument.sizeBudget` is read off the main actor and the session holds
+    // no buffer until the bytes land. Without `hasPendingDocumentLoad` the second
+    // URL of a multi-file open would answer "empty, use this window", invalidate
+    // the first file's claim, and the file the user clicked first would vanish
+    // exactly the way an import used to.
+    if appState.documentSession.hasEditableBuffer || hasPendingImportWork
+      || hasPendingDocumentLoad,
       let requestOpenDocumentWindow
     {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
@@ -959,7 +976,12 @@ final class AppController: ObservableObject {
   /// tab "×", sidebar close, ⌘W). No-op for a clean buffer.
   @discardableResult
   func savePendingChangesOnClose() -> Bool {
-    documentStore.savePendingChangesOnClose(appState: appState)
+    // The window is going away, so whatever it was still reading is no longer
+    // owed to anyone. Cancelling here is belt to the apply's own claim check and
+    // weak session reference — those already make a late result a no-op; this
+    // stops the read from continuing at all.
+    appState.cancelPendingDocumentLoad()
+    return documentStore.savePendingChangesOnClose(appState: appState)
   }
 
   /// When this window's session was last edited, on the process-wide `EditRecency` scale. Read by

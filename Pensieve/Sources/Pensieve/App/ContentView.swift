@@ -179,7 +179,12 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    if !appState.documentHasEditableBuffer {
+    // Ahead of the empty state, because a staged open is bufferless too and the
+    // two must not look the same: one window is idle, the other is working on a
+    // file the user just asked for.
+    if appState.documentIsLoading {
+      DocumentOpeningView(title: appState.documentTitle)
+    } else if !appState.documentHasEditableBuffer {
       DocumentEmptyStateView()
     } else {
       switch appState.mode {

@@ -1071,6 +1071,8 @@ final class DocumentWindowRegistry: ObservableObject {
     return controller.hasEditableBuffer
       || controller.isAwaitingLaunchRestore
       || controller.hasPendingImportWork
+      // A large document being read off the main actor: real work, no buffer yet.
+      || controller.hasPendingDocumentLoad
   }
 
   /// Files `window` as a content window even though no document identity backs
