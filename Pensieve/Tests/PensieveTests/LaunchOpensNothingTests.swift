@@ -118,7 +118,7 @@ final class LaunchOpensNothingTests: XCTestCase {
   /// only "Close from Open Files" retires it — and the registry re-opens a
   /// launcher after the last document window goes, so the app is never left
   /// windowless. That replacement launcher's root runs the very same
-  /// `start(restoringWorkspace: true)` as the launch one did. With the reopen
+  /// `start(intent: .coldLaunch)` as the launch one did. With the reopen
   /// gated per controller, the launcher immediately reloaded the file the user
   /// had just closed: the last document could not be closed at all without
   /// first removing its Open Files row.
@@ -339,7 +339,7 @@ private final class LaunchHarness {
   /// The user closing the last document window. AppKit's close reaches the
   /// registry, which — so the app is never left windowless — re-opens a
   /// launcher through the factory; that launcher's root then runs the same
-  /// `start(restoringWorkspace: true)` as the launch one. Returns the
+  /// `start(intent: .coldLaunch)` as the launch one. Returns the
   /// REPLACEMENT launcher's session.
   func closeWindowAdoptingTheReplacementLauncher(_ window: NSWindow) -> RelaunchedSession {
     guard let registry else {

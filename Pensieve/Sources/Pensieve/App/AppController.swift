@@ -12,7 +12,7 @@ private enum DocumentImportOutcome: Sendable {
 ///
 /// Bringing the working set back is something the APPLICATION does once, when
 /// it starts — not something every window that runs
-/// `start(restoringWorkspace:)` does. Every launcher takes that same path: the
+/// `start(intent:)` does. Every launcher takes that same path: the
 /// one the registry re-opens after the last document window closes, and the one
 /// a Dock reopen makes. And a native window close deliberately LEAVES the file
 /// in the working set (only "Close from Open Files" retires it), so a
