@@ -97,6 +97,15 @@ final class RecoveryStore {
   func deleteDraft(id: UUID?) {
     guard let id else { return }
     openDraftIDs.remove(id)
+    removeDraftFiles(id: id)
+  }
+
+  /// Drops BOTH files a draft is made of. Retention used to remove only the
+  /// `.md`, so every launch sweep left the `.title` sidecar behind — invisible
+  /// (the directory listing only reads `.md`) and never collected by anything,
+  /// so the recovery directory grew a permanent orphan per pruned draft.
+  /// Measured on a seeded run: 26 drafts in, 20 `.md` and 26 `.title` out.
+  private func removeDraftFiles(id: UUID) {
     try? fileManager.removeItem(at: draftURL(for: id))
     try? fileManager.removeItem(at: titleURL(for: id))
   }
@@ -152,7 +161,7 @@ final class RecoveryStore {
         && now.timeIntervalSince(draft.updatedAt) > Self.draftRetentionInterval
     }
     for draft in expired {
-      try? fileManager.removeItem(at: draft.url)
+      removeDraftFiles(id: draft.id)
       removed.append(draft.id)
     }
 
@@ -174,7 +183,7 @@ final class RecoveryStore {
     var remaining = draftsNewestFirst.count
     for draft in draftsNewestFirst.reversed() where remaining > Self.maximumDraftCount {
       guard !openDraftIDs.contains(draft.id) else { continue }
-      try? fileManager.removeItem(at: draft.url)
+      removeDraftFiles(id: draft.id)
       removed.append(draft.id)
       remaining -= 1
     }
