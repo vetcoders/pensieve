@@ -72,6 +72,27 @@ final class CommandSurfaceContext: ObservableObject {
   }
 }
 
+/// WHEN a root takes over the fallback. Extracted for the same reason as
+/// `CommandTargetResolution`: the rule is "the KEY window's root owns the
+/// surface", and it must hold no matter which of the two triggers observes it
+/// first.
+///
+/// Neither trigger alone is sufficient. `didBecomeKey` fires for windows this
+/// root does not own, so it must be filtered by identity — but the root learns
+/// its own window from the COALESCED, async window accessor, and a
+/// factory-built native tab routinely becomes key BEFORE that callback lands.
+/// The key notification never repeats, so a root that missed it would leave the
+/// fallback pointed at the previously-key tab for the rest of the tab's life:
+/// during focus-silent periods every menu action would then mutate the session
+/// the user just navigated AWAY from, while the chrome shows the one they are
+/// looking at.
+enum CommandSurfaceAdoption {
+  static func shouldAdopt(rootWindow: NSWindow?, keyWindow: NSWindow?) -> Bool {
+    guard let rootWindow, let keyWindow else { return false }
+    return rootWindow === keyWindow
+  }
+}
+
 /// Which root the menu bar acts on. Extracted so the pair-consistency rule is
 /// pinned by tests rather than by reading the `if let` chain below.
 enum CommandTargetResolution {

@@ -5,6 +5,7 @@ import SwiftUI
 struct EditorView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  @EnvironmentObject private var themeManager: ThemeManager
   @State private var autocompleteError: String?
   private let scrollSyncCoordinator: ScrollSyncCoordinator?
 
@@ -24,6 +25,7 @@ struct EditorView: View {
         text: documentText,
         editorMode: appState.mode,
         fontSize: appState.fontSize,
+        skin: themeManager.skin,
         syntaxHighlightingEnabled: appState.richMarkdownEnabled,
         formattingCommand: appState.pendingMarkdownFormatCommand,
         rewriteCommand: appState.pendingAIRewriteCommand,
@@ -127,7 +129,7 @@ struct EditorView: View {
         }
       }
     }
-    .background(Color(NSColor.textBackgroundColor))
+    .background(Color(themeManager.skin.tokens.source.nsColor))
   }
 
   private var documentText: Binding<String> {
@@ -156,6 +158,9 @@ struct EditorRepresentable: NSViewRepresentable {
   @Binding var text: String
   let editorMode: EditorMode
   let fontSize: CGFloat
+  /// Reading-surface skin driving the source panel tokens. Defaulted so test
+  /// call sites that build the representable directly keep the GitHub surface.
+  let skin: PensieveTheme
   let syntaxHighlightingEnabled: Bool
   let formattingCommand: MarkdownFormatCommand?
   let rewriteCommand: AIRewriteCommand?
@@ -184,6 +189,7 @@ struct EditorRepresentable: NSViewRepresentable {
     text: Binding<String>,
     editorMode: EditorMode,
     fontSize: CGFloat,
+    skin: PensieveTheme = .default,
     syntaxHighlightingEnabled: Bool,
     formattingCommand: MarkdownFormatCommand?,
     rewriteCommand: AIRewriteCommand? = nil,
@@ -208,6 +214,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self._text = text
     self.editorMode = editorMode
     self.fontSize = fontSize
+    self.skin = skin
     self.syntaxHighlightingEnabled = syntaxHighlightingEnabled
     self.formattingCommand = formattingCommand
     self.rewriteCommand = rewriteCommand
@@ -234,12 +241,14 @@ struct EditorRepresentable: NSViewRepresentable {
     let surface = MarkdownEditorSurface(
       text: text,
       fontSize: fontSize,
+      skin: skin,
       syntaxHighlightingEnabled: syntaxHighlightingEnabled,
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
       aiAutocompleteEnabled: aiAutocompleteEnabled,
       documentID: documentID
     )
+    context.coordinator.rethemeMemo.record(skin.paintedIdentity)
     surface.onTextChanged = { newText in
       self.text = newText
       self.isDirty = true
@@ -282,6 +291,31 @@ struct EditorRepresentable: NSViewRepresentable {
     surface.onAutocompleteErrorChanged = onAutocompleteErrorChanged
     surface.onRewritePreviewChanged = onRewritePreviewChanged
     surface.configureDocument(id: documentID)
+    // Re-theme only when the palette actually changed. Pushing tokens re-runs a
+    // full highlight refresh, so doing it on every keystroke re-render would be
+    // the per-keystroke hang the perf pins guard against.
+    //
+    // The key is the PAINTED identity, not the skin the operator picked. Those
+    // were the same thing until a skin gained two palettes: on a paired skin the
+    // enum stays `.typewriter` while the Mac moves between the halves, so a memo
+    // keyed on the enum answers "nothing changed" to the one change that matters
+    // and leaves the source panel painted in the other half — a black pane in a
+    // fully light window, which is exactly what the operator saw.
+    if context.coordinator.rethemeMemo.needsReapply(skin.paintedIdentity) {
+      surface.applyTheme(skin)
+    }
+    // Keep the host window's appearance + titlebar backing in lockstep with the
+    // source panel. Unlike `applyTheme` above this runs UNCONDITIONALLY, on every
+    // pass: it is a compare-and-set invariant, not a one-shot pin. The window can
+    // lose the chrome we set it without any skin change to tell us — AppKit
+    // re-bridges the hosting view's toolbar when toolbar content changes (the
+    // theme picker's label carries the skin name, so every switch re-bridges) and
+    // tab-group reshuffles re-parent windows — and a pin that only fired on a
+    // skin change would never come back to heal that. Running every pass also
+    // covers the initial attach, where `applyTheme` ran before the window
+    // existed. Equal values are skipped inside, so a keystroke re-render writes
+    // nothing.
+    surface.applyWindowChrome(for: skin)
     // Pin the scroll position across SwiftUI re-renders. The per-window state bridge fires
     // objectWillChange on every keystroke, re-laying out this representable; without this the
     // clip view re-scrolls to the caret each time ("the screen goes wild on every letter").
@@ -329,12 +363,40 @@ struct EditorRepresentable: NSViewRepresentable {
     }
   }
 
+  /// Remembers what the source panel is currently painted in, so the expensive
+  /// re-theme runs on a palette change and on nothing else.
+  ///
+  /// A value type on purpose: the whole failure this replaces was a memo whose
+  /// key was subtly weaker than the thing it guarded, and a key that can be
+  /// exercised on its own is a key that can be pinned across a full
+  /// dark → light → dark cycle without a SwiftUI host.
+  struct RethemeMemo {
+    private var painted: PaintedSkin?
+
+    /// True when `candidate` differs from what was last painted — and records it
+    /// in the same step, so a caller cannot ask and then forget to commit.
+    mutating func needsReapply(_ candidate: PaintedSkin) -> Bool {
+      guard painted != candidate else { return false }
+      painted = candidate
+      return true
+    }
+
+    /// Records a palette applied by someone else (the surface themes itself in
+    /// its initialiser, before `updateNSView` ever runs).
+    mutating func record(_ applied: PaintedSkin) {
+      painted = applied
+    }
+  }
+
   func makeCoordinator() -> Coordinator {
     Coordinator()
   }
 
   final class Coordinator {
     var surface: MarkdownEditorSurface?
+    /// Guards the surface re-theme, so `updateNSView` re-themes only on a real
+    /// palette change and never re-runs the highlight pass per keystroke.
+    var rethemeMemo = RethemeMemo()
     private var lastAppliedFormattingCommandID: UUID?
     private var lastAppliedRewriteCommandID: UUID?
     private var lastAppliedFindCommandID: UUID?
@@ -404,6 +466,9 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   var onRewritePreviewChanged: ((AIRewritePreview?) -> Void)?
   private var lastNotifiedCaretOffset = -1
   private var lastNotifiedSelectionLength = -1
+  /// Active theme tokens for the source panel. Held so `update` can keep typing
+  /// attributes on the theme text colour when the font size changes.
+  private var activeTokens: ThemeTokens = PensieveTheme.default.tokens
   var typewriterScrollEnabled = false
   var isApplyingExternalText = false
   private var aiAutocompleteEnabled: Bool
@@ -420,7 +485,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// Logical line index (newline count before the caret) at the last typewriter
   /// re-center. Same-line edits keep this stable → no per-keystroke re-center.
   private var lastCenteredLine: Int?
+  /// Anchor for `lineIndex(forUTF16Offset:)`: a (offset, line) pair that holds
+  /// while the text in `[0, offset)` is unchanged. Parked on a LINE START
+  /// whenever a resolve crosses a separator, so typing — which edits at or after
+  /// the line start, backspace included — never invalidates it.
+  private var lineAnchorOffset = 0
+  private var lineAnchorLine = 0
   private var findQuery = ""
+  /// `.foregroundColor` runs the find washes painted over, captured at paint
+  /// time so a teardown can restore them without a highlight pass per match.
+  private var inkUnderFindWashes: [(range: NSRange, color: NSColor?)] = []
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
@@ -431,6 +505,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   init(
     text: String,
     fontSize: CGFloat,
+    skin: PensieveTheme = .default,
     syntaxHighlightingEnabled: Bool = true,
     tableTidyOnPaste: Bool = true,
     asciiSafeTables: Bool = false,
@@ -498,11 +573,23 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       name: NSView.boundsDidChangeNotification,
       object: scrollView.contentView
     )
+    // Deliberately registered WITHOUT an `object:` filter. The manager our undo
+    // entries actually land in is the WINDOW's (`MarkdownTextView.undoManager`
+    // resolves up the responder chain), and at init time this surface has no
+    // window yet — `textView.undoManager` answers with the private
+    // `fallbackUndoManager`. Pinning the observer to that object registered us
+    // on a manager the user never undoes through, so `editorWillUndo` never
+    // fired once the editor was hosted and the opaque continuation survived
+    // every Cmd+Z. Re-registering on `viewDidMoveToWindow` would mean tracking
+    // one more teardown path across the close/detach seams (see the scrub guard
+    // in `MarkdownTextView`); listening broadly and discriminating on identity
+    // needs no lifecycle bookkeeping at all — the guard below reads the CURRENT
+    // manager on every notification, so a window change is followed for free.
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(editorWillUndo(_:)),
       name: .NSUndoManagerWillUndoChange,
-      object: textView.undoManager
+      object: nil
     )
     textView.onFormatRequest = { [weak self] format in
       _ = self?.applyMarkdownFormat(format)
@@ -521,6 +608,46 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     bindAutocomplete()
     bindRewritePreview()
+    // Viewport seam for a live skin switch: the storage re-colours what is on
+    // screen synchronously and defers the rest of the document, so it has to be
+    // able to ask what "on screen" currently is. Wired BEFORE the first
+    // `applyTheme` so no retheme can ever run without it.
+    textContentStorage.visibleRangeProvider = { [weak self] in
+      self?.textView.visibleCharacterRange
+    }
+    // The deferred half of that switch runs a full refresh, which strips
+    // `.backgroundColor` document-wide — the attribute the find washes live in —
+    // and lands after `applyTheme` already repainted them once.
+    textContentStorage.onRethemeCompleted = { [weak self] in
+      self?.reapplyFindHighlights()
+    }
+    // …and every SCOPED pass strips it over the range it repaints. The sweep
+    // starts at offset 0 and rides one chunk per frame, so waiting for the
+    // completion above left matches near the top of the document unwashed for
+    // the whole length of the sweep. Repaint per chunk instead.
+    textContentStorage.onHighlightingRepainted = { [weak self] range in
+      self?.reapplyFindHighlights(in: range)
+    }
+    // The caret→line resolver caches an anchor keyed on the text before it. Only
+    // the storage sees every character edit — direct mutations included — so the
+    // invalidation is driven from there rather than from the delegate callbacks.
+    textContentStorage.onCharactersEdited = { [weak self] location, _ in
+      self?.invalidateLineAnchor(editedAt: location)
+    }
+    // The gutter no longer counts its row numbers off the enumeration (which is
+    // what forced every repaint to lay out the whole document); it starts at the
+    // first VISIBLE fragment and asks what number that row carries. Answering
+    // from the anchored resolver keeps a scroll paying for the span it moved
+    // across. The anchor is shared with the caret, so a viewport far away from
+    // the caret makes the two queries alternate over the gap — that costs at
+    // worst one layout-free scan, which is what an unshared gutter would pay on
+    // EVERY draw, and typing (caret on screen) keeps both queries adjacent.
+    textView.gutter?.lineNumberForUTF16Offset = { [weak self] offset in
+      (self?.lineIndex(forUTF16Offset: offset) ?? 0) + 1
+    }
+    // Theme the surface BEFORE the initial content load so the first highlight
+    // pass in `update` already uses the theme's source-panel colours.
+    applyTheme(skin)
     update(
       text: text,
       fontSize: fontSize,
@@ -553,17 +680,26 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     if textContentStorage.syntaxHighlightingEnabled != syntaxHighlightingEnabled {
       textContentStorage.syntaxHighlightingEnabled = syntaxHighlightingEnabled
+      // A full highlight refresh strips `.backgroundColor` document-wide, and the
+      // find washes live in that attribute — see `reapplyFindHighlights`.
+      reapplyFindHighlights()
     }
 
     if textContentStorage.fontSize != fontSize {
       textContentStorage.fontSize = fontSize
-      let baseFont = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+      // One source of truth for the face: the highlighter's own base font, in the
+      // active theme's monospace family at the new size.
+      let baseFont = textContentStorage.baseFont
       textView.font = baseFont
       // Keep typing attributes in lockstep with the base font so newly typed text renders in
       // the monospaced face immediately (no system-font flash before the highlight pass).
-      textView.typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
+      // Foreground stays on the active theme text colour, not a fixed system one.
+      textView.typingAttributes = [
+        .font: baseFont, .foregroundColor: activeTokens.text.nsColor,
+      ]
       textView.gutter?.fontSize = fontSize
       textView.gutter?.needsDisplay = true
+      reapplyFindHighlights()
     }
 
     if textStorage.string != text {
@@ -594,6 +730,61 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
 
     updateFind(query: findQuery, visible: findBarVisible)
+    updateGutterCurrentLine()
+  }
+
+  /// Applies a reading-surface theme to the source panel: the scroll view and
+  /// text view backgrounds become the theme `source`, the caret + typing colour
+  /// follow `text`, the gutter takes its own tokens, and the markdown
+  /// highlighter re-runs with the theme's syntax palette.
+  func applyTheme(_ theme: PensieveTheme) {
+    let tokens = theme.tokens
+    activeTokens = tokens
+    scrollView.backgroundColor = tokens.source.nsColor
+    textView.applyTheme(tokens, baseSize: textContentStorage.fontSize)
+    textContentStorage.tokens = tokens
+    // Pushing tokens re-highlights, which strips `.backgroundColor` — the
+    // attribute the find-match washes live in. `updateFind` will not repaint
+    // them (unchanged query + non-empty matches short-circuits), so the matches
+    // would stay invisible until the operator retyped the query. Repaint from
+    // the cached matches instead of clearing them: clearing would also drop the
+    // active-match index and the scroll position the operator is reading.
+    //
+    // This covers the pass that just ran inline. On a large document only the
+    // viewport is repainted here and the rest of the refresh is deferred, so the
+    // storage calls us back through `onRethemeCompleted` to do it again once the
+    // full pass has landed.
+    reapplyFindHighlights()
+    applyWindowChrome(for: theme)
+  }
+
+  /// Holds the host window's appearance and titlebar backing on the skin, so the
+  /// chrome reads the same reading surface as the source panel. The appearance
+  /// is the theme's fixed light/dark (or `nil` for the adaptive skins, which
+  /// follow the system), and the backing colour is the recipe's titlebar glass
+  /// backing — the same `tokens.source` the pane paints, so the glass strip and
+  /// the pane can never split. Assigning the window appearance also forces the
+  /// full window re-composite the live layer-backed pane needs to actually show
+  /// a new opaque source colour on a live skin switch (the NSColor properties
+  /// alone update without a visible repaint until an appearance change lands).
+  ///
+  /// Re-asserted (compare-and-set), NOT pinned once: `updateNSView` calls this
+  /// on every pass and `WindowChromeRecipe.assertWindowChrome` corrects only
+  /// what disagrees. A one-shot pin guarded on "the skin changed" loses
+  /// permanently to an external reset — AppKit re-bridges the toolbar when its
+  /// content changes (the theme picker's label carries the skin name, so every
+  /// switch re-bridges) and tab-group reshuffles re-parent windows; either can
+  /// hand back a default appearance after we pinned, with no further skin
+  /// change coming to re-trigger the pin. Equal values are skipped, so a
+  /// steady state issues no sets and there is no recomposite storm.
+  ///
+  /// No window means nothing to assert AND no bookkeeping — recording a
+  /// "pinned" state for a window that does not exist would claim a pin that
+  /// never happened, which is what used to let a windowless call suppress the
+  /// real one.
+  func applyWindowChrome(for theme: PensieveTheme) {
+    guard let window = scrollView.window else { return }
+    WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
   }
 
   deinit {
@@ -617,6 +808,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scheduleScrollSyncSample()
   }
 
+  /// Drops the provider-side continuation before an undo rewrites the document
+  /// the accepted turns were built on. Every undo manager in the process posts
+  /// here (the observer carries no `object:` filter — see `init`), so the
+  /// identity check against the manager this editor currently undoes through is
+  /// the whole filter: it is re-read per notification, so it follows the surface
+  /// from the windowless fallback manager to whichever window hosts it.
   @objc private func editorWillUndo(_ notification: Notification) {
     guard notification.object as? UndoManager === textView.undoManager else { return }
     autocompleteController.invalidateContinuation()
@@ -691,6 +888,16 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     lastNotifiedCaretOffset = range.location
     lastNotifiedSelectionLength = range.length
     onSelectionChanged?(range.location, range.length)
+    updateGutterCurrentLine()
+  }
+
+  /// Pushes the caret's 1-based source line to the gutter so it can pick out the
+  /// active line's number + accent marker. Layout-free (newline count before the
+  /// caret, matching the gutter's per-paragraph counter), and the gutter no-ops
+  /// when the line is unchanged, so same-line typing never repaints the ruler.
+  private func updateGutterCurrentLine() {
+    let caret = textView.selectedRange().location
+    textView.gutter?.currentLineNumber = lineIndex(forUTF16Offset: caret) + 1
   }
 
   /// UTF-16 cap on the completion prompt tail. Without it every debounce
@@ -1005,19 +1212,115 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     scrollView.reflectScrolledClipView(scrollView.contentView)
   }
 
-  /// Logical line index = number of newlines before `offset`. Layout-free and
-  /// stable across same-line horizontal edits — the property the typewriter
-  /// re-center guard needs and the caret-glyph rect does not have.
-  private func lineIndex(forUTF16Offset offset: Int) -> Int {
+  /// Logical line index = number of PARAGRAPH SEPARATORS before `offset`.
+  /// Layout-free and stable across same-line horizontal edits — the property the
+  /// typewriter re-center guard needs and the caret-glyph rect does not have.
+  ///
+  /// Two things were wrong with the walk this replaces.
+  ///
+  /// It rescanned from offset 0 on EVERY call. `updateGutterCurrentLine` runs it
+  /// from `notifySelectionChanged` and again, unconditionally, from `update(…)`
+  /// on every SwiftUI pass — twice per keystroke — and Focus mode's
+  /// `centerCaretLineIfNeeded` makes three. Measured in a debug test build,
+  /// 200 caret moves on a 1.08 MB document cost 1436 ms through this method
+  /// (~7 ms a call), i.e. 14–21 ms of main thread per keystroke purely to move a
+  /// gutter marker; the bare counting loop alone is 4.1 ms. It is now anchored: a caret
+  /// move counts separators only over the span between the last resolved
+  /// position and this one, which for typing on one line is nothing at all.
+  ///
+  /// And it counted 0x0A alone, while the gutter numbers one row per
+  /// `NSTextLayoutFragment`. Measured on a real `NSTextLayoutManager` in this
+  /// package, `"alpha\rbeta\rgamma"` is THREE fragments and U+2029 likewise,
+  /// both of which the old count read as line 0. Nothing normalises line endings
+  /// on load — `DocumentStore.loadClean` reads the bytes as they are — so a
+  /// CR-only file put the whole document on line 1.
+  ///
+  /// The separator set is the measured one, not the intuitive one: U+2028,
+  /// U+0085, U+000B and U+000C each yield ONE fragment in the same harness, so
+  /// none of them starts a row here. See `EditorLineResolverTests`, which
+  /// asserts this against the layout manager rather than against a list.
+  func lineIndex(forUTF16Offset offset: Int) -> Int {
     let ns = textStorage.string as NSString
     let clamped = min(max(offset, 0), ns.length)
-    var line = 0
-    var i = 0
-    while i < clamped {
-      if ns.character(at: i) == 0x0A { line += 1 }
-      i += 1
+    if lineAnchorOffset > ns.length {
+      resetLineAnchor()
     }
-    return line
+
+    if clamped >= lineAnchorOffset {
+      let scan = Self.paragraphSeparators(in: ns, from: lineAnchorOffset, to: clamped)
+      lineAnchorLine += scan.count
+      // Park the anchor on the START of the line the caret landed on. A caret
+      // position would be lost by the very next backspace (which edits at
+      // caret-1, i.e. BELOW the anchor); a line start survives every edit on
+      // that line, which is what typing is.
+      if let lineStart = scan.lastSeparatorEnd {
+        lineAnchorOffset = lineStart
+      }
+    } else {
+      let scan = Self.paragraphSeparators(in: ns, from: clamped, to: lineAnchorOffset)
+      lineAnchorLine = max(0, lineAnchorLine - scan.count)
+      // Moving BACKWARDS gives no line start for free — finding one would mean
+      // scanning back from `clamped`, which is the walk being removed. The
+      // caret offset is a perfectly valid anchor, just a more fragile one.
+      lineAnchorOffset = clamped
+    }
+    return lineAnchorLine
+  }
+
+  private func resetLineAnchor() {
+    lineAnchorOffset = 0
+    lineAnchorLine = 0
+  }
+
+  /// Drops the anchor when an edit landed BELOW it. At or above it, the text in
+  /// `[0, lineAnchorOffset)` is untouched and the anchor still answers correctly.
+  private func invalidateLineAnchor(editedAt location: Int) {
+    guard lineAnchorOffset > location else { return }
+    resetLineAnchor()
+  }
+
+  struct ParagraphSeparatorScan {
+    let count: Int
+    /// Offset just past the LAST separator in the window, i.e. the start of the
+    /// line the window ends on. `nil` when the window crossed none.
+    let lastSeparatorEnd: Int?
+  }
+
+  /// Counts the paragraph separators in `[start, end)`.
+  ///
+  /// CR, LF and CRLF, plus U+2029. CRLF is ONE separator, not two — see the
+  /// fragment counts in `EditorLineResolverTests`.
+  static func paragraphSeparators(in string: NSString, from start: Int, to end: Int)
+    -> ParagraphSeparatorScan
+  {
+    guard end > start, start >= 0, end <= string.length else {
+      return ParagraphSeparatorScan(count: 0, lastSeparatorEnd: nil)
+    }
+    var count = 0
+    var lastSeparatorEnd: Int?
+    var index = start
+    // A window opening ON the LF of a CRLF would count the pair a second time:
+    // the CR that owns it sits just outside, and already counted it.
+    if index > 0, string.character(at: index) == 0x0A,
+      string.character(at: index - 1) == 0x0D
+    {
+      index += 1
+    }
+    while index < end {
+      let unit = string.character(at: index)
+      if unit == 0x0D {
+        count += 1
+        if index + 1 < string.length, string.character(at: index + 1) == 0x0A {
+          index += 1
+        }
+        lastSeparatorEnd = index + 1
+      } else if unit == 0x0A || unit == 0x2029 {
+        count += 1
+        lastSeparatorEnd = index + 1
+      }
+      index += 1
+    }
+    return ParagraphSeparatorScan(count: count, lastSeparatorEnd: lastSeparatorEnd)
   }
 
   static func centeredScrollY(
@@ -1110,6 +1413,52 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
     findQuery = query
     refreshFindMatches()
+  }
+
+  /// Repaints the CACHED find matches after something else wiped the document's
+  /// `.backgroundColor` (a theme switch, a font-size change, a syntax-highlight
+  /// toggle — all of which run a full highlight refresh). Idempotent, and a
+  /// no-op when no find session is live, so it never costs a keystroke.
+  ///
+  /// Match ranges are validated against the current text first: the caller may
+  /// sit in the same update pass that is about to replace the document, and
+  /// painting a stale range past the end of the storage would raise. Skipping is
+  /// safe — the text change reaches `refreshFindMatches` on its own.
+  func reapplyFindHighlights() {
+    guard !findMatches.isEmpty else { return }
+    let length = textStorage.length
+    guard findMatches.allSatisfy({ NSMaxRange($0) <= length }) else { return }
+    applyFindHighlights()
+  }
+
+  /// The same repaint, restricted to the matches a PARTIAL highlight pass
+  /// touched.
+  ///
+  /// The deferred retheme sweep repaints the document one chunk per frame, and
+  /// every chunk resets `.backgroundColor` over its own range. Repainting the
+  /// whole cached match set on each of those chunks would be quadratic on a
+  /// document with many matches, so only the matches intersecting the painted
+  /// range are put back — which is exactly the set that just lost its wash.
+  func reapplyFindHighlights(in range: NSRange) {
+    guard !findMatches.isEmpty else { return }
+    let length = textStorage.length
+    guard findMatches.allSatisfy({ NSMaxRange($0) <= length }) else { return }
+    let touched = findMatches.enumerated().filter {
+      NSIntersectionRange($0.element, range).length > 0
+    }
+    guard !touched.isEmpty else { return }
+
+    // The highlighter just repainted `range`, so the ink snapshot for it is
+    // stale AND the colour sitting there now is the correct one — drop the old
+    // entries before capturing fresh ones underneath the wash.
+    inkUnderFindWashes.removeAll { NSIntersectionRange($0.range, range).length > 0 }
+
+    textStorage.beginEditing()
+    let palette = Self.findWashes(for: activeTokens)
+    for (index, match) in touched {
+      paintFindWash(over: match, isActive: index == activeFindMatchIndex, palette: palette)
+    }
+    textStorage.endEditing()
   }
 
   func clearFindHighlights() {
@@ -1243,19 +1592,129 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // thread once per match.
     textStorage.beginEditing()
     removeFindHighlights()
-    // Clear, high-contrast find shading: every match gets a yellow wash so it is
-    // obvious in the document, and the active match an orange one so it stands
-    // out from the rest of the hits.
-    let passiveColor = NSColor.systemYellow.withAlphaComponent(0.50)
-    let activeColor = NSColor.systemOrange.withAlphaComponent(0.80)
+    let palette = Self.findWashes(for: activeTokens)
     for (index, range) in findMatches.enumerated() {
-      textStorage.addAttribute(
-        .backgroundColor,
-        value: index == activeFindMatchIndex ? activeColor : passiveColor,
-        range: range
-      )
+      paintFindWash(over: range, isActive: index == activeFindMatchIndex, palette: palette)
     }
     textStorage.endEditing()
+  }
+
+  /// Clear, high-contrast find shading: every match gets a yellow wash so it is
+  /// obvious in the document, and the active match an orange one so it stands
+  /// out from the rest of the hits.
+  ///
+  /// The one place a wash is written, so the full repaint and the per-chunk one
+  /// can never disagree about what a match looks like. Caller owns the edit
+  /// transaction and supplies the resolved palette, so the contrast arithmetic
+  /// runs once per pass rather than once per match.
+  private func paintFindWash(over range: NSRange, isActive: Bool, palette: FindWashPalette) {
+    let wash = isActive ? palette.active : palette.passive
+    // Capture what the highlighter had put here BEFORE the wash ink covers it,
+    // so a teardown can give it back without re-running a highlight pass.
+    textStorage.enumerateAttribute(.foregroundColor, in: range, options: []) {
+      value, subrange, _ in
+      inkUnderFindWashes.append((subrange, value as? NSColor))
+    }
+    textStorage.addAttribute(.backgroundColor, value: wash.background, range: range)
+    textStorage.addAttribute(.foregroundColor, value: wash.foreground, range: range)
+  }
+
+  /// Puts the highlighter's own `.foregroundColor` back under every wash this
+  /// surface painted, then forgets them.
+  ///
+  /// Ranges are validated against the CURRENT length: a teardown can follow a
+  /// text change that shortened the document, and painting past the end raises.
+  private func restoreInkUnderFindWashes() {
+    guard !inkUnderFindWashes.isEmpty else { return }
+    let length = textStorage.length
+    for entry in inkUnderFindWashes where NSMaxRange(entry.range) <= length {
+      if let color = entry.color {
+        textStorage.addAttribute(.foregroundColor, value: color, range: entry.range)
+      } else {
+        textStorage.removeAttribute(.foregroundColor, range: entry.range)
+      }
+    }
+    inkUnderFindWashes.removeAll(keepingCapacity: true)
+  }
+
+  /// A find wash and the ink that has to stay readable on it.
+  struct FindWash: Equatable {
+    let background: NSColor
+    let foreground: NSColor
+  }
+
+  struct FindWashPalette: Equatable {
+    let passive: FindWash
+    let active: FindWash
+  }
+
+  /// The washes stay on the system accents rather than theme tokens: a find hit
+  /// should read as a find hit in every skin, and stay distinguishable from the
+  /// theme's own `==mark==` wash, which is a different statement about the text.
+  /// The SKIN then decides the ink that goes on top.
+  static let passiveFindWash = NSColor.systemYellow.withAlphaComponent(0.50)
+  static let activeFindWash = NSColor.systemOrange.withAlphaComponent(0.80)
+
+  /// Resolves both washes for a skin.
+  ///
+  /// The washes used to be written as `.backgroundColor` alone, leaving the
+  /// foreground on whatever the highlighter had painted. Measured on this
+  /// machine, that put Graphite's body ink at 2.15:1 on the active match's
+  /// composited orange and 2.96:1 on the passive yellow, and Ink's at 2.40:1
+  /// active — all under the repo's own `ThemeContrast.minimumTextContrast` of 3.
+  /// A dark skin's find results were the hardest text in the document to read.
+  ///
+  /// Resolved per pass rather than cached because the adaptive skins carry LIVE
+  /// semantic colours: a cached answer would freeze whichever appearance was
+  /// current when it was built. That is also why there is no `tokens.mode`
+  /// guard here — unlike the highlighter's colour caches, nothing outlives the
+  /// pass.
+  static func findWashes(for tokens: ThemeTokens) -> FindWashPalette {
+    FindWashPalette(
+      passive: FindWash(
+        background: passiveFindWash,
+        foreground: findWashInk(on: passiveFindWash, tokens: tokens)),
+      active: FindWash(
+        background: activeFindWash,
+        foreground: findWashInk(on: activeFindWash, tokens: tokens)))
+  }
+
+  /// Ink for `wash` over the skin's source surface: the theme's body text when
+  /// it carries the composited wash, otherwise the theme's `source` — the far
+  /// pole of the SAME palette, so the match reads as an inverted stamp. Two
+  /// tokens from one theme, never an invented per-theme hex: the shape
+  /// `SyntaxHighlighter.legibleHighlightText` and `CodeBlockHighlighter`'s
+  /// accent guard already use.
+  static func findWashInk(on wash: NSColor, tokens: ThemeTokens) -> NSColor {
+    let surface = compositedFindWash(wash, over: tokens.source.nsColor)
+    let text = tokens.text.nsColor
+    if ThemeContrast.isLegible(text, on: surface) { return text }
+
+    let source = tokens.source.nsColor
+    // Neither pole proven legible (an unmeasurable pattern colour, say): take
+    // whichever measures better, and keep the body ink when nothing measures.
+    guard let textRatio = ThemeContrast.ratio(text, surface),
+      let sourceRatio = ThemeContrast.ratio(source, surface)
+    else { return text }
+    return sourceRatio > textRatio ? source : text
+  }
+
+  /// `wash` composited over an opaque `surface`. The wash is translucent, so
+  /// measuring ink against the wash alone would answer a question nobody asked —
+  /// what the operator looks at is the blend.
+  static func compositedFindWash(_ wash: NSColor, over surface: NSColor) -> NSColor {
+    guard let top = wash.usingColorSpace(.sRGB),
+      let bottom = surface.usingColorSpace(.sRGB)
+    else { return wash }
+    let alpha = top.alphaComponent
+    func blend(_ over: CGFloat, _ under: CGFloat) -> CGFloat {
+      over * alpha + under * (1 - alpha)
+    }
+    return NSColor(
+      srgbRed: blend(top.redComponent, bottom.redComponent),
+      green: blend(top.greenComponent, bottom.greenComponent),
+      blue: blend(top.blueComponent, bottom.blueComponent),
+      alpha: 1)
   }
 
   private func removeFindHighlights() {
@@ -1267,6 +1726,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // per-keystroke "text reflows/jumps at a fixed scroll origin" bug, which is
     // independent of syntax highlighting (hence disabling rich markdown never
     // helped).
+    // The washes co-write `.foregroundColor` — a wash the body ink cannot carry
+    // would otherwise hide exactly what it marks — so taking them down has to
+    // give the highlighter's own colour back. Unconditional: the ink outlives a
+    // match set that has already been emptied.
+    restoreInkUnderFindWashes()
     guard !findMatches.isEmpty else { return }
     let fullRange = NSRange(location: 0, length: textStorage.length)
     textStorage.removeAttribute(.backgroundColor, range: fullRange)

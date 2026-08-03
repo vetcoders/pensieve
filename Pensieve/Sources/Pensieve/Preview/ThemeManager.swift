@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Loads preview CSS bundles from release-safe resource locations and caches them.
@@ -11,10 +12,11 @@ import Foundation
 ///   * `Theme` (flavor) — the markdown *dialect* stylesheet: plain Markdown vs
 ///     GitHub Flavored. This is the heavy base CSS bundle (`markdown.css` /
 ///     `gfm.css`) shipped in Resources.
-///   * `PreviewTheme` (skin) — the *reading surface* on top of the flavor:
-///     code-like, paper-like, raw, or the default GitHub surface. The skin is a
-///     thin token/typography overlay composed AFTER the flavor CSS, so a skin
-///     never re-implements a flavor — it re-tunes it.
+///   * `PensieveTheme` (skin) — the *reading surface* on top of the flavor: the
+///     token palette + typography that dresses BOTH the rendered preview and
+///     the source editor. Its `ThemeTokens` feed the source panel and titlebar
+///     directly; the preview overlay CSS is composed AFTER the flavor CSS, so a
+///     skin never re-implements a flavor — it re-tunes it.
 ///
 /// Keeping the two axes separate is deliberate: a reader can want GitHub
 /// Flavored tables *and* a paper-like serif body at the same time.
@@ -36,103 +38,176 @@ final class ThemeManager: ObservableObject {
     fileprivate var resourceName: String { rawValue }
   }
 
-  /// Reading-surface skin layered on top of the flavor CSS. Each case is a thin
-  /// CSS overlay (typography + design tokens), NOT a new base bundle.
-  enum PreviewTheme: String, CaseIterable, Identifiable {
-    /// GitHub-like surface — the established look; no overlay beyond the base
-    /// appearance tokens.
-    case `default`
-    /// Paper-like reading surface: warm background, serif body, narrow measure.
-    case paper
-    /// Code-like surface: monospace body, terminal-ish dark tokens, tight rhythm.
-    case code
-    /// Raw surface: stripped chrome, monospace, full-width, minimal styling —
-    /// closest to "view source" while still rendered.
-    case raw
-    /// Notion-like surface: warm neutral ink on white, comfortable measure,
-    /// soft block tokens with a red inline-code accent.
-    case notion
-    /// Vista surface: Helvetica technical-doc look with framed, banded tables.
-    case vista
-    /// MLA surface: Times serif, double-spaced, narrow academic measure with
-    /// indented paragraphs and a centred title.
-    case mla
-    /// Jamstatic surface: Poppins sans, slate body, lilac accents and
-    /// deep-violet links.
-    case jamstatic
-    /// Vercel surface: Geist-style sans, near-black ink on white, blue links and
-    /// a purple callout accent. Ported from the MIT-licensed Typora Vercel theme
-    /// (tecladochen). See THIRD_PARTY_THEMES.md.
-    case vercel
-    /// Themeable surface: Inter sans on slate, clean Tailwind-ish palette.
-    /// Ported from the MIT-licensed Typora Themeable theme (jhildenbiddle).
-    /// See THIRD_PARTY_THEMES.md.
-    case themeable
-    /// Glass surface: translucent, backdrop-blurred panels with soft pastel
-    /// accents. Ported from the MIT-licensed Typora Foresee theme (passwordgloo).
-    /// See THIRD_PARTY_THEMES.md.
-    case glass
-
-    var id: String { rawValue }
-
-    var displayName: String {
-      switch self {
-      case .default: return "Default"
-      case .paper: return "Document"
-      case .code: return "Code"
-      case .raw: return "Raw"
-      case .notion: return "Notion"
-      case .vista: return "Vista"
-      case .mla: return "MLA"
-      case .jamstatic: return "Jamstatic"
-      case .vercel: return "Vercel"
-      case .themeable: return "Themeable"
-      case .glass: return "Glass"
-      }
-    }
-
-    /// SF Symbol for the toolbar picker — keeps the menu legible at a glance.
-    var systemImage: String {
-      switch self {
-      case .default: return "doc.richtext"
-      case .paper: return "book"
-      case .code: return "chevron.left.forwardslash.chevron.right"
-      case .raw: return "text.alignleft"
-      case .notion: return "square.grid.2x2"
-      case .vista: return "tablecells"
-      case .mla: return "graduationcap"
-      case .jamstatic: return "paintpalette"
-      case .vercel: return "triangle.fill"
-      case .themeable: return "slider.horizontal.3"
-      case .glass: return "square.on.square"
-      }
-    }
-  }
-
   @Published var current: Theme {
-    didSet { persist(\.flavorKey, current.rawValue) }
+    didSet { persist(Self.flavorKey, current.rawValue) }
   }
 
   /// Active reading-surface skin. App-wide like the flavor so every window and
   /// the toolbar picker agree on one selection.
-  @Published var skin: PreviewTheme {
-    didSet { persist(\.skinKey, skin.rawValue) }
+  @Published var skin: PensieveTheme {
+    didSet { persist(Self.skinKey, skin.rawValue) }
   }
+
+  /// Bumped when the system light/dark setting flips.
+  ///
+  /// A PAIRED skin resolves its tokens from that setting, and nothing else in
+  /// the app changes when the setting does: `skin` is still the same case, so no
+  /// `@Published` fires and every view holding this object keeps the palette it
+  /// already drew. This counter is that missing signal — one published bump, and
+  /// the ordinary update path re-reads the tokens exactly the way it does after
+  /// the operator picks a skin by hand.
+  ///
+  /// It is a COUNTER rather than a stored appearance so there is no second copy
+  /// of the system setting to go stale; `SystemAppearance.isDark` stays the only
+  /// place that answer is read.
+  @Published private(set) var systemAppearanceGeneration: Int = 0
 
   private let defaults: UserDefaults
   private var cache: [Theme: String] = [:]
+  private var appearanceObservation: NSKeyValueObservation?
 
-  private let flavorKey = "pensieve.preview.flavor"
-  private let skinKey = "pensieve.preview.skin"
+  static let flavorKey = "pensieve.preview.flavor"
+  static let skinKey = "pensieve.preview.skin"
+
+  /// Where this preferences container came from, decided once and written down.
+  ///
+  /// The skin key alone cannot say. `guard let raw else { return .graphite }`
+  /// reads a missing `pensieve.preview.skin` as "fresh install, take the new
+  /// default" — but the builds before this one resolved that same absence to
+  /// `.default`, and `skin`'s `didSet` does not fire during `init`, so an
+  /// operator who has been reading on Default since before this build and never
+  /// touched the picker has no key either. Left alone, shipping this build would
+  /// silently re-theme her to Graphite on first launch.
+  ///
+  /// So the container is classified instead, once, on the first launch that
+  /// knows how to ask.
+  enum InstallOrigin: String {
+    /// Nothing of Pensieve's was in the container: a genuinely new install,
+    /// which takes this build's fresh-install default.
+    case fresh
+    /// A previous build had already written here. Absent a skin key, that
+    /// operator was on Default and never chose otherwise; she keeps it.
+    case upgrade
+
+    /// Skin for an install carrying NO `pensieve.preview.skin` key.
+    var skinWithoutAChoice: PensieveTheme {
+      switch self {
+      case .fresh: return .graphite
+      case .upgrade: return .default
+      }
+    }
+  }
+
+  /// The one-time marker. Its presence is what makes the classification stable:
+  /// once this build starts writing keys of its own, the container stops looking
+  /// fresh, and re-deriving the answer on a later launch would flip it.
+  static let installOriginKey = "pensieve.install.origin"
+
+  /// Keys a build BEFORE this one could have left behind.
+  ///
+  /// Not one of them is guaranteed — every single one is written from a `didSet`
+  /// or from an explicit action, and Swift skips property observers during
+  /// `init`, so this app writes NOTHING on a launch where the operator changes
+  /// nothing. The test is therefore "any of these", not "one particular one",
+  /// and it still cannot see an install that was launched, never touched, and
+  /// never opened a file. That residue is the honest limit of a marker
+  /// introduced after the fact: there is no earlier evidence to read.
+  static let priorContainerKeys = [
+    flavorKey,
+    "pensieve.sidebar.tab",
+    "Pensieve.sidebarSortOrder",
+    "Pensieve.dispatch.lastRunRootPath",
+    "Pensieve.workspace.rootBookmarks",
+    "Pensieve.workspace.fileBookmarks",
+    "Pensieve.openFolder.bookmark",
+    "Pensieve.previewAutoReload",
+    "Pensieve.tableTidyOnPaste",
+    "Pensieve.asciiSafeTables",
+    "Pensieve.aiAutocompleteEnabled",
+    "Pensieve.scrollSyncEnabled",
+    // AppKit's own Open-Recent history, which it writes for us whenever a
+    // document is opened — the widest net available for "this install was used".
+    "NSRecentDocumentRecords",
+  ]
+
+  /// Classifies the container and remembers the answer. Idempotent: after the
+  /// first call the marker is read back rather than re-derived.
+  @discardableResult
+  static func installOrigin(defaults: UserDefaults) -> InstallOrigin {
+    if let known = defaults.string(forKey: installOriginKey)
+      .flatMap(InstallOrigin.init(rawValue:))
+    {
+      return known
+    }
+
+    let usedBefore =
+      defaults.object(forKey: skinKey) != nil
+      || priorContainerKeys.contains { defaults.object(forKey: $0) != nil }
+    let origin: InstallOrigin = usedBefore ? .upgrade : .fresh
+    defaults.set(origin.rawValue, forKey: installOriginKey)
+    return origin
+  }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.current =
-      defaults.string(forKey: "pensieve.preview.flavor")
+      defaults.string(forKey: Self.flavorKey)
       .flatMap(Theme.init(rawValue:)) ?? .markdown
-    self.skin =
-      defaults.string(forKey: "pensieve.preview.skin")
-      .flatMap(PreviewTheme.init(rawValue:)) ?? .default
+
+    // Classify BEFORE this instance writes anything of its own — the migration
+    // write-back below lands in the same container the classification reads.
+    let origin = Self.installOrigin(defaults: defaults)
+    let persistedSkin = defaults.string(forKey: Self.skinKey)
+    let resolvedSkin = PensieveTheme.resolve(
+      persistedRawValue: persistedSkin, withoutAChoice: origin.skinWithoutAChoice)
+    self.skin = resolvedSkin
+
+    // A migration that only lives in memory is not a migration. `skin`'s
+    // `didSet` does not fire for the assignment above — Swift skips property
+    // observers during initialisation — so a retired name (`glass` → `ink`)
+    // stays in the store until the operator happens to pick a skin by hand:
+    // every launch re-migrates the same dead value, and anything else reading
+    // the raw key still sees a skin this build no longer has. Settle it where
+    // it is resolved. No skin key still means no choice yet — resolving one is
+    // not the operator picking one — so an install without a stored skin gets
+    // no skin written, whichever way `installOrigin` classified it.
+    if let persistedSkin, persistedSkin != resolvedSkin.rawValue {
+      persist(Self.skinKey, resolvedSkin.rawValue)
+    }
+
+    observeSystemAppearance()
+  }
+
+  /// Watches the system light/dark setting for the paired skins.
+  ///
+  /// Two things this deliberately does NOT do, both of them lessons already paid
+  /// for on this surface:
+  ///
+  ///   * It writes NOTHING that feeds the property it observes. The reaction is
+  ///     a counter bump; the chrome pass downstream writes the resolved half to
+  ///     the WINDOW and never touches `NSApp.appearance`, which is the only
+  ///     property `effectiveAppearance` here is derived from. That separation is
+  ///     what makes the pin safe: a paired skin now answers `.aqua`/`.darkAqua`
+  ///     rather than `nil`, and it still cannot re-trigger its own observation.
+  ///     So the appearance loop that `7908bfd` fixed cannot form here — and the
+  ///     edge-triggered `assertedAppearances` table still guards the write.
+  ///   * It repaints nothing synchronously inside the callback. The bump is
+  ///     dispatched onto the next main-queue turn and the ordinary SwiftUI
+  ///     update path does the work, which is the same shape `d721f55`/`ce4397f`
+  ///     settled for a live skin switch: a re-theme that runs through the normal
+  ///     cycle instead of walking every surface from inside a notification.
+  ///
+  /// Unpaired skins read no system setting, so they are filtered out before the
+  /// bump rather than being re-rendered for a change that cannot affect them.
+  private func observeSystemAppearance() {
+    appearanceObservation = NSApplication.shared.observe(
+      \.effectiveAppearance, options: [.new]
+    ) { [weak self] _, _ in
+      DispatchQueue.main.async {
+        guard let self, self.skin.isPaired else { return }
+        self.systemAppearanceGeneration &+= 1
+      }
+    }
   }
 
   func css(for theme: Theme) -> String {
@@ -144,7 +219,7 @@ final class ThemeManager: ObservableObject {
     return loaded
   }
 
-  private func persist(_ key: KeyPath<ThemeManager, String>, _ value: String) {
-    defaults.set(value, forKey: self[keyPath: key])
+  private func persist(_ key: String, _ value: String) {
+    defaults.set(value, forKey: key)
   }
 }

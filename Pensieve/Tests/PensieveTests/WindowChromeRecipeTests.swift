@@ -145,8 +145,22 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(expected, 0)
   }
 
-  func testTitlebarGlassBackingColorMatchesEditorSurface() {
-    XCTAssertEqual(WindowChromeRecipe.titlebarGlassBackingColor, .textBackgroundColor)
+  func testTitlebarGlassBackingColorIsTheThemeSourceToken() {
+    // The adaptive `default` theme keeps the established editor surface...
+    XCTAssertEqual(
+      WindowChromeRecipe.titlebarGlassBackingColor(for: .default), .textBackgroundColor)
+    // ...and a fixed-palette theme feeds its own source colour so the titlebar
+    // strip never lights up on a dark surface.
+    let inkBacking = WindowChromeRecipe.titlebarGlassBackingColor(for: .ink)
+      .usingColorSpace(.sRGB)
+    let inkSource = PensieveTheme.ink.tokens.source.nsColor.usingColorSpace(.sRGB)
+    XCTAssertNotNil(inkBacking)
+    XCTAssertNotNil(inkSource)
+    if let inkBacking, let inkSource {
+      XCTAssertEqual(inkBacking.redComponent, inkSource.redComponent, accuracy: 0.001)
+      XCTAssertEqual(inkBacking.greenComponent, inkSource.greenComponent, accuracy: 0.001)
+      XCTAssertEqual(inkBacking.blueComponent, inkSource.blueComponent, accuracy: 0.001)
+    }
   }
 
   @MainActor
@@ -155,9 +169,11 @@ final class WindowChromeRecipeTests: XCTestCase {
     let webView = view.subviews.compactMap { $0 as? WKWebView }.first
     XCTAssertNotNil(webView)
     // WKWebView resolves the dynamic catalog colour to concrete sRGB on set;
-    // compare resolved components, not colour identity.
+    // compare resolved components, not colour identity. A freshly built view
+    // (no document loaded) backs the chrome with the `default` theme surface.
     let applied = webView?.underPageBackgroundColor.usingColorSpace(.sRGB)
-    let expected = WindowChromeRecipe.titlebarGlassBackingColor.usingColorSpace(.sRGB)
+    let expected = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
+      .usingColorSpace(.sRGB)
     XCTAssertNotNil(applied)
     XCTAssertNotNil(expected)
     if let applied, let expected {
@@ -272,4 +288,380 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
   }
 
+  @MainActor
+  func testGutterAdoptsThickenedRuleAndCurrentLineToken() {
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 200, height: 400))
+    let textView = NSTextView(frame: scrollView.bounds)
+    scrollView.documentView = textView
+    let layoutManager = NSTextLayoutManager()
+    let gutter = LineNumberGutter(scrollView: scrollView, textLayoutManager: layoutManager)
+
+    // Chrome-polish cut: the ruler widened 40 -> 46.
+    XCTAssertEqual(gutter.ruleThickness, 46)
+
+    // The active-line number + right-edge marker paint from the theme's
+    // srcCurrentLine token; the fill stays the source token.
+    gutter.applyTokens(PensieveTheme.ink.tokens)
+    XCTAssertEqual(gutter.gutterCurrentLine, PensieveTheme.ink.tokens.srcCurrentLine.nsColor)
+    XCTAssertEqual(gutter.gutterBackground, PensieveTheme.ink.tokens.source.nsColor)
+
+    // The active line the gutter picks out is a settable 1-based line.
+    gutter.currentLineNumber = 4
+    XCTAssertEqual(gutter.currentLineNumber, 4)
+  }
+
+  // MARK: - Toolbar chip tint
+
+  /// The chip fill is the skin's `chromeAccent`, byte-for-byte — the same token
+  /// table the titlebar backing reads, so the chips and the strip they sit on
+  /// can never come from two different skins.
+  func testToolbarChipBezelColorIsTheSkinsChromeAccent() {
+    for skin in PensieveTheme.allCases {
+      XCTAssertEqual(
+        WindowChromeRecipe.toolbarChipBezelColor(for: skin),
+        skin.tokens.chromeAccent.nsColor,
+        skin.rawValue)
+    }
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarChipBezelColor(for: .typewriter),
+      ColorSpec.nsColor(fromHex: "#6e6e6e"))
+    // Adaptive skins still follow the accent picked in System Settings.
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarChipBezelColor(for: .default), NSColor.controlAccentColor)
+  }
+
+  /// The discriminator that keeps the paint on the toggle chips and off the rest
+  /// of the toolbar. A SwiftUI `ControlGroup` becomes one segmented control, and
+  /// its tracking mode is what says which kind of group it was: independent
+  /// toggles (`.selectAny`), the single-selection mode picker (`.selectOne`), or
+  /// a row of plain buttons (`.momentary`).
+  @MainActor
+  func testOnlyMultiSelectToggleGroupsCountAsChipGroups() {
+    func control(_ tracking: NSSegmentedControl.SwitchTracking) -> NSSegmentedControl {
+      let control = NSSegmentedControl()
+      control.segmentCount = 3
+      control.trackingMode = tracking
+      return control
+    }
+
+    XCTAssertTrue(WindowChromeRecipe.isToggleChipGroup(control(.selectAny)))
+    XCTAssertFalse(
+      WindowChromeRecipe.isToggleChipGroup(control(.selectOne)),
+      "the segmented mode picker must keep its own selection colour")
+    XCTAssertFalse(
+      WindowChromeRecipe.isToggleChipGroup(control(.momentary)),
+      "a group of plain buttons has no on-state chip to paint")
+  }
+
+  /// A window with no toolbar has nothing to correct — the assertion must stay
+  /// silent rather than report a correction on every pass, because
+  /// `assertWindowChrome` folds this result into its own converged/not answer.
+  @MainActor
+  func testToolbarChipAssertionIsSilentWithoutAToolbar() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    XCTAssertTrue(WindowChromeRecipe.toolbarSegmentedControls(in: window).isEmpty)
+    XCTAssertFalse(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+  }
+
+  /// The real shape, minus SwiftUI: a toolbar carrying one toggle group and one
+  /// single-selection picker. The chip group takes the skin's fill, the picker
+  /// is left alone, and a second pass corrects nothing — the compare-and-set
+  /// converges instead of re-writing on every update pass.
+  @MainActor
+  func testToolbarChipAssertionPaintsToggleGroupsOnlyAndConverges() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    let chips = NSSegmentedControl()
+    chips.segmentCount = 2
+    chips.trackingMode = .selectAny
+
+    let picker = NSSegmentedControl()
+    picker.segmentCount = 3
+    picker.trackingMode = .selectOne
+
+    let toolbar = NSToolbar(identifier: "pensieve.test.chiptint")
+    let delegate = StubToolbarDelegate(views: [chips, picker])
+    toolbar.delegate = delegate
+    window.toolbar = toolbar
+
+    XCTAssertEqual(
+      WindowChromeRecipe.toolbarSegmentedControls(in: window).count, 2,
+      "premise: the walk reaches both view-backed toolbar items")
+
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .parchment))
+    XCTAssertNil(picker.selectedSegmentBezelColor, "the mode picker must not be repainted")
+
+    // Converged: nothing left to correct on the next pass.
+    XCTAssertFalse(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .parchment))
+
+    // A skin switch moves the chip; an external reset (what a toolbar re-bridge
+    // does) is healed by the next pass.
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .porcelain))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
+
+    chips.selectedSegmentBezelColor = nil
+    XCTAssertTrue(WindowChromeRecipe.assertToolbarChipTint(on: window, for: .porcelain))
+    XCTAssertEqual(
+      chips.selectedSegmentBezelColor,
+      WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
+  }
+
+  // MARK: - Native tab bar
+
+  /// `VibrantDark` and `DarkAqua` are the same SIDE. Comparing raw names would
+  /// call an already-correct vibrant tab bar a disagreement and rewrite it on
+  /// every pass — flattening its glass and never converging.
+  func testAppearancePolarityFoldsTheVibrantVariantsOntoTwoAnswers() {
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(NSAppearance(named: .vibrantDark)), .darkAqua)
+    XCTAssertEqual(WindowChromeRecipe.appearancePolarity(NSAppearance(named: .darkAqua)), .darkAqua)
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(NSAppearance(named: .vibrantLight)), .aqua)
+    XCTAssertEqual(WindowChromeRecipe.appearancePolarity(NSAppearance(named: .aqua)), .aqua)
+    XCTAssertNil(WindowChromeRecipe.appearancePolarity(nil))
+  }
+
+  /// A correction keeps the material it found. A glass node that had chosen
+  /// `VibrantLight` is put back to `VibrantDark`; a flat one to `DarkAqua`.
+  func testACorrectionKeepsTheVibrancyItFound() {
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .darkAqua, preservingVibrancyOf: NSAppearance(named: .vibrantLight))?.name,
+      .vibrantDark,
+      "flattening a glass node to DarkAqua would drop the material the tab bar is made of")
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .aqua, preservingVibrancyOf: NSAppearance(named: .vibrantDark))?.name,
+      .vibrantLight)
+    XCTAssertEqual(
+      WindowChromeRecipe.matchingAppearance(
+        for: .darkAqua, preservingVibrancyOf: NSAppearance(named: .aqua))?.name,
+      .darkAqua)
+  }
+
+  /// The side the tab bar must agree with comes from the SKIN when the skin
+  /// names one, and from the window only for the adaptive skins.
+  ///
+  /// Skin-first is load-bearing, not tidiness: a skin switch is one of the
+  /// moments the tab bar is rebuilt, and `window.effectiveAppearance` can still
+  /// be reporting the outgoing half while that happens — so a window-first read
+  /// would pin the new tab bar to the skin being left.
+  @MainActor
+  func testTabBarPolarityPrefersTheSkinAndFallsBackToTheWindow() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    window.appearance = NSAppearance(named: .darkAqua)
+    XCTAssertEqual(
+      WindowChromeRecipe.tabBarPolarity(on: window, for: .parchment), .aqua,
+      "a light skin's tab bar must be light even while the window still reads dark")
+
+    XCTAssertEqual(
+      WindowChromeRecipe.tabBarPolarity(on: window, for: .default), .darkAqua,
+      "an adaptive skin names no appearance, so the window is the only answer left")
+    window.appearance = NSAppearance(named: .aqua)
+    XCTAssertEqual(WindowChromeRecipe.tabBarPolarity(on: window, for: .default), .aqua)
+  }
+
+  /// THE REGRESSION PIN for the tab bar.
+  ///
+  /// What it models is the state an operator photographed: a native tab pill
+  /// over the white preview column rendering light on a dark window. The
+  /// TRIGGER is not reproducible below the window server — a glass view resolves
+  /// against composited luminance, and a headless probe with a white content
+  /// column produced no flip at all (the same limit `bdbb816` recorded for the
+  /// toolbar platters). So the flip is INJECTED, exactly as measured on the
+  /// probe: the tab bar's glass nodes carrying an explicitly-set `VibrantLight`
+  /// while the window is `darkAqua`.
+  ///
+  /// Injecting the state is honest here because the state is what was measured
+  /// on the real app, and because the defect is TRANSIENT: the tab bar is
+  /// rebuilt out from under any one-shot pin (every window in the group carries
+  /// its own accessory, and selecting a tab hands the newly visible one a glass
+  /// node with no appearance of its own). What has to be true is that production
+  /// puts a wrong-sided tab bar back, on demand, as often as AppKit hands it
+  /// one — and that is exactly what this asserts.
+  @MainActor
+  func testAFlippedTabBarIsPutBackOnTheWindowsSide() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+    window.appearance = NSAppearance(named: .darkAqua)
+
+    // The measured shape: a track-level glass node and one per tab pill, each
+    // having self-selected the wrong side.
+    let track = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 28))
+    let leading = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+    let trailing = NSView(frame: NSRect(x: 300, y: 0, width: 300, height: 24))
+    track.addSubview(leading)
+    track.addSubview(trailing)
+    for view in [track, leading, trailing] {
+      view.appearance = NSAppearance(named: .vibrantLight)
+    }
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertTabBarAppearance(
+        on: window, for: .ink, tabBarViews: [track, leading, trailing]))
+    for view in [track, leading, trailing] {
+      XCTAssertEqual(
+        view.appearance?.name, .vibrantDark,
+        "a tab pill that self-selected light over the preview column stays light — nothing "
+          + "re-asserts the window's side on the tab bar")
+    }
+
+    // Converged: an already-correct tab bar is not touched again, so this is
+    // safe on a window update cycle.
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(
+        on: window, for: .ink, tabBarViews: [track, leading, trailing]),
+      "a second pass rewrote an already-correct tab bar — that is the write loop, on a "
+        + "notification the window itself posts")
+
+    // And a node already on the right side keeps its exact material.
+    let vibrant = NSView(frame: .zero)
+    vibrant.appearance = NSAppearance(named: .vibrantDark)
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(on: window, for: .ink, tabBarViews: [vibrant]))
+    XCTAssertEqual(vibrant.appearance?.name, .vibrantDark)
+  }
+
+  /// A window with no visible tab bar has nothing to correct, and must say so
+  /// rather than report a correction on every pass — `assertWindowChrome` folds
+  /// this answer into its own converged/not result.
+  @MainActor
+  func testTabBarAssertionIsSilentWithoutATabBar() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    XCTAssertTrue(WindowChromeRecipe.tabBarSelfSelectingViews(in: window).isEmpty)
+    XCTAssertFalse(WindowChromeRecipe.assertTabBarAppearance(on: window, for: .parchment))
+  }
+
+  /// THE END-TO-END PIN: a REAL native tab group, the real AppKit view tree, and
+  /// the production entry point with no seam.
+  ///
+  /// The pin above drives the polarity rules against a known view shape; this
+  /// one proves the other half — that the walk actually FINDS AppKit's tab bar
+  /// (`titlebarAccessoryViewControllers` → `NSTabBar` → the glass nodes that set
+  /// their own appearance), that the `isTabBarVisible` gate lets it through, and
+  /// that `assertWindowChrome` runs it. Nothing here names a private class: the
+  /// flip is injected onto whatever nodes the walk itself returns, so the pin
+  /// cannot pass by agreeing with a hard-coded view hierarchy.
+  @MainActor
+  func testARealTabGroupsFlippedGlassIsRepairedThroughAssertWindowChrome() throws {
+    func makeWindow(_ title: String) -> NSWindow {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false)
+      WindowChromeRecipe.apply(to: window, title: title)
+      window.contentView = NSView(frame: .zero)
+      return window
+    }
+
+    let leading = makeWindow("dont_forget_about")
+    let trailing = makeWindow("Recovered Untitled.md")
+    defer {
+      for window in [leading, trailing] {
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+      }
+    }
+    for window in [leading, trailing] { window.appearance = NSAppearance(named: .darkAqua) }
+    // Parked far offscreen at zero alpha: still laid out, never on a screen an
+    // operator is looking at.
+    leading.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+    leading.alphaValue = 0
+    leading.makeKeyAndOrderFront(nil)
+    leading.addTabbedWindow(trailing, ordered: .above)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+
+    let found = WindowChromeRecipe.tabBarSelfSelectingViews(in: leading)
+    guard leading.tabGroup?.isTabBarVisible == true, !found.isEmpty else {
+      throw XCTSkip("headless host did not build a native tab bar")
+    }
+
+    // Inject the measured symptom onto the real nodes.
+    for view in found { view.appearance = NSAppearance(named: .vibrantLight) }
+    XCTAssertEqual(
+      WindowChromeRecipe.appearancePolarity(found.first?.appearance), .aqua,
+      "premise: the tab bar is now on the wrong side, like the pill over the preview column")
+
+    XCTAssertTrue(
+      WindowChromeRecipe.assertWindowChrome(on: leading, for: .ink),
+      "the window chrome pass did not reach the native tab bar at all")
+    for view in WindowChromeRecipe.tabBarSelfSelectingViews(in: leading) {
+      XCTAssertEqual(
+        WindowChromeRecipe.appearancePolarity(view.appearance), .darkAqua,
+        "a self-selected light tab bar survived the chrome pass on a dark window")
+    }
+
+    // Converged: the same pass over an already-correct tab bar writes nothing,
+    // which is what makes it safe on every window update cycle.
+    XCTAssertFalse(
+      WindowChromeRecipe.assertTabBarAppearance(on: leading, for: .ink),
+      "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
+  }
+}
+
+/// Minimal toolbar delegate handing back two view-backed items — the AppKit
+/// shape a SwiftUI `ControlGroup` is bridged into.
+@MainActor
+private final class StubToolbarDelegate: NSObject, NSToolbarDelegate {
+  static let chipsIdentifier = NSToolbarItem.Identifier("pensieve.test.chips")
+  static let pickerIdentifier = NSToolbarItem.Identifier("pensieve.test.picker")
+
+  private let views: [NSView]
+
+  init(views: [NSView]) {
+    self.views = views
+  }
+
+  func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    [Self.chipsIdentifier, Self.pickerIdentifier]
+  }
+
+  func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    toolbarDefaultItemIdentifiers(toolbar)
+  }
+
+  func toolbar(
+    _ toolbar: NSToolbar,
+    itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+    willBeInsertedIntoToolbar flag: Bool
+  ) -> NSToolbarItem? {
+    let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+    item.view = itemIdentifier == Self.chipsIdentifier ? views[0] : views[1]
+    return item
+  }
 }

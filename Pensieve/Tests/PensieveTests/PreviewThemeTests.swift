@@ -14,80 +14,84 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertFalse(css.contains(".markdown-body"))
   }
 
-  func testPaperSkinIsSerifAndNarrow() {
-    let css = PreviewWebView.skinCSS(for: .paper)
-    XCTAssertTrue(css.contains("vc-skin:paper"))
-    XCTAssertTrue(css.contains("serif"))
-    XCTAssertTrue(css.contains("max-width: 720px"))
-  }
-
-  func testCodeSkinIsMonospace() {
-    let css = PreviewWebView.skinCSS(for: .code)
-    XCTAssertTrue(css.contains("vc-skin:code"))
-    XCTAssertTrue(css.contains("monospace"))
-  }
-
   func testRawSkinStripsChrome() {
     let css = PreviewWebView.skinCSS(for: .raw)
     XCTAssertTrue(css.contains("vc-skin:raw"))
     XCTAssertTrue(css.contains("max-width: none"))
   }
 
-  func testNotionSkinUsesNotionTokens() {
-    let css = PreviewWebView.skinCSS(for: .notion)
-    XCTAssertTrue(css.contains("vc-skin:notion"))
-    // Notion ink + red inline-code accent are the signature tokens.
-    XCTAssertTrue(css.contains("#37352f"))
-    XCTAssertTrue(css.contains("--vc-preview-notion-code"))
+  func testRawSkinIsTruePlaintextWithFlatHeadingsAndUnderlinedLinks() {
+    let raw = PreviewWebView.skinCSS(for: .raw)
+    // Flat headings: body size, no accent colour — just bold.
+    XCTAssertTrue(raw.contains("font-size: 1em"))
+    // Links carry no colour of their own; underline is the only affordance.
+    XCTAssertTrue(raw.contains("text-decoration: underline"))
+
+    // `default` keeps its existing byte-for-byte contract — untouched by this skin.
+    XCTAssertEqual(
+      PreviewWebView.skinCSS(for: .default),
+      "/* vc-skin:default — base appearance, no overlay */")
   }
 
-  func testVistaSkinBandsTables() {
-    let css = PreviewWebView.skinCSS(for: .vista)
-    XCTAssertTrue(css.contains("vc-skin:vista"))
-    XCTAssertTrue(css.contains("Helvetica"))
-    // Banded rows are the VISTA table signature.
-    XCTAssertTrue(css.contains("tbody tr:nth-child(even)"))
-  }
-
-  func testMLASkinIsSerifAndDoubleSpaced() {
-    let css = PreviewWebView.skinCSS(for: .mla)
-    XCTAssertTrue(css.contains("vc-skin:mla"))
+  func testParchmentSkinIsWarmSerifAndNarrow() {
+    let css = PreviewWebView.skinCSS(for: .parchment)
+    XCTAssertTrue(css.contains("vc-skin:parchment"))
     XCTAssertTrue(css.contains("serif"))
-    XCTAssertTrue(css.contains("line-height: 2.0"))
+    XCTAssertTrue(css.contains("Newsreader"))
+    XCTAssertTrue(css.contains("max-width: 680px"))
+    XCTAssertTrue(css.contains("--vc-preview-parchment-bg: #f7f2e4"))
   }
 
-  func testJamstaticSkinIsPoppinsWithLilacAccent() {
-    let css = PreviewWebView.skinCSS(for: .jamstatic)
-    XCTAssertTrue(css.contains("vc-skin:jamstatic"))
-    XCTAssertTrue(css.contains("Poppins"))
-    XCTAssertTrue(css.contains("#b1a3cc"))
+  func testGraphiteSkinIsCoolReportInstrument() {
+    let css = PreviewWebView.skinCSS(for: .graphite)
+    XCTAssertTrue(css.contains("vc-skin:graphite"))
+    XCTAssertTrue(css.contains("Instrument Sans"))
+    XCTAssertTrue(css.contains("#d2d2d2"))
+    XCTAssertTrue(css.contains("JetBrains Mono"))
   }
 
-  func testVercelSkinIsBlueLinkOnNearBlackInk() {
-    let css = PreviewWebView.skinCSS(for: .vercel)
-    XCTAssertTrue(css.contains("vc-skin:vercel"))
-    XCTAssertTrue(css.contains("#171717"))
-    XCTAssertTrue(css.contains("Geist"))
-    XCTAssertTrue(css.contains("font-weight: 700"))
-  }
-
-  func testThemeableSkinIsInterOnSlate() {
-    let css = PreviewWebView.skinCSS(for: .themeable)
-    XCTAssertTrue(css.contains("vc-skin:themeable"))
-    XCTAssertTrue(css.contains("Inter"))
-    XCTAssertTrue(css.contains("#1e293b"))
-  }
-
-  func testGlassSkinIsBackdropBlurred() {
-    let css = PreviewWebView.skinCSS(for: .glass)
-    XCTAssertTrue(css.contains("vc-skin:glass"))
-    XCTAssertTrue(css.contains("backdrop-filter: blur"))
+  func testInkSkinIsSignatureDarkWithFadingHeadingRule() {
+    let css = PreviewWebView.skinCSS(for: .ink)
+    XCTAssertTrue(css.contains("vc-skin:ink"))
+    XCTAssertTrue(css.contains("Literata"))
+    XCTAssertTrue(css.contains("#c6ccd6"))
+    // Signature: the fading silver rule under h2 is an ::after gradient, not a
+    // full border.
+    XCTAssertTrue(css.contains("h2::after"))
     XCTAssertTrue(css.contains("linear-gradient"))
+    XCTAssertTrue(css.contains("--vc-preview-link: #8a7fc8"))
+  }
+
+  func testPorcelainSkinIsClinicalNeutral() {
+    let css = PreviewWebView.skinCSS(for: .porcelain)
+    XCTAssertTrue(css.contains("vc-skin:porcelain"))
+    XCTAssertTrue(css.contains("IBM Plex Sans"))
+    XCTAssertTrue(css.contains("#14181c"))
+    // Patient-card table opens with a thick rule.
+    XCTAssertTrue(css.contains("border-top: 2px solid var(--vc-preview-text) !important"))
+  }
+
+  func testTypewriterSkinIsOneMonoFamilyCentred() {
+    let css = PreviewWebView.skinCSS(for: .typewriter)
+    XCTAssertTrue(css.contains("vc-skin:typewriter"))
+    XCTAssertTrue(css.contains("Spline Sans Mono"))
+    XCTAssertTrue(css.contains("monospace"))
+    XCTAssertTrue(css.contains("text-align: center"))
+  }
+
+  func testFixedPaletteSkinsCarryNoPrefersColorSchemeBlock() {
+    // Single-mode themes set every token unconditionally; the appearance is
+    // pinned on the WebView instead of branching on the system setting.
+    for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter] {
+      XCTAssertFalse(
+        PreviewWebView.skinCSS(for: skin).contains("prefers-color-scheme"),
+        "skin \(skin.rawValue) must not branch on prefers-color-scheme")
+    }
   }
 
   func testEverySkinIsExhaustivelyCovered() {
     // Guards against an enum case being added without a skinCSS branch + marker.
-    for skin in ThemeManager.PreviewTheme.allCases {
+    for skin in PensieveTheme.allCases {
       let css = PreviewWebView.skinCSS(for: skin)
       XCTAssertTrue(
         css.contains("vc-skin:\(skin.rawValue)"),
@@ -95,18 +99,231 @@ final class PreviewThemeTests: XCTestCase {
     }
   }
 
+  /// Asserts a token fact against BOTH halves of the Typewriter pair.
+  ///
+  /// `tokens` resolves a paired skin against the LIVE system setting, so a pin
+  /// written against it states a fact about the machine the suite happens to run
+  /// on. Every value pinned here is currently shared by both halves — which is
+  /// exactly why reading `tokens` looked safe, and exactly why it would have
+  /// gone quietly machine-dependent the day one half moved.
+  private func assertOnBothTypewriterHalves(
+    _ what: String, file: StaticString = #filePath, line: UInt = #line,
+    _ holds: (ThemeTokens) -> Bool
+  ) {
+    for isDark in [true, false] {
+      XCTAssertTrue(
+        holds(PensieveTheme.typewriter.tokens(underDarkSystem: isDark)),
+        "\(what) differs on the \(isDark ? "dark" : "light") half of the typewriter pair",
+        file: file, line: line)
+    }
+  }
+
+  // MARK: - semantic status tokens live in the base block
+
+  func testBaseBlockDefinesSemanticStatusTokensInBothModes() {
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
+
+    // Light defaults in the base :root...
+    XCTAssertTrue(css.contains("--vc-preview-danger: #cf222e"))
+    XCTAssertTrue(css.contains("--vc-preview-warning: #9a6700"))
+    XCTAssertTrue(css.contains("--vc-preview-positive: #1a7f37"))
+    // ...and dark overrides in the base @media block, so `default`/`raw` keep
+    // the tokens without any skin overlay.
+    XCTAssertTrue(css.contains("--vc-preview-danger: #ff7b72"))
+    XCTAssertTrue(css.contains("--vc-preview-warning: #d29922"))
+    XCTAssertTrue(css.contains("--vc-preview-positive: #3fb950"))
+  }
+
+  /// The status bar's dirty "Edited" marker paints from `tokens.warning`; each
+  /// fixed theme mirrors its own `--vc-preview-warning` so the chrome and the
+  /// rendered preview agree, and the adaptive skins keep a system-orange warning
+  /// (the old dirty-dot colour) with the GitHub light base as its CSS fallback.
+  func testWarningStatusTokenMirrorsPreviewWarningPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.warning.css, "#8a6a20")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.warning.css, "#c49a72")
+    XCTAssertEqual(PensieveTheme.ink.tokens.warning.css, "#c8b07a")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.warning.css, "#7a4a12")
+    assertOnBothTypewriterHalves("warning") { $0.warning.css == "#6e6e6e" }
+    XCTAssertEqual(PensieveTheme.default.tokens.warning.css, "#9a6700")
+    // Fixed themes resolve the same hex to their NSColor, so the marker colour
+    // is the parsed token, not a system fallback.
+    XCTAssertEqual(
+      PensieveTheme.ink.tokens.warning.nsColor,
+      ColorSpec.nsColor(fromHex: "#c8b07a"))
+  }
+
+  /// The chrome accent (sidebar selection, toolbar diamond) is byte-parity with
+  /// each theme's preview `--vc-preview-link`; adaptive themes wrap the system
+  /// `linkColor` with the GitHub base as CSS fallback.
+  func testAccentTokenMirrorsPreviewLinkPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.accent.css, "#9a5b28")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.accent.css, "#86b8c4")
+    XCTAssertEqual(PensieveTheme.ink.tokens.accent.css, "#8a7fc8")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.accent.css, "#0f6f6c")
+    assertOnBothTypewriterHalves("accent") { $0.accent.css == "#1c1c1c" }
+    // Adaptive: live linkColor, GitHub base as the CSS fallback.
+    XCTAssertEqual(PensieveTheme.default.tokens.accent.css, "#0969da")
+    XCTAssertEqual(PensieveTheme.default.tokens.accent.nsColor, NSColor.linkColor)
+    XCTAssertEqual(PensieveTheme.raw.tokens.accent.css, "#0969da")
+  }
+
+  /// The toolbar's on-state toggle chips (Rich Markdown, auto reload, scroll
+  /// sync, dictation, autocomplete) fill from `chromeAccent`, not from the
+  /// system accent. Where the link ink is already fill-strength the token
+  /// repeats it verbatim; graphite/ink deepen their pale link, and typewriter
+  /// needs a value of its own because its link ink IS its titlebar backing —
+  /// a step up its own grey ramp, not a hue.
+  func testChromeAccentTokenIsFillStrengthPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.chromeAccent.css, "#9a5b28")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.chromeAccent.css, "#3d6f7d")
+    XCTAssertEqual(PensieveTheme.ink.tokens.chromeAccent.css, "#6a5fae")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.chromeAccent.css, "#0f6f6c")
+    assertOnBothTypewriterHalves("chromeAccent") { $0.chromeAccent.css == "#6e6e6e" }
+
+    // Adaptive skins keep the accent the user picked in System Settings, so
+    // `default`/`raw` are the ONLY skins where the chips may read system blue.
+    for skin in [PensieveTheme.default, .raw] {
+      XCTAssertEqual(skin.tokens.chromeAccent.nsColor, NSColor.controlAccentColor, skin.rawValue)
+    }
+
+    // Fixed skins resolve their own hex — no system fallback leaks in.
+    assertOnBothTypewriterHalves("chromeAccent resolves its own hex") {
+      $0.chromeAccent.nsColor == ColorSpec.nsColor(fromHex: "#6e6e6e")
+    }
+  }
+
+  /// Typewriter is achromatic by design: the mockup that arbitrates this skin
+  /// declares "zero colour", and the whole palette is one grey ramp
+  /// (`#e6e6e6 · #a8a8a8 · #6e6e6e · #1c1c1c · #171717`). The walk reflects over
+  /// EVERY colour token the skin declares rather than a hand-listed subset, so a
+  /// hue smuggled back into any of them — the ribbon red `#a8342a` the chrome
+  /// accent used to carry — fails here instead of shipping.
+  func testTypewriterSkinCarriesNoChromaticToken() {
+    var walked = 0
+    for child in Mirror(reflecting: PensieveTheme.typewriter.tokens).children {
+      // Module-qualified: bare `ColorSpec` collides with the Carbon QuickDraw
+      // struct AppKit drags in, and a cast has no static member to disambiguate.
+      guard let spec = child.value as? Pensieve.ColorSpec else { continue }
+      walked += 1
+      let srgb = spec.nsColor.usingColorSpace(.sRGB) ?? spec.nsColor
+      let name = child.label ?? "<unlabelled>"
+      XCTAssertEqual(
+        srgb.redComponent, srgb.greenComponent, accuracy: 0.001,
+        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+      XCTAssertEqual(
+        srgb.greenComponent, srgb.blueComponent, accuracy: 0.001,
+        "typewriter token \(name) = \(spec.css) carries a hue; the skin is grey-ramp only")
+    }
+    // The reflection actually saw the table — without this the loop would pass
+    // vacuously if `ThemeTokens` ever stopped yielding its specs. A new colour
+    // token has to bump this count, which is the review gate: it must land on
+    // the ramp before it lands in the skin.
+    XCTAssertEqual(walked, 17, "unexpected colour-token count on the typewriter skin")
+  }
+
+  /// The two legibility invariants a filled chip has to satisfy on every fixed
+  /// palette: the glyph riding on the fill stays readable, and the chip itself
+  /// separates from the titlebar backing it sits on (`source`) instead of
+  /// dissolving into it. Both are measured on the colours the chrome pass
+  /// actually paints with — the bezel it sets and the glyph AppKit draws over it
+  /// — so a future change to either is measured, not assumed. This is the guard
+  /// that catches a skin reusing an ink token: the exact failure typewriter's
+  /// `accent == source` would have shipped.
+  func testChromeAccentStaysLegibleAgainstGlyphAndTitlebarBacking() {
+    for skin in [PensieveTheme.parchment, .graphite, .ink, .porcelain, .typewriter] {
+      let fill = WindowChromeRecipe.toolbarChipBezelColor(for: skin)
+      let glyphContrast = Self.contrastRatio(fill, WindowChromeRecipe.toolbarChipGlyphColor)
+      XCTAssertGreaterThanOrEqual(
+        glyphContrast, 4.5,
+        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) cannot carry its glyph "
+          + "(contrast \(String(format: "%.2f", glyphContrast)))")
+
+      let backingContrast = Self.contrastRatio(fill, skin.tokens.source.nsColor)
+      XCTAssertGreaterThanOrEqual(
+        backingContrast, 2.0,
+        "\(skin.rawValue) chip fill \(skin.tokens.chromeAccent.css) dissolves into its titlebar "
+          + "backing \(skin.tokens.source.css) "
+          + "(contrast \(String(format: "%.2f", backingContrast)))")
+    }
+  }
+
+  /// WCAG relative luminance / contrast ratio over sRGB components.
+  private static func contrastRatio(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
+    let first = relativeLuminance(lhs)
+    let second = relativeLuminance(rhs)
+    return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+  }
+
+  private static func relativeLuminance(_ color: NSColor) -> CGFloat {
+    let srgb = color.usingColorSpace(.sRGB) ?? color
+    func linear(_ component: CGFloat) -> CGFloat {
+      component <= 0.03928 ? component / 12.92 : pow((component + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * linear(srgb.redComponent) + 0.7152 * linear(srgb.greenComponent) + 0.0722
+      * linear(srgb.blueComponent)
+  }
+
+  /// The chrome muted colour (section headers, row glyphs) mirrors each theme's
+  /// preview `--vc-preview-muted`; adaptive themes wrap `secondaryLabelColor`.
+  func testMutedTokenMirrorsPreviewMutedPerTheme() {
+    XCTAssertEqual(PensieveTheme.parchment.tokens.muted.css, "#7a7062")
+    XCTAssertEqual(PensieveTheme.graphite.tokens.muted.css, "#848484")
+    XCTAssertEqual(PensieveTheme.ink.tokens.muted.css, "#8590a0")
+    XCTAssertEqual(PensieveTheme.porcelain.tokens.muted.css, "#667079")
+    assertOnBothTypewriterHalves("muted") { $0.muted.css == "#6e6e6e" }
+    XCTAssertEqual(PensieveTheme.default.tokens.muted.css, "#57606a")
+    XCTAssertEqual(PensieveTheme.default.tokens.muted.nsColor, NSColor.secondaryLabelColor)
+  }
+
+  /// Typography tokens map to the families `BundledFonts` registers and the skin
+  /// CSS font-family chains reference. Adaptive themes carry no bundled family.
+  func testTypographyTokensMapToBundledFamiliesPerTheme() {
+    let expected: [PensieveTheme: (preview: String, heading: String, mono: String)] = [
+      .parchment: ("Newsreader", "Newsreader", "Sometype Mono"),
+      .graphite: ("Instrument Sans", "Instrument Sans", "JetBrains Mono"),
+      .ink: ("Literata", "Archivo", "JetBrains Mono"),
+      .porcelain: ("IBM Plex Sans", "IBM Plex Sans", "IBM Plex Mono"),
+      .typewriter: ("Spline Sans Mono", "Spline Sans Mono", "Spline Sans Mono"),
+    ]
+    for (skin, families) in expected {
+      XCTAssertEqual(skin.tokens.previewFamily, families.preview, skin.rawValue)
+      XCTAssertEqual(skin.tokens.previewHeadingFamily, families.heading, skin.rawValue)
+      XCTAssertEqual(skin.tokens.monoFamily, families.mono, skin.rawValue)
+      // Every referenced family is one the bundle actually registers.
+      for family in [families.preview, families.heading, families.mono] {
+        XCTAssertTrue(
+          BundledFonts.expectedResolvableFamilies.contains(family),
+          "\(skin.rawValue) references unbundled family \(family)")
+      }
+    }
+    // Adaptive themes fall back to the system face.
+    for skin in [PensieveTheme.default, .raw] {
+      XCTAssertEqual(skin.tokens.previewFamily, "")
+      XCTAssertEqual(skin.tokens.previewHeadingFamily, "")
+      XCTAssertEqual(skin.tokens.monoFamily, "")
+    }
+  }
+
+  /// An empty family name resolves to the system font of the requested size —
+  /// the deterministic native fallback the adaptive themes rely on.
+  func testEmptyFamilyResolvesToSystemFont() {
+    let resolved = ThemeTokens.font("", 12.5)
+    XCTAssertEqual(resolved.pointSize, 12.5, accuracy: 0.001)
+    XCTAssertEqual(resolved.fontName, NSFont.systemFont(ofSize: 12.5).fontName)
+  }
+
   // MARK: - appearanceCSS threads the skin through
 
   func testAppearanceCSSAppendsSkinOverlay() {
     let base = PreviewWebView.appearanceCSS(fontSize: 14, skin: .default)
-    let paper = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
+    let parchment = PreviewWebView.appearanceCSS(fontSize: 14, skin: .parchment)
 
     // Both carry the shared base tokens...
     XCTAssertTrue(base.contains("--vc-preview-text"))
-    XCTAssertTrue(paper.contains("--vc-preview-text"))
-    // ...but only the paper skin appends its overlay marker.
-    XCTAssertFalse(base.contains("vc-skin:paper"))
-    XCTAssertTrue(paper.contains("vc-skin:paper"))
+    XCTAssertTrue(parchment.contains("--vc-preview-text"))
+    // ...but only the parchment skin appends its overlay marker.
+    XCTAssertFalse(base.contains("vc-skin:parchment"))
+    XCTAssertTrue(parchment.contains("vc-skin:parchment"))
   }
 
   func testAppearanceCSSDefaultsToDefaultSkin() {
@@ -147,8 +364,44 @@ final class PreviewThemeTests: XCTestCase {
     XCTAssertTrue(raw.contains("box-shadow: none !important"))
   }
 
+  /// `[~]` draws as a diamond in a frame (mockups 1a–1e, 2a) from the accent
+  /// token, so every skin gets it from the base block — no per-skin CSS — and the
+  /// native `[ ]`/`[x]` controls are never touched.
+  func testAppearanceCSSDrawsTheInProgressCheckboxAsAnAccentDiamondForEverySkin() {
+    let frameSelector =
+      ".markdown-body .task-list-item-checkbox[data-vc-task-state=\"in-progress\"]"
+
+    for skin in PensieveTheme.allCases {
+      let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: skin)
+
+      let frame = cssRule(selector: frameSelector, containing: "border:", in: css)
+      XCTAssertTrue(
+        frame?.contains("border: 1.5px solid var(--vc-preview-link);") == true,
+        "skin \(skin.rawValue): \(frame ?? "missing")")
+      XCTAssertTrue(
+        frame?.contains("-webkit-appearance: none;") == true,
+        "skin \(skin.rawValue): \(frame ?? "missing")")
+
+      let diamond = cssRule(selector: "\(frameSelector)::after", containing: "transform:", in: css)
+      XCTAssertTrue(
+        diamond?.contains("transform: rotate(45deg);") == true,
+        "skin \(skin.rawValue): \(diamond ?? "missing")")
+      XCTAssertTrue(
+        diamond?.contains("background: var(--vc-preview-link);") == true,
+        "skin \(skin.rawValue): \(diamond ?? "missing")")
+    }
+
+    // The two GFM states keep the native control: on `default` nothing styles
+    // the bare checkbox class beyond placement. (`typewriter` deliberately draws
+    // all three — that is its own signature, not the base contract.)
+    let bare = cssRule(
+      selector: ".markdown-body .task-list-item-checkbox", containing: "appearance: none",
+      in: PreviewWebView.appearanceCSS(fontSize: 14, skin: .default))
+    XCTAssertNil(bare, bare ?? "")
+  }
+
   func testAppearanceCSSDefinesRelativeHeadingScaleIndependentOfFlavor() {
-    for skin in [ThemeManager.PreviewTheme.default, .vercel, .paper] {
+    for skin in [PensieveTheme.default, .ink, .parchment] {
       let css = PreviewWebView.appearanceCSS(fontSize: 16, skin: skin)
 
       XCTAssertTrue(css.contains("line-height: 1.25"), "skin \(skin.rawValue)")
@@ -182,14 +435,14 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   func testAppearanceCSSDefaultsTitlebarOverlapToOpaqueUntilNativeMeasurement() {
-    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .paper)
+    let css = PreviewWebView.appearanceCSS(fontSize: 14, skin: .parchment)
 
     XCTAssertTrue(css.contains("--vc-preview-titlebar-glass-height: 0px"))
     XCTAssertTrue(css.contains("body::before"))
     XCTAssertTrue(css.contains("top: var(--vc-preview-titlebar-glass-height)"))
     XCTAssertTrue(css.contains("background: var(--vc-preview-page-background)"))
-    XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-paper-bg)"))
-    XCTAssertFalse(css.contains("background: var(--vc-preview-paper-bg) !important"))
+    XCTAssertTrue(css.contains("--vc-preview-page-background: var(--vc-preview-parchment-bg)"))
+    XCTAssertFalse(css.contains("background: var(--vc-preview-parchment-bg) !important"))
   }
 
   func testAppearanceCSSPinsPreviewTopContentInsetToWindowChromeRecipe() {
@@ -316,16 +569,12 @@ final class PreviewThemeTests: XCTestCase {
   }
 
   func testOpaqueSkinsRouteBackgroundThroughPageBackdropToken() {
-    let skins: [ThemeManager.PreviewTheme] = [
-      .paper,
-      .code,
-      .notion,
-      .vista,
-      .mla,
-      .jamstatic,
-      .vercel,
-      .themeable,
-      .glass,
+    let skins: [PensieveTheme] = [
+      .parchment,
+      .graphite,
+      .ink,
+      .porcelain,
+      .typewriter,
     ]
 
     for skin in skins {
@@ -345,24 +594,105 @@ final class PreviewThemeTests: XCTestCase {
       markdown: "x", fontSize: 14, theme: .gfm, documentURL: nil)
     XCTAssertEqual(withDefault.skin, .default)
 
-    let withCode = PreviewRenderRequest(
-      markdown: "x", fontSize: 14, theme: .gfm, skin: .code, documentURL: nil)
-    XCTAssertEqual(withCode.skin, .code)
+    let withInk = PreviewRenderRequest(
+      markdown: "x", fontSize: 14, theme: .gfm, skin: .ink, documentURL: nil)
+    XCTAssertEqual(withInk.skin, .ink)
     // Skin participates in equality so a skin change is a distinct request.
-    XCTAssertNotEqual(withDefault, withCode)
+    XCTAssertNotEqual(withDefault, withInk)
   }
 
-  // MARK: - ThemeManager persists the skin
+  // MARK: - PensieveTheme migration + fresh-install default
+
+  func testFreshInstallDefaultsToGraphite() {
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: nil), .graphite)
+  }
+
+  func testKnownRawValuesResolveToThemselves() {
+    for theme in PensieveTheme.allCases {
+      XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: theme.rawValue), theme)
+    }
+  }
+
+  func testLegacyRawValuesMigrateToConsolidationTargets() {
+    let expected: [String: PensieveTheme] = [
+      "paper": .parchment,
+      "mla": .parchment,
+      "code": .graphite,
+      "vista": .porcelain,
+      "notion": .porcelain,
+      "vercel": .porcelain,
+      "themeable": .porcelain,
+      "jamstatic": .porcelain,
+      "glass": .ink,
+      "pergament": .parchment,
+      "klinika": .porcelain,
+      "maszynopis": .typewriter,
+    ]
+    for (raw, target) in expected {
+      XCTAssertEqual(
+        PensieveTheme.resolve(persistedRawValue: raw), target,
+        "legacy skin \(raw) should migrate to \(target.rawValue)")
+    }
+  }
+
+  func testUnknownRawValueFallsBackToDefault() {
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: "nonexistent-skin"), .default)
+    XCTAssertEqual(PensieveTheme.resolve(persistedRawValue: ""), .default)
+  }
+
+  // MARK: - ThemeManager persists + migrates the skin
+
+  func testThemeManagerFreshInstallDefaultsToGraphite() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.fresh")
+    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .graphite)
+  }
 
   func testThemeManagerPersistsSkinSelection() {
     let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.tests")
 
     let manager = ThemeManager(defaults: defaults)
-    XCTAssertEqual(manager.skin, .default)
-    manager.skin = .paper
+    manager.skin = .parchment
 
     let reloaded = ThemeManager(defaults: defaults)
-    XCTAssertEqual(reloaded.skin, .paper)
+    XCTAssertEqual(reloaded.skin, .parchment)
+  }
+
+  func testThemeManagerMigratesLegacyPersistedSkin() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.legacy")
+    defaults.set("glass", forKey: "pensieve.preview.skin")
+
+    XCTAssertEqual(ThemeManager(defaults: defaults).skin, .ink)
+  }
+
+  /// The migration has to reach the store, not just the running instance: a
+  /// resolve-only migration leaves the retired name on disk until the operator
+  /// picks a skin by hand.
+  func testThemeManagerWritesTheMigratedSkinBackToDefaults() {
+    let defaults = makeEphemeralDefaults(prefix: "pensieve.preview.skin.writeback")
+    defaults.set("glass", forKey: "pensieve.preview.skin")
+
+    _ = ThemeManager(defaults: defaults)
+
+    XCTAssertEqual(
+      defaults.string(forKey: "pensieve.preview.skin"), PensieveTheme.ink.rawValue,
+      "the retired name must not survive the migration that replaced it")
+  }
+
+  /// …and nothing else moves: a skin this build still answers to is left exactly
+  /// as the operator stored it, and a fresh install stays unwritten — no key
+  /// means no choice yet, so defaulting to graphite must not look like a pick.
+  func testThemeManagerLeavesANonMigratedSkinKeyAlone() {
+    let current = makeEphemeralDefaults(prefix: "pensieve.preview.skin.nomigration")
+    current.set(PensieveTheme.parchment.rawValue, forKey: "pensieve.preview.skin")
+    _ = ThemeManager(defaults: current)
+    XCTAssertEqual(
+      current.string(forKey: "pensieve.preview.skin"), PensieveTheme.parchment.rawValue)
+
+    let fresh = makeEphemeralDefaults(prefix: "pensieve.preview.skin.freshwriteback")
+    _ = ThemeManager(defaults: fresh)
+    XCTAssertNil(
+      fresh.string(forKey: "pensieve.preview.skin"),
+      "a fresh install has made no choice to persist")
   }
 }
 

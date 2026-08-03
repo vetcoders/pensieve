@@ -141,6 +141,40 @@ sign_code() {
     fi
 }
 
+# bundle_identity_matches() — guards the lanes that REUSE an existing .app.
+# Kept in a sourceable lib so scripts/test-bundle-identity.sh can exercise it
+# without a build (see `make test-scripts`).
+# The source= directive lets `shellcheck -x` follow the lib; the plain hook run
+# has no -x, hence the SC1091 pair (same idiom as the .notary.env source below).
+# shellcheck source=scripts/lib/bundle-identity.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/bundle-identity.sh"
+
+# rpath_strip_absolute()/rpath_assert_clean() — the LC_RPATH hygiene pair. Same
+# sourceable-lib arrangement as above, exercised by scripts/test-rpath-hygiene.sh.
+# shellcheck source=scripts/lib/rpath-hygiene.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/rpath-hygiene.sh"
+
+# Fail the build if anything inside the .app still carries an absolute LC_RPATH.
+# Verification only — it never mutates, so it is safe to call after signing and
+# in the lanes that reuse an already-signed bundle.
+assert_app_rpath_hygiene() {
+    local hint="$1"
+    local target
+    for target in \
+        "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+        "$APP_BUNDLE/Contents/Frameworks/libqube_ffi.dylib"
+    do
+        [[ -f "$target" ]] || continue
+        rpath_assert_clean "$target" || die "$hint"
+    done
+    # The strip is only safe while everything the executable still resolves
+    # through @rpath lives inside the bundle. Check it rather than trust it.
+    rpath_assert_resolvable "$APP_BUNDLE/Contents/MacOS/$APP_NAME" "$APP_BUNDLE/Contents/Frameworks" \
+        || die "$hint"
+}
+
 # ─── Pre-flight ───────────────────────────────────────────────────────────
 log "Pre-flight checks"
 [[ -d "$PKG_DIR" ]] || die "Pensieve/ not found at $PKG_DIR"
@@ -225,7 +259,27 @@ if (( DMG_ONLY )); then
     if ! codesign --verify --strict "$APP_BUNDLE" >/dev/null 2>&1; then
         die "--dmg-only: $APP_BUNDLE signature is invalid — rebuild it before packaging a DMG."
     fi
-    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (skipping build/sign/notarize-app)"
+    # A valid signature proves the bundle was not modified after signing. It is
+    # NOT proof of identity: a perfectly signed .app from an older VERSION/HEAD
+    # verifies clean, and everything downstream here (DMG filename, the stable
+    # Pensieve.dmg download alias, the checksum, the release notes) would then
+    # advertise $BUILD_LABEL while shipping that older app. Compare the identity
+    # stamped into the bundle at build time before reusing it.
+    if ! bundle_identity_matches "$APP_BUNDLE" "$APP_VERSION" "$COMMIT_FULL"; then
+        die "--dmg-only: $APP_BUNDLE was built from a different source than this tree.
+       Packaging it would ship that older app under the label $BUILD_LABEL.
+       Run a full build first: make release-clean (or ./scripts/build-release.sh --clean)."
+    fi
+    # The strip below lives in the build lane, which --dmg-only skips. A bundle
+    # produced by an older script (or by a hand-run swift build) therefore still
+    # carries the builder's absolute rpaths, and re-stripping here is not an
+    # option: install_name_tool would break the signature and the staple. Verify
+    # and refuse instead.
+    assert_app_rpath_hygiene "--dmg-only: $APP_BUNDLE still carries absolute LC_RPATH entries.
+       They cannot be stripped from an already-signed bundle without invalidating
+       its signature and notarization ticket. Rebuild it: make release-clean
+       (or ./scripts/build-release.sh --clean)."
+    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, LC_RPATH clean, skipping build/sign/notarize-app)"
 fi
 
 if (( ! DMG_ONLY )); then
@@ -314,6 +368,31 @@ if [[ -f "$QUBE_DYLIB_SRC" ]]; then
         install_name_tool -change "$QUBE_OLD_REF" "@rpath/libqube_ffi.dylib" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
     fi
     install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+
+    # …and drop the absolute ones the link step left behind. Package.swift passes
+    # `-Xlinker -rpath -Xlinker <packageRoot>/Vendor/qube-ffi/<profile>` so a bare
+    # `swift build` can find the vendored dylib, and the toolchain adds absolute
+    # search paths of its own. Both survive into the shipped binary, and dyld
+    # searches them BEFORE the @executable_path entry appended just above — so on
+    # any machine that happens to have the builder's Vendor path,
+    # @rpath/libqube_ffi.dylib resolves outside the bundle, to a copy the bundle
+    # signature does not cover. They also publish the builder's home directory in
+    # a downloadable artifact. Nothing here needs them: @rpath/libqube_ffi.dylib
+    # is the only @rpath consumer, and every system/Swift dylib is linked by
+    # absolute install name, which dyld resolves without consulting LC_RPATH.
+    #
+    # ORDER MATTERS: install_name_tool invalidates a code signature, so this must
+    # run before every sign_code call below (the dylib's included).
+    log "Stripping absolute LC_RPATH entries"
+    rpath_strip_absolute "$FRAMEWORKS_DIR/libqube_ffi.dylib" \
+        || die "Could not strip absolute LC_RPATH entries from the embedded qube-ffi dylib."
+    rpath_strip_absolute "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+        || die "Could not strip absolute LC_RPATH entries from $APP_NAME."
+    assert_app_rpath_hygiene "Absolute LC_RPATH entries survived the strip — refusing to sign a bundle
+       that can load its dylib from outside itself and leaks the builder's paths.
+       Inspect with: otool -l '$APP_BUNDLE/Contents/MacOS/$APP_NAME' | grep -A2 LC_RPATH"
+    ok "LC_RPATH: loader-relative only"
+
     # Same identity (= same Team ID) as the main executable: the sandbox's
     # library validation refuses dylibs signed by another team.
     sign_code "$FRAMEWORKS_DIR/libqube_ffi.dylib"

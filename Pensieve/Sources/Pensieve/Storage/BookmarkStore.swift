@@ -8,7 +8,21 @@ final class BookmarkStore {
   private let legacyFolderBookmarkKey = "Pensieve.openFolder.bookmark"
   private let rootBookmarksKey = "Pensieve.workspace.rootBookmarks"
   private let fileBookmarksKey = "Pensieve.workspace.fileBookmarks"
-  private var activeAccess: [URL: Bool] = [:]
+
+  /// One live security-scoped grant: the URL access was actually STARTED on
+  /// (start/stop must balance on the same object) and whether the start
+  /// succeeded. Filed under the standardized URL — see `stopAccess(to:)`.
+  private struct ActiveAccess {
+    let exactURL: URL
+    let wasGranted: Bool
+  }
+
+  private var activeAccess: [URL: ActiveAccess] = [:]
+
+  /// How many security-scoped grants this store is still holding. A leaked
+  /// grant has no observable effect until the process exits, so this is the
+  /// only seam a test can measure the balance through.
+  var activeSecurityScopeCount: Int { activeAccess.count }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -38,14 +52,36 @@ final class BookmarkStore {
     activate(url)
   }
 
+  /// Records one ad-hoc file in the persisted working set.
+  ///
+  /// Identity is the RESOLVED PATH, never the bookmark blob. Blob equality is
+  /// what this used to dedupe on, and it does not hold: the bytes minted for a
+  /// file vary with the spelling of the URL and with volume metadata, so
+  /// re-opening the same file could append a second entry pointing at it. The
+  /// operator's working set carried fifteen bookmarks for twelve files — three
+  /// pairs — and every one of those pairs was a duplicate the launch restore
+  /// would have opened twice.
+  ///
+  /// An existing entry is REPLACED where it stands rather than moved to the
+  /// end: the order of this key is the working set's order, and the cap prunes
+  /// from the front of it. Entries a previous build already duplicated collapse
+  /// onto that first position, so a key can heal through an ordinary open
+  /// instead of waiting for the next launch.
   func persistFile(url: URL, into appState: AppState) throws {
     let data = try url.bookmarkData(
       options: [.withSecurityScope],
       includingResourceValuesForKeys: nil,
       relativeTo: nil
     )
+    let targetPath = url.standardizedFileURL.path
     var bookmarks = fileBookmarkData
-    if !bookmarks.contains(data) {
+    let matches = bookmarks.indices.filter { resolvedPath(for: bookmarks[$0]) == targetPath }
+    if let first = matches.first {
+      bookmarks[first] = data
+      for duplicate in matches.dropFirst().reversed() {
+        bookmarks.remove(at: duplicate)
+      }
+    } else {
       bookmarks.append(data)
     }
     defaults.set(bookmarks, forKey: fileBookmarksKey)
@@ -53,51 +89,16 @@ final class BookmarkStore {
     appState.lastError = nil
   }
 
-  /// Drops the persisted file bookmark whose resolved target matches `url`.
-  ///
-  /// A file opened from OUTSIDE the workspace persists a security-scoped
-  /// bookmark (via `persistFile`) so it survives a relaunch. When such a file
-  /// is consciously closed it must STAY closed — leaving the bookmark behind
-  /// lets launch restore resolve it and resurrect the file on every launch.
-  /// Only `fileBookmarksKey` is touched; workspace roots are never affected.
-  ///
-  /// Each stored bookmark is resolved just to compare paths — the list is
-  /// small (`maxOpenFiles`-bounded). Entries that no longer resolve (target
-  /// deleted, stale beyond repair) are pruned in the same pass rather than
-  /// left to fail again on the next restore. Security-scoped access this store
-  /// opened for the removed URL is released.
-  func forgetFile(url: URL) {
-    let targetPath = url.standardizedFileURL.path
-    var survivors: [Data] = []
-    for data in fileBookmarkData {
-      var bookmarkIsStale = false
-      guard
-        let resolved = try? URL(
-          resolvingBookmarkData: data,
-          options: [.withSecurityScope],
-          relativeTo: nil,
-          bookmarkDataIsStale: &bookmarkIsStale
-        )
-      else {
-        // Unresolvable blob: prune it (stale-bookmark hygiene) instead of
-        // carrying a dead entry forward to fail again next restore.
-        continue
-      }
-      if resolved.standardizedFileURL.path == targetPath {
-        // The file being closed. Drop the bookmark and release the scope this
-        // store opened for it, if any.
-        stopAccess(matching: resolved)
-        continue
-      }
-      survivors.append(data)
-    }
-    defaults.set(survivors, forKey: fileBookmarksKey)
-  }
-
   /// Replaces the complete persisted workspace only after every new bookmark has been created.
   /// This preserves the previous relaunch state if one of the requested URLs cannot produce a
   /// security-scoped bookmark; callers can still update their live in-memory workspace and surface
   /// the persistence failure without erasing otherwise valid roots.
+  ///
+  /// This is the one writer that takes a whole list at once, so it is the one
+  /// writer that could put a file in the working set twice by simply being
+  /// handed it twice. Its only caller passes the live Open Files list, which is
+  /// de-duplicated upstream — the guard below is what keeps that a fact about
+  /// this key rather than a fact about today's callers.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
     let roots = try rootURLs.map { url in
       (
@@ -109,16 +110,20 @@ final class BookmarkStore {
         )
       )
     }
-    let files = try fileURLs.map { url in
-      (
-        url.standardizedFileURL,
-        try url.bookmarkData(
-          options: [.withSecurityScope],
-          includingResourceValuesForKeys: nil,
-          relativeTo: nil
+    var seenFilePaths: Set<String> = []
+    let files =
+      try fileURLs
+      .filter { seenFilePaths.insert($0.standardizedFileURL.path).inserted }
+      .map { url in
+        (
+          url.standardizedFileURL,
+          try url.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+          )
         )
-      )
-    }
+      }
 
     stopAllAccess()
     defaults.set(roots.map(\.1), forKey: rootBookmarksKey)
@@ -182,24 +187,61 @@ final class BookmarkStore {
 
     appState.bookmarkData = roots.first
 
-    let rootURLs = restoreURLs(
-      from: roots,
-      expectedKind: .directory,
-      staleHandler: { [weak self] url, appState in
-        try self?.persistRoot(url: url, into: appState)
-      },
-      into: appState
-    )
-    let fileURLs = restoreURLs(
-      from: files,
-      expectedKind: .file,
-      staleHandler: { [weak self] url, appState in
-        try self?.persistFile(url: url, into: appState)
-      },
-      into: appState
-    )
+    let rootURLs = restoreRootURLs(from: roots, into: appState)
+    let fileURLs = restoreFileURLs(from: files)
 
     return RestoredWorkspaceBookmarks(rootURLs: rootURLs, fileURLs: fileURLs)
+  }
+
+  /// Drops ONE file's bookmark, because the user closed that file out of Open
+  /// Files. Without it a close is only ever a close of the WINDOW: the working
+  /// set the next launch restores from still names the file, so it comes back —
+  /// and comes back on every launch after that, since nothing else ever prunes
+  /// this key.
+  ///
+  /// Identity is the RESOLVED path, NOT `Data` equality: the bookmark bytes
+  /// minted for the same file are not stable across path spellings or volume
+  /// metadata moves, so matching blobs would leave the entry the user just
+  /// closed sitting in the key.
+  ///
+  /// "Unresolvable ≠ garbage" holds here and matters more than it does when
+  /// writing: an entry we cannot resolve today (an unplugged volume) is KEPT,
+  /// because failing to identify a bookmark must never be a reason to silently
+  /// forget a file the user did not close.
+  func removeFile(url: URL) {
+    removeFiles(urls: [url])
+  }
+
+  /// Drops SEVERAL files' bookmarks in one pass, because the working-set prune
+  /// evicts a whole tail at once — a launch inheriting a key that accumulated
+  /// past the cap can drop dozens.
+  ///
+  /// One pass rather than one `removeFile` per URL: identity is the resolved
+  /// path, and resolving a bookmark is not free, so the per-file form would
+  /// re-resolve the entire key once per eviction. Same rules as the single form
+  /// in every other respect, including "unresolvable ≠ garbage".
+  func removeFiles(urls: [URL]) {
+    guard !urls.isEmpty else { return }
+    let targets = Set(urls.map(\.standardizedFileURL.path))
+    let remaining = fileBookmarkData.filter { bookmark in
+      guard let path = resolvedPath(for: bookmark) else { return true }
+      return !targets.contains(path)
+    }
+    defaults.set(remaining, forKey: fileBookmarksKey)
+    for url in urls { stopAccess(to: url.standardizedFileURL) }
+  }
+
+  private func resolvedPath(for bookmark: Data) -> String? {
+    var bookmarkIsStale = false
+    guard
+      let url = try? URL(
+        resolvingBookmarkData: bookmark,
+        options: [.withSecurityScope],
+        relativeTo: nil,
+        bookmarkDataIsStale: &bookmarkIsStale
+      )
+    else { return nil }
+    return url.standardizedFileURL.path
   }
 
   func clear(into appState: AppState, error: String? = nil) {
@@ -214,32 +256,41 @@ final class BookmarkStore {
   }
 
   private func activate(_ url: URL) {
-    if activeAccess[url] != nil {
+    let key = url.standardizedFileURL
+    if activeAccess[key] != nil {
       return
     }
 
-    activeAccess[url] = url.startAccessingSecurityScopedResource()
+    activeAccess[key] = ActiveAccess(
+      exactURL: url,
+      wasGranted: url.startAccessingSecurityScopedResource()
+    )
+  }
+
+  /// Releases the security-scoped access this store took for one file.
+  ///
+  /// Keyed by the STANDARDIZED URL, and it has to be: `activate` is called with
+  /// whatever spelling reached it — `persistFile` passes the caller's raw URL,
+  /// and `restoreURLs` passes the bookmark-RESOLVED URL, which for anything
+  /// under `/tmp` or `/var` differs from its standardized form. `removeFile`
+  /// has always stopped with the standardized URL, so a grant taken under a
+  /// non-canonical spelling was never found and leaked until process exit.
+  ///
+  /// The stop itself still goes through the EXACT URL that was activated:
+  /// start/stop must balance on the same object, so canonicalizing the key is
+  /// not licence to canonicalize the call.
+  private func stopAccess(to url: URL) {
+    guard let access = activeAccess.removeValue(forKey: url.standardizedFileURL) else { return }
+    if access.wasGranted {
+      access.exactURL.stopAccessingSecurityScopedResource()
+    }
   }
 
   private func stopAllAccess() {
-    for (url, accessWasGranted) in activeAccess where accessWasGranted {
-      url.stopAccessingSecurityScopedResource()
+    for access in activeAccess.values where access.wasGranted {
+      access.exactURL.stopAccessingSecurityScopedResource()
     }
     activeAccess.removeAll()
-  }
-
-  /// Releases security-scoped access for a single tracked URL, matched by
-  /// standardized path so it finds the entry regardless of whether it was
-  /// activated with the raw or the resolved URL form.
-  private func stopAccess(matching url: URL) {
-    let targetPath = url.standardizedFileURL.path
-    for (key, accessWasGranted) in activeAccess
-    where key.standardizedFileURL.path == targetPath {
-      if accessWasGranted {
-        key.stopAccessingSecurityScopedResource()
-      }
-      activeAccess.removeValue(forKey: key)
-    }
   }
 
   private func isExistingDirectory(_ url: URL) -> Bool {
@@ -262,17 +313,7 @@ final class BookmarkStore {
     defaults.array(forKey: fileBookmarksKey) as? [Data] ?? []
   }
 
-  private enum ExpectedKind {
-    case directory
-    case file
-  }
-
-  private func restoreURLs(
-    from bookmarks: [Data],
-    expectedKind: ExpectedKind,
-    staleHandler: (URL, AppState) throws -> Void,
-    into appState: AppState
-  ) -> [URL] {
+  private func restoreRootURLs(from bookmarks: [Data], into appState: AppState) -> [URL] {
     bookmarks.compactMap { data in
       var bookmarkIsStale = false
       do {
@@ -283,18 +324,14 @@ final class BookmarkStore {
           bookmarkDataIsStale: &bookmarkIsStale
         )
 
-        let exists =
-          expectedKind == .directory
-          ? isExistingDirectory(url)
-          : isExistingFile(url)
-        guard exists else {
+        guard isExistingDirectory(url) else {
           return nil
         }
 
         activate(url)
 
         if bookmarkIsStale {
-          try staleHandler(url, appState)
+          try persistRoot(url: url, into: appState)
         }
 
         return url
@@ -305,6 +342,78 @@ final class BookmarkStore {
         return nil
       }
     }
+  }
+
+  /// Resolves the persisted working set AND writes back what resolution proved
+  /// dead, because two kinds of entry must not survive a launch:
+  ///
+  /// - a DUPLICATE of a file already in the set. Bookmark blobs are not stable
+  ///   identities, so the same file could be recorded twice (see `persistFile`);
+  ///   restoring both asked the app to open one file as two tabs.
+  /// - a ref that now resolves INTO THE TRASH. A trashed file still exists, so
+  ///   the existence check passes and the launch faithfully reopened a document
+  ///   the user threw away. The product rule is that the Trash is dead: a file
+  ///   in it does not exist for Pensieve.
+  ///
+  /// Everything else keeps its bookmark, including entries that fail to resolve
+  /// or point at something missing today — unresolvable is not garbage, and an
+  /// unplugged volume must never cost the user a file. Those are dropped from
+  /// the RESTORED list only, exactly as before.
+  private func restoreFileURLs(from bookmarks: [Data]) -> [URL] {
+    var survivingBookmarks: [Data] = []
+    var restoredURLs: [URL] = []
+    var seenPaths: Set<String> = []
+
+    for data in bookmarks {
+      var bookmarkIsStale = false
+      guard
+        let url = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        )
+      else {
+        survivingBookmarks.append(data)
+        continue
+      }
+
+      let standardizedURL = url.standardizedFileURL
+      guard !Self.isInTrash(standardizedURL) else { continue }
+      guard seenPaths.insert(standardizedURL.path).inserted else { continue }
+      guard isExistingFile(url) else {
+        survivingBookmarks.append(data)
+        continue
+      }
+
+      activate(url)
+      // A stale bookmark is REPLACED here rather than re-persisted through
+      // `persistFile`: appending a refreshed blob while the stale one stays in
+      // the key is how a working set grows a second entry for a file it already
+      // holds.
+      let refreshed =
+        bookmarkIsStale
+        ? (try? url.bookmarkData(
+          options: [.withSecurityScope],
+          includingResourceValuesForKeys: nil,
+          relativeTo: nil))
+        : nil
+      survivingBookmarks.append(refreshed ?? data)
+      restoredURLs.append(url)
+    }
+
+    if survivingBookmarks != bookmarks {
+      defaults.set(survivingBookmarks, forKey: fileBookmarksKey)
+    }
+    return restoredURLs
+  }
+
+  /// Whether `url` lives in a Trash directory — the user's `~/.Trash` or a
+  /// volume's `/.Trashes/<uid>`. Matched on path components rather than against
+  /// one resolved Trash URL because a working set can span volumes, and every
+  /// volume has its own.
+  private static func isInTrash(_ url: URL) -> Bool {
+    url.standardizedFileURL.pathComponents.contains { $0 == ".Trash" || $0 == ".Trashes" }
   }
 }
 

@@ -10,13 +10,14 @@ import Foundation
 /// is a property of ONE launch, so it lives on the launch.
 ///
 /// The four cases are the four ways a window with no document of its own comes
-/// into existence; each one answers the two restore questions below
-/// differently.
+/// into existence; each one answers the restore question below.
 ///
-/// Crash-recovery drafts are deliberately NOT one of those questions any more:
-/// no intent adopts a draft. W2-D moved recovery to the launcher's explicit
-/// "Recovered Drafts" section, so a draft is only ever opened because the user
-/// pointed at it.
+/// Two things are deliberately NOT questions here. Picking a document is not:
+/// restoration re-selects only what a window already showed and never chooses
+/// one for the user, on any intent (`selectRestoredDocument`). Claiming a
+/// crash-recovery draft is not either: no intent adopts a draft. W2-D moved
+/// recovery to the launcher's explicit "Recovered Drafts" section, so a draft is
+/// only ever opened because the user pointed at it.
 enum LaunchIntent: Equatable, Sendable {
   /// The process just started with no explicit document — the only intent that
   /// brings the previous session back in full.
@@ -42,20 +43,6 @@ enum LaunchIntent: Equatable, Sendable {
     switch self {
     case .coldLaunch, .dockReopen, .newUntitledTab: return true
     case .explicitDocument: return false
-    }
-  }
-
-  /// Whether restoration may pick a document on its own when the window has no
-  /// selection of its own.
-  ///
-  /// This is the switch that ends restoration-absorption: only a genuine cold
-  /// launch auto-selects. A launcher reborn mid-session used to run the same
-  /// auto-select and pull in `documents.first` — which is not even the document
-  /// the user just closed — so `Close` on the last document looked like a no-op.
-  var selectsRestoredDocument: Bool {
-    switch self {
-    case .coldLaunch: return true
-    case .dockReopen, .newUntitledTab, .explicitDocument: return false
     }
   }
 }

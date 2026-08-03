@@ -101,6 +101,11 @@ test:  ## Run unit + integration tests
 		exit $$status; \
 	}
 
+.PHONY: test-scripts
+test-scripts:  ## Shell-side unit tests (release script guards)
+	@$(SCRIPTS)/test-bundle-identity.sh
+	@$(SCRIPTS)/test-rpath-hygiene.sh
+
 .PHONY: ui-smoke
 ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
 	@$(SCRIPTS)/ui-smoke.sh "$(APP_BUNDLE)"
@@ -140,7 +145,7 @@ semgrep:  ## Security scan with reviewed, repository-owned finding policy
 	@$(SCRIPTS)/semgrep-with-policy.sh
 
 .PHONY: gates
-gates: test lint semgrep  ## Run all quality gates (test + lint + security)
+gates: test test-scripts lint semgrep  ## Run all quality gates (test + shell tests + lint + security)
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) all gates passed\n"
 
 .PHONY: init-hooks

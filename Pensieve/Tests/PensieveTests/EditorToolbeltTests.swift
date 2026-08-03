@@ -40,7 +40,7 @@ final class EditorToolbeltTests: XCTestCase {
   func testSkinAxisAutoPopulates() {
     // The menu renders one row per case — every skin needs a display name
     // and a symbol, and the ids the picker tags on must stay unique.
-    let skins = ThemeManager.PreviewTheme.allCases
+    let skins = PensieveTheme.allCases
     XCTAssertFalse(skins.isEmpty)
     XCTAssertEqual(Set(skins.map(\.id)).count, skins.count)
     for skin in skins {
@@ -97,6 +97,68 @@ final class EditorToolbeltTests: XCTestCase {
     XCTAssertEqual(
       MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier),
       expectedToolbarIdentifiers)
+  }
+
+  // MARK: - Titlebar breadcrumb subtitle (5.2)
+
+  func testBreadcrumbIsWorkspaceRootedWhenFileLivesUnderARoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/10_projects/vetcoders/reports/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]),
+      "proj › 10_projects › vetcoders › reports")
+  }
+
+  func testBreadcrumbForFileDirectlyInRootIsJustTheRoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]), "proj")
+  }
+
+  func testBreadcrumbOutsideWorkspaceUsesLastFewParentComponents() {
+    let file = URL(fileURLWithPath: "/a/b/c/d/e/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: []), "c › d › e")
+  }
+
+  func testBreadcrumbIsEmptyWithoutAnActiveDocument() {
+    XCTAssertEqual(EditorToolbelt.breadcrumbSubtitle(for: nil, workspaceRoots: []), "")
+  }
+
+  /// Roots can nest — `mergedRoots` dedupes on the exact path only, so opening
+  /// `/w` and then `/w/proj` leaves BOTH in the list. `first(where:)` then let
+  /// insertion order pick the crumb: the same document read `proj › a` or
+  /// `w › proj › a` purely by which folder the operator happened to open first.
+  /// The innermost containing root is the one the file actually lives in, so
+  /// the answer must be identical in either order.
+  func testBreadcrumbUsesTheInnermostRootRegardlessOfInsertionOrder() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let inner = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, inner]),
+      "proj › a",
+      "the parent root was added first and won — the crumb depends on open order, not on"
+        + " where the document lives")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [inner, outer]),
+      "proj › a")
+  }
+
+  /// CONTROL LEG. Preferring the longest match must not start claiming files
+  /// that merely SHARE A PREFIX with a root: `/w/projector` is not inside
+  /// `/w/proj`, and a document under it belongs to the root that does contain
+  /// it.
+  func testALongerRootThatOnlySharesAPrefixDoesNotClaimTheDocument() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let sibling = WorkspaceRoot(id: URL(fileURLWithPath: "/w/projector-notes"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, sibling]),
+      "w › proj › a")
   }
 
   // MARK: - Titlebar order contract
@@ -433,14 +495,18 @@ final class FormattingAccessoryChromeTruthTests: XCTestCase {
   }
 }
 
-/// Regression for the dangling-undo-target SIGSEGV (crash report Pensieve
-/// 2026-07-19-060545): the text view registers undo actions targeting `self`
-/// into the WINDOW's undo manager, which outlives the view. When SwiftUI rebuilds
-/// the editor representable, the freed view is still referenced by those entries
-/// (NSUndoManager holds targets unsafe-unretained), so the first Cmd+Z afterwards
-/// drives `undoNestedGroup → popAndInvoke → objc_msgSend` onto a dangling pointer.
-/// Detaching the view from its window must scrub every entry targeting it from the
-/// outgoing window's undo manager.
+/// Regression for the dangling-undo-target SIGSEGV (crash reports Pensieve
+/// 2026-07-19-060545 and build 528): the editor registers undo actions into the
+/// WINDOW's undo manager, which outlives it. When SwiftUI rebuilds the editor
+/// representable — a live skin switch does exactly that — the freed objects are still
+/// referenced by those entries (NSUndoManager holds targets unsafe-unretained), so the
+/// first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke → objc_msgSend` onto a
+/// dangling pointer.
+///
+/// Two distinct targets are involved, and only the first was covered originally:
+/// `registerSmartPasteUndo` targets the text VIEW, while AppKit's typing undo targets
+/// the text STORAGE (`-[NSTextStorage _undoRedoTextOperation:]`, the selector in `x1` of
+/// the build-528 report). Detaching must scrub both.
 @MainActor
 final class MarkdownTextViewUndoDetachTests: XCTestCase {
   func testDetachingFromWindowClearsUndoActionsTargetingTextView() throws {
@@ -489,5 +555,145 @@ final class MarkdownTextViewUndoDetachTests: XCTestCase {
       windowUndoManager.canUndo,
       "detaching the text view must clear its entries from the window's undo manager, "
         + "or the freed view is left as a dangling undo target (SIGSEGV on next Cmd+Z)")
+  }
+
+  /// PIN (a) — the build-528 surface. Types through the REAL AppKit path so the entries
+  /// are the ones `allowsUndo` registers, not a hand-rolled stand-in, then proves the
+  /// outgoing window's manager keeps nothing targeting the dying editor. Fails on the
+  /// pre-fix guard, which scrubbed only the view.
+  func testDetachingFromWindowClearsAppKitTypingUndoEntries() throws {
+    let (surface, window) = Self.makeHostedSurface()
+    defer { window.close() }
+    let windowUndoManager = try XCTUnwrap(window.undoManager)
+
+    Self.typeThroughAppKit("dangling", into: surface.textView, manager: windowUndoManager)
+    XCTAssertTrue(
+      windowUndoManager.canUndo, "precondition: AppKit typing must have registered an entry")
+    XCTAssertEqual(
+      windowUndoManager.undoActionName, "Typing",
+      "precondition: the entry must be AppKit's own typing undo, not a stand-in")
+
+    // AppKit's typing undo targets the STORAGE, so a view-only scrub is not enough —
+    // this is exactly the gap that let build 528 crash.
+    windowUndoManager.removeAllActions(withTarget: surface.textView)
+    XCTAssertTrue(
+      windowUndoManager.canUndo,
+      "typing undo does not target the text view — if this ever flips, the storage scrub "
+        + "below is no longer load-bearing and this suite must be re-derived")
+
+    surface.scrollView.removeFromSuperview()
+    XCTAssertNil(surface.textView.window)
+    XCTAssertFalse(
+      windowUndoManager.canUndo,
+      "detach must clear the typing-undo entries targeting the editor's text storage")
+    XCTAssertFalse(windowUndoManager.canRedo)
+  }
+
+  /// PIN (a), close-path symmetry. `DocumentWindow.close()` — Cmd+W, the tab ×, the red
+  /// button and the quit sweep alike — tears the editor down by nilling the window's
+  /// `contentView` rather than by `removeFromSuperview`. Same guard must fire.
+  func testClearingWindowContentViewClearsAppKitTypingUndoEntries() throws {
+    let (surface, window) = Self.makeHostedSurface()
+    defer { window.close() }
+    let windowUndoManager = try XCTUnwrap(window.undoManager)
+
+    Self.typeThroughAppKit("closing", into: surface.textView, manager: windowUndoManager)
+    XCTAssertTrue(windowUndoManager.canUndo, "precondition: an entry must be live before close")
+
+    window.contentView = nil
+    XCTAssertNil(surface.textView.window, "nilling contentView must detach the editor subtree")
+    XCTAssertFalse(
+      windowUndoManager.canUndo,
+      "the contentView teardown path must scrub the editor's undo entries too")
+  }
+
+  /// PIN (b) — Cmd+Z after the tab is gone is a safe no-op, not a crash. The editor is
+  /// dropped for real (weak reference proves it), then the window's undo manager is
+  /// driven exactly the way the Cmd+Z menu item drives it.
+  func testUndoAfterEditorTeardownIsASafeNoOp() throws {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    let windowUndoManager = try XCTUnwrap(window.undoManager)
+
+    weak var deadStorage: NSTextStorage?
+    weak var deadTextView: MarkdownTextView?
+    autoreleasepool {
+      let surface = MarkdownEditorSurface(text: "", fontSize: 14)
+      window.contentView = surface.scrollView
+      surface.scrollView.frame = window.contentView?.bounds ?? .zero
+      surface.scrollView.layoutSubtreeIfNeeded()
+      Self.typeThroughAppKit("gone", into: surface.textView, manager: windowUndoManager)
+      XCTAssertTrue(
+        windowUndoManager.canUndo, "precondition: an entry must be live before teardown")
+      deadStorage = surface.textStorage
+      deadTextView = surface.textView
+      window.contentView = nil
+    }
+    // AppKit hands the detached subtree to the enclosing autorelease pool and finishes its
+    // own teardown on the next run-loop turn, so the objects are not gone the instant the
+    // strong references drop. Spin until they are (bounded), so the pin below is exercised
+    // against a genuinely freed editor rather than a live one.
+    Self.drainUntilDeallocated { deadStorage == nil && deadTextView == nil }
+
+    XCTAssertNil(deadStorage, "the editor's text storage must really be gone for this pin to bite")
+    XCTAssertNil(deadTextView, "the editor's text view must really be gone for this pin to bite")
+
+    XCTAssertFalse(
+      windowUndoManager.canUndo,
+      "a freed editor must leave no undoable action behind — Cmd+Z would msgSend a dangling "
+        + "target (SIGSEGV, build 528)")
+    XCTAssertFalse(windowUndoManager.canRedo)
+
+    // Only drive the real Cmd+Z path once the stack is proven clean: on a regressed build
+    // the assertion above fails first, so the suite reports a failure instead of taking the
+    // whole runner down with a use-after-free.
+    guard !windowUndoManager.canUndo else { return }
+    windowUndoManager.undo()
+    XCTAssertFalse(windowUndoManager.canUndo)
+    XCTAssertFalse(windowUndoManager.canRedo)
+  }
+
+  private static func drainUntilDeallocated(
+    timeout: TimeInterval = 2, _ isDone: () -> Bool
+  ) {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !isDone(), Date() < deadline {
+      autoreleasepool {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+      }
+    }
+  }
+
+  private static func makeHostedSurface() -> (MarkdownEditorSurface, NSWindow) {
+    let surface = MarkdownEditorSurface(text: "", fontSize: 14)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = surface.scrollView
+    surface.scrollView.frame = window.contentView?.bounds ?? .zero
+    surface.scrollView.layoutSubtreeIfNeeded()
+    return (surface, window)
+  }
+
+  /// Types through `insertText(_:replacementRange:)` — the same entry point a keystroke
+  /// takes — inside an explicitly closed group. `removeAllActions(withTarget:)` only
+  /// scrubs entries whose group is closed, and AppKit's default `groupsByEvent` closes
+  /// groups on run-loop turns this test does not spin; real teardown always happens on a
+  /// later event with the group already closed, which is the state reproduced here.
+  private static func typeThroughAppKit(
+    _ text: String, into textView: MarkdownTextView, manager: UndoManager
+  ) {
+    manager.groupsByEvent = false
+    manager.beginUndoGrouping()
+    textView.insertText(text, replacementRange: NSRange(location: 0, length: 0))
+    manager.endUndoGrouping()
   }
 }

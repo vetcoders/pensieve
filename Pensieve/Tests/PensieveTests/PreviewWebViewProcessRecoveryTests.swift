@@ -8,14 +8,16 @@ import XCTest
 /// newest document — and a stale failure must never overwrite a newer page.
 final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
-  private func makeDocument(body: String = "<p>hello</p>", refreshToken: Int = 0)
+  private func makeDocument(
+    body: String = "<p>hello</p>", styleHTML: String = "", refreshToken: Int = 0
+  )
     -> PreviewDocument
   {
     PreviewDocument(
       html: "<html><body><article class=\"markdown-body\">\(body)</article></body></html>",
       baseURL: nil,
       bodyHTML: body,
-      styleHTML: "",
+      styleHTML: styleHTML,
       mermaidJavaScript: nil,
       katexJavaScript: nil,
       katexCSS: nil,
@@ -85,6 +87,57 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
     view.handleUpdateScriptResult(false, error: nil, for: newer)
     XCTAssertEqual(fullLoads.count, 3, "an on-screen failed update must fall back to a full load")
     XCTAssertEqual(fullLoads.last, newer)
+  }
+
+  /// The composed stylesheet carries the skin's inlined `@font-face` payload —
+  /// hundreds of kilobytes of base64 for a bundled-font theme. A same-identity
+  /// edit whose stylesheet is byte-identical must not re-escape and re-marshal
+  /// that blob across the JS bridge; a genuinely new stylesheet (skin switch)
+  /// still must.
+  @MainActor
+  func testUnchangedStylesheetIsNotReshippedOnEveryInPlaceUpdate() {
+    let view = PreviewWebView(frame: .zero)
+    var scripts: [String] = []
+    view.inPlaceUpdateObserver = { scripts.append($0) }
+
+    // Full page load: the HTML embeds the stylesheet, so the page has it already.
+    view.load(document: makeDocument(body: "<p>v1</p>", styleHTML: "article { color: red; }"))
+    XCTAssertTrue(scripts.isEmpty, "the first load is a full page load, not an in-place update")
+
+    view.load(document: makeDocument(body: "<p>v2</p>", styleHTML: "article { color: red; }"))
+    XCTAssertEqual(scripts.count, 1)
+    XCTAssertTrue(scripts[0].contains("v2"), "the body still updates")
+    XCTAssertFalse(
+      scripts[0].contains("vc-preview-style"),
+      "an unchanged stylesheet must not cross the bridge again")
+    XCTAssertFalse(scripts[0].contains("color: red"), scripts[0])
+
+    view.load(document: makeDocument(body: "<p>v3</p>", styleHTML: "article { color: blue; }"))
+    XCTAssertEqual(scripts.count, 2)
+    XCTAssertTrue(
+      scripts[1].contains("vc-preview-style"),
+      "a changed stylesheet (skin switch) must still be shipped")
+    XCTAssertTrue(scripts[1].contains("color: blue"), scripts[1])
+  }
+
+  /// A full page load re-embeds the stylesheet inline, so the bookkeeping must
+  /// follow it — otherwise the recovered page and this side disagree and the next
+  /// edit re-ships a stylesheet the page already has (or, worse, the reverse).
+  @MainActor
+  func testStylesheetBookkeepingFollowsAFullReload() {
+    let view = PreviewWebView(frame: .zero)
+    var scripts: [String] = []
+    view.inPlaceUpdateObserver = { scripts.append($0) }
+
+    let style = "article { color: red; }"
+    view.load(document: makeDocument(body: "<p>v1</p>", styleHTML: style))
+    view.handleWebContentProcessTermination()
+
+    view.load(document: makeDocument(body: "<p>v2</p>", styleHTML: style))
+    XCTAssertEqual(scripts.count, 1)
+    XCTAssertFalse(
+      scripts[0].contains("vc-preview-style"),
+      "the reloaded page already carries this stylesheet inline")
   }
 
   @MainActor
