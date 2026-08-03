@@ -622,6 +622,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textContentStorage.onCharactersEdited = { [weak self] location, _ in
       self?.invalidateLineAnchor(editedAt: location)
     }
+    // The gutter no longer counts its row numbers off the enumeration (which is
+    // what forced every repaint to lay out the whole document); it starts at the
+    // first VISIBLE fragment and asks what number that row carries. Answering
+    // from the anchored resolver keeps a scroll paying for the span it moved
+    // across. The anchor is shared with the caret, so a viewport far away from
+    // the caret makes the two queries alternate over the gap — that costs at
+    // worst one layout-free scan, which is what an unshared gutter would pay on
+    // EVERY draw, and typing (caret on screen) keeps both queries adjacent.
+    textView.gutter?.lineNumberForUTF16Offset = { [weak self] offset in
+      (self?.lineIndex(forUTF16Offset: offset) ?? 0) + 1
+    }
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
     applyTheme(skin)

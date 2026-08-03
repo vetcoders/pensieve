@@ -38,6 +38,30 @@ class LineNumberGutter: NSRulerView {
     }
   }
 
+  /// 1-based row number for the row that STARTS at a UTF-16 offset, answered
+  /// without laying anything out.
+  ///
+  /// The gutter used to get its numbering for free from the enumeration itself —
+  /// start at 1 at the document start, +1 per fragment — which is precisely what
+  /// forced every repaint to walk the whole document. Starting at the first
+  /// VISIBLE fragment means the number for that fragment has to come from
+  /// somewhere else, and the one thing it must not come from is layout.
+  ///
+  /// `MarkdownEditorSurface` wires this to its anchored caret→line resolver, so a
+  /// scroll pays for the span it moved across rather than a fresh scan of
+  /// everything above the viewport. Left unset (a gutter built standalone) the
+  /// fallback below scans the text before the offset, which is layout-free but
+  /// linear.
+  var lineNumberForUTF16Offset: ((Int) -> Int)?
+
+  /// Test seam: fires once per layout fragment a draw pass touches, with the row
+  /// number resolved for it and whether that number was painted.
+  ///
+  /// The COUNT is the pin on the viewport contract — it has to track the height
+  /// of the ruler, not the length of the document. The numbers are the pin on the
+  /// contract that this stayed a pure performance change.
+  var onFragmentVisited: ((_ lineNumber: Int, _ painted: Bool) -> Void)?
+
   /// Monospace family the line numbers are drawn in — the theme's own
   /// (`ThemeTokens.monoFamily`), so the gutter cannot read as a different
   /// typeface than the text beside it. Empty (adaptive skins) keeps the system
@@ -132,14 +156,37 @@ class LineNumberGutter: NSRulerView {
       .foregroundColor: gutterCurrentLine,
     ]
 
-    var lineNumber = 1
+    // The band this pass may paint, mapped back into text-container coordinates
+    // — the inverse of the `fragmentRect` construction below.
+    let containerMinY = rect.minY - textContainerInset.height + scrollOffset
+    let containerMaxY = rect.maxY - textContainerInset.height + scrollOffset
 
-    // TextKit 2: iterate over layout fragments
-    let documentRange = textContentManager.documentRange
+    // TextKit 2: iterate over the layout fragments the band actually covers.
+    let documentStart = textContentManager.documentRange.location
+    let firstVisible = firstFragmentLocation(
+      atContainerY: containerMinY, layoutManager: layoutManager, documentStart: documentStart)
+    let firstVisibleOffset = textContentManager.offset(from: documentStart, to: firstVisible)
+    var lineNumber = lineNumber(
+      forUTF16Offset: firstVisibleOffset == NSNotFound ? 0 : firstVisibleOffset, in: textView)
+
     layoutManager.enumerateTextLayoutFragments(
-      from: documentRange.location, options: [.ensuresLayout]
+      from: firstVisible, options: [.ensuresLayout]
     ) { fragment in
       let frame = fragment.layoutFragmentFrame
+
+      // Below the band: every later fragment sits lower still, so nothing beyond
+      // this one can be painted. Stopping HERE is the fix. Running on to the end
+      // of the document — which is what an unconditional `return true` did —
+      // TYPESETS every paragraph below the viewport, because `.ensuresLayout`
+      // lays out whatever it walks over. AppKit posts a full ruler repaint on
+      // every scroll and on every text-view layout pass, and TextKit 2 discards
+      // the layout it is not showing, so that whole-document typesetting ran
+      // again and again: measured at 1.7-2.7 s per repaint on a 200 kB document
+      // with a bundled theme face, and minutes on the operator's own file.
+      guard frame.minY <= containerMaxY else {
+        self.onFragmentVisited?(lineNumber, false)
+        return false
+      }
 
       // fragment rect in text view coordinates
       let fragmentRect = NSRect(
@@ -150,7 +197,8 @@ class LineNumberGutter: NSRulerView {
       )
 
       // Only draw if visible
-      if fragmentRect.maxY >= rect.minY && fragmentRect.minY <= rect.maxY {
+      let painted = fragmentRect.maxY >= rect.minY
+      if painted {
         let isCurrentLine = lineNumber == currentLineNumber
         let attributes = isCurrentLine ? currentLineAttributes : numberAttributes
         let numberString = NSString(string: "\(lineNumber)")
@@ -171,8 +219,44 @@ class LineNumberGutter: NSRulerView {
         }
       }
 
+      self.onFragmentVisited?(lineNumber, painted)
       lineNumber += 1
       return true  // continue enumeration
     }
+  }
+
+  /// Where a draw has to start enumerating so it can paint its band without
+  /// touching anything above it.
+  ///
+  /// `textLayoutFragment(for:)` is the canonical "which fragment is at this
+  /// point": it reads the layout the text view's own viewport controller has
+  /// already produced rather than building more. It answers `nil` only where no
+  /// layout exists at that height at all, and the fallbacks then give up as
+  /// little ground as possible — the viewport controller's own range first, the
+  /// document start (the old behaviour) only when there is no viewport at all,
+  /// which is the top of the document and therefore cheap.
+  private func firstFragmentLocation(
+    atContainerY y: CGFloat,
+    layoutManager: NSTextLayoutManager,
+    documentStart: NSTextLocation
+  ) -> NSTextLocation {
+    guard y > 0 else { return documentStart }
+    if let fragment = layoutManager.textLayoutFragment(for: CGPoint(x: 0, y: y)) {
+      return fragment.rangeInElement.location
+    }
+    return layoutManager.textViewportLayoutController.viewportRange?.location ?? documentStart
+  }
+
+  /// 1-based number of the row starting at `offset`, counted WITHOUT layout.
+  ///
+  /// Rows and paragraph separators are the same thing here: TextKit 2 makes one
+  /// `NSTextLayoutFragment` per paragraph, wrapping included, so a wrapped line
+  /// still carries exactly one gutter number. That equality is pinned against a
+  /// real layout manager in `EditorLineResolverTests`, which is what lets the
+  /// number be read off the string instead of counted off the enumeration.
+  private func lineNumber(forUTF16Offset offset: Int, in textView: NSTextView) -> Int {
+    if let resolve = lineNumberForUTF16Offset { return resolve(offset) }
+    let string = textView.string as NSString
+    return MarkdownEditorSurface.paragraphSeparators(in: string, from: 0, to: offset).count + 1
   }
 }
