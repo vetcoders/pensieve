@@ -240,7 +240,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       mergeWindowIntoTabsBehind: { _, window in probe.backgroundMerges.append(window) },
       orderAndActivateWindow: { probe.activations.append($0) },
       currentMergeTarget: { target },
-      makeDocumentWindow: { [weak probe] _ in
+      makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
         let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
         probe.windows.append(window)
@@ -301,7 +301,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     controller.requestNoteDocumentAlreadyOnScreen = { announced.append($0) }
     controller.requestOpenRestoredDocumentWindows = { bulkRestored.append($0.map(\.id)) }
 
-    controller.start(restoringWorkspace: true)
+    controller.start(intent: .coldLaunch)
 
     XCTAssertEqual(
       appState.documentSession.url?.standardizedFileURL, notes[0],
@@ -368,7 +368,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       currentMergeTarget: { resolvedTarget },
-      makeDocumentWindow: { [weak probe] _ in
+      makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
         let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
         probe.windows.append(window)

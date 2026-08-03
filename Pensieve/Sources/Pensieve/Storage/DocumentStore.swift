@@ -2,6 +2,32 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
+/// What an open/restore flow knew about a window's selection at the moment it
+/// STARTED. Every selection decision at the end of such a flow is made from
+/// this snapshot, never from ambient state — the walk in between runs off the
+/// main actor and the window keeps living while it does.
+@MainActor
+struct WorkspaceSelectionContext {
+  /// The document this window showed when the flow started; restored by name if
+  /// it is still part of the workspace.
+  let previousSelection: DocumentRef.ID?
+  /// The window's conscious-close counter at start. A different value at the
+  /// end means the user closed the document mid-flow.
+  let closeGeneration: Int
+
+  static func capture(from appState: AppState) -> WorkspaceSelectionContext {
+    WorkspaceSelectionContext(
+      previousSelection: appState.selectedDocumentID,
+      closeGeneration: appState.windowModel.documentCloseGeneration)
+  }
+
+  /// False once the user consciously closed this window's document after the
+  /// flow began — restoration must not put it back.
+  func survivesConsciousClose(in appState: AppState) -> Bool {
+    appState.windowModel.documentCloseGeneration == closeGeneration
+  }
+}
+
 @MainActor
 final class FolderManager {
   typealias RecycleItems = ([URL], @escaping @Sendable ([URL: URL], Error?) -> Void) -> Void
@@ -522,6 +548,9 @@ final class FolderManager {
     openResolvedWorkspace(rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
   }
 
+  /// Rebuilds the persisted workspace (roots, tree, sidebar) for a starting
+  /// window. It never picks a document for the user — see
+  /// `selectRestoredDocument`.
   func restoreLastFolderInBackground(into appState: AppState) {
     let restored = bookmarkStore.restoreWorkspace(into: appState)
     DebugTrace.log(
@@ -1311,7 +1340,7 @@ final class FolderManager {
     // the walk below is what decides. `.opening` (subtle) instead of an import claim.
     setOpenActivity(.opening(label), into: appState)
     indexDatabase.open(into: appState)
-    let previousSelection = appState.selectedDocumentID
+    let selection = WorkspaceSelectionContext.capture(from: appState)
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
 
     // ONE tree walk for the whole cold open. Build the sidebar from it, then decide skip vs full.
@@ -1323,7 +1352,7 @@ final class FolderManager {
     if attemptColdStartValidSkip(
       scans: scans, rootURLs: rootURLs, exclusions: scanExclusions, into: appState)
     {
-      selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      selectRestoredDocument(selection, into: appState)
       startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       setOpenActivity(nil, into: appState)
       return
@@ -1344,7 +1373,7 @@ final class FolderManager {
       cachedScans: scans,
       into: appState
     )
-    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    selectRestoredDocument(selection, into: appState)
     startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
     setOpenActivity(nil, into: appState)
   }
@@ -1525,13 +1554,13 @@ final class FolderManager {
     // Preserve the existing/cached tree while ONE detached validation job walks + fingerprints.
     // No substrate validation, scanner build, fingerprint, or signature fallback runs before this
     // method returns to the main actor.
-    let previousSelection = appState.selectedDocumentID
+    let selection = WorkspaceSelectionContext.capture(from: appState)
     prepareWorkspaceShell(rootURLs: rootURLs, fileURLs: fileURLs, into: appState)
     let restoredPresentationCache =
       !isHotReopen
       && restoreCachedWorkspace(
         rootURLs: rootURLs,
-        previousSelection: previousSelection,
+        selection: selection,
         into: appState
       )
     let hasStalePresentation = isHotReopen || restoredPresentationCache
@@ -1551,7 +1580,7 @@ final class FolderManager {
     let scanExclusions = appState.excludedWorkspacePaths
     guard !roots.isEmpty else {
       applyWorkspaceScans([], into: appState)
-      selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      selectRestoredDocument(selection, into: appState)
       setOpenActivity(nil, into: appState)
       return
     }
@@ -1637,7 +1666,7 @@ final class FolderManager {
         self.setOpenActivity(.cacheHit(label), into: appState)
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
-        self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        self.selectRestoredDocument(selection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         return
       }
@@ -1666,7 +1695,7 @@ final class FolderManager {
         self.lastWorkspaceSignature = validation.searchSignature
         appState.lastError = nil
         DebugTrace.log("coldStartValidSkip taken roots=\(roots.count)")
-        self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+        self.selectRestoredDocument(selection, into: appState)
         self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
         return
       }
@@ -1692,7 +1721,7 @@ final class FolderManager {
         workspaceIndexWriteTask = nil
       }
       self.workspaceIndexWriteTask = workspaceIndexWriteTask
-      self.selectRestoredDocument(previousSelection: previousSelection, into: appState)
+      self.selectRestoredDocument(selection, into: appState)
       self.startWatching(urls: appState.workspaceRoots.map(\.url), appState: appState)
       await workspaceIndexWriteTask?.value
       guard !Task.isCancelled, generation == self.openFlowGeneration else { return }
@@ -1824,7 +1853,7 @@ final class FolderManager {
   /// again before use. Fresh scans always replace this state later in the same open flow.
   private func restoreCachedWorkspace(
     rootURLs: [URL],
-    previousSelection: DocumentRef.ID?,
+    selection: WorkspaceSelectionContext,
     into appState: AppState
   ) -> Bool {
     guard !rootURLs.isEmpty else { return false }
@@ -1842,7 +1871,7 @@ final class FolderManager {
 
     applyWorkspaceScans(scans, into: appState)
     lastWorkspaceSignature = cacheStore.readSearchSignature(for: identity)
-    selectRestoredDocument(previousSelection: previousSelection, into: appState)
+    selectRestoredDocument(selection, into: appState)
     DebugTrace.log(
       "presentation cache restored roots=\(rootURLs.count) documents=\(appState.documents.count)")
     return true
@@ -2215,8 +2244,10 @@ final class FolderManager {
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
   }
 
-  /// Re-selects the document this window was already on after the workspace
-  /// collection is rebuilt — and NOTHING else.
+  /// Decides what an open/restore flow puts on screen once its walk lands,
+  /// using only what the flow knew when it STARTED (`selection`).
+  ///
+  /// Re-selects the document this window was already on — and NOTHING else.
   ///
   /// It used to fall back to `documents.first` when there was no previous
   /// selection, which on a launch is always. That is how a file the operator had
@@ -2231,8 +2262,22 @@ final class FolderManager {
   /// through the store that actually records it — the file bookmarks behind Open
   /// Files — and a launch with none shows the launcher, which is what "nothing
   /// was open" looks like.
-  private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
+  ///
+  /// Two further guards protect a session the user is responsible for: a dirty
+  /// buffer always wins, and a conscious `Close` that happened while this flow
+  /// was in flight wins too. The second one closes the race the old code had no
+  /// answer for — the validation tail of a workspace opened seconds earlier
+  /// would happily re-select the previous document into a window the user had
+  /// just emptied, making ⌘W look like it did nothing.
+  private func selectRestoredDocument(
+    _ selection: WorkspaceSelectionContext,
+    into appState: AppState
+  ) {
     guard !appState.documentSession.isDirty else { return }
+    guard selection.survivesConsciousClose(in: appState) else {
+      DebugTrace.log("selectRestoredDocument skipped: document closed while the open flow ran")
+      return
+    }
 
     let documents = appState.allDocuments
     if let currentSelection = appState.selectedDocumentID,
@@ -2241,7 +2286,7 @@ final class FolderManager {
       return
     }
 
-    if let previousSelection,
+    if let previousSelection = selection.previousSelection,
       let ref = documents.first(where: { $0.id == previousSelection })
     {
       DocumentStore.shared.select(ref: ref, into: appState)
@@ -2952,20 +2997,15 @@ private struct WorkspaceDirectoryEntry: Sendable {
 
 @MainActor
 final class DocumentStore {
-  enum DirtyUntitledResponse {
-    case save
-    case discard
-    case cancel
-  }
-
   static let shared = DocumentStore(recoveryStore: .shared)
   private let autosaver: Autosaver
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
   private let recoveryStore: RecoveryStore
+  private let savingSettings: DocumentSavingSettings
   private let writeDocument: (String, URL) throws -> Void
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
-  private let dirtyUntitledPrompt: @MainActor (DocumentSession) -> DirtyUntitledResponse
+  private let dirtySessionPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
   private var selfWriteObserver: @MainActor (URL) -> Void
   private weak var appState: AppState?
@@ -2975,14 +3015,16 @@ final class DocumentStore {
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
     recoveryStore: RecoveryStore,
+    savingSettings: DocumentSavingSettings? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
-    dirtyUntitledPrompt: (@MainActor (DocumentSession) -> DirtyUntitledResponse)? = nil,
+    dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
     selfWriteObserver: (@MainActor (URL) -> Void)? = nil
   ) {
     let resolvedIndexDatabase = indexDatabase ?? .shared
     self.autosaver = autosaver ?? .shared
+    self.savingSettings = savingSettings ?? .shared
     self.indexDatabase = resolvedIndexDatabase
     self.bookmarkStore = bookmarkStore ?? .shared
     self.recoveryStore = recoveryStore
@@ -3007,7 +3049,7 @@ final class DocumentStore {
             document: ref, body: body, appState: appState)
         }
       }
-    self.dirtyUntitledPrompt = dirtyUntitledPrompt ?? Self.promptForDirtyUntitledSession
+    self.dirtySessionPrompt = dirtySessionPrompt ?? Self.promptForDirtySession
     self.savePanelURLProvider = savePanelURLProvider ?? Self.promptForSaveURL
     self.selfWriteObserver = selfWriteObserver ?? { _ in }
   }
@@ -3016,16 +3058,22 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
-  /// The user closed this file OUT of Open Files — the list itself, not just a
-  /// window onto it. Retires it from the WORKING SET a relaunch restores from.
+  /// The user closed this DOCUMENT — retires it from the WORKING SET a relaunch
+  /// restores from, not just from the window that was showing it.
   ///
-  /// Closing a document window is deliberately NOT this: a window is a view of
-  /// a file, and quitting with files open has to bring them back. Open Files is
-  /// the file list, so removing a row from it is the user saying "stop carrying
-  /// this one". Those two intents were previously served by the same code path,
-  /// which is why the second one did nothing that outlived the process: the row
-  /// disappeared with the window, and the next launch read a working set nobody
-  /// had told.
+  /// CONTRACT REVERSAL, operator decision 2026-08-03. Until now closing a
+  /// document deliberately did NOT come here: "a window is a view of a file",
+  /// so ⌘W and a tab's "×" left the row in place and the next launch brought
+  /// the file back; only "Close from Open Files" retired it. The operator's
+  /// call is the opposite one — closing a single document explicitly (⌘W /
+  /// File ▸ Close, a tab's "×", "Close from Open Files") takes the file out of
+  /// the session for good.
+  ///
+  /// What still does NOT retire, and must not: closing a whole WINDOW, which
+  /// takes every tab in it down at once, and every termination teardown — quit,
+  /// logout, crash. Those are the paths the next launch is supposed to restore
+  /// from; reading them as "the user closed all of these" would quietly empty
+  /// the working set behind the user's back.
   ///
   /// Two stores hold that answer and both have to hear it, or whichever one is
   /// missed reseeds the other on the next launch: the in-memory `openFiles`
@@ -3037,10 +3085,43 @@ final class DocumentStore {
     bookmarkStore.removeFile(url: standardizedURL)
   }
 
+  // MARK: - Recovered drafts
+
+  /// Every unhandled crash draft, newest first. The launcher's Recovered Drafts
+  /// section is the ONLY route from here into a window — nothing adopts a draft
+  /// on its own any more.
+  ///
+  /// A draft another window is already editing is not "unhandled": it is live
+  /// work with a window on it, so it drops off every other launcher surface.
+  func recoveredDrafts() -> [RecoveryDraft] {
+    recoveryStore.unclaimedDrafts()
+  }
+
+  /// Launch sweep for the recovery directory (age + count retention).
   @discardableResult
-  func restoreRecoveredDraft(into appState: AppState) -> Bool {
+  func pruneRecoveredDrafts(now: Date = Date()) -> [UUID] {
+    recoveryStore.pruneDrafts(now: now)
+  }
+
+  /// Adopts `draft` into an EMPTY window as the untitled document it was.
+  ///
+  /// The draft file stays on disk: it is retired only by a successful save or
+  /// an explicit discard, so a window closed again without deciding leaves the
+  /// draft exactly where the user can find it. Refuses a window that already
+  /// holds a buffer — the section that offers this is only shown in an empty
+  /// one, and silently replacing a document would be the very hijack W2-D
+  /// removes.
+  ///
+  /// Refuses a draft ANOTHER window already adopted too. `recoveredDrafts()`
+  /// stops offering a claimed draft, but a launcher rendered before the claim
+  /// still holds the stale row: adopting it would put two buffers on one
+  /// recovery ID, autosaving over each other, with a Save As… in one undone by
+  /// the other's next autosave recreating the file. Refusing is a no-op — the
+  /// caller refreshes and the stale row disappears.
+  @discardableResult
+  func openRecoveredDraft(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
-    guard let draft = recoveryStore.claimDraftForRestore() else { return false }
+    guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
 
     self.appState = appState
     cancelOwnDebouncesOnSessionChange(appState: appState)
@@ -3050,8 +3131,48 @@ final class DocumentStore {
       text: draft.text,
       recoveryID: draft.id
     )
+    recoveryStore.markDraftOpen(id: draft.id)
     appState.lastError = nil
     return true
+  }
+
+  /// Writes `draft` to a location the user picks and retires it. The draft
+  /// survives a cancelled panel and a failed write — it is dropped only once
+  /// its content is safely somewhere else.
+  @discardableResult
+  func saveRecoveredDraftAs(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
+    self.appState = appState
+
+    guard let url = savePanelURLProvider(appState) else { return false }
+
+    // A draft this window already adopted is just an unsaved document: the
+    // ordinary Save As… path owns it (registration, working set, index) and
+    // retires the draft on success.
+    if appState.documentSession.recoveryID == draft.id {
+      return saveAs(appState: appState, to: url)
+    }
+
+    let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
+    do {
+      try FileManager.default.createDirectory(
+        at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try writeDocument(draft.text, targetURL)
+      selfWriteObserver(targetURL)
+      indexDocument(documentRef(for: targetURL, appState: appState), draft.text, appState)
+      recoveryStore.deleteDraft(id: draft.id)
+      appState.lastError = nil
+      return true
+    } catch {
+      let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
+      appState.lastError = message
+      NSLog(message)
+      return false
+    }
+  }
+
+  /// Drops `draft` for good. The caller owns the confirmation.
+  func discardRecoveredDraft(_ draft: RecoveryDraft) {
+    recoveryStore.deleteDraft(id: draft.id)
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -3095,6 +3216,116 @@ final class DocumentStore {
     }
 
     loadClean(ref: ref, into: appState)
+    return true
+  }
+
+  /// What `File > Close` must do with this window's session. Pure — call it
+  /// before showing anything, then feed the user's answer to `finishClose`.
+  ///
+  /// The auto-save setting is read HERE, per close, so a flip in Settings
+  /// changes the very next ⌘W without a restart: with auto-save on, a
+  /// file-backed document flushes and closes (asking would offer a "Don't Save"
+  /// that cannot undo the writes already on disk); with it off, every dirty
+  /// document asks.
+  func closeDecision(appState: AppState) -> DocumentCloseDecision {
+    DocumentCloseDecision.resolve(
+      for: appState.documentSession,
+      autoSavesPathedDocuments: savingSettings.autoSavesPathedDocuments)
+  }
+
+  /// What a completed close does to the Open Files working set. Stated by the
+  /// caller, because only the caller knows which gesture it serves.
+  enum OpenFilesRetirement {
+    /// Leave the row alone — the close was a window/teardown, and the next
+    /// launch is supposed to bring this file back.
+    case keep
+    /// Retire the document now: an explicit single-document close
+    /// (operator decision 2026-08-03).
+    case now
+    /// Hand the settled location to `report` and let the caller decide. The
+    /// window route needs this: whether its close was one TAB leaving a live
+    /// window or the whole window going down is only knowable a runloop turn
+    /// later, but the url to retire is only knowable HERE, after the save
+    /// branches.
+    case deferred(@MainActor (URL) -> Void)
+  }
+
+  /// Second half of the conscious close: applies the user's answer (`nil` when
+  /// `decision` needed no prompt) and clears the session when the answer
+  /// allows it. Returns whether the document actually closed — `false` means
+  /// the close was cancelled or its save failed, and the session stays exactly
+  /// as it was so the user can retry.
+  ///
+  /// Unlike `savePendingChangesOnClose` (the window/tab teardown guard, which
+  /// has no veto point left and therefore persists silently), this path is
+  /// allowed to refuse: nothing has been torn down yet.
+  ///
+  /// `retiring` states what this close means for the Open Files working set.
+  /// Only the CALLER knows which gesture it is serving, so the store never
+  /// guesses: see `OpenFilesRetirement`.
+  @discardableResult
+  func finishClose(
+    decision: DocumentCloseDecision,
+    response: SaveChangesResponse?,
+    appState: AppState,
+    retiring: OpenFilesRetirement = .keep
+  ) -> Bool {
+    self.appState = appState
+
+    switch (decision, response) {
+    case (.closeWithoutPrompting, _):
+      break
+
+    case (.saveWithoutPrompting, _), (.confirm(.savePathed), .save):
+      let openSessionID = appState.documentSession.id
+      guard saveExisting(appState: appState, indexNow: true) else {
+        appState.selectedDocumentID = openSessionID
+        return false
+      }
+
+    case (.confirm(.saveAsUntitled), .save):
+      guard let url = savePanelURLProvider(appState) else { return false }
+      guard saveAs(appState: appState, to: url) else { return false }
+
+    case (.confirm(.saveAsUntitled), .discard):
+      // "Don't Save" on a draft is a conscious throw-away, so the crash-recovery
+      // copy goes with it — leaving it behind would resurrect the very text the
+      // user just declined to keep.
+      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+
+    case (.confirm(.savePathed), .discard):
+      // The buffer is dropped; whatever is already on disk stays as it is.
+      break
+
+    case (.confirm, .cancel), (.confirm, nil):
+      return false
+    }
+
+    autosaver.cancel()
+    // The settled location, read AFTER the save branches: a draft that only
+    // earned a path through "Save As…" retires under THAT url, not the nil it
+    // arrived with. A cancelled or failed close returned above, so it forgets
+    // nothing.
+    if let closedURL = appState.documentSession.url {
+      switch retiring {
+      case .keep:
+        break
+      case .now:
+        forgetOpenFile(closedURL, into: appState)
+      case .deferred(let report):
+        report(closedURL)
+      }
+    }
+    // Whatever the answer was, no buffer is holding this draft any more, so it
+    // stops being exempt from retention. (Discard/Save already removed the file
+    // outright; this only releases the claim when one survived.)
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    appState.selectedDocumentID = nil
+    appState.documentSession.clear()
+    // The window is now empty BECAUSE the user asked for it. Any workspace
+    // walk still in flight captured an older generation and will stand down
+    // instead of selecting a document back into this window.
+    appState.windowModel.noteConsciousDocumentClose()
     return true
   }
 
@@ -3216,9 +3447,29 @@ final class DocumentStore {
     cancelArmedIndexIfOwned(by: appState)
     if appState.documentSession.isUntitled {
       saveRecoveryDraft(appState: appState)
+      // The buffer goes away with the window; the draft it just wrote is a
+      // recovery artifact from here on, not live work, so it re-enters
+      // retention like any other unhandled draft.
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       return true
     }
-    return saveExisting(appState: appState, indexNow: true)
+    // A file-backed buffer. Auto-save owns the file only when it is ON: then the
+    // teardown flush keeps that file current, as designed. With auto-save OFF,
+    // writing the file here would be exactly the silent write the setting
+    // forbids — and this teardown path has no veto point left (a raw
+    // `window.close()`, or a SwiftUI-scene close that never reached the
+    // shouldClose sheet). Either way — auto-save off, OR an auto-save write that
+    // FAILED — the buffer must not die with the window: stash it as a recovery
+    // draft and leave the file exactly as it is. Nothing is written behind the
+    // user's back, and nothing is lost.
+    if savingSettings.autoSavesPathedDocuments,
+      saveExisting(appState: appState, indexNow: true)
+    {
+      return true
+    }
+    stashClosingBufferAsRecoveryDraft(appState: appState)
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    return true
   }
 
   /// The `Autosaver.cancel()` a session change used to call, with the SAVE half narrowed to this
@@ -3308,8 +3559,9 @@ final class DocumentStore {
   /// guard — force-save a pathed doc, or Save/Discard/Cancel an untitled draft —
   /// without clearing the session, returning `false` only when the untitled
   /// prompt was cancelled. Correct for switching the document within one window,
-  /// where there is no later step that could still abort. A multi-window close
-  /// that CAN be cancelled late must instead split decide from apply via
+  /// where there is no later step that could still abort. A multi-window pass
+  /// that CAN be cancelled late — "Clear Open Files" and ⌘Q — must instead split
+  /// decide from apply via
   /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`.
   @discardableResult
   func prepareForDocumentSwitch(appState: AppState) -> Bool {
@@ -3317,6 +3569,18 @@ final class DocumentStore {
     return saveDirtySessionIfNeeded(appState: appState)
   }
 
+  /// Debounced persistence for the live buffer (1.5s after the last edit, the
+  /// interval this path has always used — the setting decides WHETHER a
+  /// file-backed document is written, it does not introduce a new cadence).
+  ///
+  /// The auto-save setting is checked when the timer FIRES, not when it is
+  /// scheduled: turning auto-save off must also stop the write that was already
+  /// pending from the keystroke before the flip, instead of letting one last
+  /// edit slip onto disk under the old setting.
+  ///
+  /// An untitled draft is never gated by the setting — its write target is the
+  /// recovery store, not a file the user owns, and crash recovery works the same
+  /// in both states.
   private func scheduleAutosave(appState: AppState) {
     guard appState.documentSession.isDirty else {
       return
@@ -3330,7 +3594,7 @@ final class DocumentStore {
       guard let self, let appState else { return }
       if appState.documentSession.isUntitled {
         self.saveRecoveryDraft(appState: appState)
-      } else {
+      } else if self.savingSettings.autoSavesPathedDocuments {
         self.saveExisting(appState: appState, indexNow: false)
       }
     }
@@ -3347,6 +3611,27 @@ final class DocumentStore {
       )
       appState.documentSession.recoveryID = draft.id
       appState.lastError = nil
+    } catch {
+      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+    }
+  }
+
+  /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
+  /// tearing down without reaching disk — auto-save is off, or an auto-save write
+  /// just failed. Unlike `saveRecoveryDraft` (untitled), this never clears
+  /// `appState.lastError`: when the stash follows a FAILED save that error must
+  /// stay surfaced (a recovery draft AND a visible error), so the user learns the
+  /// file on disk is stale rather than believing the close saved it.
+  private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
+    guard appState.documentSession.isDirty else { return }
+
+    do {
+      let draft = try recoveryStore.saveDraft(
+        id: appState.documentSession.recoveryID,
+        title: appState.documentSession.displayTitle,
+        text: appState.documentSession.text
+      )
+      appState.documentSession.recoveryID = draft.id
     } catch {
       appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
     }
@@ -3401,27 +3686,51 @@ final class DocumentStore {
     /// `applyDirtySessionResolution`, so a Cancel later in a multi-window pass
     /// leaves the draft recoverable.
     case discardUntitled
+    /// The user chose Don't Save on a FILE-BACKED document while auto-save is
+    /// off. The DESTRUCTIVE part — cancelling the pending debounced write and
+    /// marking the buffer clean, which lets the in-memory edit go — is deferred
+    /// for the same reason as `.discardUntitled`: a Cancel later in a
+    /// multi-window pass must leave the edit intact and still dirty. The file on
+    /// disk is never touched by this case, in either half.
+    case discardPathedEdit
   }
 
-  /// Non-destructive DECIDE half of the dirty-session guard. Force-saves a
-  /// pathed doc, or prompts Save/Discard/Cancel for an untitled draft, but
-  /// performs NO irreversible drop: a Discard is only RECORDED as
-  /// `.discardUntitled`. Returns `nil` when the user cancelled (or a forced save
-  /// failed). A Save DOES write bytes here — that write is the only step where a
-  /// failed I/O can still abort the pass, so it must stay in decide, never move
-  /// to apply.
+  /// Non-destructive DECIDE half of the dirty-session guard. Prompts
+  /// Save/Discard/Cancel for an untitled draft, and — when auto-save is off —
+  /// for a file-backed document too; otherwise it force-saves the pathed doc.
+  /// It performs NO irreversible drop: a Discard is only RECORDED, as
+  /// `.discardUntitled` or `.discardPathedEdit`. Returns `nil` when the user
+  /// cancelled (or a forced save failed). A Save DOES write bytes here — that
+  /// write is the only step where a failed I/O can still abort the pass, so it
+  /// must stay in decide, never move to apply.
   private func decideDirtySessionResolution(appState: AppState) -> DirtySessionResolution? {
     guard appState.documentSession.isDirty else {
       return .settled
     }
 
     if appState.documentSession.isUntitled {
-      switch dirtyUntitledPrompt(appState.documentSession) {
+      switch dirtySessionPrompt(appState.documentSession) {
       case .save:
         guard let url = savePanelURLProvider(appState) else { return nil }
         return saveAs(appState: appState, to: url) ? .settled : nil
       case .discard:
         return .discardUntitled
+      case .cancel:
+        return nil
+      }
+    }
+
+    if !savingSettings.autoSavesPathedDocuments {
+      switch dirtySessionPrompt(appState.documentSession) {
+      case .save:
+        // Falls through to the save below — the one write path for this branch.
+        break
+      case .discard:
+        // RECORD ONLY. The buffer is being replaced and whatever is on disk
+        // stays as it is, but cancelling the pending debounced write and
+        // clearing `isDirty` lets the in-memory edit go — so both wait for the
+        // apply half, where a Cancel in a later window can no longer intervene.
+        return .discardPathedEdit
       case .cancel:
         return nil
       }
@@ -3436,9 +3745,10 @@ final class DocumentStore {
     return .settled
   }
 
-  /// APPLY half: performs the deferred destructive step recorded by decide. Only
-  /// `.discardUntitled` carries one — drop the untitled recovery draft and mark
-  /// the buffer clean. `.settled` is a no-op.
+  /// APPLY half: performs the deferred destructive step recorded by decide.
+  /// `.settled` is a no-op; the two Discard cases each drop what makes their
+  /// edit recoverable. Neither clears the session, the identity or the buffer —
+  /// the caller tears the window down separately.
   private func applyDirtySessionResolution(
     _ resolution: DirtySessionResolution, appState: AppState
   ) {
@@ -3447,6 +3757,13 @@ final class DocumentStore {
       break
     case .discardUntitled:
       recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      appState.documentSession.isDirty = false
+    case .discardPathedEdit:
+      // The pending debounced write must not resurrect the dropped edit; the
+      // file on disk keeps the bytes it already had. Scoped to THIS window's
+      // session — a blanket cancel would also disarm another window's armed
+      // save, which is a data-loss path of its own.
+      autosaver.cancelSave(ownedBy: appState)
       appState.documentSession.isDirty = false
     }
   }
@@ -3472,6 +3789,24 @@ final class DocumentStore {
     applyDirtySessionResolution(resolution, appState: appState)
   }
 
+  /// Settles the current buffer before something replaces it WITHIN this window:
+  /// a document switch or a new document. Single-window path — decide and apply
+  /// run back to back, because nothing later in such a pass can still cancel it.
+  ///
+  /// App termination is deliberately NOT on this path: ⌘Q resolves every window
+  /// and a Cancel in the LAST one aborts the quit, so the fused form would have
+  /// destroyed an earlier window's draft before the pass could be called off.
+  /// That pass runs the split
+  /// `confirmDirtySessionForExternalClose` / `applyDeferredDirtySessionResolution`
+  /// pair instead, exactly like "Clear Open Files".
+  ///
+  /// Auto-save decides who owns a file-backed buffer here as well. With auto-save
+  /// on, the switch flushes silently — keeping that file current is Pensieve's
+  /// job. With it off, the Close rule applies to this lifecycle too: nothing
+  /// reaches disk, and nothing is dropped, until the user answers
+  /// `Save / Don't Save / Cancel`. Otherwise "auto-save off" would still write
+  /// the file the moment the user clicked another document in the sidebar.
+  /// An untitled draft asks in both states — it has no file to be saved into.
   private func saveDirtySessionIfNeeded(appState: AppState) -> Bool {
     guard let resolution = decideDirtySessionResolution(appState: appState) else {
       return false
@@ -3578,9 +3913,13 @@ final class DocumentStore {
     bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 
-  private static func promptForDirtyUntitledSession(
+  /// The switch/termination save question. Asked for a dirty untitled draft in
+  /// both auto-save states, and for a dirty file-backed document when auto-save
+  /// is off. App-modal on purpose: this is not a per-window close but a buffer
+  /// about to be replaced everywhere the caller is heading.
+  private static func promptForDirtySession(
     _ session: DocumentSession
-  ) -> DirtyUntitledResponse {
+  ) -> SaveChangesResponse {
     let alert = NSAlert()
     alert.messageText = "Do you want to save changes to \(session.displayTitle)?"
     alert.informativeText = "Your changes will be lost if you don't save them."

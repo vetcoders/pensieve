@@ -2235,9 +2235,12 @@ final class TerminationQuiescenceTests: XCTestCase {
       try indexHits(matching: "faileddsaveneedle", at: databaseURL), 0,
       "fixture precondition: the debounce must still be asleep")
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the close-time file write must genuinely fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the close-time file write must genuinely fail — a successful one "
+        + "clears isDirty. The teardown reports success either way now: with the write refused it "
+        + "stashes the buffer as a recovery draft rather than losing it")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2323,9 +2326,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     appState.documentSession.load(document: closingRef, text: "before the doomed edit")
     appState.documentSession.isDirty = true
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the closing window's own save must fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the closing window's own save must fail — a successful one clears "
+        + "isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2403,9 +2408,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     appState.documentSession.load(document: closingRef, text: "before the doomed edit")
     appState.documentSession.isDirty = true
 
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: appState),
-      "fixture precondition: the closing window's own save must fail")
+    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertTrue(
+      appState.documentSession.isDirty,
+      "fixture precondition: the closing window's own save must fail — a successful one clears "
+        + "isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -2419,9 +2426,11 @@ final class TerminationQuiescenceTests: XCTestCase {
         + "cancel rule exists to prevent")
 
     // Now the owner itself closes — and its save fails too. Still nothing may reach FTS.
-    XCTAssertFalse(
-      store.savePendingChangesOnClose(appState: otherState),
-      "fixture precondition: the owner's own close-time write must genuinely fail")
+    store.savePendingChangesOnClose(appState: otherState)
+    XCTAssertTrue(
+      otherState.documentSession.isDirty,
+      "fixture precondition: the owner's own close-time write must genuinely fail — a successful "
+        + "one clears isDirty")
     await database.drainPendingIndexWrites()
 
     XCTAssertEqual(
@@ -3047,9 +3056,9 @@ final class TerminationQuiescenceTests: XCTestCase {
   ///
   /// The observable is deliberately the SYNCHRONOUS limb of `controller.start`. Its other two limbs
   /// (the background index warm-up, the workspace restore) are tasks, so asserting on them would be
-  /// asserting on the scheduler; `documentStore.restoreRecoveredDraft` is a plain call inside `start`,
-  /// so a seeded recovery draft that is still unclaimed afterwards is proof the method never ran —
-  /// with no timing in the claim at all.
+  /// asserting on the scheduler; `refreshRecoveredDrafts` is a plain call inside `start`, so a
+  /// seeded recovery draft that the controller has still never listed afterwards is proof the method
+  /// never ran — with no timing in the read at all.
   ///
   /// Note what a bare `cancel()` would NOT have done here, which is why the fix is a one-way latch:
   /// the startup task's only suspension is `try? await Task.sleep(...)`, so cancelling it merely
@@ -3094,7 +3103,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     // Armed and NOT settled — the ten-second delay is the launch that is still making up its mind
     // when the user quits. Nothing here sleeps for it; the quit is what runs next.
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 10_000_000_000)
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
       "fixture precondition: the startup decision must still be pending, so nothing has restored yet")
@@ -3111,10 +3120,11 @@ final class TerminationQuiescenceTests: XCTestCase {
     // Everything that CAN still run gets its chance — this pin asserts that something did NOT happen.
     pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
 
-    XCTAssertNotNil(
-      recoveryStore.claimDraftForRestore(),
-      "the launch-intent startup task must not run after phase Q: the draft it would have claimed is "
-        + "still pending, which is only true if `controller.start` never ran")
+    XCTAssertEqual(recoveryStore.loadDrafts().count, 1, "fixture: the seeded draft is still on disk")
+    XCTAssertTrue(
+      controller.recoveredDrafts.isEmpty,
+      "the launch-intent startup task must not run after phase Q: the draft it would have listed is "
+        + "still unread, which is only true if `controller.start` never ran")
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
       "…so no session was restored into a window the quit has already flushed")
@@ -3145,8 +3155,12 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     let recoveryStore = RecoveryStore(
       directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
-    _ = try recoveryStore.saveDraft(
+    let seededDraft = try recoveryStore.saveDraft(
       id: nil, title: "Recovered Untitled.md", text: "settledlaunchneedle from the previous session")
+    // Writing a draft claims it for the window that produced it. This one came
+    // from a PREVIOUS session, so release the claim — that is the state a draft
+    // left behind by a crash is actually in, and the only one the launcher lists.
+    recoveryStore.markDraftClosed(id: seededDraft.id)
 
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
     let store = DocumentStore(
@@ -3171,16 +3185,19 @@ final class TerminationQuiescenceTests: XCTestCase {
     registry.registerController(controller, for: window)
 
     let coordinator = LaunchIntentCoordinator(settleDelayNanoseconds: 0)
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
-    XCTAssertTrue(
-      appState.documentSession.hasEditableBuffer,
-      "an ordinary launch must still restore its recovery draft — the termination latch may only be "
+    XCTAssertEqual(
+      controller.recoveredDrafts.count, 1,
+      "an ordinary launch must still list its recovery draft — the termination latch may only be "
         + "set by `quiesceForTermination()`, never by arming")
     XCTAssertEqual(
-      appState.documentSession.text, "settledlaunchneedle from the previous session",
-      "…with the draft's own bytes, not an empty buffer")
+      controller.recoveredDrafts.first?.text, "settledlaunchneedle from the previous session",
+      "…with the draft's own bytes, not an empty entry")
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "listing is not adopting: a draft reaches a window only when the user opens it")
   }
 
   // MARK: - R11: a session change may not disarm another window's index debounce

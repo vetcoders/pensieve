@@ -272,6 +272,8 @@ struct DocumentEmptyStateView: View {
         .font(.caption)
         .foregroundStyle(.tertiary)
         .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
+
+      RecoveredDraftsSection(palette: palette)
     }
     // The hierarchical levels the shared chrome asks for (`.secondary` labels,
     // the `.tertiary` build line) resolve against these, so every glyph on the
@@ -286,6 +288,81 @@ struct DocumentEmptyStateView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Color(palette.background).ignoresSafeArea(.container, edges: .top))
     .ignoresSafeArea(.container, edges: .top)
+    // The launcher is the only place a crash draft can be reached, so it reads
+    // the recovery directory every time it comes back on screen — including
+    // after a Close, which is exactly when a draft may have just been retired.
+    .onAppear { controller.refreshRecoveredDrafts() }
     .accessibilityIdentifier("pensieve.emptyState")
+  }
+}
+
+/// The ONE way a crash-recovery draft reaches a window. Nothing adopts a draft
+/// automatically any more (W2-D): unsaved work from a crash waits here, in the
+/// empty launcher, until the user opens, saves, or discards it.
+///
+/// Deliberately quiet — it is a footnote under the empty state, and it renders
+/// nothing at all when there is no unhandled draft, which is the normal case.
+struct RecoveredDraftsSection: View {
+  @EnvironmentObject private var controller: AppController
+  /// The launcher pane's own skin tokens. The section sits INSIDE the themed
+  /// empty state, so a system colour here would reinstate exactly the grey card
+  /// on a cream/ink pane the empty-state palette exists to prevent.
+  let palette: EmptyStatePalette
+
+  var body: some View {
+    // Nothing to recover renders NOTHING — not even a header. An always-visible
+    // "0 drafts" row would turn the ordinary launcher into a permanent crash
+    // reminder.
+    if !controller.recoveredDrafts.isEmpty {
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Recovered Drafts")
+          .font(.headline)
+          .foregroundStyle(Color(palette.secondaryText))
+
+        ForEach(controller.recoveredDrafts) { draft in
+          RecoveredDraftRow(draft: draft, palette: palette)
+        }
+      }
+      .padding(16)
+      .frame(maxWidth: 460)
+      .background(
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .fill(Color(palette.keyCapFill))
+      )
+      .accessibilityIdentifier("pensieve.recoveredDrafts")
+    }
+  }
+}
+
+private struct RecoveredDraftRow: View {
+  @EnvironmentObject private var controller: AppController
+  let draft: RecoveryDraft
+  let palette: EmptyStatePalette
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 12) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(draft.title)
+          .font(.callout)
+          .foregroundStyle(Color(palette.primaryText))
+          .lineLimit(1)
+        Text(draft.previewSnippet)
+          .font(.caption)
+          .foregroundStyle(Color(palette.secondaryText))
+          .lineLimit(1)
+        Text(draft.updatedAt.formatted(date: .abbreviated, time: .shortened))
+          .font(.caption2)
+          .foregroundStyle(Color(palette.tertiaryText))
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      HStack(spacing: 6) {
+        Button("Open") { controller.openRecoveredDraft(draft) }
+        Button("Save As…") { controller.saveRecoveredDraftAs(draft) }
+        Button("Discard") { controller.discardRecoveredDraft(draft) }
+      }
+      .controlSize(.small)
+    }
+    .accessibilityIdentifier("pensieve.recoveredDrafts.row")
   }
 }
