@@ -7,11 +7,64 @@ class LineNumberGutter: NSRulerView {
     didSet { needsDisplay = true }
   }
 
+  // Theme colours for the gutter. Defaulted to the previous system colours so a
+  // gutter built without a theme keeps the established look. The gutter fill is
+  // the editor `source` (not `windowBackgroundColor`) so it stops reading as a
+  // separate band beside the text on dark themes. `currentLine` is carried for
+  // the active-line marker that lands with the chrome-polish cut; it has no
+  // painter yet.
+  var gutterBackground: NSColor = .windowBackgroundColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterBorder: NSColor = .separatorColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterNumber: NSColor = .tertiaryLabelColor {
+    didSet { needsDisplay = true }
+  }
+  var gutterCurrentLine: NSColor = .labelColor {
+    didSet { needsDisplay = true }
+  }
+
+  /// 1-based source line the caret currently sits on, so the gutter can pick out
+  /// that number in `gutterCurrentLine` and draw the right-edge accent marker.
+  /// `0` means "no active line". `MarkdownEditorSurface` pushes this on selection
+  /// changes; only a real line change repaints, so same-line typing stays quiet
+  /// (the per-keystroke gutter redraw the scroll pins guard against).
+  var currentLineNumber: Int = 0 {
+    didSet {
+      guard currentLineNumber != oldValue else { return }
+      needsDisplay = true
+    }
+  }
+
+  /// Monospace family the line numbers are drawn in — the theme's own
+  /// (`ThemeTokens.monoFamily`), so the gutter cannot read as a different
+  /// typeface than the text beside it. Empty (adaptive skins) keeps the system
+  /// tabular figures.
+  var monoFamily: String = "" {
+    didSet {
+      guard monoFamily != oldValue else { return }
+      needsDisplay = true
+    }
+  }
+
+  /// Applies the source-panel tokens the brief maps to the gutter: `source`
+  /// (fill), `border` (right edge), `srcGutter` (numbers), `srcCurrentLine`,
+  /// plus the theme's monospace family for the numbers themselves.
+  func applyTokens(_ tokens: ThemeTokens) {
+    gutterBackground = tokens.source.nsColor
+    gutterBorder = tokens.border.nsColor
+    gutterNumber = tokens.srcGutter.nsColor
+    gutterCurrentLine = tokens.srcCurrentLine.nsColor
+    monoFamily = tokens.monoFamily
+  }
+
   init(scrollView: NSScrollView, textLayoutManager: NSTextLayoutManager) {
     self.textLayoutManager = textLayoutManager
     super.init(scrollView: scrollView, orientation: .verticalRuler)
     self.clientView = scrollView.documentView
-    self.ruleThickness = 40
+    self.ruleThickness = 46
   }
 
   required init(coder: NSCoder) {
@@ -52,11 +105,11 @@ class LineNumberGutter: NSRulerView {
     defer { NSGraphicsContext.current?.restoreGraphicsState() }
     NSBezierPath(rect: allowed).setClip()
 
-    NSColor.windowBackgroundColor.setFill()
+    gutterBackground.setFill()
     bounds.fill()
 
     // Draw right border
-    NSColor.separatorColor.setStroke()
+    gutterBorder.setStroke()
     let path = NSBezierPath()
     path.move(to: NSPoint(x: bounds.maxX - 1, y: bounds.minY))
     path.line(to: NSPoint(x: bounds.maxX - 1, y: bounds.maxY))
@@ -66,9 +119,17 @@ class LineNumberGutter: NSRulerView {
     let textContainerInset = textView.textContainerInset
     let scrollOffset = scrollView?.documentVisibleRect.origin.y ?? 0
 
-    let attributes: [NSAttributedString.Key: Any] = [
-      .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize - 2, weight: .regular),
-      .foregroundColor: NSColor.tertiaryLabelColor,
+    // Resolved (and cached) per family+size — this runs on every gutter repaint,
+    // i.e. on every scroll, so it must never construct a font from scratch.
+    let numberFont = MonoFontResolver.font(
+      family: monoFamily, size: fontSize - 2, fallback: .monoDigits)
+    let numberAttributes: [NSAttributedString.Key: Any] = [
+      .font: numberFont,
+      .foregroundColor: gutterNumber,
+    ]
+    let currentLineAttributes: [NSAttributedString.Key: Any] = [
+      .font: numberFont,
+      .foregroundColor: gutterCurrentLine,
     ]
 
     var lineNumber = 1
@@ -90,6 +151,8 @@ class LineNumberGutter: NSRulerView {
 
       // Only draw if visible
       if fragmentRect.maxY >= rect.minY && fragmentRect.minY <= rect.maxY {
+        let isCurrentLine = lineNumber == currentLineNumber
+        let attributes = isCurrentLine ? currentLineAttributes : numberAttributes
         let numberString = NSString(string: "\(lineNumber)")
         let size = numberString.size(withAttributes: attributes)
         let drawPoint = NSPoint(
@@ -97,6 +160,15 @@ class LineNumberGutter: NSRulerView {
           y: fragmentRect.minY + (frame.height - size.height) / 2
         )
         numberString.draw(at: drawPoint, withAttributes: attributes)
+
+        // Active-line accent: a 2 px marker hard against the gutter's right
+        // edge, in the same current-line token as the number.
+        if isCurrentLine {
+          gutterCurrentLine.setFill()
+          NSRect(
+            x: bounds.maxX - 2, y: fragmentRect.minY, width: 2, height: frame.height
+          ).fill()
+        }
       }
 
       lineNumber += 1

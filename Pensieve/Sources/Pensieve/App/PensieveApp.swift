@@ -14,6 +14,11 @@ struct PensieveApp: App {
   private let providerSettings: ProviderSettings
 
   init() {
+    // Register the bundled OFL theme fonts into this process's font environment
+    // before any view builds. Idempotent and non-fatal — a missing/failed font
+    // never blocks launch; the skin CSS fallback chains cover absence.
+    BundledFonts.registerOnce()
+
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
@@ -137,6 +142,12 @@ struct DocumentWindowRootView: View {
 
   var body: some View {
     ContentView(hostWindow: $currentWindow)
+      // Every window this app can build — the scene-owned launcher (which is
+      // where restoration puts the recovered document), a state-restored
+      // WindowGroup scene, and every factory-built native tab — shares THIS
+      // root, so declaring the skin's appearance once here is what makes a
+      // light skin light on all of them, chrome included.
+      .pensieveSkinAppearance(themeManager)
       .environment(appState)
       .environmentObject(controller)
       .environmentObject(controller.transcriptionService)
@@ -209,9 +220,22 @@ struct DocumentWindowRootView: View {
       // focused values go silent.
       .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) {
         notification in
-        guard let keyWindow = notification.object as? NSWindow, keyWindow === currentWindow else {
-          return
-        }
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: currentWindow, keyWindow: notification.object as? NSWindow)
+        else { return }
+        CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
+      }
+      // Second half of the same rule. The accessor above is coalesced and
+      // async, so a factory-built native tab is regularly key BEFORE this root
+      // knows which window is its own — and `didBecomeKey` has already fired
+      // and will not fire again. Without this trigger such a tab never adopts,
+      // and the fallback keeps serving the PREVIOUS tab's session.
+      .onChange(of: currentWindow) { _, resolvedWindow in
+        guard
+          CommandSurfaceAdoption.shouldAdopt(
+            rootWindow: resolvedWindow, keyWindow: NSApp.keyWindow)
+        else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
       // App-wide save-on-close guard. Every window (factory-built document tab AND
@@ -242,6 +266,15 @@ struct DocumentWindowRootView: View {
     controller.requestCloseCurrentWindowIfEmpty = {
       guard !appState.documentSession.hasEditableBuffer else { return }
       DocumentWindowRegistry.shared.closeWindowIfEmptyLauncher(currentWindow)
+    }
+    // A window that adopted the crash draft holds real work behind no URL, so
+    // nothing else would ever reclassify it out of "launcher".
+    controller.requestPromoteWindowToContent = {
+      guard let currentWindow else { return }
+      DocumentWindowRegistry.shared.markWindowAsContent(currentWindow)
+    }
+    controller.requestLauncherSweepReconcile = {
+      DocumentWindowRegistry.shared.reconcileLaunchersAfterRestoreSettled()
     }
   }
 

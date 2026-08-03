@@ -23,6 +23,26 @@ class MarkdownTextView: NSTextView {
     super.undoManager ?? fallbackUndoManager
   }
 
+  /// Character range currently laid out in the viewport, or `nil` while layout
+  /// has not established one yet (before the first viewport pass, or while the
+  /// surface has no window at all — the launch ordering, where the skin is
+  /// applied before the view is hosted).
+  ///
+  /// This is what lets a live skin switch repaint the visible text first and
+  /// defer the rest of the document; see `MarkdownTextStorage.rethemeHighlighting`.
+  var visibleCharacterRange: NSRange? {
+    guard let layoutManager = textLayoutManager,
+      let contentManager = layoutManager.textContentManager,
+      let viewportRange = layoutManager.textViewportLayoutController.viewportRange
+    else { return nil }
+
+    let documentStart = contentManager.documentRange.location
+    let location = contentManager.offset(from: documentStart, to: viewportRange.location)
+    let end = contentManager.offset(from: documentStart, to: viewportRange.endLocation)
+    guard location != NSNotFound, end != NSNotFound, end >= location else { return nil }
+    return NSRange(location: location, length: end - location)
+  }
+
   /// The window undo manager our entries land in, captured while attached so we can
   /// scrub them on detach. See `viewWillMove(toWindow:)` for why `self.window` is not a
   /// reliable source at detach time.
@@ -83,9 +103,51 @@ class MarkdownTextView: NSTextView {
     // (proportional system) font and visibly "pops" to monospace only once the debounced
     // highlight pass re-applies attributes — the font-jump the operator saw per keystroke.
     // `EditorRepresentable.update` keeps these in sync when the font size changes.
-    let baseFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    // No theme has landed yet, so `monoFamily` is empty and this resolves to the
+    // system monospaced face; `applyTheme` swaps in the skin's family.
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: 14)
     font = baseFont
     typingAttributes = [.font: baseFont, .foregroundColor: NSColor.textColor]
+  }
+
+  /// Monospace family the active theme dresses the source panel in
+  /// (`ThemeTokens.monoFamily`). Empty until a theme lands — and empty for the
+  /// adaptive skins — which resolves to the system monospaced face.
+  private(set) var monoFamily: String = ""
+
+  /// Applies the active theme to the editor surface: the pane background is the
+  /// theme `source`, the caret + typing colour follow the theme `text`, the pane
+  /// takes the theme's monospace family, and the gutter receives its own
+  /// source-panel tokens. Called from `MarkdownEditorSurface` on setup and
+  /// whenever the skin changes.
+  ///
+  /// The family has to land here, not only in the highlighter: `font` and
+  /// `typingAttributes` are what freshly typed characters are drawn with before
+  /// the debounced highlight pass reaches them, so leaving them on the previous
+  /// family would make every keystroke flash the old face.
+  ///
+  /// `baseSize` is passed in rather than read back from `font`. `NSTextView.font`
+  /// is a *rendered* attribute — it answers with the font of the FIRST character,
+  /// which the highlighter has already grown to a heading size on any document
+  /// that opens with `#` (h1 is `baseFontSize + 12`). Deriving the base face from
+  /// it made every live skin switch re-seed the caret at heading size, so the
+  /// next character typed came out 26 pt on a 14 pt document. The authority is
+  /// the storage's own base size, which is what the highlighter lays down.
+  func applyTheme(_ tokens: ThemeTokens, baseSize: CGFloat) {
+    let source = tokens.source.nsColor
+    let text = tokens.text.nsColor
+    drawsBackground = true
+    backgroundColor = source
+    insertionPointColor = text
+    monoFamily = tokens.monoFamily
+    let baseFont = MonoFontResolver.font(family: monoFamily, size: baseSize)
+    font = baseFont
+    var attributes = typingAttributes
+    attributes[.font] = baseFont
+    attributes[.foregroundColor] = text
+    typingAttributes = attributes
+    autocompleteGhostField?.font = baseFont
+    gutter?.applyTokens(tokens)
   }
 
   func setupGutter(layoutManager: NSTextLayoutManager) {
@@ -172,7 +234,7 @@ class MarkdownTextView: NSTextView {
       addSubview(ghostField)
     }
     ghostField.stringValue = suggestion
-    ghostField.font = font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ghostField.font = font ?? MonoFontResolver.font(family: monoFamily, size: 14)
     ghostField.sizeToFit()
     ghostField.setFrameOrigin(
       autocompleteGhostOrigin(caretLocation: caretLocation, size: ghostField.frame.size))

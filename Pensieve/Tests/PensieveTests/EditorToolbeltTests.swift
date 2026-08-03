@@ -40,7 +40,7 @@ final class EditorToolbeltTests: XCTestCase {
   func testSkinAxisAutoPopulates() {
     // The menu renders one row per case — every skin needs a display name
     // and a symbol, and the ids the picker tags on must stay unique.
-    let skins = ThemeManager.PreviewTheme.allCases
+    let skins = PensieveTheme.allCases
     XCTAssertFalse(skins.isEmpty)
     XCTAssertEqual(Set(skins.map(\.id)).count, skins.count)
     for skin in skins {
@@ -97,6 +97,68 @@ final class EditorToolbeltTests: XCTestCase {
     XCTAssertEqual(
       MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier),
       expectedToolbarIdentifiers)
+  }
+
+  // MARK: - Titlebar breadcrumb subtitle (5.2)
+
+  func testBreadcrumbIsWorkspaceRootedWhenFileLivesUnderARoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/10_projects/vetcoders/reports/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]),
+      "proj › 10_projects › vetcoders › reports")
+  }
+
+  func testBreadcrumbForFileDirectlyInRootIsJustTheRoot() {
+    let root = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]), "proj")
+  }
+
+  func testBreadcrumbOutsideWorkspaceUsesLastFewParentComponents() {
+    let file = URL(fileURLWithPath: "/a/b/c/d/e/file.md")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: []), "c › d › e")
+  }
+
+  func testBreadcrumbIsEmptyWithoutAnActiveDocument() {
+    XCTAssertEqual(EditorToolbelt.breadcrumbSubtitle(for: nil, workspaceRoots: []), "")
+  }
+
+  /// Roots can nest — `mergedRoots` dedupes on the exact path only, so opening
+  /// `/w` and then `/w/proj` leaves BOTH in the list. `first(where:)` then let
+  /// insertion order pick the crumb: the same document read `proj › a` or
+  /// `w › proj › a` purely by which folder the operator happened to open first.
+  /// The innermost containing root is the one the file actually lives in, so
+  /// the answer must be identical in either order.
+  func testBreadcrumbUsesTheInnermostRootRegardlessOfInsertionOrder() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let inner = WorkspaceRoot(id: URL(fileURLWithPath: "/w/proj"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, inner]),
+      "proj › a",
+      "the parent root was added first and won — the crumb depends on open order, not on"
+        + " where the document lives")
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [inner, outer]),
+      "proj › a")
+  }
+
+  /// CONTROL LEG. Preferring the longest match must not start claiming files
+  /// that merely SHARE A PREFIX with a root: `/w/projector` is not inside
+  /// `/w/proj`, and a document under it belongs to the root that does contain
+  /// it.
+  func testALongerRootThatOnlySharesAPrefixDoesNotClaimTheDocument() {
+    let outer = WorkspaceRoot(id: URL(fileURLWithPath: "/w"))
+    let sibling = WorkspaceRoot(id: URL(fileURLWithPath: "/w/projector-notes"))
+    let file = URL(fileURLWithPath: "/w/proj/a/b.md")
+
+    XCTAssertEqual(
+      EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [outer, sibling]),
+      "w › proj › a")
   }
 
   // MARK: - Titlebar order contract

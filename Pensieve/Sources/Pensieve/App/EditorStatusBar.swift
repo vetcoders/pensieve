@@ -37,8 +37,6 @@ struct EditorStatusBar: View {
     HStack(spacing: 14) {
       item("Mode", appState.mode.label)
 
-      Divider().frame(height: 12)
-
       item("Ln", "\(caret.line):\(caret.column)")
       if selectionCharacters > 0 {
         item("Sel", "\(selectionCharacters)")
@@ -56,22 +54,20 @@ struct EditorStatusBar: View {
       if appState.documentIsDirty {
         HStack(spacing: 4) {
           Circle()
-            .fill(Color.orange)
-            .frame(width: 6, height: 6)
+            .fill(Color(themeManager.skin.tokens.warning.nsColor))
+            .frame(width: 5, height: 5)
           Text("Edited")
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Color(themeManager.skin.tokens.warning.nsColor))
         }
         .accessibilityIdentifier("pensieve.statusbar.dirty")
-        Divider().frame(height: 12)
       }
 
-      item("Flavor", themeManager.current.displayName)
-      item("Theme", themeManager.skin.displayName)
+      appearanceChip
     }
-    .font(.system(size: 11))
+    .font(.system(size: 10.5))
     .lineLimit(1)
     .padding(.horizontal, 12)
-    .frame(height: 22)
+    .frame(height: 26)
     .frame(maxWidth: .infinity)
     .background(.bar)
     .overlay(alignment: .top) {
@@ -94,5 +90,41 @@ struct EditorStatusBar: View {
     .fixedSize()
     .accessibilityElement(children: .combine)
     .accessibilityLabel("\(label): \(value)")
+  }
+
+  /// The reading-surface chip: `Theme / Flavor` in a hairline capsule that opens
+  /// the SAME two appearance pickers as the toolbar's menu. Previously Flavor and
+  /// Theme were two inert text cells — the user could read the active theme but
+  /// had to travel to the toolbar to change it. Bound straight into the shared
+  /// `ThemeManager`, so a change here re-dresses both panels live.
+  private var appearanceChip: some View {
+    Menu {
+      Picker("Flavor", selection: $themeManager.current) {
+        ForEach(ThemeManager.Theme.allCases) { theme in
+          Text(theme.displayName).tag(theme)
+        }
+      }
+      .pickerStyle(.menu)
+
+      Picker("Theme", selection: $themeManager.skin) {
+        ForEach(PensieveTheme.allCases) { skin in
+          Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
+        }
+      }
+      .pickerStyle(.menu)
+    } label: {
+      Text("\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .overlay(
+          RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+        )
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .help("Preview appearance — markdown flavor and reading theme")
+    .accessibilityIdentifier("pensieve.statusbar.appearance")
   }
 }

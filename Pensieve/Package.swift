@@ -36,7 +36,14 @@ let package = Package(
                 .copy("Resources/mermaid.min.js"),
                 .copy("Resources/katex.min.js"),
                 .copy("Resources/katex.inline.min.css"),
-                .copy("Resources/sample.md")
+                .copy("Resources/sample.md"),
+                // Bundled OFL theme fonts (family→files manifest in
+                // BundledFonts.swift). `.copy` preserves the per-family
+                // directory tree verbatim — including each family's OFL.txt
+                // license next to its faces — so the runtime registrar can walk
+                // it and CoreText reads genuine TrueType data. `.process` would
+                // flatten/rename and is meant for image/localized assets.
+                .copy("Resources/Fonts")
             ],
             linkerSettings: [
                 .unsafeFlags([

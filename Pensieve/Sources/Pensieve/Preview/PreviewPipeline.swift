@@ -24,7 +24,7 @@ struct PreviewRenderRequest: Equatable {
   /// Reading-surface skin layered on top of the flavor CSS. Defaulted so the
   /// many constructors that predate the skin axis (export, command palette,
   /// tests) keep compiling and render the established GitHub surface.
-  var skin: ThemeManager.PreviewTheme = .default
+  var skin: PensieveTheme = .default
   let documentURL: URL?
   var refreshToken: Int = 0
 
@@ -72,6 +72,10 @@ struct PreviewDocument: Equatable {
   let containsMath: Bool
   let sourceURL: URL?
   let refreshToken: Int
+  /// Reading-surface skin this document was composed for. The sink
+  /// (`PreviewWebView`) reads it to pin the WebView appearance and titlebar
+  /// backing colour to the theme mode.
+  var skin: PensieveTheme = .default
 }
 
 extension PreviewDocument {
@@ -83,7 +87,7 @@ extension PreviewDocument {
     body: String,
     css: String,
     fontSize: CGFloat,
-    skin: ThemeManager.PreviewTheme = .default,
+    skin: PensieveTheme = .default,
     baseURL: URL?,
     mermaidJavaScript: String? = nil,
     katexJavaScript: String? = nil,
@@ -152,7 +156,8 @@ extension PreviewDocument {
       katexCSS: katexCSS,
       containsMath: containsMath,
       sourceURL: sourceURL,
-      refreshToken: refreshToken)
+      refreshToken: refreshToken,
+      skin: skin)
   }
 
   /// Neutralizes element-closing sequences inside inline <script>/<style>

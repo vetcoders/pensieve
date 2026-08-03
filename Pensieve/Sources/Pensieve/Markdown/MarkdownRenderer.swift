@@ -25,8 +25,12 @@ final class MarkdownRenderer {
     if let cached = cachedOutput, cacheKey == key {
       return cached
     }
-    let document = Document(parsing: Self.strippingLeadingFrontmatter(markdown))
-    var emitter = HTMLEmitter()
+    // ONE string feeds both the parser and the emitter: the emitter resolves
+    // cmark source locations against it (escaped-marker disambiguation), so a
+    // frontmatter-stripped parse must not be paired with the unstripped source.
+    let parsed = Self.strippingLeadingFrontmatter(markdown)
+    let document = Document(parsing: parsed)
+    var emitter = HTMLEmitter(source: parsed)
     let body = emitter.visit(document)
     let output = Output(body: body, paragraphCount: emitter.nextBlockIndex)
     cacheKey = key

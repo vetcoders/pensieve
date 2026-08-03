@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct SidebarView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
+  @EnvironmentObject private var themeManager: ThemeManager
   // Live open-tab group (the actual tabs), published by the window registry so
   // "Open Files" mirrors the tab chain instead of a per-window working set.
   @ObservedObject private var windowRegistry = DocumentWindowRegistry.shared
@@ -74,7 +75,10 @@ struct SidebarView: View {
     VStack(alignment: .leading, spacing: 6) {
       HStack(spacing: 8) {
         Text(sidebarTitle)
-          .font(.headline)
+          .font(.system(size: 10, weight: .semibold))
+          .textCase(.uppercase)
+          .tracking(1)
+          .foregroundStyle(themeMuted)
           .lineLimit(1)
           .accessibilityIdentifier("pensieve.sidebar.title")
 
@@ -123,23 +127,16 @@ struct SidebarView: View {
   }
 
   private var emptyState: some View {
-    VStack(spacing: 12) {
+    VStack(alignment: .leading, spacing: 16) {
       Spacer()
-      Image(systemName: "folder.badge.plus")
-        .font(.system(size: 36))
-        .foregroundColor(.secondary)
-      Text("No folder open")
-        .font(.headline)
-      Text("⌘O opens a Markdown file. ⌘⇧O opens a workspace folder.")
-        .font(.caption)
-        .foregroundColor(.secondary)
-      Button("New File…") {
-        controller.createUntitledDocument()
-      }
-      .accessibilityIdentifier("pensieve.sidebar.emptyState.newFile")
+      EmptyStateWordmark(size: 22)
+      EmptyStateShortcuts(
+        newFileAccessibilityIdentifier: "pensieve.sidebar.emptyState.newFile")
+      EmptyStateRecents(store: controller.recentDocuments, limit: 5)
       Spacer()
     }
-    .frame(maxWidth: .infinity)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.horizontal, 14)
     .accessibilityIdentifier("pensieve.sidebar.emptyState")
   }
 
@@ -184,13 +181,11 @@ struct SidebarView: View {
       }
     }
     .padding(4)
+    // 5.1: no outline — just the panel fill. The active tab carries a full
+    // accent wash (from `selectionBackground`), not merely a heavier font.
     .background(
       RoundedRectangle(cornerRadius: 7, style: .continuous)
-        .fill(Color(NSColor.controlBackgroundColor).opacity(0.72))
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 7, style: .continuous)
-        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        .fill(Color(NSColor.controlBackgroundColor))
     )
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
@@ -440,24 +435,27 @@ struct SidebarView: View {
     let hovered = descriptor.fileURL.map { hoveredDocumentID == $0 } ?? false
     return HStack {
       Image(systemName: "doc.text")
-        .foregroundColor(.secondary)
+        .foregroundStyle(selected ? themeAccent : themeMuted)
       // File-backed rows expose a context-menu Rename that sets `renamingURL`;
       // route the title through `renameableTitle` so that selection actually
       // surfaces the inline field. File-less descriptors (untitled drafts) fall
       // back to plain text inside the helper.
       renameableTitle(for: descriptor.fileURL, title: descriptor.displayTitle)
+        .font(rowTitleFont)
       Spacer(minLength: 4)
       if descriptor.isDirty {
         Circle()
-          .fill(Color.secondary)
-          .frame(width: 6, height: 6)
+          .fill(themeWarning)
+          .frame(width: 5, height: 5)
           .accessibilityLabel("Edited")
       }
     }
-    .padding(.vertical, 4)
     .padding(.horizontal, 6)
     .help(descriptor.fileURL?.path ?? descriptor.displayTitle)
-    .frame(maxWidth: .infinity, alignment: .leading)
+    .frame(
+      maxWidth: .infinity, minHeight: Self.rowHeight, maxHeight: Self.rowHeight,
+      alignment: .leading
+    )
     .contentShape(Rectangle())
     .background(selectionBackground(selected || hovered))
   }
@@ -539,36 +537,52 @@ struct SidebarView: View {
     isHighlighted: Bool
   ) -> some View {
     HStack(spacing: 5) {
+      indentGuides(depth: depth)
+
       Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
         .font(.caption2.weight(.semibold))
-        .foregroundColor(.secondary)
-        .frame(width: 10)
+        .foregroundStyle(themeMuted)
+        .frame(width: Self.disclosureWidth)
 
       Image(systemName: "folder")
-        .foregroundColor(.secondary)
+        .foregroundStyle(themeMuted)
 
       renameableTitle(for: node.url, title: node.name)
+        .font(rowTitleFont)
     }
-    .padding(.leading, CGFloat(depth) * 14)
-    .padding(.vertical, 4)
     .padding(.horizontal, 6)
     .help(node.url?.path ?? node.name)
-    .frame(maxWidth: .infinity, alignment: .leading)
+    .frame(
+      maxWidth: .infinity, minHeight: Self.rowHeight, maxHeight: Self.rowHeight,
+      alignment: .leading
+    )
     .contentShape(Rectangle())
     .background(selectionBackground(isHighlighted))
   }
 
   private func nodeRow(_ node: WorkspaceNode, depth: Int, isSelected: Bool) -> some View {
-    HStack {
+    HStack(spacing: 5) {
+      indentGuides(depth: depth)
+
+      // Reserve the folder rows' disclosure slot so a file icon at the same
+      // depth aligns under a sibling folder's icon (closes the old
+      // depth*14+15 vs depth*14 misalignment).
+      Color.clear.frame(width: Self.disclosureWidth)
+
+      // File vs folder read as two brightness levels: the folder glyph is
+      // muted, a file is base text — and a selected file takes the accent.
       Image(systemName: "doc.text")
-        .foregroundColor(.secondary)
+        .foregroundStyle(isSelected ? themeAccent : themeText)
+
       renameableTitle(for: node.url, title: node.name)
+        .font(rowTitleFont)
     }
-    .padding(.leading, CGFloat(depth) * 14 + 15)
-    .padding(.vertical, 4)
     .padding(.horizontal, 6)
     .help(node.url?.path ?? node.name)
-    .frame(maxWidth: .infinity, alignment: .leading)
+    .frame(
+      maxWidth: .infinity, minHeight: Self.rowHeight, maxHeight: Self.rowHeight,
+      alignment: .leading
+    )
     .contentShape(Rectangle())
     .background(selectionBackground(isSelected))
   }
@@ -612,8 +626,63 @@ struct SidebarView: View {
   }
 
   private func selectionBackground(_ isSelected: Bool) -> some View {
-    RoundedRectangle(cornerRadius: 6, style: .continuous)
-      .fill(isSelected ? Color.accentColor.opacity(0.24) : Color.clear)
+    ZStack(alignment: .leading) {
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(isSelected ? themeAccent.opacity(0.16) : Color.clear)
+      if isSelected {
+        // 2 px accent bar hard against the row's leading edge.
+        themeAccent
+          .frame(width: 2)
+          .clipShape(RoundedRectangle(cornerRadius: 1, style: .continuous))
+      }
+    }
+  }
+
+  // MARK: - Theme chrome (5.1)
+
+  /// The accent every sidebar row actually gets — the selected-file glyph, the
+  /// selection wash, the 2 px leading bar and the selected Open Files row.
+  ///
+  /// It is `ThemeTokens.legibleAccent` rather than the raw token because the
+  /// sidebar is painted on the window CHROME, not on the reading surface the
+  /// accent was tuned for; see that property. Named and static so the pin can
+  /// measure the value the rows are handed instead of re-deriving it.
+  static func chromeAccentColor(for tokens: ThemeTokens) -> NSColor { tokens.legibleAccent }
+
+  private var themeAccent: Color { Color(Self.chromeAccentColor(for: themeManager.skin.tokens)) }
+  private var themeMuted: Color { Color(themeManager.skin.tokens.muted.nsColor) }
+  private var themeText: Color { Color(themeManager.skin.tokens.text.nsColor) }
+  private var themeBorder: Color { Color(themeManager.skin.tokens.border.nsColor) }
+  private var themeWarning: Color { Color(themeManager.skin.tokens.warning.nsColor) }
+
+  /// Row-title face: the theme's heading family at 12.5 pt (Archivo in Ink,
+  /// Newsreader in Parchment…), or the system face when the theme carries no
+  /// bundled family (adaptive default/raw). `Font.custom` degrades to the
+  /// system font if the family did not register, matching the native fallback.
+  private var rowTitleFont: Font {
+    let family = themeManager.skin.tokens.previewHeadingFamily
+    return family.isEmpty ? .system(size: 12.5) : .custom(family, size: 12.5)
+  }
+
+  private static let rowHeight: CGFloat = 26
+  private static let indentStep: CGFloat = 22
+  private static let disclosureWidth: CGFloat = 14
+
+  /// One 1 px vertical guide per indentation level, in the theme's border tint —
+  /// the tree-depth rails from 5.1. Consumes `depth * indentStep` of leading
+  /// width so a row's icon lands at a fixed x for its depth.
+  @ViewBuilder
+  private func indentGuides(depth: Int) -> some View {
+    if depth > 0 {
+      HStack(spacing: 0) {
+        ForEach(0..<depth, id: \.self) { _ in
+          themeBorder
+            .frame(width: 1)
+            .frame(width: Self.indentStep, alignment: .leading)
+        }
+      }
+      .frame(maxHeight: .infinity)
+    }
   }
 
   @ViewBuilder
