@@ -246,9 +246,18 @@ final class AppController: ObservableObject {
   /// `applyWorkspaceScans` deliberately keeps them out of Open Files rather than
   /// listing them twice.
   private func reopenRestoredOpenFiles() {
-    let alreadyOpen = Set(documentWindowRegistry.openDocuments.map(\.identity))
-    var pending = appState.openFiles.filter { ref in
-      ref.isAdHoc && !alreadyOpen.contains(.file(ref.id.standardizedFileURL))
+    // ONE identity set for the whole pass, seeded with what is already open and
+    // grown as refs are taken. Computing "already open" once and then trusting
+    // the working set to hold each file at most once was a duplicate tab
+    // waiting to happen: a persisted set that names the same file twice — which
+    // `BookmarkStore` used to produce, since a bookmark blob is not a stable
+    // identity for the file it points at — asked the registry to open it twice
+    // before either request had registered a window.
+    var claimed = Set(documentWindowRegistry.openDocuments.map(\.identity))
+    var pending: [DocumentRef] = []
+    for ref in appState.openFiles where ref.isAdHoc {
+      guard claimed.insert(.file(ref.id.standardizedFileURL)).inserted else { continue }
+      pending.append(ref)
     }
     guard !pending.isEmpty else { return }
 

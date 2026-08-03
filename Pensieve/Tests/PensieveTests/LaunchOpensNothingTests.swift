@@ -112,6 +112,59 @@ final class LaunchOpensNothingTests: XCTestCase {
       "a working set of two files must come back as two open documents")
   }
 
+  /// ONE FILE IS ONE TAB, however many times the working set names it.
+  ///
+  /// The operator's `fileBookmarks` held fifteen entries for twelve files —
+  /// three of them recorded twice — and the restore turns each entry into a
+  /// request for a window.
+  ///
+  /// This leg passes on the build that HAS the duplicated key, because
+  /// `prepareWorkspaceShell` de-duplicates the live list before the reopen ever
+  /// sees it; the defect it belongs to lives further down, in the store that
+  /// kept the duplicate across launches (`StartupRestoreWorkingSetHygieneTests`)
+  /// and in the reopen's own habit of trusting the list it was handed. It is
+  /// kept as the CONTRACT pin for the whole path: exactly one of those three
+  /// layers has to be wrong for the user to get two tabs on one document, and
+  /// this is the only place that would notice.
+  func testAWorkingSetThatNamesOneFileTwiceComesBackAsOneDocument() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    let repeatedURL = try harness.writeLooseNote(named: "repeated.md")
+    try harness.openWorkspace()
+    try harness.persistWorkingSet([keptURL, repeatedURL, repeatedURL])
+
+    let relaunched = try harness.relaunch()
+
+    XCTAssertEqual(
+      relaunched.appState.openFiles.map(\.url.standardizedFileURL), [keptURL, repeatedURL],
+      "the duplicate reached the working set, and every ref in it is a window the launch asks"
+        + " for")
+    XCTAssertEqual(
+      relaunched.registry.openDocuments.count, 2,
+      "one document came back as two tabs")
+  }
+
+  /// THE TRASH IS DEAD. A file the user threw away still exists on disk and its
+  /// bookmark still resolves, so nothing in the restore's existence checks
+  /// stopped it — the launch faithfully reopened a document that is, from the
+  /// user's side, deleted.
+  func testAFileTheUserThrewAwayDoesNotComeBack() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.writeLooseNote(named: "kept.md")
+    let trashedURL = try harness.writeTrashedNote(named: "thrown-away.md")
+    try harness.openWorkspace()
+    try harness.persistWorkingSet([keptURL, trashedURL])
+
+    let relaunched = try harness.relaunch()
+
+    XCTAssertEqual(
+      relaunched.appState.openFiles.map(\.url.standardizedFileURL), [keptURL],
+      "a file in the Trash came back into the working set")
+    XCTAssertEqual(
+      relaunched.registry.openDocuments.map(\.identity), [.file(keptURL)],
+      "the launch reopened a document the user had thrown away")
+  }
+
   /// CLOSING THE LAST DOCUMENT MUST CLOSE IT.
   ///
   /// A native window close deliberately LEAVES the file in the working set —
@@ -174,7 +227,11 @@ final class LaunchOpensNothingTests: XCTestCase {
     let root = container.appendingPathComponent("Workspace", isDirectory: true)
     let support = container.appendingPathComponent("Support", isDirectory: true)
     let loose = container.appendingPathComponent("Loose", isDirectory: true)
-    for directory in [root, support, loose] {
+    // A Trash of this fixture's own. The real one is never touched, and the
+    // product rule is about the LOCATION — `~/.Trash`, a volume's `.Trashes` —
+    // not about one particular path.
+    let trash = container.appendingPathComponent(".Trash", isDirectory: true)
+    for directory in [root, support, loose, trash] {
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
     addTeardownBlock {
@@ -187,6 +244,7 @@ final class LaunchOpensNothingTests: XCTestCase {
       root: root,
       support: support,
       loose: loose,
+      trash: trash,
       defaults: defaults,
       manager: makeManager(support: support, bookmarkStore: bookmarkStore),
       makeManager: makeManager,
@@ -234,6 +292,7 @@ private final class LaunchHarness {
   let root: URL
   let support: URL
   let loose: URL
+  let trash: URL
   let defaults: UserDefaults
   let manager: FolderManager
   let makeManager: (URL, BookmarkStore) -> FolderManager
@@ -253,6 +312,7 @@ private final class LaunchHarness {
     root: URL,
     support: URL,
     loose: URL,
+    trash: URL,
     defaults: UserDefaults,
     manager: FolderManager,
     makeManager: @escaping (URL, BookmarkStore) -> FolderManager,
@@ -261,6 +321,7 @@ private final class LaunchHarness {
     self.root = root
     self.support = support
     self.loose = loose
+    self.trash = trash
     self.defaults = defaults
     self.manager = manager
     self.makeManager = makeManager
@@ -286,6 +347,24 @@ private final class LaunchHarness {
   @discardableResult
   func writeLooseNote(named name: String) throws -> URL {
     try write(name: name, in: loose)
+  }
+
+  /// A loose note the user then threw away: still on disk, still resolvable
+  /// from its bookmark, and — as far as Pensieve is concerned — gone.
+  @discardableResult
+  func writeTrashedNote(named name: String) throws -> URL {
+    try write(name: name, in: trash)
+  }
+
+  /// Seeds the persisted working set the way an older build could leave it:
+  /// one file recorded twice. The key is a cross-process contract, so a pin
+  /// for the state it can be found in has to name it.
+  func persistWorkingSet(_ urls: [URL]) throws {
+    let bookmarks = try urls.map {
+      try $0.bookmarkData(
+        options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+    defaults.set(bookmarks, forKey: "Pensieve.workspace.fileBookmarks")
   }
 
   private func write(name: String, in directory: URL) throws -> URL {
