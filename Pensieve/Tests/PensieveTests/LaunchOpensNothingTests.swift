@@ -206,11 +206,13 @@ final class LaunchOpensNothingTests: XCTestCase {
   /// control leg above (`testAFileLeftOpenAtQuitStillComesBack`) is the only
   /// thing that makes this measurable at all.
   ///
-  /// The second window is the trap. `start` claims the application's one
-  /// startup restore BEFORE it consults the setting, so a declining cold launch
-  /// still consumes it; were the claim taken after the gate, the replacement
-  /// launcher would arrive unclaimed and reopen the very files the user turned
-  /// off — the setting would hold for exactly one window.
+  /// The Dock-reopen launcher is the trap, and it is why `start` claims the
+  /// application's one startup restore BEFORE it consults the setting. The gate
+  /// fires on `.coldLaunch` only — by design, so the Dock still rebuilds the
+  /// workspace — but the reopen behind it is gated on the startup CLAIM, not on
+  /// the intent. Take the claim after the gate and a declining cold launch
+  /// leaves it unclaimed for the next launcher to pick up: click the Dock icon
+  /// and every file the user had just turned off comes back.
   func testColdLaunchWithRestoreOffReopensNoFilesInAnyWindow() throws {
     let harness = try makeHarness()
     let keptURL = try harness.writeLooseNote(named: "kept.md")
@@ -228,11 +230,13 @@ final class LaunchOpensNothingTests: XCTestCase {
       launched.registry.openDocuments.isEmpty,
       "the file came back as an open document despite the setting")
 
-    let replacement = harness.closeWindowAdoptingTheReplacementLauncher(launched.window)
+    let dockLauncher = harness.openDockReopenLauncher()
     XCTAssertNil(
-      replacement.appState.documentSession.url,
-      "the replacement launcher inherited the startup reopen the user had turned off")
-    XCTAssertTrue(replacement.registry.openDocuments.isEmpty)
+      dockLauncher.appState.documentSession.url,
+      "the Dock-reopen launcher inherited the startup reopen the user had turned off")
+    XCTAssertTrue(
+      dockLauncher.registry.openDocuments.isEmpty,
+      "clicking the Dock icon brought back the files the setting had just declined")
   }
 
   /// The measurement behind "first is not most recent", kept as a pin because it
@@ -479,10 +483,20 @@ private final class LaunchHarness {
     return adoptRootView(for: replacement)
   }
 
+  /// The user clicking the Dock icon later in the SAME process, with the
+  /// workspace already launched. `DocumentWindowRegistry` puts that launcher
+  /// back on `.dockReopen`, which is a different intent from the launch — so it
+  /// is the window that would inherit an unclaimed startup restore.
+  func openDockReopenLauncher() -> RelaunchedSession {
+    adoptRootView(for: makeWindow(), intent: .dockReopen)
+  }
+
   /// Everything `DocumentWindowRootView` does for one window: build the
   /// session and controller, publish the controller to the registry, run the
   /// launch decision, and report back what the window ended up holding.
-  private func adoptRootView(for window: NSWindow) -> RelaunchedSession {
+  private func adoptRootView(for window: NSWindow, intent: LaunchIntent = .coldLaunch)
+    -> RelaunchedSession
+  {
     guard let registry, let bookmarkStore, let startupRestore else {
       preconditionFailure("relaunch() first: there is no launched process to build a window in")
     }
@@ -500,7 +514,7 @@ private final class LaunchHarness {
     controller.requestOpenDocumentWindow = { registry.open($0) }
     registry.registerController(controller, for: window)
 
-    controller.start(intent: .coldLaunch)
+    controller.start(intent: intent)
 
     // What SwiftUI's `DocumentWindowAccessor` publishes for this window,
     // spelled out: a headless test has no render pass, so nothing else would
