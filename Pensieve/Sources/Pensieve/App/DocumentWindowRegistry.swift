@@ -17,6 +17,19 @@ enum WindowCloseTombstonePolicy {
   case factoryWindow
 }
 
+/// How a freshly opened document window joins the app.
+enum DocumentWindowPresentation {
+  /// The user asked for this document NOW: its tab goes in front and the app
+  /// activates. Every interactive open uses this.
+  case activateNow
+  /// Bulk restore: the tab joins the group BEHIND the selected one and is never
+  /// made key, so AppKit never displays it and its SwiftUI content is never
+  /// laid out. The caller orders the final window front once, so the end state
+  /// is the same as a run of `activateNow` opens — without paying a full
+  /// layout, and a full preview render, for every tab on the way there.
+  case joinTabGroupInBackground
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -93,6 +106,12 @@ final class DocumentWindowRegistry: ObservableObject {
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
+  /// Same merge, ordered BEHIND the target: the window joins the tab group
+  /// without becoming the selected tab. AppKit only displays the selected tab,
+  /// so a window merged this way is never laid out until the user switches to
+  /// it — which is what makes a twelve-file restore cost twelve window
+  /// constructions instead of twelve full SwiftUI layout + preview renders.
+  private let mergeWindowIntoTabsBehind: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
@@ -113,6 +132,10 @@ final class DocumentWindowRegistry: ObservableObject {
     mergeWindowIntoTabs: @escaping @MainActor (NSWindow, NSWindow) -> Void = { target, window in
       target.addTabbedWindow(window, ordered: .above)
     },
+    mergeWindowIntoTabsBehind: @escaping @MainActor (NSWindow, NSWindow) -> Void = {
+      target, window in
+      target.addTabbedWindow(window, ordered: .below)
+    },
     orderAndActivateWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
@@ -130,6 +153,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.scheduleDeferredMainWork = scheduleDeferredMainWork
     self.scheduleLauncherWindowSweep = scheduleLauncherWindowSweep
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
+    self.mergeWindowIntoTabsBehind = mergeWindowIntoTabsBehind
     self.orderAndActivateWindow = orderAndActivateWindow
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
@@ -144,11 +168,48 @@ final class DocumentWindowRegistry: ObservableObject {
   /// already as a tab. The per-window SwiftUI scene cold-starts AFTER
   /// presentation, inside the tab, behind the in-tab startup spinner.
   func open(_ ref: DocumentRef) {
+    open(ref, presentation: .activateNow)
+  }
+
+  /// The launch restore's bulk open — every ad-hoc file the user left open at
+  /// quit, in one pass.
+  ///
+  /// Opening them one interactive `open(_:)` at a time was the launch
+  /// beachball. Each of those calls makes its window the selected tab, and
+  /// AppKit answers a tab-group insertion by syncing the frames of the windows
+  /// ALREADY in the group to the newcomer
+  /// (`-[NSWindowStackController _syncInactiveTabWindowSizesToWindow:]`); every
+  /// one of those frame changes forces a synchronous full layout of that tab's
+  /// view tree, and a Pensieve document window lays out to a complete Markdown
+  /// preview render. Twelve restored files therefore paid a quadratic number of
+  /// full renders on the main thread before the app drew anything — minutes, on
+  /// a workspace the size of the operator's.
+  ///
+  /// So the restore joins the tab group WITHOUT selecting each tab, and orders
+  /// the last one front once at the end. Same files, same order, same window in
+  /// front when the dust settles; the eleven tabs behind it simply wait to be
+  /// looked at before they render.
+  func openRestoredDocuments(_ refs: [DocumentRef]) {
+    var frontmost: NSWindow?
+    for ref in refs {
+      if let window = open(ref, presentation: .joinTabGroupInBackground) {
+        frontmost = window
+      }
+    }
+    guard let frontmost else { return }
+    orderAndActivateWindow(frontmost)
+  }
+
+  @discardableResult
+  private func open(
+    _ ref: DocumentRef,
+    presentation: DocumentWindowPresentation
+  ) -> NSWindow? {
     let documentID = ref.id.standardizedFileURL
     let identity = DocumentIdentity.file(documentID).standardized
     guard canMutateWindowTabs() else {
-      deferOpen(ref, documentID: documentID)
-      return
+      deferOpen(ref, documentID: documentID, presentation: presentation)
+      return nil
     }
 
     if let existing = windowsByIdentity[identity]?.window {
@@ -159,9 +220,11 @@ final class DocumentWindowRegistry: ObservableObject {
         DebugTrace.log(
           "registry.open \(documentID.lastPathComponent) -> activate existing '\(existing.title)'")
         mergeExistingWindowIntoCurrentTabsIfNeeded(existing)
-        orderAndActivateWindow(existing)
+        if presentation == .activateNow {
+          orderAndActivateWindow(existing)
+        }
         closeEmptyLauncherWindows(except: existing)
-        return
+        return existing
       }
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> dropping dead mapping")
       windowsByDocumentID.removeValue(forKey: documentID)
@@ -172,11 +235,11 @@ final class DocumentWindowRegistry: ObservableObject {
 
     guard let makeDocumentWindow else {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> no window factory wired")
-      return
+      return nil
     }
     guard let window = makeDocumentWindow(ref) else {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned nil")
-      return
+      return nil
     }
     DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory created window")
 
@@ -193,14 +256,36 @@ final class DocumentWindowRegistry: ObservableObject {
       isDirty: false,
       window: window)
 
+    var didJoinTabGroup = false
     if let target = currentMergeTarget(), target !== window {
       prepareTabbedWindow(target)
       prepareTabbedWindow(window)
-      mergeWindowIntoTabs(target, window)
+      // Every window in a tab group ends up sharing one frame — AppKit enforces
+      // that on each insertion, and enforces it by RESIZING the windows already
+      // in the group, which lays each of their view trees out synchronously.
+      // The factory hands us a window sized to its own recipe, so that sync had
+      // something to do on every single open. Adopting the target's frame here
+      // — before the window has ever been shown, while its hosting view still
+      // has nothing laid out — leaves the group already consistent and the sync
+      // with nothing to resize.
+      window.setFrame(target.frame, display: false)
+      switch presentation {
+      case .activateNow:
+        mergeWindowIntoTabs(target, window)
+      case .joinTabGroupInBackground:
+        mergeWindowIntoTabsBehind(target, window)
+      }
+      didJoinTabGroup = true
       DebugTrace.log("merged '\(window.title)' into '\(target.title)' before first presentation")
     }
-    orderAndActivateWindow(window)
+    // A window with no group to join has no other way onto the screen: order it
+    // front even during a restore, or the file "came back" into an invisible
+    // window. With a group, the restore's own final ordering is the only one.
+    if presentation == .activateNow || !didJoinTabGroup {
+      orderAndActivateWindow(window)
+    }
     closeEmptyLauncherWindows(except: window)
+    return window
   }
 
   /// The single close lifecycle for factory callbacks and process-wide AppKit
@@ -619,12 +704,16 @@ final class DocumentWindowRegistry: ObservableObject {
       || rhs.tabbedWindows?.contains { $0 === lhs } == true
   }
 
-  private func deferOpen(_ ref: DocumentRef, documentID: URL) {
+  private func deferOpen(
+    _ ref: DocumentRef,
+    documentID: URL,
+    presentation: DocumentWindowPresentation
+  ) {
     guard deferredOpenDocumentIDs.insert(documentID).inserted else { return }
     scheduleDeferredMainWork { [weak self] in
       guard let self else { return }
       deferredOpenDocumentIDs.remove(documentID)
-      open(ref)
+      open(ref, presentation: presentation)
     }
   }
 

@@ -90,6 +90,12 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  /// The launch restore's bulk route. One call for the WHOLE working set, so
+  /// the registry can join every tab to the group and bring exactly one window
+  /// front at the end instead of paying a full window presentation — and the
+  /// tab-group frame sync that comes with it — per restored file. Unwired
+  /// (tests, headless) falls back to the per-file route.
+  var requestOpenRestoredDocumentWindows: (([DocumentRef]) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
   /// Marks this window as holding content the sweep must not reap. Called when
   /// the window adopts a recovery draft, which carries no URL for the accessor
@@ -253,6 +259,16 @@ final class AppController: ObservableObject {
     // loads in place when the window holds nothing.
     if !appState.documentSession.hasEditableBuffer {
       documentStore.load(ref: pending.removeFirst(), into: appState)
+    }
+    guard !pending.isEmpty else { return }
+
+    // The bulk route exists because the per-file one cost a full window
+    // presentation — and AppKit's tab-group frame sync, which lays out every
+    // tab already in the group — for each restored file. See
+    // `DocumentWindowRegistry.openRestoredDocuments`.
+    if let requestOpenRestoredDocumentWindows {
+      requestOpenRestoredDocumentWindows(pending)
+      return
     }
     guard let requestOpenDocumentWindow else { return }
     for ref in pending {
