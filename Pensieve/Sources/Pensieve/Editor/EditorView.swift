@@ -692,7 +692,11 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       let savedOrigin = scrollView.contentView.bounds.origin
       textStorage.replaceCharacters(
         in: NSRange(location: 0, length: textStorage.length), with: text)
-      textContentStorage.refreshHighlighting()
+      // Viewport-first past `LargeDocument.sizeBudget`, one synchronous full pass
+      // below it — which is every ordinary document, unchanged. This call site is
+      // the one the open path lands on, and a full-document pass here is seconds
+      // of frozen main thread on a large file.
+      textContentStorage.refreshHighlightingAfterFullTextReplacement()
       let newLength = (textStorage.string as NSString).length
       let caret = min(savedSelection.location, newLength)
       textView.setSelectedRange(

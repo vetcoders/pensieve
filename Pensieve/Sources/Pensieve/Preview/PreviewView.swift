@@ -165,7 +165,29 @@ struct PreviewRepresentable: NSViewRepresentable {
         return
       }
       lastAccepted = request
-      pipeline.submit(request, initial: initial)
+      pipeline.submit(request, initial: initial && Self.rendersFirstPassSynchronously(request))
+    }
+
+    /// Whether a first mount may render SYNCHRONOUSLY.
+    ///
+    /// `initial: true` exists so the reader never stares at an empty pane while
+    /// the 400 ms debounce elapses, and for an ordinary note that is the right
+    /// trade: the parse is a few milliseconds. Past `LargeDocument.sizeBudget` it
+    /// inverts — a full cmark parse plus HTML emission of a multi-megabyte
+    /// document runs on the main thread in the very turn that just applied the
+    /// text and mounted the pane, so the "instant" render is paid for by freezing
+    /// the window it was supposed to fill. A large document goes through the
+    /// debounce instead: the pane appears at once and fills a moment later, which
+    /// is the whole point of staging the open.
+    ///
+    /// Applied HERE rather than at the mount site so every route into the
+    /// pipeline is gated by it, and so the decision is reachable from a pin
+    /// without synthesising an `NSViewRepresentable.Context`.
+    static func rendersFirstPassSynchronously(_ request: PreviewRenderRequest) -> Bool {
+      // `utf8.count` rather than `count`: O(1) for a native Swift string, where
+      // counting Characters would walk the whole document just to decide whether
+      // walking the whole document is too expensive.
+      !LargeDocument.isLarge(request.markdown.utf8.count)
     }
 
     /// True when the only difference between `previous` and `next` is the

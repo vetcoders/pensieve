@@ -30,6 +30,20 @@ enum DocumentIdentity: Hashable {
 struct DocumentSession: Equatable {
   enum Kind: Equatable {
     case empty
+    /// A file this window has CLAIMED but whose bytes are still being read off
+    /// the main actor — the staged half of a large-document open.
+    ///
+    /// It carries the document, so the window, the tab, the title bar and the
+    /// registry all name the right file from the moment the user clicked, and
+    /// every post-condition the synchronous open path publishes in its own turn
+    /// (`selectedDocumentID`, `documentSession.url`) still holds in that turn.
+    ///
+    /// It does NOT carry an editable buffer. The text is empty until the read
+    /// lands, and `hasEditableBuffer` is what the whole document command surface
+    /// gates on — Save, Save As, Export, Share, Dispatch, the editor and the
+    /// preview all go quiet — so no surface can act on, or worse WRITE, the
+    /// empty placeholder buffer standing in for a file that is still loading.
+    case loading(DocumentRef)
     case untitled(title: String, identity: DocumentIdentity, recoveryID: UUID?)
     case fileBacked(DocumentRef)
   }
@@ -52,8 +66,17 @@ struct DocumentSession: Equatable {
 
   var document: DocumentRef? {
     get {
-      guard case .fileBacked(let document) = kind else { return nil }
-      return document
+      switch kind {
+      // A staged open answers with its document too: the file is the one this
+      // window is on, and everything keyed on document IDENTITY — the tab, the
+      // registry mapping, Open Recent's "did this window actually land on the
+      // file" post-condition — has to agree with the user's click immediately,
+      // not one background read later.
+      case .fileBacked(let document), .loading(let document):
+        return document
+      case .empty, .untitled:
+        return nil
+      }
     }
     set {
       kind = newValue.map(Kind.fileBacked) ?? .empty
@@ -74,13 +97,26 @@ struct DocumentSession: Equatable {
       return nil
     case .untitled(_, let identity, _):
       return identity.standardized
-    case .fileBacked(let document):
+    case .fileBacked(let document), .loading(let document):
       return .file(document.url.standardizedFileURL)
     }
   }
 
   var isUntitled: Bool {
     guard case .untitled = kind else { return false }
+    return true
+  }
+
+  /// This window has claimed a file and is still reading it off the main actor.
+  ///
+  /// Distinct from "has no buffer": an EMPTY window is idle and reapable, a
+  /// LOADING one is spoken for. Everything that asks "is this window free?" —
+  /// the registry's launcher sweep, the open router deciding between this window
+  /// and a new tab, the crash-draft restore — has to tell those two apart, the
+  /// same way `AppController.hasPendingImportWork` already makes them tell an
+  /// in-flight Word/PDF conversion apart from an idle window.
+  var isLoading: Bool {
+    guard case .loading = kind else { return false }
     return true
   }
 
@@ -104,7 +140,11 @@ struct DocumentSession: Equatable {
 
   var hasEditableBuffer: Bool {
     switch kind {
-    case .empty:
+    // `.loading` is false BY DESIGN, not by omission. Its buffer is an empty
+    // placeholder standing in for bytes that have not arrived; every write path
+    // in the app gates on this predicate, so answering true here would let a ⌘S
+    // during a large open truncate the file being opened.
+    case .empty, .loading:
       return false
     case .untitled, .fileBacked:
       return true
@@ -117,7 +157,7 @@ struct DocumentSession: Equatable {
       return ""
     case .untitled(let title, _, _):
       return title
-    case .fileBacked(let document):
+    case .fileBacked(let document), .loading(let document):
       return document.title
     }
   }
@@ -137,6 +177,15 @@ struct DocumentSession: Equatable {
   mutating func load(document: DocumentRef, text: String) {
     self.kind = .fileBacked(document)
     self.text = text
+    self.isDirty = false
+  }
+
+  /// Claims `document` for this window while its bytes are read off the main
+  /// actor. The buffer is empty and NOT editable until `load(document:text:)`
+  /// lands the real text — see `Kind.loading`.
+  mutating func beginLoading(document: DocumentRef) {
+    self.kind = .loading(document)
+    self.text = ""
     self.isDirty = false
   }
 

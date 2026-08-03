@@ -31,6 +31,8 @@ final class DocumentWindowModel {
       let url = documentSession.url
       if documentURL != url { documentURL = url }
       if documentIsDirty != documentSession.isDirty { documentIsDirty = documentSession.isDirty }
+      let loading = documentSession.isLoading
+      if documentIsLoading != loading { documentIsLoading = loading }
     }
   }
 
@@ -57,6 +59,68 @@ final class DocumentWindowModel {
   private(set) var documentHasEditableBuffer: Bool = false
   private(set) var documentURL: URL?
   private(set) var documentIsDirty: Bool = false
+  private(set) var documentIsLoading: Bool = false
+
+  // MARK: - Staged open claim
+
+  /// Which staged open this window is currently answering to.
+  ///
+  /// A background read has to be able to ask "am I still the load this window
+  /// wants?" before it applies anything, and a URL cannot answer that — the user
+  /// can close a file and reopen the SAME one while the first read is in flight,
+  /// and the stale result would then match by URL and clobber the newer session.
+  /// A strictly increasing per-window counter answers it exactly: every claim is
+  /// unique for the life of the window, so an apply either holds the current
+  /// number or is provably obsolete.
+  ///
+  /// Observation-ignored: it changes once per open and is read only by the store,
+  /// never by a view.
+  @ObservationIgnored private(set) var documentLoadClaim: UInt64 = 0
+
+  /// The in-flight background read, held only so it can be cancelled. Its result
+  /// is dropped by the claim check regardless — this is about not leaving work
+  /// running for a window nobody is looking at any more.
+  @ObservationIgnored private var pendingDocumentLoad: Task<Void, Never>?
+
+  /// Claims this window for a NEW document load and invalidates every earlier
+  /// one. Called by both open paths — the synchronous one too, which is what
+  /// makes "a small file opened over a large one in flight wins" true without a
+  /// special case.
+  @discardableResult
+  func beginDocumentLoad() -> UInt64 {
+    pendingDocumentLoad?.cancel()
+    pendingDocumentLoad = nil
+    documentLoadClaim &+= 1
+    return documentLoadClaim
+  }
+
+  func trackPendingDocumentLoad(_ task: Task<Void, Never>) {
+    pendingDocumentLoad = task
+  }
+
+  func isCurrentDocumentLoad(_ claim: UInt64) -> Bool {
+    claim == documentLoadClaim
+  }
+
+  /// The claimed load has landed. Drops the task handle without bumping the
+  /// claim: the session that just arrived IS the current one.
+  func finishDocumentLoad(_ claim: UInt64) {
+    guard isCurrentDocumentLoad(claim) else { return }
+    pendingDocumentLoad = nil
+  }
+
+  /// Window teardown, or any other abandonment of the in-flight open. Bumps the
+  /// claim so a read already past cancellation cannot apply into a window that is
+  /// on its way out.
+  func cancelPendingDocumentLoad() {
+    pendingDocumentLoad?.cancel()
+    pendingDocumentLoad = nil
+    documentLoadClaim &+= 1
+  }
+
+  deinit {
+    pendingDocumentLoad?.cancel()
+  }
 
   var mode: EditorMode = .split
   var fontSize: CGFloat = 14
@@ -137,6 +201,7 @@ final class DocumentWindowModel {
     self.documentIdentity = documentSession.identity
     self.documentTitle = documentSession.displayTitle
     self.documentHasEditableBuffer = documentSession.hasEditableBuffer
+    self.documentIsLoading = documentSession.isLoading
     self.documentURL = documentSession.url
     self.documentIsDirty = documentSession.isDirty
   }

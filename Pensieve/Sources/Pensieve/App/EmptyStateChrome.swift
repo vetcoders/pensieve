@@ -221,6 +221,51 @@ struct EmptyStateShortcuts: View {
   }
 }
 
+/// What the document pane shows while a file past `LargeDocument.sizeBudget` is
+/// being read off the main actor.
+///
+/// It is the missing half of the fix, not decoration. Moving the read off the
+/// main thread stops the beachball, but on its own it replaces a frozen window
+/// with a window that looks finished and shows nothing — which reads as "the
+/// click did not register" and invites a second click. The named file plus a
+/// spinner is the signal that the click DID land and the work is this window's.
+///
+/// Mirrors the folder-open affordance (`WorkspaceActivity.opening` +
+/// `WorkspaceActivityMiniView`) deliberately: a workspace and a large document
+/// are the same promise to the user, and they should not be two different
+/// vocabularies. This one is per WINDOW, though — `workspaceActivity` lives on
+/// the shared `WorkspaceStore`, so a spinner driven from there would appear in
+/// every window at once.
+struct DocumentOpeningView: View {
+  @EnvironmentObject private var themeManager: ThemeManager
+  let title: String
+
+  var body: some View {
+    let palette = EmptyStatePalette(theme: themeManager.skin)
+    VStack(spacing: 14) {
+      ProgressView()
+        .controlSize(.small)
+      VStack(spacing: 4) {
+        Text("Opening \(title)")
+          .font(.callout)
+          .foregroundStyle(Color(palette.primaryText))
+          .lineLimit(1)
+          .truncationMode(.middle)
+        Text("Large document — reading in the background")
+          .font(.caption)
+          .foregroundStyle(Color(palette.tertiaryText))
+      }
+    }
+    .padding(32)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(palette.background).ignoresSafeArea(.container, edges: .top))
+    .ignoresSafeArea(.container, edges: .top)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("Opening \(title)")
+    .accessibilityIdentifier("pensieve.documentOpening")
+  }
+}
+
 /// Row labels for the recent-documents list.
 ///
 /// The list shows basenames, which is what makes it readable — and ambiguous the
