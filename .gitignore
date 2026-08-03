@@ -101,6 +101,7 @@ dist/
 !CONTRIBUTING.md
 !SECURITY.md
 !AGENTS.md
+!docs/keyboard-shortcuts-and-file-lifecycle-contract.md
 /tmp
 /dist
 /docs/superpowers
