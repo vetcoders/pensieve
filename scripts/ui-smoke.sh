@@ -648,18 +648,25 @@ on assertMenuItem(appName, menuName, itemName)
 end assertMenuItem
 
 on toolbarElementByDescription(appName, targetDescription)
-  tell application "System Events"
-    tell process appName
-      set toolbarElements to entire contents of toolbar 1 of window 1
-      repeat with elementRef in toolbarElements
-        set elementDescription to ""
-        try
-          set elementDescription to get description of elementRef
-        end try
-        if elementDescription is targetDescription then return contents of elementRef
-      end repeat
+  -- AX attribute propagation can lag behind the identifier-based toolbar
+  -- census: a control can exist (and already show up by identifier) before
+  -- its localized description is queryable. Retry with a bounded backoff
+  -- instead of failing on the first miss.
+  repeat with attemptNumber from 1 to 5
+    tell application "System Events"
+      tell process appName
+        set toolbarElements to entire contents of toolbar 1 of window 1
+        repeat with elementRef in toolbarElements
+          set elementDescription to ""
+          try
+            set elementDescription to get description of elementRef
+          end try
+          if elementDescription is targetDescription then return contents of elementRef
+        end repeat
+      end tell
     end tell
-  end tell
+    if attemptNumber < 5 then delay 1
+  end repeat
   error "Missing toolbar control: " & targetDescription
 end toolbarElementByDescription
 

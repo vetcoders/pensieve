@@ -449,6 +449,26 @@ struct SidebarView: View {
           .frame(width: 5, height: 5)
           .accessibilityLabel("Edited")
       }
+      // Hover close: the ⌘W / context-menu close is undiscoverable, so surface
+      // a standard sidebar × on hover. It routes through the SAME decision path
+      // as "Close from Open Files" — a dirty document still asks Save / Don't
+      // Save / Cancel via its owning window. Kept in layout at zero opacity when
+      // not hovered so the row width does not jump; hit-testing is disabled then
+      // so it cannot be clicked while invisible.
+      Button {
+        controller.closeOpenDocument(identity: descriptor.identity)
+      } label: {
+        Image(systemName: "xmark")
+          .font(.caption2.weight(.semibold))
+          .foregroundColor(.secondary)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .opacity(hovered ? 1 : 0)
+      .allowsHitTesting(hovered)
+      .help("Close from Open Files")
+      .accessibilityLabel("Close")
+      .accessibilityIdentifier("pensieve.sidebar.openFiles.close")
     }
     .padding(.horizontal, 6)
     .help(descriptor.fileURL?.path ?? descriptor.displayTitle)
