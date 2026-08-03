@@ -843,6 +843,16 @@ tell application "System Events"
     end if
     key code 53
 
+    -- Looking this control up BY NAME, not by identifier, is the assertion and
+    -- not an implementation detail: a toolbar control declared directly in its
+    -- group is bridged to an NSToolbarItem of its own and does NOT inherit its
+    -- SwiftUI label's text the way a `ControlGroup` segment did. When this
+    -- menu left the assistants `ControlGroup` it came back as AXDescription
+    -- "menu button" with the raw SF Symbol name ("wand.and.stars") as its
+    -- AXTitle -- which is what VoiceOver then announces. The identifier census
+    -- cannot see that at all: AXIdentifier survives the move untouched, so a
+    -- census-only check would have stayed green on a control no assistive tool
+    -- can name. Keep this lookup name-based.
     set rewriteControl to my toolbarElementByDescription(appName, "Rewrite with AI")
     if (role of rewriteControl) is not "AXMenuButton" then
       error "Rewrite with AI must be a native menu button, got " & (role of rewriteControl)

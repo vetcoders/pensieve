@@ -44,7 +44,7 @@ final class MarkdownWikilinksTests: XCTestCase {
 
   private func render(_ markdown: String) -> String {
     let document = Document(parsing: markdown)
-    var emitter = HTMLEmitter()
+    var emitter = HTMLEmitter(source: markdown)
     return emitter.visit(document)
   }
 }

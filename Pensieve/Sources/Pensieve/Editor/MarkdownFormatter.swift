@@ -84,7 +84,23 @@ enum MarkdownFormatter {
   }
 
   private enum AutoconversionPatterns {
-    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX]\]\s*(.*)$"#)
+    /// `[~]` ("in progress") continues like the other two states — Return on a
+    /// `- [~] …` line opens the next item as an empty `- [ ] `, not a bare dash.
+    ///
+    /// The `(?=\s|$)` is the same separator the highlighter and `HTMLEmitter`
+    /// demand: `\s*` alone matches empty, so `- [~]wip` — a plain bullet
+    /// everywhere else in the app — reached the marker closure and Return
+    /// continued it as a task. A lookahead rather than a consuming group so the
+    /// capture-group numbering the closure indexes stays exactly as it was; the
+    /// line then falls through to `unorderedList` and continues as a bullet.
+    static let taskList = compile(#"^(\s*)([-*+])\s+\[[ xX~]\](?=\s|$)\s*(.*)$"#)
+    /// A NUMBERED task continues as a numbered task. GFM hangs the checkbox off
+    /// the list ITEM — `HTMLEmitter.visitListItem` promotes ordered items too —
+    /// so `1. [~] wip` is a checkbox the reader can see in the preview, and
+    /// Return over it used to fall through to `orderedList` and open a bare
+    /// `2. `, silently dropping the task. Same separator demand as the bullet
+    /// form, and both ordered delimiters, exactly as cmark accepts them.
+    static let orderedTaskList = compile(#"^(\s*)(\d+)([.)])\s+\[[ xX~]\](?=\s|$)\s*(.*)$"#)
     static let unorderedList = compile(#"^(\s*)([-*+])\s+(.*)$"#)
     static let orderedList = compile(#"^(\s*)(\d+)([.)])\s+(.*)$"#)
     static let blockquote = compile(#"^(\s*)>\s?(.*)$"#)
@@ -171,6 +187,19 @@ enum MarkdownFormatter {
       marker: { captures in
         guard !captures[2].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
         return "\(captures[0])\(captures[1]) [ ] "
+      }
+    ) {
+      return conversion
+    }
+
+    if let conversion = continuation(
+      matching: AutoconversionPatterns.orderedTaskList,
+      in: line,
+      caretRange: range,
+      marker: { captures in
+        guard !captures[3].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        let nextNumber = (Int(captures[1]) ?? 0) + 1
+        return "\(captures[0])\(nextNumber)\(captures[2]) [ ] "
       }
     ) {
       return conversion

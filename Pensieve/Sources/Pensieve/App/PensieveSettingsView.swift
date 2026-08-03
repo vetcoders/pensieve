@@ -81,7 +81,10 @@ struct GeneralSettingsView: View {
 
       VStack(alignment: .leading, spacing: 5) {
         Text("When off, Pensieve starts with an empty launcher — no workspace, no open files.")
-        Text("Your workspace folders stay remembered either way; turn this back on to bring them back.")
+        Text(
+          "Your workspace folders stay remembered either way; turn this back on "
+            + "to bring them back."
+        )
       }
       .font(.caption)
       .foregroundStyle(.secondary)

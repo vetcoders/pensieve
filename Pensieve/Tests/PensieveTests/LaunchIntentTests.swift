@@ -2,45 +2,43 @@ import XCTest
 
 @testable import Pensieve
 
-/// The restore matrix: intent × does it rebuild the workspace × does it select
-/// a document. Claiming the crash draft is deliberately absent — no intent does
-/// that any more (W2-D moved recovery to the launcher's Recovered Drafts
-/// section).
+/// The restore matrix: intent × does it rebuild the workspace. Both other axes
+/// are deliberately absent: no intent picks a document (restoration re-selects
+/// only what a window already showed) and no intent claims the crash draft
+/// (W2-D moved recovery to the launcher's Recovered Drafts section).
 ///
 /// The behaviour under test is the end of restoration-absorption. Closing the
-/// last document used to look like a no-op: the app put a launcher back, the
-/// launcher ran the full cold-launch restore, and the restore selected
-/// `documents.first` — not even the document that was closed. Only a cold
-/// launch may do that now.
+/// last document used to look like a no-op: the app put a launcher back and the
+/// launcher ran the full cold-launch restore. Picking a document is no longer
+/// part of that matrix at all — restoration re-selects only what a window
+/// already showed, on EVERY intent (`selectRestoredDocument`), and a draft is
+/// only ever opened because the user pointed at it.
 final class LaunchIntentTests: XCTestCase {
 
   // MARK: - Policy matrix (pure)
 
-  func testColdLaunchIsTheOnlyIntentThatRestoresTheWholeSession() {
+  func testColdLaunchRebuildsTheWorkspace() {
     XCTAssertTrue(LaunchIntent.coldLaunch.restoresWorkspace)
-    XCTAssertTrue(LaunchIntent.coldLaunch.selectsRestoredDocument)
   }
 
-  func testMidSessionLaunchersRestoreTheWorkspaceButNoDocument() {
+  func testMidSessionLaunchersStillRebuildTheWorkspace() {
     for intent: LaunchIntent in [.dockReopen, .newUntitledTab] {
       XCTAssertTrue(intent.restoresWorkspace, "\(intent) should still rebuild the sidebar")
-      XCTAssertFalse(
-        intent.selectsRestoredDocument,
-        "\(intent) must not pick a document — that is restoration reversing a conscious close")
     }
   }
 
   func testExplicitDocumentLaunchRestoresNothingAroundItsDocument() {
     XCTAssertFalse(LaunchIntent.explicitDocument.restoresWorkspace)
-    XCTAssertFalse(LaunchIntent.explicitDocument.selectsRestoredDocument)
   }
 
   // MARK: - start(intent:) — workspace and selection
 
-  /// Status quo pin. Cold-launch policy is deliberately UNCHANGED by this cut:
-  /// starting the process still brings back the workspace AND opens a document.
+  /// Cold launch rebuilds the workspace and NOTHING beyond it. The app picking a
+  /// document for the user was retired on `main` (`LaunchOpensNothingTests`);
+  /// what the user left open comes back from the file bookmarks, not from a
+  /// guess at `documents.first`.
   @MainActor
-  func testColdLaunchRestoresWorkspaceAndSelectsADocument() async throws {
+  func testColdLaunchRestoresTheWorkspaceWithoutPickingADocument() async throws {
     let harness = try makeRestoreHarness(documentNames: ["alpha.md", "zebra.md"])
 
     harness.controller.start(intent: .coldLaunch)
@@ -48,9 +46,9 @@ final class LaunchIntentTests: XCTestCase {
 
     XCTAssertEqual(harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL])
     XCTAssertFalse(harness.appState.documents.isEmpty, "cold launch must rebuild the sidebar")
-    XCTAssertNotNil(
+    XCTAssertNil(
       harness.appState.selectedDocumentID,
-      "cold launch still opens a document — this cut does not change cold-launch policy")
+      "no intent may pick a document for the user — not even a cold launch")
   }
 
   @MainActor
@@ -123,7 +121,12 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   func testStartPublishesPendingDraftsToTheLauncher() throws {
     let harness = try makeRestoreHarness(documentNames: [])
-    _ = try harness.recoveryStore.saveDraft(id: nil, title: "Untitled.md", text: "crash draft")
+    let seeded = try harness.recoveryStore.saveDraft(
+      id: nil, title: "Untitled.md", text: "crash draft")
+    // Writing a draft claims it for the buffer that produced it. A draft left
+    // behind by a CRASH has no such buffer — the process died with the claim —
+    // and only an unclaimed draft is offered on the launcher.
+    harness.recoveryStore.markDraftClosed(id: seeded.id)
 
     harness.controller.start(intent: .coldLaunch)
 
@@ -176,22 +179,31 @@ final class LaunchIntentTests: XCTestCase {
       "the workspace itself still finished restoring — only the selection stood down")
   }
 
-  /// The guard is a generation, not a latch: an open the user performs AFTER a
-  /// close is their new intent and must select normally.
+  /// The guard is a generation, not a latch. A flow that was ALREADY walking
+  /// when the user closed stands down; one that STARTS after the close carries
+  /// the new generation and restores normally. A flag would have blocked both.
+  ///
+  /// Pinned on the context itself rather than through a second workspace open:
+  /// restoration never picks a document for the user any more
+  /// (`selectRestoredDocument`), so the two outcomes are indistinguishable from
+  /// the outside once the selection is empty either way.
   @MainActor
-  func testAnOpenAfterACloseStillSelectsItsDocument() async throws {
+  func testTheCloseGuardBlocksOnlyTheFlowThatWasAlreadyRunning() throws {
     let harness = try makeRestoreHarness(documentNames: ["alpha.md"])
     let openedURL = harness.folder.appendingPathComponent("alpha.md").standardizedFileURL
     harness.documentStore.load(ref: DocumentRef(id: openedURL), into: harness.appState)
+
+    let alreadyRunning = WorkspaceSelectionContext.capture(from: harness.appState)
     harness.controller.closeActiveDocument { _ in }
     XCTAssertNil(harness.appState.selectedDocumentID)
+    let startedAfterTheClose = WorkspaceSelectionContext.capture(from: harness.appState)
 
-    harness.controller.openFolder(url: harness.folder)
-    await harness.folderManager.waitForPendingWorkspaceBuild()
-
-    XCTAssertEqual(
-      harness.appState.selectedDocumentID, openedURL,
-      "a folder the user opened after a close must still show a document")
+    XCTAssertFalse(
+      alreadyRunning.survivesConsciousClose(in: harness.appState),
+      "a flow in flight when the user closed must not select a document back in")
+    XCTAssertTrue(
+      startedAfterTheClose.survivesConsciousClose(in: harness.appState),
+      "the guard is a generation, not a latch — the NEXT flow must restore normally")
   }
 
   // MARK: - A launch URL belongs to ONE launch
@@ -239,7 +251,9 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertEqual(
       later.appState.workspaceRoots.map(\.url), [later.folder.standardizedFileURL],
       "an earlier file launch suppressed workspace restore for a later window")
-    XCTAssertNotNil(later.appState.selectedDocumentID)
+    XCTAssertFalse(
+      later.appState.documents.isEmpty,
+      "…and its sidebar was rebuilt, which is what the suppressed restore used to cost")
   }
 
   /// And a mid-session launcher keeps its own policy after a file launch: the
@@ -402,8 +416,10 @@ final class LaunchIntentTests: XCTestCase {
       "the bookmark must survive a skipped auto-restore — only the auto-invoke was skipped")
   }
 
-  /// Turning the toggle back ON restores the previous working set on the next
+  /// Turning the toggle back ON restores the previous workspace on the next
   /// cold launch (a fresh `AppController`, modeling the next process launch).
+  /// The workspace is the whole claim: picking a document is not part of the
+  /// restore matrix on any intent, so the launcher still comes up unselected.
   @MainActor
   func testRestoreSessionBackOnRestoresOnTheNextColdLaunch() async throws {
     let harness = try makeRestoreHarness(
@@ -429,7 +445,10 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertEqual(
       nextAppState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
       "flipping the setting back on must restore the workspace on the next cold launch")
-    XCTAssertNotNil(nextAppState.selectedDocumentID)
+    XCTAssertFalse(nextAppState.documents.isEmpty, "the sidebar comes back with the workspace")
+    XCTAssertNil(
+      nextAppState.selectedDocumentID,
+      "restoring the session is not picking a document — no intent does that")
   }
 
   // MARK: - Which intent each window route asks for

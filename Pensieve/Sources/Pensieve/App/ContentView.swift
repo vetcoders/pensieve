@@ -38,23 +38,20 @@ struct ContentView: View {
       appState.documentHasEditableBuffer
         ? appState.documentTitle : "Pensieve"
     )
-    .navigationSubtitle(appState.documentIsDirty ? "Edited" : "")
-    .toolbar {
-      EditorToolbelt(
-        appState: appState,
-        controller: controller,
-        themeManager: themeManager,
-        onDispatchToAgent: {
-          controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
-        },
-        isDispatchDisabled:
-          !appState.documentHasEditableBuffer
-          || !SandboxCapabilities.allowsExternalAgentDispatch(),
-        dispatchHelp:
-          SandboxCapabilities.allowsExternalAgentDispatch()
-          ? "Dispatch to Agent"
-          : SandboxCapabilities.dispatchUnavailableExplanation)
-    }
+    // 5.2: the subtitle carries the document's breadcrumb path; the dirty
+    // "Edited" state it used to hold now lives in the status bar's marker.
+    .navigationSubtitle(
+      appState.documentHasEditableBuffer
+        ? EditorToolbelt.breadcrumbSubtitle(
+          for: appState.documentURL, workspaceRoots: appState.workspaceRoots)
+        : ""
+    )
+    .toolbar { toolbelt }
+    // The clipped-items ("»") menu the bridge cannot build on its own. Anchored
+    // in the content, not the toolbar: a clipped item leaves the view tree, so a
+    // sink living inside the toolbar would stop running exactly when the
+    // overflow menu becomes the only way to reach a family.
+    .background(ToolbarOverflowSink(families: toolbelt.overflowFamilies))
     // The ONE dispatch surface: every route (toolbar, Agents menu, sidebar)
     // lands as this window's pendingDispatchIntent and presents here, in the
     // window that raised it. `.sheet(item:)` keys presentation on the intent
@@ -105,6 +102,26 @@ struct ContentView: View {
       providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
       evaluateProviderOnboarding()
     }
+  }
+
+  /// Built once per pass and used twice — as the toolbar's content and as the
+  /// source of its overflow menu — so the two can never describe different
+  /// toolbars.
+  private var toolbelt: EditorToolbelt {
+    EditorToolbelt(
+      appState: appState,
+      controller: controller,
+      themeManager: themeManager,
+      onDispatchToAgent: {
+        controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
+      },
+      isDispatchDisabled:
+        !appState.documentHasEditableBuffer
+        || !SandboxCapabilities.allowsExternalAgentDispatch(),
+      dispatchHelp:
+        SandboxCapabilities.allowsExternalAgentDispatch()
+        ? "Dispatch to Agent"
+        : SandboxCapabilities.dispatchUnavailableExplanation)
   }
 
   private var dispatchIntentBinding: Binding<DispatchIntent?> {
@@ -163,9 +180,7 @@ struct EditorPreviewSplit: View {
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
     if !appState.documentHasEditableBuffer {
-      DocumentEmptyStateView(
-        hasWorkspace: appState.hasWorkspaceContent
-      )
+      DocumentEmptyStateView()
     } else {
       switch appState.mode {
       case .source:
@@ -237,49 +252,47 @@ private struct FocusModeDimmingOverlay: View {
 /// thing the operator sees instead of stale editor/preview state.
 struct DocumentEmptyStateView: View {
   @EnvironmentObject private var controller: AppController
-  let hasWorkspace: Bool
+  @EnvironmentObject private var themeManager: ThemeManager
 
   var body: some View {
-    VStack(spacing: 18) {
-      VStack(spacing: 12) {
-        Image(systemName: "doc.text")
-          .font(.system(size: 48, weight: .light))
-          .foregroundStyle(.tertiary)
+    // This placeholder occupies the document pane, so it dresses from the active
+    // skin's surface — the same token the editor pane and the titlebar glass
+    // backing already use. `windowBackgroundColor` painted a system-grey pane
+    // that ignored the theme (parchment: cream titlebar, grey body) and stayed
+    // put on a skin switch.
+    let palette = EmptyStatePalette(theme: themeManager.skin)
+    VStack(spacing: 26) {
+      EmptyStateWordmark(size: 40, palette: palette)
 
-        Text("No Document Open")
-          .font(.title2)
-          .foregroundStyle(.secondary)
+      EmptyStateShortcuts(palette: palette)
 
-        Text(secondaryMessage)
-          .font(.callout)
-          .foregroundStyle(.tertiary)
-          .multilineTextAlignment(.center)
-          .padding(.horizontal, 32)
-          .accessibilityIdentifier("pensieve.emptyState.message")
+      EmptyStateRecents(store: controller.recentDocuments)
 
-        Text(BuildIdentity.current.conciseLabel)
-          .font(.caption)
-          .foregroundStyle(.tertiary)
-          .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
-      }
+      Text(BuildIdentity.current.conciseLabel)
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+        .accessibilityIdentifier("pensieve.emptyState.buildIdentity")
 
-      RecoveredDraftsSection()
+      RecoveredDraftsSection(palette: palette)
     }
+    // The hierarchical levels the shared chrome asks for (`.secondary` labels,
+    // the `.tertiary` build line) resolve against these, so every glyph on the
+    // pane comes from the skin instead of the system label colours — which, on a
+    // skin whose surface disagrees with its pinned appearance, land unreadable.
+    .foregroundStyle(
+      Color(palette.primaryText),
+      Color(palette.secondaryText),
+      Color(palette.tertiaryText)
+    )
+    .padding(32)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Color(NSColor.windowBackgroundColor).ignoresSafeArea(.container, edges: .top))
+    .background(Color(palette.background).ignoresSafeArea(.container, edges: .top))
     .ignoresSafeArea(.container, edges: .top)
     // The launcher is the only place a crash draft can be reached, so it reads
     // the recovery directory every time it comes back on screen — including
     // after a Close, which is exactly when a draft may have just been retired.
     .onAppear { controller.refreshRecoveredDrafts() }
     .accessibilityIdentifier("pensieve.emptyState")
-  }
-
-  private var secondaryMessage: String {
-    if hasWorkspace {
-      return "Pick a note in the sidebar, or open a Markdown file from File ▸ Open."
-    }
-    return "Open a Markdown file or folder from the File menu to get started."
   }
 }
 
@@ -291,6 +304,10 @@ struct DocumentEmptyStateView: View {
 /// nothing at all when there is no unhandled draft, which is the normal case.
 struct RecoveredDraftsSection: View {
   @EnvironmentObject private var controller: AppController
+  /// The launcher pane's own skin tokens. The section sits INSIDE the themed
+  /// empty state, so a system colour here would reinstate exactly the grey card
+  /// on a cream/ink pane the empty-state palette exists to prevent.
+  let palette: EmptyStatePalette
 
   var body: some View {
     // Nothing to recover renders NOTHING — not even a header. An always-visible
@@ -300,17 +317,17 @@ struct RecoveredDraftsSection: View {
       VStack(alignment: .leading, spacing: 8) {
         Text("Recovered Drafts")
           .font(.headline)
-          .foregroundStyle(.secondary)
+          .foregroundStyle(Color(palette.secondaryText))
 
         ForEach(controller.recoveredDrafts) { draft in
-          RecoveredDraftRow(draft: draft)
+          RecoveredDraftRow(draft: draft, palette: palette)
         }
       }
       .padding(16)
       .frame(maxWidth: 460)
       .background(
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .fill(Color(NSColor.controlBackgroundColor))
+          .fill(Color(palette.keyCapFill))
       )
       .accessibilityIdentifier("pensieve.recoveredDrafts")
     }
@@ -320,20 +337,22 @@ struct RecoveredDraftsSection: View {
 private struct RecoveredDraftRow: View {
   @EnvironmentObject private var controller: AppController
   let draft: RecoveryDraft
+  let palette: EmptyStatePalette
 
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 12) {
       VStack(alignment: .leading, spacing: 2) {
         Text(draft.title)
           .font(.callout)
+          .foregroundStyle(Color(palette.primaryText))
           .lineLimit(1)
         Text(draft.previewSnippet)
           .font(.caption)
-          .foregroundStyle(.secondary)
+          .foregroundStyle(Color(palette.secondaryText))
           .lineLimit(1)
         Text(draft.updatedAt.formatted(date: .abbreviated, time: .shortened))
           .font(.caption2)
-          .foregroundStyle(.tertiary)
+          .foregroundStyle(Color(palette.tertiaryText))
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
