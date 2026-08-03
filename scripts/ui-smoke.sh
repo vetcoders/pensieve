@@ -40,6 +40,32 @@ ok() {
   printf '\033[32m[ ok ]\033[0m %s\n' "$*"
 }
 
+# Shell out to a tiny Swift snippet that queries CoreGraphics' window server
+# directly, bypassing the Accessibility tree entirely. Used only to classify a
+# census failure: an empty AX census can mean the app truly has no window (a
+# real product FAIL) or that its window exists but is offscreen because the
+# active Space cannot host it (e.g. a fullscreen Screen Sharing session) --
+# an environment condition, not a product bug.
+dump_window_server_state() {
+  SMOKE_OWNER_NAME="$APP_NAME" swift - <<'EOF' 2>/dev/null || true
+import CoreGraphics
+import Foundation
+// Passed through the environment rather than interpolated: the heredoc is
+// quoted so the snippet stays a literal, and the owner name is the staged
+// smoke bundle's, never the operator's app.
+let owner = ProcessInfo.processInfo.environment["SMOKE_OWNER_NAME"] ?? "PensieveSmoke"
+let wl = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+var total = 0, onscreen = 0
+for w in wl where (w["kCGWindowOwnerName"] as? String) == owner
+  && (w["kCGWindowLayer"] as? Int) == 0 {
+  total += 1
+  if (w["kCGWindowIsOnscreen"] as? Bool) == true { onscreen += 1 }
+  print("CGWINDOW num=\(w["kCGWindowNumber"] ?? "?") name=\(w["kCGWindowName"] ?? "-") onscreen=\(w["kCGWindowIsOnscreen"] ?? false)")
+}
+print("CGWINDOW_SUMMARY total=\(total) onscreen=\(onscreen)")
+EOF
+}
+
 # Terminate every running instance of the app under test and block until the
 # process table is clear. AppleScript targets the app by bare process name
 # ("tell process PensieveSmoke"), and System Events resolves that name to the
@@ -376,6 +402,10 @@ if [[ $# -gt 0 && "$1" != --* ]]; then
   shift
 fi
 
+# Exit codes: 0 = pass; 1 = real FAIL (product/harness); 3 = environment
+# inconclusive -- the witness window exists but is offscreen (e.g. active
+# Space unavailable) rather than a genuine census FAIL. Never treat 3 as a
+# PASS; re-run once a normal desktop Space is active.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --toolbar-cold-only)
@@ -491,8 +521,9 @@ ax_runner=()
 if command -v gtimeout >/dev/null 2>&1; then
   ax_runner=(gtimeout --signal=TERM 60)
 fi
-"${ax_runner[@]}" osascript - "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
-  "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" <<'APPLESCRIPT'
+ax_census_status=0
+ax_census_output=$("${ax_runner[@]}" osascript - "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+  "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1 <<'APPLESCRIPT'
 on waitForProcess(appName, timeoutSeconds)
   tell application "System Events"
     repeat with i from 1 to (timeoutSeconds * 10)
@@ -875,6 +906,28 @@ my assertWindowGeometry(appName, coldPosition, coldSize, "key-window regain/redr
 log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
+) || ax_census_status=$?
+printf '%s\n' "$ax_census_output"
+
+if [[ $ax_census_status -ne 0 ]]; then
+  # A completely empty observed census can mean the app truly has no window
+  # (a real product FAIL) or that its window exists but landed offscreen
+  # because the active Space cannot host it (e.g. a fullscreen Screen Sharing
+  # session) -- an environment condition, not a product bug. A partial census
+  # (some identifiers observed, some missing) is never this case and always
+  # stays a real FAIL.
+  ax_census_env_pattern='observed:  \(-2700\)|observed: ;'
+  if [[ "$ax_census_output" =~ $ax_census_env_pattern ]]; then
+    window_server_state="$(dump_window_server_state)"
+    printf '%s\n' "$window_server_state"
+    window_server_pattern='CGWINDOW_SUMMARY total=([1-9][0-9]*) onscreen=0'
+    if [[ "$window_server_state" =~ $window_server_pattern ]]; then
+      log "UI-SMOKE-ENV: $APP_NAME window exists but is offscreen (active Space unavailable -- e.g. fullscreen Screen Sharing). Environment inconclusive, NOT a product failure. Re-run when a normal desktop Space is active."
+      exit 3
+    fi
+  fi
+  exit "$ax_census_status"
+fi
 
 ok "native UI smoke passed"
 
