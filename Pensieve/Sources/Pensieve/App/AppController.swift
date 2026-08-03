@@ -114,6 +114,18 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  /// The launch restore's bulk route. One call for the WHOLE working set, so
+  /// the registry can join every tab to the group and bring exactly one window
+  /// front at the end instead of paying a full window presentation — and the
+  /// tab-group frame sync that comes with it — per restored file. Unwired
+  /// (tests, headless) falls back to the per-file route.
+  var requestOpenRestoredDocumentWindows: (([DocumentRef]) -> Void)?
+  /// Tells the registry a document is already on screen in THIS window, so
+  /// nothing orders a window front for it afterwards. The launch window loads
+  /// the first restored file into itself; its attach lands asynchronously, and
+  /// without this the registry counts that as the document's first presentation
+  /// and pulls this window in front of the tab the restore just fronted.
+  var requestNoteDocumentAlreadyOnScreen: ((URL) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
   /// Marks this window as holding content the sweep must not reap. Called when
   /// the window adopts a recovery draft, which carries no URL for the accessor
@@ -279,9 +291,18 @@ final class AppController: ObservableObject {
   /// `applyWorkspaceScans` deliberately keeps them out of Open Files rather than
   /// listing them twice.
   private func reopenRestoredOpenFiles() {
-    let alreadyOpen = Set(documentWindowRegistry.openDocuments.map(\.identity))
-    var pending = appState.openFiles.filter { ref in
-      ref.isAdHoc && !alreadyOpen.contains(.file(ref.id.standardizedFileURL))
+    // ONE identity set for the whole pass, seeded with what is already open and
+    // grown as refs are taken. Computing "already open" once and then trusting
+    // the working set to hold each file at most once was a duplicate tab
+    // waiting to happen: a persisted set that names the same file twice — which
+    // `BookmarkStore` used to produce, since a bookmark blob is not a stable
+    // identity for the file it points at — asked the registry to open it twice
+    // before either request had registered a window.
+    var claimed = Set(documentWindowRegistry.openDocuments.map(\.identity))
+    var pending: [DocumentRef] = []
+    for ref in appState.openFiles where ref.isAdHoc {
+      guard claimed.insert(.file(ref.id.standardizedFileURL)).inserted else { continue }
+      pending.append(ref)
     }
     guard !pending.isEmpty else { return }
 
@@ -291,7 +312,25 @@ final class AppController: ObservableObject {
     // in the commonest case of exactly one file. Mirrors `openFile`, which also
     // loads in place when the window holds nothing.
     if !appState.documentSession.hasEditableBuffer {
-      documentStore.load(ref: pending.removeFirst(), into: appState)
+      let inPlace = pending.removeFirst()
+      documentStore.load(ref: inPlace, into: appState)
+      // This window is on screen and now shows `inPlace` — the restore never
+      // has to order anything for it. Say so BEFORE the bulk route runs: this
+      // window's own attach is asynchronous and lands after the pass has
+      // fronted its last tab, and the registry would read it as the document's
+      // first presentation and front this window instead. The user left a
+      // different tab in front; that is the one that must come back in front.
+      requestNoteDocumentAlreadyOnScreen?(inPlace.id)
+    }
+    guard !pending.isEmpty else { return }
+
+    // The bulk route exists because the per-file one cost a full window
+    // presentation — and AppKit's tab-group frame sync, which lays out every
+    // tab already in the group — for each restored file. See
+    // `DocumentWindowRegistry.openRestoredDocuments`.
+    if let requestOpenRestoredDocumentWindows {
+      requestOpenRestoredDocumentWindows(pending)
+      return
     }
     guard let requestOpenDocumentWindow else { return }
     for ref in pending {

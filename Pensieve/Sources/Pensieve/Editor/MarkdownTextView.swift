@@ -48,15 +48,53 @@ class MarkdownTextView: NSTextView {
   /// reliable source at detach time.
   private weak var attachedWindowUndoManager: UndoManager?
 
+  /// Every object this editor's undo entries are registered AGAINST, so a detach can
+  /// scrub all of them off the window's undo manager.
+  ///
+  /// `self` is only one of them, and not the dangerous one. AppKit's typing undo does
+  /// NOT target the text view: it registers `_undoRedoTextOperation:` against the
+  /// **text storage** (`-[NSTextStorage _undoRedoTextOperation:]` — the selector sitting
+  /// in `x1` of crash report build 528, and the method NSTextView does not even
+  /// implement). Scrubbing only `self`, as the first version of this guard did, therefore
+  /// left every keystroke's entry in place and the SIGSEGV survived the fix.
+  ///
+  /// The TextKit 2 objects are reached through `textContentStorage`, never through the
+  /// TextKit 1 `textStorage` / `layoutManager` compatibility accessors: touching those on
+  /// a TextKit 2 view can force the whole surface back into the legacy layout path.
+  /// Each surface builds its own storage/layout stack (`MarkdownEditorSurface.init`), so
+  /// nothing here is shared with another live editor.
+  private var undoTargets: [AnyObject] {
+    var targets: [AnyObject] = [self]
+    if let textContentStorage {
+      targets.append(textContentStorage)
+      if let storage = textContentStorage.textStorage {
+        targets.append(storage)
+      }
+    }
+    if let textLayoutManager {
+      targets.append(textLayoutManager)
+    }
+    return targets
+  }
+
+  private func scrubUndoEntries(from manager: UndoManager?) {
+    guard let manager else { return }
+    for target in undoTargets {
+      manager.removeAllActions(withTarget: target)
+    }
+  }
+
   /// Detach guard for the window's undo stack.
   ///
-  /// This view registers undo actions with a target of `self` into the WINDOW's undo
-  /// manager — both implicitly (AppKit typing-undo via `allowsUndo`) and explicitly
-  /// (`registerSmartPasteUndo`). That manager lives with the window, not the view, and
-  /// holds its targets `unsafe-unretained`. When SwiftUI tears this representable down
-  /// and rebuilds it, the old view is freed while its entries stay in the window's
-  /// manager — so the first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke →
-  /// objc_msgSend` onto a dangling pointer (the SIGSEGV in crash report 2026-07-19).
+  /// This editor registers undo actions into the WINDOW's undo manager — implicitly
+  /// (AppKit typing-undo via `allowsUndo`, targeting the text storage) and explicitly
+  /// (`registerSmartPasteUndo`, targeting `self`). That manager lives with the window,
+  /// not with the editor, and holds its targets `unsafe-unretained`. When SwiftUI tears
+  /// this representable down and rebuilds it — a live skin switch does exactly that —
+  /// the old view and its storage are freed while their entries stay in the surviving
+  /// window's manager. The first Cmd+Z afterwards drives `undoNestedGroup → popAndInvoke
+  /// → objc_msgSend` onto a dangling pointer (SIGSEGV, crash reports 2026-07-19 and
+  /// build 528).
   ///
   /// Clearing on `deinit` cannot fix this: by then `super.undoManager` is already `nil`,
   /// so we would scrub the `fallbackUndoManager` and miss the window's real one. Nor can
@@ -64,9 +102,14 @@ class MarkdownTextView: NSTextView {
   /// removed, the superview chain is already severed by the time this descendant's
   /// `viewWillMove` fires, so `self.window` resolves to `nil`. We therefore scrub the
   /// manager captured in `viewDidMoveToWindow` while the view was still attached.
+  ///
+  /// This is the single seam every close path funnels through: SwiftUI teardown removes
+  /// the scroll view from its superview, and `DocumentWindow.close()` (Cmd+W, the tab ×,
+  /// the red button, and the quit sweep alike) nils the window's `contentView` one runloop
+  /// turn later — both send `viewWillMove(toWindow: nil)` down the whole subtree.
   override func viewWillMove(toWindow newWindow: NSWindow?) {
     if newWindow !== window {
-      (window?.undoManager ?? attachedWindowUndoManager)?.removeAllActions(withTarget: self)
+      scrubUndoEntries(from: window?.undoManager ?? attachedWindowUndoManager)
     }
     super.viewWillMove(toWindow: newWindow)
   }

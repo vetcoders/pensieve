@@ -77,6 +77,14 @@ final class FolderManager {
   /// `waitForPendingWatcherRefresh()` answers "has the armed refresh finished", and proving that
   /// NOTHING was armed needs the counter itself — there is no task to await.
   private(set) var watcherRefreshGeneration: UInt64 = 0
+  /// Single-flight gate for the watcher refresh: set the moment a pass is ARMED and cleared when
+  /// that pass (debounce + walk + apply, plus any coalesced follow-up) has finished. While it is
+  /// set, `scheduleWatcherRefresh` records the event instead of starting a second pass.
+  private var isWatcherRefreshArmed = false
+  /// Set by an event that arrives while a pass is armed or running, and consumed by that pass as
+  /// "run exactly once more". A flag rather than a counter is the whole point: a burst of N events
+  /// buys ONE follow-up walk, not N.
+  private var pendingWatcherRescan = false
   /// One-way switch set by `quiesceForTermination()`, and the successor half of the watcher
   /// quiescence. `watcher.stop()` bumps a generation, so an FSEvents batch still on the watcher
   /// queue is discarded — but the generation is checked on that queue, BEFORE the delivery hops to
@@ -710,23 +718,61 @@ final class FolderManager {
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
-  /// Debounced, off-main watcher refresh (RC-2). Coalesces a burst of watcher events into a
-  /// single refresh after a short quiet period, then builds one presentation + search snapshot
-  /// on a background task so foreign filesystem churn never blocks the main actor. Only the
-  /// independent signature comparisons and required publications hop back to the main actor.
-  /// A new event cancels the in-flight debounce/scan, so overlapping scans cannot pile up.
+  /// Debounced, single-flight, off-main watcher refresh (RC-2). Coalesces a burst of watcher
+  /// events into a single refresh after a short quiet period, then builds one presentation +
+  /// search snapshot on a background task so foreign filesystem churn never blocks the main actor.
+  /// Only the independent signature comparisons and required publications hop back to the main
+  /// actor.
+  ///
+  /// Events arriving while a pass is still in its quiet period are absorbed by that debounce;
+  /// events arriving while its walk is already running buy exactly ONE follow-up pass, however
+  /// many of them there are. Cancel-and-re-arm — what this used to do — only looked like
+  /// coalescing: `cancel()` cannot reach a walk that is already running (see
+  /// `cancellableRefreshSnapshot`), so each surviving event batch added a full-tree walk to the
+  /// ones already burning a core, and nothing bounded the pile except the event rate. A workspace
+  /// whose event source is faster than one walk — an iCloud Drive root materialising placeholders,
+  /// a sync client, a build directory — therefore saturated every core while converging on
+  /// nothing, since each superseded pass discarded its own result.
   func scheduleWatcherRefresh(into appState: AppState) {
     // The arming site itself, so "no watcher refresh is armed after the quiescence" holds for every
     // caller rather than for the one hop that is known to reach here today. A cancel covers the task
     // that exists; only refusal covers its successor.
     guard !isQuiescedForTermination else { return }
     watcherRefreshGeneration &+= 1
+    guard !isWatcherRefreshArmed else {
+      pendingWatcherRescan = true
+      return
+    }
+    isWatcherRefreshArmed = true
     watcherRefreshTask?.cancel()
     watcherRefreshTask = Task { [weak self, weak appState, watcherDebounceNanoseconds] in
       try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
+      guard let self else { return }
+      // A cancelled pass drops the request it absorbed, deliberately: every site that cancels this
+      // task either runs an authoritative reconcile straight behind it (`scheduleExplicitRefresh`)
+      // or is tearing the workspace down (`closeWorkspace`, `quiesceForTermination`).
+      defer {
+        self.isWatcherRefreshArmed = false
+        self.pendingWatcherRescan = false
+      }
+      guard !Task.isCancelled, let appState else { return }
+      await self.runWatcherRefreshPasses(into: appState)
+    }
+  }
+
+  /// The walk/apply loop of one armed watcher refresh, entered after the first debounce has
+  /// elapsed. `pendingWatcherRescan` is cleared BEFORE each walk and re-read after it, which is
+  /// exactly what splits "already covered by this pass" from "needs the next one": an event the
+  /// walk could have seen is absorbed, an event that arrived after it started gets one more pass —
+  /// and that pass is debounced too, so a burst during a walk still costs a single follow-up.
+  private func runWatcherRefreshPasses(into appState: AppState) async {
+    while true {
+      guard !isQuiescedForTermination else { return }
+      pendingWatcherRescan = false
+      await performWatcherRefresh(into: appState)
+      guard !Task.isCancelled, pendingWatcherRescan else { return }
+      try? await Task.sleep(nanoseconds: watcherDebounceNanoseconds)
       guard !Task.isCancelled else { return }
-      guard let self, let appState else { return }
-      await self.performWatcherRefresh(into: appState)
     }
   }
 
@@ -826,13 +872,12 @@ final class FolderManager {
       let exclusions = appState.excludedWorkspacePaths
       let workspaceBuilder = self.workspaceBuilder
 
-      let snapshot = await Task.detached(priority: .userInitiated) {
-        FolderManager.refreshSnapshot(
-          roots: roots,
-          exclusions: exclusions,
-          builder: workspaceBuilder
-        )
-      }.value
+      let snapshot = await FolderManager.cancellableRefreshSnapshot(
+        roots: roots,
+        exclusions: exclusions,
+        builder: workspaceBuilder,
+        priority: .userInitiated
+      )
       guard !Task.isCancelled else { return }
       guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
         appState.excludedWorkspacePaths == exclusions
@@ -850,6 +895,35 @@ final class FolderManager {
     return task
   }
 
+  /// One workspace walk plus every artifact derived from it, run off the main actor in a way that
+  /// cancelling the OWNING task can actually stop.
+  ///
+  /// `Task.detached` inherits nothing — not the actor, not the priority, and not the cancellation.
+  /// Detachment is what keeps the walk off the main actor, but it also put the walk out of reach of
+  /// the handle callers cancel, so `WorkspaceScanner.buildCancellable`'s `Task.checkCancellation()`
+  /// was interrogating a flag nothing could set. A superseded refresh stopped being AWAITED while
+  /// its walk kept a core busy to the end. The cancellation handler is what makes the cancel honest;
+  /// the walk then returns the empty compatibility value its callers already discard.
+  private nonisolated static func cancellableRefreshSnapshot(
+    roots: [URL],
+    exclusions: Set<String>,
+    builder: @escaping WorkspaceScanner.Builder,
+    priority: TaskPriority
+  ) async -> WorkspaceRefreshSnapshot {
+    let walk = Task.detached(priority: priority) {
+      FolderManager.refreshSnapshot(
+        roots: roots,
+        exclusions: exclusions,
+        builder: builder
+      )
+    }
+    return await withTaskCancellationHandler {
+      await walk.value
+    } onCancel: {
+      walk.cancel()
+    }
+  }
+
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
   /// off-main; only delta decisions and publication touch main-actor state.
   private func performWatcherRefresh(into appState: AppState) async {
@@ -859,13 +933,12 @@ final class FolderManager {
     let exclusions = appState.excludedWorkspacePaths
     let workspaceBuilder = workspaceBuilder
 
-    let snapshot = await Task.detached(priority: .utility) {
-      FolderManager.refreshSnapshot(
-        roots: roots,
-        exclusions: exclusions,
-        builder: workspaceBuilder
-      )
-    }.value
+    let snapshot = await FolderManager.cancellableRefreshSnapshot(
+      roots: roots,
+      exclusions: exclusions,
+      builder: workspaceBuilder,
+      priority: .utility
+    )
     guard !Task.isCancelled else { return }
     guard appState.workspaceRoots.map({ $0.url.standardizedFileURL.path }) == rootPaths,
       appState.excludedWorkspacePaths == exclusions

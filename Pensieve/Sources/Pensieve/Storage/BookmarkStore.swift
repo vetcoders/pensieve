@@ -52,14 +52,36 @@ final class BookmarkStore {
     activate(url)
   }
 
+  /// Records one ad-hoc file in the persisted working set.
+  ///
+  /// Identity is the RESOLVED PATH, never the bookmark blob. Blob equality is
+  /// what this used to dedupe on, and it does not hold: the bytes minted for a
+  /// file vary with the spelling of the URL and with volume metadata, so
+  /// re-opening the same file could append a second entry pointing at it. The
+  /// operator's working set carried fifteen bookmarks for twelve files — three
+  /// pairs — and every one of those pairs was a duplicate the launch restore
+  /// would have opened twice.
+  ///
+  /// An existing entry is REPLACED where it stands rather than moved to the
+  /// end: the order of this key is the working set's order, and the cap prunes
+  /// from the front of it. Entries a previous build already duplicated collapse
+  /// onto that first position, so a key can heal through an ordinary open
+  /// instead of waiting for the next launch.
   func persistFile(url: URL, into appState: AppState) throws {
     let data = try url.bookmarkData(
       options: [.withSecurityScope],
       includingResourceValuesForKeys: nil,
       relativeTo: nil
     )
+    let targetPath = url.standardizedFileURL.path
     var bookmarks = fileBookmarkData
-    if !bookmarks.contains(data) {
+    let matches = bookmarks.indices.filter { resolvedPath(for: bookmarks[$0]) == targetPath }
+    if let first = matches.first {
+      bookmarks[first] = data
+      for duplicate in matches.dropFirst().reversed() {
+        bookmarks.remove(at: duplicate)
+      }
+    } else {
       bookmarks.append(data)
     }
     defaults.set(bookmarks, forKey: fileBookmarksKey)
@@ -71,6 +93,12 @@ final class BookmarkStore {
   /// This preserves the previous relaunch state if one of the requested URLs cannot produce a
   /// security-scoped bookmark; callers can still update their live in-memory workspace and surface
   /// the persistence failure without erasing otherwise valid roots.
+  ///
+  /// This is the one writer that takes a whole list at once, so it is the one
+  /// writer that could put a file in the working set twice by simply being
+  /// handed it twice. Its only caller passes the live Open Files list, which is
+  /// de-duplicated upstream — the guard below is what keeps that a fact about
+  /// this key rather than a fact about today's callers.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
     let roots = try rootURLs.map { url in
       (
@@ -82,16 +110,20 @@ final class BookmarkStore {
         )
       )
     }
-    let files = try fileURLs.map { url in
-      (
-        url.standardizedFileURL,
-        try url.bookmarkData(
-          options: [.withSecurityScope],
-          includingResourceValuesForKeys: nil,
-          relativeTo: nil
+    var seenFilePaths: Set<String> = []
+    let files =
+      try fileURLs
+      .filter { seenFilePaths.insert($0.standardizedFileURL.path).inserted }
+      .map { url in
+        (
+          url.standardizedFileURL,
+          try url.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+          )
         )
-      )
-    }
+      }
 
     stopAllAccess()
     defaults.set(roots.map(\.1), forKey: rootBookmarksKey)
@@ -155,22 +187,8 @@ final class BookmarkStore {
 
     appState.bookmarkData = roots.first
 
-    let rootURLs = restoreURLs(
-      from: roots,
-      expectedKind: .directory,
-      staleHandler: { [weak self] url, appState in
-        try self?.persistRoot(url: url, into: appState)
-      },
-      into: appState
-    )
-    let fileURLs = restoreURLs(
-      from: files,
-      expectedKind: .file,
-      staleHandler: { [weak self] url, appState in
-        try self?.persistFile(url: url, into: appState)
-      },
-      into: appState
-    )
+    let rootURLs = restoreRootURLs(from: roots, into: appState)
+    let fileURLs = restoreFileURLs(from: files)
 
     return RestoredWorkspaceBookmarks(rootURLs: rootURLs, fileURLs: fileURLs)
   }
@@ -295,17 +313,7 @@ final class BookmarkStore {
     defaults.array(forKey: fileBookmarksKey) as? [Data] ?? []
   }
 
-  private enum ExpectedKind {
-    case directory
-    case file
-  }
-
-  private func restoreURLs(
-    from bookmarks: [Data],
-    expectedKind: ExpectedKind,
-    staleHandler: (URL, AppState) throws -> Void,
-    into appState: AppState
-  ) -> [URL] {
+  private func restoreRootURLs(from bookmarks: [Data], into appState: AppState) -> [URL] {
     bookmarks.compactMap { data in
       var bookmarkIsStale = false
       do {
@@ -316,18 +324,14 @@ final class BookmarkStore {
           bookmarkDataIsStale: &bookmarkIsStale
         )
 
-        let exists =
-          expectedKind == .directory
-          ? isExistingDirectory(url)
-          : isExistingFile(url)
-        guard exists else {
+        guard isExistingDirectory(url) else {
           return nil
         }
 
         activate(url)
 
         if bookmarkIsStale {
-          try staleHandler(url, appState)
+          try persistRoot(url: url, into: appState)
         }
 
         return url
@@ -338,6 +342,78 @@ final class BookmarkStore {
         return nil
       }
     }
+  }
+
+  /// Resolves the persisted working set AND writes back what resolution proved
+  /// dead, because two kinds of entry must not survive a launch:
+  ///
+  /// - a DUPLICATE of a file already in the set. Bookmark blobs are not stable
+  ///   identities, so the same file could be recorded twice (see `persistFile`);
+  ///   restoring both asked the app to open one file as two tabs.
+  /// - a ref that now resolves INTO THE TRASH. A trashed file still exists, so
+  ///   the existence check passes and the launch faithfully reopened a document
+  ///   the user threw away. The product rule is that the Trash is dead: a file
+  ///   in it does not exist for Pensieve.
+  ///
+  /// Everything else keeps its bookmark, including entries that fail to resolve
+  /// or point at something missing today — unresolvable is not garbage, and an
+  /// unplugged volume must never cost the user a file. Those are dropped from
+  /// the RESTORED list only, exactly as before.
+  private func restoreFileURLs(from bookmarks: [Data]) -> [URL] {
+    var survivingBookmarks: [Data] = []
+    var restoredURLs: [URL] = []
+    var seenPaths: Set<String> = []
+
+    for data in bookmarks {
+      var bookmarkIsStale = false
+      guard
+        let url = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        )
+      else {
+        survivingBookmarks.append(data)
+        continue
+      }
+
+      let standardizedURL = url.standardizedFileURL
+      guard !Self.isInTrash(standardizedURL) else { continue }
+      guard seenPaths.insert(standardizedURL.path).inserted else { continue }
+      guard isExistingFile(url) else {
+        survivingBookmarks.append(data)
+        continue
+      }
+
+      activate(url)
+      // A stale bookmark is REPLACED here rather than re-persisted through
+      // `persistFile`: appending a refreshed blob while the stale one stays in
+      // the key is how a working set grows a second entry for a file it already
+      // holds.
+      let refreshed =
+        bookmarkIsStale
+        ? (try? url.bookmarkData(
+          options: [.withSecurityScope],
+          includingResourceValuesForKeys: nil,
+          relativeTo: nil))
+        : nil
+      survivingBookmarks.append(refreshed ?? data)
+      restoredURLs.append(url)
+    }
+
+    if survivingBookmarks != bookmarks {
+      defaults.set(survivingBookmarks, forKey: fileBookmarksKey)
+    }
+    return restoredURLs
+  }
+
+  /// Whether `url` lives in a Trash directory — the user's `~/.Trash` or a
+  /// volume's `/.Trashes/<uid>`. Matched on path components rather than against
+  /// one resolved Trash URL because a working set can span volumes, and every
+  /// volume has its own.
+  private static func isInTrash(_ url: URL) -> Bool {
+    url.standardizedFileURL.pathComponents.contains { $0 == ".Trash" || $0 == ".Trashes" }
   }
 }
 
