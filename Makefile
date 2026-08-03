@@ -104,6 +104,7 @@ test:  ## Run unit + integration tests
 .PHONY: test-scripts
 test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
+	@$(SCRIPTS)/test-rpath-hygiene.sh
 
 .PHONY: ui-smoke
 ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
