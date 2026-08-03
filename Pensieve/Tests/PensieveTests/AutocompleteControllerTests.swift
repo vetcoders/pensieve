@@ -186,6 +186,105 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(store.session(for: "doc-undo").continuation, .none)
   }
 
+  /// The undo hook has to listen to the manager the editor really undoes through.
+  /// `MarkdownTextView.undoManager` resolves up the responder chain to the WINDOW's
+  /// manager, so a hosted editor's Cmd+Z never passes through the private
+  /// `fallbackUndoManager` the surface answers with while it has no window — which
+  /// is exactly what the observer used to be pinned to at `init` time. The
+  /// windowless sibling test above cannot see that: there both sides are the
+  /// fallback manager, so it stayed green while every real undo left the opaque
+  /// continuation pointing at a document state the user had just rewound.
+  func testUndoInAHostingWindowInvalidatesOpaqueContinuation() {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("undo-window-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    store.save(
+      DocumentAISession(
+        documentID: "doc-undo-window",
+        providerFingerprint: ProviderFingerprint(
+          shape: .openAIResponses,
+          endpoint: "https://api.openai.com/v1/responses",
+          model: "gpt-test"),
+        acceptedTurns: [AcceptedAITurn(input: "hello", output: " world")],
+        continuation: .openAI(previousResponseID: "resp-committed")))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(), debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello world",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-undo-window",
+      autocompleteController: controller)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.contentView = surface.scrollView
+    window.makeFirstResponder(surface.textView)
+    // The window is the undo authority once the surface is hosted; if this ever
+    // stops holding, the rest of the test would be measuring the wrong manager.
+    XCTAssertTrue(surface.textView.undoManager === window.undoManager)
+    surface.textView.setSelectedRange(NSRange(location: 11, length: 0))
+
+    surface.textView.insertText("!", replacementRange: NSRange(location: 11, length: 0))
+    XCTAssertEqual(surface.textStorage.string, "hello world!")
+    surface.textView.undoManager?.undo()
+
+    // Asserted so the continuation check can never pass vacuously on an undo
+    // that did not actually run.
+    XCTAssertEqual(surface.textStorage.string, "hello world")
+    XCTAssertEqual(store.session(for: "doc-undo-window").continuation, .none)
+  }
+
+  /// The routing itself, with no text edit in play: any undo on the manager this
+  /// editor is attached to must reach the hook. Keeps the pin honest even if a
+  /// future text-change path starts invalidating the continuation on its own and
+  /// would otherwise mask a dead observer.
+  func testUndoOnTheHostingWindowManagerReachesTheEditorHook() {
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("undo-isolated-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = DocumentAISessionStore(fileURL: file)
+    store.save(
+      DocumentAISession(
+        documentID: "doc-undo-isolated",
+        providerFingerprint: ProviderFingerprint(
+          shape: .openAIResponses,
+          endpoint: "https://api.openai.com/v1/responses",
+          model: "gpt-test"),
+        acceptedTurns: [AcceptedAITurn(input: "hello", output: " world")],
+        continuation: .openAI(previousResponseID: "resp-committed")))
+    let controller = AutocompleteController(
+      engine: MockVistaAutocompleteEngine(), debounceNanoseconds: 1, sessionStore: store)
+    let surface = MarkdownEditorSurface(
+      text: "hello world",
+      fontSize: 14,
+      syntaxHighlightingEnabled: true,
+      tableTidyOnPaste: true,
+      asciiSafeTables: false,
+      aiAutocompleteEnabled: false,
+      documentID: "doc-undo-isolated",
+      autocompleteController: controller)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.contentView = surface.scrollView
+    window.makeFirstResponder(surface.textView)
+    let manager = surface.textView.undoManager
+    let sentinel = NSObject()
+    manager?.registerUndo(withTarget: sentinel) { _ in }
+    manager?.undo()
+
+    XCTAssertEqual(store.session(for: "doc-undo-isolated").continuation, .none)
+  }
+
   func testRewriteUsesExactSelectionAndAcceptsAsOneUndoableEdit() async {
     let file = FileManager.default.temporaryDirectory
       .appendingPathComponent("rewrite-session-\(UUID().uuidString).json")
