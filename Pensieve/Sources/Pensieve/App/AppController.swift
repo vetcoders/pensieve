@@ -54,6 +54,7 @@ final class AppController: ObservableObject {
   private let folderManager: FolderManager
   private let documentStore: DocumentStore
   private let indexDatabase: IndexDatabase
+  private let launchSettings: LaunchSettings
   private let documentWindowRegistry: DocumentWindowRegistry
   private let startupRestore: ApplicationStartupRestore
   let recentDocuments: RecentDocumentsStore
@@ -150,6 +151,7 @@ final class AppController: ObservableObject {
     folderManager: FolderManager,
     documentStore: DocumentStore,
     indexDatabase: IndexDatabase? = nil,
+    launchSettings: LaunchSettings? = nil,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
     startupRestore: ApplicationStartupRestore = .shared,
     recentDocuments: RecentDocumentsStore? = nil,
@@ -192,6 +194,7 @@ final class AppController: ObservableObject {
     self.folderManager = folderManager
     self.documentStore = documentStore
     self.indexDatabase = indexDatabase ?? .shared
+    self.launchSettings = launchSettings ?? .shared
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.startupRestore = startupRestore
     self.recentDocuments = recentDocuments ?? .shared
@@ -268,6 +271,17 @@ final class AppController: ObservableObject {
     // branch can return early: whichever window gets here first IS the launch,
     // and every launcher after it must be an empty launcher.
     let isApplicationStartupRestore = startupRestore.claimStartupRestore()
+
+    // The toggle governs LAUNCH only: a cold launch with it off lands on the
+    // clean launcher, but Dock reopen / the tab bar's "+" still rebuild the
+    // workspace they always did — those never asked to restore a whole
+    // session, only to put a launcher back. Persisted bookmarks are untouched
+    // either way; only this auto-invoke is skipped. The claim above is taken
+    // FIRST on purpose: a declining cold launch is still the application's one
+    // startup restore, so the launcher that appears later cannot inherit the
+    // document reopen the user just turned off.
+    if intent == .coldLaunch, !launchSettings.restoreSessionOnLaunch { return }
+
     folderManager.restoreLastFolderInBackground(into: appState)
     guard isApplicationStartupRestore else { return }
     reopenRestoredOpenFiles()
