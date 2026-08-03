@@ -386,12 +386,18 @@ final class AutocompleteControllerTests: XCTestCase {
     })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
+    // Both waits are conditions, not durations. The failure being pinned here is
+    // a LATCH — a state that never arrives — so waiting on the state itself is
+    // the honest test: a fixed sleep only asks whether this machine was fast
+    // enough, and the reported error travels a debounce, a detached task and a
+    // `MainActor` hop before it lands. Measured: this test is green locally and
+    // was the one that timed out on a loaded CI runner.
     controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { controller.lastError != nil }
     XCTAssertEqual(controller.lastError, "AI autocomplete failed: connection reset")
 
     controller.textDidChange(prefix: "hello a")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil { attempts.value == 2 }
 
     XCTAssertEqual(
       attempts.value, 2,

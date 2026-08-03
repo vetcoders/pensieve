@@ -132,6 +132,10 @@ final class WorkspaceFreshnessTests: XCTestCase {
     let appState = AppState()
     harness.manager.open(url: root, into: appState)
     await settle(harness)
+    // Opening a workspace shows its tree; the document being read is the user's
+    // pick (RefreshOpensNothingTests), and this test is about what a refresh
+    // does to it afterwards.
+    selectDocument(at: note, in: appState)
     let callsAfterOpen = harness.scanProbe.callCount
 
     try "clean external replacement".write(to: note, atomically: true, encoding: .utf8)

@@ -992,14 +992,25 @@ final class FolderManager {
       return
     }
 
-    if let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
-    } else {
-      appState.selectedDocumentID = nil
-      appState.activeDocumentURL = nil
-      appState.activeDocumentText = ""
-      appState.activeDocumentDirty = false
-    }
+    // Nothing to re-select: the empty state, never a substitute document. This
+    // used to fall back to `documents.first` — the same fallback the restore
+    // path carried, with the same two failure modes. A session with nothing
+    // open (which, since a launch stopped picking for the user, is what an
+    // untouched session looks like) had a document opened FOR it by the next
+    // file event that happened to reach the watcher. And a user whose document
+    // left the workspace — trashed, or its folder excluded — got a neighbouring
+    // file in the editor they had not asked to change; `removeReferences` has
+    // already cleared the selection by then, so this branch was free to fill it.
+    //
+    // The paths that legitimately move a selection never reach here: rename and
+    // move re-point `selectedDocumentID` through `replaceReferences` BEFORE
+    // scheduling the refresh, so the document is found by the branch above, and
+    // create/duplicate select the new document themselves. Nor does opening a
+    // different workspace, which is the cold path.
+    appState.selectedDocumentID = nil
+    appState.activeDocumentURL = nil
+    appState.activeDocumentText = ""
+    appState.activeDocumentDirty = false
   }
 
   func addExcludedURLs(_ urls: [URL], into appState: AppState) {
@@ -1797,6 +1808,14 @@ final class FolderManager {
       .map { $0.standardizedFileURL }
       .filter { seenOpenFileURLs.insert($0).inserted }
       .map { DocumentRef(id: $0, isAdHoc: true) }
+    // THE CAP APPLIES TO WHAT A LAUNCH INHERITS, not only to what a session
+    // grows. The restored set is every bookmark that survived — for an install
+    // that predates the paired prune below, that is every ad-hoc file ever
+    // opened and not explicitly closed — and the startup restore now opens the
+    // working set for real, one tab per ref. Nothing in-session can repair such
+    // a key; only the restore can, so the newest `maxOpenFiles` are kept here
+    // and the rest lose their bookmarks with their rows.
+    pruneOpenFiles(into: appState)
     appState.lastError = nil
   }
 
@@ -2196,6 +2215,22 @@ final class FolderManager {
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
   }
 
+  /// Re-selects the document this window was already on after the workspace
+  /// collection is rebuilt — and NOTHING else.
+  ///
+  /// It used to fall back to `documents.first` when there was no previous
+  /// selection, which on a launch is always. That is how a file the operator had
+  /// not touched in two weeks became the one open document after a launch, with
+  /// no bookmark of its own anywhere in the working set: nothing restored it, the
+  /// app picked it. `documents.first` is not "the most recent" — the scan sorts
+  /// folders before files and each group alphabetically, then walks depth-first,
+  /// so it is the first Markdown file inside the alphabetically-first folder
+  /// chain.
+  ///
+  /// An empty session therefore stays empty. What the user left open comes back
+  /// through the store that actually records it — the file bookmarks behind Open
+  /// Files — and a launch with none shows the launcher, which is what "nothing
+  /// was open" looks like.
   private func selectRestoredDocument(previousSelection: DocumentRef.ID?, into appState: AppState) {
     guard !appState.documentSession.isDirty else { return }
 
@@ -2210,8 +2245,6 @@ final class FolderManager {
       let ref = documents.first(where: { $0.id == previousSelection })
     {
       DocumentStore.shared.select(ref: ref, into: appState)
-    } else if let first = documents.first {
-      DocumentStore.shared.select(ref: first, into: appState)
     } else {
       appState.selectedDocumentID = nil
       appState.activeDocumentURL = nil
@@ -2328,8 +2361,15 @@ final class FolderManager {
     }
   }
 
+  /// The working-set prune, and the bookmark side of it. `persistFile` only ever
+  /// grows the key, and before this the only things that shrank it were an
+  /// explicit close and the removal of a root — so an eviction here left a
+  /// bookmark the next launch would restore into a row the cap had already
+  /// rejected.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 }
 
@@ -2976,6 +3016,27 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
+  /// The user closed this file OUT of Open Files — the list itself, not just a
+  /// window onto it. Retires it from the WORKING SET a relaunch restores from.
+  ///
+  /// Closing a document window is deliberately NOT this: a window is a view of
+  /// a file, and quitting with files open has to bring them back. Open Files is
+  /// the file list, so removing a row from it is the user saying "stop carrying
+  /// this one". Those two intents were previously served by the same code path,
+  /// which is why the second one did nothing that outlived the process: the row
+  /// disappeared with the window, and the next launch read a working set nobody
+  /// had told.
+  ///
+  /// Two stores hold that answer and both have to hear it, or whichever one is
+  /// missed reseeds the other on the next launch: the in-memory `openFiles`
+  /// working set, shared across windows, and the persisted file bookmarks,
+  /// which are what a relaunch actually reads.
+  func forgetOpenFile(_ url: URL, into appState: AppState) {
+    let standardizedURL = url.standardizedFileURL
+    appState.openFiles.removeAll { $0.url.standardizedFileURL == standardizedURL }
+    bookmarkStore.removeFile(url: standardizedURL)
+  }
+
   @discardableResult
   func restoreRecoveredDraft(into appState: AppState) -> Bool {
     guard !appState.documentSession.hasEditableBuffer else { return false }
@@ -3508,8 +3569,13 @@ final class DocumentStore {
     appState.selectedDocumentID = ref.id
   }
 
+  /// Same contract as `FolderManager`'s: whatever the cap drops out of the list
+  /// also leaves the persisted set, so the two never disagree about what the
+  /// working set is.
   private func pruneOpenFiles(into appState: AppState, protecting protectedID: URL? = nil) {
-    pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    let evicted = pruneOpenFilesWorkingSet(into: appState, protecting: protectedID)
+    guard !evicted.isEmpty else { return }
+    bookmarkStore.removeFiles(urls: evicted.map(\.url))
   }
 
   private static func promptForDirtyUntitledSession(
@@ -3593,9 +3659,17 @@ private final class WorkspaceOpenGeneration: @unchecked Sendable {
   }
 }
 
+/// Trims the working set to its declared size and RETURNS what it dropped, so
+/// the caller can take the evicted files out of the persisted set too. A
+/// bookmark with no row is the same invisible state as a row with no window: the
+/// next launch resolves it, restores it, and — since the startup restore opens
+/// the working set for real — hands the user a tab for a file they stopped using
+/// months ago.
 @MainActor
-private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil) {
-  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return }
+private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protectedID: URL? = nil)
+  -> [DocumentRef]
+{
+  guard appState.openFiles.count > WorkspaceStore.maxOpenFiles else { return [] }
 
   let activePath = (protectedID ?? appState.selectedDocumentID)?.path
   var protected: DocumentRef?
@@ -3607,9 +3681,11 @@ private func pruneOpenFilesWorkingSet(into appState: AppState, protecting protec
   }
 
   let allowedCount = WorkspaceStore.maxOpenFiles - (protected == nil ? 0 : 1)
+  let evicted = Array(candidates.dropLast(min(max(allowedCount, 0), candidates.count)))
   candidates = Array(candidates.suffix(max(allowedCount, 0)))
   if let protected {
     candidates.append(protected)
   }
   appState.openFiles = candidates
+  return evicted
 }

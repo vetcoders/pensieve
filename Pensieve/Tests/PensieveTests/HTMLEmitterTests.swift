@@ -6,7 +6,7 @@ import XCTest
 final class HTMLEmitterTests: XCTestCase {
   private func render(_ markdown: String) -> String {
     let document = Document(parsing: markdown)
-    var emitter = HTMLEmitter()
+    var emitter = HTMLEmitter(source: markdown)
     return emitter.visit(document)
   }
 
@@ -105,6 +105,222 @@ final class HTMLEmitterTests: XCTestCase {
       html.contains("class=\"task-list-item-checkbox\" disabled checked />"), html)
   }
 
+  func testInProgressTaskEmitsThirdStateWithoutTheLiteralMarker() {
+    let html = render("- [~] wip")
+    XCTAssertTrue(html.contains("<li class=\"task-list-item\">"), html)
+    XCTAssertTrue(
+      html.contains(
+        "class=\"task-list-item-checkbox\" disabled data-vc-task-state=\"in-progress\" aria-checked=\"mixed\" />"
+      ), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+    XCTAssertTrue(html.contains(">wip</p>"), html)
+    // The third state is never `checked` — that would make it read as done.
+    XCTAssertFalse(html.contains("checked />"), html)
+  }
+
+  /// THE REFERENCE the editor panes have to agree with. GFM puts task markers on
+  /// list items, not on bullets: `visitListItem` runs for ordered items too, so a
+  /// numbered task is a real checkbox in the preview — in every state and with
+  /// either ordered delimiter.
+  func testNumberedListItemsAreTasksToo() {
+    for markdown in ["1. [x] done", "1. [ ] todo", "1) [x] done"] {
+      let html = render(markdown)
+      XCTAssertTrue(html.contains("task-list-item"), "\(markdown) → \(html)")
+    }
+    let inProgress = render("1. [~] wip")
+    XCTAssertTrue(inProgress.contains("data-vc-task-state=\"in-progress\""), inProgress)
+    XCTAssertFalse(inProgress.contains("[~]"), inProgress)
+  }
+
+  func testInProgressTaskKeepsInlineChildrenAndNestedBlocks() {
+    let html = render("- [~] **bold** tail\n  - [~] inner")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 2, html)
+    XCTAssertTrue(html.contains("<strong>bold</strong> tail"), html)
+    XCTAssertTrue(html.contains(">inner</p>"), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+  }
+
+  func testEmptyInProgressTaskEmitsBareItemLikeAnEmptyUncheckedTask() {
+    let html = render("- [~]")
+    XCTAssertTrue(html.contains("data-vc-task-state=\"in-progress\""), html)
+    XCTAssertFalse(html.contains("[~]"), html)
+    XCTAssertFalse(html.contains("<p"), html)
+  }
+
+  /// `[~]` is a checkbox only where GFM would accept one: opening the item and
+  /// followed by whitespace. Everything else stays prose.
+  func testTildeMarkerOutsideTaskPositionStaysLiteralText() {
+    for markdown in ["- [~]wip", "- wip [~] tail", "[~] loose paragraph"] {
+      let html = render(markdown)
+      XCTAssertFalse(html.contains("task-list-item"), "\(markdown) → \(html)")
+      XCTAssertTrue(html.contains("[~]"), "\(markdown) → \(html)")
+    }
+  }
+
+  /// GFM keeps an escaped `\[x]` as prose; the third state must obey the same
+  /// escape. cmark resolves `\[` before it builds the Text node, so the AST alone
+  /// cannot tell `\[~] wip` from `[~] wip` — the emitter has to consult the
+  /// source. An author who escaped the marker asked for literal text.
+  func testEscapedMarkerStaysProseInsteadOfBecomingATask() {
+    let html = render("- \\[~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
+  /// The escape must not disarm the marker for the whole document: the unescaped
+  /// sibling in the same list still promotes, and the escaped one is untouched.
+  func testEscapedAndRealMarkersCoexistInOneList() {
+    let html = render("- \\[~] literal\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// The source lookup is by line + column, so a marker that is not on line 1
+  /// (and sits behind a longer prefix) must resolve just as exactly.
+  func testEscapeDetectionHoldsForLaterLinesAndNestedItems() {
+    let html = render("intro\n\n- first\n- [~] real\n  - \\[~] literal\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+  }
+
+  /// The source check asked the WRONG question: "is the first byte a
+  /// backslash?" A backslash is not the only way to reach a `[` that the author
+  /// did not type — cmark decodes character references during inline parsing, so
+  /// `&#91;~] wip` arrives in the AST as a pristine `[~] wip` whose first source
+  /// byte is `&`. That is not a backslash, so the old test said "not escaped"
+  /// and promoted a task GFM would never promote. Ask the positive question
+  /// instead: the marker counts only when the source really begins with `[`.
+  func testEntityEncodedMarkerStaysProseInsteadOfBecomingATask() {
+    let html = render("- &#91;~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
+  /// THE CONTROL LEG for the positive test. Turning "not a backslash" into "is a
+  /// `[`" must not disarm the plainly written marker beside it.
+  func testAPlainlyWrittenMarkerStillPromotesBesideAnEncodedOne() {
+    let html = render("- &#91;~] encoded\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] encoded"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// The opening byte was only ONE THIRD of the marker. Checking `[` alone left
+  /// the other two characters free to be spelled any way at all: `- [&#126;] wip`
+  /// and `- [~&#93; wip` both open with a literal `[`, and cmark decodes the
+  /// reference so a leading `Text` reading `[~] wip` reaches the emitter — the
+  /// check said yes and prose was promoted to an in-progress checkbox GFM would
+  /// never recognize. The source has to carry all three bytes, not the first one.
+  func testMarkerWithAnEncodedInteriorCharacterStaysProse() {
+    for markdown in ["- [&#126;] wip", "- [~&#93; wip"] {
+      let html = render(markdown)
+      XCTAssertFalse(html.contains("task-list-item"), "\(markdown) → \(html)")
+      XCTAssertFalse(html.contains("data-vc-task-state"), "\(markdown) → \(html)")
+      XCTAssertTrue(html.contains("[~] wip"), "\(markdown) → \(html)")
+    }
+  }
+
+  /// CONTROL LEG. `- [~&#93;] wip` decodes to `[~]] wip`, which the trailing-byte
+  /// rule ALREADY kept as prose (the character after the marker is `]`, not
+  /// whitespace) — so it is green before this cut and has to stay green after it.
+  /// It is here because that rule stops being the thing protecting it the moment
+  /// the marker check changes shape.
+  func testEncodedClosingBracketBesideARealOneStaysProse() {
+    let html = render("- [~&#93;] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~]] wip"), html)
+  }
+
+  /// CONTROL LEG. Demanding all three bytes must not disarm the marker anyone
+  /// actually writes — the plain one still promotes, beside an encoded sibling in
+  /// the same list.
+  func testPlainMarkerStillPromotesBesideAnEncodedInterior() {
+    let html = render("- [&#126;] encoded\n- [~] real\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] encoded"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// CONTROL LEG. The earlier finding's case — an encoded OPENING bracket — is
+  /// still prose. Widening the check from one byte to three must keep what the
+  /// one-byte check already caught.
+  func testEncodedOpeningBracketIsStillProseUnderTheWiderCheck() {
+    let html = render("- &#91;~] wip")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] wip"), html)
+  }
+
+  /// The source index counted a line start only at `\n`, but cmark treats a
+  /// LONE CR as a line ending too and advances its line numbers accordingly. In
+  /// a CR-only document the index therefore ran one line short at every marker:
+  /// `byte(at:)` resolved past the end and answered nil, the check fell back to
+  /// "allow", and an escaped marker was promoted. Nothing normalizes lone CR on
+  /// the render path, so a document saved by a classic-Mac-era tool (or pasted
+  /// out of one) hit this directly.
+  func testEscapedMarkerStaysProseInACROnlyDocument() {
+    let html = render("intro\r\r- first\r- \\[~] literal\r")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+  }
+
+  /// CONTROL LEG (a): the same CR-only document must still promote a marker the
+  /// author DID write, or "treat CR as a line ending" would have degenerated
+  /// into "never promote anything in a CR document".
+  func testRealMarkerStillPromotesInACROnlyDocument() {
+    let html = render("intro\r\r- first\r- [~] real\r")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+    XCTAssertFalse(html.contains("[~] real"), html)
+  }
+
+  /// CONTROL LEG (b): CRLF must not gain a second line start from its CR half —
+  /// that would push every later offset one byte early and break the documents
+  /// that already worked.
+  func testEscapeDetectionSurvivesCRLFLineEndings() {
+    let html = render("intro\r\n\r\n- first\r\n- [~] real\r\n  - \\[~] literal\r\n")
+    XCTAssertEqual(html.components(separatedBy: "data-vc-task-state").count - 1, 1, html)
+    XCTAssertTrue(html.contains("[~] literal"), html)
+    XCTAssertTrue(html.contains(">real</p>"), html)
+  }
+
+  /// GFM's own escaped checkbox is unaffected — the byte-parity guard for the
+  /// two states cmark already owns.
+  func testEscapedGFMCheckboxStillRendersAsProse() {
+    let html = render("- \\[x] done\n- \\[ ] todo\n")
+    XCTAssertFalse(html.contains("task-list-item"), html)
+    XCTAssertTrue(html.contains("[x] done"), html)
+    XCTAssertTrue(html.contains("[ ] todo"), html)
+  }
+
+  /// A single `~` is also a GFM strikethrough delimiter; promoting the marker
+  /// must not swallow a later `~pair~` on the same line.
+  func testInProgressTaskLeavesStrikethroughOnTheSameLineIntact() {
+    let html = render("- [~] wip ~gone~ tail")
+    XCTAssertTrue(html.contains("data-vc-task-state=\"in-progress\""), html)
+    XCTAssertTrue(html.contains("wip <del>gone</del> tail"), html)
+  }
+
+  /// Guards the `default` theme's GitHub contract: the two states GFM already
+  /// knows emit exactly the same bytes as before the third state existed.
+  func testExistingCheckboxStatesEmitNoThirdStateAttributes() {
+    let html = render("- [ ] todo\n- [x] done\n- [X] shouted")
+    XCTAssertFalse(html.contains("data-vc-task-state"), html)
+    XCTAssertFalse(html.contains("aria-checked"), html)
+    let unchecked = "class=\"task-list-item-checkbox\" disabled />"
+    let checked = "class=\"task-list-item-checkbox\" disabled checked />"
+    XCTAssertEqual(html.components(separatedBy: unchecked).count - 1, 1, html)
+    XCTAssertEqual(html.components(separatedBy: checked).count - 1, 2, html)
+  }
+
   func testBlockquote() {
     let html = render("> quoted")
     XCTAssertTrue(html.contains("<blockquote"), html)
@@ -127,8 +343,9 @@ final class HTMLEmitterTests: XCTestCase {
   }
 
   func testParagraphAnchorsCount() {
-    let document = Document(parsing: "# A\n\nBody\n\n## B\n\n- l1\n- l2")
-    var emitter = HTMLEmitter()
+    let markdown = "# A\n\nBody\n\n## B\n\n- l1\n- l2"
+    let document = Document(parsing: markdown)
+    var emitter = HTMLEmitter(source: markdown)
     _ = emitter.visit(document)
     // 4 top-level blocks: h1, p, h2, ul
     XCTAssertGreaterThanOrEqual(

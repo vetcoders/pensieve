@@ -40,12 +40,92 @@ final class MarkdownFormatterTests: XCTestCase {
     )
     XCTAssertEqual(task?.replacement, "\n- [ ] ")
 
+    // `[~]` ("in progress") continues as a task, not as a bare dash.
+    let inProgress = MarkdownFormatter.autoconversion(
+      in: "- [~] wip",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(inProgress?.replacement, "\n- [ ] ")
+
     let quote = MarkdownFormatter.autoconversion(
       in: "> thought",
       range: NSRange(location: 9, length: 0),
       replacement: "\n"
     )
     XCTAssertEqual(quote?.replacement, "\n> ")
+  }
+
+  /// `- [~]wip` is NOT a task anywhere else in the app — the highlighter leaves
+  /// it as a plain bullet and `HTMLEmitter` renders it as one — so Return must
+  /// not open a checkbox under it. The line falls through to the unordered-list
+  /// rule and continues as the bullet it actually is.
+  func testReturnOnABracketWithoutASeparatorContinuesAPlainBullet() {
+    for line in ["- [~]wip", "- [x]wip", "- [ ]wip"] {
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, "\n- ", line)
+    }
+  }
+
+  /// Control leg: a WELL-FORMED marker still continues as a task, in all three
+  /// states and with the bracket at end of line. The lookahead must tighten the
+  /// pattern, not disable it.
+  func testReturnOnAWellFormedTaskMarkerStillOpensACheckbox() {
+    for line in ["- [~] wip", "- [x] done", "* [ ] todo", "+ [X] shouted"] {
+      let marker = String(line.prefix(1))
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, "\n\(marker) [ ] ", line)
+    }
+  }
+
+  /// Return on a NUMBERED task opens the next numbered task, not a bare `2. `.
+  /// The preview already draws `1. [~] wip` as a checkbox (GFM hangs the marker
+  /// off the list item, so `HTMLEmitter.visitListItem` promotes ordered items
+  /// too), so continuing it as a plain ordered item made the editor drop a task
+  /// the reader can see.
+  func testReturnOnANumberedTaskOpensTheNextNumberedTask() {
+    for (line, expected) in [
+      ("1. [~] wip", "\n2. [ ] "),
+      ("1. [x] done", "\n2. [ ] "),
+      ("  9. [ ] todo", "\n  10. [ ] "),
+      ("3) [X] shouted", "\n4) [ ] "),
+    ] {
+      let conversion = MarkdownFormatter.autoconversion(
+        in: line,
+        range: NSRange(location: (line as NSString).length, length: 0),
+        replacement: "\n"
+      )
+      XCTAssertEqual(conversion?.replacement, expected, line)
+    }
+  }
+
+  /// CONTROL: the numbered form obeys the same two limits as the bullet form —
+  /// a bracket with no separator is not a task (it continues as the ordinary
+  /// ordered item it is), and an EMPTY task exits the container instead of
+  /// opening another one.
+  func testNumberedTaskRespectsTheSeparatorAndTheEmptyMarkerExit() {
+    let noSeparator = MarkdownFormatter.autoconversion(
+      in: "1. [~]wip",
+      range: NSRange(location: 9, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(noSeparator?.replacement, "\n2. ")
+
+    let empty = MarkdownFormatter.autoconversion(
+      in: "1. [ ] ",
+      range: NSRange(location: 7, length: 0),
+      replacement: "\n"
+    )
+    XCTAssertEqual(empty?.range, NSRange(location: 0, length: 7))
+    XCTAssertEqual(empty?.replacement, "")
   }
 
   func testTypingReturnOnEmptyMarkdownMarkerExitsTheContainer() {
