@@ -2985,16 +2985,22 @@ final class DocumentStore {
     selfWriteObserver = observer
   }
 
-  /// The user closed this file OUT of Open Files — the list itself, not just a
-  /// window onto it. Retires it from the WORKING SET a relaunch restores from.
+  /// The user closed this DOCUMENT — retires it from the WORKING SET a relaunch
+  /// restores from, not just from the window that was showing it.
   ///
-  /// Closing a document window is deliberately NOT this: a window is a view of
-  /// a file, and quitting with files open has to bring them back. Open Files is
-  /// the file list, so removing a row from it is the user saying "stop carrying
-  /// this one". Those two intents were previously served by the same code path,
-  /// which is why the second one did nothing that outlived the process: the row
-  /// disappeared with the window, and the next launch read a working set nobody
-  /// had told.
+  /// CONTRACT REVERSAL, operator decision 2026-08-03. Until now closing a
+  /// document deliberately did NOT come here: "a window is a view of a file",
+  /// so ⌘W and a tab's "×" left the row in place and the next launch brought
+  /// the file back; only "Close from Open Files" retired it. The operator's
+  /// call is the opposite one — closing a single document explicitly (⌘W /
+  /// File ▸ Close, a tab's "×", "Close from Open Files") takes the file out of
+  /// the session for good.
+  ///
+  /// What still does NOT retire, and must not: closing a whole WINDOW, which
+  /// takes every tab in it down at once, and every termination teardown — quit,
+  /// logout, crash. Those are the paths the next launch is supposed to restore
+  /// from; reading them as "the user closed all of these" would quietly empty
+  /// the working set behind the user's back.
   ///
   /// Two stores hold that answer and both have to hear it, or whichever one is
   /// missed reseeds the other on the next launch: the in-memory `openFiles`
@@ -3154,6 +3160,23 @@ final class DocumentStore {
       autoSavesPathedDocuments: savingSettings.autoSavesPathedDocuments)
   }
 
+  /// What a completed close does to the Open Files working set. Stated by the
+  /// caller, because only the caller knows which gesture it serves.
+  enum OpenFilesRetirement {
+    /// Leave the row alone — the close was a window/teardown, and the next
+    /// launch is supposed to bring this file back.
+    case keep
+    /// Retire the document now: an explicit single-document close
+    /// (operator decision 2026-08-03).
+    case now
+    /// Hand the settled location to `report` and let the caller decide. The
+    /// window route needs this: whether its close was one TAB leaving a live
+    /// window or the whole window going down is only knowable a runloop turn
+    /// later, but the url to retire is only knowable HERE, after the save
+    /// branches.
+    case deferred(@MainActor (URL) -> Void)
+  }
+
   /// Second half of the conscious close: applies the user's answer (`nil` when
   /// `decision` needed no prompt) and clears the session when the answer
   /// allows it. Returns whether the document actually closed — `false` means
@@ -3163,11 +3186,16 @@ final class DocumentStore {
   /// Unlike `savePendingChangesOnClose` (the window/tab teardown guard, which
   /// has no veto point left and therefore persists silently), this path is
   /// allowed to refuse: nothing has been torn down yet.
+  ///
+  /// `retiring` states what this close means for the Open Files working set.
+  /// Only the CALLER knows which gesture it is serving, so the store never
+  /// guesses: see `OpenFilesRetirement`.
   @discardableResult
   func finishClose(
     decision: DocumentCloseDecision,
     response: SaveChangesResponse?,
-    appState: AppState
+    appState: AppState,
+    retiring: OpenFilesRetirement = .keep
   ) -> Bool {
     self.appState = appState
 
@@ -3201,6 +3229,20 @@ final class DocumentStore {
     }
 
     autosaver.cancel()
+    // The settled location, read AFTER the save branches: a draft that only
+    // earned a path through "Save As…" retires under THAT url, not the nil it
+    // arrived with. A cancelled or failed close returned above, so it forgets
+    // nothing.
+    if let closedURL = appState.documentSession.url {
+      switch retiring {
+      case .keep:
+        break
+      case .now:
+        forgetOpenFile(closedURL, into: appState)
+      case .deferred(let report):
+        report(closedURL)
+      }
+    }
     // Whatever the answer was, no buffer is holding this draft any more, so it
     // stops being exempt from retention. (Discard/Save already removed the file
     // outright; this only releases the claim when one survived.)

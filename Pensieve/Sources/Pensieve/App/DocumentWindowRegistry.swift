@@ -17,6 +17,19 @@ enum WindowCloseTombstonePolicy {
   case factoryWindow
 }
 
+/// How much a close that arrived through one window actually closed.
+///
+/// The Open Files working set turns on this distinction: retiring a document is
+/// a decision about the DOCUMENT (the user closed this file), while a window
+/// going away is a decision about the WINDOW and leaves every file it held in
+/// the set the next launch restores.
+enum DocumentCloseScope {
+  /// One tab left a window that is still open.
+  case tab
+  /// The window itself went away, taking every tab in it along.
+  case window
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -107,6 +120,10 @@ final class DocumentWindowRegistry: ObservableObject {
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
+  /// The windows sharing `window`'s native tab group, `window` included. A seam
+  /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
+  /// and the tab-vs-window close scope is decided from exactly this list.
+  private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
 
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
@@ -134,6 +151,9 @@ final class DocumentWindowRegistry: ObservableObject {
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
     },
+    tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
+      window.tabbedWindows ?? [window]
+    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
@@ -143,6 +163,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.orderAndActivateWindow = orderAndActivateWindow
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
+    self.tabGroupWindows = tabGroupWindows
     self.closeWindow = closeWindow
     self.makeDocumentWindow = makeDocumentWindow
   }
@@ -580,6 +601,54 @@ final class DocumentWindowRegistry: ObservableObject {
 
   func unregisterController(for window: NSWindow) {
     controllersByWindow.removeValue(forKey: ObjectIdentifier(window))
+  }
+
+  /// Whether `window` is still a live, registered document window. The root
+  /// view drops its registration on `willCloseNotification`, so this is the
+  /// app's own answer to "did that window survive the close", independent of
+  /// AppKit's tab-group bookkeeping.
+  func hasRegisteredController(for window: NSWindow) -> Bool {
+    controllersByWindow[ObjectIdentifier(window)]?.controller != nil
+  }
+
+  /// Answers what a close that arrived through `window` actually took with it.
+  ///
+  /// AppKit routes the tab's "×" and the window's red button through the SAME
+  /// `performClose`, so the gesture cannot be read at the moment it fires. The
+  /// scope can: a tab leaving a window that stays open leaves its SIBLING tabs
+  /// registered, while a window close takes the whole group down in the same
+  /// pass. So the sibling list is captured now and read back once the close has
+  /// settled — if any sibling is still a live document window, one tab left a
+  /// live window (`.tab`); otherwise the window itself went away (`.window`).
+  ///
+  /// A window with no tab siblings is `.window` by construction, answered
+  /// synchronously: closing the only document window IS closing a window, and
+  /// there is nothing to wait for. So is EVERY close once the app is
+  /// terminating: quit tears every window down at the same time, and reading
+  /// that as the user closing documents would empty the working set the next
+  /// launch restores from.
+  func resolveCloseScope(
+    for window: NSWindow,
+    then report: @escaping @MainActor (DocumentCloseScope) -> Void
+  ) {
+    guard !isTerminating else {
+      report(.window)
+      return
+    }
+    let siblings = tabGroupWindows(window).filter { $0 !== window }
+    guard !siblings.isEmpty else {
+      report(.window)
+      return
+    }
+    scheduleDeferredMainWork { [weak self] in
+      guard let self else { return }
+      guard !self.isTerminating else {
+        report(.window)
+        return
+      }
+      let groupSurvived = siblings.contains { self.hasRegisteredController(for: $0) }
+      report(groupSurvived ? .tab : .window)
+    }
   }
 
   /// Every window controller still alive, deduplicated. `TerminationSequence` flushes each window's

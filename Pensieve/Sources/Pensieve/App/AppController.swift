@@ -14,10 +14,11 @@ private enum DocumentImportOutcome: Sendable {
 /// it starts — not something every window that runs
 /// `start(intent:)` does. Every launcher takes that same path: the
 /// one the registry re-opens after the last document window closes, and the one
-/// a Dock reopen makes. And a native window close deliberately LEAVES the file
-/// in the working set (only "Close from Open Files" retires it), so a
-/// per-controller gate meant closing the last document immediately reopened it
-/// — the user could not close it at all.
+/// a Dock reopen makes. And closing a WINDOW deliberately leaves its files in
+/// the working set — retiring a file is what closing the DOCUMENT does (⌘W, a
+/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — so a
+/// per-controller gate meant closing the last document window immediately
+/// reopened it: the user could not close it at all.
 ///
 /// Production shares `.shared`; a test that simulates a launch holds its own
 /// instance, because "once per process" is otherwise once per test BUNDLE.
@@ -925,6 +926,14 @@ final class AppController: ObservableObject {
   /// anything. `completion` reports whether the document actually closed; it
   /// fires after the sheet is answered, so it is asynchronous whenever the
   /// close needs a decision.
+  ///
+  /// This is the SINGLE-DOCUMENT close (⌘W / File ▸ Close, and the owning
+  /// window's half of "Close from Open Files"), so a close that goes through
+  /// also retires the file from the Open Files working set — operator decision
+  /// 2026-08-03. The window stays alive and reverts to the launcher; the file
+  /// is out of the session and does not come back on the next launch. A Cancel
+  /// (or a failed save) never reaches the retirement: `finishClose` returns
+  /// before it.
   func closeActiveDocument(completion: (@MainActor (Bool) -> Void)? = nil) {
     let decision = documentStore.closeDecision(appState: appState)
 
@@ -933,7 +942,7 @@ final class AppController: ObservableObject {
       // close entirely whenever the caller passed no completion, because
       // optional chaining never evaluates the argument of a nil call.
       let didClose = documentStore.finishClose(
-        decision: decision, response: nil, appState: appState)
+        decision: decision, response: nil, appState: appState, retiring: .now)
       refreshRecoveredDrafts()
       completion?(didClose)
       return
@@ -953,7 +962,7 @@ final class AppController: ObservableObject {
       guard let self else { return }
       self.isConfirmingClose = false
       let didClose = self.documentStore.finishClose(
-        decision: decision, response: response, appState: self.appState)
+        decision: decision, response: response, appState: self.appState, retiring: .now)
       self.refreshRecoveredDrafts()
       completion?(didClose)
     }
@@ -975,6 +984,11 @@ final class AppController: ObservableObject {
     guard let prompt = decision.prompt else {
       // closeWithoutPrompting / saveWithoutPrompting: nothing to ask. Let the
       // normal teardown run — for an auto-save-owned file it flushes on close.
+      // The session is still intact here, so the document this close settles is
+      // read now and retired only if the close turns out to be a TAB close.
+      if let closingURL = appState.documentSession.url {
+        retireDocumentIfOnlyThisTabCloses(url: closingURL, window: window)
+      }
       return true
     }
 
@@ -989,7 +1003,14 @@ final class AppController: ObservableObject {
       guard let self else { return }
       self.isConfirmingClose = false
       let didClose = self.documentStore.finishClose(
-        decision: decision, response: response, appState: self.appState)
+        decision: decision, response: response, appState: self.appState,
+        // Reported only by a close that went through, and only after the save
+        // branches — a draft that earned its path through "Save As…" is retired
+        // under that new location, exactly like the ⌘W route.
+        retiring: .deferred { [weak self, weak window] closedURL in
+          guard let self, let window else { return }
+          self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+        })
       self.refreshRecoveredDrafts()
       // Only a settled close (saved or discarded) tears the window down; its
       // `willCloseNotification` guard is a no-op on the now-clean session. Cancel
@@ -998,6 +1019,24 @@ final class AppController: ObservableObject {
       window?.close()
     }
     return false
+  }
+
+  /// Retires the document from the Open Files working set, but ONLY when this
+  /// close is one tab leaving a window that stays open.
+  ///
+  /// The operator's 2026-08-03 rule is about closing a DOCUMENT: ⌘W and a tab's
+  /// "×" take the file out of the session for good. Closing a WINDOW is not
+  /// that decision — it takes every tab in it down at once, and the files it
+  /// held must still be there on the next launch (the same reason termination
+  /// never retires). AppKit hands both gestures to `windowShouldClose`
+  /// identically, so the registry resolves the SCOPE — see
+  /// `DocumentWindowRegistry.resolveCloseScope`, which answers once the close
+  /// has settled and the surviving tabs can be counted.
+  private func retireDocumentIfOnlyThisTabCloses(url: URL, window: NSWindow) {
+    documentWindowRegistry.resolveCloseScope(for: window) { [weak self] scope in
+      guard let self, scope == .tab else { return }
+      self.documentStore.forgetOpenFile(url, into: self.appState)
+    }
   }
 
   // MARK: - Recovered drafts (launcher surface)
