@@ -312,6 +312,15 @@ private struct ActivePensieveCommands: Commands {
       )
       .accessibilityIdentifier("pensieve.autocomplete.menuToggle")
 
+      Toggle(
+        "Show All Files",
+        isOn: Binding(
+          get: { appState.showAllFilesInSidebar },
+          set: { appState.showAllFilesInSidebar = $0 }
+        )
+      )
+      .accessibilityIdentifier("pensieve.sidebar.showAllFiles.menuToggle")
+
       Button("Show/Hide Tab Bar") {
         NSApp.sendAction(#selector(NSWindow.toggleTabBar(_:)), to: nil, from: nil)
       }

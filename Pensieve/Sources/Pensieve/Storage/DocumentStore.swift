@@ -300,13 +300,38 @@ final class FolderManager {
     guard !trimmed.isEmpty else { return false }
 
     let source = url.standardizedFileURL
+
+    var isDirectoryObjC: ObjCBool = false
+    let sourceExists = FileManager.default.fileExists(
+      atPath: source.path, isDirectory: &isDirectoryObjC)
+    let sourceIsDirectory = sourceExists && isDirectoryObjC.boolValue
+
+    // Sidebar inline-rename prefills the field with the full filename,
+    // extension included. If the user retypes just the base name and drops
+    // the extension, silently reinstate it (Finder-style) so the file
+    // doesn't fall out of the workspace scanner's markdown filter and
+    // appear to have vanished. `URL.pathExtension` alone is not a reliable
+    // "did they type an extension?" signal here: a name like "ver 2.5" reports
+    // a pathExtension of "5" (a decimal fragment, not an extension). Requiring
+    // at least one letter filters those out while still honoring real,
+    // explicit extensions ("b.txt") — in doubt, keep the source extension:
+    // a visible file beats an invisible one.
+    var resolvedName = trimmed
+    if !sourceIsDirectory {
+      let sourceExtension = source.pathExtension
+      let typedExtensionLooksReal = WorkspaceScanner.hasRealExtension(forTypedName: trimmed)
+      if !sourceExtension.isEmpty, !typedExtensionLooksReal {
+        resolvedName = "\(trimmed).\(sourceExtension)"
+      }
+    }
+
     let target =
       source.deletingLastPathComponent()
-      .appendingPathComponent(trimmed)
+      .appendingPathComponent(resolvedName)
       .standardizedFileURL
     guard source != target else { return true }
     guard !FileManager.default.fileExists(atPath: target.path) else {
-      appState.lastError = "A file or folder named \(trimmed) already exists."
+      appState.lastError = "A file or folder named \(resolvedName) already exists."
       return false
     }
 
@@ -714,7 +739,12 @@ final class FolderManager {
     _ lhs: WorkspaceNode,
     _ rhs: WorkspaceNode
   ) -> Bool {
-    if lhs.kind != rhs.kind { return lhs.kind == .folder }
+    // Folders always sort first; documents and foreign files share the same non-folder
+    // bucket and fall through to the name compare together (three kinds now exist, so
+    // "differs" alone no longer implies "one of them is a folder").
+    if lhs.kind != rhs.kind, lhs.kind == .folder || rhs.kind == .folder {
+      return lhs.kind == .folder
+    }
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
   }
 
@@ -2434,9 +2464,10 @@ struct WorkspaceScan: Codable, Sendable {
   var rootNode: WorkspaceNode
 }
 
-/// Deterministic identity of the sidebar's visible universe. Every root, folder, and supported
-/// document contributes its standardized path and semantic kind; unsupported files never enter
-/// the scanner tree and therefore cannot perturb presentation freshness.
+/// Deterministic identity of the sidebar's visible universe. Every root, folder, document,
+/// and foreign (non-markdown) file contributes its standardized path and semantic kind, so
+/// adding/renaming/removing any of them perturbs presentation freshness and triggers a
+/// re-render.
 struct WorkspacePresentationSignature: Equatable, Sendable {
   struct Entry: Equatable, Sendable {
     var path: String
@@ -2643,7 +2674,34 @@ enum WorkspaceScanner {
     "Pensieve can open Markdown or plain text files with .md, .markdown, or .txt extensions."
 
   static func isMarkdownFile(_ url: URL) -> Bool {
-    ["md", "markdown", "txt"].contains(url.pathExtension.lowercased())
+    isMarkdownExtension(url.pathExtension)
+  }
+
+  static func isMarkdownExtension(_ ext: String) -> Bool {
+    ["md", "markdown", "txt"].contains(ext.lowercased())
+  }
+
+  static func hasRealExtension(forTypedName name: String) -> Bool {
+    let ext = URL(fileURLWithPath: name).pathExtension
+    return !ext.isEmpty && ext.count <= 5 && ext.allSatisfy(\.isLetter)
+  }
+
+  /// Sidebar inline-rename hint: true when the typed name has a real
+  /// extension that falls outside the markdown family (md/markdown/txt).
+  /// Folders never warn — this only applies to file renames.
+  static func warnsAboutLeavingMarkdownFamily(typedName: String, isFolder: Bool) -> Bool {
+    guard !isFolder else { return false }
+    guard hasRealExtension(forTypedName: typedName) else { return false }
+    return !isMarkdownExtension(URL(fileURLWithPath: typedName).pathExtension)
+  }
+
+  /// Sidebar inline-rename prefill (Finder-style): a name with a real extension
+  /// prefills without it, so retyping the base name and committing doesn't
+  /// silently drop the extension. Names with no extension (directories, or
+  /// extensionless files) are returned unchanged.
+  static func renamePrefill(for url: URL) -> String {
+    guard !url.pathExtension.isEmpty else { return url.lastPathComponent }
+    return url.deletingPathExtension().lastPathComponent
   }
 
   static func normalizedMarkdownFileURL(for url: URL) -> URL {
@@ -2780,6 +2838,21 @@ enum WorkspaceScanner {
             id: "document:\(entry.standardizedURL.path)",
             name: entry.url.deletingPathExtension().lastPathComponent,
             kind: .document,
+            url: entry.standardizedURL,
+            children: nil
+          )
+        )
+      } else if entry.isRegularFile {
+        // Outside the markdown allow-list, but still on disk: surface it as an inert
+        // sidebar node instead of silently dropping it (that silence is how a rename
+        // that loses its extension used to look like data loss). It never joins
+        // `documents`, so FTS indexing, Open Files, and the open-document guards
+        // stay untouched.
+        nodes.append(
+          WorkspaceNode(
+            id: "foreign:\(entry.standardizedURL.path)",
+            name: entry.url.lastPathComponent,
+            kind: .foreignFile,
             url: entry.standardizedURL,
             children: nil
           )

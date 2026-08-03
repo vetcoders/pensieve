@@ -1134,9 +1134,17 @@ final class PensieveSmokeTests: XCTestCase {
 
     manager.open(url: folder, into: appState)
 
+    // The scanner's `IndexDatabase` fixture writes its own `index.db` (and WAL siblings)
+    // directly into this same folder, so they scan alongside the fixture's own files. They
+    // fall outside the markdown allow-list and surface as trailing foreign nodes, sorted by
+    // name after the folders and documents rather than being silently dropped.
     let children = try XCTUnwrap(appState.workspaceTree.first?.children)
-    XCTAssertEqual(children.map(\.name), ["Alpha", "Zeta", "2", "10"])
-    XCTAssertEqual(children.map(\.kind), [.folder, .folder, .document, .document])
+    XCTAssertEqual(
+      children.map(\.name), ["Alpha", "Zeta", "2", "10", "index.db", "index.db-shm", "index.db-wal"]
+    )
+    XCTAssertEqual(
+      children.map(\.kind),
+      [.folder, .folder, .document, .document, .foreignFile, .foreignFile, .foreignFile])
   }
 
   @MainActor
@@ -1300,13 +1308,22 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       recorder.values.reduce(0, +), recordsAfterOpen, "unchanged .md must skip the FTS write")
 
-    // 2) add a non-markdown file (e.g. screenshot/.DS_Store) -> scan runs, still no delivery
+    // 2) add a non-markdown file (e.g. screenshot) -> it surfaces as a greyed-out foreign
+    //    sidebar node (this cut's contract), so the tree updates; FTS still sees nothing,
+    //    since foreign files never enter `documents`.
     try Data().write(to: folder.appendingPathComponent("shot.png"))
     manager.refresh(into: appState)
     await manager.waitForPendingIndexUpdate()
     await indexDatabase.waitForPendingReindex()
     XCTAssertEqual(calls.count, afterOpen + 2, "refresh reconciles through exactly one scan")
-    XCTAssertEqual(appState.workspaceTree, treeAfterOpen, "non-.md change must skip tree delivery")
+    XCTAssertNotEqual(
+      appState.workspaceTree, treeAfterOpen,
+      "a newly visible foreign file must update the presentation tree")
+    XCTAssertTrue(
+      appState.workspaceTree.first?.children?.contains {
+        $0.name == "shot.png" && $0.kind == .foreignFile
+      } ?? false,
+      "the new non-markdown file surfaces as a greyed-out foreign node")
     XCTAssertEqual(
       recorder.values.reduce(0, +), recordsAfterOpen, "non-.md change must skip the FTS write")
 
@@ -1373,10 +1390,11 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(calls.count, afterOpen + 1, ".md change must trigger exactly one rebuild")
   }
 
-  /// RC-2 invariant (1): a foreign change to a NON-`.md` file does NOT trigger a rebuild/reindex
-  /// when the `.md` set is unchanged. Under the one-scan/two-signature contract the watcher path
-  /// still reconciles through exactly one off-main scan; both signatures match, so neither the
-  /// tree nor the FTS index is delivered to.
+  /// RC-2 invariant (1): a foreign change to a NON-`.md` file does NOT trigger a reindex when
+  /// the `.md` set is unchanged. Under the one-scan/two-signature contract the watcher path
+  /// still reconciles through exactly one off-main scan; the search signature is untouched, so
+  /// the FTS index is never delivered to. The presentation tree DOES update — a new foreign
+  /// file must surface as a greyed-out sidebar node instead of staying invisible.
   @MainActor
   func testScheduleWatcherRefreshSkipsRebuildForNonMarkdownChange() async throws {
     let folder = FileManager.default.temporaryDirectory
@@ -1414,7 +1432,8 @@ final class PensieveSmokeTests: XCTestCase {
     let recordsAfterOpen = recorder.values.reduce(0, +)
     let treeAfterOpen = appState.workspaceTree
 
-    // Foreign churn: a screenshot / .DS_Store sibling write leaves the .md set untouched.
+    // Foreign churn: a screenshot / .DS_Store sibling write leaves the .md set untouched, but
+    // the new file must surface as a visible, greyed-out foreign node in the sidebar.
     try Data().write(to: folder.appendingPathComponent("shot.png"))
     manager.scheduleWatcherRefresh(into: appState)
     await manager.waitForPendingWatcherRefresh()
@@ -1422,8 +1441,14 @@ final class PensieveSmokeTests: XCTestCase {
     await indexDatabase.waitForPendingReindex()
 
     XCTAssertEqual(calls.count, afterOpen + 1, "the watcher reconciles through exactly one scan")
-    XCTAssertEqual(
-      appState.workspaceTree, treeAfterOpen, "non-.md change must not republish the tree")
+    XCTAssertNotEqual(
+      appState.workspaceTree, treeAfterOpen,
+      "a newly visible foreign file must update the presentation tree")
+    XCTAssertTrue(
+      appState.workspaceTree.first?.children?.contains {
+        $0.name == "shot.png" && $0.kind == .foreignFile
+      } ?? false,
+      "the new non-markdown file surfaces as a greyed-out foreign node")
     XCTAssertEqual(
       recorder.values.reduce(0, +), recordsAfterOpen, "non-.md change must not write the FTS index")
   }

@@ -180,7 +180,10 @@ final class WorkspaceStore {
   }
 
   private func compareWorkspaceNodes(_ lhs: WorkspaceNode, _ rhs: WorkspaceNode) -> Bool {
-    if lhs.kind != rhs.kind {
+    // Folders always sort first; documents and foreign files share the same non-folder
+    // bucket and fall through to name/date comparison together (three kinds now exist,
+    // so "differs" alone no longer implies "one of them is a folder").
+    if lhs.kind != rhs.kind, lhs.kind == .folder || rhs.kind == .folder {
       return lhs.kind == .folder
     }
     return compareURLs(lhs.url, rhs.url, lhsTitle: lhs.name, rhsTitle: rhs.name)
