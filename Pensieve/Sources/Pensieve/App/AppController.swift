@@ -96,6 +96,12 @@ final class AppController: ObservableObject {
   /// tab-group frame sync that comes with it — per restored file. Unwired
   /// (tests, headless) falls back to the per-file route.
   var requestOpenRestoredDocumentWindows: (([DocumentRef]) -> Void)?
+  /// Tells the registry a document is already on screen in THIS window, so
+  /// nothing orders a window front for it afterwards. The launch window loads
+  /// the first restored file into itself; its attach lands asynchronously, and
+  /// without this the registry counts that as the document's first presentation
+  /// and pulls this window in front of the tab the restore just fronted.
+  var requestNoteDocumentAlreadyOnScreen: ((URL) -> Void)?
   var requestCloseCurrentWindowIfEmpty: (() -> Void)?
   /// Marks this window as holding content the sweep must not reap. Called when
   /// the window adopts a recovery draft, which carries no URL for the accessor
@@ -267,7 +273,15 @@ final class AppController: ObservableObject {
     // in the commonest case of exactly one file. Mirrors `openFile`, which also
     // loads in place when the window holds nothing.
     if !appState.documentSession.hasEditableBuffer {
-      documentStore.load(ref: pending.removeFirst(), into: appState)
+      let inPlace = pending.removeFirst()
+      documentStore.load(ref: inPlace, into: appState)
+      // This window is on screen and now shows `inPlace` — the restore never
+      // has to order anything for it. Say so BEFORE the bulk route runs: this
+      // window's own attach is asynchronous and lands after the pass has
+      // fronted its last tab, and the registry would read it as the document's
+      // first presentation and front this window instead. The user left a
+      // different tab in front; that is the one that must come back in front.
+      requestNoteDocumentAlreadyOnScreen?(inPlace.id)
     }
     guard !pending.isEmpty else { return }
 

@@ -23,10 +23,10 @@ enum DocumentWindowPresentation {
   /// activates. Every interactive open uses this.
   case activateNow
   /// Bulk restore: the tab joins the group BEHIND the selected one and is never
-  /// made key, so AppKit never displays it and its SwiftUI content is never
-  /// laid out. The caller orders the final window front once, so the end state
-  /// is the same as a run of `activateNow` opens — without paying a full
-  /// layout, and a full preview render, for every tab on the way there.
+  /// made key, so it never becomes the selected tab and the tabs already in the
+  /// group are not resized around it. The caller orders the final window front
+  /// once, so the end state is the same as a run of `activateNow` opens —
+  /// without re-laying-out every tab already in the group on the way there.
   case joinTabGroupInBackground
 }
 
@@ -70,6 +70,15 @@ final class DocumentWindowRegistry: ObservableObject {
   private var closedWindows: [ObjectIdentifier: WeakWindow] = [:]
   private var launcherSweepPending = false
   private var launcherSweepSparedWindow: WeakWindow?
+  /// The launch restore's queue: refs still waiting for their tab, the window
+  /// the pass will order front when the queue drains, and whether a step is
+  /// already booked for a later run-loop turn.
+  private var pendingRestoreRefs: [DocumentRef] = []
+  private var restoreFrontmostWindow: WeakWindow?
+  private var restoreStepScheduled = false
+  /// Documents that reached the screen without the registry presenting them —
+  /// see `noteDocumentAlreadyOnScreen`. Consumed by the attach that reports one.
+  private var documentsAlreadyOnScreen: Set<URL> = []
   private var launcherReopenPending = false
   private var launcherReopenAwaitingFactory = false
   /// Set once the app starts quitting so the last document window's close does
@@ -105,6 +114,10 @@ final class DocumentWindowRegistry: ObservableObject {
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void
+  /// Hands the next restored tab to a LATER run-loop turn. See
+  /// `openRestoredDocuments`: one insertion is main-thread work the app cannot
+  /// interrupt, and the window is already on screen while the rest arrive.
+  private let scheduleRestoreStep: (@escaping DeferredMainWork) -> Void
   private let mergeWindowIntoTabs: @MainActor (NSWindow, NSWindow) -> Void
   /// Same merge, ordered BEHIND the target: the window joins the tab group
   /// without becoming the selected tab. AppKit only displays the selected tab,
@@ -126,6 +139,15 @@ final class DocumentWindowRegistry: ObservableObject {
     },
     scheduleLauncherWindowSweep: @escaping (@escaping DeferredMainWork) -> Void = { work in
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        Task { @MainActor in work() }
+      }
+    },
+    // A TIMER hop, not `DispatchQueue.main.async`: the main queue's run-loop
+    // source drains the blocks enqueued while it is draining, so a chain of
+    // `async` steps can run back to back inside ONE turn and never let the app
+    // service an event. A deadline in the future forces the run loop around.
+    scheduleRestoreStep: @escaping (@escaping DeferredMainWork) -> Void = { work in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
         Task { @MainActor in work() }
       }
     },
@@ -152,6 +174,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.canMutateWindowTabs = canMutateWindowTabs
     self.scheduleDeferredMainWork = scheduleDeferredMainWork
     self.scheduleLauncherWindowSweep = scheduleLauncherWindowSweep
+    self.scheduleRestoreStep = scheduleRestoreStep
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.mergeWindowIntoTabsBehind = mergeWindowIntoTabsBehind
     self.orderAndActivateWindow = orderAndActivateWindow
@@ -187,15 +210,67 @@ final class DocumentWindowRegistry: ObservableObject {
   ///
   /// So the restore joins the tab group WITHOUT selecting each tab, and orders
   /// the last one front once at the end. Same files, same order, same window in
-  /// front when the dust settles; the eleven tabs behind it simply wait to be
-  /// looked at before they render.
+  /// front when the dust settles.
+  ///
+  /// That removed the quadratic term and NOT the beachball. Measured on the
+  /// staged build (twelve ad-hoc files, window on screen at t+0.7s, first event
+  /// serviced at t+8.6s): `_syncInactiveTabWindowSizesToWindow:` ends in an
+  /// explicit `CA::Transaction::commit()`, and a CoreAnimation commit runs the
+  /// PROCESS-WIDE layout pass — so the newcomer's own hosting view, brand new
+  /// and entirely dirty, is laid out synchronously inside the insertion whether
+  /// or not its tab is selected. A tab behind the selected one does not "wait
+  /// to be looked at": it pays its first full SwiftUI layout the moment it
+  /// joins the group, ~0.6s of it. Twelve of those back to back is ONE
+  /// uninterruptible main-thread block, and by then the window is already on
+  /// screen — which is what the operator sees as a frozen app.
+  ///
+  /// The cost per tab is the tab's own first layout and is not this pass's to
+  /// avoid. The freeze is: so the queue is drained ONE tab per run-loop turn.
+  /// The app services events between tabs, the window stays alive while the
+  /// rest of the working set arrives, and the pass still ends in exactly one
+  /// ordering.
   func openRestoredDocuments(_ refs: [DocumentRef]) {
-    var frontmost: NSWindow?
-    for ref in refs {
+    pendingRestoreRefs.append(contentsOf: refs)
+    guard !restoreStepScheduled else { return }
+    openNextRestoredDocument()
+  }
+
+  /// Records a document as ALREADY on screen in a window the registry did not
+  /// present. The launch window loads the first restored file into ITSELF
+  /// rather than spawning a tab for it: that window is up from the start, but
+  /// its SwiftUI accessor attaches asynchronously — late enough to land after
+  /// this pass has fronted its last tab. Without the note, `completeAttach`
+  /// reads that attach as the document's first presentation and pulls the
+  /// launch window in front of the tab the restore deliberately chose.
+  ///
+  /// A note describes exactly ONE presentation and the attach reporting it
+  /// consumes it, so a later close-and-reopen of the same document is a genuine
+  /// first presentation again.
+  func noteDocumentAlreadyOnScreen(_ documentID: URL) {
+    documentsAlreadyOnScreen.insert(documentID.standardizedFileURL)
+  }
+
+  private func openNextRestoredDocument() {
+    restoreStepScheduled = false
+    if !pendingRestoreRefs.isEmpty {
+      let ref = pendingRestoreRefs.removeFirst()
       if let window = open(ref, presentation: .joinTabGroupInBackground) {
-        frontmost = window
+        restoreFrontmostWindow = WeakWindow(window)
       }
     }
+    guard !pendingRestoreRefs.isEmpty else {
+      finishRestorePass()
+      return
+    }
+    restoreStepScheduled = true
+    scheduleRestoreStep { [weak self] in
+      self?.openNextRestoredDocument()
+    }
+  }
+
+  private func finishRestorePass() {
+    let frontmost = restoreFrontmostWindow?.window
+    restoreFrontmostWindow = nil
     guard let frontmost else { return }
     orderAndActivateWindow(frontmost)
   }
@@ -557,7 +632,13 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func completeAttach(_ window: NSWindow, documentID: URL) {
-    if orderedDocumentIDs.insert(documentID).inserted {
+    // A window that started showing a document without going through `open()`
+    // has no other way of getting in front — unless it is already there, which
+    // is what a note says. Both facts are consumed here: the ordering record is
+    // taken either way, the activation only when nobody put it on screen first.
+    let isFirstPresentation = orderedDocumentIDs.insert(documentID).inserted
+    let wasAlreadyOnScreen = documentsAlreadyOnScreen.remove(documentID) != nil
+    if isFirstPresentation, !wasAlreadyOnScreen {
       orderAndActivateWindow(window)
     }
     closeEmptyLauncherWindows(except: window)
