@@ -606,6 +606,15 @@ struct EditorToolbelt: ToolbarContent {
     }
     .help("Rewrite the selection or current paragraph with AI")
     .disabled(!hasEditableBuffer || appState.mode == .preview)
+    // Spelled out for the same reason `AppearanceToolbarMenu` spells its own
+    // out: this menu is declared DIRECTLY in the toolbar group, so it is
+    // bridged to an `NSMenuToolbarItem` of its own and does not inherit the
+    // `Label`'s text the way a `ControlGroup` segment did. Measured on the
+    // built app after the move: `AXDescription "menu button"`, `AXTitle
+    // "wand.and.stars"` — the raw symbol name is what VoiceOver announced.
+    // `AXIdentifier` survives the move untouched, so nothing but a name-based
+    // lookup (`scripts/ui-smoke.sh`) can catch this going anonymous again.
+    .accessibilityLabel("Rewrite with AI")
     .accessibilityIdentifier(Self.rewriteIdentifier)
   }
 }
