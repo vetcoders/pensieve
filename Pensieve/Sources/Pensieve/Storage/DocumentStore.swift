@@ -3202,12 +3202,6 @@ final class DocumentStore {
     recoveryStore.unclaimedDrafts()
   }
 
-  /// Launch sweep for the recovery directory (age + count retention).
-  @discardableResult
-  func pruneRecoveredDrafts(now: Date = Date()) -> [UUID] {
-    recoveryStore.pruneDrafts(now: now)
-  }
-
   /// Adopts `draft` into an EMPTY window as the untitled document it was.
   ///
   /// The draft file stays on disk: it is retired only by a successful save or
@@ -3506,8 +3500,8 @@ final class DocumentStore {
         report(closedURL)
       }
     }
-    // Whatever the answer was, no buffer is holding this draft any more, so it
-    // stops being exempt from retention. (Discard/Save already removed the file
+    // Whatever the answer was, no buffer is holding this draft any more, so the
+    // launcher may offer it again. (Discard/Save already removed the file
     // outright; this only releases the claim when one survived.)
     recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
     appState.selectedDocumentID = nil
@@ -3638,8 +3632,8 @@ final class DocumentStore {
     if appState.documentSession.isUntitled {
       saveRecoveryDraft(appState: appState)
       // The buffer goes away with the window; the draft it just wrote is a
-      // recovery artifact from here on, not live work, so it re-enters
-      // retention like any other unhandled draft.
+      // recovery artifact from here on, not live work, so it goes back on the
+      // launcher like any other unhandled draft.
       recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       return true
     }

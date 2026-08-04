@@ -205,35 +205,40 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   var terminationFolderManagerOverride: FolderManager?
   var terminationAutosaverOverride: Autosaver?
   var terminationLaunchIntentCoordinatorOverride: LaunchIntentCoordinator?
-  /// Launch-sweep injection seam, same shape as the termination ones above.
-  /// Production leaves it `nil` and sweeps `RecoveryStore.shared`; a test points
-  /// it at a temp directory so the LAUNCH sweep can be driven for real without
+  /// Launch-pass injection seam, same shape as the termination ones above.
+  /// Production leaves it `nil` and reads `RecoveryStore.shared`; a test points
+  /// it at a temp directory so the LAUNCH pass can be driven for real without
   /// touching the operator's own crash drafts.
   var launchRecoveryStoreOverride: RecoveryStore?
 
-  /// The application's ONE retention sweep for crash drafts, run at the one
-  /// moment nothing can be holding a draft open: drafts nobody came back for
-  /// within 30 days go, and whatever survives is capped. Recovery is a safety
-  /// net, not an archive.
+  /// The application's once-per-process look at the crash-draft directory,
+  /// taken at the one moment nothing can be holding a draft open.
+  ///
+  /// It is READ-ONLY. This used to be a retention sweep that dropped drafts past
+  /// 30 days and trimmed the rest to a cap of 20; Monika's decision of 04.08 —
+  /// "they don't disappear without my decision" — retired it, matching what the
+  /// lifecycle contract's Recovery section always said: a draft is removed by a
+  /// successful save, an explicit discard, or a confirmed Don't Save, and by
+  /// nothing else. Launching the app is not one of those, so this pass reports
+  /// what is stored and deletes nothing.
   ///
   /// It lives HERE, on `applicationDidFinishLaunching`, and not in
   /// `AppController.start`: `start` runs once per WINDOW (every launcher, every
-  /// Dock reopen, every "+" tab), while retention is a once-per-process fact,
-  /// and this hook is also the only launch point guaranteed to run BEFORE any
-  /// window can adopt a draft. Verified at runtime on macOS 26 (Darwin 25.6),
-  /// debug build, 2026-08-03: the `@NSApplicationDelegateAdaptor` instance does
-  /// receive `applicationDidFinishLaunching`, and the sweep dropped 6 of 26
-  /// seeded drafts (1 expired + 5 over the cap) before the launcher appeared.
+  /// Dock reopen, every "+" tab), while this is a once-per-process fact, and the
+  /// hook is the only launch point guaranteed to run BEFORE any window can adopt
+  /// a draft. Verified at runtime on macOS 26 (Darwin 25.6), debug build,
+  /// 2026-08-03: the `@NSApplicationDelegateAdaptor` instance does receive
+  /// `applicationDidFinishLaunching`.
   @discardableResult
-  func pruneRecoveredDraftsOnLaunch() -> [UUID] {
-    (launchRecoveryStoreOverride ?? .shared).pruneDrafts()
+  func surveyRecoveredDraftsOnLaunch() -> [RecoveryDraft] {
+    (launchRecoveryStoreOverride ?? .shared).loadDrafts()
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
 
-    pruneRecoveredDraftsOnLaunch()
+    surveyRecoveredDraftsOnLaunch()
 
     // Window-agnostic close lifecycle. Not every document-bearing window
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene

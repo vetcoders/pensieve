@@ -7,103 +7,36 @@ import XCTest
 /// Two properties are under test, both provable on the FILESYSTEM rather than
 /// in memory — a draft is a file, and "kept" or "gone" only means anything on
 /// disk:
-///   * retention — 30-day sweep, 20-draft cap, and an absolute exemption for
-///     the draft a window is editing right now;
+///   * persistence — a draft survives everything except a decision the user
+///     made about it. Age does not retire it, volume does not retire it, and
+///     launching the app does not retire it (Monika, 04.08: they don't
+///     disappear without her decision — retiring the old 30-day sweep and
+///     20-draft cap);
 ///   * the three launcher actions (Open / Save As… / Discard), each of which
 ///     may retire a draft only when the work is safely elsewhere.
 final class RecoveredDraftsTests: XCTestCase {
 
-  // MARK: - Retention
+  // MARK: - A draft outlives everything but a decision
 
+  /// Writing a NEW draft used to evict the oldest one on the spot, to hold a
+  /// 20-draft ceiling. The arrival of newer work is not a decision the user made
+  /// about the older draft, so nothing falls out.
   @MainActor
-  func testSweepDropsDraftsPastTheRetentionWindowAndKeepsTheRest() throws {
-    let store = try makeRecoveryStore()
-    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40)
-    let borderline = try seedDraft(in: store, text: "thirty-one days old", ageInDays: 31)
-    let fresh = try seedDraft(in: store, text: "five days old", ageInDays: 5)
-
-    let removed = store.pruneDrafts()
-
-    XCTAssertEqual(Set(removed), [stale.id, borderline.id])
-    XCTAssertFalse(fileExists(stale.url), "a 40-day-old draft survived the sweep")
-    XCTAssertFalse(fileExists(borderline.url), "a 31-day-old draft survived the sweep")
-    XCTAssertTrue(fileExists(fresh.url), "the sweep deleted a draft inside the retention window")
-    XCTAssertEqual(store.loadDrafts().map(\.text), ["five days old"])
-  }
-
-  /// The one rule retention may never break: the draft a window is editing is
-  /// the ONLY copy of that work.
-  @MainActor
-  func testSweepNeverDropsADraftThatIsOpenInAWindow() throws {
-    let store = try makeRecoveryStore()
-    let openDraft = try seedDraft(
-      in: store, text: "being edited right now", ageInDays: 100, keepOpen: true)
-
-    let removed = store.pruneDrafts()
-
-    XCTAssertTrue(removed.isEmpty)
-    XCTAssertTrue(fileExists(openDraft.url), "the sweep deleted the draft a window is editing")
-  }
-
-  @MainActor
-  func testSweepTrimsToTheDraftCapOldestFirst() throws {
-    let store = try makeRecoveryStore()
-    // All open while seeding, so the write-time cap cannot evict mid-loop and
-    // the sweep is what the assertion measures.
-    var seeded: [RecoveryDraft] = []
-    for index in 0..<25 {
-      seeded.append(
-        try seedDraft(
-          in: store, text: "draft \(index)", ageInDays: Double(25 - index), keepOpen: true))
-    }
-    for draft in seeded { store.markDraftClosed(id: draft.id) }
-
-    let removed = store.pruneDrafts()
-
-    XCTAssertEqual(removed.count, 5)
-    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
-    // Oldest five (the ones seeded first) are the ones that fell out.
-    for dropped in seeded.prefix(5) {
-      XCTAssertFalse(fileExists(dropped.url), "the cap kept a draft older than the survivors")
-    }
-    for kept in seeded.suffix(20) {
-      XCTAssertTrue(fileExists(kept.url), "the cap dropped one of the 20 newest drafts")
-    }
-  }
-
-  @MainActor
-  func testTheCapNeverEvictsAnOpenDraft() throws {
+  func testWritingANewDraftEvictsNothing() throws {
     let store = try makeRecoveryStore()
     var seeded: [RecoveryDraft] = []
-    for index in 0..<25 {
-      seeded.append(
-        try seedDraft(
-          in: store, text: "draft \(index)", ageInDays: Double(25 - index), keepOpen: true))
-    }
-
-    XCTAssertTrue(store.pruneDrafts().isEmpty)
-    XCTAssertEqual(store.loadDrafts().count, 25, "the cap evicted drafts held open by a window")
-    for draft in seeded {
-      XCTAssertTrue(fileExists(draft.url))
-    }
-  }
-
-  /// Writing a NEW draft applies the cap immediately — otherwise a crash loop
-  /// grows the list unbounded between launches.
-  @MainActor
-  func testWritingANewDraftAppliesTheCap() throws {
-    let store = try makeRecoveryStore()
-    var seeded: [RecoveryDraft] = []
-    for index in 0..<RecoveryStore.maximumDraftCount {
+    for index in 0..<20 {
       seeded.append(
         try seedDraft(in: store, text: "draft \(index)", ageInDays: Double(20 - index)))
     }
-    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
+    XCTAssertEqual(store.loadDrafts().count, 20)
 
     let newest = try store.saveDraft(id: nil, title: "Untitled.md", text: "one draft too many")
 
-    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
-    XCTAssertFalse(fileExists(try XCTUnwrap(seeded.first).url), "the oldest draft was not evicted")
+    XCTAssertEqual(store.loadDrafts().count, 21, "writing the 21st draft evicted an older one")
+    for draft in seeded {
+      XCTAssertTrue(fileExists(draft.url), "a draft was deleted to make room for a newer one")
+    }
     XCTAssertTrue(fileExists(newest.url))
   }
 
@@ -113,7 +46,7 @@ final class RecoveredDraftsTests: XCTestCase {
   func testResavingAnExistingDraftEvictsNothing() throws {
     let store = try makeRecoveryStore()
     var seeded: [RecoveryDraft] = []
-    for index in 0..<RecoveryStore.maximumDraftCount {
+    for index in 0..<20 {
       seeded.append(
         try seedDraft(in: store, text: "draft \(index)", ageInDays: Double(20 - index)))
     }
@@ -121,97 +54,86 @@ final class RecoveredDraftsTests: XCTestCase {
     let live = try XCTUnwrap(seeded.last)
     _ = try store.saveDraft(id: live.id, title: "Untitled.md", text: "still typing")
 
-    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
+    XCTAssertEqual(store.loadDrafts().count, 20)
     for draft in seeded {
       XCTAssertTrue(fileExists(draft.url))
     }
   }
 
-  // MARK: - The sweep on the LAUNCH path
+  // MARK: - The LAUNCH path
 
-  /// Retention is only worth anything if something actually RUNS it, and the
-  /// store's API is not evidence that anything does. This drives the
+  /// The launch path used to be the one place that deleted drafts on its own:
+  /// past 30 days they went, and what survived was trimmed to the newest 20.
+  /// Monika's decision of 04.08 retired both rules, and a decision is only worth
+  /// anything if the code the user actually runs obeys it. This drives the
   /// application's own launch entry point — `PensieveAppDelegate`, the
   /// `@NSApplicationDelegateAdaptor` instance every launch goes through — and
   /// then reads the result back through the LAUNCHER surface
   /// (`AppController.recoveredDrafts`), which is where the user meets it.
   ///
-  /// The three properties in one pass: an over-retention draft goes, the cap is
-  /// applied to what survives, and the draft a window is holding open right now
-  /// is exempt from both.
+  /// Both retired rules in one pass: drafts far past the old 30-day window, and
+  /// a directory far past the old cap of 20, all still there afterwards.
   @MainActor
-  func testTheLaunchSweepDropsStaleAndOverCapDraftsAndNeverTheOpenOne() throws {
+  func testTheLaunchPassKeepsAncientAndOverCapDraftsAlike() throws {
     let folder = try makeTemporaryFolder()
     let store = try makeRecoveryStore(in: folder)
 
-    // Everything is seeded OPEN so the write-time cap cannot evict mid-loop:
-    // what the sweep does is the thing under test, and the claims are released
-    // right after — except the one draft that stays open on purpose.
-    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40, keepOpen: true)
-    // Oldest first, so the ones the cap drops are the ones seeded first.
+    let ancient = try seedDraft(in: store, text: "four hundred days old", ageInDays: 400)
+    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40)
+    let borderline = try seedDraft(in: store, text: "thirty-one days old", ageInDays: 31)
+    // Oldest first, so the ones the retired cap would have dropped are the ones
+    // seeded first.
     var overCap: [RecoveryDraft] = []
     for index in 0..<25 {
       overCap.append(
-        try seedDraft(
-          in: store, text: "draft \(index)", ageInDays: Double(25 - index), keepOpen: true))
+        try seedDraft(in: store, text: "draft \(index)", ageInDays: Double(25 - index)))
     }
-    // Ancient AND the very oldest in the list: retention would take it twice
-    // over if the open-draft claim did not outrank both rules.
-    let openDraft = try seedDraft(
-      in: store, text: "being edited right now", ageInDays: 400, keepOpen: true)
-    store.markDraftClosed(id: stale.id)
-    for draft in overCap { store.markDraftClosed(id: draft.id) }
 
     let delegate = PensieveAppDelegate()
     delegate.launchRecoveryStoreOverride = store
-    let removed = Set(delegate.pruneRecoveredDraftsOnLaunch())
+    let surveyed = Set(delegate.surveyRecoveredDraftsOnLaunch().map(\.id))
 
-    XCTAssertTrue(removed.contains(stale.id), "the launch sweep kept a 40-day-old draft")
-    // 27 seeded − 1 expired = 26, trimmed to the cap of 20: the six oldest
-    // sweepable drafts go, and the open one keeps its slot.
-    for dropped in overCap.prefix(6) {
+    let all = [ancient, stale, borderline] + overCap
+    XCTAssertEqual(store.loadDrafts().count, all.count, "the launch pass deleted drafts")
+    for draft in all {
       XCTAssertTrue(
-        removed.contains(dropped.id), "the launch sweep did not apply the count cap")
-      XCTAssertFalse(fileExists(dropped.url))
+        fileExists(draft.url),
+        "launching the app deleted a draft nobody decided about — the only copy of that work")
+      XCTAssertTrue(surveyed.contains(draft.id))
     }
-    XCTAssertFalse(
-      removed.contains(openDraft.id),
-      "the launch sweep dropped the draft a window is editing — the only copy of that work")
-    XCTAssertTrue(fileExists(openDraft.url))
-    XCTAssertEqual(store.loadDrafts().count, RecoveryStore.maximumDraftCount)
 
-    // …and the launcher the user lands on shows exactly what survived, minus
-    // the one already claimed by a window.
-    let controller = makeController(in: folder, recoveryStore: store, confirmsDiscard: false)
-    controller.refreshRecoveredDrafts()
-    let offered = Set(controller.recoveredDrafts.map(\.id))
-    XCTAssertFalse(offered.contains(stale.id))
-    XCTAssertFalse(offered.contains(openDraft.id), "a claimed draft is not an unhandled one")
-    XCTAssertEqual(offered.count, RecoveryStore.maximumDraftCount - 1)
-  }
-
-  /// A draft is two files — the `.md` and the `.title` sidecar holding its
-  /// name — and retention used to remove only the first. The orphan was
-  /// invisible (the directory listing reads `.md` only) and nothing ever
-  /// collected it, so the recovery directory grew one dead file per pruned
-  /// draft, on every launch, forever.
-  @MainActor
-  func testTheLaunchSweepTakesTheTitleSidecarWithTheDraft() throws {
-    let folder = try makeTemporaryFolder()
-    let store = try makeRecoveryStore(in: folder)
-    let stale = try seedDraft(in: store, text: "forty days old", ageInDays: 40)
-    let fresh = try seedDraft(in: store, text: "five days old", ageInDays: 5)
-
-    let delegate = PensieveAppDelegate()
-    delegate.launchRecoveryStoreOverride = store
-    delegate.pruneRecoveredDraftsOnLaunch()
-
-    let recoveryDirectory = stale.url.deletingLastPathComponent()
-    let sidecars = try FileManager.default.contentsOfDirectory(atPath: recoveryDirectory.path)
+    // A draft is two files — the `.md` and the `.title` sidecar holding its
+    // name — and neither may be collected behind the user's back.
+    let recoveryDirectory = ancient.url.deletingLastPathComponent()
+    let sidecars = try FileManager.default
+      .contentsOfDirectory(atPath: recoveryDirectory.path)
       .filter { $0.hasSuffix(".title") }
     XCTAssertEqual(
-      sidecars, ["\(fresh.id.uuidString).title"],
-      "the swept draft left its title sidecar behind as a permanent orphan")
+      Set(sidecars), Set(all.map { "\($0.id.uuidString).title" }),
+      "the launch pass took a draft's title sidecar")
+
+    // …and the launcher the user lands on offers every one of them.
+    let controller = makeController(in: folder, recoveryStore: store, confirmsDiscard: false)
+    controller.refreshRecoveredDrafts()
+    XCTAssertEqual(Set(controller.recoveredDrafts.map(\.id)), Set(all.map(\.id)))
+  }
+
+  /// The draft a window is holding open is the only copy of live work. It is not
+  /// "unhandled", so it drops off every other launcher surface — and the launch
+  /// pass still leaves the file exactly where it is.
+  @MainActor
+  func testTheLaunchPassLeavesTheDraftAWindowIsEditingAlone() throws {
+    let store = try makeRecoveryStore()
+    let openDraft = try seedDraft(
+      in: store, text: "being edited right now", ageInDays: 400, keepOpen: true)
+
+    let delegate = PensieveAppDelegate()
+    delegate.launchRecoveryStoreOverride = store
+    delegate.surveyRecoveredDraftsOnLaunch()
+
+    XCTAssertTrue(fileExists(openDraft.url), "the launch pass deleted a draft being edited")
+    XCTAssertTrue(store.isDraftOpen(id: openDraft.id))
+    XCTAssertTrue(store.unclaimedDrafts().isEmpty, "a claimed draft is not an unhandled one")
   }
 
   // MARK: - Open
@@ -233,7 +155,7 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
     // Opening is not deciding: the draft is still recoverable.
     XCTAssertTrue(fileExists(draft.url), "Open deleted the draft before it was saved or discarded")
-    XCTAssertTrue(store.isDraftOpen(id: draft.id), "the adopted draft is not protected from sweeps")
+    XCTAssertTrue(store.isDraftOpen(id: draft.id), "the adopted draft was not claimed")
   }
 
   @MainActor
@@ -409,20 +331,33 @@ final class RecoveredDraftsTests: XCTestCase {
 
   // MARK: - Discard
 
+  /// Discard is now one of only three things that may retire a draft, so it is
+  /// also the only place the two-file invariant can still be broken: a draft is
+  /// its `.md` AND its `.title` sidecar, and removing only the first leaves an
+  /// orphan the directory listing (which reads `.md` only) can never show and
+  /// nothing ever collects.
   @MainActor
-  func testDiscardDeletesTheDraftOnlyAfterConfirmation() throws {
+  func testDiscardDeletesTheDraftAndItsSidecarOnlyAfterConfirmation() throws {
     let folder = try makeTemporaryFolder()
     let store = try makeRecoveryStore(in: folder)
     let draft = try seedDraft(in: store, text: "throwaway", ageInDays: 0)
+    let recoveryDirectory = draft.url.deletingLastPathComponent()
+    let sidecars = {
+      try FileManager.default.contentsOfDirectory(atPath: recoveryDirectory.path)
+        .filter { $0.hasSuffix(".title") }
+    }
 
     let refusing = makeController(in: folder, recoveryStore: store, confirmsDiscard: false)
     XCTAssertFalse(refusing.discardRecoveredDraft(draft))
     XCTAssertTrue(fileExists(draft.url), "Cancel on the discard alert still deleted the draft")
+    XCTAssertEqual(try sidecars(), ["\(draft.id.uuidString).title"])
 
     let accepting = makeController(in: folder, recoveryStore: store, confirmsDiscard: true)
     XCTAssertTrue(accepting.discardRecoveredDraft(draft))
     XCTAssertFalse(fileExists(draft.url), "a confirmed discard left the draft on disk")
     XCTAssertTrue(accepting.recoveredDrafts.isEmpty)
+    XCTAssertEqual(
+      try sidecars(), [], "the discarded draft left its title sidecar behind as an orphan")
   }
 
   // MARK: - Launcher model
@@ -480,7 +415,7 @@ final class RecoveredDraftsTests: XCTestCase {
   }
 
   /// Seeds one draft with an explicit age. Ages are set on the file itself, so
-  /// retention is exercised through the same modification dates production
+  /// the age assertions run against the same modification dates production
   /// reads. `keepOpen` leaves the write-time claim in place (a window editing
   /// the draft); otherwise the claim is released, which is the state a draft
   /// left behind by a crash is actually in.
