@@ -322,7 +322,12 @@ struct EditorRepresentable: NSViewRepresentable {
     // A genuine text change (document load) is allowed to scroll; a pure re-render keeps the
     // viewport where the user left it — caret only moves scroll when typing pushes it past
     // the edge, which AppKit already did before this re-render ran.
-    let textUnchanged = surface.textStorage.string == text
+    //
+    // Asked through `bufferHoldsText`, never as `surface.textStorage.string == text`. The
+    // literal spelling is what pinned the main thread at 100% on a 17 MB file: see the
+    // comment on `bufferHoldsText`. This guard and the one inside `surface.update` below
+    // are the two comparisons the operator's sample caught, one per pass.
+    let textUnchanged = surface.bufferHoldsText(text)
     let savedOrigin = scroll.contentView.bounds.origin
     surface.typewriterScrollEnabled = editorMode == .focus
     surface.configureScrollSync(
@@ -476,6 +481,15 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var autocompleteErrorCancellable: AnyCancellable?
   private var rewritePreviewCancellable: AnyCancellable?
   private var documentRevision: UInt64 = 0
+  /// The text the buffer is known to hold, kept as the bridged string OBJECT and
+  /// never as characters to walk — the whole point of `bufferHoldsText`. Dropped
+  /// by every character edit (see `onCharactersEdited`), so it can go stale only
+  /// if some path mutates the buffer without the storage seeing it.
+  private var syncedTextObject: NSString?
+  /// Whole-buffer comparisons `bufferHoldsText` could not settle from the cheap
+  /// signals. A steady re-render pass — SwiftUI re-laying the representable out
+  /// with the text untouched — must add nothing to this.
+  private(set) var wholeBufferComparisonCount = 0
   private var autocompleteRenderGeneration: UInt64 = 0
   private var lastTextChangeSelection: NSRange?
   private weak var scrollSyncCoordinator: ScrollSyncCoordinator?
@@ -633,6 +647,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // invalidation is driven from there rather than from the delegate callbacks.
     textContentStorage.onCharactersEdited = { [weak self] location, _ in
       self?.invalidateLineAnchor(editedAt: location)
+      // Same reason the line anchor is invalidated from here rather than from the
+      // delegate: the storage is the only place that sees EVERY character edit,
+      // direct mutations included. `bufferHoldsText` answers from a remembered
+      // string identity, and a memo that outlived the buffer it describes would
+      // claim the model is in sync with characters that are no longer there.
+      self?.syncedTextObject = nil
     }
     // The gutter no longer counts its row numbers off the enumeration (which is
     // what forced every repaint to lay out the whole document); it starts at the
@@ -658,6 +678,59 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       findQuery: "",
       findBarVisible: false
     )
+  }
+
+  /// Does the buffer already hold exactly `candidate`?
+  ///
+  /// The obvious spelling — `textStorage.string == candidate` — is what froze the
+  /// app on a 17 MB file, and it froze it on the passes where the answer was
+  /// "yes, nothing changed". Two costs stack there:
+  ///
+  /// * `NSTextStorage.string` bridges the backing store into a Swift `String`,
+  ///   which copies the whole document;
+  /// * `String ==` is canonical equivalence, so on a bridged `NSBigMutableString`
+  ///   (what the backing store becomes at that size) it normalises to NFC scalar
+  ///   by scalar, and every scalar is an `objc_msgSend` into `characterAtIndex:`.
+  ///
+  /// SwiftUI re-runs `updateNSView` freely, so an O(document) walk per pass — two
+  /// of them, this guard and the one in `update` — is an unbounded main-thread
+  /// burn with no end condition. The operator's sample caught exactly that: both
+  /// call sites sitting in `_stringCompareSlow`, 100% CPU, indefinitely.
+  ///
+  /// So the walk is the last resort, not the test:
+  ///
+  /// 1. UTF-16 lengths disagree ⇒ different, O(1). This also keeps the memo
+  ///    below honest — a buffer that changed length behind our back can never be
+  ///    answered from a remembered identity.
+  /// 2. `candidate` is backed by the very object the buffer was last synced with
+  ///    ⇒ same characters without reading one, O(1). This is the steady state:
+  ///    the model gets its value FROM this surface (`textDidChange` hands the
+  ///    buffer snapshot up and it is stored verbatim), so the string coming back
+  ///    down through the binding is that same instance, pass after pass.
+  /// 3. Otherwise compare code units. `NSString.isEqual(to:)` is exact and does
+  ///    NOT normalise, so it costs a scan and not a scan times Unicode. The
+  ///    result is memoised, so a given value pays it once rather than per pass.
+  ///
+  /// Step 3 being exact rather than canonical also closes a real hole: text that
+  /// is canonically equivalent to the buffer but differently composed (NFD where
+  /// the buffer holds NFC) used to read as "unchanged" and never reached the
+  /// view, leaving model and buffer silently split. Strict equality only ever
+  /// syncs MORE, never less, and it cannot ping-pong: what the surface hands the
+  /// model is the buffer's own code units.
+  func bufferHoldsText(_ candidate: String) -> Bool {
+    let candidateObject = candidate as NSString
+    guard candidateObject.length == textStorage.length else { return false }
+    if candidateObject === syncedTextObject { return true }
+    wholeBufferComparisonCount += 1
+    guard textStorage.mutableString.isEqual(to: candidate) else { return false }
+    syncedTextObject = candidateObject
+    return true
+  }
+
+  /// Records that the buffer now holds exactly `text`, so the next pass can be
+  /// answered by identity instead of by a scan.
+  private func recordSyncedText(_ text: String) {
+    syncedTextObject = text as NSString
   }
 
   // No default parameter values on purpose: a defaulted behavior flag already
@@ -702,7 +775,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       reapplyFindHighlights()
     }
 
-    if textStorage.string != text {
+    if !bufferHoldsText(text) {
       isApplyingExternalText = true
       documentRevision &+= 1
       autocompleteController.cancelRewrite()
@@ -715,12 +788,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       let savedOrigin = scrollView.contentView.bounds.origin
       textStorage.replaceCharacters(
         in: NSRange(location: 0, length: textStorage.length), with: text)
+      // The buffer now holds these exact code units. Recorded AFTER the mutation,
+      // because the edit itself drops the memo (`onCharactersEdited`).
+      recordSyncedText(text)
       // Viewport-first past `LargeDocument.sizeBudget`, one synchronous full pass
       // below it — which is every ordinary document, unchanged. This call site is
       // the one the open path lands on, and a full-document pass here is seconds
       // of frozen main thread on a large file.
       textContentStorage.refreshHighlightingAfterFullTextReplacement()
-      let newLength = (textStorage.string as NSString).length
+      // `textStorage.length` IS the UTF-16 length; going through `.string` would
+      // copy the whole document to ask a question the storage answers for free.
+      let newLength = textStorage.length
       let caret = min(savedSelection.location, newLength)
       textView.setSelectedRange(
         NSRange(location: caret, length: min(savedSelection.length, newLength - caret)))
@@ -857,6 +935,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard let changedTextView = notification.object as? NSTextView, changedTextView === textView
     else { return }
     let latestText = textStorage.string
+    // The snapshot about to be handed to the model IS the buffer, so record it as
+    // the synced value. The model stores it verbatim, which is what lets the next
+    // `updateNSView` pass answer "unchanged" from identity instead of a scan.
+    recordSyncedText(latestText)
     documentRevision &+= 1
     if textView.undoManager?.isUndoing == true {
       autocompleteController.invalidateContinuation()
