@@ -168,6 +168,15 @@ Clarifications (03.08, after bug I "ghost factory"):
 - Drafts surface exclusively through an explicit launcher
   (Recovered Drafts section) — never through silent adoption into a fresh tab.
 
+Clarification (04.08, Monika — "they don't disappear without my decision"):
+
+- **No retention, no cap.** Neither the passage of time nor the number of stored
+  drafts retires anything. The launch pass over the recovery directory is
+  read-only; the app previously deleted drafts older than 30 days and trimmed the
+  rest to the newest 20, and that behavior is gone.
+- If the number of drafts ever needs to be surfaced, it is shown to the user as
+  information — never acted on by deleting.
+
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 
 - being saved as a regular file;
