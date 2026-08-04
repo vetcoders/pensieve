@@ -200,7 +200,6 @@ private struct ActivePensieveCommands: Commands {
       Button("New Folder") {
         createFolder()
       }
-      .keyboardShortcut("n", modifiers: [.command, .shift])
       .disabled(defaultNewFileDirectory() == nil)
 
       Divider()
