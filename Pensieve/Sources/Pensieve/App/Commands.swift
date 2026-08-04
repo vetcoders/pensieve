@@ -93,6 +93,16 @@ enum CommandSurfaceAdoption {
   }
 }
 
+/// Which window `Shift+Cmd+W` closes. Extracted for the same reason as
+/// `CommandSurfaceAdoption`: SwiftUI's `Commands` body cannot be pinned by a
+/// test directly, so the target-selection rule is pinned here instead. Mirrors
+/// the `keyWindow ?? mainWindow` fallback `DocumentSharing` already uses.
+enum CloseWindowTarget {
+  static func resolve(keyWindow: NSWindow?, mainWindow: NSWindow?) -> NSWindow? {
+    keyWindow ?? mainWindow
+  }
+}
+
 /// Which root the menu bar acts on. Extracted so the pair-consistency rule is
 /// pinned by tests rather than by reading the `if let` chain below.
 enum CommandTargetResolution {
@@ -208,7 +218,6 @@ private struct ActivePensieveCommands: Commands {
       Button("Close Folder") {
         controller.closeWorkspace()
       }
-      .keyboardShortcut("w", modifiers: [.command, .shift])
       .disabled(appState.workspaceRoots.isEmpty)
 
       Divider()
@@ -300,6 +309,11 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut("w", modifiers: [.command])
       .disabled(!appState.documentHasEditableBuffer)
+
+      Button("Close Window") {
+        closeKeyWindow()
+      }
+      .keyboardShortcut("w", modifiers: [.command, .shift])
     }
 
     CommandGroup(after: .toolbar) {
@@ -717,6 +731,15 @@ private struct ActivePensieveCommands: Commands {
     }
 
     return candidate
+  }
+
+  /// `Shift+Cmd+W` — closes the key window exactly like the red button: via
+  /// `performClose`, which routes through `windowShouldClose` and therefore the
+  /// unsaved-work guard. Files stay in Open Files (window-close is a tidying
+  /// gesture, not a document-close); no DocumentStore mutation happens here.
+  private func closeKeyWindow() {
+    CloseWindowTarget.resolve(keyWindow: NSApp.keyWindow, mainWindow: NSApp.mainWindow)?
+      .performClose(nil)
   }
 
   private func showFindBar(replace: Bool) {

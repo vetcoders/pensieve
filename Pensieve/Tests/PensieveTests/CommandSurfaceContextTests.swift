@@ -316,4 +316,39 @@ final class CommandSurfaceContextTests: XCTestCase {
 
     XCTAssertNil(resolved)
   }
+
+  // MARK: - Shift+Cmd+W (Close Window)
+
+  /// Contract (docs/keyboard-shortcuts-and-file-lifecycle-contract.md,
+  /// "`Shift+Cmd+W` — Close Window"): the shortcut closes the KEY window, the
+  /// same target the red button acts on — never a background window.
+  @MainActor
+  func testCloseWindowTargetPrefersTheKeyWindowOverMainWindow() {
+    let key = Self.makeParkedWindow()
+    let main = Self.makeParkedWindow()
+    defer {
+      key.close()
+      main.close()
+    }
+
+    XCTAssertTrue(CloseWindowTarget.resolve(keyWindow: key, mainWindow: main) === key)
+  }
+
+  /// Menu-bar tracking and other focus-silent periods can leave `NSApp.keyWindow`
+  /// nil; `Shift+Cmd+W` must still fall back to the main window rather than
+  /// silently doing nothing.
+  @MainActor
+  func testCloseWindowTargetFallsBackToMainWindowWhenNoKeyWindow() {
+    let main = Self.makeParkedWindow()
+    defer { main.close() }
+
+    XCTAssertTrue(CloseWindowTarget.resolve(keyWindow: nil, mainWindow: main) === main)
+  }
+
+  /// No window at all (e.g. between scenes) must resolve to nothing rather
+  /// than crash `performClose`.
+  @MainActor
+  func testCloseWindowTargetResolvesToNothingWithNoWindowAtAll() {
+    XCTAssertNil(CloseWindowTarget.resolve(keyWindow: nil, mainWindow: nil))
+  }
 }
