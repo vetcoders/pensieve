@@ -495,6 +495,15 @@ enum WindowChromeRecipe {
       corrected = true
     }
 
+    // The titlebar's TRANSPARENCY is chrome too, and it is the precondition the
+    // preview's OS-owned top inset hangs on — see
+    // `assertOpaqueTitlebarForWebContentInsets`. Skin-independent, so it does
+    // not ride the appearance edge trigger above; it round-trips, so a plain
+    // compare-and-set converges here.
+    if assertOpaqueTitlebarForWebContentInsets(on: window) {
+      corrected = true
+    }
+
     // The toolbar's on-state chips are chrome too, and they are lost to the same
     // external resets this method exists to heal (a toolbar re-bridge hands the
     // segmented control back its default accent fill).
@@ -509,6 +518,82 @@ enum WindowChromeRecipe {
     }
 
     return corrected
+  }
+
+  // MARK: - The pocket's precondition
+
+  /// True where WebKit's automatic `obscuredContentInsets` pocket — the ONE
+  /// owner of the preview's top offset (see `PreviewWebView`) — exists at all.
+  /// Before macOS 26 there is no pocket and `PreviewTitlebarGlassController`
+  /// plumbs the measured glass height as a CSS offset instead, so nothing below
+  /// applies there.
+  static var webContentInsetsOwnedByOS: Bool {
+    if #available(macOS 26.0, *) { return true }
+    return false
+  }
+
+  /// Whether this window's chrome SUPPRESSES that adoption.
+  ///
+  /// WebKit only adopts the pocket for a full-size-content window whose
+  /// titlebar is not declared transparent; a transparent titlebar means "the
+  /// app lays out its own chrome band", so WebKit hands the offset back and
+  /// pins the insets at zero.
+  static func suppressesAutomaticWebContentInsets(
+    styleMask: NSWindow.StyleMask, titlebarAppearsTransparent: Bool
+  ) -> Bool {
+    styleMask.contains(.fullSizeContentView) && titlebarAppearsTransparent
+  }
+
+  /// Puts a window back into the shape where the OS owns the preview's top
+  /// inset. Returns `true` when something had to be corrected.
+  ///
+  /// The two window paths did NOT agree here, and only one of them said so out
+  /// loud. An AppKit `DocumentWindow` keeps `NSWindow`'s default opaque
+  /// titlebar; the SwiftUI scene-owned launcher — the FIRST window of every
+  /// session, and the one restoration loads the recovered document into —
+  /// arrives with `titlebarAppearsTransparent = true`, which SwiftUI sets for
+  /// its own chrome. Measured on a staged build (macOS 26.6, instrumented
+  /// preview sink, `tiny.md` opened into the launcher):
+  ///
+  ///   * factory `DocumentWindow`, `transparentTitlebar=false`: pocket top
+  ///     0 pt at attach, **88 pt one quarter-second later** — adopted, matching
+  ///     `frameH − contentLayoutRect.height`.
+  ///   * scene `AppKitWindow` (`pensieve.launcher-AppWindow-1`),
+  ///     `transparentTitlebar=true`: pocket top **0 pt forever**, while the
+  ///     same window measured a 52 pt (80 pt with a tab bar) chrome band. The
+  ///     document's first heading sat under the toolbar with no way to scroll
+  ///     to it, permanently — the preview never recomputes on its own.
+  ///   * the same launcher window with this correction applied: pocket top
+  ///     **52 pt one tick after the write**, page start at the glass line, and
+  ///     the write ROUND-TRIPS (read back `false`, still `false` 24 passes
+  ///     later — SwiftUI does not put its answer back the way it does for
+  ///     `NSWindow.appearance`, so this is a plain compare-and-set with no
+  ///     write loop).
+  ///
+  /// This is deliberately the ROOT-CAUSE TRIGGER and not a compensating offset:
+  /// with the precondition restored the pocket owns the band again, including
+  /// its own re-measurement when a tab bar appears or disappears (52 ↔ 80) and
+  /// the scroll-edge dissolve the CSS imitation could never match. Re-asserted
+  /// from `assertWindowChrome` for the same reason everything else there is:
+  /// a toolbar re-bridge or a tab-group re-parent can hand the window back a
+  /// default chrome, and only a level-triggered invariant survives that.
+  ///
+  /// Only the editor's `NSScrollView` half was ever healthy on the launcher:
+  /// AppKit's `automaticallyAdjustsContentInsets` carries no such precondition,
+  /// which is why the defect looked preview-specific rather than window-shaped.
+  @discardableResult
+  static func assertOpaqueTitlebarForWebContentInsets(
+    on window: NSWindow,
+    osOwnsWebContentInsets: Bool = webContentInsetsOwnedByOS
+  ) -> Bool {
+    guard osOwnsWebContentInsets else { return false }
+    guard
+      suppressesAutomaticWebContentInsets(
+        styleMask: window.styleMask,
+        titlebarAppearsTransparent: window.titlebarAppearsTransparent)
+    else { return false }
+    window.titlebarAppearsTransparent = false
+    return true
   }
 
   /// sRGB component comparison. `NSColor ==` is unreliable across colour spaces
