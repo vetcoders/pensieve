@@ -4,10 +4,15 @@ import Observation
 /// The app-wide restore-on-launch preference (Settings ▸ General).
 ///
 /// Governs exactly ONE thing: whether a genuine cold launch (the process just
-/// started, no explicit document) rebuilds the previous workspace and reopens
-/// its documents. Persisted workspace bookmarks are never touched by this
-/// setting — turning it off only skips auto-opening them on a cold launch;
-/// turning it back on picks them up again on the next one. Dock reopen, the
+/// started, no explicit document) reopens the WORKING SET — the files the user
+/// left open at quit — and the selection that came with it.
+///
+/// It does NOT govern the workspace. Workspace is configuration and always
+/// comes back (decision 26.07, W9): roots, tree and sidebar are rebuilt on
+/// every cold launch whatever this setting says, so a user who turned the
+/// session off still lands in the project she works in — with nothing open in
+/// it. Persisted bookmarks are never touched either way; turning the setting
+/// back on picks the working set up again on the next launch. Dock reopen, the
 /// tab bar's "+", and any explicit open/restore action are different
 /// `LaunchIntent` cases and are not affected by this setting at all.
 @Observable

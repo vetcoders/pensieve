@@ -201,18 +201,18 @@ final class LaunchOpensNothingTests: XCTestCase {
 
   /// RESTORE-ON-LAUNCH OFF MEANS THE FILES STAY SHUT — including the ones the
   /// launch reopens through the WINDOW REGISTRY, which is the half the user
-  /// actually sees. The setting promises "no workspace, no open files", and the
-  /// working set is restored by a different step from the workspace, so the
-  /// control leg above (`testAFileLeftOpenAtQuitStillComesBack`) is the only
-  /// thing that makes this measurable at all.
+  /// actually sees. The setting promises "no files reopened", NOT "no
+  /// workspace": the roots come back on every cold launch (decision 26.07, W9),
+  /// and the working set is restored by a different step, so the control leg
+  /// above (`testAFileLeftOpenAtQuitStillComesBack`) is the only thing that
+  /// makes this measurable at all.
   ///
   /// The Dock-reopen launcher is the trap, and it is why `start` claims the
-  /// application's one startup restore BEFORE it consults the setting. The gate
-  /// fires on `.coldLaunch` only — by design, so the Dock still rebuilds the
-  /// workspace — but the reopen behind it is gated on the startup CLAIM, not on
-  /// the intent. Take the claim after the gate and a declining cold launch
-  /// leaves it unclaimed for the next launcher to pick up: click the Dock icon
-  /// and every file the user had just turned off comes back.
+  /// application's one startup restore BEFORE anything can return early, and
+  /// gates the reopen on that CLAIM rather than on the intent. Take the claim
+  /// later and a declining cold launch leaves it unclaimed for the next
+  /// launcher to pick up: click the Dock icon and every file the user had just
+  /// turned off comes back.
   func testColdLaunchWithRestoreOffReopensNoFilesInAnyWindow() throws {
     let harness = try makeHarness()
     let keptURL = try harness.writeLooseNote(named: "kept.md")
@@ -229,6 +229,10 @@ final class LaunchOpensNothingTests: XCTestCase {
     XCTAssertTrue(
       launched.registry.openDocuments.isEmpty,
       "the file came back as an open document despite the setting")
+    XCTAssertEqual(
+      launched.appState.workspaceRoots.map(\.url), [harness.root.standardizedFileURL],
+      "the workspace is configuration and comes back regardless — declining the session must"
+        + " not leave the user in an app that forgot which project she works in")
 
     let dockLauncher = harness.openDockReopenLauncher()
     XCTAssertNil(
