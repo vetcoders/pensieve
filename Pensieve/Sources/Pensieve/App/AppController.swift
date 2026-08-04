@@ -281,18 +281,24 @@ final class AppController: ObservableObject {
     // and every launcher after it must be an empty launcher.
     let isApplicationStartupRestore = startupRestore.claimStartupRestore()
 
-    // The toggle governs LAUNCH only: a cold launch with it off lands on the
-    // clean launcher, but Dock reopen / the tab bar's "+" still rebuild the
-    // workspace they always did — those never asked to restore a whole
-    // session, only to put a launcher back. Persisted bookmarks are untouched
-    // either way; only this auto-invoke is skipped. The claim above is taken
-    // FIRST on purpose: a declining cold launch is still the application's one
-    // startup restore, so the launcher that appears later cannot inherit the
-    // document reopen the user just turned off.
-    if intent == .coldLaunch, !launchSettings.restoreSessionOnLaunch { return }
+    // WORKSPACE IS CONFIGURATION — IT ALWAYS COMES BACK (decision 26.07, W9).
+    // The toggle governs the SESSION: the files a launch reopens and the
+    // selection it would restore, never the roots, the tree or the sidebar.
+    // Skipping the whole restore here was the fracture — a user who only asked
+    // not to have her tabs reopened lost the workspace with them, and the
+    // launcher came up with nothing to open FROM.
+    //
+    // It also governs LAUNCH only: Dock reopen / the tab bar's "+" never asked
+    // to restore a whole session, only to put a launcher back, so they are not
+    // gated on it at all. Persisted bookmarks are untouched on every path.
+    let reopensWorkingSet = intent != .coldLaunch || launchSettings.restoreSessionOnLaunch
 
     folderManager.restoreLastFolderInBackground(into: appState)
-    guard isApplicationStartupRestore else { return }
+    // The claim above is taken FIRST on purpose, and the reopen is gated on it
+    // rather than on the intent: a cold launch that declines the working set is
+    // still the application's one startup restore, so the launcher that appears
+    // later cannot inherit the document reopen the user just turned off.
+    guard isApplicationStartupRestore, reopensWorkingSet else { return }
     reopenRestoredOpenFiles()
   }
 

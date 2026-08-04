@@ -363,21 +363,41 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertTrue(LaunchSettings(defaults: defaults).restoreSessionOnLaunch)
   }
 
-  /// The toggle's OFF state: a cold launch must land on the clean launcher —
-  /// no workspace roots, no documents, nothing selected.
+  /// THE CONTRACT PIN for the toggle's OFF state (decision 26.07, W9):
+  /// **workspace is configuration — it always comes back.** Off means the
+  /// launcher opens NO file and selects nothing; it does not mean the user is
+  /// dropped into an app that has forgotten which project she works in.
+  ///
+  /// The three claims are deliberately measured together, because the fracture
+  /// this pin closes passed every one-sided assertion: `start` returned before
+  /// `restoreLastFolderInBackground`, so "no files open" was true for the worst
+  /// possible reason — there was no workspace left to open anything from.
   @MainActor
-  func testColdLaunchWithRestoreSessionOffLandsOnTheCleanLauncher() async throws {
+  func testColdLaunchWithRestoreSessionOffKeepsTheWorkspaceAndOpensNothing() async throws {
     let harness = try makeRestoreHarness(
       documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
+    // A file left open at quit, OUTSIDE the root: the working set is what the
+    // toggle governs, and a workspace document would prove nothing since the
+    // tree brings those back by itself.
+    let keptURL = try makeTemporaryFolder("loose").appendingPathComponent("kept.md")
+    try "kept".write(to: keptURL, atomically: true, encoding: .utf8)
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: keptURL, into: AppState()))
 
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
+    await harness.folderManager.waitForPendingWorkspaceBuild()
 
-    XCTAssertTrue(
-      harness.appState.workspaceRoots.isEmpty,
-      "restore-session-on-launch off must skip the cold-launch workspace restore")
-    XCTAssertTrue(harness.appState.documents.isEmpty)
-    XCTAssertNil(harness.appState.selectedDocumentID)
+    XCTAssertEqual(
+      harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "workspace is configuration: restore-session off must still rebuild the roots")
+    XCTAssertFalse(
+      harness.appState.documents.isEmpty,
+      "the sidebar tree is part of the workspace, not of the session")
+    XCTAssertNil(
+      harness.appState.documentSession.url,
+      "the working set must stay shut — a cold launch with the toggle off opens no file")
+    XCTAssertNil(
+      harness.appState.selectedDocumentID,
+      "and it selects nothing: auto-select is the other half of what the toggle governs")
   }
 
   /// The toggle governs LAUNCH only — Dock reopen (and, by the same
@@ -397,23 +417,33 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertNil(harness.appState.selectedDocumentID)
   }
 
-  /// A skipped cold-launch restore must not touch the persisted bookmark: an
-  /// explicit/manual restore right afterwards still finds the workspace.
+  /// A declined working-set reopen must not touch the persisted bookmarks. The
+  /// toggle skips an ACTION, it does not forget anything: a fresh session
+  /// restoring right afterwards still finds both the root and the file the user
+  /// left open, which is what makes flipping the toggle back on reversible.
   @MainActor
   func testRestoreSessionOffDoesNotClearThePersistedBookmark() async throws {
     let harness = try makeRestoreHarness(
       documentNames: ["alpha.md"], restoreSessionOnLaunch: false)
+    let keptURL = try makeTemporaryFolder("loose").appendingPathComponent("kept.md")
+    try "kept".write(to: keptURL, atomically: true, encoding: .utf8)
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: keptURL, into: AppState()))
 
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
-    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+    XCTAssertNil(
+      harness.appState.documentSession.url, "the declining launch must open no document")
 
-    harness.folderManager.restoreLastFolderInBackground(into: harness.appState)
+    let nextSession = AppState()
+    harness.folderManager.restoreLastFolderInBackground(into: nextSession)
     await harness.folderManager.waitForPendingWorkspaceBuild()
 
     XCTAssertEqual(
-      harness.appState.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
-      "the bookmark must survive a skipped auto-restore — only the auto-invoke was skipped")
+      nextSession.workspaceRoots.map(\.url), [harness.folder.standardizedFileURL],
+      "the root bookmark must survive a declined reopen — only the auto-invoke was skipped")
+    XCTAssertEqual(
+      nextSession.openFiles.map(\.id), [keptURL.standardizedFileURL],
+      "and so must the file bookmarks: turning the setting back on has to bring them back")
   }
 
   /// Turning the toggle back ON restores the previous workspace on the next
@@ -425,8 +455,8 @@ final class LaunchIntentTests: XCTestCase {
     let harness = try makeRestoreHarness(
       documentNames: ["alpha.md", "zebra.md"], restoreSessionOnLaunch: false)
     harness.controller.start(intent: .coldLaunch)
-    await Task.yield()
-    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+    await harness.folderManager.waitForPendingWorkspaceBuild()
+    XCTAssertNil(harness.appState.selectedDocumentID)
 
     harness.launchSettings.restoreSessionOnLaunch = true
     let nextAppState = AppState()
