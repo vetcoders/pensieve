@@ -55,9 +55,12 @@ that area — it is the single largest source of click-to-reproduce bugs here.
 **`DocumentStore.swift` is a hub** with 20 direct and 56 transitive consumers.
 Run `loct impact` on it before changing a signature.
 
-**`make ui-smoke` kills the running app.** It calls `pkill -x Pensieve`, which
-also terminates the operator's production instance from `/Applications` —
-without saving. Do not run it while someone is working in Pensieve.
+**`make ui-smoke` runs against an isolated smoke identity, not the operator's
+app.** It stages a renamed, re-signed copy of the built app under
+`$SMOKE_ROOT` as `PensieveSmoke` (bundle id `io.vetcoders.pensieve.smoke`) and
+drives that — a separate process name, defaults domain, and support directory
+from the operator's production instance in `/Applications`. See
+`scripts/ui-smoke.sh` for the identity-isolation rationale.
 
 **`ui-smoke.sh` runs under whatever `bash` is first on PATH.** The shebang is
 `#!/usr/bin/env bash`, so a clean environment picks the system bash 3.2. Empty
@@ -71,9 +74,11 @@ finding, add it there with a reason — do not sprinkle inline ignores.
 
 ## What the gates do not cover
 
-- **CI only triggers on `main`.** `.github/workflows/ci.yml` has
-  `pull_request: branches: ["main"]`, so a PR based on another branch (stacked
-  PRs) gets no checks at all. Run `make gates` locally and say so in the PR.
+- **CI only triggers on `main`, `fix/**` and `feat/**` base branches.**
+  `.github/workflows/ci.yml` has `pull_request: branches: ["main", "fix/**",
+"feat/**"]`, so a stacked PR based on a `fix/*` or `feat/*` branch still gets
+  checks; a PR based on any other branch prefix gets none. Run `make gates`
+  locally and say so in the PR when the base branch is outside that list.
 - **`ui-smoke` is not part of `make ci`.** It is operator-side and ad hoc.
 - **Semgrep does not parse every file.** The gate passes with parser warnings;
   a Swift construct it cannot parse silently drops that whole file from the
