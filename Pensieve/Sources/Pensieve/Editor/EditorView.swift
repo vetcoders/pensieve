@@ -506,9 +506,31 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var lineAnchorOffset = 0
   private var lineAnchorLine = 0
   private var findQuery = ""
-  /// `.foregroundColor` runs the find washes painted over, captured at paint
-  /// time so a teardown can restore them without a highlight pass per match.
-  private var inkUnderFindWashes: [(range: NSRange, color: NSColor?)] = []
+  /// One wash this surface actually painted: where it went, which of the two
+  /// washes it was, and the `.foregroundColor` runs it covered — captured at
+  /// paint time so a teardown can restore them without a highlight pass.
+  private struct FindWashRecord {
+    let range: NSRange
+    let isActive: Bool
+    let ink: [(range: NSRange, color: NSColor?)]
+
+    /// Identity of a painted wash for diffing purposes: same place, same wash.
+    var key: Key { Key(location: range.location, length: range.length, isActive: isActive) }
+
+    struct Key: Hashable {
+      let location: Int
+      let length: Int
+      let isActive: Bool
+    }
+  }
+
+  /// Every wash currently on the document, in paint order.
+  ///
+  /// The single source of truth for the teardown, which is never derived from
+  /// `findMatches`: the repaint runs after `findMatches` has already been
+  /// replaced, so a match-derived teardown would strand the previous query's
+  /// washes on screen.
+  private var paintedFindWashes: [FindWashRecord] = []
   private var findMatches: [NSRange] = []
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
@@ -1514,6 +1536,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     guard !findMatches.isEmpty else { return }
     let length = textStorage.length
     guard findMatches.allSatisfy({ NSMaxRange($0) <= length }) else { return }
+    // The wash this surface recorded is no longer on the document — the pass
+    // that called us just wiped it — so the diff has to start from a clean
+    // slate or it would conclude there is nothing to repaint.
+    forgetPaintedFindWashes()
     applyFindHighlights()
   }
 
@@ -1534,10 +1560,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     }
     guard !touched.isEmpty else { return }
 
-    // The highlighter just repainted `range`, so the ink snapshot for it is
-    // stale AND the colour sitting there now is the correct one — drop the old
-    // entries before capturing fresh ones underneath the wash.
-    inkUnderFindWashes.removeAll { NSIntersectionRange($0.range, range).length > 0 }
+    // The highlighter just repainted `range`, so the records covering it are
+    // stale AND the colour sitting there now is the correct one — drop them
+    // before capturing fresh ink underneath the wash.
+    forgetPaintedFindWashes(in: range)
 
     textStorage.beginEditing()
     let palette = Self.findWashes(for: activeTokens)
@@ -1642,8 +1668,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   private func refreshFindMatches() {
-    removeFindHighlights()
+    // No blanket teardown here: `applyFindHighlights` below diffs the new match
+    // set against what is already painted and touches only the difference.
+    // Tearing everything down first would hand it an empty slate and cost the
+    // full-document repaint this fix exists to avoid.
     guard !findQuery.isEmpty else {
+      removeFindHighlights()
       findMatches = []
       activeFindMatchIndex = nil
       return
@@ -1671,17 +1701,58 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     notifyFindStateChanged()
   }
 
+  /// Bring the document's washes in line with the current match set by touching
+  /// ONLY what actually differs.
+  ///
+  /// Taking every wash down and painting every match back was the shape that
+  /// made typing unusable. Even after the teardown was scoped to painted ranges,
+  /// a document with matches scattered through it still produced a coalesced
+  /// `editedRange` spanning almost the whole storage — `endEditing` unions every
+  /// edit in the transaction — and TextKit 2 re-estimates every fragment height
+  /// it covers, sliding the text under a stationary scroll origin.
+  ///
+  /// A keystroke does not actually change most washes: matches before the caret
+  /// keep their ranges, and only the ones after it shift. Diffing therefore
+  /// confines the transaction to the region that genuinely moved, which leaves
+  /// the layout above the edit — and with it the viewport — untouched.
+  ///
+  /// One edit transaction for the whole pass: each unbatched addAttribute is
+  /// its own TextKit transaction with a layout invalidation, so a common
+  /// query on a large document (thousands of matches) beachballed the main
+  /// thread once per match.
   private func applyFindHighlights() {
-    // One edit transaction for the whole pass: each unbatched addAttribute is
-    // its own TextKit transaction with a layout invalidation, so a common
-    // query on a large document (thousands of matches) beachballed the main
-    // thread once per match.
-    textStorage.beginEditing()
-    removeFindHighlights()
-    let palette = Self.findWashes(for: activeTokens)
-    for (index, range) in findMatches.enumerated() {
-      paintFindWash(over: range, isActive: index == activeFindMatchIndex, palette: palette)
+    let desired = findMatches.enumerated().map { index, range in
+      FindWashRecord.Key(
+        location: range.location, length: range.length,
+        isActive: index == activeFindMatchIndex)
     }
+    var missing = Set(desired)
+
+    textStorage.beginEditing()
+
+    // Keep every wash that is already exactly where it should be; take down the
+    // ones that are not.
+    var kept: [FindWashRecord] = []
+    kept.reserveCapacity(paintedFindWashes.count)
+    for record in paintedFindWashes {
+      if missing.remove(record.key) != nil {
+        kept.append(record)
+      } else {
+        unpaintFindWash(record)
+      }
+    }
+    paintedFindWashes = kept
+
+    if !missing.isEmpty {
+      let palette = Self.findWashes(for: activeTokens)
+      for key in desired where missing.contains(key) {
+        missing.remove(key)
+        paintFindWash(
+          over: NSRange(location: key.location, length: key.length),
+          isActive: key.isActive, palette: palette)
+      }
+    }
+
     textStorage.endEditing()
   }
 
@@ -1697,30 +1768,47 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     let wash = isActive ? palette.active : palette.passive
     // Capture what the highlighter had put here BEFORE the wash ink covers it,
     // so a teardown can give it back without re-running a highlight pass.
+    var ink: [(range: NSRange, color: NSColor?)] = []
     textStorage.enumerateAttribute(.foregroundColor, in: range, options: []) {
       value, subrange, _ in
-      inkUnderFindWashes.append((subrange, value as? NSColor))
+      ink.append((subrange, value as? NSColor))
     }
+    paintedFindWashes.append(FindWashRecord(range: range, isActive: isActive, ink: ink))
     textStorage.addAttribute(.backgroundColor, value: wash.background, range: range)
     textStorage.addAttribute(.foregroundColor, value: wash.foreground, range: range)
   }
 
-  /// Puts the highlighter's own `.foregroundColor` back under every wash this
-  /// surface painted, then forgets them.
+  /// Take one wash off the document and give the highlighter's own ink back
+  /// underneath it.
   ///
-  /// Ranges are validated against the CURRENT length: a teardown can follow a
-  /// text change that shortened the document, and painting past the end raises.
-  private func restoreInkUnderFindWashes() {
-    guard !inkUnderFindWashes.isEmpty else { return }
-    let length = textStorage.length
-    for entry in inkUnderFindWashes where NSMaxRange(entry.range) <= length {
+  /// Ranges are clipped to the CURRENT length: a teardown can follow a text
+  /// change that shortened the document, and painting past the end raises.
+  private func unpaintFindWash(_ record: FindWashRecord) {
+    let documentRange = NSRange(location: 0, length: textStorage.length)
+    for entry in record.ink {
+      let live = NSIntersectionRange(entry.range, documentRange)
+      guard live.length > 0 else { continue }
       if let color = entry.color {
-        textStorage.addAttribute(.foregroundColor, value: color, range: entry.range)
+        textStorage.addAttribute(.foregroundColor, value: color, range: live)
       } else {
-        textStorage.removeAttribute(.foregroundColor, range: entry.range)
+        textStorage.removeAttribute(.foregroundColor, range: live)
       }
     }
-    inkUnderFindWashes.removeAll(keepingCapacity: true)
+    let live = NSIntersectionRange(record.range, documentRange)
+    guard live.length > 0 else { return }
+    textStorage.removeAttribute(.backgroundColor, range: live)
+  }
+
+  /// Forget the painted washes WITHOUT touching the document.
+  ///
+  /// For the callers whose whole premise is that something else already wiped
+  /// `.backgroundColor` — a theme switch, a font-size change, a highlight
+  /// refresh. The records describe paint that is no longer on the document, and
+  /// the ink they carry is equally stale, so replaying either would fight the
+  /// pass that just ran.
+  private func forgetPaintedFindWashes(in range: NSRange? = nil) {
+    guard let range else { return paintedFindWashes.removeAll(keepingCapacity: true) }
+    paintedFindWashes.removeAll { NSIntersectionRange($0.range, range).length > 0 }
   }
 
   /// A find wash and the ink that has to stay readable on it.
@@ -1804,22 +1892,32 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   private func removeFindHighlights() {
-    // Find highlights only exist when there are matches. Skip the whole-document
-    // attribute mutation when there is nothing to remove: this ran on EVERY
-    // keystroke (textDidChange -> refreshFindMatches) AND every SwiftUI re-render
-    // (updateNSView -> updateFind -> clearFindHighlights), and a full-range
-    // removeAttribute forces a TextKit2 relayout of the visible viewport — the
-    // per-keystroke "text reflows/jumps at a fixed scroll origin" bug, which is
-    // independent of syntax highlighting (hence disabling rich markdown never
-    // helped).
+    // Take the wash down over the ranges this surface actually painted, and
+    // nowhere else.
+    //
+    // This used to strip `.backgroundColor` across the WHOLE document, and it
+    // ran on every keystroke (textDidChange -> refreshFindMatches) as well as
+    // every SwiftUI re-render (updateNSView -> updateFind). TextKit 2 lays out
+    // the viewport lazily and estimates the rest, so a document-wide attribute
+    // edit re-estimates every fragment height: the scroll origin stays put while
+    // a different part of the text slides under it — the "text jumps while I
+    // type with the Find Bar open" bug. Scoping the removal keeps the edit
+    // proportional to the matches, so nothing outside them is invalidated.
+    //
+    // It also stops trampling the highlighter's own backgrounds (inline code,
+    // ==highlight==), which a full-range removal wiped as collateral.
+    //
     // The washes co-write `.foregroundColor` — a wash the body ink cannot carry
     // would otherwise hide exactly what it marks — so taking them down has to
     // give the highlighter's own colour back. Unconditional: the ink outlives a
     // match set that has already been emptied.
-    restoreInkUnderFindWashes()
-    guard !findMatches.isEmpty else { return }
-    let fullRange = NSRange(location: 0, length: textStorage.length)
-    textStorage.removeAttribute(.backgroundColor, range: fullRange)
+    guard !paintedFindWashes.isEmpty else { return }
+    textStorage.beginEditing()
+    for record in paintedFindWashes {
+      unpaintFindWash(record)
+    }
+    textStorage.endEditing()
+    paintedFindWashes.removeAll(keepingCapacity: true)
   }
 
   /// Push the current match total + active index up to the UI (FindBar count),
