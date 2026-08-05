@@ -324,6 +324,15 @@ final class RecoveredDraftsTests: XCTestCase {
 
   // MARK: - A failed draft write is never reported as a success
 
+  // SCOPE, stated because the two `CloseFlush` names overreach: these drive
+  // `DocumentStore` directly on a live `AppState`. They prove the RETURN VALUE
+  // and the state of the buffer after a failed write — NOT what a real Close or
+  // Quit does with that answer. Both teardown call sites (`PensieveApp`'s
+  // willClose hook and `TerminationSequence.flushPendingWindowSaves`) still
+  // DISCARD the result and run past their veto point; that gap is open and named
+  // in the lifecycle contract's Recovery section (GAP 1). The import test below
+  // is the one that goes through a real controller end to end.
+
   /// P0. `saveRecoveryDraft` caught its write error, set `appState.lastError` and
   /// returned NOTHING, and the untitled branch of `savePendingChangesOnClose`
   /// answered `true` regardless. The one caller whose buffer SURVIVES that flush —
