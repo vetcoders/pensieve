@@ -115,6 +115,10 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  /// ⌘N's route to a tab of its own, the same seam the tab bar's "+" button
+  /// already uses (`DocumentWindowRegistry.newUntitledTab`). Unwired (tests,
+  /// headless) falls back to replacing this window's session in place.
+  var requestNewUntitledTab: (() -> Void)?
   /// The launch restore's bulk route. One call for the WHOLE working set, so
   /// the registry can join every tab to the group and bring exactly one window
   /// front at the end instead of paying a full window presentation — and the
@@ -892,8 +896,27 @@ final class AppController: ObservableObject {
     documentWindowRegistry.closeAllDocumentWindows()
   }
 
+  /// ⌘N / "New File…".
+  ///
+  /// A window holding LIVE WORK is spoken for — the first term of
+  /// `routesToOwnTab`, and the reason ⌘O on such a window opens a tab instead of
+  /// loading in place. ⌘N never asked, so it replaced the buffer where it fired:
+  /// the file-backed session was overwritten by the new draft, the window's
+  /// registry identity flipped from `.file(url)` to `.untitled(uuid)`, and the
+  /// document's row in the sidebar's Open Files list — which mirrors the tab
+  /// chain — was REPLACED rather than joined. One document open, ⌘N, and the
+  /// document was gone from the list.
+  ///
+  /// The tab bar's "+" button had the right behaviour all along
+  /// (`DocumentWindowRegistry.newUntitledTab`); this routes the keyboard gesture
+  /// through the same seam so the two affordances stop disagreeing.
   @discardableResult
   func createUntitledDocument() -> Bool {
+    if holdsLiveDocumentWork, let requestNewUntitledTab {
+      requestNewUntitledTab()
+      return true
+    }
+
     guard documentStore.prepareForDocumentSwitch(appState: appState) else {
       return false
     }

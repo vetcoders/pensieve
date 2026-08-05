@@ -6285,6 +6285,134 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.activeDocumentText, "alpha")
   }
 
+  /// ⌘N over an open document must not EAT that document.
+  ///
+  /// The operator opened one file from Finder and pressed ⌘N: the file's row
+  /// vanished from the sidebar's Open Files list and was replaced by a single
+  /// "Untitled.md", titlebar included. Open Files mirrors the tab chain
+  /// (`SidebarView.openFilesList` reads `windowRegistry.openDocuments`), and
+  /// `createUntitledDocument` overwrote THIS window's session in place — so the
+  /// window's registry identity flipped from `.file(url)` to `.untitled(uuid)`
+  /// and `DocumentWindowRegistry.publish` replaced the descriptor at the same
+  /// index rather than adding one. Nothing was deleted from disk; the document
+  /// simply stopped being open.
+  ///
+  /// ⌘O from the same window already routes to a tab of its own, on the first
+  /// term of `routesToOwnTab` — and the tab bar's "+" button already opens an
+  /// untitled TAB. ⌘N was the one door that clobbered.
+  @MainActor
+  func testNewDocumentOverALiveBufferOpensATabInsteadOfEatingTheOpenFile() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileTabTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("transcript.md").standardizedFileURL
+    try "# transcript".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [documentWindow, untitledWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      documentWindow.close()
+      untitledWindow.close()
+    }
+
+    var untitledFactoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("⌘N must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { documentWindow },
+      applicationWindows: { [documentWindow, untitledWindow] },
+      makeDocumentWindow: { ref, _ in
+        XCTAssertNil(ref, "⌘N asks the factory for an untitled window")
+        untitledFactoryCalls += 1
+        return untitledWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestNewUntitledTab = { registry.newUntitledTab(from: documentWindow) }
+
+    // The window is showing the file the user opened from Finder, and the
+    // sidebar's Open Files list is that registry row.
+    appState.documentSession.load(document: DocumentRef(id: noteURL), text: "# transcript")
+    registry.attach(documentWindow, documentID: noteURL, hasEditableBuffer: true)
+    XCTAssertEqual(registry.openTabDocumentIDs, [noteURL])
+    XCTAssertTrue(controller.holdsLiveDocumentWork)
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(
+      untitledFactoryCalls, 1,
+      "⌘N over a live buffer must open its own tab, like the tab bar's + button")
+    XCTAssertEqual(
+      registry.openTabDocumentIDs, [noteURL],
+      "the open document lost its row in Open Files to the new untitled draft")
+    XCTAssertEqual(
+      appState.documentSession.url, noteURL,
+      "⌘N overwrote the file-backed buffer of the window it fired from")
+    XCTAssertEqual(appState.activeDocumentText, "# transcript")
+  }
+
+  /// The other half of the same policy: an IDLE window has nothing to lose, so
+  /// ⌘N is still answered in place instead of spawning a tab beside an empty
+  /// launcher. Without this term the fix would trade one bug for a window leak.
+  @MainActor
+  func testNewDocumentInAnIdleWindowStillFillsThatWindowInPlace() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var tabRequests = 0
+    controller.requestNewUntitledTab = { tabRequests += 1 }
+
+    XCTAssertFalse(controller.holdsLiveDocumentWork)
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(tabRequests, 0, "an idle window is the one that takes the new draft")
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+  }
+
   @MainActor
   func testOpenDocumentWindowFallsBackToInWindowSelectWithoutRouting() throws {
     let folder = FileManager.default.temporaryDirectory

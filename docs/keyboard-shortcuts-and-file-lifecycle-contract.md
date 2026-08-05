@@ -34,6 +34,14 @@ Clarifications (decisions 26.07/31.07, canon item 2):
 
 In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab / untitled buffer. It must not mean sometimes a new file, sometimes a window, and sometimes a workspace.
 
+Implemented from build 665: `Cmd+N` routes through the same
+`DocumentWindowRegistry.newUntitledTab` seam the tab bar's `+` button uses,
+whenever the window holds live work. Until then it replaced the current window's
+session in place, so `Cmd+N` over an open document dropped that document out of
+the tab chain and out of the sidebar's Open Files list. An **idle** window still
+takes the new draft in place — a tab beside an empty launcher would be a window
+leak, not a second document.
+
 Splitting `Cmd+N` (new window/document) from `Cmd+T` (new tab) is only possible after an explicit product decision on the multi-window model.
 
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
@@ -323,7 +331,7 @@ Close All must never cause silent data loss.
 An agent implementing or refactoring menu/commands must verify:
 
 - [ ] `Cmd+T` creates an empty tab with no file on disk.
-- [ ] `Cmd+N` does the same as `Cmd+T` in v1.
+- [x] `Cmd+N` does the same as `Cmd+T` in v1 (routed through `newUntitledTab`; pinned by `testNewDocumentOverALiveBufferOpensATabInsteadOfEatingTheOpenFile`).
 - [ ] `Cmd+O` opens the file picker, `Shift+Cmd+O` the folder picker (workspace).
 - [ ] `Cmd+S` saves an existing file, and for untitled it triggers Save As.
 - [ ] `Shift+Cmd+S` triggers Save As.
