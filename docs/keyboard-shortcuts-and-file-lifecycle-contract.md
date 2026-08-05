@@ -117,12 +117,19 @@ Closes the whole window with all its tabs — the equivalent of the red button.
 A tidying gesture: it does NOT remove files from Open Files (they come back on restore).
 For dirty tabs, the window-close flow applies (batch modal).
 
-### `Shift+Cmd+T` — Reopen Closed Tab (03.08 proposal)
+### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed
-tab along with returning the file to Open Files. Pending product
-confirmation — together with Recent Files (D5) it forms the full set of
-cushions against accidental closes.
+tab along with returning the file to Open Files. Together with Recent Files
+(D5) it forms the full set of cushions against accidental closes.
+
+**RESOLVED (Monika, 2026-08-05):** `Shift+Cmd+T` is reserved for this
+Reopen Closed Tab behavior, per macOS convention. The feature itself is
+**not yet implemented** — it stays on the backlog. Truthful state of this
+branch today: `Shift+Cmd+T` is actually bound to **Tidy Table** (Format
+menu); no reopen-tab code exists anywhere in the app yet. When Reopen
+Closed Tab ships, Tidy Table loses (or is reassigned) this shortcut — the
+two cannot coexist on the same binding.
 
 ### Tab navigation
 
@@ -268,7 +275,17 @@ Close All must never cause silent data loss.
 
   A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
   mid-replacement, or on an unplugged volume) and only drops out of what a
-  restore opens. Workspace **roots** keep their own lifecycle — still **[OPEN]**.
+  restore opens.
+
+  **RESOLVED (Monika, 2026-08-05):** a workspace **root** follows the same
+  rule as an individual file above. A root that lands in the Trash
+  disappears from the sidebar live, at the next scan commit — same as a
+  trashed file leaving Open Files without waiting for a relaunch. Its
+  bookmarks (the root's own and every file bookmark it granted) are pruned
+  at the same time. Recovery is manual: put the folder back from the Trash,
+  then re-add it as a workspace root. **[OPEN — implementation pending]**:
+  this PR only implements the individual-file half of "Trash is dead"; the
+  root half described here is decided but not yet built.
 
 - **Removing one workspace root never revokes another tab's access.** The
   persisted bookmark set is rebuilt from the UNION of the working set and the
@@ -335,13 +352,16 @@ An agent implementing or refactoring menu/commands must verify:
 ## Open decisions and items to verify
 
 0. **List of currently open items (state as of 03.08, after this morning's decisions):**
-   - **[OPEN]** workspace ROOT in Trash on restore (same rule as
-     files — does it stay);
+   - **[OPEN — implementation pending]** workspace ROOT in Trash: behavior
+     **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
+     "Trash is dead" section above); not yet built in this PR;
    - **[OPEN]** native Save sheet for untitled on close
      (Monika's 03.08 proposal, separate UX cut);
    - **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
-   - **[OPEN]** `Shift+Cmd+T` Reopen Closed Tab (proposal — ⌘W-retire
-     safety net).
+   - **[OPEN — implementation pending]** `Shift+Cmd+T` Reopen Closed Tab:
+     shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
+     (see the `Shift+Cmd+T` section above); the feature itself is not yet
+     implemented.
 
    **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
    markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
