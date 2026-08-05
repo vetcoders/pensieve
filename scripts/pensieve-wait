@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# pensieve-wait — Composer v2 Tor B helper for $VC_COMPOSER.
+#
+# Blocks until the Pensieve window for the given file closes, then exits.
+# Intended contract (vc-frame / compact-bar):
+#
+#   export VC_COMPOSER='/path/to/pensieve-wait'
+#   # or inline:
+#   open -W -n -a Pensieve --args --wait "$file"
+#
+# Usage:
+#   pensieve-wait [file]
+#   pensieve-wait --wait file.md     # --wait is accepted and ignored (always on)
+#
+set -euo pipefail
+
+resolve_app() {
+  if [[ -d /Applications/Pensieve.app ]]; then
+    echo /Applications/Pensieve.app
+    return
+  fi
+  # Repo-local signed build (make release-local / install-app).
+  local repo_root
+  repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+  if [[ -d "$repo_root/dist/Pensieve.app" ]]; then
+    echo "$repo_root/dist/Pensieve.app"
+    return
+  fi
+  return 1
+}
+
+file=""
+for arg in "$@"; do
+  case "$arg" in
+    --wait|-w) ;;
+    --help|-h)
+      cat <<'EOF'
+pensieve-wait — open a file in Pensieve and block until the window closes.
+
+Usage: pensieve-wait [file]
+
+Environment:
+  Prefer installing Pensieve.app under /Applications (make install-app).
+  Falls back to dist/Pensieve.app from this repo when present.
+
+Composer v2 (vc-frame):
+  VC_COMPOSER="…/scripts/pensieve-wait"
+  # equivalent raw form:
+  # open -W -n -a Pensieve --args --wait <file>
+EOF
+      exit 0
+      ;;
+    -*)
+      echo "pensieve-wait: unknown flag: $arg" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -z "$file" ]]; then
+        file="$arg"
+      else
+        echo "pensieve-wait: only one file is supported (got extra: $arg)" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$file" ]]; then
+  # Empty tafla: still wait mode, no file path.
+  app="$(resolve_app)" || {
+    echo "pensieve-wait: Pensieve.app not found in /Applications or dist/" >&2
+    exit 127
+  }
+  exec open -W -n -a "$app" --args --wait
+fi
+
+# Resolve to absolute path so a CWD change cannot orphan the open.
+if [[ "$file" != /* ]]; then
+  file="$(pwd)/$file"
+fi
+
+app="$(resolve_app)" || {
+  echo "pensieve-wait: Pensieve.app not found in /Applications or dist/" >&2
+  exit 127
+}
+
+exec open -W -n -a "$app" --args --wait -- "$file"

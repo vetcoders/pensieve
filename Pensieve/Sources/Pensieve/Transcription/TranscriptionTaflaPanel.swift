@@ -89,7 +89,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       }
     )
     let hostingView = NSHostingView(rootView: root)
-    // Match CodeScribe's proven floating-panel host: the window owns its size,
+    // Match Codescribe's proven floating-panel host: the window owns its size,
     // while an absolute frame sync keeps SwiftUI from exporting changing
     // fitting-size constraints back into the resizable panel.
     hostingView.sizingOptions = []

@@ -786,7 +786,8 @@ final class FolderManager {
   /// ones already burning a core, and nothing bounded the pile except the event rate. A workspace
   /// whose event source is faster than one walk — an iCloud Drive root materialising placeholders,
   /// a sync client, a build directory — therefore saturated every core while converging on
-  /// nothing, since each superseded pass discarded its own result.
+  /// nothing, since each superseded pass discarded its own result. Each stacked walk also holds a
+  /// full workspace snapshot, which is what the 154 GB footprint peak on 0.4.2 was made of.
   func scheduleWatcherRefresh(into appState: AppState) {
     // The arming site itself, so "no watcher refresh is armed after the quiescence" holds for every
     // caller rather than for the one hop that is known to reach here today. A cancel covers the task
@@ -979,7 +980,9 @@ final class FolderManager {
   }
 
   /// Body of the debounced watcher refresh. One injected scanner walk plus both signatures run
-  /// off-main; only delta decisions and publication touch main-actor state.
+  /// off-main; only delta decisions and publication touch main-actor state. The walk goes through
+  /// `cancellableRefreshSnapshot`, so `WorkspaceScanner.buildCancellable`'s cooperative checks
+  /// actually fire when this refresh is cancel-replaced or superseded by an explicit refresh.
   private func performWatcherRefresh(into appState: AppState) async {
     guard appState.hasWorkspaceContent else { return }
     let roots = appState.workspaceRoots.map(\.url)
@@ -2595,6 +2598,7 @@ private enum WorkspaceDefaults {
     "node_modules",
     "dist",
     "DerivedData",
+    "target",
   ]
 }
 
@@ -3738,8 +3742,18 @@ final class DocumentStore {
   /// cancels the still-pending timer. No blocking prompt: the window is already
   /// committed to closing, so there is nothing to cancel. A clean (non-dirty)
   /// buffer is a no-op. Returns whether anything was persisted.
+  ///
+  /// `releasesDraftClaim` is the part of "on close" that is about the WINDOW
+  /// rather than the bytes: the buffer dies with it, so the draft this pass just
+  /// wrote stops being live work and goes back on the launcher as an unhandled
+  /// artifact. A caller whose buffer SURVIVES the flush passes `false` —
+  /// `AppController.importDocument` persists the converted draft into a window
+  /// that stays on screen, and releasing the claim there advertises a LIVE
+  /// buffer's draft on every other launcher surface. Adopting it from one puts
+  /// two buffers on a single recovery ID, autosaving over each other, which is
+  /// exactly what the claim exists to forbid.
   @discardableResult
-  func savePendingChangesOnClose(appState: AppState) -> Bool {
+  func savePendingChangesOnClose(appState: AppState, releasesDraftClaim: Bool = true) -> Bool {
     self.appState = appState
     // BEFORE the dirty guard, deliberately. A CLEAN session can still be holding a sleeping index
     // debounce: the 1.5 s autosave already wrote the bytes and marked the buffer clean while the
@@ -3794,8 +3808,11 @@ final class DocumentStore {
       saveRecoveryDraft(appState: appState)
       // The buffer goes away with the window; the draft it just wrote is a
       // recovery artifact from here on, not live work, so it goes back on the
-      // launcher like any other unhandled draft.
-      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+      // launcher like any other unhandled draft — unless the caller told us the
+      // buffer SURVIVES this flush, in which case the write-time claim stands.
+      if releasesDraftClaim {
+        recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+      }
       return true
     }
     // A file-backed buffer. Auto-save owns the file only when it is ON: then the
@@ -3813,7 +3830,9 @@ final class DocumentStore {
       return true
     }
     stashClosingBufferAsRecoveryDraft(appState: appState)
-    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    if releasesDraftClaim {
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    }
     return true
   }
 
@@ -3967,6 +3986,14 @@ final class DocumentStore {
   /// `appState.lastError`: when the stash follows a FAILED save that error must
   /// stay surfaced (a recovery draft AND a visible error), so the user learns the
   /// file on disk is stale rather than believing the close saved it.
+  ///
+  /// The read-and-write-back of `recoveryID` around the save is what keeps this
+  /// buffer on ONE draft. It used to be a pair of no-ops here — `recoveryID`
+  /// lived inside `DocumentSession.Kind.untitled`, so a file-backed session read
+  /// `nil` and its write-back was swallowed — and every stash of the same file
+  /// therefore minted a fresh UUID. Nothing sweeps the recovery directory either
+  /// (no age limit, no cap — a draft is retired only by a decision), so a single
+  /// unsaved document produced a new draft on every close, without bound.
   private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
     guard appState.documentSession.isDirty else { return }
 
@@ -4190,11 +4217,21 @@ final class DocumentStore {
       let url = appState.documentSession.url
     else { return false }
     let ref = documentRef(for: url, appState: appState)
+    // Read BEFORE the write: `documentSession.document` below drops the
+    // association, and a successful save is one of the three closed reasons a
+    // draft may be retired — the edit it was standing in for is now the file.
+    let stashedRecoveryID = appState.documentSession.recoveryID
 
     do {
       try writeDocument(appState.documentSession.text, url)
       selfWriteObserver(url)
       registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
+      // A file-backed buffer whose window tore down with auto-save off left a
+      // stash behind (`stashClosingBufferAsRecoveryDraft`). Now that the same
+      // bytes are on disk that stash is not recoverable work any more, and
+      // leaving it would have the launcher offering content the user already
+      // saved — forever, since nothing sweeps drafts.
+      recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       appState.lastError = nil

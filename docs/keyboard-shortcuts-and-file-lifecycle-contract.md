@@ -214,6 +214,27 @@ Clarification (04.08, Monika — "they don't disappear without my decision"):
 - If the number of drafts ever needs to be surfaced, it is shown to the user as
   information — never acted on by deleting.
 
+Clarification (05.08, after the file-backed half of bug I):
+
+- **"One buffer" includes a FILE-BACKED buffer.** A named document whose window
+  tears down without reaching disk (auto-save off, or a save that failed) is
+  stashed as a recovery item too, and that stash follows the same rule: the
+  buffer keeps ONE item across every close, every quit flush and every window on
+  the same file. It must not mint a new UUID per stash. (It did:
+  `recoveryID` lived inside the untitled session shape, so a file-backed buffer
+  read `nil` and its write-back was dropped, and with no sweep left to hide it a
+  single unsaved document grew the recovery directory without bound.)
+- A **successful save from the SAME session** retires the stash it was standing
+  in for — the same closed list as before ("being saved as a regular file"), now
+  also applying to a plain ⌘S on a named document. The scope is exact: the
+  association lives on the live `DocumentSession`, so retirement holds only while
+  the buffer that wrote the stash is the one saving. A stash produced by a window
+  TEARING DOWN is orphaned from every later session on the same file — reopening
+  that file in a fresh window and saving it does NOT retire the stash, and the
+  launcher keeps offering content that is by then already on disk until it is
+  explicitly discarded. (Retiring such a stash by URL is a pending product
+  decision, not current behavior.)
+
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 
 - being saved as a regular file;
