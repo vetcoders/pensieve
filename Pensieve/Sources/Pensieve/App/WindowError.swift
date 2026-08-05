@@ -12,7 +12,10 @@ import Foundation
 ///     durable already. Almost every error in the app is this.
 ///   * `.dataLoss` — the app failed to put the user's content anywhere durable
 ///     AND the only remaining copy is the in-memory buffer. Losing the process
-///     loses the work. This is the class a passive line is not enough for.
+///     loses the work. It is dressed more loudly and, unlike a status message,
+///     it LATCHES: `DocumentWindowModel.unresolvedDataLoss` outlives both the
+///     banner and any later routine message, and only a durable write retires
+///     it.
 ///
 /// Classified at the WRITE SITE, never by matching on the message text: the
 /// site is the only place that knows whether a durable copy survived the
@@ -50,11 +53,11 @@ struct WindowError: Equatable {
 /// the same split `EmptyStatePalette` and `WindowChromeRecipe` already use for
 /// chrome that has to be provable.
 enum WindowErrorSurface: Equatable {
-  /// Nothing to report — no banner, no alert.
+  /// Nothing to report.
   case none
-  /// A passive line in the chrome. Both severities show one: an alert is
-  /// dismissed and then gone, and the standing reminder that the work is not
-  /// safe has to outlive it.
+  /// A passive line in the chrome. Both severities show one and only one — the
+  /// app has no modal error surface at all; severity changes the dressing, not
+  /// whether the user is interrupted.
   case banner(WindowError)
 
   static func resolve(for error: WindowError?) -> WindowErrorSurface {

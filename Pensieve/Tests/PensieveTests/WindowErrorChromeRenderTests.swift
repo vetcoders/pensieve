@@ -34,7 +34,7 @@ final class WindowErrorChromeRenderTests: XCTestCase {
       withBanner, quiet,
       "recording an error changed nothing in the live window — the banner was never mounted")
 
-    rig.appState.clearError()
+    rig.appState.resolveError()
     rig.settle(0.3)
 
     XCTAssertEqual(
@@ -42,11 +42,10 @@ final class WindowErrorChromeRenderTests: XCTestCase {
       "the banner kept the editor's room after the error it reported was cleared")
   }
 
-  /// The data-loss class mounts the same standing banner, not only an alert.
-  /// The modal is answered and gone; the reminder that the work is not safe has
-  /// to outlive it.
+  /// The data-loss class mounts the same standing banner. There is no modal
+  /// anywhere in this surface, so the line IS the whole report.
   @MainActor
-  func testADataLossErrorAlsoMountsTheStandingBanner() throws {
+  func testADataLossErrorMountsTheStandingBanner() throws {
     let rig = try makeWindowErrorChromeRig(prefix: "errorchrome-dataloss")
     defer { rig.tearDown() }
 
@@ -57,9 +56,90 @@ final class WindowErrorChromeRenderTests: XCTestCase {
 
     XCTAssertLessThan(
       try XCTUnwrap(rig.editorPaneHeight()), quiet,
-      "the window raised an alert and left nothing standing behind it")
-    XCTAssertNotNil(
-      rig.appState.pendingDataLossAlert, "losing the only copy of the text asked the user nothing")
+      "losing the only copy of the text put nothing on screen")
+    XCTAssertNotNil(rig.appState.unresolvedDataLoss, "the loss was not latched")
+  }
+
+  /// RULE 1 on the live surface: a routine message arriving after a data loss
+  /// does not take the line. The height alone cannot tell the two banners
+  /// apart, so the severity is read from the same state the view renders.
+  @MainActor
+  func testARoutineMessageDoesNotTakeTheLineFromADataLoss() throws {
+    let rig = try makeWindowErrorChromeRig(prefix: "errorchrome-rule1")
+    defer { rig.tearDown() }
+
+    let quiet = try XCTUnwrap(rig.editorPaneHeight())
+    rig.appState.reportDataLoss("Could not write recovery draft: no space left on device")
+    rig.settle(0.3)
+    let withBanner = try XCTUnwrap(rig.editorPaneHeight())
+    XCTAssertLessThan(withBanner, quiet, "fixture precondition: the banner is up")
+
+    rig.appState.lastError = "Could not open Kancelaria: no such directory"
+    rig.settle(0.3)
+
+    XCTAssertEqual(
+      try XCTUnwrap(rig.editorPaneHeight()), withBanner,
+      "the line changed shape when a routine message arrived over a data loss")
+    XCTAssertEqual(
+      rig.appState.currentError?.severity, .dataLoss,
+      "a routine message displaced the unresolved data loss on screen")
+  }
+
+  /// RULE 2 on the live surface: the banner the user closed stays closed while
+  /// the same failure keeps repeating. This is the pin that would have caught a
+  /// dismissal which resets the condition — the banner would flick back on the
+  /// very next autosave tick.
+  @MainActor
+  func testADismissedDataLossBannerStaysDownAcrossAnIdenticalRetry() throws {
+    let rig = try makeWindowErrorChromeRig(prefix: "errorchrome-rule2")
+    defer { rig.tearDown() }
+
+    let quiet = try XCTUnwrap(rig.editorPaneHeight())
+    let message = "Could not write recovery draft: no space left on device"
+
+    rig.appState.reportDataLoss(message)
+    rig.settle(0.3)
+    XCTAssertLessThan(
+      try XCTUnwrap(rig.editorPaneHeight()), quiet, "fixture precondition: the banner is up")
+
+    rig.appState.dismissVisibleError()
+    rig.settle(0.3)
+    XCTAssertEqual(
+      try XCTUnwrap(rig.editorPaneHeight()), quiet, "the dismiss button did not take the line down")
+
+    // The autosave retries into the same full disk.
+    rig.appState.reportDataLoss(message)
+    rig.settle(0.3)
+
+    XCTAssertEqual(
+      try XCTUnwrap(rig.editorPaneHeight()), quiet,
+      "an identical retry put the dismissed banner back on screen")
+  }
+
+  /// RULE 3 on the live surface: once resolved, the same problem happening
+  /// again is news and the window shows it. Rule 2 must not harden into
+  /// permanent silence for that message.
+  @MainActor
+  func testAFreshOccurrenceAfterResolutionMountsTheBannerAgain() throws {
+    let rig = try makeWindowErrorChromeRig(prefix: "errorchrome-rule3")
+    defer { rig.tearDown() }
+
+    let quiet = try XCTUnwrap(rig.editorPaneHeight())
+    let message = "Could not write recovery draft: no space left on device"
+
+    rig.appState.reportDataLoss(message)
+    rig.appState.dismissVisibleError()
+    rig.appState.resolveError()
+    rig.settle(0.3)
+    XCTAssertEqual(
+      try XCTUnwrap(rig.editorPaneHeight()), quiet, "fixture precondition: the window is quiet")
+
+    rig.appState.reportDataLoss(message)
+    rig.settle(0.3)
+
+    XCTAssertLessThan(
+      try XCTUnwrap(rig.editorPaneHeight()), quiet,
+      "a fresh occurrence after a resolved one never reached the screen")
   }
 
   // MARK: - The passive surface stays passive
@@ -70,9 +150,8 @@ final class WindowErrorChromeRenderTests: XCTestCase {
   /// the banner carries a focusable dismiss button, exactly the kind of thing
   /// SwiftUI can hand first responder to on insertion.
   ///
-  /// The data-loss alert is the deliberate exception and is not under test
-  /// here: it is modal by design, and it is reserved for losing the only copy
-  /// of the user's text.
+  /// Nothing in this surface is modal, data loss included, so this contract has
+  /// no exception: no error Pensieve can raise may take the caret.
   @MainActor
   func testTheBannerNeitherTakesFocusNorInterruptsTyping() throws {
     let rig = try makeWindowErrorChromeRig(prefix: "errorchrome-focus")
@@ -106,7 +185,7 @@ final class WindowErrorChromeRenderTests: XCTestCase {
       "typing did not continue into the document after the banner appeared: \(editor.string)")
 
     // Its disappearance is the same contract: the layout changes, focus does not.
-    rig.appState.clearError()
+    rig.appState.resolveError()
     rig.settle(0.3)
 
     XCTAssertEqual(

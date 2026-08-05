@@ -447,8 +447,8 @@ final class RecoveredDraftsTests: XCTestCase {
   /// 45.1 made the failed import RECORD its error; the field it recorded into
   /// had no renderer, so nothing said it out loud. This pins the whole chain on
   /// the real production path — convert, fail to write the draft, and end up
-  /// with a window that shows a standing banner AND asks, because the converted
-  /// text exists in exactly one place and that place is volatile.
+  /// with a window showing a standing banner for an unresolved loss, because
+  /// the converted text exists in exactly one place and that place is volatile.
   ///
   /// The severity matters as much as the message: `importDocument` composes its
   /// own sentence on top of the write error, and doing that through a plain
@@ -481,11 +481,11 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(
       WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
       "the failed import left the window with nothing to show")
-    let alert = try XCTUnwrap(
-      appState.pendingDataLossAlert, "the failed import asked the user nothing")
+    let latched = try XCTUnwrap(
+      appState.unresolvedDataLoss, "the failed import latched no unresolved loss")
     XCTAssertTrue(
-      alert.message.contains("Board Resolution.pdf"),
-      "the alert does not say WHICH converted text has no safe copy: \(alert.message)")
+      latched.message.contains("Board Resolution.pdf"),
+      "the report does not say WHICH converted text has no safe copy: \(latched.message)")
   }
 
   /// Control: with a writable recovery directory the import path is unchanged —
