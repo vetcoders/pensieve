@@ -610,9 +610,10 @@ final class DocumentWindowRegistry: ObservableObject {
     else { return false }
 
     // A window displays exactly one document: switching documents in place
-    // (the default in-window click routing) must release the previous
-    // mapping, or `open()` keeps "activating" this window for documents it no
-    // longer shows and Open in New Window becomes a silent no-op.
+    // (`openFileInCurrentWindow`, a restore loading into the launch window)
+    // must release the previous mapping, or `open()` keeps "activating" this
+    // window for documents it no longer shows and the next open of the old
+    // document becomes a silent no-op.
     releaseStaleDocumentMappings(for: window, keeping: documentID)
     if let documentID {
       if windowsByDocumentID[documentID]?.window !== window {

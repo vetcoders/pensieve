@@ -50,6 +50,28 @@ the contract adopts this split:
   gets immediate feedback (tab/progress), and expensive work must not
   freeze the main thread for minutes (lesson from bugs H/J, 03.08).
 
+### Clicking a file — same route as `Cmd+O`
+
+`click = tab` (decision 26.07) is not only about `Cmd+O`. Every single-open
+gesture — a row in the workspace tree, a search result, the context-menu
+**Open**, a RECENT row on the launcher — lands where a Finder "Open with
+Pensieve" lands: as a native tab in the current window's tab group. A click is
+an explicit open, so it never replaces the document the window is reading;
+files stay visible in parallel and switching between them is switching tabs.
+
+- A file that already has a tab is **activated**, never opened a second time —
+  neither a re-click nor a click from another window may render the same
+  document twice.
+- An **empty, idle window** (launcher / empty state) is reused in place instead
+  of spawning a tab beside itself: no stray launcher tab, no flash. The single
+  exception is the rule above — a file that already has a tab is activated
+  there even when the clicking window is idle.
+- Clicking the document the window already shows is a no-op.
+- Because every open lands as a tab, there is **no separate "Open in New
+  Window"** item: it would be a second button for the same action. A detached
+  (non-tabbed) window is not part of v1 and is tied to the open multi-window
+  decision below.
+
 ### `Cmd+S` — Save
 
 Saves the active tab:
@@ -276,6 +298,9 @@ An agent implementing or refactoring menu/commands must verify:
       recovery item (zero draft multiplication).
 - [ ] Clicking a RECENT row on the launcher gives immediate feedback,
       and opening a large file does not block the UI silently.
+- [ ] A click in the workspace tree / a search result / context-menu "Open"
+      opens a tab and leaves the current tab's document alone; re-clicking an
+      open file activates its tab instead of opening a duplicate.
 - [ ] Restore after restart: workspace always comes back; open files max 12;
       a file/root from Trash does not come back; a deliberately closed file does not come back.
 
