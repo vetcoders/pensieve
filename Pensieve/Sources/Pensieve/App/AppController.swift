@@ -244,6 +244,16 @@ final class AppController: ObservableObject {
   /// this window and a new tab, the empty-window close — has to ask this too.
   var hasPendingDocumentLoad: Bool { appState.documentIsLoading }
 
+  /// "Is this window already spoken for?" — the single question every open
+  /// router asks before choosing between loading in place and handing the
+  /// document to the registry. An empty, idle window is the one that may be
+  /// reused; a buffer, a conversion in flight or a staged read all claim it.
+  /// One expression so `openFile` (⌘O, Finder, recents) and
+  /// `openDocumentWindow` (every click) cannot drift apart.
+  var holdsLiveDocumentWork: Bool {
+    appState.documentSession.hasEditableBuffer || hasPendingImportWork || hasPendingDocumentLoad
+  }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a
@@ -439,10 +449,7 @@ final class AppController: ObservableObject {
     // URL of a multi-file open would answer "empty, use this window", invalidate
     // the first file's claim, and the file the user clicked first would vanish
     // exactly the way an import used to.
-    if appState.documentSession.hasEditableBuffer || hasPendingImportWork
-      || hasPendingDocumentLoad,
-      let requestOpenDocumentWindow
-    {
+    if holdsLiveDocumentWork, let requestOpenDocumentWindow {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
       return
@@ -1198,42 +1205,42 @@ final class AppController: ObservableObject {
         ? appState.makeDocumentRef(for: id) : nil)
   }
 
-  /// Default click (Open Files list, workspace tree, search result, context-menu
-  /// "Open"): load the document in the current window, reusing the active editor
-  /// pane. This is the VS Code / Zed model — a single click never spawns a window
-  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
-  /// gesture. Clicking the currently displayed document is a no-op.
+  /// Every click that means "open this file" — the workspace tree, a search
+  /// result, the context-menu "Open" — lands exactly where ⌘O and a Finder
+  /// "Open with Pensieve" land: as a native window tab. `click = tab`
+  /// (`docs/keyboard-shortcuts-and-file-lifecycle-contract.md`, decision
+  /// 26.07). A click is an explicit open, so it must not replace the document
+  /// this window is reading: files stay visible in parallel and switching
+  /// between them is switching tabs.
+  ///
+  /// Destination is `openFile`'s policy, not a second one: an empty, idle
+  /// window is reused in place — the launcher the user clicked from becomes
+  /// the file's window instead of spawning a tab beside itself and being
+  /// reaped a moment later — and a window holding live work hands the document
+  /// to the registry. The registry activates the tab already showing the
+  /// document rather than opening a twin, which is also why a document open
+  /// SOMEWHERE ELSE routes even from an idle window: loading it in place would
+  /// leave the same file rendered in two tabs.
+  ///
+  /// Clicking the document this window already shows is a no-op. Falls back to
+  /// in-window selection when no routing is wired (tests, headless).
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+    let documentID = ref.id.standardizedFileURL
+    if appState.selectedDocumentID?.standardizedFileURL == documentID {
       return
     }
 
-    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
-    selectDocument(id: ref.id)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture: route through the window
-  /// registry to open the document in a native tab (or activate the window
-  /// already showing it). Clicking the currently displayed document is a no-op.
-  /// Falls back to in-window selection when no routing is wired (tests, headless).
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = resolveDocumentRef(for: id) else { return }
-
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
-      return
-    }
-
-    guard let requestOpenDocumentWindow else {
+    let isOpenInSomeTab = documentWindowRegistry.openTabDocumentIDs.contains(documentID)
+    guard holdsLiveDocumentWork || isOpenInSomeTab, let requestOpenDocumentWindow else {
       DebugTrace.log(
-        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
-      )
+        "openDocumentWindow -> load in this window: \(ref.id.lastPathComponent)")
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
   }
 

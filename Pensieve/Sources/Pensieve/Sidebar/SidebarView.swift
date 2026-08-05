@@ -777,16 +777,10 @@ struct SidebarView: View {
 
   @ViewBuilder
   private func documentContextMenu(for doc: DocumentRef) -> some View {
+    // Every open lands as a native tab, so a separate "Open in New Window"
+    // item would be a second button for exactly this one.
     Button("Open") {
       controller.openDocumentWindow(id: doc.id)
-    }
-
-    // One window per document by design: the gesture only makes sense for a
-    // document this window is not currently showing.
-    if appState.selectedDocumentID?.standardizedFileURL != doc.id.standardizedFileURL {
-      Button("Open in New Window") {
-        controller.openDocumentInNewWindow(id: doc.id)
-      }
     }
 
     Button("Open in Default App") {
