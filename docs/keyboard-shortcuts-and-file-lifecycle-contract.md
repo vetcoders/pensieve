@@ -198,34 +198,59 @@ Clarification (05.08, after the file-backed half of bug I):
   explicitly discarded. (Retiring such a stash by URL is a pending product
   decision, not current behavior.)
 
-Clarification (05.08, after the "silent failed recovery write" bug):
+Clarification (05.08, after the "silent failed recovery write" bug) — PARTIAL,
+with two named gaps below:
 
-- **A recovery write either succeeds, or the failure is visible.** There is no
-  third outcome. Every path that persists a recovery item reports whether the
-  bytes reached disk, and a caller may only treat the work as safe when they did.
-  A failed write must leave `lastError` on screen — it must never be cleared by a
-  later step in the same operation.
-- **What a failure guarantees.** The buffer stays OPEN and stays DIRTY, holding
-  the full text; nothing on the user's disk is written or removed; no recovery
-  item is listed that does not exist as a file; and the message names both the
-  cause and what is at stake.
-- **What a failure does NOT guarantee.** Pensieve does not retry the write, does
-  not relocate the recovery directory, and does not save the work anywhere else.
-  The content lives in the buffer only, so it survives exactly as long as the
-  process does — an unresolved failure means a crash or a Force Quit still loses
-  that text. Resolving it is the user's Save As….
-- **Import (Word/PDF) is the sharp case and follows the same rule.** The
-  conversion result has no file behind it, so the recovery item is its only copy.
-  A conversion that lands with a failed recovery write is reported as a partial
-  success — converted text on screen, error visible — never as a completed import.
-  (It was: the import path cleared `lastError` unconditionally right after the
-  flush, and the flush returned success regardless of the write, so the user got
-  neither a file, nor a draft, nor a warning.)
-- Test that holds this: `RecoveredDraftsTests`
-  `testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer` (with
+- **A recovery write reports whether the bytes reached disk.** Every path that
+  persists a recovery item now returns that result instead of a constant, and a
+  caller may only treat the work as safe when the write actually succeeded. This
+  is a precondition for honest behavior, not the behavior itself: what a caller
+  does with the result is the caller's, and today only one consumes it.
+- **Where the guarantee holds: a surface that SURVIVES the operation and reads
+  the result.** Today that is exactly one caller, `importDocument`. There, a
+  failed recovery write means: the buffer stays OPEN and stays DIRTY holding the
+  full text, `lastError` is set and is NOT cleared by a later step in the same
+  operation, nothing on the user's disk is written or removed, and no recovery
+  item is listed that does not exist as a file.
+- **GAP 1 — close and quit consume nothing.** Both teardown flush sites
+  (`PensieveApp`'s `willCloseNotification` hook and
+  `TerminationSequence.flushPendingWindowSaves`) discard the result, and both run
+  PAST the veto point — after `windowShouldClose` / `applicationShouldTerminate`
+  have already consented. `lastError` is per-window state
+  (`AppState.lastError` → `DocumentWindowModel.lastError`), so a window that dies
+  carrying the error takes the error with it. On these paths a failed stash is
+  still a silent loss. In ordinary use the conscious close settles the buffer
+  BEFORE teardown, so the flush finds nothing dirty and the gap does not bite;
+  it bites on teardowns that bypass the conscious close — which is exactly what
+  the stash exists as a backstop for.
+- **GAP 2 — `lastError` currently has no renderer.** `AppState.lastError` is
+  written in many places and read by no view: the only non-test readers are its
+  own getter and the import path appending to it. So "the error stays on screen"
+  describes the STATE, not anything the user can see today. Until an error
+  surface exists, every guarantee above is about what the app knows, not about
+  what it tells anyone. Both gaps are open follow-ups, not settled behavior —
+  see `2026-08-05_notatka-45-1-close-quit-flush.md` in the project notes.
+- **What is NOT guaranteed even where the guarantee holds.** Pensieve does not
+  relocate the recovery directory and does not save the work anywhere else. It
+  performs no retry of its own; the next write EVENT (an edit re-arming autosave)
+  may retry and may report the failure again. The content lives in the buffer
+  only, so it survives exactly as long as the process does — an unresolved
+  failure means a crash or a Force Quit still loses that text. Resolving it is
+  the user's Save As….
+- **Import (Word/PDF) is the sharp case.** The conversion result has no file
+  behind it, so the recovery item is its only copy. A conversion that lands with
+  a failed recovery write is treated as a partial success — converted text in the
+  buffer, error recorded — never as a completed import. (It was: the import path
+  cleared `lastError` unconditionally right after the flush, and the flush
+  returned success regardless of the write, so the app itself could not tell the
+  two apart.)
+- Tests. `testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer` holds the
+  import path end to end through `AppController`.
   `testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess` and
-  `testACloseFlushReportsAFailedStashOfAFileBackedBuffer` on the two flush
-  branches).
+  `testACloseFlushReportsAFailedStashOfAFileBackedBuffer` pin the two flush
+  branches at the `DocumentStore` level — they prove the RETURN VALUE and the
+  buffer state, and deliberately not the behavior of a real Close or Quit, which
+  is GAP 1.
 
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 

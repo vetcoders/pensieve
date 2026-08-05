@@ -548,11 +548,17 @@ final class AppController: ObservableObject {
         guard persisted else {
           // The conversion succeeded and its ONLY copy is the buffer on screen —
           // there is no source-backed file to fall back to and no draft on disk.
-          // Clearing `lastError` here (which this path did unconditionally) erased
-          // the one signal the user had: the import looked like a success, and a
-          // crash before Save As… took the conversion with it. The buffer is left
-          // open and dirty, and the message says what is at stake on top of the
-          // write error `saveRecoveryDraft` already reported.
+          // Clearing `lastError` here (which this path did unconditionally) left
+          // the app unable to tell a completed import from a failed one, so a
+          // crash before Save As… took the conversion with nothing having
+          // recorded the risk. The buffer is left open and dirty, and the stakes
+          // are appended to the write error `saveRecoveryDraft` already reported.
+          //
+          // NOT yet a message the user SEES: `AppState.lastError` currently has
+          // no renderer — it is written all over the app and read by no view. So
+          // this records the failure rather than surfacing it, and the surfacing
+          // is a separate, open piece of work. See the lifecycle contract's
+          // Recovery section, GAP 2.
           appState.lastError =
             (appState.lastError ?? "Could not write recovery draft.")
             + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
