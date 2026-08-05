@@ -89,7 +89,13 @@ final class TrashedWorkingSetTests: XCTestCase {
     try store.persistFile(url: dropURL, into: AppState())
     let trashedURL = try trash(dropURL)
 
-    XCTAssertEqual(store.pruneTrashedFiles(), [trashedURL])
+    let pruned = store.pruneTrashedFiles()
+    XCTAssertEqual(pruned.map(\.trashedURL), [trashedURL])
+    XCTAssertEqual(
+      pruned.compactMap(\.originURL).map(BookmarkStore.identityPath),
+      [BookmarkStore.identityPath(dropURL)],
+      "the prune reports both halves: where the bookmark landed, and the path it was MINTED for — "
+        + "the only thing a live working-set row can be matched against")
     XCTAssertEqual(restoredFileURLs(), [keepURL])
     XCTAssertTrue(
       store.pruneTrashedFiles().isEmpty,
@@ -198,6 +204,47 @@ final class TrashedWorkingSetTests: XCTestCase {
     XCTAssertEqual(
       persistedFileBookmarkCount(), 1,
       "the bookmark survives: a vanished file may be mid-replacement, or on an unplugged volume")
+  }
+
+  /// Two documents, one NAME. The one this app has open lives on a volume that
+  /// went away; the one the user threw away is a different file entirely.
+  ///
+  /// This is the collision the two-signal rule used to lose: both halves fired
+  /// on the same basename — "a `notes.md` vanished" and "a `notes.md` turned up
+  /// in the Trash" — and the live external document was retired on the strength
+  /// of a coincidence. The rule is about ONE file leaving ONE path, so the
+  /// second signal has to be the dropped bookmark's own pre-trash path.
+  func testRefreshKeepsAVanishedFileWhenItsNamesakeIsTheOneThatWasTrashed() async throws {
+    _ = try writeNote("root-note.md", in: workspace)
+    let elsewhere = fixtureRoot.appendingPathComponent("Elsewhere", isDirectory: true)
+    try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+    // Same name, different documents — and different bytes, so nothing but the
+    // name could ever confuse the two.
+    let vanishingURL = try writeNote("notes.md", in: outside)
+    let trashedNamesakeURL = try writeNote("notes.md", in: elsewhere)
+    let harness = try makeHarness()
+
+    await harness.openWorkspace()
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: vanishingURL, into: harness.appState))
+    XCTAssertNotNil(
+      harness.folderManager.registerOpenFile(url: trashedNamesakeURL, into: harness.appState))
+    XCTAssertEqual(harness.openFileURLs, [vanishingURL, trashedNamesakeURL])
+
+    // The namesake is genuinely thrown away; the open document merely stops
+    // being reachable, the way an unplugged volume takes a file with it.
+    try trash(trashedNamesakeURL)
+    try FileManager.default.removeItem(at: vanishingURL)
+
+    harness.folderManager.refresh(into: harness.appState, force: true)
+    await harness.folderManager.waitForPendingForcedRefresh()
+
+    XCTAssertEqual(
+      harness.openFileURLs, [vanishingURL],
+      "a live document on a disconnected volume must not be retired because some OTHER file with "
+        + "the same name was thrown away")
+    XCTAssertEqual(
+      persistedFileBookmarkCount(), 1,
+      "…and it keeps its bookmark, so the volume coming back brings the document back with it")
   }
 
   // MARK: - Open route
