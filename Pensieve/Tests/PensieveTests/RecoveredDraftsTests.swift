@@ -467,6 +467,46 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertNotEqual(first.documentSession.recoveryID, second.documentSession.recoveryID)
   }
 
+  /// The SEVERING half of the same rule, and the reason the association is safe
+  /// to keep across stashes: it is dropped the moment the buffer's IDENTITY
+  /// changes. `createUntitled` replaces the buffer with a brand new document, so
+  /// the draft the previous one wrote stays behind untouched and the next stash
+  /// mints its OWN — a new document must not overwrite work the user has not
+  /// decided about yet.
+  @MainActor
+  func testANewUntitledBufferDoesNotInheritTheDraftTheReplacedOneWrote() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.createUntitled(title: "Umowa.md")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let stashed = try XCTUnwrap(store.loadDrafts().first)
+    XCTAssertEqual(appState.documentSession.recoveryID, stashed.id)
+
+    appState.documentSession.createUntitled(title: "Untitled 2.md")
+
+    XCTAssertNil(
+      appState.documentSession.recoveryID,
+      "a brand new buffer inherited the draft the buffer it replaced owns")
+    appState.activeDocumentText = "# Aneks"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      Set(store.loadDrafts().map(\.id)).count, 2,
+      "the new buffer's stash overwrote the draft of the work it replaced")
+    XCTAssertEqual(
+      store.loadDrafts().first(where: { $0.id == stashed.id })?.text, "# Umowa",
+      "the replaced buffer's draft was rewritten with text that is not its own")
+  }
+
   /// A stash is recoverable work only until the work is safely on disk. Now that a
   /// file-backed buffer keeps its draft across closes, the save that publishes the
   /// same bytes has to retire it — otherwise the launcher would offer content the
