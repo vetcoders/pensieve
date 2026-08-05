@@ -643,6 +643,44 @@ enum WindowChromeRecipe {
       contentLayoutHeight: window.contentLayoutRect.height)
   }
 
+  /// Height of the chrome AppKit lays out BELOW the toolbar — on this app that
+  /// is the native tab bar, which is a `.bottom` titlebar accessory.
+  ///
+  /// This is the number SwiftUI does not spend on the split view's SIDEBAR
+  /// column, and the whole of bug A. Measured on the probe (1300×760, dark,
+  /// three restored documents in one tab group):
+  ///
+  ///   * no tab bar — `frame.height - contentLayoutRect.height` = 52, sidebar
+  ///     content top = 52. They agree, and the header renders.
+  ///   * one tab bar — the band grows to 88 (`accessories=[layout=4 h=36]`),
+  ///     and the sidebar content top stays at 52.
+  ///
+  /// 52 is where the WORKSPACE TITLE ROW lives (`pensieve.sidebar.title` at
+  /// 62..80, the search field at 84..108), so with a tab bar those 36 points are
+  /// spent twice: once by AppKit for the tab strip, once by SwiftUI for the
+  /// sidebar header. What actually covers the header is the SwiftUI-owned
+  /// `NSHostingView<PlatformBarBackground>` that `.toolbarColorScheme` installs
+  /// into `NSTitlebarContainerView` (`topDY=0 h=88 w=1300` — the FULL window
+  /// width, sidebar column included). Dropping that declaration does fix the
+  /// pixels and reopens the toolbar-platter defect `SkinChrome` documents;
+  /// `.toolbarBackgroundVisibility(.hidden, for: .windowToolbar)` does too, and
+  /// costs the glass platters as well (typewriter, toolbar row dy=26: glyphs
+  /// fall from (230,230,230) to (86,85,84)). So the bar background stays, and
+  /// the sidebar stops laying its header under it.
+  ///
+  /// Read from the accessories rather than from the 88−52 difference because
+  /// only the accessories are a number AppKit publishes: the 52 is SwiftUI's
+  /// own placement, and nothing exposes it. `titled` is checked first because
+  /// `titlebarAccessoryViewControllers` RAISES on a window without that style
+  /// mask — that is the `NSAssertionHandler` abort a diagnostic probe hit on a
+  /// plain helper window while chasing this bug, not a torn titlebar.
+  static func belowToolbarChromeHeight(in window: NSWindow?) -> CGFloat {
+    guard let window, window.styleMask.contains(.titled) else { return 0 }
+    return window.titlebarAccessoryViewControllers
+      .filter { $0.layoutAttribute == .bottom && !$0.view.isHidden }
+      .reduce(0) { $0 + max(0, $1.view.frame.height) }
+  }
+
   static func contentLayoutRect(in view: NSView) -> NSRect? {
     guard let window = view.window else { return nil }
     return view.convert(window.contentLayoutRect, from: nil)
@@ -862,6 +900,112 @@ struct WindowChromeSink: NSViewRepresentable {
       coordinator.observe(view.window)
       coordinator.assertChrome()
     }
+  }
+}
+
+/// Reports the hosting window's below-toolbar chrome height to SwiftUI.
+///
+/// A sink rather than a `GeometryReader` because the number is AppKit's and
+/// SwiftUI never sees it: the split view places the sidebar column at the
+/// TOOLBAR height and a `GeometryReader` in the column reads that same placement
+/// back. Reading its own answer is also why measuring the gap in SwiftUI cannot
+/// work at all — inset the content by the difference and the next read returns
+/// the corrected number, which oscillates.
+///
+/// Driven off `NSWindow.didUpdateNotification`, the trigger `WindowChromeSink`
+/// already uses, because the tab bar comes and goes BETWEEN SwiftUI passes: a
+/// second document joins the group, or the last one leaves it, without anything
+/// in the sidebar's own graph changing. The callback only fires on a CHANGED
+/// value, so a window update that moves nothing does not re-drive the graph.
+struct SidebarChromeInsetSink: NSViewRepresentable {
+  let onChange: (CGFloat) -> Void
+
+  @MainActor
+  final class Coordinator {
+    var onChange: (CGFloat) -> Void = { _ in }
+    private var reported: CGFloat?
+    private weak var window: NSWindow?
+    private var observer: NSObjectProtocol?
+
+    func observe(_ window: NSWindow?) {
+      if self.window !== window {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        self.window = window
+        if let window {
+          observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification, object: window, queue: .main
+          ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.report() }
+          }
+        }
+      }
+      report()
+    }
+
+    func report() {
+      let height = WindowChromeRecipe.belowToolbarChromeHeight(in: window)
+      guard reported != height else { return }
+      reported = height
+      onChange(height)
+    }
+
+    deinit {
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+  }
+
+  final class SinkView: NSView {
+    var onWindowChanged: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      onWindowChanged?()
+    }
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  func makeNSView(context: Context) -> NSView {
+    let view = SinkView(frame: .zero)
+    view.isHidden = true
+    configure(view, coordinator: context.coordinator)
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    guard let view = nsView as? SinkView else { return }
+    configure(view, coordinator: context.coordinator)
+  }
+
+  private func configure(_ view: SinkView, coordinator: Coordinator) {
+    coordinator.onChange = onChange
+    view.onWindowChanged = { [weak view] in coordinator.observe(view?.window) }
+    coordinator.observe(view.window)
+  }
+}
+
+private struct SidebarChromeInsetModifier: ViewModifier {
+  @State private var inset: CGFloat = 0
+
+  func body(content: Content) -> some View {
+    content
+      .safeAreaInset(edge: .top, spacing: 0) {
+        Color.clear.frame(height: inset)
+      }
+      .background(SidebarChromeInsetSink { inset = $0 })
+  }
+}
+
+extension View {
+  /// Keeps this column's content clear of the chrome AppKit lays out below the
+  /// toolbar. Zero without a tab bar, so the untabbed window is untouched.
+  ///
+  /// See `WindowChromeRecipe.belowToolbarChromeHeight(in:)` for the measurement
+  /// and for why the fix lives on the sidebar rather than on the bar background
+  /// that does the covering.
+  func pensieveSidebarChromeInset() -> some View {
+    modifier(SidebarChromeInsetModifier())
   }
 }
 
