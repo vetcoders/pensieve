@@ -530,7 +530,15 @@ final class AppController: ObservableObject {
         )
         // The conversion result has no source-backed autosave target. Persist
         // the dirty untitled session immediately so a crash cannot erase the handoff.
-        documentStore.savePendingChangesOnClose(appState: appState)
+        //
+        // `releasesDraftClaim: false` because this window STAYS OPEN holding the
+        // buffer that draft belongs to. The flush's default is a close, where
+        // releasing the claim is the point — the buffer dies and its draft goes
+        // back on the launcher. Here it would publish a LIVE buffer's draft as
+        // unhandled: every other launcher surface would offer it, and adopting it
+        // into a second window would put two buffers on one recovery ID,
+        // autosaving over each other.
+        documentStore.savePendingChangesOnClose(appState: appState, releasesDraftClaim: false)
         appState.lastError = nil
         DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
       case .failure(let message):
