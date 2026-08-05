@@ -3539,7 +3539,7 @@ final class DocumentStore {
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       recoveryStore.deleteDraft(id: recoveryID)
-      appState.lastError = nil
+      appState.resolveError()
       // Same publication, same exposure: saving AS an existing file makes our bytes that file's
       // content, so a settled window already open on it holds a buffer this write has just made
       // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
@@ -3833,7 +3833,7 @@ final class DocumentStore {
         text: appState.documentSession.text
       )
       appState.documentSession.recoveryID = draft.id
-      appState.clearError()
+      appState.resolveError()
       return true
     } catch {
       // DATA LOSS: this write IS the durable copy. It failed, so the text exists
@@ -3874,6 +3874,12 @@ final class DocumentStore {
         text: appState.documentSession.text
       )
       appState.documentSession.recoveryID = draft.id
+      // Deliberately NOT `resolveError()`, unlike the other durable writes. A
+      // stash often follows a save that FAILED, and the file the user actually
+      // asked to write is still stale — the draft is a backstop, not the
+      // outcome they wanted. Retiring the latch here would take "could not save
+      // X" off the screen on the strength of a copy they never asked for. It is
+      // retired when a real save of that file lands.
       return true
     } catch {
       // DATA LOSS: the file on disk is already stale — that is why this path
@@ -4110,7 +4116,7 @@ final class DocumentStore {
       recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
-      appState.lastError = nil
+      appState.resolveError()
       if indexNow {
         // Only THIS session's debounce, and only when it is armed for the document just written: the
         // write below supersedes it, so leaving it would duplicate the same row. A debounce armed for

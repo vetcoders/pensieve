@@ -555,10 +555,10 @@ final class AppController: ObservableObject {
           // are appended to the write error `saveRecoveryDraft` already reported.
           //
           // Reported through `reportDataLoss`, not a plain `lastError` write:
-          // the assignment would re-file this as an ordinary status line and
-          // silently DOWNGRADE the data-loss severity `saveRecoveryDraft` just
-          // recorded, costing the alert. See the lifecycle contract's Recovery
-          // section.
+          // the assignment lands in the STATUS slot, so it would leave the
+          // sharper sentence sitting behind the unresolved data loss
+          // `saveRecoveryDraft` just latched and never reach the screen. See
+          // the lifecycle contract's Recovery section.
           appState.reportDataLoss(
             (appState.lastError ?? "Could not write recovery draft.")
               + " The text converted from \(sourceURL.lastPathComponent) is open but has no"

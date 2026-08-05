@@ -46,12 +46,12 @@ final class WindowErrorSurfaceTests: XCTestCase {
       WindowErrorSurface.resolve(for: bystander.currentError), .none,
       "one window's failure showed up in another window's chrome")
     XCTAssertNil(
-      bystander.pendingDataLossAlert,
-      "one window's failure raised an alert over another window")
+      bystander.unresolvedDataLoss,
+      "one window's failure latched a data loss onto another window")
   }
 
   /// The banner's dismiss button, which is the only way a passive line goes away
-  /// on its own. `clearError()` is exactly what the button calls.
+  /// on its own. `dismissVisibleError()` is exactly what the button calls.
   @MainActor
   func testDismissingTheBannerClearsIt() throws {
     let folder = try makeTemporaryFolder()
@@ -64,16 +64,17 @@ final class WindowErrorSurfaceTests: XCTestCase {
       WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
       "a refused action recorded nothing for the chrome to show")
 
-    appState.clearError()
+    appState.dismissVisibleError()
 
     XCTAssertEqual(WindowErrorSurface.resolve(for: appState.currentError), .none)
   }
 
-  // MARK: - Only data loss gets to interrupt
+  // MARK: - Data loss latches; status does not
 
-  /// An ordinary refusal is a passive line and nothing more — no modal.
+  /// An ordinary refusal is a passive line and nothing more. It latches nothing:
+  /// the moment it is put away the window is quiet again.
   @MainActor
-  func testAnOrdinaryFailureShowsABannerAndRaisesNoAlert() throws {
+  func testAnOrdinaryFailureShowsABannerAndLatchesNothing() throws {
     let folder = try makeTemporaryFolder()
     let appState = AppState()
     let controller = makeController(in: folder, appState: appState)
@@ -83,14 +84,14 @@ final class WindowErrorSurfaceTests: XCTestCase {
     XCTAssertEqual(appState.currentError?.severity, .status)
     XCTAssertTrue(WindowErrorSurface.resolve(for: appState.currentError).showsBanner)
     XCTAssertNil(
-      appState.pendingDataLossAlert,
-      "a refused action interrupted the user with a modal it did not earn")
+      appState.unresolvedDataLoss,
+      "a refused action latched a data loss it did not earn")
   }
 
   /// …and a recovery-draft write that fails IS data loss: the untitled buffer is
-  /// the only copy of that text, so it earns both the banner and the alert.
+  /// the only copy of that text, so the window latches it.
   @MainActor
-  func testAFailedRecoveryDraftWriteRaisesTheDataLossAlert() throws {
+  func testAFailedRecoveryDraftWriteLatchesTheDataLoss() throws {
     let folder = try makeTemporaryFolder()
     let store = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
@@ -106,16 +107,21 @@ final class WindowErrorSurfaceTests: XCTestCase {
       appState.currentError?.severity, .dataLoss,
       "the only copy of an unsaved document failed to persist and was filed as routine")
     XCTAssertTrue(WindowErrorSurface.resolve(for: appState.currentError).showsBanner)
-    let alert = try XCTUnwrap(
-      appState.pendingDataLossAlert, "losing the only copy of the text asked the user nothing")
-    XCTAssertTrue(alert.message.contains("recovery draft"))
+    let latched = try XCTUnwrap(
+      appState.unresolvedDataLoss, "losing the only copy of the text latched nothing")
+    XCTAssertTrue(latched.message.contains("recovery draft"))
   }
 
-  /// The storm guard. A full volume does not fail once — an armed autosave
-  /// retries and fails again with the SAME message. The banner keeps standing,
-  /// but the modal is asked once, not once per attempt.
+  // MARK: - The three latch rules
+
+  /// RULE 1 — a routine message may not displace an unresolved data loss.
+  ///
+  /// These arrive in this order all the time: the recovery write fails, and the
+  /// next thing the user does produces an ordinary refusal. If the second one
+  /// took the line, the window would stop saying the thing that actually costs
+  /// work while it is still true.
   @MainActor
-  func testARepeatedIdenticalDataLossFailureAsksOnce() throws {
+  func testAnOrdinaryStatusDoesNotDisplaceAnUnresolvedDataLoss() throws {
     let folder = try makeTemporaryFolder()
     let store = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
@@ -126,31 +132,108 @@ final class WindowErrorSurfaceTests: XCTestCase {
       title: "Board Resolution.md", text: "# Prokurent", recoveryID: UUID())
 
     store.savePendingChangesOnClose(appState: appState)
-    // The user answered the first alert.
-    appState.pendingDataLossAlert = nil
-    // …and the next attempt fails exactly the same way.
-    store.savePendingChangesOnClose(appState: appState)
+    XCTAssertEqual(appState.currentError?.severity, .dataLoss, "fixture precondition")
 
-    XCTAssertNil(
-      appState.pendingDataLossAlert,
-      "the same failure asked twice — a failing autosave would bury the app in modals")
+    // Something entirely routine happens next.
+    appState.lastError = "Could not open Kancelaria: no such directory"
+
+    XCTAssertEqual(
+      appState.currentError?.severity, .dataLoss,
+      "a routine message took the line away from an unresolved data loss")
+    XCTAssertNotNil(appState.unresolvedDataLoss, "the latch was cleared by a status write")
     XCTAssertTrue(
-      WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
-      "the standing reminder that the work is unsafe disappeared with the answered alert")
+      try XCTUnwrap(appState.currentError).message.contains("recovery draft"),
+      "the window is showing the routine message instead of the loss")
   }
 
-  /// A NEW data-loss condition after an answered one does ask again — the guard
-  /// above must dedupe identical failures, not silence the second problem.
+  /// …and neither may a routine CLEAR. Roughly a dozen sites assign
+  /// `lastError = nil` on their own unrelated success, and none of them know
+  /// anything about a buffer whose content reached no disk.
   @MainActor
-  func testADifferentDataLossFailureAsksAgain() throws {
+  func testAnUnrelatedSuccessClearingLastErrorDoesNotResolveTheLoss() {
+    let appState = AppState()
+    appState.reportDataLoss("Could not save umowa.md: no space left on device")
+
+    appState.lastError = nil
+
+    XCTAssertNotNil(
+      appState.unresolvedDataLoss,
+      "an unrelated operation reporting success retired somebody else's data loss")
+    XCTAssertTrue(WindowErrorSurface.resolve(for: appState.currentError).showsBanner)
+  }
+
+  /// RULE 2 — dismissing the banner must not re-arm on an identical retry.
+  ///
+  /// A full volume does not fail once: the armed autosave retries every 1.5 s
+  /// and fails with the same message every time. If putting the banner away
+  /// reset the condition, each retry would read as news and the banner the user
+  /// just closed would come straight back, indefinitely.
+  @MainActor
+  func testDismissingADataLossBannerSurvivesAnIdenticalRetry() throws {
+    let folder = try makeTemporaryFolder()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: try makeUnwritableRecoveryStore(in: folder))
+    let appState = AppState()
+    appState.documentSession.restoreUntitled(
+      title: "Board Resolution.md", text: "# Prokurent", recoveryID: UUID())
+
+    store.savePendingChangesOnClose(appState: appState)
+    appState.dismissVisibleError()
+    XCTAssertEqual(
+      WindowErrorSurface.resolve(for: appState.currentError), .none, "fixture precondition")
+
+    // The same write fails the same way on the next tick.
+    store.savePendingChangesOnClose(appState: appState)
+
+    XCTAssertEqual(
+      WindowErrorSurface.resolve(for: appState.currentError), .none,
+      "an identical retry resurrected the banner the user had put away")
+    XCTAssertNotNil(
+      appState.unresolvedDataLoss,
+      "dismissing the banner made the app forget the work is still unsafe")
+  }
+
+  /// RULE 3 — once the loss is RESOLVED, the same problem happening again is
+  /// news, and the window says so. This is the boundary of rule 2: the dedupe
+  /// must be scoped to one unresolved condition, not to a message string
+  /// forever.
+  @MainActor
+  func testAFreshOccurrenceAfterResolutionArmsTheSurfaceAgain() {
+    let appState = AppState()
+    let message = "Could not save umowa.md: no space left on device"
+
+    appState.reportDataLoss(message)
+    appState.dismissVisibleError()
+    // The user freed some space and saved: a durable write landed.
+    appState.resolveError()
+    XCTAssertNil(appState.unresolvedDataLoss, "fixture precondition: the loss is resolved")
+
+    // The disk fills up again.
+    appState.reportDataLoss(message)
+
+    XCTAssertTrue(
+      WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
+      "a fresh occurrence after a resolved one stayed silent")
+    XCTAssertEqual(appState.currentError?.severity, .dataLoss)
+  }
+
+  /// A genuinely DIFFERENT failure arriving while the first is still unresolved
+  /// is also news — the dedupe keys on the condition, not on "some loss is
+  /// already latched".
+  @MainActor
+  func testADifferentDataLossReplacesTheLatchAndShowsAgain() {
     let appState = AppState()
 
     appState.reportDataLoss("Could not save a.md: disk full")
-    appState.pendingDataLossAlert = nil
+    appState.dismissVisibleError()
     appState.reportDataLoss("Could not save b.md: permission denied")
 
-    XCTAssertNotNil(
-      appState.pendingDataLossAlert, "a second, different loss was swallowed by the dedupe")
+    XCTAssertTrue(
+      WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
+      "a second, different loss was swallowed by the dedupe")
+    XCTAssertEqual(appState.unresolvedDataLoss?.message, "Could not save b.md: permission denied")
   }
 
   // MARK: - The default stays quiet
@@ -165,7 +248,7 @@ final class WindowErrorSurfaceTests: XCTestCase {
     appState.lastError = "Could not open folder: no such directory"
 
     XCTAssertEqual(appState.currentError?.severity, .status)
-    XCTAssertNil(appState.pendingDataLossAlert)
+    XCTAssertNil(appState.unresolvedDataLoss)
     XCTAssertEqual(appState.lastError, "Could not open folder: no such directory")
   }
 

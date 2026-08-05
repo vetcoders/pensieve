@@ -7,11 +7,15 @@ import SwiftUI
 /// saying (a workspace that will not open, a file that has moved) happen in a
 /// window showing nothing at all.
 ///
-/// Deliberately passive. It appears when the window records an error, stays
-/// until the user dismisses it or something clears it, takes no focus, and
-/// blocks nothing. A data-loss error also raises the alert `ContentView`
-/// presents; the banner is what remains afterwards, because the standing
-/// reminder that the work is not safe has to outlive a dismissed modal.
+/// Deliberately passive, and the ONLY error surface in the app: it appears when
+/// the window records an error, stays until the user dismisses it or a durable
+/// write resolves it, takes no focus, and blocks nothing. Nothing here is ever
+/// modal — not even the data-loss class, which is louder in dress only.
+///
+/// Dismissing a data-loss banner hides this view and nothing else. The window
+/// keeps its `unresolvedDataLoss` latch, so the app still knows the work is not
+/// safe and an identical failure repeating on the next autosave tick has
+/// nothing new to say.
 ///
 /// Dressed from `tokens.warning` — the same semantic token the status bar's
 /// "Edited" marker uses — so it reads as chrome of the active skin rather than

@@ -274,32 +274,59 @@ raised, never by matching its message text:
   those. Status is the default precisely so that the loud class stays opt-in: a
   new error has to be argued into it and cannot fall into it.
 
-**Status class — a passive line in the window chrome.** It appears in the
-window that recorded the error and in no other (the state is per-window:
-`AppState.currentError` → `DocumentWindowModel.currentError`). It sits between
-the document pane and the status bar, and deliberately NOT behind the status
-bar's `documentHasEditableBuffer` gate — the errors that most need saying can
-land in a window with nothing open. It is passive in the strict sense: it never
-takes first responder, so it may appear and disappear under a live editing
-session without moving the caret or interrupting typing. It carries a dismiss
-button, and it goes away when dismissed or when something clears the error
-(a successful recovery write does exactly that). Nothing times it out.
+**One surface, and it is passive.** Pensieve has NO modal error path. Both
+classes show the same standing line in the window that recorded the failure and
+in no other (the state is per-window: `AppState.currentError` →
+`DocumentWindowModel`). It sits between the document pane and the status bar,
+and deliberately NOT behind the status bar's `documentHasEditableBuffer` gate —
+the errors that most need saying can land in a window with nothing open. It is
+passive in the strict sense: it never takes first responder, so it may appear
+and disappear under a live editing session without moving the caret or
+interrupting typing. It carries a dismiss button. Nothing times it out. Severity
+changes the dressing — filled accent and a warning icon for data loss, the
+status bar's own material for everything else — never whether the user is
+interrupted.
 
-**Data-loss class — the same standing line PLUS an alert.** The alert is the one
-thing allowed to interrupt, and it may take focus. It is per-window, so a
-failure in one window never raises a modal over another. It is armed only on the
-TRANSITION into a new data-loss condition: a failing autosave repeating the same
-error every 1.5 s asks once, not once per tick, while a genuinely different
-failure asks again. The banner outlives the answered alert on purpose — the
-standing reminder that the work is not safe must not disappear with the modal.
+**Data loss LATCHES; status does not.** The two live in separate state, and the
+separation is the point:
+
+- `DocumentWindowModel.statusError` — the passive message, freely overwritten
+  and freely cleared by whoever wrote it.
+- `DocumentWindowModel.unresolvedDataLoss` — a latch: content that reached no
+  file and exists only in a buffer that dies with the process.
+- `DocumentWindowModel.dataLossBannerDismissed` — visibility only, never safety.
+
+Three rules follow, and each is pinned:
+
+1. **A status message cannot displace an unresolved data loss** — not by being
+   written, and not by being cleared. Around a dozen sites assign
+   `lastError = nil` on their own unrelated success, and none of them know
+   anything about a buffer whose content reached no disk. The banner keeps
+   showing the loss while it is still true.
+2. **Dismissing the banner does not reset the condition.** The latch survives,
+   so an identical failure repeating on the next autosave tick has nothing new
+   to say and the banner the user put away stays away. Without this a full disk
+   would resurrect a dismissed banner every 1.5 seconds.
+3. **A resolved loss that happens again IS news.** The dedupe is scoped to one
+   unresolved condition, not to a message string forever, so the surface re-arms
+   — dismissal included. A genuinely different failure arriving while the first
+   is still unresolved also re-arms.
+
+**What retires the latch.** Only `AppState.resolveError()`, called where a
+durable write for that buffer actually lands: a successful `saveExisting`,
+`saveAs`, or recovery-draft write. A successful closing-buffer STASH
+deliberately does not — that path runs precisely because the file the user asked
+to write is stale, and a backstop copy they never asked for must not take "could
+not save X" off the screen.
 
 Tests. `WindowErrorChromeRenderTests` drives a real window hosting the real
 `ContentView` and measures the live layout, so "the banner is mounted" is read
-from the window and not from a resolver; it also holds the focus contract
-(typing continues, caret unmoved, first responder unchanged) across the banner
-appearing and disappearing. `WindowErrorSurfaceTests` pins the classification
-through real production paths (a failing save, an unwritable recovery
-directory, a refused document creation) and the once-per-condition alert.
+from the window and not from a resolver; it holds all three latch rules on that
+live surface plus the focus contract (typing continues, caret unmoved, first
+responder unchanged) across the banner appearing and disappearing.
+`WindowErrorSurfaceTests` pins the classification through real production paths
+(a failing save, an unwritable recovery directory, a refused document creation)
+and the same three rules at the state level.
 `testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss` holds the import chain
 end to end.
 
