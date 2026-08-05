@@ -3972,9 +3972,9 @@ final class DocumentStore {
   /// buffer on ONE draft. It used to be a pair of no-ops here — `recoveryID`
   /// lived inside `DocumentSession.Kind.untitled`, so a file-backed session read
   /// `nil` and its write-back was swallowed — and every stash of the same file
-  /// therefore minted a fresh UUID. With auto-save off (the default) nothing
-  /// retires those files either, so a single unsaved document produced a new
-  /// draft on every close, without bound.
+  /// therefore minted a fresh UUID. Nothing sweeps the recovery directory either
+  /// (no age limit, no cap — a draft is retired only by a decision), so a single
+  /// unsaved document produced a new draft on every close, without bound.
   private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
     guard appState.documentSession.isDirty else { return }
 
