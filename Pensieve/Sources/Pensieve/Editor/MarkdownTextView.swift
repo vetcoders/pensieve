@@ -18,6 +18,17 @@ class MarkdownTextView: NSTextView {
   // press Esc before typing/copying again. A non-responder subview in the SAME window never becomes
   // key, so the text view keeps first-responder → no focus theft, no Esc. The bar is also draggable.
   private var formattingAccessory: FloatingFormatBarView?
+  /// Whether the bar BELONGS on screen, kept apart from whether it is currently on
+  /// screen. A selection whose rect TextKit cannot answer for takes the view away
+  /// without cancelling the intent, so the next good measurement — the next scroll
+  /// or layout pass — can put the bar back rather than waiting for the user to
+  /// re-select. Only an explicit dismissal (Esc, an empty selection, losing focus)
+  /// clears the intent itself.
+  private var wantsFormattingAccessory = false
+  /// Set once the user drags the bar by its grip. A hand-parked bar is where the
+  /// user wants it, so the automatic re-anchoring on scroll/relayout leaves it
+  /// alone; cleared whenever the bar is placed automatically again or taken away.
+  private var formattingAccessoryWasMovedByUser = false
 
   override var undoManager: UndoManager? {
     super.undoManager ?? fallbackUndoManager
@@ -213,14 +224,14 @@ class MarkdownTextView: NSTextView {
   @objc private func boundsDidChange() {
     gutter?.needsDisplay = true
     scheduleAutocompleteGhostReposition()
-    clampFormattingAccessoryIntoChrome()
+    updateFormattingAccessory()
   }
 
   override func layout() {
     super.layout()
     gutter?.needsDisplay = true
     scheduleAutocompleteGhostReposition()
-    clampFormattingAccessoryIntoChrome()
+    updateFormattingAccessory()
   }
 
   override func paste(_ sender: Any?) {
@@ -369,35 +380,25 @@ class MarkdownTextView: NSTextView {
       hideFormattingPopover()
       return
     }
+    wantsFormattingAccessory = true
+    // A fresh selection is a fresh placement: whatever the user dragged the bar to
+    // belonged to the previous one.
+    formattingAccessoryWasMovedByUser = false
+    updateFormattingAccessory()
+  }
 
-    let selection = selectedRange()
+  /// The current selection's rect in this (flipped) text view's own coordinate
+  /// space, or `nil` when TextKit cannot say where the selection is — which it
+  /// signals by returning exactly `.zero`, and which happens routinely: a range
+  /// outside the laid-out region, or one whose layout an edit above it has just
+  /// invalidated. Callers must treat `nil` as "do not place anything", never as
+  /// "place it somewhere reasonable".
+  private func selectionRectInOwnCoordinates() -> NSRect? {
+    guard let window else { return nil }
     var actualRange = NSRange(location: 0, length: 0)
-    let screenRect = firstRect(forCharacterRange: selection, actualRange: &actualRange)
-    // The selection rect lives in this (flipped) text view's own coordinate space; anchoring the
-    // accessory there makes it scroll in lockstep with the text, so it never sits over a stale spot.
-    let localRect: NSRect
-    if let window {
-      localRect = convert(window.convertFromScreen(screenRect), from: nil)
-    } else {
-      localRect = visibleRect
-    }
-
-    let accessory =
-      formattingAccessory
-      ?? FloatingFormatBarView { [weak self] format in
-        self?.applyFloatingFormat(format)
-      }
-    if accessory.superview !== self {
-      accessory.removeFromSuperview()
-      addSubview(accessory)
-    }
-    formattingAccessory = accessory
-
-    let size = accessory.fittingBarSize
-    accessory.setFrameSize(size)
-    accessory.setFrameOrigin(
-      Self.accessoryOrigin(
-        for: localRect, size: size, allowed: accessoryAllowedRect(), isFlipped: isFlipped))
+    let screenRect = firstRect(forCharacterRange: selectedRange(), actualRange: &actualRange)
+    guard screenRect != .zero else { return nil }
+    return convert(window.convertFromScreen(screenRect), from: nil)
   }
 
   /// The region the floating accessories may occupy: the visible rect minus any window
@@ -444,21 +445,72 @@ class MarkdownTextView: NSTextView {
     return clamped
   }
 
+  /// Bring the bar in line with where the selection is RIGHT NOW. Called both when
+  /// a selection change asks for it and after every bounds/layout change.
+  ///
   /// The bar is a subview of this text view, so it scrolls in lockstep with the text —
-  /// which also means a scroll can carry it under the titlebar. Re-pin it after every
-  /// bounds/layout change.
-  private func clampFormattingAccessoryIntoChrome() {
-    guard let bar = formattingAccessory, bar.superview === self else { return }
-    let clamped = Self.clampedAccessoryOrigin(
-      bar.frame.origin, size: bar.frame.size, allowed: accessoryAllowedRect())
-    if clamped != bar.frame.origin {
-      bar.setFrameOrigin(clamped)
+  /// which also means a scroll can carry it under the titlebar. But the text can move
+  /// out from under it too: an edit ABOVE the selection shifts the annotated line while
+  /// the selection itself never changes, so nothing fires a re-show and a clamp-only
+  /// pass would leave the bar on whatever paragraph now occupies that spot. So re-derive
+  /// the anchor from the CURRENT selection rect instead of nudging the stale origin.
+  ///
+  /// When TextKit cannot say where the selection is, the bar comes off the screen —
+  /// every position would be a guess — but the INTENT survives, so the next pass that
+  /// can measure the selection puts it back. Nothing spins or polls for that: the
+  /// existing bounds/layout hooks are the retry.
+  ///
+  /// A bar the user dragged by its grip keeps that position while it is up; the only
+  /// automatic move it still gets is the chrome clamp that keeps it clear of the toolbar.
+  private func updateFormattingAccessory() {
+    guard wantsFormattingAccessory, selectedRange().length > 0, window?.firstResponder === self
+    else { return }
+    guard let localRect = selectionRectInOwnCoordinates() else {
+      removeFormattingAccessory()
+      return
+    }
+
+    let accessory =
+      formattingAccessory
+      ?? FloatingFormatBarView { [weak self] format in
+        self?.applyFloatingFormat(format)
+      }
+    if accessory.superview !== self {
+      accessory.removeFromSuperview()
+      addSubview(accessory)
+    }
+    formattingAccessory = accessory
+
+    let size = accessory.fittingBarSize
+    if size != accessory.frame.size {
+      accessory.setFrameSize(size)
+    }
+    let allowed = accessoryAllowedRect()
+    let origin =
+      formattingAccessoryWasMovedByUser
+      ? Self.clampedAccessoryOrigin(accessory.frame.origin, size: size, allowed: allowed)
+      : Self.accessoryOrigin(
+        for: localRect, size: size, allowed: allowed, isFlipped: isFlipped)
+    if origin != accessory.frame.origin {
+      accessory.setFrameOrigin(origin)
     }
   }
 
+  /// Called by the grip so a hand-parked bar stops being re-anchored automatically.
+  func formattingAccessoryWasDragged() {
+    formattingAccessoryWasMovedByUser = true
+  }
+
   func hideFormattingPopover() {
+    wantsFormattingAccessory = false
+    removeFormattingAccessory()
+  }
+
+  /// Take the view away without touching the intent behind it.
+  private func removeFormattingAccessory() {
     formattingAccessory?.removeFromSuperview()
     formattingAccessory = nil
+    formattingAccessoryWasMovedByUser = false
   }
 
   @discardableResult
@@ -696,6 +748,7 @@ private final class FormatBarGrip: NSView {
     origin.x = min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - bar.frame.width))
     origin.y = min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - bar.frame.height))
     bar.setFrameOrigin(origin)
+    (canvas as? MarkdownTextView)?.formattingAccessoryWasDragged()
   }
 }
 
