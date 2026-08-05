@@ -1207,6 +1207,11 @@ final class FolderManager {
   /// - documents whose file no longer exists. `replaceWorkspace` is all-or-
   ///   nothing, so one unbookmarkable URL would throw the entire rewrite away
   ///   and leave the just-removed root persisted.
+  /// - documents whose file sits in the TRASH. A thrown-away file still exists,
+  ///   so the check above says yes about it, and a tab that has not been retired
+  ///   yet would have handed this rewrite a fresh bookmark for a dead document —
+  ///   re-minting exactly what `pruneTrashedFiles` exists to drop, and putting it
+  ///   back in the working set the next launch restores from.
   private func fileBookmarkURLsToKeep(survivingRootURLs: [URL], in appState: AppState) -> [URL] {
     var urls = appState.openFiles.map(\.url)
     var seenPaths = Set(urls.map { $0.standardizedFileURL.path })
@@ -1216,7 +1221,8 @@ final class FolderManager {
       let standardizedURL = url.standardizedFileURL
       guard seenPaths.insert(standardizedURL.path).inserted,
         !standardizedRoots.contains(where: { WorkspaceScanner.contains(standardizedURL, in: $0) }),
-        FileManager.default.fileExists(atPath: standardizedURL.path)
+        FileManager.default.fileExists(atPath: standardizedURL.path),
+        !bookmarkStore.isTrashed(standardizedURL)
       else {
         continue
       }
