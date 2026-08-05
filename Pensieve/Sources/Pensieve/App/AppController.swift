@@ -499,6 +499,11 @@ final class AppController: ObservableObject {
   /// Converts a Word/PDF source off the main actor and opens the result as an
   /// unsaved Markdown draft. The source file remains untouched; Save therefore
   /// follows the normal untitled-document Save As path.
+  ///
+  /// The conversion and the recovery write are reported SEPARATELY. A conversion
+  /// that lands but cannot be backed by a draft is not a success: the converted
+  /// text exists only in the buffer, so the error stays on screen rather than
+  /// being cleared, and the buffer stays open and dirty.
   func importDocument(url: URL) {
     let sourceURL = url.standardizedFileURL
     documentImportTask?.cancel()
@@ -538,7 +543,24 @@ final class AppController: ObservableObject {
         // unhandled: every other launcher surface would offer it, and adopting it
         // into a second window would put two buffers on one recovery ID,
         // autosaving over each other.
-        documentStore.savePendingChangesOnClose(appState: appState, releasesDraftClaim: false)
+        let persisted = documentStore.savePendingChangesOnClose(
+          appState: appState, releasesDraftClaim: false)
+        guard persisted else {
+          // The conversion succeeded and its ONLY copy is the buffer on screen —
+          // there is no source-backed file to fall back to and no draft on disk.
+          // Clearing `lastError` here (which this path did unconditionally) erased
+          // the one signal the user had: the import looked like a success, and a
+          // crash before Save As… took the conversion with it. The buffer is left
+          // open and dirty, and the message says what is at stake on top of the
+          // write error `saveRecoveryDraft` already reported.
+          appState.lastError =
+            (appState.lastError ?? "Could not write recovery draft.")
+            + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
+            + " recovery copy — save it with Save As… before quitting."
+          DebugTrace.log(
+            "importDocument -> Markdown draft NOT persisted: \(sourceURL.lastPathComponent)")
+          return
+        }
         appState.lastError = nil
         DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
       case .failure(let message):

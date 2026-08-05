@@ -198,6 +198,35 @@ Clarification (05.08, after the file-backed half of bug I):
   explicitly discarded. (Retiring such a stash by URL is a pending product
   decision, not current behavior.)
 
+Clarification (05.08, after the "silent failed recovery write" bug):
+
+- **A recovery write either succeeds, or the failure is visible.** There is no
+  third outcome. Every path that persists a recovery item reports whether the
+  bytes reached disk, and a caller may only treat the work as safe when they did.
+  A failed write must leave `lastError` on screen — it must never be cleared by a
+  later step in the same operation.
+- **What a failure guarantees.** The buffer stays OPEN and stays DIRTY, holding
+  the full text; nothing on the user's disk is written or removed; no recovery
+  item is listed that does not exist as a file; and the message names both the
+  cause and what is at stake.
+- **What a failure does NOT guarantee.** Pensieve does not retry the write, does
+  not relocate the recovery directory, and does not save the work anywhere else.
+  The content lives in the buffer only, so it survives exactly as long as the
+  process does — an unresolved failure means a crash or a Force Quit still loses
+  that text. Resolving it is the user's Save As….
+- **Import (Word/PDF) is the sharp case and follows the same rule.** The
+  conversion result has no file behind it, so the recovery item is its only copy.
+  A conversion that lands with a failed recovery write is reported as a partial
+  success — converted text on screen, error visible — never as a completed import.
+  (It was: the import path cleared `lastError` unconditionally right after the
+  flush, and the flush returned success regardless of the write, so the user got
+  neither a file, nor a draft, nor a warning.)
+- Test that holds this: `RecoveredDraftsTests`
+  `testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer` (with
+  `testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess` and
+  `testACloseFlushReportsAFailedStashOfAFileBackedBuffer` on the two flush
+  branches).
+
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 
 - being saved as a regular file;

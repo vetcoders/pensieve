@@ -322,6 +322,149 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(fileExists(draft.url))
   }
 
+  // MARK: - A failed draft write is never reported as a success
+
+  /// P0. `saveRecoveryDraft` caught its write error, set `appState.lastError` and
+  /// returned NOTHING, and the untitled branch of `savePendingChangesOnClose`
+  /// answered `true` regardless. The one caller whose buffer SURVIVES that flush —
+  /// `importDocument` — read that `true` as "the work is safe" and cleared the
+  /// error on top of it. The flush now reports the write it actually made.
+  @MainActor
+  func testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only this explicit flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store)
+    let appState = AppState()
+    appState.documentSession.restoreUntitled(
+      title: "Board Resolution.md", text: "# Prokurent\n\napproval required", recoveryID: UUID())
+
+    XCTAssertFalse(
+      documentStore.savePendingChangesOnClose(appState: appState, releasesDraftClaim: false),
+      "a draft write that failed was reported as work persisted")
+
+    XCTAssertNotNil(appState.lastError, "the write failure was not surfaced")
+    XCTAssertTrue(
+      appState.documentSession.hasEditableBuffer,
+      "the buffer holding the only copy of the text was torn down")
+    XCTAssertTrue(appState.documentSession.isDirty, "the buffer was marked clean over unsaved text")
+    XCTAssertEqual(appState.documentSession.text, "# Prokurent\n\napproval required")
+    XCTAssertTrue(store.loadDrafts().isEmpty, "a draft was advertised that is not on disk")
+  }
+
+  /// The same report for the FILE-BACKED half: this branch is reached precisely
+  /// because the file on disk is stale (auto-save off, or a save that threw), so a
+  /// stash that fails leaves the edit in memory only.
+  @MainActor
+  func testACloseFlushReportsAFailedStashOfAFileBackedBuffer() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "edited but never told to save"
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      documentStore.savePendingChangesOnClose(appState: appState),
+      "a stash that failed was reported as work persisted")
+
+    XCTAssertNotNil(appState.lastError)
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "on disk",
+      "the failed stash wrote the user's file behind their back")
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+  }
+
+  /// The user-facing shape of the same defect. A Word/PDF import converts fine and
+  /// publishes an untitled buffer; its recovery write then fails, and the import
+  /// path cleared `lastError` unconditionally on the next line. The user saw a
+  /// successful import with no error and no draft — the conversion existed only in
+  /// memory, so a crash before Save As… took it.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer() async throws {
+    let folder = try makeTemporaryFolder()
+    // A real PDF: `importMarkdown` rejects anything that is not `.docx`/`.pdf`,
+    // and a rejected conversion would make this test pass for the wrong reason.
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    try await waitForPublishedImportBuffer(in: appState)
+
+    // 1) the conversion itself succeeded — the text is in the buffer…
+    XCTAssertTrue(appState.documentSession.text.contains("Prokurent"))
+    // 2) …3) …and the failed draft write is visible rather than cleared.
+    XCTAssertNotNil(
+      appState.lastError,
+      "the import cleared the recovery-write failure and looked like a success")
+    XCTAssertTrue(
+      try XCTUnwrap(appState.lastError).contains("Board Resolution.pdf"),
+      "the message does not say WHICH converted text has no safe copy")
+    // 4) the buffer stays open and dirty, so the work is still reachable…
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    // 5) …and nothing pretends a draft exists.
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
+  }
+
+  /// Control: with a writable recovery directory the import path is unchanged —
+  /// the draft lands, the error is cleared, and the buffer keeps its claim.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteSucceedsClearsTheError() async throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    let draft = try await waitForSingleDraft(in: store)
+
+    XCTAssertNil(appState.lastError, "a successful import left an error on screen")
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(
+      documentStore.recoveredDrafts().isEmpty,
+      "the live import buffer's draft was released to the launcher")
+  }
+
   // MARK: - Save As…
 
   @MainActor
@@ -663,6 +806,38 @@ final class RecoveredDraftsTests: XCTestCase {
     }
     XCTFail("no recovery draft was persisted", file: file, line: line)
     throw XCTSkip("no recovery draft was persisted")
+  }
+
+  /// Waits for an import to PUBLISH its conversion into the window's session. The
+  /// publication is what both the success and the failure path share, so a pin on
+  /// what happens afterwards can wait for it without assuming either outcome.
+  @MainActor
+  private func waitForPublishedImportBuffer(
+    in appState: AppState,
+    timeout: TimeInterval = 10,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if appState.documentSession.hasEditableBuffer, !appState.documentSession.text.isEmpty {
+        return
+      }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("the import never published a buffer", file: file, line: line)
+  }
+
+  /// A `RecoveryStore` whose directory can never exist: a regular FILE sits on its
+  /// path, so `createDirectory(withIntermediateDirectories:)` throws
+  /// `NSFileWriteFileExists` on every `saveDraft`. Deterministic in a way a
+  /// permission bit or a full volume is not — no root, no timing, no sandbox
+  /// assumptions — and it stays inside the test's own temporary folder, never
+  /// touching the real recovery directory.
+  private func makeUnwritableRecoveryStore(in folder: URL) throws -> RecoveryStore {
+    let blocked = folder.appendingPathComponent("Recovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blocked, options: .atomic)
+    return RecoveryStore(directoryURL: blocked)
   }
 
   /// A one-page PDF with a real text layer, mirroring `DocumentTransferTests`'
