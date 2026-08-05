@@ -232,7 +232,8 @@ final class TrashedWorkingSetTests: XCTestCase {
     let harness = try makeHarness()
 
     await harness.openWorkspace()
-    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: vanishingURL, into: harness.appState))
+    XCTAssertNotNil(
+      harness.folderManager.registerOpenFile(url: vanishingURL, into: harness.appState))
     XCTAssertNotNil(
       harness.folderManager.registerOpenFile(url: trashedNamesakeURL, into: harness.appState))
     XCTAssertEqual(harness.openFileURLs, [vanishingURL, trashedNamesakeURL])
