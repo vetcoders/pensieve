@@ -251,10 +251,36 @@ Close All must never cause silent data loss.
   (decision 03.08, interim pending a true session snapshot — target model:
   "tabs from the moment of quit", variant b from 31.07).
 - Restore **must not undo a deliberate Close** by the user.
-- **Trash is dead** (decision 26.07): a file or folder whose bookmark
-  points into `~/.Trash` does not exist for the app — it does not come back on
-  restore and disappears from the store. (Implemented for files in PR #30; for
-  workspace roots **[OPEN]**.)
+- **Trash is dead** (decision 26.07): a file whose bookmark points into a Trash
+  does not exist for the app. Membership is asked of the filesystem (every volume
+  has its own Trash, a sandboxed build a container-relative one), not matched
+  against a hardcoded `~/.Trash`, so a directory merely NAMED `.Trash` is not one.
+  The rule holds at every point a file can become, or stay, an open document:
+  - launch restore drops such an entry and its bookmark;
+  - a **running** app retires it on the next scan commit, whether Pensieve or
+    Finder did the trashing — the row leaves Open Files without waiting for a
+    relaunch;
+  - opening one is refused with "<name> is in the Trash. Put it back to open it.",
+    so no route (Recents, drag, a stale sidebar row) can re-add it;
+  - selecting one refuses to put its content in the editor and retires the row;
+  - after Pensieve's own **Move to Trash**, bookmarks are pruned by where they
+    LAND, which also covers every document inside a trashed folder.
+
+  A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
+  mid-replacement, or on an unplugged volume) and only drops out of what a
+  restore opens. Workspace **roots** keep their own lifecycle — still **[OPEN]**.
+
+- **Removing one workspace root never revokes another tab's access.** The
+  persisted bookmark set is rebuilt from the UNION of the working set and the
+  live tab chain across every window: a document of the removed root that a
+  window still has open gets a file bookmark of its own, a document covered by a
+  surviving root does not (its root already grants access), and a file that is in
+  neither source still loses its bookmark — nothing is resurrected.
+- **The working set is durable by the time the process is gone.** Quit forces it
+  out of cfprefsd's write-back queue instead of letting the system flush it on its
+  own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
+  change made to those defaults in the meantime). It runs inside the quit's drain
+  budget, so a stalled flush can never beachball the quit.
 - **Single source of truth for the session: the app.** macOS's own window
   restoration (Saved Application State) must not resurrect documents alongside
   the app's session model (bug G, 03.08 — pending session-layer audit). The

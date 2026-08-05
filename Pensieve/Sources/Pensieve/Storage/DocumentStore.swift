@@ -38,6 +38,10 @@ final class FolderManager {
   private let metadataStore: WorkspaceMetadataStore
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
+  /// The live tab chain across EVERY window. Consulted when the persisted
+  /// bookmark set is rebuilt, because the working set alone does not know which
+  /// documents other windows still have open.
+  private let documentWindowRegistry: DocumentWindowRegistry
   private let workspaceBuilder: WorkspaceScanner.Builder
   private let workspaceSubstrate: WorkspaceSubstrate
   private let workspaceValidationProbe: WorkspaceSubstrate.ValidationProbe
@@ -136,6 +140,7 @@ final class FolderManager {
     metadataStore: WorkspaceMetadataStore = .shared,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
+    documentWindowRegistry: DocumentWindowRegistry? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
     workspaceValidationProbe: @escaping WorkspaceSubstrate.ValidationProbe = { _ in },
@@ -150,6 +155,7 @@ final class FolderManager {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
+    self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.cancellableBuilder
     self.workspaceSubstrate = workspaceSubstrate
     self.workspaceValidationProbe = workspaceValidationProbe
@@ -218,6 +224,19 @@ final class FolderManager {
 
     let standardizedURL = standardizeFileURL(url)
     let standardizedPath = standardizedURL.path
+
+    // Nothing in the Trash is an open document. Refusing here is what keeps the
+    // guard honest end to end: without it a trashed file could be re-added to
+    // the working set — and given a fresh bookmark — through any open route that
+    // still had its URL lying around (a Recents row, a re-drop, a stale sidebar
+    // click), which is precisely how launch restore's guard would be undone one
+    // file at a time.
+    if bookmarkStore.isTrashed(standardizedURL) {
+      appState.lastError =
+        "\(standardizedURL.lastPathComponent) is in the Trash. Put it back to open it."
+      return nil
+    }
+
     if let ref = appState.allDocuments.first(where: {
       $0.url.path == standardizedPath
     }) {
@@ -407,6 +426,11 @@ final class FolderManager {
     )
 
     removeReferences(for: source, into: appState)
+    // `removeReferences` clears the in-memory rows; the persisted bookmarks are
+    // the other half. They cannot be matched by the path just trashed — each one
+    // now resolves into the Trash — so they are dropped by where they LAND,
+    // which also covers every document inside a trashed folder.
+    bookmarkStore.pruneTrashedFiles()
     noteSelfWrite(at: source)
     appState.lastError = nil
 
@@ -1136,7 +1160,7 @@ final class FolderManager {
       $0.url.standardizedFileURL != targetRoot.url.standardizedFileURL
     }
     let survivingRootURLs = survivingRoots.map(\.url)
-    let openFileURLs = appState.openFiles.map(\.url)
+    let openFileURLs = fileBookmarkURLsToKeep(survivingRootURLs: survivingRootURLs, in: appState)
     let retainedExclusions = appState.excludedWorkspacePaths.filter {
       !WorkspaceExclusion.isScoped($0, to: standardizedURL)
     }
@@ -1158,6 +1182,47 @@ final class FolderManager {
     if let bookmarkError {
       appState.lastError = bookmarkError
     }
+  }
+
+  /// Every file that must keep its security-scoped bookmark when the persisted
+  /// workspace is rewritten.
+  ///
+  /// `openFiles` is the PERSISTENCE truth — the ad-hoc rows a relaunch brings
+  /// back — but it is not the set of files the app currently has open. It is
+  /// capped at `WorkspaceStore.maxOpenFiles` and pruned whenever a root takes a
+  /// file over, so a document living in ANOTHER window's tab can be missing from
+  /// it entirely. Rebuilding the GLOBAL bookmark set from the working set alone
+  /// therefore revoked that window's sandbox access without telling anyone: its
+  /// save could fail on the spot, and after the next launch its file could no
+  /// longer be reopened at all.
+  ///
+  /// The registry's tab chain is the UI truth across every window, so it fills
+  /// exactly that gap. It is a union, never a replacement: a file the user
+  /// consciously closed sits in neither source, so nothing is resurrected.
+  ///
+  /// Two kinds of open tab are deliberately left out of the file set:
+  /// - documents already covered by a SURVIVING root bookmark. They keep their
+  ///   access through the root, and persisting them as file bookmarks would come
+  ///   back as spurious ad-hoc working-set rows on the next launch.
+  /// - documents whose file no longer exists. `replaceWorkspace` is all-or-
+  ///   nothing, so one unbookmarkable URL would throw the entire rewrite away
+  ///   and leave the just-removed root persisted.
+  private func fileBookmarkURLsToKeep(survivingRootURLs: [URL], in appState: AppState) -> [URL] {
+    var urls = appState.openFiles.map(\.url)
+    var seenPaths = Set(urls.map { $0.standardizedFileURL.path })
+    let standardizedRoots = survivingRootURLs.map(\.standardizedFileURL)
+
+    for url in documentWindowRegistry.openTabDocumentIDs {
+      let standardizedURL = url.standardizedFileURL
+      guard seenPaths.insert(standardizedURL.path).inserted,
+        !standardizedRoots.contains(where: { WorkspaceScanner.contains(standardizedURL, in: $0) }),
+        FileManager.default.fileExists(atPath: standardizedURL.path)
+      else {
+        continue
+      }
+      urls.append(standardizedURL)
+    }
+    return urls
   }
 
   /// Arms the off-main index housekeeping (WAL truncate + page compaction) that follows a close.
@@ -2272,6 +2337,64 @@ final class FolderManager {
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
+    reconcileTrashedOpenFiles(into: appState)
+  }
+
+  /// Makes the saved working set durable NOW rather than whenever cfprefsd feels
+  /// like it. Called on the way out of the process — see `BookmarkStore.startFlush()`
+  /// for the write-back race this closes, and `TerminationSequence` for the
+  /// budget the await puts around it.
+  func flushWorkingSet() async {
+    await bookmarkStore.startFlush().value
+  }
+
+  /// Retires open files that have been thrown away since the last scan.
+  ///
+  /// Every scan commit passes through here — the explicit refresh after
+  /// Pensieve's own `Move to Trash` and the debounced watcher refresh that
+  /// follows a trashing done in Finder — so this is the one seam where a LIVE
+  /// working set learns about it, instead of the app carrying a dead row until
+  /// the next launch (where the restore guard finally drops it).
+  ///
+  /// Two shapes, because trashing hides the same event behind two different
+  /// symptoms:
+  ///
+  /// - the row points INTO the Trash already (it was restored from a bookmark
+  ///   that followed its file there), which is exact and decides on its own;
+  /// - the row's file vanished from the path it was opened at, AND a bookmark of
+  ///   that same name has just turned up in the Trash. Neither half is proof
+  ///   alone — a missing file may be mid-replacement, and a trashed namesake may
+  ///   be a different document — but together they cannot describe a document
+  ///   that is still open, and if two namesakes really were trashed at once both
+  ///   are dead anyway.
+  ///
+  /// The cheap existence/membership survey runs first so a healthy working set
+  /// never pays for resolving bookmarks on the refresh path.
+  private func reconcileTrashedOpenFiles(into appState: AppState) {
+    guard !appState.openFiles.isEmpty else { return }
+
+    let fileManager = FileManager.default
+    var vanishedNames = Set<String>()
+    var trashedRowPaths = Set<String>()
+    for ref in appState.openFiles {
+      let url = ref.url.standardizedFileURL
+      if !fileManager.fileExists(atPath: url.path) {
+        vanishedNames.insert(url.lastPathComponent)
+      } else if bookmarkStore.isTrashed(url) {
+        trashedRowPaths.insert(url.path)
+      }
+    }
+    guard !vanishedNames.isEmpty || !trashedRowPaths.isEmpty else { return }
+
+    let trashedNames = Set(bookmarkStore.pruneTrashedFiles().map(\.lastPathComponent))
+    appState.openFiles.removeAll { ref in
+      let url = ref.url.standardizedFileURL
+      if trashedRowPaths.contains(url.path) {
+        return true
+      }
+      let name = url.lastPathComponent
+      return vanishedNames.contains(name) && trashedNames.contains(name)
+    }
   }
 
   /// Decides what an open/restore flow puts on screen once its walk lands,
@@ -3304,6 +3427,19 @@ final class DocumentStore {
   /// would be racing the user's answer with a background write.
   private func loadClean(ref: DocumentRef, into appState: AppState) {
     cancelOwnDebouncesOnSessionChange(appState: appState)
+
+    // Last line of the Trash guard, and the only one that covers a document
+    // whose file was thrown away between being listed and being asked for — the
+    // window in which the row is still on screen because no scan has committed
+    // yet. A trashed file still reads perfectly, so without this the app would
+    // present it as an ordinary editable document. It leaves the working set
+    // here instead of being rendered.
+    if bookmarkStore.isTrashed(ref.url) {
+      forgetOpenFile(ref.url, into: appState)
+      appState.lastError = "\(ref.url.lastPathComponent) is in the Trash."
+      appState.selectedDocumentID = appState.documentSession.id
+      return
+    }
 
     // Claim the window on BOTH branches. That is what makes an in-flight staged
     // read lose to whatever the user did next, whether the next thing was another
