@@ -44,11 +44,23 @@ struct DocumentSession: Equatable {
     /// preview all go quiet — so no surface can act on, or worse WRITE, the
     /// empty placeholder buffer standing in for a file that is still loading.
     case loading(DocumentRef)
-    case untitled(title: String, identity: DocumentIdentity, recoveryID: UUID?)
+    case untitled(title: String, identity: DocumentIdentity)
     case fileBacked(DocumentRef)
   }
 
   private var kind: Kind
+  /// The recovery draft this buffer already owns, if it wrote one.
+  ///
+  /// Stored ALONGSIDE the kind, not inside `.untitled`, because every buffer
+  /// shape can produce a draft: a file-backed one is stashed by
+  /// `DocumentStore.stashClosingBufferAsRecoveryDraft` whenever its window tears
+  /// down without reaching disk (auto-save off, or a save that failed). While
+  /// this lived in the `.untitled` payload the getter answered `nil` for such a
+  /// buffer and the setter silently dropped the write-back, so EVERY stash of the
+  /// same file minted a fresh UUID — one new draft file per close, forever, with
+  /// nothing on disk ever converging. Keeping it here is what makes "one buffer,
+  /// one draft" true for all of them.
+  private var storedRecoveryID: UUID?
   var text: String
   var isDirty: Bool
 
@@ -59,7 +71,7 @@ struct DocumentSession: Equatable {
     identityID: UUID = UUID()
   ) -> DocumentSession {
     DocumentSession(
-      kind: .untitled(title: title, identity: .untitled(identityID), recoveryID: nil),
+      kind: .untitled(title: title, identity: .untitled(identityID)),
       text: "",
       isDirty: false)
   }
@@ -80,6 +92,13 @@ struct DocumentSession: Equatable {
     }
     set {
       kind = newValue.map(Kind.fileBacked) ?? .empty
+      // A new document is a new identity, so it inherits nothing: keeping the
+      // previous buffer's recovery ID here would let this session's next stash
+      // overwrite a draft that belongs to work the user has not decided about.
+      // The two callers that PUBLISH the current buffer under a path — `saveAs`
+      // and `saveExisting` — retire their own draft explicitly before they get
+      // here, which is why dropping the association is safe rather than leaky.
+      storedRecoveryID = nil
     }
   }
 
@@ -95,7 +114,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return nil
-    case .untitled(_, let identity, _):
+    case .untitled(_, let identity):
       return identity.standardized
     case .fileBacked(let document), .loading(let document):
       return .file(document.url.standardizedFileURL)
@@ -120,21 +139,26 @@ struct DocumentSession: Equatable {
     return true
   }
 
+  /// The draft this buffer owns. Reading it is how every writer — the debounced
+  /// autosave, the teardown stash — upserts INTO the draft it already wrote
+  /// instead of minting a new UUID, so one buffer is one draft file no matter
+  /// how many times it is persisted.
   var recoveryID: UUID? {
-    get {
-      guard case .untitled(_, _, let recoveryID) = kind else { return nil }
-      return recoveryID
-    }
+    get { storedRecoveryID }
     set {
-      guard case .untitled(let title, let identity, _) = kind else { return }
-      // Once a draft is backed by a recovery record its persistent identity must
-      // become `.recovered(recoveryID)` — the SAME key a post-relaunch restore
-      // rebuilds via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)`
-      // key here would derive the AI session store key `untitled:<uuid>` before
-      // close but `recovery:<recoveryID>` after restore, silently dropping the
-      // AI continuation saved for this draft. Nil clears (discard) keep identity.
+      storedRecoveryID = newValue
+      // A FILE-BACKED buffer keeps its file identity: the draft is a stash of an
+      // edit that has not reached that file, not a new document. Only an
+      // UNTITLED one is re-keyed, and it must be: once a draft is backed by a
+      // recovery record its persistent identity has to become
+      // `.recovered(recoveryID)` — the SAME key a post-relaunch restore rebuilds
+      // via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)` key would
+      // derive the AI session store key `untitled:<uuid>` before close but
+      // `recovery:<recoveryID>` after restore, silently dropping the AI
+      // continuation saved for this draft. Nil clears (discard) keep identity.
+      guard case .untitled(let title, let identity) = kind else { return }
       let resolvedIdentity = newValue.map(DocumentIdentity.recovered) ?? identity
-      kind = .untitled(title: title, identity: resolvedIdentity, recoveryID: newValue)
+      kind = .untitled(title: title, identity: resolvedIdentity)
     }
   }
 
@@ -155,7 +179,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return ""
-    case .untitled(let title, _, _):
+    case .untitled(let title, _):
       return title
     case .fileBacked(let document), .loading(let document):
       return document.title
@@ -176,6 +200,7 @@ struct DocumentSession: Equatable {
 
   mutating func load(document: DocumentRef, text: String) {
     self.kind = .fileBacked(document)
+    self.storedRecoveryID = nil
     self.text = text
     self.isDirty = false
   }
@@ -185,21 +210,23 @@ struct DocumentSession: Equatable {
   /// lands the real text — see `Kind.loading`.
   mutating func beginLoading(document: DocumentRef) {
     self.kind = .loading(document)
+    self.storedRecoveryID = nil
     self.text = ""
     self.isDirty = false
   }
 
   mutating func createUntitled(title: String = "Untitled.md") {
-    self.kind = .untitled(title: title, identity: .untitled(UUID()), recoveryID: nil)
+    self.kind = .untitled(title: title, identity: .untitled(UUID()))
+    // A brand new buffer owns no draft. The one it eventually writes is ITS own,
+    // and the draft the replaced buffer wrote stays where the user can find it.
+    self.storedRecoveryID = nil
     self.text = ""
     self.isDirty = false
   }
 
   mutating func restoreUntitled(title: String, text: String, recoveryID: UUID) {
-    self.kind = .untitled(
-      title: title,
-      identity: .recovered(recoveryID),
-      recoveryID: recoveryID)
+    self.kind = .untitled(title: title, identity: .recovered(recoveryID))
+    self.storedRecoveryID = recoveryID
     self.text = text
     self.isDirty = true
   }
