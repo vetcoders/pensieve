@@ -64,6 +64,33 @@ final class TrashLocationTests: XCTestCase {
       "a nonexistent path inside the Trash still describes a thrown-away document")
   }
 
+  /// The same question one volume over. An item trashed on an external disk never
+  /// leaves it — it lands in `<volume>/.Trashes/<uid>` — and once that item is
+  /// gone the system can no longer name that Trash for us: both the relationship
+  /// query and `url(for:.trashDirectory, appropriateFor:)` need something to look
+  /// at. So a working-set entry that outlived a file on an external volume used to
+  /// answer NO, and the home Trash was the only Trash a gone item could be in.
+  func testAGonePathInsideAVolumeTrashIsRecognized() throws {
+    let volume = URL(fileURLWithPath: "/Volumes/PensieveNoSuchVolume-\(UUID().uuidString)")
+    let trashed = volume
+      .appendingPathComponent(".Trashes", isDirectory: true)
+      .appendingPathComponent(String(getuid()), isDirectory: true)
+      .appendingPathComponent("gone.md")
+
+    XCTAssertTrue(
+      TrashLocation.contains(trashed),
+      "a bookmark that followed its file into another volume's Trash still describes a "
+        + "thrown-away document, even after the item itself is gone")
+
+    XCTAssertFalse(
+      TrashLocation.contains(volume.appendingPathComponent("Notes/gone.md")),
+      "control: an ordinary path on the same absent volume is not trashed")
+    XCTAssertFalse(
+      TrashLocation.contains(
+        volume.appendingPathComponent("Trashes/\(getuid())/gone.md")),
+      "control: the match is the system's own layout, not any directory called Trashes")
+  }
+
   /// End to end against the REAL Trash, closing the gap between the simulated
   /// Trash the rest of the suite injects and what actually happens on this
   /// machine: a genuinely trashed file, a genuine security-scoped bookmark, and
