@@ -88,6 +88,9 @@ final class TrashedWorkingSetTests: XCTestCase {
     try store.persistFile(url: keepURL, into: AppState())
     try store.persistFile(url: dropURL, into: AppState())
     let trashedURL = try trash(dropURL)
+    XCTAssertEqual(
+      store.activeSecurityScopeCount, 2,
+      "precondition: persisting a file takes a security-scoped grant on it")
 
     let pruned = store.pruneTrashedFiles()
     XCTAssertEqual(pruned.map(\.trashedURL), [trashedURL])
@@ -97,6 +100,10 @@ final class TrashedWorkingSetTests: XCTestCase {
       "the prune reports both halves: where the bookmark landed, and the path it was MINTED for — "
         + "the only thing a live working-set row can be matched against")
     XCTAssertEqual(restoredFileURLs(), [keepURL])
+    XCTAssertEqual(
+      store.activeSecurityScopeCount, 1,
+      "the trashed file's grant is released, not leaked: it was taken under the path the file had "
+        + "BEFORE it was thrown away, which is the key the prune has to stop by")
     XCTAssertTrue(
       store.pruneTrashedFiles().isEmpty,
       "a healthy working set reports nothing to prune, so no defaults write happens")
