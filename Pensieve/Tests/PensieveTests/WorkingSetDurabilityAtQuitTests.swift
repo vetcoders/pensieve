@@ -63,12 +63,51 @@ final class WorkingSetDurabilityAtQuitTests: XCTestCase {
       "applicationWillTerminate's own entry point must flush, not only the awaitable one")
   }
 
+  /// The flush talks to ANOTHER PROCESS, so it is the one phase of the quit that can stall while
+  /// nothing in this app is wrong — and it runs first. Sharing one budget with the index phases
+  /// therefore had a direction: a cfprefsd that never answered spent the whole deadline here, and
+  /// the index drain, the latch and the terminal checkpoint never ran at all.
+  ///
+  /// Asserted through the latch (`isClosedForTermination`), which `run()` can only reach by having
+  /// gone through the drain first.
+  func testAStalledWorkingSetFlushCannotConsumeTheDrainBudget() async throws {
+    let blocking = try XCTUnwrap(
+      BlockingFlushDefaults(suiteName: EphemeralDefaults.suiteName(prefix: "PensieveStalledFlush")))
+    // Released before anything else can be torn down, so the parked thread is never stranded.
+    addTeardownBlock { blocking.releaseFlush() }
+    let fixture = try makeFixture(defaults: blocking, workingSetFlushTimeout: 0.2)
+
+    let flag = TerminationRunCompletion()
+    Task { @MainActor in
+      await fixture.sequence.run()
+      flag.didFinish = true
+    }
+
+    let deadline = Date().addingTimeInterval(4)
+    while !flag.didFinish, Date() < deadline {
+      try await Task.sleep(nanoseconds: 2_000_000)
+    }
+
+    XCTAssertGreaterThan(
+      blocking.synchronizeCount, 0,
+      "fixture precondition: the quit must actually have started the flush — a phase that never ran "
+        + "would pass this pin for the wrong reason")
+    XCTAssertTrue(
+      flag.didFinish,
+      "the quit sequence never returned: a stalled cfprefsd swallowed the whole drain budget")
+    XCTAssertTrue(
+      fixture.indexDatabase.isClosedForTermination,
+      "the index phases must still run: the latch is only reached after the drain, so a closed "
+        + "funnel is the proof that D and L happened despite the flush hanging")
+  }
+
   // MARK: - Fixture
 
   @MainActor
   private struct Fixture {
     let sequence: TerminationSequence
     let defaults: FlushCountingDefaults
+    let indexDatabase: IndexDatabase
     let bookmarkStore: BookmarkStore
     let sandbox: URL
 
@@ -80,14 +119,21 @@ final class WorkingSetDurabilityAtQuitTests: XCTestCase {
 
   @MainActor
   private func makeFixture() throws -> Fixture {
+    let suiteName = EphemeralDefaults.suiteName(prefix: "PensieveWorkingSetDurability")
+    let defaults = try XCTUnwrap(FlushCountingDefaults(suiteName: suiteName))
+    addTeardownBlock { EphemeralDefaults.destroy(suiteName: suiteName) }
+    return try makeFixture(defaults: defaults, workingSetFlushTimeout: nil)
+  }
+
+  @MainActor
+  private func makeFixture(
+    defaults: FlushCountingDefaults,
+    workingSetFlushTimeout: TimeInterval?
+  ) throws -> Fixture {
     let sandbox = FileManager.default.temporaryDirectory
       .appendingPathComponent("WorkingSetDurabilityTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
     addTeardownBlock { try? FileManager.default.removeItem(at: sandbox) }
-
-    let suiteName = EphemeralDefaults.suiteName(prefix: "PensieveWorkingSetDurability")
-    let defaults = try XCTUnwrap(FlushCountingDefaults(suiteName: suiteName))
-    addTeardownBlock { EphemeralDefaults.destroy(suiteName: suiteName) }
 
     let bookmarkStore = BookmarkStore(defaults: defaults)
     let indexDatabase = IndexDatabase(
@@ -108,20 +154,31 @@ final class WorkingSetDurabilityAtQuitTests: XCTestCase {
         indexDatabase: indexDatabase,
         folderManager: manager,
         autosaver: Autosaver(),
-        launchIntentCoordinator: LaunchIntentCoordinator()
+        launchIntentCoordinator: LaunchIntentCoordinator(),
+        workingSetFlushTimeout: workingSetFlushTimeout
+          ?? TerminationSequence.defaultWorkingSetFlushTimeout
       ),
       defaults: defaults,
+      indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
       sandbox: sandbox
     )
   }
 }
 
+/// Whether the quit sequence under test ever returned. Read from the test body while the sequence
+/// runs in its own task — which is the only way to fail cleanly instead of hanging when the answer
+/// is "never".
+@MainActor
+final class TerminationRunCompletion {
+  var didFinish = false
+}
+
 /// `UserDefaults` that counts `synchronize()` calls, so the quit flush can be
 /// asserted as a seam instead of inferred from a plist whose write timing is
 /// cfprefsd's business. Backed by an absolute-path suite, so it strands nothing
 /// in `~/Library/Preferences`.
-final class FlushCountingDefaults: UserDefaults {
+class FlushCountingDefaults: UserDefaults {
   private let lock = NSLock()
   private nonisolated(unsafe) var flushes = 0
 
@@ -132,9 +189,33 @@ final class FlushCountingDefaults: UserDefaults {
   }
 
   override func synchronize() -> Bool {
+    countFlush()
+    return super.synchronize()
+  }
+
+  final func countFlush() {
     lock.lock()
     flushes += 1
     lock.unlock()
-    return super.synchronize()
+  }
+}
+
+/// `UserDefaults` whose flush never comes back until the test lets it, standing in for the case the
+/// quit has to survive: cfprefsd is another process, and an XPC round trip to it can stall for
+/// reasons that have nothing to do with this app. Blocks the flush's own detached thread, never the
+/// main one, exactly as the real stall would.
+final class BlockingFlushDefaults: FlushCountingDefaults {
+  private let gate = DispatchSemaphore(value: 0)
+
+  override func synchronize() -> Bool {
+    countFlush()
+    gate.wait()
+    return true
+  }
+
+  /// Lets the parked flush finish. Must run before the test process tears the suite down, or the
+  /// thread is stranded for the rest of the run.
+  func releaseFlush() {
+    gate.signal()
   }
 }
