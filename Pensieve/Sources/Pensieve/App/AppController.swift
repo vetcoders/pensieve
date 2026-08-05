@@ -499,6 +499,11 @@ final class AppController: ObservableObject {
   /// Converts a Word/PDF source off the main actor and opens the result as an
   /// unsaved Markdown draft. The source file remains untouched; Save therefore
   /// follows the normal untitled-document Save As path.
+  ///
+  /// The conversion and the recovery write are reported SEPARATELY. A conversion
+  /// that lands but cannot be backed by a draft is not a success: the converted
+  /// text exists only in the buffer, so the error stays on screen rather than
+  /// being cleared, and the buffer stays open and dirty.
   func importDocument(url: URL) {
     let sourceURL = url.standardizedFileURL
     documentImportTask?.cancel()
@@ -530,7 +535,38 @@ final class AppController: ObservableObject {
         )
         // The conversion result has no source-backed autosave target. Persist
         // the dirty untitled session immediately so a crash cannot erase the handoff.
-        documentStore.savePendingChangesOnClose(appState: appState)
+        //
+        // `releasesDraftClaim: false` because this window STAYS OPEN holding the
+        // buffer that draft belongs to. The flush's default is a close, where
+        // releasing the claim is the point — the buffer dies and its draft goes
+        // back on the launcher. Here it would publish a LIVE buffer's draft as
+        // unhandled: every other launcher surface would offer it, and adopting it
+        // into a second window would put two buffers on one recovery ID,
+        // autosaving over each other.
+        let persisted = documentStore.savePendingChangesOnClose(
+          appState: appState, releasesDraftClaim: false)
+        guard persisted else {
+          // The conversion succeeded and its ONLY copy is the buffer on screen —
+          // there is no source-backed file to fall back to and no draft on disk.
+          // Clearing `lastError` here (which this path did unconditionally) left
+          // the app unable to tell a completed import from a failed one, so a
+          // crash before Save As… took the conversion with nothing having
+          // recorded the risk. The buffer is left open and dirty, and the stakes
+          // are appended to the write error `saveRecoveryDraft` already reported.
+          //
+          // Reported through `reportDataLoss`, not a plain `lastError` write:
+          // the assignment lands in the STATUS slot, so it would leave the
+          // sharper sentence sitting behind the unresolved data loss
+          // `saveRecoveryDraft` just latched and never reach the screen. See
+          // the lifecycle contract's Recovery section.
+          appState.reportDataLoss(
+            (appState.lastError ?? "Could not write recovery draft.")
+              + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
+              + " recovery copy — save it with Save As… before quitting.")
+          DebugTrace.log(
+            "importDocument -> Markdown draft NOT persisted: \(sourceURL.lastPathComponent)")
+          return
+        }
         appState.lastError = nil
         DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
       case .failure(let message):

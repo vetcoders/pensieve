@@ -28,6 +28,13 @@ struct ContentView: View {
     } detail: {
       VStack(spacing: 0) {
         EditorPreviewSplit()
+        // Deliberately OUTSIDE the buffer gate below: the errors that most need
+        // saying (a workspace that will not open, a file that has moved, a
+        // recovery draft that could not be written) can all land in a window
+        // with nothing open, where the status bar does not exist.
+        if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
+          WindowErrorBanner(error: error) { appState.dismissVisibleError() }
+        }
         if appState.documentHasEditableBuffer {
           EditorStatusBar()
             .opacity(appState.mode == .focus ? 0.45 : 1)

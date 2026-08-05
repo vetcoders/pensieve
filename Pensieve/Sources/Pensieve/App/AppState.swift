@@ -338,9 +338,73 @@ final class AppState {
     set { windowModel.showAllFilesInSidebar = newValue }
   }
 
+  /// The plain-message surface every ordinary failure writes to. Assigning here
+  /// files the error as `.status`: a refused action, a failed read, a piece of
+  /// housekeeping that did not land — nothing the user typed is at risk.
+  ///
+  /// Kept as `String?` so the ~35 existing call sites read exactly as before;
+  /// the severity they get is the safe default. A site that IS losing the user's
+  /// only copy has to say so through `reportDataLoss`, which is the point: the
+  /// loud class is opt-in and argued for, never inherited.
+  ///
+  /// Writing here — including writing `nil` — touches the STATUS slot and only
+  /// the status slot. It cannot displace or silence an unresolved data loss:
+  /// "the folder you asked for is gone" arriving after "your text reached no
+  /// disk" must not be what takes the second message off the screen, and the
+  /// ~35 sites that clear this field on their own success know nothing about
+  /// some other buffer whose content is still only in memory.
   var lastError: String? {
-    get { windowModel.lastError }
-    set { windowModel.lastError = newValue }
+    get { windowModel.effectiveError?.message }
+    set { windowModel.statusError = newValue.map(WindowError.status) }
+  }
+
+  /// What the chrome renders: an unresolved data loss the user has not put away,
+  /// otherwise the passive status line.
+  var currentError: WindowError? { windowModel.effectiveError }
+
+  /// The data loss this window has NOT yet resolved, whether or not its banner
+  /// is currently on screen. This is the latch the surface is derived from —
+  /// dismissing the banner hides a message, it does not make the work safe.
+  var unresolvedDataLoss: WindowError? { windowModel.unresolvedDataLoss }
+
+  /// Files a failure that leaves the user's content in memory and nowhere else.
+  ///
+  /// Arms only on a CHANGE of condition. A write that keeps failing (a full
+  /// volume, a revoked permission) re-reports the identical message on every
+  /// autosave tick, and treating each tick as news would resurrect a banner the
+  /// user has deliberately put away — every 1.5 seconds, for as long as the
+  /// disk stays full. A genuinely different failure is different news and does
+  /// re-arm, dismissal included.
+  func reportDataLoss(_ message: String) {
+    let error = WindowError.dataLoss(message)
+    guard windowModel.unresolvedDataLoss != error else { return }
+    windowModel.unresolvedDataLoss = error
+    windowModel.dataLossBannerDismissed = false
+  }
+
+  /// A durable write for this buffer landed, so nothing is at risk any more.
+  ///
+  /// The ONLY thing that retires the latch. It is deliberately not reachable
+  /// from `lastError = nil`: the failure is resolved by the content reaching
+  /// disk, never by some unrelated operation reporting its own success.
+  func resolveError() {
+    windowModel.unresolvedDataLoss = nil
+    windowModel.dataLossBannerDismissed = false
+    windowModel.statusError = nil
+  }
+
+  /// The user clicking the banner's dismiss button.
+  ///
+  /// Puts away exactly what is on screen. On a data loss that means the banner
+  /// only — the latch survives, so a later identical failure has nothing new to
+  /// say and the window stays quiet, while the app still knows the work is
+  /// unsaved.
+  func dismissVisibleError() {
+    if windowModel.unresolvedDataLoss != nil, !windowModel.dataLossBannerDismissed {
+      windowModel.dataLossBannerDismissed = true
+    } else {
+      windowModel.statusError = nil
+    }
   }
 
   /// The dispatch-gateway request for THIS window. Menu/toolbar/sidebar

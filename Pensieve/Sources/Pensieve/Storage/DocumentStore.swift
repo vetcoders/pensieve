@@ -3270,6 +3270,8 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
+      // STATUS, not data loss: the draft file is still on disk — it is
+      // retired only on a SUCCESSFUL save — so the work survives this failure.
       appState.lastError = message
       NSLog(message)
       return false
@@ -3537,7 +3539,7 @@ final class DocumentStore {
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       recoveryStore.deleteDraft(id: recoveryID)
-      appState.lastError = nil
+      appState.resolveError()
       // Same publication, same exposure: saving AS an existing file makes our bytes that file's
       // content, so a settled window already open on it holds a buffer this write has just made
       // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
@@ -3546,7 +3548,9 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
-      appState.lastError = message
+      // DATA LOSS: the edit reached no file, so the buffer is the only copy
+      // of it and the document on disk is stale.
+      appState.reportDataLoss(message)
       NSLog(message)
       return false
     }
@@ -3576,9 +3580,26 @@ final class DocumentStore {
   /// to disk, untitled buffers persist a recovery draft — but runs NOW and
   /// cancels the still-pending timer. No blocking prompt: the window is already
   /// committed to closing, so there is nothing to cancel. A clean (non-dirty)
-  /// buffer is a no-op. Returns whether anything was persisted.
+  /// buffer is a no-op.
+  ///
+  /// Returns whether anything was persisted — and that is a REPORT ON THE WRITE,
+  /// not on having taken the branch. Both recovery branches used to return `true`
+  /// unconditionally: the draft write set `appState.lastError` and told nobody, so
+  /// a caller whose buffer survives the flush (`importDocument`) read success over
+  /// a draft that does not exist. `false` here means the bytes are in memory and
+  /// nowhere else, and `appState.lastError` says why.
+  ///
+  /// `releasesDraftClaim` is the part of "on close" that is about the WINDOW
+  /// rather than the bytes: the buffer dies with it, so the draft this pass just
+  /// wrote stops being live work and goes back on the launcher as an unhandled
+  /// artifact. A caller whose buffer SURVIVES the flush passes `false` —
+  /// `AppController.importDocument` persists the converted draft into a window
+  /// that stays on screen, and releasing the claim there advertises a LIVE
+  /// buffer's draft on every other launcher surface. Adopting it from one puts
+  /// two buffers on a single recovery ID, autosaving over each other, which is
+  /// exactly what the claim exists to forbid.
   @discardableResult
-  func savePendingChangesOnClose(appState: AppState) -> Bool {
+  func savePendingChangesOnClose(appState: AppState, releasesDraftClaim: Bool = true) -> Bool {
     self.appState = appState
     // BEFORE the dirty guard, deliberately. A CLEAN session can still be holding a sleeping index
     // debounce: the 1.5 s autosave already wrote the bytes and marked the buffer clean while the
@@ -3630,12 +3651,21 @@ final class DocumentStore {
     // through `ownedBy:`, so there is no longer a case in which a foreign entry could be meant.
     cancelArmedIndexIfOwned(by: appState)
     if appState.documentSession.isUntitled {
-      saveRecoveryDraft(appState: appState)
+      let persisted = saveRecoveryDraft(appState: appState)
       // The buffer goes away with the window; the draft it just wrote is a
       // recovery artifact from here on, not live work, so it goes back on the
-      // launcher like any other unhandled draft.
-      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
-      return true
+      // launcher like any other unhandled draft — unless the caller told us the
+      // buffer SURVIVES this flush, in which case the write-time claim stands.
+      //
+      // Released even when the write FAILED, deliberately. The claim is in-memory
+      // and the buffer is dying either way; an EARLIER draft of this same session
+      // may well be on disk from a successful autosave tick, and holding a claim
+      // over it after its buffer is gone strands it — invisible on every launcher
+      // for the rest of the process. Releasing offers whatever content survived.
+      if releasesDraftClaim {
+        recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+      }
+      return persisted
     }
     // A file-backed buffer. Auto-save owns the file only when it is ON: then the
     // teardown flush keeps that file current, as designed. With auto-save OFF,
@@ -3651,9 +3681,11 @@ final class DocumentStore {
     {
       return true
     }
-    stashClosingBufferAsRecoveryDraft(appState: appState)
-    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
-    return true
+    let stashed = stashClosingBufferAsRecoveryDraft(appState: appState)
+    if releasesDraftClaim {
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    }
+    return stashed
   }
 
   /// The `Autosaver.cancel()` a session change used to call, with the SAVE half narrowed to this
@@ -3784,8 +3816,15 @@ final class DocumentStore {
     }
   }
 
-  private func saveRecoveryDraft(appState: AppState) {
-    guard appState.documentSession.isUntitled, appState.documentSession.isDirty else { return }
+  /// Returns whether the draft actually reached disk. A failure here is the ONLY
+  /// copy of an untitled buffer failing to be written, so it may not be reported
+  /// as a success: the caller decides what to do about a buffer that is now live
+  /// in memory and nowhere else, and `appState.lastError` carries the reason.
+  @discardableResult
+  private func saveRecoveryDraft(appState: AppState) -> Bool {
+    guard appState.documentSession.isUntitled, appState.documentSession.isDirty else {
+      return false
+    }
 
     do {
       let draft = try recoveryStore.saveDraft(
@@ -3794,9 +3833,14 @@ final class DocumentStore {
         text: appState.documentSession.text
       )
       appState.documentSession.recoveryID = draft.id
-      appState.lastError = nil
+      appState.resolveError()
+      return true
     } catch {
-      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+      // DATA LOSS: this write IS the durable copy. It failed, so the text exists
+      // only in the buffer and dies with the process.
+      appState.reportDataLoss(
+        "Could not write recovery draft: \(error.localizedDescription)")
+      return false
     }
   }
 
@@ -3806,8 +3850,22 @@ final class DocumentStore {
   /// `appState.lastError`: when the stash follows a FAILED save that error must
   /// stay surfaced (a recovery draft AND a visible error), so the user learns the
   /// file on disk is stale rather than believing the close saved it.
-  private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
-    guard appState.documentSession.isDirty else { return }
+  ///
+  /// The read-and-write-back of `recoveryID` around the save is what keeps this
+  /// buffer on ONE draft. It used to be a pair of no-ops here — `recoveryID`
+  /// lived inside `DocumentSession.Kind.untitled`, so a file-backed session read
+  /// `nil` and its write-back was swallowed — and every stash of the same file
+  /// therefore minted a fresh UUID. Nothing sweeps the recovery directory either
+  /// (no age limit, no cap — a draft is retired only by a decision), so a single
+  /// unsaved document produced a new draft on every close, without bound.
+  ///
+  /// Returns whether the stash reached disk, for the same reason
+  /// `saveRecoveryDraft` does: this path is reached precisely because the file on
+  /// disk is stale, so a failed stash leaves the edit in memory only and must not
+  /// be reported as work persisted.
+  @discardableResult
+  private func stashClosingBufferAsRecoveryDraft(appState: AppState) -> Bool {
+    guard appState.documentSession.isDirty else { return false }
 
     do {
       let draft = try recoveryStore.saveDraft(
@@ -3816,8 +3874,20 @@ final class DocumentStore {
         text: appState.documentSession.text
       )
       appState.documentSession.recoveryID = draft.id
+      // Deliberately NOT `resolveError()`, unlike the other durable writes. A
+      // stash often follows a save that FAILED, and the file the user actually
+      // asked to write is still stale — the draft is a backstop, not the
+      // outcome they wanted. Retiring the latch here would take "could not save
+      // X" off the screen on the strength of a copy they never asked for. It is
+      // retired when a real save of that file lands.
+      return true
     } catch {
-      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+      // DATA LOSS: the file on disk is already stale — that is why this path
+      // runs — so the stash was the last chance to put the edit anywhere
+      // durable. It failed, and the buffer is about to be torn down.
+      appState.reportDataLoss(
+        "Could not write recovery draft: \(error.localizedDescription)")
+      return false
     }
   }
 
@@ -4029,14 +4099,24 @@ final class DocumentStore {
       let url = appState.documentSession.url
     else { return false }
     let ref = documentRef(for: url, appState: appState)
+    // Read BEFORE the write: `documentSession.document` below drops the
+    // association, and a successful save is one of the three closed reasons a
+    // draft may be retired — the edit it was standing in for is now the file.
+    let stashedRecoveryID = appState.documentSession.recoveryID
 
     do {
       try writeDocument(appState.documentSession.text, url)
       selfWriteObserver(url)
       registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
+      // A file-backed buffer whose window tore down with auto-save off left a
+      // stash behind (`stashClosingBufferAsRecoveryDraft`). Now that the same
+      // bytes are on disk that stash is not recoverable work any more, and
+      // leaving it would have the launcher offering content the user already
+      // saved — forever, since nothing sweeps drafts.
+      recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
-      appState.lastError = nil
+      appState.resolveError()
       if indexNow {
         // Only THIS session's debounce, and only when it is armed for the document just written: the
         // write below supersedes it, so leaving it would duplicate the same row. A debounce armed for
@@ -4060,7 +4140,9 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
-      appState.lastError = message
+      // DATA LOSS: the edit reached no file, so the buffer is the only copy
+      // of it and the document on disk is stale.
+      appState.reportDataLoss(message)
       NSLog(message)
       return false
     }

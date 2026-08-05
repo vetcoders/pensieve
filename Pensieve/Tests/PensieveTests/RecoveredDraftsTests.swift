@@ -1,3 +1,5 @@
+import AppKit
+import CoreText
 import XCTest
 
 @testable import Pensieve
@@ -269,6 +271,255 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertEqual(reopened.activeDocumentText, "crash text")
   }
 
+  /// …and the loan is NOT handed back by a caller whose window stays open.
+  ///
+  /// `importDocument` publishes its converted Word/PDF text as an untitled buffer
+  /// and persists it through the close-time flush, so a crash cannot erase the
+  /// handoff. That flush's default is a CLOSE — the buffer dies with the window,
+  /// so its draft goes back on the launcher — and for this caller that is simply
+  /// false: the window is on screen holding the buffer. Released, the draft was
+  /// offered as unhandled work while a window was editing it, and adopting it
+  /// from a second surface put two buffers on one recovery ID, autosaving over
+  /// each other.
+  @MainActor
+  func testImportingADocumentKeepsItsDraftClaimedByTheWindowHoldingIt() async throws {
+    let folder = try makeTemporaryFolder()
+    // A real PDF: `importMarkdown` rejects anything that is not `.docx`/`.pdf`,
+    // and a rejected conversion would make this test pass for the wrong reason.
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only the import's own explicit flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    let draft = try await waitForSingleDraft(in: store)
+
+    XCTAssertTrue(
+      appState.documentSession.hasEditableBuffer,
+      "fixture precondition: the importing window still holds the buffer that draft belongs to")
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertTrue(
+      documentStore.recoveredDrafts().isEmpty,
+      "the launcher offered the draft of a buffer a window is still editing")
+
+    let second = AppState()
+    XCTAssertFalse(
+      documentStore.openRecoveredDraft(draft, into: second),
+      "a second window adopted the live import buffer's draft — two buffers on one recovery ID")
+    XCTAssertFalse(second.documentSession.hasEditableBuffer, "the refusal built a second buffer")
+    XCTAssertTrue(fileExists(draft.url))
+  }
+
+  // MARK: - A failed draft write is never reported as a success
+
+  // SCOPE, stated because the two `CloseFlush` names overreach: these drive
+  // `DocumentStore` directly on a live `AppState`. They prove the RETURN VALUE
+  // and the state of the buffer after a failed write — NOT what a real Close or
+  // Quit does with that answer. Both teardown call sites (`PensieveApp`'s
+  // willClose hook and `TerminationSequence.flushPendingWindowSaves`) still
+  // DISCARD the result and run past their veto point; that gap is open and named
+  // in the lifecycle contract's Recovery section (GAP 1). The import test below
+  // is the one that goes through a real controller end to end.
+
+  /// P0. `saveRecoveryDraft` caught its write error, set `appState.lastError` and
+  /// returned NOTHING, and the untitled branch of `savePendingChangesOnClose`
+  /// answered `true` regardless. The one caller whose buffer SURVIVES that flush —
+  /// `importDocument` — read that `true` as "the work is safe" and cleared the
+  /// error on top of it. The flush now reports the write it actually made.
+  @MainActor
+  func testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only this explicit flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store)
+    let appState = AppState()
+    appState.documentSession.restoreUntitled(
+      title: "Board Resolution.md", text: "# Prokurent\n\napproval required", recoveryID: UUID())
+
+    XCTAssertFalse(
+      documentStore.savePendingChangesOnClose(appState: appState, releasesDraftClaim: false),
+      "a draft write that failed was reported as work persisted")
+
+    XCTAssertNotNil(appState.lastError, "the write failure was not surfaced")
+    XCTAssertTrue(
+      appState.documentSession.hasEditableBuffer,
+      "the buffer holding the only copy of the text was torn down")
+    XCTAssertTrue(appState.documentSession.isDirty, "the buffer was marked clean over unsaved text")
+    XCTAssertEqual(appState.documentSession.text, "# Prokurent\n\napproval required")
+    XCTAssertTrue(store.loadDrafts().isEmpty, "a draft was advertised that is not on disk")
+  }
+
+  /// The same report for the FILE-BACKED half: this branch is reached precisely
+  /// because the file on disk is stale (auto-save off, or a save that threw), so a
+  /// stash that fails leaves the edit in memory only.
+  @MainActor
+  func testACloseFlushReportsAFailedStashOfAFileBackedBuffer() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "edited but never told to save"
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      documentStore.savePendingChangesOnClose(appState: appState),
+      "a stash that failed was reported as work persisted")
+
+    XCTAssertNotNil(appState.lastError)
+    XCTAssertEqual(
+      try String(contentsOf: noteURL, encoding: .utf8), "on disk",
+      "the failed stash wrote the user's file behind their back")
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+  }
+
+  /// The user-facing shape of the same defect. A Word/PDF import converts fine and
+  /// publishes an untitled buffer; its recovery write then fails, and the import
+  /// path cleared `lastError` unconditionally on the next line. The user saw a
+  /// successful import with no error and no draft — the conversion existed only in
+  /// memory, so a crash before Save As… took it.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer() async throws {
+    let folder = try makeTemporaryFolder()
+    // A real PDF: `importMarkdown` rejects anything that is not `.docx`/`.pdf`,
+    // and a rejected conversion would make this test pass for the wrong reason.
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeUnwritableRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    try await waitForPublishedImportBuffer(in: appState)
+
+    // 1) the conversion itself succeeded — the text is in the buffer…
+    XCTAssertTrue(appState.documentSession.text.contains("Prokurent"))
+    // 2) …3) …and the failed draft write is visible rather than cleared.
+    XCTAssertNotNil(
+      appState.lastError,
+      "the import cleared the recovery-write failure and looked like a success")
+    XCTAssertTrue(
+      try XCTUnwrap(appState.lastError).contains("Board Resolution.pdf"),
+      "the message does not say WHICH converted text has no safe copy")
+    // 4) the buffer stays open and dirty, so the work is still reachable…
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    // 5) …and nothing pretends a draft exists.
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
+  }
+
+  /// The same failure, followed one step further: it now reaches the operator.
+  ///
+  /// 45.1 made the failed import RECORD its error; the field it recorded into
+  /// had no renderer, so nothing said it out loud. This pins the whole chain on
+  /// the real production path — convert, fail to write the draft, and end up
+  /// with a window showing a standing banner for an unresolved loss, because
+  /// the converted text exists in exactly one place and that place is volatile.
+  ///
+  /// The severity matters as much as the message: `importDocument` composes its
+  /// own sentence on top of the write error, and doing that through a plain
+  /// `lastError` assignment would silently demote the failure to a passive
+  /// notice on the way.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss() async throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: try makeUnwritableRecoveryStore(in: folder))
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    try await waitForPublishedImportBuffer(in: appState)
+
+    XCTAssertEqual(
+      appState.currentError?.severity, .dataLoss,
+      "the only copy of the converted text is the buffer, and the window filed that as routine")
+    XCTAssertTrue(
+      WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
+      "the failed import left the window with nothing to show")
+    let latched = try XCTUnwrap(
+      appState.unresolvedDataLoss, "the failed import latched no unresolved loss")
+    XCTAssertTrue(
+      latched.message.contains("Board Resolution.pdf"),
+      "the report does not say WHICH converted text has no safe copy: \(latched.message)")
+  }
+
+  /// Control: with a writable recovery directory the import path is unchanged —
+  /// the draft lands, the error is cleared, and the buffer keeps its claim.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteSucceedsClearsTheError() async throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    let draft = try await waitForSingleDraft(in: store)
+
+    XCTAssertNil(appState.lastError, "a successful import left an error on screen")
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(
+      documentStore.recoveredDrafts().isEmpty,
+      "the live import buffer's draft was released to the launcher")
+  }
+
   // MARK: - Save As…
 
   @MainActor
@@ -360,6 +611,185 @@ final class RecoveredDraftsTests: XCTestCase {
       try sidecars(), [], "the discarded draft left its title sidecar behind as an orphan")
   }
 
+  // MARK: - One buffer, one draft identity
+
+  /// The live defect, at its smallest: ONE buffer persisted twice must land in
+  /// ONE draft file. Nothing sweeps the recovery directory any more, so a writer
+  /// that mints a fresh UUID per write does not merely churn — it grows the
+  /// directory without bound (the operator's build 636 accumulated 95 byte-identical
+  /// drafts of a single document).
+  ///
+  /// The untitled autosave path is the control half of the root cause: it always
+  /// wrote its ID back into the session, so it converged.
+  @MainActor
+  func testTwoAutosaveTicksOnOneUntitledBufferWriteOneDraft() async throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store)
+    appState.documentSession.createUntitled(title: "Untitled.md")
+
+    appState.activeDocumentText = "# Umowa"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntilDrafts(in: store, contain: "# Umowa")
+    let firstID = try XCTUnwrap(store.loadDrafts().first?.id)
+
+    appState.activeDocumentText = "# Umowa\n\npara 1"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntilDrafts(in: store, contain: "# Umowa\n\npara 1")
+
+    XCTAssertEqual(
+      store.loadDrafts().map(\.id), [firstID],
+      "a second autosave tick on the same buffer wrote a second draft file")
+    XCTAssertEqual(appState.documentSession.recoveryID, firstID)
+  }
+
+  /// ROOT CAUSE. `recoveryID` used to live inside `DocumentSession.Kind.untitled`,
+  /// so for a FILE-BACKED buffer the getter answered `nil` and the setter was a
+  /// no-op. `stashClosingBufferAsRecoveryDraft` — the teardown path taken by every
+  /// dirty file-backed buffer whose window dies without reaching disk (auto-save
+  /// off, or a save that failed) — read `nil`, minted a fresh UUID, and threw the
+  /// write-back away. Every close of the same document therefore produced ANOTHER
+  /// draft file of the same text.
+  @MainActor
+  func testRepeatedTeardownStashesOfOneFileBackedBufferKeepOneDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only the explicit teardown flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let firstID = try XCTUnwrap(store.loadDrafts().first?.id)
+    // The buffer is still dirty (nothing reached the file), so the next teardown
+    // pass over the same session — a second window on the file, the quit flush
+    // after a window close — stashes it again.
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      store.loadDrafts().map(\.id), [firstID],
+      "the second stash of the same buffer minted a new draft UUID")
+    XCTAssertEqual(store.loadDrafts().map(\.text), ["# Umowa"])
+    XCTAssertEqual(
+      appState.documentSession.recoveryID, firstID,
+      "the stash did not record which draft this buffer owns")
+  }
+
+  /// Control: identity, not content, is what dedups. Two buffers that happen to
+  /// hold the same text are two different pieces of work and keep two drafts.
+  @MainActor
+  func testTwoDifferentBuffersKeepTwoDraftsEvenWithIdenticalText() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+
+    let first = AppState()
+    first.documentSession.createUntitled(title: "Untitled.md")
+    first.activeDocumentText = "# Umowa"
+    first.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: first))
+
+    let second = AppState()
+    second.documentSession.createUntitled(title: "Untitled 2.md")
+    second.activeDocumentText = "# Umowa"
+    second.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: second))
+
+    XCTAssertEqual(
+      Set(store.loadDrafts().map(\.id)).count, 2,
+      "two independent buffers were collapsed into one draft")
+    XCTAssertNotEqual(first.documentSession.recoveryID, second.documentSession.recoveryID)
+  }
+
+  /// The SEVERING half of the same rule, and the reason the association is safe
+  /// to keep across stashes: it is dropped the moment the buffer's IDENTITY
+  /// changes. `createUntitled` replaces the buffer with a brand new document, so
+  /// the draft the previous one wrote stays behind untouched and the next stash
+  /// mints its OWN — a new document must not overwrite work the user has not
+  /// decided about yet.
+  @MainActor
+  func testANewUntitledBufferDoesNotInheritTheDraftTheReplacedOneWrote() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.createUntitled(title: "Umowa.md")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let stashed = try XCTUnwrap(store.loadDrafts().first)
+    XCTAssertEqual(appState.documentSession.recoveryID, stashed.id)
+
+    appState.documentSession.createUntitled(title: "Untitled 2.md")
+
+    XCTAssertNil(
+      appState.documentSession.recoveryID,
+      "a brand new buffer inherited the draft the buffer it replaced owns")
+    appState.activeDocumentText = "# Aneks"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      Set(store.loadDrafts().map(\.id)).count, 2,
+      "the new buffer's stash overwrote the draft of the work it replaced")
+    XCTAssertEqual(
+      store.loadDrafts().first(where: { $0.id == stashed.id })?.text, "# Umowa",
+      "the replaced buffer's draft was rewritten with text that is not its own")
+  }
+
+  /// A stash is recoverable work only until the work is safely on disk. Now that a
+  /// file-backed buffer keeps its draft across closes, the save that publishes the
+  /// same bytes has to retire it — otherwise the launcher would offer content the
+  /// user already saved, forever, since nothing sweeps drafts.
+  @MainActor
+  func testSavingTheFileRetiresTheDraftItWasStashedInto() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let stashed = try XCTUnwrap(store.loadDrafts().first)
+
+    documentStore.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "# Umowa")
+    XCTAssertFalse(
+      fileExists(stashed.url), "the draft outlived the save that made it redundant")
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertNil(appState.documentSession.recoveryID)
+  }
+
   // MARK: - Launcher model
 
   @MainActor
@@ -397,6 +827,94 @@ final class RecoveredDraftsTests: XCTestCase {
 
   private func fileExists(_ url: URL) -> Bool {
     FileManager.default.fileExists(atPath: url.path)
+  }
+
+  /// Waits for the debounced autosave to land `text` in the recovery store.
+  private func waitUntilDrafts(
+    in store: RecoveryStore,
+    contain text: String,
+    timeout: TimeInterval = 5,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if store.loadDrafts().contains(where: { $0.text == text }) { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("no recovery draft holding \(text.debugDescription)", file: file, line: line)
+  }
+
+  /// Waits for the ONE draft an asynchronous path is expected to persist. Polls
+  /// instead of sleeping a fixed amount, so a correct build waits only as long as
+  /// the conversion actually takes.
+  private func waitForSingleDraft(
+    in store: RecoveryStore,
+    timeout: TimeInterval = 10,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws -> RecoveryDraft {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if let draft = store.loadDrafts().first { return draft }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("no recovery draft was persisted", file: file, line: line)
+    throw XCTSkip("no recovery draft was persisted")
+  }
+
+  /// Waits for an import to PUBLISH its conversion into the window's session. The
+  /// publication is what both the success and the failure path share, so a pin on
+  /// what happens afterwards can wait for it without assuming either outcome.
+  @MainActor
+  private func waitForPublishedImportBuffer(
+    in appState: AppState,
+    timeout: TimeInterval = 10,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if appState.documentSession.hasEditableBuffer, !appState.documentSession.text.isEmpty {
+        return
+      }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("the import never published a buffer", file: file, line: line)
+  }
+
+  /// A `RecoveryStore` whose directory can never exist: a regular FILE sits on its
+  /// path, so `createDirectory(withIntermediateDirectories:)` throws
+  /// `NSFileWriteFileExists` on every `saveDraft`. Deterministic in a way a
+  /// permission bit or a full volume is not — no root, no timing, no sandbox
+  /// assumptions — and it stays inside the test's own temporary folder, never
+  /// touching the real recovery directory.
+  private func makeUnwritableRecoveryStore(in folder: URL) throws -> RecoveryStore {
+    let blocked = folder.appendingPathComponent("Recovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blocked, options: .atomic)
+    return RecoveryStore(directoryURL: blocked)
+  }
+
+  /// A one-page PDF with a real text layer, mirroring `DocumentTransferTests`'
+  /// fixture: the import path only accepts `.docx`/`.pdf`, so a pin on what an
+  /// import leaves behind needs a document that genuinely converts.
+  private func makeTextPDF(_ text: String) throws -> Data {
+    let data = NSMutableData()
+    guard let consumer = CGDataConsumer(data: data as CFMutableData) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+    guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    context.beginPDFPage(nil)
+    let line = CTLineCreateWithAttributedString(
+      NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14)]))
+    context.textPosition = CGPoint(x: 72, y: 720)
+    CTLineDraw(line, context)
+    context.endPDFPage()
+    context.closePDF()
+    return data as Data
   }
 
   private func makeTemporaryFolder() throws -> URL {

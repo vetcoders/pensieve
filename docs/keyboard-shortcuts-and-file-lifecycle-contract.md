@@ -177,6 +177,159 @@ Clarification (04.08, Monika — "they don't disappear without my decision"):
 - If the number of drafts ever needs to be surfaced, it is shown to the user as
   information — never acted on by deleting.
 
+Clarification (05.08, after the file-backed half of bug I):
+
+- **"One buffer" includes a FILE-BACKED buffer.** A named document whose window
+  tears down without reaching disk (auto-save off, or a save that failed) is
+  stashed as a recovery item too, and that stash follows the same rule: the
+  buffer keeps ONE item across every close, every quit flush and every window on
+  the same file. It must not mint a new UUID per stash. (It did:
+  `recoveryID` lived inside the untitled session shape, so a file-backed buffer
+  read `nil` and its write-back was dropped, and with no sweep left to hide it a
+  single unsaved document grew the recovery directory without bound.)
+- A **successful save from the SAME session** retires the stash it was standing
+  in for — the same closed list as before ("being saved as a regular file"), now
+  also applying to a plain ⌘S on a named document. The scope is exact: the
+  association lives on the live `DocumentSession`, so retirement holds only while
+  the buffer that wrote the stash is the one saving. A stash produced by a window
+  TEARING DOWN is orphaned from every later session on the same file — reopening
+  that file in a fresh window and saving it does NOT retire the stash, and the
+  launcher keeps offering content that is by then already on disk until it is
+  explicitly discarded. (Retiring such a stash by URL is a pending product
+  decision, not current behavior.)
+
+Clarification (05.08, after the "silent failed recovery write" bug) — PARTIAL,
+with one named gap below:
+
+- **A recovery write reports whether the bytes reached disk.** Every path that
+  persists a recovery item now returns that result instead of a constant, and a
+  caller may only treat the work as safe when the write actually succeeded. This
+  is a precondition for honest behavior, not the behavior itself: what a caller
+  does with the result is the caller's, and today only one consumes it.
+- **Where the guarantee holds: a surface that SURVIVES the operation and reads
+  the result.** Today that is exactly one caller, `importDocument`. There, a
+  failed recovery write means: the buffer stays OPEN and stays DIRTY holding the
+  full text, `lastError` is set and is NOT cleared by a later step in the same
+  operation, nothing on the user's disk is written or removed, and no recovery
+  item is listed that does not exist as a file.
+- **GAP 1 — close and quit consume nothing.** Both teardown flush sites
+  (`PensieveApp`'s `willCloseNotification` hook and
+  `TerminationSequence.flushPendingWindowSaves`) discard the result, and both run
+  PAST the veto point — after `windowShouldClose` / `applicationShouldTerminate`
+  have already consented. `lastError` is per-window state
+  (`AppState.lastError` → `DocumentWindowModel.lastError`), so a window that dies
+  carrying the error takes the error with it. On these paths a failed stash is
+  still a silent loss. In ordinary use the conscious close settles the buffer
+  BEFORE teardown, so the flush finds nothing dirty and the gap does not bite;
+  it bites on teardowns that bypass the conscious close — which is exactly what
+  the stash exists as a backstop for.
+- **GAP 2 — no renderer — CLOSED (05.08, same line of work).** `AppState.lastError`
+  used to be written in many places and read by no view, so "the error stays on
+  screen" described the STATE and nothing the user could see. It now renders;
+  see "Error surface" below for exactly what appears and when. GAP 1 remains an
+  open follow-up, not settled behavior — see
+  `2026-08-05_notatka-45-1-close-quit-flush.md` in the project notes.
+- **What is NOT guaranteed even where the guarantee holds.** Pensieve does not
+  relocate the recovery directory and does not save the work anywhere else. It
+  performs no retry of its own; the next write EVENT (an edit re-arming autosave)
+  may retry and may report the failure again. The content lives in the buffer
+  only, so it survives exactly as long as the process does — an unresolved
+  failure means a crash or a Force Quit still loses that text. Resolving it is
+  the user's Save As….
+- **Import (Word/PDF) is the sharp case.** The conversion result has no file
+  behind it, so the recovery item is its only copy. A conversion that lands with
+  a failed recovery write is treated as a partial success — converted text in the
+  buffer, error recorded — never as a completed import. (It was: the import path
+  cleared `lastError` unconditionally right after the flush, and the flush
+  returned success regardless of the write, so the app itself could not tell the
+  two apart.)
+- Tests. `testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer` holds the
+  import path end to end through `AppController`.
+  `testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess` and
+  `testACloseFlushReportsAFailedStashOfAFileBackedBuffer` pin the two flush
+  branches at the `DocumentStore` level — they prove the RETURN VALUE and the
+  buffer state, and deliberately not the behavior of a real Close or Quit, which
+  is GAP 1.
+
+### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
+
+What an error the app records actually does on screen. The behavior below is
+implemented and pinned; its **visual shape is a recommendation awaiting Monika's
+ratification**, so the wording, colour and placement may still change without
+changing anything in this section's rules.
+
+**Two classes, chosen at the write site.** A failure is classified where it is
+raised, never by matching its message text:
+
+- **Status** (the default). The action was refused, a read failed, or some
+  housekeeping did not land — and nothing the user typed is at risk. Examples:
+  "Open a workspace folder before creating a workspace file", a workspace that
+  will not open, a recovered draft that could not be saved under a new name
+  (the draft file is still on disk, so the work survives).
+- **Data loss.** Pensieve failed to put content anywhere durable AND the only
+  remaining copy is the in-memory buffer. Exactly four sites raise it today:
+  `saveExisting` and `saveAs` (the edit reached no file), the untitled recovery
+  draft write and the closing-buffer stash (the write that WAS the durable
+  copy), plus `importDocument` composing its own sentence on top of the last of
+  those. Status is the default precisely so that the loud class stays opt-in: a
+  new error has to be argued into it and cannot fall into it.
+
+**One surface, and it is passive.** Pensieve has NO modal error path. Both
+classes show the same standing line in the window that recorded the failure and
+in no other (the state is per-window: `AppState.currentError` →
+`DocumentWindowModel`). It sits between the document pane and the status bar,
+and deliberately NOT behind the status bar's `documentHasEditableBuffer` gate —
+the errors that most need saying can land in a window with nothing open. It is
+passive in the strict sense: it never takes first responder, so it may appear
+and disappear under a live editing session without moving the caret or
+interrupting typing. It carries a dismiss button. Nothing times it out. Severity
+changes the dressing — filled accent and a warning icon for data loss, the
+status bar's own material for everything else — never whether the user is
+interrupted.
+
+**Data loss LATCHES; status does not.** The two live in separate state, and the
+separation is the point:
+
+- `DocumentWindowModel.statusError` — the passive message, freely overwritten
+  and freely cleared by whoever wrote it.
+- `DocumentWindowModel.unresolvedDataLoss` — a latch: content that reached no
+  file and exists only in a buffer that dies with the process.
+- `DocumentWindowModel.dataLossBannerDismissed` — visibility only, never safety.
+
+Three rules follow, and each is pinned:
+
+1. **A status message cannot displace an unresolved data loss** — not by being
+   written, and not by being cleared. Around a dozen sites assign
+   `lastError = nil` on their own unrelated success, and none of them know
+   anything about a buffer whose content reached no disk. The banner keeps
+   showing the loss while it is still true.
+2. **Dismissing the banner does not reset the condition.** The latch survives,
+   so an identical failure repeating on the next autosave tick has nothing new
+   to say and the banner the user put away stays away. Without this a full disk
+   would resurrect a dismissed banner every 1.5 seconds.
+3. **A resolved loss that happens again IS news.** The dedupe is scoped to one
+   unresolved condition, not to a message string forever, so the surface re-arms
+   — dismissal included. A genuinely different failure arriving while the first
+   is still unresolved also re-arms.
+
+**What retires the latch.** Only `AppState.resolveError()`, called where a
+durable write for that buffer actually lands: a successful `saveExisting`,
+`saveAs`, or recovery-draft write. A successful closing-buffer STASH
+deliberately does not — that path runs precisely because the file the user asked
+to write is stale, and a backstop copy they never asked for must not take "could
+not save X" off the screen.
+
+Tests. `WindowErrorChromeRenderTests` drives a real window hosting the real
+`ContentView` and measures the live layout, so "the banner is mounted" is read
+from the window and not from a resolver; it holds all three latch rules on that
+live surface plus the focus contract (typing continues, caret unmoved, first
+responder unchanged) across the banner appearing and disappearing.
+`WindowErrorSurfaceTests` pins the classification through real production paths
+(a failing save, an unwritable recovery directory, a refused document creation)
+and the same three rules at the state level.
+`testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss` holds the import chain
+end to end.
+
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 
 - being saved as a regular file;

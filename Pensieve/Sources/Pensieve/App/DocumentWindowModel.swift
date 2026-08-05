@@ -190,7 +190,39 @@ final class DocumentWindowModel {
       defaults.set(showAllFilesInSidebar, forKey: Self.showAllFilesInSidebarKey)
     }
   }
-  var lastError: String?
+  /// This window's ordinary, passive report, or `nil` when it has nothing to
+  /// say. Refused actions, failed reads, housekeeping that did not land.
+  ///
+  /// Was a bare `String?` that nothing rendered: it was written from ~35 sites
+  /// across the app and read by no view at all, so every failure the app knew
+  /// about — including a crash-recovery draft that could not be written — was
+  /// recorded and never shown. It now backs `WindowErrorBanner`.
+  var statusError: WindowError?
+
+  /// A data loss this window has not resolved: content that reached no file and
+  /// exists only in a buffer that dies with the process.
+  ///
+  /// This is a LATCH, deliberately separate from the status slot and from
+  /// whether the banner is currently visible. Keeping the two apart is what
+  /// stops the loud condition from being erased by things that know nothing
+  /// about it — a later routine message, one of the ~35 sites clearing
+  /// `lastError` after its own unrelated success, or the user putting the
+  /// banner away. Only a durable write for this buffer retires it
+  /// (`AppState.resolveError`).
+  var unresolvedDataLoss: WindowError?
+
+  /// Whether the user has put away the banner for the CURRENT unresolved data
+  /// loss. Visibility only — it never makes the work safe, and it is reset when
+  /// the latch changes or is resolved, so a genuinely new failure is still
+  /// shown.
+  var dataLossBannerDismissed = false
+
+  /// What the chrome renders: an unresolved data loss the user has not put
+  /// away, otherwise the passive status line.
+  var effectiveError: WindowError? {
+    if let loss = unresolvedDataLoss, !dataLossBannerDismissed { return loss }
+    return statusError
+  }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
