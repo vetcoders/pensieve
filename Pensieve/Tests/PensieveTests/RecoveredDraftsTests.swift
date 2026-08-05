@@ -1,3 +1,5 @@
+import AppKit
+import CoreText
 import XCTest
 
 @testable import Pensieve
@@ -267,6 +269,57 @@ final class RecoveredDraftsTests: XCTestCase {
       documentStore.openRecoveredDraft(draft, into: reopened),
       "a released draft stayed unadoptable")
     XCTAssertEqual(reopened.activeDocumentText, "crash text")
+  }
+
+  /// …and the loan is NOT handed back by a caller whose window stays open.
+  ///
+  /// `importDocument` publishes its converted Word/PDF text as an untitled buffer
+  /// and persists it through the close-time flush, so a crash cannot erase the
+  /// handoff. That flush's default is a CLOSE — the buffer dies with the window,
+  /// so its draft goes back on the launcher — and for this caller that is simply
+  /// false: the window is on screen holding the buffer. Released, the draft was
+  /// offered as unhandled work while a window was editing it, and adopting it
+  /// from a second surface put two buffers on one recovery ID, autosaving over
+  /// each other.
+  @MainActor
+  func testImportingADocumentKeepsItsDraftClaimedByTheWindowHoldingIt() async throws {
+    let folder = try makeTemporaryFolder()
+    // A real PDF: `importMarkdown` rejects anything that is not `.docx`/`.pdf`,
+    // and a rejected conversion would make this test pass for the wrong reason.
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let store = try makeRecoveryStore(in: folder)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only the import's own explicit flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: store)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    let draft = try await waitForSingleDraft(in: store)
+
+    XCTAssertTrue(
+      appState.documentSession.hasEditableBuffer,
+      "fixture precondition: the importing window still holds the buffer that draft belongs to")
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertTrue(
+      documentStore.recoveredDrafts().isEmpty,
+      "the launcher offered the draft of a buffer a window is still editing")
+
+    let second = AppState()
+    XCTAssertFalse(
+      documentStore.openRecoveredDraft(draft, into: second),
+      "a second window adopted the live import buffer's draft — two buffers on one recovery ID")
+    XCTAssertFalse(second.documentSession.hasEditableBuffer, "the refusal built a second buffer")
+    XCTAssertTrue(fileExists(draft.url))
   }
 
   // MARK: - Save As…
@@ -592,6 +645,46 @@ final class RecoveredDraftsTests: XCTestCase {
       try await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("no recovery draft holding \(text.debugDescription)", file: file, line: line)
+  }
+
+  /// Waits for the ONE draft an asynchronous path is expected to persist. Polls
+  /// instead of sleeping a fixed amount, so a correct build waits only as long as
+  /// the conversion actually takes.
+  private func waitForSingleDraft(
+    in store: RecoveryStore,
+    timeout: TimeInterval = 10,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws -> RecoveryDraft {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if let draft = store.loadDrafts().first { return draft }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("no recovery draft was persisted", file: file, line: line)
+    throw XCTSkip("no recovery draft was persisted")
+  }
+
+  /// A one-page PDF with a real text layer, mirroring `DocumentTransferTests`'
+  /// fixture: the import path only accepts `.docx`/`.pdf`, so a pin on what an
+  /// import leaves behind needs a document that genuinely converts.
+  private func makeTextPDF(_ text: String) throws -> Data {
+    let data = NSMutableData()
+    guard let consumer = CGDataConsumer(data: data as CFMutableData) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+    guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    context.beginPDFPage(nil)
+    let line = CTLineCreateWithAttributedString(
+      NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14)]))
+    context.textPosition = CGPoint(x: 72, y: 720)
+    CTLineDraw(line, context)
+    context.endPDFPage()
+    context.closePDF()
+    return data as Data
   }
 
   private func makeTemporaryFolder() throws -> URL {
