@@ -16,14 +16,16 @@ import Foundation
 ///    controller, and the workspace manager (watcher stopped, refresh/build tasks cancelled),
 /// 2. FLUSH — land everything the user already owns: every window's pending edit, and the armed
 ///    autosave index debounce, run NOW rather than when its 5 s timer says so,
-/// 3. DRAIN — wait for every index write the app owes, including the ones step 2 just scheduled,
+/// 3. PERSIST — force the saved working set out of cfprefsd's queue and onto disk, so the state the
+///    next launch restores from is final by the time the process is gone,
+/// 4. DRAIN — wait for every index write the app owes, including the ones step 2 just scheduled,
 ///    and for the post-close index housekeeping, all under one budget,
-/// 4. LATCH — close the index funnel one way; from here every write entry point and lazy open
+/// 5. LATCH — close the index funnel one way; from here every write entry point and lazy open
 ///    refuses, and the terminal checkpoint is the only DB operation left that can run,
-/// 5. take the truncating checkpoint,
-/// 6. return, and let AppKit tear the windows down.
+/// 6. take the truncating checkpoint,
+/// 7. return, and let AppKit tear the windows down.
 ///
-/// Steps 1 and 4 are the difference between "the writes we knew about are safe" and "no new managed
+/// Steps 1 and 5 are the difference between "the writes we knew about are safe" and "no new managed
 /// write can arise". Five review rounds each found another producer that was still alive during the
 /// quit; the answer was never a sixth patch but the missing phase — and a refusal at the funnel for
 /// whatever the inventory missed. This class is the SINGLE owner of that phase state: no other type
@@ -31,11 +33,11 @@ import Foundation
 /// switched by this one (`IndexDatabase.closeForTermination`).
 ///
 /// The order above is one thing; WHICH of it the `drainTimeout` bounds is another, and the two are
-/// not the same question. Steps 1–2 are the user's own bytes; steps 3–5 are index bookkeeping. Only
-/// the latter can wedge (SQLite, a background pool), only the latter is what the budget was built
-/// for, and a buffer that misses the disk is gone for good while a WAL left long is reclaimed by the
-/// next launch. So the split is: `runUserFlushPhases()` runs OUTSIDE any task and outside the
-/// deadline, `runIndexPhases()` runs inside both. Phase order is unchanged — Q → F → D → L → C.
+/// not the same question. Steps 1–2 are the user's own bytes; steps 3–6 are bookkeeping that can
+/// wedge or stall (SQLite, a background pool, an XPC round trip to cfprefsd), which is what the
+/// budget was built for — and a buffer that misses the disk is gone for good while a WAL left long
+/// is reclaimed by the next launch. So the split is: `runUserFlushPhases()` runs OUTSIDE any task
+/// and outside the deadline, `runIndexPhases()` runs inside both. Phase order: Q → F → P → D → L → C.
 ///
 /// Deliberately prompt-free and non-destructive: nothing here asks the user anything and nothing
 /// discards a buffer. A dirty untitled session is persisted as a recovery draft by the same
@@ -129,11 +131,20 @@ final class TerminationSequence {
     autosaver.quiesceForTermination()
   }
 
-  /// Phases D, L and C — the half `drainTimeout` was actually built to bound, and the only half that
-  /// can wedge: SQLite, a background pool, a producer that outlived its owner. Every wait here is an
-  /// `await` — see `runBlockingMainRunLoop()`: a synchronous wait would park the pump and make the
-  /// deadline dead.
+  /// Phases P, D, L and C — the half `drainTimeout` was actually built to bound, and the only half
+  /// that can wedge or stall: SQLite, a background pool, a producer that outlived its owner, another
+  /// process. Every wait here is an `await` — see `runBlockingMainRunLoop()`: a synchronous wait
+  /// would park the pump and make the deadline dead.
   func runIndexPhases() async {
+    // ---- P: persist. The saved working set is not on disk just because it was written: every
+    // `UserDefaults` change is handed to cfprefsd, which writes the backing plist on its own
+    // schedule — measured here at up to ~14 s AFTER the process had already exited. A quit therefore
+    // left it in flight, and a flush landing that late could overwrite an external change made to a
+    // quit app's saved state in the meantime. Landed FIRST inside the budget, before the index work
+    // that is the only part of this sequence able to wedge, so a stalled pool cannot cost the user
+    // their working set. See `BookmarkStore.startFlush()` for why the wait is an await.
+    await folderManager.flushWorkingSet()
+
     // ---- D: drain. The accepted work first, then the post-close index housekeeping — which is a
     // barrier vacuum + truncate and, until now, was awaited only by tests. `Close Folder` followed by
     // a fast ⌘Q raced that vacuum against this quit's own checkpoint, and GRDB serializes the two
