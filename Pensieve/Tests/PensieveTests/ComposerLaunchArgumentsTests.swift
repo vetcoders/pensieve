@@ -125,7 +125,10 @@ final class ComposerLaunchArgumentsTests: XCTestCase {
     XCTAssertTrue(coordinator.isComposerWaitMode)
     XCTAssertTrue(coordinator.hasExplicitLaunchIntent)
 
-    coordinator.startWhenLaunchIntentsSettle(controller: controller)
+    // `.coldLaunch` on purpose: wait-mode must UPGRADE an ordinary cold launch
+    // to `.explicitDocument` (see the settle in LaunchIntentCoordinator) — the
+    // assertions below only prove the upgrade if the input intent is the weak one.
+    coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     await coordinator.waitForStartupDecision()
 
     XCTAssertEqual(
