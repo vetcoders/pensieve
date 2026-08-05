@@ -248,6 +248,12 @@ Close All must never cause silent data loss.
   mid-replacement, or on an unplugged volume) and only drops out of what a
   restore opens. Workspace **roots** keep their own lifecycle — still **[OPEN]**.
 
+- **Removing one workspace root never revokes another tab's access.** The
+  persisted bookmark set is rebuilt from the UNION of the working set and the
+  live tab chain across every window: a document of the removed root that a
+  window still has open gets a file bookmark of its own, a document covered by a
+  surviving root does not (its root already grants access), and a file that is in
+  neither source still loses its bookmark — nothing is resurrected.
 - **The working set is durable by the time the process is gone.** Quit forces it
   out of cfprefsd's write-back queue instead of letting the system flush it on its
   own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
