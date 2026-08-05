@@ -72,7 +72,8 @@ final class TrashLocationTests: XCTestCase {
   /// answer NO, and the home Trash was the only Trash a gone item could be in.
   func testAGonePathInsideAVolumeTrashIsRecognized() throws {
     let volume = URL(fileURLWithPath: "/Volumes/PensieveNoSuchVolume-\(UUID().uuidString)")
-    let trashed = volume
+    let trashed =
+      volume
       .appendingPathComponent(".Trashes", isDirectory: true)
       .appendingPathComponent(String(getuid()), isDirectory: true)
       .appendingPathComponent("gone.md")
