@@ -44,11 +44,7 @@ final class TrashedWorkingSetTests: XCTestCase {
   /// `BookmarkStore` over the shared ephemeral suite, told that the fixture's
   /// `Trash/` directory is a Trash.
   private func makeBookmarkStore() -> BookmarkStore {
-    let fakeTrashPath = fakeTrash.standardizedFileURL.path
-    return BookmarkStore(defaults: defaults) { url in
-      let path = url.standardizedFileURL.path
-      return path == fakeTrashPath || path.hasPrefix(fakeTrashPath + "/")
-    }
+    BookmarkStore(defaults: defaults, trashMembership: SimulatedTrash.membership(at: fakeTrash))
   }
 
   /// Moves `url` into the simulated Trash the way the system does: a plain move,
