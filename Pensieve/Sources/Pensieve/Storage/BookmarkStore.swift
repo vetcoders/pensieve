@@ -11,13 +11,13 @@ final class BookmarkStore {
 
   /// One live security-scoped grant: the URL access was actually STARTED on
   /// (start/stop must balance on the same object) and whether the start
-  /// succeeded. Filed under the standardized URL — see `stopAccess(to:)`.
+  /// succeeded. Filed under `identityPath` — see `stopAccess(to:)`.
   private struct ActiveAccess {
     let exactURL: URL
     let wasGranted: Bool
   }
 
-  private var activeAccess: [URL: ActiveAccess] = [:]
+  private var activeAccess: [String: ActiveAccess] = [:]
 
   /// How many security-scoped grants this store is still holding. A leaked
   /// grant has no observable effect until the process exits, so this is the
@@ -312,12 +312,20 @@ final class BookmarkStore {
         survivors.append(data)
         continue
       }
+      // Released under the ACTIVATION key, which is the path the file had
+      // before it was thrown away — a grant is taken when a file is persisted
+      // or restored, both of them pre-trash events, so stopping by the Trash
+      // LANDING path looked up a key that was never written and leaked the
+      // grant for the rest of the process. The landing path is released too:
+      // both lookups are no-ops when absent, and only one of them can ever be
+      // the key that exists.
+      let origin = Self.bookmarkedOriginURL(for: data)
+      if let origin {
+        stopAccess(to: origin)
+      }
       stopAccess(to: resolved.standardizedFileURL)
       trashed.append(
-        PrunedTrashedFile(
-          trashedURL: resolved.standardizedFileURL,
-          originURL: Self.bookmarkedOriginURL(for: data)
-        ))
+        PrunedTrashedFile(trashedURL: resolved.standardizedFileURL, originURL: origin))
     }
 
     guard !trashed.isEmpty else { return [] }
@@ -387,7 +395,7 @@ final class BookmarkStore {
   }
 
   private func activate(_ url: URL) {
-    let key = url.standardizedFileURL
+    let key = Self.identityPath(url)
     if activeAccess[key] != nil {
       return
     }
@@ -400,18 +408,23 @@ final class BookmarkStore {
 
   /// Releases the security-scoped access this store took for one file.
   ///
-  /// Keyed by the STANDARDIZED URL, and it has to be: `activate` is called with
+  /// Keyed by `identityPath`, and it has to be: `activate` is called with
   /// whatever spelling reached it — `persistFile` passes the caller's raw URL,
   /// and `restoreURLs` passes the bookmark-RESOLVED URL, which for anything
   /// under `/tmp` or `/var` differs from its standardized form. `removeFile`
   /// has always stopped with the standardized URL, so a grant taken under a
   /// non-canonical spelling was never found and leaked until process exit.
   ///
+  /// Plain standardization is not enough on its own for one caller: the Trash
+  /// prune releases by the path the file was activated at, which by then no
+  /// longer exists, and `standardizedFileURL` leaves `/private` on a path whose
+  /// target is gone. See `identityPath`.
+  ///
   /// The stop itself still goes through the EXACT URL that was activated:
   /// start/stop must balance on the same object, so canonicalizing the key is
   /// not licence to canonicalize the call.
   private func stopAccess(to url: URL) {
-    guard let access = activeAccess.removeValue(forKey: url.standardizedFileURL) else { return }
+    guard let access = activeAccess.removeValue(forKey: Self.identityPath(url)) else { return }
     if access.wasGranted {
       access.exactURL.stopAccessingSecurityScopedResource()
     }
