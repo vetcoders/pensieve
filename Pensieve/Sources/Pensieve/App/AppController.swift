@@ -377,6 +377,25 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Whether an explicit open of `documentID` must go to the window registry
+  /// instead of loading into THIS window.
+  ///
+  /// One predicate, two callers, because there is one policy — and it used to be
+  /// written down twice. `openDocumentWindow` (the sidebar/search click) had both
+  /// terms; `openFile` (⌘O, Finder, Open Recent, the launcher's RECENT list) had
+  /// only the first, so an idle window asked to open a document that already had
+  /// a tab elsewhere loaded it in place and put the same file on screen twice.
+  ///
+  /// - a window holding LIVE WORK is spoken for: an editable buffer, a pending
+  ///   import, or a staged read whose bytes have not landed yet. Loading over any
+  ///   of them throws the user's document away.
+  /// - a document ALREADY IN SOME TAB routes even from an idle window, precisely
+  ///   because the window is free: rendering it here would be the second copy.
+  ///   The registry activates the tab that already shows it.
+  private func routesToOwnTab(_ documentID: URL) -> Bool {
+    holdsLiveDocumentWork || documentWindowRegistry.openTabDocumentIDs.contains(documentID)
+  }
+
   func openFolder(url: URL) {
     if importsFoldersInBackground {
       folderManager.openInBackground(url: url, into: appState)
@@ -386,10 +405,11 @@ final class AppController: ObservableObject {
   }
 
   /// External/explicit file opens (⌘O, Finder, recents): tab per document.
-  /// An empty window (no editable buffer) is reused in place; once this
-  /// window shows a document, further opens route through the window registry
-  /// and appear as native tabs. Falls back to in-window load when no routing
-  /// is wired (tests, headless).
+  /// An empty, idle window is reused in place; a window holding live work — or
+  /// an open request for a document that already has a tab somewhere — routes
+  /// through the window registry and appears as a native tab. Both terms live in
+  /// `routesToOwnTab`, shared with `openDocumentWindow`. Falls back to in-window
+  /// load when no routing is wired (tests, headless).
   func openFile(url: URL) {
     let standardizedURL = url.standardizedFileURL
 
@@ -449,7 +469,7 @@ final class AppController: ObservableObject {
     // URL of a multi-file open would answer "empty, use this window", invalidate
     // the first file's claim, and the file the user clicked first would vanish
     // exactly the way an import used to.
-    if holdsLiveDocumentWork, let requestOpenDocumentWindow {
+    if routesToOwnTab(standardizedURL), let requestOpenDocumentWindow {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
       return
@@ -1213,14 +1233,14 @@ final class AppController: ObservableObject {
   /// this window is reading: files stay visible in parallel and switching
   /// between them is switching tabs.
   ///
-  /// Destination is `openFile`'s policy, not a second one: an empty, idle
-  /// window is reused in place — the launcher the user clicked from becomes
-  /// the file's window instead of spawning a tab beside itself and being
-  /// reaped a moment later — and a window holding live work hands the document
-  /// to the registry. The registry activates the tab already showing the
-  /// document rather than opening a twin, which is also why a document open
-  /// SOMEWHERE ELSE routes even from an idle window: loading it in place would
-  /// leave the same file rendered in two tabs.
+  /// Destination is `openFile`'s policy, not a second one — literally, through
+  /// the shared `routesToOwnTab`: an empty, idle window is reused in place — the
+  /// launcher the user clicked from becomes the file's window instead of
+  /// spawning a tab beside itself and being reaped a moment later — and a window
+  /// holding live work hands the document to the registry. The registry
+  /// activates the tab already showing the document rather than opening a twin,
+  /// which is also why a document open SOMEWHERE ELSE routes even from an idle
+  /// window: loading it in place would leave the same file rendered in two tabs.
   ///
   /// Clicking the document this window already shows is a no-op. Falls back to
   /// in-window selection when no routing is wired (tests, headless).
@@ -1232,8 +1252,7 @@ final class AppController: ObservableObject {
       return
     }
 
-    let isOpenInSomeTab = documentWindowRegistry.openTabDocumentIDs.contains(documentID)
-    guard holdsLiveDocumentWork || isOpenInSomeTab, let requestOpenDocumentWindow else {
+    guard routesToOwnTab(documentID), let requestOpenDocumentWindow else {
       DebugTrace.log(
         "openDocumentWindow -> load in this window: \(ref.id.lastPathComponent)")
       selectDocument(id: ref.id)
