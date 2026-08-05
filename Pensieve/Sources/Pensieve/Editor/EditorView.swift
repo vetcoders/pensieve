@@ -507,12 +507,25 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var lineAnchorLine = 0
   private var findQuery = ""
   /// One wash this surface actually painted: where it went, which of the two
-  /// washes it was, and the `.foregroundColor` runs it covered — captured at
-  /// paint time so a teardown can restore them without a highlight pass.
+  /// washes it was, and the highlighter's own colouring it covered — captured at
+  /// paint time so a teardown can restore it without a highlight pass.
   private struct FindWashRecord {
-    let range: NSRange
+    var range: NSRange
     let isActive: Bool
-    let ink: [(range: NSRange, color: NSColor?)]
+    var ink: [InkRun]
+
+    /// One run of colouring a wash covered.
+    ///
+    /// BOTH attributes travel together because the wash overwrites both, and
+    /// the highlighter uses `.backgroundColor` for meaning of its own: inline
+    /// code and `==highlight==` are drawn on a background. Recording only the
+    /// foreground made the teardown strip those backgrounds permanently — the
+    /// find session left the document less coloured than it found it.
+    struct InkRun {
+      var range: NSRange
+      let foreground: NSColor?
+      let background: NSColor?
+    }
 
     /// Identity of a painted wash for diffing purposes: same place, same wash.
     var key: Key { Key(location: range.location, length: range.length, isActive: isActive) }
@@ -521,6 +534,52 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       let location: Int
       let length: Int
       let isActive: Bool
+    }
+
+    /// Where an offset ends up after `delta` characters were inserted at — or
+    /// deleted from — `location`. An offset inside a deleted span collapses onto
+    /// the edit point, which is the only place the text it named still exists.
+    static func mapOffset(_ offset: Int, editedAt location: Int, delta: Int) -> Int {
+      guard offset > location else { return offset }
+      guard delta < 0 else { return offset + delta }
+      return offset >= location - delta ? offset + delta : location
+    }
+
+    /// This record re-expressed in the document's new offsets, or `nil` when the
+    /// edit consumed everything it described.
+    ///
+    /// A wash painted BELOW an edit keeps naming the same characters at moved
+    /// offsets — that is the whole reason a record is kept rather than derived
+    /// from `findMatches`, which is recomputed and can no longer say what is
+    /// currently on the document.
+    func shifted(editedAt location: Int, delta: Int) -> FindWashRecord? {
+      guard NSMaxRange(range) > location else { return self }
+
+      let start = Self.mapOffset(range.location, editedAt: location, delta: delta)
+      let end = Self.mapOffset(NSMaxRange(range), editedAt: location, delta: delta)
+      guard end > start else { return nil }
+      let moved = NSRange(location: start, length: end - start)
+
+      // Untouched text that merely slid: the captured colouring still describes
+      // the very same characters, so it travels with them.
+      if range.location >= location {
+        let movedInk = ink.compactMap { run -> InkRun? in
+          let runStart = Self.mapOffset(run.range.location, editedAt: location, delta: delta)
+          let runEnd = Self.mapOffset(NSMaxRange(run.range), editedAt: location, delta: delta)
+          guard runEnd > runStart else { return nil }
+          return InkRun(
+            range: NSRange(location: runStart, length: runEnd - runStart),
+            foreground: run.foreground, background: run.background)
+        }
+        return FindWashRecord(range: moved, isActive: isActive, ink: movedInk)
+      }
+
+      // The edit landed INSIDE this wash. The characters underneath it are not
+      // the ones whose colouring was captured, so replaying that colouring would
+      // paint the highlighter's old answer onto new text. The RANGE is kept so
+      // the wash can still be taken off; the colouring underneath is left to the
+      // highlight pass the edit itself schedules over the same region.
+      return FindWashRecord(range: moved, isActive: isActive, ink: [])
     }
   }
 
@@ -667,8 +726,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // The caret→line resolver caches an anchor keyed on the text before it. Only
     // the storage sees every character edit — direct mutations included — so the
     // invalidation is driven from there rather than from the delegate callbacks.
-    textContentStorage.onCharactersEdited = { [weak self] location, _ in
+    textContentStorage.onCharactersEdited = { [weak self] location, delta in
       self?.invalidateLineAnchor(editedAt: location)
+      // The painted-wash records are an offset-keyed cache of what is on the
+      // document, so they move with the text for the same reason the line
+      // anchor does — and from the same callback, the only one that sees every
+      // character edit including direct mutations.
+      self?.shiftPaintedFindWashes(editedAt: location, delta: delta)
       // Same reason the line anchor is invalidated from here rather than from the
       // delegate: the storage is the only place that sees EVERY character edit,
       // direct mutations included. `bufferHoldsText` answers from a remembered
@@ -1766,12 +1830,19 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// runs once per pass rather than once per match.
   private func paintFindWash(over range: NSRange, isActive: Bool, palette: FindWashPalette) {
     let wash = isActive ? palette.active : palette.passive
-    // Capture what the highlighter had put here BEFORE the wash ink covers it,
-    // so a teardown can give it back without re-running a highlight pass.
-    var ink: [(range: NSRange, color: NSColor?)] = []
-    textStorage.enumerateAttribute(.foregroundColor, in: range, options: []) {
-      value, subrange, _ in
-      ink.append((subrange, value as? NSColor))
+    // Capture what the highlighter had put here BEFORE the wash covers it, so a
+    // teardown can give it back without re-running a highlight pass. Enumerating
+    // the whole attribute dictionary rather than one key splits the runs on the
+    // union of every boundary, which is what keeps a foreground change and a
+    // background change inside the same match from being flattened onto each
+    // other.
+    var ink: [FindWashRecord.InkRun] = []
+    textStorage.enumerateAttributes(in: range, options: []) { attributes, subrange, _ in
+      ink.append(
+        FindWashRecord.InkRun(
+          range: subrange,
+          foreground: attributes[.foregroundColor] as? NSColor,
+          background: attributes[.backgroundColor] as? NSColor))
     }
     paintedFindWashes.append(FindWashRecord(range: range, isActive: isActive, ink: ink))
     textStorage.addAttribute(.backgroundColor, value: wash.background, range: range)
@@ -1783,20 +1854,29 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   ///
   /// Ranges are clipped to the CURRENT length: a teardown can follow a text
   /// change that shortened the document, and painting past the end raises.
+  ///
+  /// The background is cleared over the whole wash FIRST and then given back run
+  /// by run, so a match that sat partly on inline code comes out with the code's
+  /// background intact and the plain text beside it bare — which is how the
+  /// document looked before the wash went on.
   private func unpaintFindWash(_ record: FindWashRecord) {
     let documentRange = NSRange(location: 0, length: textStorage.length)
+    let washed = NSIntersectionRange(record.range, documentRange)
+    if washed.length > 0 {
+      textStorage.removeAttribute(.backgroundColor, range: washed)
+    }
     for entry in record.ink {
       let live = NSIntersectionRange(entry.range, documentRange)
       guard live.length > 0 else { continue }
-      if let color = entry.color {
-        textStorage.addAttribute(.foregroundColor, value: color, range: live)
+      if let foreground = entry.foreground {
+        textStorage.addAttribute(.foregroundColor, value: foreground, range: live)
       } else {
         textStorage.removeAttribute(.foregroundColor, range: live)
       }
+      if let background = entry.background {
+        textStorage.addAttribute(.backgroundColor, value: background, range: live)
+      }
     }
-    let live = NSIntersectionRange(record.range, documentRange)
-    guard live.length > 0 else { return }
-    textStorage.removeAttribute(.backgroundColor, range: live)
   }
 
   /// Forget the painted washes WITHOUT touching the document.
@@ -1809,6 +1889,23 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private func forgetPaintedFindWashes(in range: NSRange? = nil) {
     guard let range else { return paintedFindWashes.removeAll(keepingCapacity: true) }
     paintedFindWashes.removeAll { NSIntersectionRange($0.range, range).length > 0 }
+  }
+
+  /// Re-express the painted washes in the document's new offsets after a text
+  /// edit.
+  ///
+  /// The records are the only description of what is physically on the document,
+  /// and they are keyed on offsets. An insert or delete ABOVE a wash moves the
+  /// text under it while the record still names where it used to be — so the
+  /// teardown would clear the background off innocent text a few characters
+  /// away, and hand the highlighter's captured colouring back to the wrong
+  /// characters. Pure arithmetic on the cache: nothing here touches the storage,
+  /// because this runs inside the storage's own edit processing.
+  private func shiftPaintedFindWashes(editedAt location: Int, delta: Int) {
+    guard delta != 0, !paintedFindWashes.isEmpty else { return }
+    paintedFindWashes = paintedFindWashes.compactMap {
+      $0.shifted(editedAt: location, delta: delta)
+    }
   }
 
   /// A find wash and the ink that has to stay readable on it.
