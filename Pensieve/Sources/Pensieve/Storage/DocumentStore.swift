@@ -2293,6 +2293,14 @@ final class FolderManager {
     reconcileTrashedOpenFiles(into: appState)
   }
 
+  /// Makes the saved working set durable NOW rather than whenever cfprefsd feels
+  /// like it. Called on the way out of the process — see `BookmarkStore.startFlush()`
+  /// for the write-back race this closes, and `TerminationSequence` for the
+  /// budget the await puts around it.
+  func flushWorkingSet() async {
+    await bookmarkStore.startFlush().value
+  }
+
   /// Retires open files that have been thrown away since the last scan.
   ///
   /// Every scan commit passes through here — the explicit refresh after

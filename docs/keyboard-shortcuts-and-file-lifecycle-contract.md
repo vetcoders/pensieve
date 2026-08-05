@@ -248,6 +248,11 @@ Close All must never cause silent data loss.
   mid-replacement, or on an unplugged volume) and only drops out of what a
   restore opens. Workspace **roots** keep their own lifecycle — still **[OPEN]**.
 
+- **The working set is durable by the time the process is gone.** Quit forces it
+  out of cfprefsd's write-back queue instead of letting the system flush it on its
+  own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
+  change made to those defaults in the meantime). It runs inside the quit's drain
+  budget, so a stalled flush can never beachball the quit.
 - **Single source of truth for the session: the app.** macOS's own window
   restoration (Saved Application State) must not resurrect documents alongside
   the app's session model (bug G, 03.08 — pending session-layer audit). The

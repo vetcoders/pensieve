@@ -44,6 +44,28 @@ final class BookmarkStore {
     trashMembership(url)
   }
 
+  /// Starts the working set's write-back to disk and hands the caller something
+  /// to wait on.
+  ///
+  /// `UserDefaults` writes nothing itself: it hands the change to cfprefsd,
+  /// which updates the backing plist on its own schedule — measured on this
+  /// machine at up to ~14 s AFTER the writing process had already exited. The
+  /// saved working set was therefore still in flight while the app looked
+  /// entirely gone, and that late flush could land on top of whatever touched
+  /// those defaults in the meantime, resurrecting state that had been cleared on
+  /// purpose. Nothing about WHAT is saved changes here — only when it is durable.
+  ///
+  /// Started off-main and awaited rather than called inline, for exactly the
+  /// reason `TerminationSequence` gives about its own checkpoint: work a quit
+  /// performs SYNCHRONOUSLY on the main thread sits outside the drain budget no
+  /// matter what the deadline says. `synchronize()` is a round trip to another
+  /// process, so it is precisely the kind of call that must be allowed to run
+  /// out of budget instead of beachballing the quit.
+  func startFlush() -> Task<Void, Never> {
+    let defaults = defaults
+    return Task.detached { defaults.synchronize() }
+  }
+
   var bookmarkData: Data? {
     rootBookmarkData.first ?? defaults.data(forKey: legacyFolderBookmarkKey)
   }
