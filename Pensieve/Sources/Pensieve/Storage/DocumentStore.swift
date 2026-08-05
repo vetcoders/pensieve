@@ -3270,6 +3270,8 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
+      // STATUS, not data loss: the draft file is still on disk — it is
+      // retired only on a SUCCESSFUL save — so the work survives this failure.
       appState.lastError = message
       NSLog(message)
       return false
@@ -3546,7 +3548,9 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
-      appState.lastError = message
+      // DATA LOSS: the edit reached no file, so the buffer is the only copy
+      // of it and the document on disk is stale.
+      appState.reportDataLoss(message)
       NSLog(message)
       return false
     }
@@ -3829,10 +3833,13 @@ final class DocumentStore {
         text: appState.documentSession.text
       )
       appState.documentSession.recoveryID = draft.id
-      appState.lastError = nil
+      appState.clearError()
       return true
     } catch {
-      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+      // DATA LOSS: this write IS the durable copy. It failed, so the text exists
+      // only in the buffer and dies with the process.
+      appState.reportDataLoss(
+        "Could not write recovery draft: \(error.localizedDescription)")
       return false
     }
   }
@@ -3869,7 +3876,11 @@ final class DocumentStore {
       appState.documentSession.recoveryID = draft.id
       return true
     } catch {
-      appState.lastError = "Could not write recovery draft: \(error.localizedDescription)"
+      // DATA LOSS: the file on disk is already stale — that is why this path
+      // runs — so the stash was the last chance to put the edit anywhere
+      // durable. It failed, and the buffer is about to be torn down.
+      appState.reportDataLoss(
+        "Could not write recovery draft: \(error.localizedDescription)")
       return false
     }
   }
@@ -4123,7 +4134,9 @@ final class DocumentStore {
       return true
     } catch {
       let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
-      appState.lastError = message
+      // DATA LOSS: the edit reached no file, so the buffer is the only copy
+      // of it and the document on disk is stale.
+      appState.reportDataLoss(message)
       NSLog(message)
       return false
     }

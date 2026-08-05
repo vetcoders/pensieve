@@ -442,6 +442,52 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
   }
 
+  /// The same failure, followed one step further: it now reaches the operator.
+  ///
+  /// 45.1 made the failed import RECORD its error; the field it recorded into
+  /// had no renderer, so nothing said it out loud. This pins the whole chain on
+  /// the real production path — convert, fail to write the draft, and end up
+  /// with a window that shows a standing banner AND asks, because the converted
+  /// text exists in exactly one place and that place is volatile.
+  ///
+  /// The severity matters as much as the message: `importDocument` composes its
+  /// own sentence on top of the write error, and doing that through a plain
+  /// `lastError` assignment would silently demote the failure to a passive
+  /// notice on the way.
+  @MainActor
+  func testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss() async throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("Board Resolution.pdf")
+    try makeTextPDF("Prokurent approval is required.").write(to: sourceURL, options: .atomic)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: indexDatabase,
+      recoveryStore: try makeUnwritableRecoveryStore(in: folder))
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase)
+
+    controller.importDocument(url: sourceURL)
+    try await waitForPublishedImportBuffer(in: appState)
+
+    XCTAssertEqual(
+      appState.currentError?.severity, .dataLoss,
+      "the only copy of the converted text is the buffer, and the window filed that as routine")
+    XCTAssertTrue(
+      WindowErrorSurface.resolve(for: appState.currentError).showsBanner,
+      "the failed import left the window with nothing to show")
+    let alert = try XCTUnwrap(
+      appState.pendingDataLossAlert, "the failed import asked the user nothing")
+    XCTAssertTrue(
+      alert.message.contains("Board Resolution.pdf"),
+      "the alert does not say WHICH converted text has no safe copy: \(alert.message)")
+  }
+
   /// Control: with a writable recovery directory the import path is unchanged —
   /// the draft lands, the error is cleared, and the buffer keeps its claim.
   @MainActor

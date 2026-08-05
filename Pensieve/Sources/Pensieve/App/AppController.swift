@@ -554,15 +554,15 @@ final class AppController: ObservableObject {
           // recorded the risk. The buffer is left open and dirty, and the stakes
           // are appended to the write error `saveRecoveryDraft` already reported.
           //
-          // NOT yet a message the user SEES: `AppState.lastError` currently has
-          // no renderer — it is written all over the app and read by no view. So
-          // this records the failure rather than surfacing it, and the surfacing
-          // is a separate, open piece of work. See the lifecycle contract's
-          // Recovery section, GAP 2.
-          appState.lastError =
+          // Reported through `reportDataLoss`, not a plain `lastError` write:
+          // the assignment would re-file this as an ordinary status line and
+          // silently DOWNGRADE the data-loss severity `saveRecoveryDraft` just
+          // recorded, costing the alert. See the lifecycle contract's Recovery
+          // section.
+          appState.reportDataLoss(
             (appState.lastError ?? "Could not write recovery draft.")
-            + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
-            + " recovery copy — save it with Save As… before quitting."
+              + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
+              + " recovery copy — save it with Save As… before quitting.")
           DebugTrace.log(
             "importDocument -> Markdown draft NOT persisted: \(sourceURL.lastPathComponent)")
           return

@@ -199,7 +199,7 @@ Clarification (05.08, after the file-backed half of bug I):
   decision, not current behavior.)
 
 Clarification (05.08, after the "silent failed recovery write" bug) — PARTIAL,
-with two named gaps below:
+with one named gap below:
 
 - **A recovery write reports whether the bytes reached disk.** Every path that
   persists a recovery item now returns that result instead of a constant, and a
@@ -223,13 +223,12 @@ with two named gaps below:
   BEFORE teardown, so the flush finds nothing dirty and the gap does not bite;
   it bites on teardowns that bypass the conscious close — which is exactly what
   the stash exists as a backstop for.
-- **GAP 2 — `lastError` currently has no renderer.** `AppState.lastError` is
-  written in many places and read by no view: the only non-test readers are its
-  own getter and the import path appending to it. So "the error stays on screen"
-  describes the STATE, not anything the user can see today. Until an error
-  surface exists, every guarantee above is about what the app knows, not about
-  what it tells anyone. Both gaps are open follow-ups, not settled behavior —
-  see `2026-08-05_notatka-45-1-close-quit-flush.md` in the project notes.
+- **GAP 2 — no renderer — CLOSED (05.08, same line of work).** `AppState.lastError`
+  used to be written in many places and read by no view, so "the error stays on
+  screen" described the STATE and nothing the user could see. It now renders;
+  see "Error surface" below for exactly what appears and when. GAP 1 remains an
+  open follow-up, not settled behavior — see
+  `2026-08-05_notatka-45-1-close-quit-flush.md` in the project notes.
 - **What is NOT guaranteed even where the guarantee holds.** Pensieve does not
   relocate the recovery directory and does not save the work anywhere else. It
   performs no retry of its own; the next write EVENT (an edit re-arming autosave)
@@ -251,6 +250,58 @@ with two named gaps below:
   branches at the `DocumentStore` level — they prove the RETURN VALUE and the
   buffer state, and deliberately not the behavior of a real Close or Quit, which
   is GAP 1.
+
+### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
+
+What an error the app records actually does on screen. The behavior below is
+implemented and pinned; its **visual shape is a recommendation awaiting Monika's
+ratification**, so the wording, colour and placement may still change without
+changing anything in this section's rules.
+
+**Two classes, chosen at the write site.** A failure is classified where it is
+raised, never by matching its message text:
+
+- **Status** (the default). The action was refused, a read failed, or some
+  housekeeping did not land — and nothing the user typed is at risk. Examples:
+  "Open a workspace folder before creating a workspace file", a workspace that
+  will not open, a recovered draft that could not be saved under a new name
+  (the draft file is still on disk, so the work survives).
+- **Data loss.** Pensieve failed to put content anywhere durable AND the only
+  remaining copy is the in-memory buffer. Exactly four sites raise it today:
+  `saveExisting` and `saveAs` (the edit reached no file), the untitled recovery
+  draft write and the closing-buffer stash (the write that WAS the durable
+  copy), plus `importDocument` composing its own sentence on top of the last of
+  those. Status is the default precisely so that the loud class stays opt-in: a
+  new error has to be argued into it and cannot fall into it.
+
+**Status class — a passive line in the window chrome.** It appears in the
+window that recorded the error and in no other (the state is per-window:
+`AppState.currentError` → `DocumentWindowModel.currentError`). It sits between
+the document pane and the status bar, and deliberately NOT behind the status
+bar's `documentHasEditableBuffer` gate — the errors that most need saying can
+land in a window with nothing open. It is passive in the strict sense: it never
+takes first responder, so it may appear and disappear under a live editing
+session without moving the caret or interrupting typing. It carries a dismiss
+button, and it goes away when dismissed or when something clears the error
+(a successful recovery write does exactly that). Nothing times it out.
+
+**Data-loss class — the same standing line PLUS an alert.** The alert is the one
+thing allowed to interrupt, and it may take focus. It is per-window, so a
+failure in one window never raises a modal over another. It is armed only on the
+TRANSITION into a new data-loss condition: a failing autosave repeating the same
+error every 1.5 s asks once, not once per tick, while a genuinely different
+failure asks again. The banner outlives the answered alert on purpose — the
+standing reminder that the work is not safe must not disappear with the modal.
+
+Tests. `WindowErrorChromeRenderTests` drives a real window hosting the real
+`ContentView` and measures the live layout, so "the banner is mounted" is read
+from the window and not from a resolver; it also holds the focus contract
+(typing continues, caret unmoved, first responder unchanged) across the banner
+appearing and disappearing. `WindowErrorSurfaceTests` pins the classification
+through real production paths (a failing save, an unwritable recovery
+directory, a refused document creation) and the once-per-condition alert.
+`testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss` holds the import chain
+end to end.
 
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 

@@ -28,6 +28,13 @@ struct ContentView: View {
     } detail: {
       VStack(spacing: 0) {
         EditorPreviewSplit()
+        // Deliberately OUTSIDE the buffer gate below: the errors that most need
+        // saying (a workspace that will not open, a file that has moved, a
+        // recovery draft that could not be written) can all land in a window
+        // with nothing open, where the status bar does not exist.
+        if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
+          WindowErrorBanner(error: error) { appState.clearError() }
+        }
         if appState.documentHasEditableBuffer {
           EditorStatusBar()
             .opacity(appState.mode == .focus ? 0.45 : 1)
@@ -68,6 +75,20 @@ struct ContentView: View {
     }
     .sheet(isPresented: onboardingSheetBinding) {
       ProviderOnboardingView(isPresented: onboardingSheetBinding)
+    }
+    // Data loss is the ONE class that gets to interrupt. Bound to this window's
+    // own pending alert — the same per-window discipline `pendingDispatchIntent`
+    // follows — so a failure while saving in one window cannot raise a modal
+    // over another one. The banner survives the dismissal; this only stops the
+    // user from walking away believing the work was written.
+    .alert(
+      "Your changes are not saved",
+      isPresented: dataLossAlertBinding,
+      presenting: appState.pendingDataLossAlert
+    ) { _ in
+      Button("OK", role: .cancel) { appState.pendingDataLossAlert = nil }
+    } message: { pending in
+      Text(pending.message)
     }
     .onAppear {
       evaluateProviderOnboarding()
@@ -128,6 +149,16 @@ struct ContentView: View {
     Binding(
       get: { appState.pendingDispatchIntent },
       set: { appState.pendingDispatchIntent = $0 }
+    )
+  }
+
+  /// Presentation flag for the data-loss alert, derived from this window's own
+  /// pending question. Setting it `false` (the alert dismissing itself) retires
+  /// the question so it is asked once.
+  private var dataLossAlertBinding: Binding<Bool> {
+    Binding(
+      get: { appState.pendingDataLossAlert != nil },
+      set: { if !$0 { appState.pendingDataLossAlert = nil } }
     )
   }
 

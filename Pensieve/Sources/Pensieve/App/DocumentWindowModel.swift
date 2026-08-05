@@ -190,7 +190,20 @@ final class DocumentWindowModel {
       defaults.set(showAllFilesInSidebar, forKey: Self.showAllFilesInSidebarKey)
     }
   }
-  var lastError: String?
+  /// This window's most recent error, or `nil` when it has nothing to report.
+  ///
+  /// Was a bare `String?` that nothing rendered: it was written from ~35 sites
+  /// across the app and read by no view at all, so every failure the app knew
+  /// about — including a crash-recovery draft that could not be written — was
+  /// recorded and never shown. It now backs `WindowErrorBanner`, and carries the
+  /// severity that decides whether a passive line is enough.
+  var currentError: WindowError?
+
+  /// A data-loss error this window has not yet ALERTED about. Set only on the
+  /// transition into a new data-loss condition, so a failing autosave repeating
+  /// the same error every 1.5 s asks once instead of once per tick. Presented
+  /// and cleared by `ContentView`, exactly like `pendingDispatchIntent`.
+  var pendingDataLossAlert: WindowError?
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
