@@ -88,6 +88,42 @@ Saves the active tab:
 - an untitled/unsaved tab — triggers Save As;
 - saving must not trigger a self-write reindex loop or lose the dirty buffer state.
 
+#### Who may CREATE a file (05.08)
+
+A write to a document's own path may **update** the file it names. Only a write
+the user **asked for** may bring one back that is no longer there.
+
+- **Explicit** — `Cmd+S`, `Shift+Cmd+S`, and **Save** answered in a close prompt.
+  If the file has vanished from disk (Trash, `rm`, a sync client), these write it
+  again. Putting the file back is what the user asked for.
+- **Unattended** — the auto-save debounce, the window-teardown flush, and the
+  close paths auto-save answers on the user's behalf. These write **only a file
+  that is still there**. A missing target is refused before any write: nobody
+  asked for it, so a note dragged to the Trash must not reappear where it was,
+  beside the copy still sitting in the Trash.
+
+What a refusal guarantees:
+
+- the file is **not** recreated, and nothing else on disk is touched;
+- the buffer keeps every character and stays **dirty**, so the tab's unsaved
+  marker and the close question stay truthful;
+- a refusal is reported exactly like any other save that did not happen, and
+  every caller already handles that: a close driven by auto-save is **aborted**
+  and the window goes on holding the text, and a window tearing down anyway
+  stashes the buffer as a recovery draft, exactly as an auto-save-OFF close
+  does. A write that was **attempted and failed** (permissions, full disk)
+  behaves identically and is unchanged by this rule — this cut adds a reason to
+  refuse a write, not a new way to close a document.
+
+Known limits, deliberately not claimed:
+
+- while a document sits in the refused state, its buffer is durable only in
+  memory until the window tears down — the same guarantee a dirty file-backed
+  buffer has today with auto-save OFF, or after a save that failed;
+- the refusal is not announced in the UI. `AppState.lastError` is set, but it
+  has no renderer, so the observable signal is that the file does not come back
+  and the document stays dirty. A visible surface for it is a separate cut.
+
 ### `Shift+Cmd+S` — Save As…
 
 Saves the active buffer as a new file, and on success assigns the tab a new path. This is not TextEdit's `Duplicate`, unless a separate flow is approved at the product level.

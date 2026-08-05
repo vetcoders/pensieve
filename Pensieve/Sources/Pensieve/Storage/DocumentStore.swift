@@ -3622,8 +3622,15 @@ final class DocumentStore {
       break
 
     case (.saveWithoutPrompting, _), (.confirm(.savePathed), .save):
+      // Auto-save answering the save question for the user is an UNATTENDED
+      // write — it may update the user's file but must never bring one back
+      // (see `saveExisting`). "Save" clicked in the prompt is the user asking
+      // for this exact write, so it stays explicit. Either way, a save that
+      // does not happen aborts the close and leaves the window holding the
+      // only copy of the text.
       let openSessionID = appState.documentSession.id
-      guard saveExisting(appState: appState, indexNow: true) else {
+      let trigger: SaveTrigger = decision == .saveWithoutPrompting ? .unattended : .explicit
+      guard saveExisting(appState: appState, indexNow: true, trigger: trigger) else {
         appState.selectedDocumentID = openSessionID
         return false
       }
@@ -3675,7 +3682,7 @@ final class DocumentStore {
   }
 
   func save(appState: AppState) {
-    _ = saveExisting(appState: appState, indexNow: true)
+    _ = saveExisting(appState: appState, indexNow: true, trigger: .explicit)
   }
 
   @discardableResult
@@ -3803,12 +3810,13 @@ final class DocumentStore {
     // writing the file here would be exactly the silent write the setting
     // forbids — and this teardown path has no veto point left (a raw
     // `window.close()`, or a SwiftUI-scene close that never reached the
-    // shouldClose sheet). Either way — auto-save off, OR an auto-save write that
-    // FAILED — the buffer must not die with the window: stash it as a recovery
-    // draft and leave the file exactly as it is. Nothing is written behind the
-    // user's back, and nothing is lost.
+    // shouldClose sheet). Either way — auto-save off, an auto-save write that
+    // FAILED, or a file no longer on disk to be updated — the buffer must not
+    // die with the window: stash it as a recovery draft and leave the file
+    // exactly as it is. Nothing is written behind the user's back, and nothing
+    // is lost.
     if savingSettings.autoSavesPathedDocuments,
-      saveExisting(appState: appState, indexNow: true)
+      saveExisting(appState: appState, indexNow: true, trigger: .unattended)
     {
       return true
     }
@@ -3940,7 +3948,7 @@ final class DocumentStore {
       if appState.documentSession.isUntitled {
         self.saveRecoveryDraft(appState: appState)
       } else if self.savingSettings.autoSavesPathedDocuments {
-        self.saveExisting(appState: appState, indexNow: false)
+        _ = self.saveExisting(appState: appState, indexNow: false, trigger: .unattended)
       }
     }
   }
@@ -3962,11 +3970,13 @@ final class DocumentStore {
   }
 
   /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
-  /// tearing down without reaching disk — auto-save is off, or an auto-save write
-  /// just failed. Unlike `saveRecoveryDraft` (untitled), this never clears
-  /// `appState.lastError`: when the stash follows a FAILED save that error must
-  /// stay surfaced (a recovery draft AND a visible error), so the user learns the
-  /// file on disk is stale rather than believing the close saved it.
+  /// tearing down without reaching disk — auto-save is off, an auto-save write
+  /// just failed, or the file it belongs to is no longer on disk for an
+  /// unattended write to update (see `saveExisting`). Unlike `saveRecoveryDraft`
+  /// (untitled), this never clears `appState.lastError`: when the stash follows a
+  /// FAILED save that error must stay surfaced (a recovery draft AND a visible
+  /// error), so the user learns the file on disk is stale rather than believing
+  /// the close saved it.
   private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
     guard appState.documentSession.isDirty else { return }
 
@@ -4082,7 +4092,13 @@ final class DocumentStore {
     }
 
     let openSessionID = appState.documentSession.id
-    _ = saveExisting(appState: appState, indexNow: true)
+    // Auto-save ON means nobody was asked, so this force-save is unattended and
+    // must not recreate a file that has gone missing; auto-save OFF means the
+    // user answered Save to the prompt above, which is them asking for this
+    // exact write. Either way a session left dirty below refuses to settle — a
+    // refused write and a failed one both leave the buffer as the only truth.
+    let trigger: SaveTrigger = savingSettings.autoSavesPathedDocuments ? .unattended : .explicit
+    _ = saveExisting(appState: appState, indexNow: true, trigger: trigger)
     guard !appState.documentSession.isDirty else {
       appState.selectedDocumentID = openSessionID
       return nil
@@ -4172,7 +4188,11 @@ final class DocumentStore {
   }
 
   @discardableResult
-  private func saveExisting(appState: AppState, indexNow: Bool) -> Bool {
+  private func saveExisting(
+    appState: AppState,
+    indexNow: Bool,
+    trigger: SaveTrigger
+  ) -> Bool {
     self.appState = appState
     // This write makes THIS session's armed autosave redundant and nobody else's: an ordinary ⌘S in
     // one window must not delete another window's pending autosave. When this runs as the debounce's
@@ -4189,6 +4209,43 @@ final class DocumentStore {
     guard appState.documentSession.hasEditableBuffer,
       let url = appState.documentSession.url
     else { return false }
+
+    // A file-backed write may UPDATE the user's file. It may not bring one back.
+    //
+    // A document can leave the disk while its buffer is still on screen —
+    // dragged to the Trash in Finder, deleted by a script, removed by a sync
+    // client — and the session goes on naming the path it was opened at. An
+    // UNATTENDED write to that path does not update anything: it CREATES the
+    // file again, so a note the user threw away reappears where it was, beside
+    // the copy still sitting in the Trash, with nothing on screen to explain it.
+    // Nobody asked for that write, so nobody can be surprised by its absence.
+    //
+    // Only unattended writes are refused. ⌘S and Save As are the user asking for
+    // this exact write, and putting the file back is precisely what they asked
+    // for — refusing there would strand the buffer with no way to reach the path
+    // it belongs to.
+    //
+    // The work is never the thing that pays. A refusal reports itself exactly
+    // like any other save that did not happen, and every caller already treats
+    // that the same way: the buffer is left as the user typed it and stays
+    // DIRTY, a close driven by auto-save is ABORTED so the window keeps holding
+    // the only copy, and the teardown guard (`savePendingChangesOnClose`)
+    // stashes it as a recovery draft rather than letting it die with the
+    // window. That is the shipped behaviour for a file-backed buffer that
+    // cannot reach disk, not a new lane opened here.
+    //
+    // Deliberately NOT stashing a draft on every refused tick: a file-backed
+    // session cannot carry a draft id (`DocumentSession.recoveryID` is defined
+    // for untitled sessions only), so each stash would mint a NEW draft and a
+    // minute of typing would pile up one per debounce.
+    if trigger == .unattended, !FileManager.default.fileExists(atPath: url.path) {
+      let message =
+        "Could not save \(url.lastPathComponent): it is no longer on disk."
+        + " Your changes are still here — use Save As… to write them somewhere."
+      appState.lastError = message
+      NSLog(message)
+      return false
+    }
     let ref = documentRef(for: url, appState: appState)
 
     do {
@@ -4225,6 +4282,18 @@ final class DocumentStore {
       NSLog(message)
       return false
     }
+  }
+
+  /// Who asked for a write to a document's own file, which is what decides
+  /// whether that write may CREATE its target.
+  private enum SaveTrigger {
+    /// The user asked for this exact write — ⌘S, or Save in a close prompt. A
+    /// file that has gone missing is theirs to put back.
+    case explicit
+    /// Nobody asked: the auto-save debounce, the window-teardown flush, and the
+    /// close paths auto-save owns because it answers the save question for the
+    /// user. These may only update a file that is still there.
+    case unattended
   }
 
   private func registerSavedDocument(
