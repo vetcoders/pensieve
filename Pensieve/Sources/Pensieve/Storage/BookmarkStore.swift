@@ -295,9 +295,9 @@ final class BookmarkStore {
   /// volume brought back before it can even be resolved cannot be describing a
   /// file that was just moved to the Trash, and an unresolvable blob is kept.
   @discardableResult
-  func pruneTrashedFiles() -> [URL] {
+  func pruneTrashedFiles() -> [PrunedTrashedFile] {
     var survivors: [Data] = []
-    var trashed: [URL] = []
+    var trashed: [PrunedTrashedFile] = []
     for data in fileBookmarkData {
       var bookmarkIsStale = false
       guard
@@ -313,12 +313,53 @@ final class BookmarkStore {
         continue
       }
       stopAccess(to: resolved.standardizedFileURL)
-      trashed.append(resolved.standardizedFileURL)
+      trashed.append(
+        PrunedTrashedFile(
+          trashedURL: resolved.standardizedFileURL,
+          originURL: Self.bookmarkedOriginURL(for: data)
+        ))
     }
 
     guard !trashed.isEmpty else { return [] }
     defaults.set(survivors, forKey: fileBookmarksKey)
     return trashed
+  }
+
+  /// The path a bookmark was MINTED for, read out of the blob itself.
+  ///
+  /// This is the only thing that connects a working-set row — which still names
+  /// the path its file was opened at — to the blob that has just turned up in
+  /// the Trash. Resolving cannot supply it: resolution follows the file and
+  /// answers where it is NOW.
+  ///
+  /// Read without resolving, so it costs no filesystem work and cannot mount
+  /// anything (see `pruneTrashedFiles`). A blob that carries no cached path
+  /// answers nil and the caller then retires nothing on its account — the row
+  /// survives, which is the safe direction.
+  private static func bookmarkedOriginURL(for bookmark: Data) -> URL? {
+    guard let path = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
+    else { return nil }
+    return URL(fileURLWithPath: path)
+  }
+
+  /// The one spelling both halves of the working set must agree on.
+  ///
+  /// A live row names a path; a bookmark blob carries the path it was minted
+  /// for. Standardizing both is not enough on its own: `standardizedFileURL`
+  /// drops a leading `/private` only while the result still names an EXISTING
+  /// item, and the case this comparison exists for is a file that no longer sits
+  /// there — so the same document reads as `/var/…` from the live row and
+  /// `/private/var/…` from the blob of its trashed self, and a correlation by
+  /// path would silently never match.
+  ///
+  /// The prefix is therefore removed unconditionally. This is an identity key,
+  /// never a path handed back to the filesystem, and on macOS `/var`, `/tmp` and
+  /// `/etc` are precisely the symlinks into `/private` that make the two
+  /// spellings the same file.
+  static func identityPath(_ url: URL) -> String {
+    let path = url.standardizedFileURL.path
+    guard path.hasPrefix("/private/") else { return path }
+    return String(path.dropFirst("/private".count))
   }
 
   private func resolvedPath(for bookmark: Data) -> String? {
@@ -503,4 +544,22 @@ final class BookmarkStore {
 struct RestoredWorkspaceBookmarks {
   var rootURLs: [URL]
   var fileURLs: [URL]
+}
+
+/// One persisted working-set entry the Trash prune retired, named on BOTH sides
+/// of the move it did not witness.
+///
+/// A caller reconciling a LIVE working set needs the second half. Its rows name
+/// the paths their files were opened at, and a trashed file is no longer there —
+/// so "which of my rows just died" can only be answered by the path the dropped
+/// bookmark was minted for. Answering it by file NAME instead is how a document
+/// still open from a disconnected volume could be retired because an unrelated
+/// namesake was thrown away.
+struct PrunedTrashedFile: Equatable {
+  /// Where the bookmark resolves NOW: inside a Trash.
+  let trashedURL: URL
+
+  /// The path the bookmark was minted for — the pre-trash location a live
+  /// working-set row still names. Nil when the blob carries no cached path.
+  let originURL: URL?
 }

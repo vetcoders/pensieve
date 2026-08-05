@@ -2361,12 +2361,19 @@ final class FolderManager {
   ///
   /// - the row points INTO the Trash already (it was restored from a bookmark
   ///   that followed its file there), which is exact and decides on its own;
-  /// - the row's file vanished from the path it was opened at, AND a bookmark of
-  ///   that same name has just turned up in the Trash. Neither half is proof
-  ///   alone — a missing file may be mid-replacement, and a trashed namesake may
-  ///   be a different document — but together they cannot describe a document
-  ///   that is still open, and if two namesakes really were trashed at once both
-  ///   are dead anyway.
+  /// - the row's file vanished from the path it was opened at, AND the bookmark
+  ///   MINTED FOR THAT PATH has just turned up in the Trash. Neither half is
+  ///   proof alone — a missing file may be mid-replacement, and a bookmark found
+  ///   in the Trash may belong to a document nobody has open — but together they
+  ///   describe one file that left one path for the Trash.
+  ///
+  /// The correlation is by the dropped bookmark's own pre-trash path, never by
+  /// file NAME. Names are not identities: `notes.md` open from an unplugged
+  /// volume is missing, and a completely unrelated `~/Desktop/notes.md` thrown
+  /// away the same minute would have retired the live external row — the exact
+  /// opposite of the rule this reconcile exists to keep, that merely MISSING is
+  /// not trashed. A blob carrying no cached path retires nothing, which leaves
+  /// the row alive: the safe direction.
   ///
   /// The cheap existence/membership survey runs first so a healthy working set
   /// never pays for resolving bookmarks on the refresh path.
@@ -2374,26 +2381,29 @@ final class FolderManager {
     guard !appState.openFiles.isEmpty else { return }
 
     let fileManager = FileManager.default
-    var vanishedNames = Set<String>()
+    var vanishedPaths = Set<String>()
     var trashedRowPaths = Set<String>()
     for ref in appState.openFiles {
       let url = ref.url.standardizedFileURL
       if !fileManager.fileExists(atPath: url.path) {
-        vanishedNames.insert(url.lastPathComponent)
+        vanishedPaths.insert(BookmarkStore.identityPath(url))
       } else if bookmarkStore.isTrashed(url) {
         trashedRowPaths.insert(url.path)
       }
     }
-    guard !vanishedNames.isEmpty || !trashedRowPaths.isEmpty else { return }
+    guard !vanishedPaths.isEmpty || !trashedRowPaths.isEmpty else { return }
 
-    let trashedNames = Set(bookmarkStore.pruneTrashedFiles().map(\.lastPathComponent))
+    let retiredPaths = Set(
+      bookmarkStore.pruneTrashedFiles()
+        .compactMap(\.originURL)
+        .map(BookmarkStore.identityPath))
     appState.openFiles.removeAll { ref in
       let url = ref.url.standardizedFileURL
       if trashedRowPaths.contains(url.path) {
         return true
       }
-      let name = url.lastPathComponent
-      return vanishedNames.contains(name) && trashedNames.contains(name)
+      let identity = BookmarkStore.identityPath(url)
+      return vanishedPaths.contains(identity) && retiredPaths.contains(identity)
     }
   }
 

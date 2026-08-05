@@ -275,7 +275,10 @@ Close All must never cause silent data loss.
 
   A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
   mid-replacement, or on an unplugged volume) and only drops out of what a
-  restore opens.
+  restore opens. The running app retires such a row only when the bookmark that
+  turned up in the Trash is the one MINTED FOR THAT PATH — never because a file
+  of the same NAME was thrown away somewhere else, which would retire a document
+  still open from a disconnected volume.
 
   **RESOLVED (Monika, 2026-08-05):** a workspace **root** follows the same
   rule as an individual file above. A root that lands in the Trash
