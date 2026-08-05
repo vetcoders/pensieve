@@ -533,7 +533,11 @@ ax_census_status=0
 # $(...) -- it dies with "unexpected EOF while looking for matching `''" long
 # before this script ever runs. Writing to a file first keeps the
 # substitution itself heredoc-free.
-ax_census_script="$(mktemp "${TMPDIR:-/tmp}/pensieve-ax-census.XXXXXX")"
+# Inside SMOKE_ROOT, which the EXIT trap owns outright. Landing it in $TMPDIR
+# instead meant every early exit -- an assertion failure, an error raised inside
+# osascript, a Ctrl-C -- stranded the file, because cleanup() knows only about
+# SMOKE_ROOT.
+ax_census_script="$(mktemp "$SMOKE_ROOT/pensieve-ax-census.XXXXXX")"
 cat >"$ax_census_script" <<'APPLESCRIPT'
 on waitForProcess(appName, timeoutSeconds)
   tell application "System Events"
