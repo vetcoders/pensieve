@@ -360,6 +360,144 @@ final class RecoveredDraftsTests: XCTestCase {
       try sidecars(), [], "the discarded draft left its title sidecar behind as an orphan")
   }
 
+  // MARK: - One buffer, one draft identity
+
+  /// The live defect, at its smallest: ONE buffer persisted twice must land in
+  /// ONE draft file. Nothing sweeps the recovery directory any more, so a writer
+  /// that mints a fresh UUID per write does not merely churn — it grows the
+  /// directory without bound (the operator's build 636 accumulated 95 byte-identical
+  /// drafts of a single document).
+  ///
+  /// The untitled autosave path is the control half of the root cause: it always
+  /// wrote its ID back into the session, so it converged.
+  @MainActor
+  func testTwoAutosaveTicksOnOneUntitledBufferWriteOneDraft() async throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store)
+    appState.documentSession.createUntitled(title: "Untitled.md")
+
+    appState.activeDocumentText = "# Umowa"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntilDrafts(in: store, contain: "# Umowa")
+    let firstID = try XCTUnwrap(store.loadDrafts().first?.id)
+
+    appState.activeDocumentText = "# Umowa\n\npara 1"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntilDrafts(in: store, contain: "# Umowa\n\npara 1")
+
+    XCTAssertEqual(
+      store.loadDrafts().map(\.id), [firstID],
+      "a second autosave tick on the same buffer wrote a second draft file")
+    XCTAssertEqual(appState.documentSession.recoveryID, firstID)
+  }
+
+  /// ROOT CAUSE. `recoveryID` used to live inside `DocumentSession.Kind.untitled`,
+  /// so for a FILE-BACKED buffer the getter answered `nil` and the setter was a
+  /// no-op. `stashClosingBufferAsRecoveryDraft` — the teardown path taken by every
+  /// dirty file-backed buffer while auto-save is off, which is the default — read
+  /// `nil`, minted a fresh UUID, and threw the write-back away. Every close of the
+  /// same document therefore produced ANOTHER draft file of the same text.
+  @MainActor
+  func testRepeatedTeardownStashesOfOneFileBackedBufferKeepOneDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      // Long enough that only the explicit teardown flush can persist anything.
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let firstID = try XCTUnwrap(store.loadDrafts().first?.id)
+    // The buffer is still dirty (nothing reached the file), so the next teardown
+    // pass over the same session — a second window on the file, the quit flush
+    // after a window close — stashes it again.
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(
+      store.loadDrafts().map(\.id), [firstID],
+      "the second stash of the same buffer minted a new draft UUID")
+    XCTAssertEqual(store.loadDrafts().map(\.text), ["# Umowa"])
+    XCTAssertEqual(
+      appState.documentSession.recoveryID, firstID,
+      "the stash did not record which draft this buffer owns")
+  }
+
+  /// Control: identity, not content, is what dedups. Two buffers that happen to
+  /// hold the same text are two different pieces of work and keep two drafts.
+  @MainActor
+  func testTwoDifferentBuffersKeepTwoDraftsEvenWithIdenticalText() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+
+    let first = AppState()
+    first.documentSession.createUntitled(title: "Untitled.md")
+    first.activeDocumentText = "# Umowa"
+    first.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: first))
+
+    let second = AppState()
+    second.documentSession.createUntitled(title: "Untitled 2.md")
+    second.activeDocumentText = "# Umowa"
+    second.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: second))
+
+    XCTAssertEqual(
+      Set(store.loadDrafts().map(\.id)).count, 2,
+      "two independent buffers were collapsed into one draft")
+    XCTAssertNotEqual(first.documentSession.recoveryID, second.documentSession.recoveryID)
+  }
+
+  /// A stash is recoverable work only until the work is safely on disk. Now that a
+  /// file-backed buffer keeps its draft across closes, the save that publishes the
+  /// same bytes has to retire it — otherwise the launcher would offer content the
+  /// user already saved, forever, since nothing sweeps drafts.
+  @MainActor
+  func testSavingTheFileRetiresTheDraftItWasStashedInto() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "")
+    appState.activeDocumentText = "# Umowa"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(documentStore.savePendingChangesOnClose(appState: appState))
+    let stashed = try XCTUnwrap(store.loadDrafts().first)
+
+    documentStore.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "# Umowa")
+    XCTAssertFalse(
+      fileExists(stashed.url), "the draft outlived the save that made it redundant")
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertNil(appState.documentSession.recoveryID)
+  }
+
   // MARK: - Launcher model
 
   @MainActor
@@ -397,6 +535,22 @@ final class RecoveredDraftsTests: XCTestCase {
 
   private func fileExists(_ url: URL) -> Bool {
     FileManager.default.fileExists(atPath: url.path)
+  }
+
+  /// Waits for the debounced autosave to land `text` in the recovery store.
+  private func waitUntilDrafts(
+    in store: RecoveryStore,
+    contain text: String,
+    timeout: TimeInterval = 5,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if store.loadDrafts().contains(where: { $0.text == text }) { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("no recovery draft holding \(text.debugDescription)", file: file, line: line)
   }
 
   private func makeTemporaryFolder() throws -> URL {

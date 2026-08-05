@@ -3806,6 +3806,14 @@ final class DocumentStore {
   /// `appState.lastError`: when the stash follows a FAILED save that error must
   /// stay surfaced (a recovery draft AND a visible error), so the user learns the
   /// file on disk is stale rather than believing the close saved it.
+  ///
+  /// The read-and-write-back of `recoveryID` around the save is what keeps this
+  /// buffer on ONE draft. It used to be a pair of no-ops here — `recoveryID`
+  /// lived inside `DocumentSession.Kind.untitled`, so a file-backed session read
+  /// `nil` and its write-back was swallowed — and every stash of the same file
+  /// therefore minted a fresh UUID. With auto-save off (the default) nothing
+  /// retires those files either, so a single unsaved document produced a new
+  /// draft on every close, without bound.
   private func stashClosingBufferAsRecoveryDraft(appState: AppState) {
     guard appState.documentSession.isDirty else { return }
 
@@ -4029,11 +4037,21 @@ final class DocumentStore {
       let url = appState.documentSession.url
     else { return false }
     let ref = documentRef(for: url, appState: appState)
+    // Read BEFORE the write: `documentSession.document` below drops the
+    // association, and a successful save is one of the three closed reasons a
+    // draft may be retired — the edit it was standing in for is now the file.
+    let stashedRecoveryID = appState.documentSession.recoveryID
 
     do {
       try writeDocument(appState.documentSession.text, url)
       selfWriteObserver(url)
       registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
+      // A file-backed buffer whose window tore down with auto-save off left a
+      // stash behind (`stashClosingBufferAsRecoveryDraft`). Now that the same
+      // bytes are on disk that stash is not recoverable work any more, and
+      // leaving it would have the launcher offering content the user already
+      // saved — forever, since nothing sweeps drafts.
+      recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       appState.lastError = nil
