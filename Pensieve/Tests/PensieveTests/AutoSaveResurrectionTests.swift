@@ -59,6 +59,71 @@ final class AutoSaveResurrectionTests: XCTestCase {
       "the thrown-away file came back on disk, beside its own copy in the Trash")
   }
 
+  /// THE OTHER PIN: the race the fast-path check cannot win.
+  ///
+  /// A preflight `fileExists` proves nothing about the write that follows it —
+  /// the file can go in between, and a plain atomic write recreates it. This
+  /// reproduces that window deterministically: the seam deletes the target
+  /// AFTER the check has already passed, and then hands the bytes to the
+  /// SHIPPED write layer. The guarantee has to come from that layer, so the
+  /// file must stay gone.
+  @MainActor
+  func testAWriteLosingItsTargetMidFlightStillDoesNotRecreateIt() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("raced.md").standardizedFileURL
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    var attempts = 0
+    let store = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      savingSettings: makeAutoSaveSettings(enabled: true),
+      replaceExistingDocument: { text, url in
+        attempts += 1
+        // The deletion the check above cannot see, landing in the window
+        // between the check and the write.
+        try FileManager.default.removeItem(at: url)
+        try DocumentStore.replaceExistingItem(text, at: url)
+      })
+    appState.documentSession.load(document: DocumentRef(id: noteURL), text: "on disk")
+    appState.documentSession.text = "typed into the race"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: appState))
+
+    XCTAssertEqual(attempts, 1, "the fast path must let this write reach the write layer")
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: noteURL.path),
+      "the file came back: the write layer created what the check had cleared")
+  }
+
+  /// The same guarantee stated at the write layer directly, without a store
+  /// around it — a missing target is refused by the publishing step itself.
+  func testTheReplaceOnlyWriteRefusesAMissingTargetAndKeepsAnExistingOne() throws {
+    let folder = try makeTemporaryFolder()
+    let missing = folder.appendingPathComponent("never-there.md")
+
+    XCTAssertThrowsError(try DocumentStore.replaceExistingItem("body", at: missing))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+
+    let present = folder.appendingPathComponent("there.md")
+    try "old".write(to: present, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+      [.posixPermissions: NSNumber(value: Int16(0o644))], ofItemAtPath: present.path)
+
+    try DocumentStore.replaceExistingItem("new", at: present)
+
+    XCTAssertEqual(try String(contentsOf: present, encoding: .utf8), "new")
+    XCTAssertEqual(
+      (try FileManager.default.attributesOfItem(atPath: present.path))[.posixPermissions]
+        as? NSNumber, NSNumber(value: Int16(0o644)),
+      "swapping inodes must not silently change the note's mode")
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: folder.path).filter {
+        $0.hasPrefix(".pensieve-save-")
+      }, [], "the temporary file must not survive the write")
+  }
+
   /// Refusing the write must not cost the user a single character. The buffer
   /// stays exactly as typed and stays DIRTY, which is what keeps the close
   /// question honest and the tab's unsaved marker truthful.

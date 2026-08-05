@@ -115,6 +115,24 @@ What a refusal guarantees:
   behaves identically and is unchanged by this rule — this cut adds a reason to
   refuse a write, not a new way to close a document.
 
+Where the guarantee lives: in the **write**, not in a check before it. An
+unattended save publishes through a replace-existing-only step
+(`DocumentStore.replaceExistingItem`) that requires its target to exist inside
+the same atomic operation, so there is no window in which the file can go and
+be recreated. The `fileExists` check ahead of it is a fast path that chooses a
+human-readable message; deleting it would change wording, never whether the
+file comes back. Any future rewrite of the write layer must keep this
+property — a plain atomic write reintroduces the bug.
+
+**Integration requirement for #45 (error surface).** When this line is
+integrated with #45, "the file is gone and the buffer is dirty" must **not**
+reach the UI as an ordinary `lastError` / `.status` notice. Under the 45.1a
+contract this is a **data-loss** class: the user's text now exists in no file,
+and the only copy is in a window they may close. It must be classified and
+surfaced as such — persistent, not auto-dismissing, and naming the recovery
+action (Save As…). Losing this classification during integration turns a
+data-loss warning into a toast.
+
 Known limits, deliberately not claimed:
 
 - while a document sits in the refused state, its buffer is durable only in
