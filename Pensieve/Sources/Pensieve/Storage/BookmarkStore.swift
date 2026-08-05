@@ -24,8 +24,24 @@ final class BookmarkStore {
   /// only seam a test can measure the balance through.
   var activeSecurityScopeCount: Int { activeAccess.count }
 
-  init(defaults: UserDefaults = .standard) {
+  private let trashMembership: (URL) -> Bool
+
+  init(
+    defaults: UserDefaults = .standard,
+    trashMembership: @escaping (URL) -> Bool = TrashLocation.contains
+  ) {
     self.defaults = defaults
+    self.trashMembership = trashMembership
+  }
+
+  /// Whether `url` names a document that has been thrown away.
+  ///
+  /// Exposed from the bookmark store on purpose: this store is what makes a file
+  /// outlive its path, so it is also what has to say when that survival stopped
+  /// meaning "still open". Every caller then shares one answer — and one
+  /// injection point for tests, which must not depend on the real Trash.
+  func isTrashed(_ url: URL) -> Bool {
+    trashMembership(url)
   }
 
   var bookmarkData: Data? {
@@ -231,6 +247,48 @@ final class BookmarkStore {
     for url in urls { stopAccess(to: url.standardizedFileURL) }
   }
 
+  /// Drops every persisted file bookmark whose target now sits in the Trash, and
+  /// reports those targets.
+  ///
+  /// This is the half of trashing that `removeFile` cannot do: `removeFile`
+  /// matches on the path a bookmark RESOLVES TO, and a trashed file resolves to
+  /// its new home under a Trash folder — never to the path it was trashed from.
+  /// Dropping by where a bookmark LANDS is also what covers every document
+  /// inside a trashed folder, whose paths the caller never enumerated.
+  ///
+  /// Unresolvable blobs are deliberately kept: this runs on live refreshes, and
+  /// "unresolvable ≠ garbage" holds here for the same reason it holds in
+  /// `removeFiles` — an unplugged volume must never cost the user a file. A file
+  /// that is merely missing is dropped by the restore-time resolution failure
+  /// instead. Defaults are only written when something actually died, so a
+  /// healthy working set costs no write at all.
+  @discardableResult
+  func pruneTrashedFiles() -> [URL] {
+    var survivors: [Data] = []
+    var trashed: [URL] = []
+    for data in fileBookmarkData {
+      var bookmarkIsStale = false
+      guard
+        let resolved = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        ),
+        isTrashed(resolved)
+      else {
+        survivors.append(data)
+        continue
+      }
+      stopAccess(to: resolved.standardizedFileURL)
+      trashed.append(resolved.standardizedFileURL)
+    }
+
+    guard !trashed.isEmpty else { return [] }
+    defaults.set(survivors, forKey: fileBookmarksKey)
+    return trashed
+  }
+
   private func resolvedPath(for bookmark: Data) -> String? {
     var bookmarkIsStale = false
     guard
@@ -379,7 +437,7 @@ final class BookmarkStore {
       }
 
       let standardizedURL = url.standardizedFileURL
-      guard !Self.isInTrash(standardizedURL) else { continue }
+      guard !isTrashed(standardizedURL) else { continue }
       guard seenPaths.insert(standardizedURL.path).inserted else { continue }
       guard isExistingFile(url) else {
         survivingBookmarks.append(data)
@@ -408,13 +466,6 @@ final class BookmarkStore {
     return restoredURLs
   }
 
-  /// Whether `url` lives in a Trash directory — the user's `~/.Trash` or a
-  /// volume's `/.Trashes/<uid>`. Matched on path components rather than against
-  /// one resolved Trash URL because a working set can span volumes, and every
-  /// volume has its own.
-  private static func isInTrash(_ url: URL) -> Bool {
-    url.standardizedFileURL.pathComponents.contains { $0 == ".Trash" || $0 == ".Trashes" }
-  }
 }
 
 struct RestoredWorkspaceBookmarks {
