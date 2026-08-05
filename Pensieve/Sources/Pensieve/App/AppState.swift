@@ -338,9 +338,47 @@ final class AppState {
     set { windowModel.showAllFilesInSidebar = newValue }
   }
 
+  /// The plain-message surface every ordinary failure writes to. Assigning here
+  /// files the error as `.status`: a refused action, a failed read, a piece of
+  /// housekeeping that did not land — nothing the user typed is at risk.
+  ///
+  /// Kept as `String?` so the ~35 existing call sites read exactly as before;
+  /// the severity they get is the safe default. A site that IS losing the user's
+  /// only copy has to say so through `reportDataLoss`, which is the point: the
+  /// loud class is opt-in and argued for, never inherited.
   var lastError: String? {
-    get { windowModel.lastError }
-    set { windowModel.lastError = newValue }
+    get { windowModel.currentError?.message }
+    set { windowModel.currentError = newValue.map(WindowError.status) }
+  }
+
+  /// This window's current error with its severity — what the chrome renders.
+  var currentError: WindowError? { windowModel.currentError }
+
+  /// Files a failure that leaves the user's content in memory and nowhere else.
+  ///
+  /// Raises the alert only when this is a NEW data-loss condition. A write that
+  /// keeps failing (a full volume, a revoked permission) re-reports the same
+  /// message on every retry, and asking again each time would bury the app under
+  /// its own modal instead of informing anyone.
+  func reportDataLoss(_ message: String) {
+    let error = WindowError.dataLoss(message)
+    if windowModel.currentError != error {
+      windowModel.pendingDataLossAlert = error
+    }
+    windowModel.currentError = error
+  }
+
+  /// The user dismissing the banner. Clears the standing report only — a pending
+  /// alert is a separate, already-raised question.
+  func clearError() {
+    windowModel.currentError = nil
+  }
+
+  /// The data-loss question this window still owes the user, if any. Presented
+  /// by `ContentView` and cleared when it is answered.
+  var pendingDataLossAlert: WindowError? {
+    get { windowModel.pendingDataLossAlert }
+    set { windowModel.pendingDataLossAlert = newValue }
   }
 
   /// The dispatch-gateway request for THIS window. Menu/toolbar/sidebar
