@@ -3738,8 +3738,18 @@ final class DocumentStore {
   /// cancels the still-pending timer. No blocking prompt: the window is already
   /// committed to closing, so there is nothing to cancel. A clean (non-dirty)
   /// buffer is a no-op. Returns whether anything was persisted.
+  ///
+  /// `releasesDraftClaim` is the part of "on close" that is about the WINDOW
+  /// rather than the bytes: the buffer dies with it, so the draft this pass just
+  /// wrote stops being live work and goes back on the launcher as an unhandled
+  /// artifact. A caller whose buffer SURVIVES the flush passes `false` —
+  /// `AppController.importDocument` persists the converted draft into a window
+  /// that stays on screen, and releasing the claim there advertises a LIVE
+  /// buffer's draft on every other launcher surface. Adopting it from one puts
+  /// two buffers on a single recovery ID, autosaving over each other, which is
+  /// exactly what the claim exists to forbid.
   @discardableResult
-  func savePendingChangesOnClose(appState: AppState) -> Bool {
+  func savePendingChangesOnClose(appState: AppState, releasesDraftClaim: Bool = true) -> Bool {
     self.appState = appState
     // BEFORE the dirty guard, deliberately. A CLEAN session can still be holding a sleeping index
     // debounce: the 1.5 s autosave already wrote the bytes and marked the buffer clean while the
@@ -3794,8 +3804,11 @@ final class DocumentStore {
       saveRecoveryDraft(appState: appState)
       // The buffer goes away with the window; the draft it just wrote is a
       // recovery artifact from here on, not live work, so it goes back on the
-      // launcher like any other unhandled draft.
-      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+      // launcher like any other unhandled draft — unless the caller told us the
+      // buffer SURVIVES this flush, in which case the write-time claim stands.
+      if releasesDraftClaim {
+        recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+      }
       return true
     }
     // A file-backed buffer. Auto-save owns the file only when it is ON: then the
@@ -3813,7 +3826,9 @@ final class DocumentStore {
       return true
     }
     stashClosingBufferAsRecoveryDraft(appState: appState)
-    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    if releasesDraftClaim {
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    }
     return true
   }
 
