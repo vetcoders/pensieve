@@ -3247,6 +3247,10 @@ final class DocumentStore {
   private let recoveryStore: RecoveryStore
   private let savingSettings: DocumentSavingSettings
   private let writeDocument: (String, URL) throws -> Void
+  /// The write an UNATTENDED save goes through: it may update a file, never
+  /// create one. Separate from `writeDocument` because Save As and an explicit
+  /// ⌘S must still be able to create their target.
+  private let replaceExistingDocument: (String, URL) throws -> Void
   private let indexDocument: @MainActor (DocumentRef, String, AppState?) -> Void
   private let dirtySessionPrompt: @MainActor (DocumentSession) -> SaveChangesResponse
   private let savePanelURLProvider: @MainActor (AppState) -> URL?
@@ -3261,6 +3265,7 @@ final class DocumentStore {
     recoveryStore: RecoveryStore,
     savingSettings: DocumentSavingSettings? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
+    replaceExistingDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
@@ -3276,6 +3281,15 @@ final class DocumentStore {
     self.writeDocument =
       writeDocument ?? { text, url in
         try text.write(to: url, atomically: true, encoding: .utf8)
+      }
+    // A test that swaps out the writer intercepts BOTH kinds of write, exactly
+    // as it did when there was one seam — otherwise every existing injection
+    // would quietly stop seeing auto-save. Only the shipped path, which nobody
+    // has overridden, gets the create-nothing guarantee.
+    self.replaceExistingDocument =
+      replaceExistingDocument ?? writeDocument
+      ?? { text, url in
+        try Self.replaceExistingItem(text, at: url)
       }
     self.indexDocument =
       indexDocument
@@ -4238,6 +4252,13 @@ final class DocumentStore {
     // session cannot carry a draft id (`DocumentSession.recoveryID` is defined
     // for untitled sessions only), so each stash would mint a NEW draft and a
     // minute of typing would pile up one per debounce.
+    //
+    // The check below is a FAST PATH, not the guarantee. It answers the common
+    // case cheaply and with a message written for a human, but between it and
+    // the write the file can still go — so the promise is kept one level down,
+    // by `replaceExistingItem`, which refuses inside the publishing syscall
+    // itself. Removing this check would change the wording of the error, never
+    // whether the file comes back.
     if trigger == .unattended, !FileManager.default.fileExists(atPath: url.path) {
       let message =
         "Could not save \(url.lastPathComponent): it is no longer on disk."
@@ -4249,7 +4270,12 @@ final class DocumentStore {
     let ref = documentRef(for: url, appState: appState)
 
     do {
-      try writeDocument(appState.documentSession.text, url)
+      switch trigger {
+      case .explicit:
+        try writeDocument(appState.documentSession.text, url)
+      case .unattended:
+        try replaceExistingDocument(appState.documentSession.text, url)
+      }
       selfWriteObserver(url)
       registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
       appState.documentSession.document = ref
@@ -4294,6 +4320,76 @@ final class DocumentStore {
     /// close paths auto-save owns because it answers the save question for the
     /// user. These may only update a file that is still there.
     case unattended
+  }
+
+  /// A write that was refused rather than attempted.
+  enum DocumentWriteError: LocalizedError {
+    /// The file an unattended write meant to update is no longer on disk, so
+    /// writing would CREATE it. Raised by the write itself, not by a check
+    /// before it.
+    case targetNoLongerExists(URL)
+
+    var errorDescription: String? {
+      switch self {
+      case .targetNoLongerExists:
+        return "it is no longer on disk"
+      }
+    }
+  }
+
+  /// Publishes `text` to a file that must ALREADY exist — atomically, and with
+  /// no window in which the file could be created.
+  ///
+  /// A preflight `fileExists` cannot give this guarantee: between the check and
+  /// the write the file can still go (Finder, `rm`, a sync client), and a plain
+  /// atomic write would then recreate it — the exact resurrection this refuses.
+  /// So the guarantee has to belong to the publishing step itself.
+  ///
+  /// `RENAME_SWAP` is that step: one syscall that exchanges two paths and
+  /// requires BOTH to exist, so a vanished target fails with `ENOENT` and
+  /// nothing is created. The bytes land whole or not at all, exactly as the
+  /// atomic write they replace.
+  nonisolated static func replaceExistingItem(_ text: String, at url: URL) throws {
+    let temporaryURL = url.deletingLastPathComponent()
+      .appendingPathComponent(".pensieve-save-\(UUID().uuidString)")
+    // A directory that has gone with the file fails here, which is the same
+    // refusal one step earlier.
+    try text.write(to: temporaryURL, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+    // The swap moves INODES, so the note would otherwise silently take the
+    // temporary file's mode instead of keeping its own.
+    if let permissions = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
+      .posixPermissions] as? NSNumber
+    {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: permissions], ofItemAtPath: temporaryURL.path)
+    }
+
+    var failure: Int32 = 0
+    let swapped = temporaryURL.withUnsafeFileSystemRepresentation { source in
+      url.withUnsafeFileSystemRepresentation { target in
+        guard let source, let target else { return Int32(-1) }
+        let result = renameatx_np(AT_FDCWD, source, AT_FDCWD, target, UInt32(RENAME_SWAP))
+        failure = errno
+        return result
+      }
+    }
+    if swapped == 0 { return }
+
+    switch failure {
+    case ENOENT:
+      // The file left between the temporary write and the swap, or before this
+      // was ever called. Either way nobody asked for a new file here.
+      throw DocumentWriteError.targetNoLongerExists(url)
+    case ENOTSUP, ENOSYS, EINVAL:
+      // A volume with no atomic swap — some network shares. `replaceItemAt`
+      // keeps the same refusal, because it too requires the original to exist;
+      // it consumes the temporary item, so the cleanup above turns into a no-op.
+      _ = try FileManager.default.replaceItemAt(url, withItemAt: temporaryURL)
+    default:
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+    }
   }
 
   private func registerSavedDocument(
