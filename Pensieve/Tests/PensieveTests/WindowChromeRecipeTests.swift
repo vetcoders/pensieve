@@ -753,6 +753,140 @@ final class WindowChromeRecipeTests: XCTestCase {
       WindowChromeRecipe.assertTabBarAppearance(on: leading, for: .ink),
       "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
   }
+
+  // MARK: - Sidebar chrome inset (bug A)
+
+  /// A window with nothing below its toolbar owes the sidebar nothing, so the
+  /// untabbed window keeps its exact current layout.
+  @MainActor
+  func testBelowToolbarChromeHeightIsZeroWithoutABottomAccessory() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
+
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0)
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: nil), 0)
+  }
+
+  /// `titlebarAccessoryViewControllers` RAISES on a window without `.titled` —
+  /// an `NSAssertionHandler` abort, not an optional. A diagnostic probe hit
+  /// exactly that on the app's plain helper window while this bug was being
+  /// measured, so the guard is pinned rather than left to reviewers' memory.
+  @MainActor
+  func testBelowToolbarChromeHeightSurvivesAWindowThatCannotHaveAccessories() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
+      styleMask: [.borderless],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+
+    XCTAssertFalse(window.styleMask.contains(.titled), "premise: no titlebar to carry accessories")
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0)
+  }
+
+  /// Only the accessories laid out BELOW the toolbar are the sidebar's problem:
+  /// a `.right` accessory shares the toolbar's own band and is already spent.
+  @MainActor
+  func testBelowToolbarChromeHeightCountsOnlyTheBottomAccessories() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
+
+    func accessory(_ attribute: NSLayoutConstraint.Attribute, height: CGFloat)
+      -> NSTitlebarAccessoryViewController
+    {
+      let controller = NSTitlebarAccessoryViewController()
+      controller.layoutAttribute = attribute
+      controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 1300, height: height))
+      return controller
+    }
+
+    window.addTitlebarAccessoryViewController(accessory(.right, height: 28))
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0,
+      "a toolbar-band accessory was billed to the sidebar")
+
+    window.addTitlebarAccessoryViewController(accessory(.bottom, height: 36))
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: window), 36,
+      "the strip below the toolbar is the height the sidebar has to skip")
+  }
+
+  /// THE PIN THAT TRACKS THE VISUAL DEFECT: a REAL native tab group, and the
+  /// arithmetic that makes the workspace title row disappear.
+  ///
+  /// Bug A is that the split view lays the sidebar column out against the
+  /// TOOLBAR height while AppKit reserves toolbar + tab bar, so the title row
+  /// (`pensieve.sidebar.title`, 62..80 in a 1300×760 window) ends up under the
+  /// full-width bar background that spans the whole 88pt band. No accessibility
+  /// frame moves when that happens — the AX dump from the live capture reports
+  /// the title row at its healthy position while the pixels are gone — so the
+  /// invariant is geometric and taken from AppKit:
+  ///
+  ///     band(tabbed) - band(untabbed) == belowToolbarChromeHeight
+  ///
+  /// Both sides come from the same two real windows, so the pin cannot pass by
+  /// agreeing with a hard-coded 36.
+  @MainActor
+  func testARealTabGroupsBandGrowsByExactlyTheSidebarChromeInset() throws {
+    func makeWindow(_ title: String) -> NSWindow {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false)
+      WindowChromeRecipe.apply(to: window, title: title)
+      window.contentView = NSView(frame: .zero)
+      return window
+    }
+
+    let leading = makeWindow("dont_forget_about")
+    let trailing = makeWindow("Recovered Untitled.md")
+    defer {
+      for window in [leading, trailing] {
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+      }
+    }
+    // Parked far offscreen at zero alpha: still laid out, never on a screen an
+    // operator is looking at.
+    leading.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+    leading.alphaValue = 0
+    leading.makeKeyAndOrderFront(nil)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+
+    let untabbedBand = WindowChromeRecipe.titlebarGlassHeight(for: leading)
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: leading), 0,
+      "premise: a lone window has nothing below its toolbar")
+
+    leading.addTabbedWindow(trailing, ordered: .above)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+
+    guard leading.tabGroup?.isTabBarVisible == true else {
+      throw XCTSkip("headless host did not build a native tab bar")
+    }
+
+    let inset = WindowChromeRecipe.belowToolbarChromeHeight(in: leading)
+    XCTAssertGreaterThan(
+      inset, 0, "the visible tab bar is not being counted as chrome below the toolbar")
+    XCTAssertEqual(
+      WindowChromeRecipe.titlebarGlassHeight(for: leading) - untabbedBand, inset, accuracy: 1,
+      "the band the tab bar adds is exactly what the sidebar column has to skip")
+  }
 }
 
 /// Minimal toolbar delegate handing back two view-backed items — the AppKit

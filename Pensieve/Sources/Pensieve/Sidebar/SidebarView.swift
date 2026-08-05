@@ -58,6 +58,10 @@ struct SidebarView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+    // The workspace title row is the first thing in this column, so it is the
+    // first thing a chrome band the split view did not budget for eats. See
+    // `WindowChromeRecipe.belowToolbarChromeHeight(in:)`.
+    .pensieveSidebarChromeInset()
     .onAppear {
       reconcileWorkspaceRootExpansion()
     }
