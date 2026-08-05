@@ -16,14 +16,16 @@ import Foundation
 ///    controller, and the workspace manager (watcher stopped, refresh/build tasks cancelled),
 /// 2. FLUSH — land everything the user already owns: every window's pending edit, and the armed
 ///    autosave index debounce, run NOW rather than when its 5 s timer says so,
-/// 3. DRAIN — wait for every index write the app owes, including the ones step 2 just scheduled,
+/// 3. PERSIST — force the saved working set out of cfprefsd's queue and onto disk, so the state the
+///    next launch restores from is final by the time the process is gone,
+/// 4. DRAIN — wait for every index write the app owes, including the ones step 2 just scheduled,
 ///    and for the post-close index housekeeping, all under one budget,
-/// 4. LATCH — close the index funnel one way; from here every write entry point and lazy open
+/// 5. LATCH — close the index funnel one way; from here every write entry point and lazy open
 ///    refuses, and the terminal checkpoint is the only DB operation left that can run,
-/// 5. take the truncating checkpoint,
-/// 6. return, and let AppKit tear the windows down.
+/// 6. take the truncating checkpoint,
+/// 7. return, and let AppKit tear the windows down.
 ///
-/// Steps 1 and 4 are the difference between "the writes we knew about are safe" and "no new managed
+/// Steps 1 and 5 are the difference between "the writes we knew about are safe" and "no new managed
 /// write can arise". Five review rounds each found another producer that was still alive during the
 /// quit; the answer was never a sixth patch but the missing phase — and a refusal at the funnel for
 /// whatever the inventory missed. This class is the SINGLE owner of that phase state: no other type
@@ -31,11 +33,13 @@ import Foundation
 /// switched by this one (`IndexDatabase.closeForTermination`).
 ///
 /// The order above is one thing; WHICH of it the `drainTimeout` bounds is another, and the two are
-/// not the same question. Steps 1–2 are the user's own bytes; steps 3–5 are index bookkeeping. Only
-/// the latter can wedge (SQLite, a background pool), only the latter is what the budget was built
-/// for, and a buffer that misses the disk is gone for good while a WAL left long is reclaimed by the
-/// next launch. So the split is: `runUserFlushPhases()` runs OUTSIDE any task and outside the
-/// deadline, `runIndexPhases()` runs inside both. Phase order is unchanged — Q → F → D → L → C.
+/// not the same question. Steps 1–2 are the user's own bytes; steps 3–6 are bookkeeping that can
+/// wedge or stall (SQLite, a background pool, an XPC round trip to cfprefsd), which is what the
+/// budget was built for — and a buffer that misses the disk is gone for good while a WAL left long
+/// is reclaimed by the next launch. So the split is: `runUserFlushPhases()` runs OUTSIDE any task
+/// and outside the deadline, `runIndexPhases()` runs inside both. Phase order: Q → F → P → D → L → C.
+/// Inside that budget, P holds a sub-budget of its own: it goes first, it talks to another process,
+/// and without one it could spend the whole deadline and leave D, L and C unrun.
 ///
 /// Deliberately prompt-free and non-destructive: nothing here asks the user anything and nothing
 /// discards a buffer. A dirty untitled session is persisted as a recovery draft by the same
@@ -47,6 +51,13 @@ final class TerminationSequence {
   /// a logout/shutdown quit.
   nonisolated static let defaultDrainTimeout: TimeInterval = 5
 
+  /// Phase P's own slice of that budget. The working-set flush is an XPC round trip to another
+  /// process, so it is the one phase that can stall without anything in this app being wrong — and
+  /// it runs FIRST, which means every second it spends is a second the index drain never gets. A
+  /// fifth of the total: long enough that a healthy cfprefsd (single-digit milliseconds here) is
+  /// never cut off, short enough that a wedged one cannot eat the drain.
+  nonisolated static let defaultWorkingSetFlushTimeout: TimeInterval = 1
+
   /// How long each run-loop pump is allowed to park before the deadline is re-checked.
   private nonisolated static let pumpInterval: TimeInterval = 0.005
 
@@ -56,6 +67,7 @@ final class TerminationSequence {
   private let autosaver: Autosaver
   private let launchIntentCoordinator: LaunchIntentCoordinator
   private let drainTimeout: TimeInterval
+  private let workingSetFlushTimeout: TimeInterval
   private let pumpRunLoop: (Date) -> Void
   private var didFinish = false
 
@@ -73,6 +85,7 @@ final class TerminationSequence {
     autosaver: Autosaver? = nil,
     launchIntentCoordinator: LaunchIntentCoordinator? = nil,
     drainTimeout: TimeInterval = TerminationSequence.defaultDrainTimeout,
+    workingSetFlushTimeout: TimeInterval = TerminationSequence.defaultWorkingSetFlushTimeout,
     pumpRunLoop: @escaping (Date) -> Void = { limit in
       RunLoop.current.run(mode: .default, before: limit)
     }
@@ -83,6 +96,7 @@ final class TerminationSequence {
     self.autosaver = autosaver ?? .shared
     self.launchIntentCoordinator = launchIntentCoordinator ?? .shared
     self.drainTimeout = drainTimeout
+    self.workingSetFlushTimeout = workingSetFlushTimeout
     self.pumpRunLoop = pumpRunLoop
   }
 
@@ -129,11 +143,32 @@ final class TerminationSequence {
     autosaver.quiesceForTermination()
   }
 
-  /// Phases D, L and C — the half `drainTimeout` was actually built to bound, and the only half that
-  /// can wedge: SQLite, a background pool, a producer that outlived its owner. Every wait here is an
-  /// `await` — see `runBlockingMainRunLoop()`: a synchronous wait would park the pump and make the
-  /// deadline dead.
+  /// Phases P, D, L and C — the half `drainTimeout` was actually built to bound, and the only half
+  /// that can wedge or stall: SQLite, a background pool, a producer that outlived its owner, another
+  /// process. Every wait here is an `await` — see `runBlockingMainRunLoop()`: a synchronous wait
+  /// would park the pump and make the deadline dead.
   func runIndexPhases() async {
+    // ---- P: persist. The saved working set is not on disk just because it was written: every
+    // `UserDefaults` change is handed to cfprefsd, which writes the backing plist on its own
+    // schedule — measured here at up to ~14 s AFTER the process had already exited. A quit therefore
+    // left it in flight, and a flush landing that late could overwrite an external change made to a
+    // quit app's saved state in the meantime. See `BookmarkStore.startFlush()` for why the wait is
+    // an await.
+    //
+    // FIRST, and therefore under a sub-budget of its own. Going first is what keeps a wedged index
+    // pool from costing the user their working set — but the tradeoff is symmetric, and sharing one
+    // 5 s budget meant it ran only one way: cfprefsd is another PROCESS, so a slow XPC round trip
+    // could spend the entire budget here and the index drain, the latch and the terminal checkpoint
+    // would never run at all. Neither phase may starve the other, so P gets its own slice and the
+    // rest of the budget survives it.
+    //
+    // Past the sub-budget the flush is abandoned, NOT cancelled: the task keeps running detached and
+    // still lands if cfprefsd frees up before the process dies. What is given up is the GUARANTEE —
+    // the working set then falls back to cfprefsd's own schedule, exactly as it was before this
+    // phase existed, which is a bounded loss of durability rather than an unbounded loss of the
+    // index drain.
+    await flushWorkingSetWithinItsOwnBudget()
+
     // ---- D: drain. The accepted work first, then the post-close index housekeeping — which is a
     // barrier vacuum + truncate and, until now, was awaited only by tests. `Close Folder` followed by
     // a fast ⌘Q raced that vacuum against this quit's own checkpoint, and GRDB serializes the two
@@ -186,6 +221,27 @@ final class TerminationSequence {
     // wait is a suspension point, which is what keeps it inside the budget.
     didStartTerminalCheckpoint = true
     await indexDatabase.startCheckpointOnTerminate()?.value
+  }
+
+  /// Awaits phase P for at most `workingSetFlushTimeout`, then returns whether it landed or not.
+  ///
+  /// The race is run WITHOUT cancelling the flush, because there is nothing to gain by stopping it
+  /// and something to lose: it is a write the user's saved state depends on, and it may still land
+  /// while the process finishes quitting. So the wait is on a sleeping task, and the flush cancels
+  /// THAT the moment it completes — a flush that lands in 3 ms costs 3 ms, a flush that never lands
+  /// costs exactly the sub-budget and leaves a detached task behind that the process exit collects.
+  private func flushWorkingSetWithinItsOwnBudget() async {
+    let flush = Task { @MainActor in
+      await self.folderManager.flushWorkingSet()
+    }
+    let subBudget = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: UInt64(workingSetFlushTimeout * 1_000_000_000))
+    }
+    Task { @MainActor in
+      await flush.value
+      subBudget.cancel()
+    }
+    await subBudget.value
   }
 
   /// Synchronous entry for `applicationWillTerminate`, which cannot await — and which is the ONLY

@@ -34,6 +34,14 @@ Clarifications (decisions 26.07/31.07, canon item 2):
 
 In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab / untitled buffer. It must not mean sometimes a new file, sometimes a window, and sometimes a workspace.
 
+Implemented from build 665: `Cmd+N` routes through the same
+`DocumentWindowRegistry.newUntitledTab` seam the tab bar's `+` button uses,
+whenever the window holds live work. Until then it replaced the current window's
+session in place, so `Cmd+N` over an open document dropped that document out of
+the tab chain and out of the sidebar's Open Files list. An **idle** window still
+takes the new draft in place — a tab beside an empty launcher would be a window
+leak, not a second document.
+
 Splitting `Cmd+N` (new window/document) from `Cmd+T` (new tab) is only possible after an explicit product decision on the multi-window model.
 
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
@@ -50,6 +58,28 @@ the contract adopts this split:
   gets immediate feedback (tab/progress), and expensive work must not
   freeze the main thread for minutes (lesson from bugs H/J, 03.08).
 
+### Clicking a file — same route as `Cmd+O`
+
+`click = tab` (decision 26.07) is not only about `Cmd+O`. Every single-open
+gesture — a row in the workspace tree, a search result, the context-menu
+**Open**, a RECENT row on the launcher — lands where a Finder "Open with
+Pensieve" lands: as a native tab in the current window's tab group. A click is
+an explicit open, so it never replaces the document the window is reading;
+files stay visible in parallel and switching between them is switching tabs.
+
+- A file that already has a tab is **activated**, never opened a second time —
+  neither a re-click nor a click from another window may render the same
+  document twice.
+- An **empty, idle window** (launcher / empty state) is reused in place instead
+  of spawning a tab beside itself: no stray launcher tab, no flash. The single
+  exception is the rule above — a file that already has a tab is activated
+  there even when the clicking window is idle.
+- Clicking the document the window already shows is a no-op.
+- Because every open lands as a tab, there is **no separate "Open in New
+  Window"** item: it would be a second button for the same action. A detached
+  (non-tabbed) window is not part of v1 and is tied to the open multi-window
+  decision below.
+
 ### `Cmd+S` — Save
 
 Saves the active tab:
@@ -57,6 +87,60 @@ Saves the active tab:
 - a tab with a path — saves to the existing file;
 - an untitled/unsaved tab — triggers Save As;
 - saving must not trigger a self-write reindex loop or lose the dirty buffer state.
+
+#### Who may CREATE a file (05.08)
+
+A write to a document's own path may **update** the file it names. Only a write
+the user **asked for** may bring one back that is no longer there.
+
+- **Explicit** — `Cmd+S`, `Shift+Cmd+S`, and **Save** answered in a close prompt.
+  If the file has vanished from disk (Trash, `rm`, a sync client), these write it
+  again. Putting the file back is what the user asked for.
+- **Unattended** — the auto-save debounce, the window-teardown flush, and the
+  close paths auto-save answers on the user's behalf. These write **only a file
+  that is still there**. A missing target is refused before any write: nobody
+  asked for it, so a note dragged to the Trash must not reappear where it was,
+  beside the copy still sitting in the Trash.
+
+What a refusal guarantees:
+
+- the file is **not** recreated, and nothing else on disk is touched;
+- the buffer keeps every character and stays **dirty**, so the tab's unsaved
+  marker and the close question stay truthful;
+- a refusal is reported exactly like any other save that did not happen, and
+  every caller already handles that: a close driven by auto-save is **aborted**
+  and the window goes on holding the text, and a window tearing down anyway
+  stashes the buffer as a recovery draft, exactly as an auto-save-OFF close
+  does. A write that was **attempted and failed** (permissions, full disk)
+  behaves identically and is unchanged by this rule — this cut adds a reason to
+  refuse a write, not a new way to close a document.
+
+Where the guarantee lives: in the **write**, not in a check before it. An
+unattended save publishes through a replace-existing-only step
+(`DocumentStore.replaceExistingItem`) that requires its target to exist inside
+the same atomic operation, so there is no window in which the file can go and
+be recreated. The `fileExists` check ahead of it is a fast path that chooses a
+human-readable message; deleting it would change wording, never whether the
+file comes back. Any future rewrite of the write layer must keep this
+property — a plain atomic write reintroduces the bug.
+
+**Integration requirement for #45 (error surface).** When this line is
+integrated with #45, "the file is gone and the buffer is dirty" must **not**
+reach the UI as an ordinary `lastError` / `.status` notice. Under the 45.1a
+contract this is a **data-loss** class: the user's text now exists in no file,
+and the only copy is in a window they may close. It must be classified and
+surfaced as such — persistent, not auto-dismissing, and naming the recovery
+action (Save As…). Losing this classification during integration turns a
+data-loss warning into a toast.
+
+Known limits, deliberately not claimed:
+
+- while a document sits in the refused state, its buffer is durable only in
+  memory until the window tears down — the same guarantee a dirty file-backed
+  buffer has today with auto-save OFF, or after a save that failed;
+- the refusal is not announced in the UI. `AppState.lastError` is set, but it
+  has no renderer, so the observable signal is that the file does not come back
+  and the document stays dirty. A visible surface for it is a separate cut.
 
 ### `Shift+Cmd+S` — Save As…
 
@@ -95,12 +179,19 @@ Closes the whole window with all its tabs — the equivalent of the red button.
 A tidying gesture: it does NOT remove files from Open Files (they come back on restore).
 For dirty tabs, the window-close flow applies (batch modal).
 
-### `Shift+Cmd+T` — Reopen Closed Tab (03.08 proposal)
+### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed
-tab along with returning the file to Open Files. Pending product
-confirmation — together with Recent Files (D5) it forms the full set of
-cushions against accidental closes.
+tab along with returning the file to Open Files. Together with Recent Files
+(D5) it forms the full set of cushions against accidental closes.
+
+**RESOLVED (Monika, 2026-08-05):** `Shift+Cmd+T` is reserved for this
+Reopen Closed Tab behavior, per macOS convention. The feature itself is
+**not yet implemented** — it stays on the backlog. Truthful state of this
+branch today: `Shift+Cmd+T` is actually bound to **Tidy Table** (Format
+menu); no reopen-tab code exists anywhere in the app yet. When Reopen
+Closed Tab ships, Tidy Table loses (or is reassigned) this shortcut — the
+two cannot coexist on the same binding.
 
 ### Tab navigation
 
@@ -229,10 +320,49 @@ Close All must never cause silent data loss.
   (decision 03.08, interim pending a true session snapshot — target model:
   "tabs from the moment of quit", variant b from 31.07).
 - Restore **must not undo a deliberate Close** by the user.
-- **Trash is dead** (decision 26.07): a file or folder whose bookmark
-  points into `~/.Trash` does not exist for the app — it does not come back on
-  restore and disappears from the store. (Implemented for files in PR #30; for
-  workspace roots **[OPEN]**.)
+- **Trash is dead** (decision 26.07): a file whose bookmark points into a Trash
+  does not exist for the app. Membership is asked of the filesystem (every volume
+  has its own Trash, a sandboxed build a container-relative one), not matched
+  against a hardcoded `~/.Trash`, so a directory merely NAMED `.Trash` is not one.
+  The rule holds at every point a file can become, or stay, an open document:
+  - launch restore drops such an entry and its bookmark;
+  - a **running** app retires it on the next scan commit, whether Pensieve or
+    Finder did the trashing — the row leaves Open Files without waiting for a
+    relaunch;
+  - opening one is refused with "<name> is in the Trash. Put it back to open it.",
+    so no route (Recents, drag, a stale sidebar row) can re-add it;
+  - selecting one refuses to put its content in the editor and retires the row;
+  - after Pensieve's own **Move to Trash**, bookmarks are pruned by where they
+    LAND, which also covers every document inside a trashed folder.
+
+  A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
+  mid-replacement, or on an unplugged volume) and only drops out of what a
+  restore opens. The running app retires such a row only when the bookmark that
+  turned up in the Trash is the one MINTED FOR THAT PATH — never because a file
+  of the same NAME was thrown away somewhere else, which would retire a document
+  still open from a disconnected volume.
+
+  **RESOLVED (Monika, 2026-08-05):** a workspace **root** follows the same
+  rule as an individual file above. A root that lands in the Trash
+  disappears from the sidebar live, at the next scan commit — same as a
+  trashed file leaving Open Files without waiting for a relaunch. Its
+  bookmarks (the root's own and every file bookmark it granted) are pruned
+  at the same time. Recovery is manual: put the folder back from the Trash,
+  then re-add it as a workspace root. **[OPEN — implementation pending]**:
+  this PR only implements the individual-file half of "Trash is dead"; the
+  root half described here is decided but not yet built.
+
+- **Removing one workspace root never revokes another tab's access.** The
+  persisted bookmark set is rebuilt from the UNION of the working set and the
+  live tab chain across every window: a document of the removed root that a
+  window still has open gets a file bookmark of its own, a document covered by a
+  surviving root does not (its root already grants access), and a file that is in
+  neither source still loses its bookmark — nothing is resurrected.
+- **The working set is durable by the time the process is gone.** Quit forces it
+  out of cfprefsd's write-back queue instead of letting the system flush it on its
+  own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
+  change made to those defaults in the meantime). It runs inside the quit's drain
+  budget, so a stalled flush can never beachball the quit.
 - **Single source of truth for the session: the app.** macOS's own window
   restoration (Saved Application State) must not resurrect documents alongside
   the app's session model (bug G, 03.08 — pending session-layer audit). The
@@ -255,7 +385,7 @@ Close All must never cause silent data loss.
 An agent implementing or refactoring menu/commands must verify:
 
 - [ ] `Cmd+T` creates an empty tab with no file on disk.
-- [ ] `Cmd+N` does the same as `Cmd+T` in v1.
+- [x] `Cmd+N` does the same as `Cmd+T` in v1 (routed through `newUntitledTab`; pinned by `testNewDocumentOverALiveBufferOpensATabInsteadOfEatingTheOpenFile`).
 - [ ] `Cmd+O` opens the file picker, `Shift+Cmd+O` the folder picker (workspace).
 - [ ] `Cmd+S` saves an existing file, and for untitled it triggers Save As.
 - [ ] `Shift+Cmd+S` triggers Save As.
@@ -276,6 +406,9 @@ An agent implementing or refactoring menu/commands must verify:
       recovery item (zero draft multiplication).
 - [ ] Clicking a RECENT row on the launcher gives immediate feedback,
       and opening a large file does not block the UI silently.
+- [ ] A click in the workspace tree / a search result / context-menu "Open"
+      opens a tab and leaves the current tab's document alone; re-clicking an
+      open file activates its tab instead of opening a duplicate.
 - [ ] Restore after restart: workspace always comes back; open files max 12;
       a file/root from Trash does not come back; a deliberately closed file does not come back.
 
@@ -284,13 +417,16 @@ An agent implementing or refactoring menu/commands must verify:
 ## Open decisions and items to verify
 
 0. **List of currently open items (state as of 03.08, after this morning's decisions):**
-   - **[OPEN]** workspace ROOT in Trash on restore (same rule as
-     files — does it stay);
+   - **[OPEN — implementation pending]** workspace ROOT in Trash: behavior
+     **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
+     "Trash is dead" section above); not yet built in this PR;
    - **[OPEN]** native Save sheet for untitled on close
      (Monika's 03.08 proposal, separate UX cut);
    - **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
-   - **[OPEN]** `Shift+Cmd+T` Reopen Closed Tab (proposal — ⌘W-retire
-     safety net).
+   - **[OPEN — implementation pending]** `Shift+Cmd+T` Reopen Closed Tab:
+     shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
+     (see the `Shift+Cmd+T` section above); the feature itself is not yet
+     implemented.
 
    **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
    markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has

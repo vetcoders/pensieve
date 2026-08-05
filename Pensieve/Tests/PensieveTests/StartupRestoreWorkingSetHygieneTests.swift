@@ -32,7 +32,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let bookmark = try harness.bookmarkData(for: note)
     harness.defaults.set([bookmark, bookmark], forKey: fileBookmarksKey)
 
-    let restored = BookmarkStore(defaults: harness.defaults)
+    let restored = harness.makeBookmarkStore()
       .restoreWorkspace(into: AppState())
 
     XCTAssertEqual(
@@ -46,7 +46,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     // PERMANENTLY, not once per launch. Sediment that is merely filtered on
     // read is sediment forever: it survives every launch, and every launch
     // pays to resolve it. A launch that finds it must also remove it.
-    let nextLaunch = BookmarkStore(defaults: harness.defaults)
+    let nextLaunch = harness.makeBookmarkStore()
       .restoreWorkspace(into: AppState())
     XCTAssertEqual(nextLaunch.fileURLs.map(\.standardizedFileURL), [note])
     XCTAssertEqual(harness.persistedFileBookmarks.count, 1)
@@ -63,7 +63,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let first = try harness.writeNote(named: "first.md")
     let repeated = try harness.writeNote(named: "repeated.md")
     let bookmark = try harness.bookmarkData(for: repeated)
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
     try store.persistFile(url: first, into: AppState())
     harness.defaults.set(
       harness.persistedFileBookmarks + [bookmark, bookmark], forKey: fileBookmarksKey)
@@ -87,7 +87,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let harness = try makeHarness()
     let first = try harness.writeNote(named: "first.md")
     let second = try harness.writeNote(named: "second.md")
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
     let appState = AppState()
 
     try store.persistFile(url: first, into: appState)
@@ -106,7 +106,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let harness = try makeHarness()
     let first = try harness.writeNote(named: "first.md")
     let second = try harness.writeNote(named: "second.md")
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
     let appState = AppState()
 
     try store.persistFile(url: first, into: appState)
@@ -127,7 +127,7 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let harness = try makeHarness()
     let first = try harness.writeNote(named: "first.md")
     let second = try harness.writeNote(named: "second.md")
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
 
     try store.replaceWorkspace(
       rootURLs: [], fileURLs: [first, second, first], into: AppState())
@@ -150,13 +150,13 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
     let harness = try makeHarness()
     let trashed = try harness.writeTrashedNote(named: "thrown-away.md")
     let kept = try harness.writeNote(named: "kept.md")
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
     let appState = AppState()
     try store.persistFile(url: trashed, into: appState)
     try store.persistFile(url: kept, into: appState)
     XCTAssertEqual(harness.persistedFileBookmarks.count, 2, "both were recorded before the launch")
 
-    let restored = BookmarkStore(defaults: harness.defaults)
+    let restored = harness.makeBookmarkStore()
       .restoreWorkspace(into: AppState())
 
     XCTAssertEqual(
@@ -175,11 +175,11 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
   func testAMissingFileDropsFromTheLaunchButKeepsItsBookmark() throws {
     let harness = try makeHarness()
     let note = try harness.writeNote(named: "vanishes.md")
-    let store = BookmarkStore(defaults: harness.defaults)
+    let store = harness.makeBookmarkStore()
     try store.persistFile(url: note, into: AppState())
     try FileManager.default.removeItem(at: note)
 
-    let restored = BookmarkStore(defaults: harness.defaults)
+    let restored = harness.makeBookmarkStore()
       .restoreWorkspace(into: AppState())
 
     XCTAssertTrue(restored.fileURLs.isEmpty)
@@ -221,6 +221,14 @@ private struct WorkingSetHarness {
 
   var persistedFileBookmarks: [Data] {
     defaults.array(forKey: fileBookmarksKey) as? [Data] ?? []
+  }
+
+  /// Every store this fixture builds shares its defaults AND its own Trash. The
+  /// membership predicate is injected because `.Trash` under `/tmp` is a
+  /// directory with a suggestive name, not a Trash the system knows about — see
+  /// `SimulatedTrash`.
+  func makeBookmarkStore() -> BookmarkStore {
+    BookmarkStore(defaults: defaults, trashMembership: SimulatedTrash.membership(at: trash))
   }
 
   func writeNote(named name: String) throws -> URL {

@@ -11,21 +11,59 @@ final class BookmarkStore {
 
   /// One live security-scoped grant: the URL access was actually STARTED on
   /// (start/stop must balance on the same object) and whether the start
-  /// succeeded. Filed under the standardized URL — see `stopAccess(to:)`.
+  /// succeeded. Filed under `identityPath` — see `stopAccess(to:)`.
   private struct ActiveAccess {
     let exactURL: URL
     let wasGranted: Bool
   }
 
-  private var activeAccess: [URL: ActiveAccess] = [:]
+  private var activeAccess: [String: ActiveAccess] = [:]
 
   /// How many security-scoped grants this store is still holding. A leaked
   /// grant has no observable effect until the process exits, so this is the
   /// only seam a test can measure the balance through.
   var activeSecurityScopeCount: Int { activeAccess.count }
 
-  init(defaults: UserDefaults = .standard) {
+  private let trashMembership: (URL) -> Bool
+
+  init(
+    defaults: UserDefaults = .standard,
+    trashMembership: @escaping (URL) -> Bool = TrashLocation.contains
+  ) {
     self.defaults = defaults
+    self.trashMembership = trashMembership
+  }
+
+  /// Whether `url` names a document that has been thrown away.
+  ///
+  /// Exposed from the bookmark store on purpose: this store is what makes a file
+  /// outlive its path, so it is also what has to say when that survival stopped
+  /// meaning "still open". Every caller then shares one answer — and one
+  /// injection point for tests, which must not depend on the real Trash.
+  func isTrashed(_ url: URL) -> Bool {
+    trashMembership(url)
+  }
+
+  /// Starts the working set's write-back to disk and hands the caller something
+  /// to wait on.
+  ///
+  /// `UserDefaults` writes nothing itself: it hands the change to cfprefsd,
+  /// which updates the backing plist on its own schedule — measured on this
+  /// machine at up to ~14 s AFTER the writing process had already exited. The
+  /// saved working set was therefore still in flight while the app looked
+  /// entirely gone, and that late flush could land on top of whatever touched
+  /// those defaults in the meantime, resurrecting state that had been cleared on
+  /// purpose. Nothing about WHAT is saved changes here — only when it is durable.
+  ///
+  /// Started off-main and awaited rather than called inline, for exactly the
+  /// reason `TerminationSequence` gives about its own checkpoint: work a quit
+  /// performs SYNCHRONOUSLY on the main thread sits outside the drain budget no
+  /// matter what the deadline says. `synchronize()` is a round trip to another
+  /// process, so it is precisely the kind of call that must be allowed to run
+  /// out of budget instead of beachballing the quit.
+  func startFlush() -> Task<Void, Never> {
+    let defaults = defaults
+    return Task.detached { defaults.synchronize() }
   }
 
   var bookmarkData: Data? {
@@ -231,6 +269,124 @@ final class BookmarkStore {
     for url in urls { stopAccess(to: url.standardizedFileURL) }
   }
 
+  /// Drops every persisted file bookmark whose target now sits in the Trash, and
+  /// reports those targets.
+  ///
+  /// This is the half of trashing that `removeFile` cannot do: `removeFile`
+  /// matches on the path a bookmark RESOLVES TO, and a trashed file resolves to
+  /// its new home under a Trash folder — never to the path it was trashed from.
+  /// Dropping by where a bookmark LANDS is also what covers every document
+  /// inside a trashed folder, whose paths the caller never enumerated.
+  ///
+  /// Unresolvable blobs are deliberately kept: this runs on live refreshes, and
+  /// "unresolvable ≠ garbage" holds here for the same reason it holds in
+  /// `removeFiles` — an unplugged volume must never cost the user a file. A file
+  /// that is merely missing is dropped by the restore-time resolution failure
+  /// instead. Defaults are only written when something actually died, so a
+  /// healthy working set costs no write at all.
+  ///
+  /// `.withoutMounting` is not an optimization, it is the difference between
+  /// reading the working set and CHANGING the machine. Resolving a bookmark is
+  /// allowed to mount the volume it names, and this runs on the repeating
+  /// watcher-driven refresh path, on the main actor: measured on this machine, a
+  /// resolve after `hdiutil detach` re-attached the volume and took 94 ms, while
+  /// the same resolve with `.withoutMounting` returned in 0.000 s and mounted
+  /// nothing. Nothing is lost by refusing the mount — a bookmark that needs a
+  /// volume brought back before it can even be resolved cannot be describing a
+  /// file that was just moved to the Trash, and an unresolvable blob is kept.
+  @discardableResult
+  func pruneTrashedFiles() -> [PrunedTrashedFile] {
+    var survivors: [Data] = []
+    var trashed: [PrunedTrashedFile] = []
+    for data in fileBookmarkData {
+      var bookmarkIsStale = false
+      guard
+        let resolved = try? URL(
+          resolvingBookmarkData: data,
+          options: [.withSecurityScope, .withoutMounting],
+          relativeTo: nil,
+          bookmarkDataIsStale: &bookmarkIsStale
+        ),
+        isTrashed(resolved)
+      else {
+        survivors.append(data)
+        continue
+      }
+      // Released under the ACTIVATION key, which is the path the file had
+      // before it was thrown away — a grant is taken when a file is persisted
+      // or restored, both of them pre-trash events, so stopping by the Trash
+      // LANDING path looked up a key that was never written and leaked the
+      // grant for the rest of the process. The landing path is released too:
+      // both lookups are no-ops when absent, and only one of them can ever be
+      // the key that exists.
+      let origin = Self.bookmarkedOriginURL(for: data)
+      if let origin {
+        stopAccess(to: origin)
+      }
+      stopAccess(to: resolved.standardizedFileURL)
+      trashed.append(
+        PrunedTrashedFile(trashedURL: resolved.standardizedFileURL, originURL: origin))
+    }
+
+    guard !trashed.isEmpty else { return [] }
+    defaults.set(survivors, forKey: fileBookmarksKey)
+    return trashed
+  }
+
+  /// The path a bookmark was MINTED for, read out of the blob itself.
+  ///
+  /// This is the only thing that connects a working-set row — which still names
+  /// the path its file was opened at — to the blob that has just turned up in
+  /// the Trash. Resolving cannot supply it: resolution follows the file and
+  /// answers where it is NOW.
+  ///
+  /// Read without resolving, so it costs no filesystem work and cannot mount
+  /// anything (see `pruneTrashedFiles`). A blob that carries no cached path
+  /// answers nil and the caller then retires nothing on its account — the row
+  /// survives, which is the safe direction.
+  private static func bookmarkedOriginURL(for bookmark: Data) -> URL? {
+    guard let path = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
+    else { return nil }
+    return URL(fileURLWithPath: path)
+  }
+
+  /// The one spelling both halves of the working set must agree on.
+  ///
+  /// A live row names a path; a bookmark blob carries the path it was minted
+  /// for. Standardizing both is not enough on its own: `standardizedFileURL`
+  /// drops a leading `/private` only while the result still names an EXISTING
+  /// item, and the case this comparison exists for is a file that no longer sits
+  /// there — so the same document reads as `/var/…` from the live row and
+  /// `/private/var/…` from the blob of its trashed self, and a correlation by
+  /// path would silently never match.
+  ///
+  /// The prefix is therefore removed here — but ONLY under the three
+  /// directories macOS publishes twice. `/var`, `/tmp` and `/etc` are symlinks
+  /// into `/private`, which is exactly what makes the two spellings one file.
+  /// Every other `/private/…` path is an independent location and comes back
+  /// untouched: folding it would give `/private/foo` and an unrelated `/foo` one
+  /// identity key, and with it one security-scoped grant and one Trash
+  /// correlation.
+  ///
+  /// This is an identity key, never a path handed back to the filesystem, and it
+  /// is NOT a general macOS canonicalizer. It resolves no symlinks of its own
+  /// (`standardizedFileURL` does not resolve them either), and it folds only
+  /// items INSIDE the three aliases — the alias root spelled on its own
+  /// (`/private/var`) is left as it stands, because identity keys are minted for
+  /// documents, not for the roots themselves. `FileWatcher.canonicalPath` folds
+  /// the same three aliases for FSEvents paths.
+  static func identityPath(_ url: URL) -> String {
+    let path = url.standardizedFileURL.path
+    for alias in privateSymlinkAliases where path.hasPrefix(alias) {
+      return String(path.dropFirst("/private".count))
+    }
+    return path
+  }
+
+  /// The only `/private` spellings `identityPath` folds. The trailing slash is
+  /// load-bearing: it keeps `/private/variants` out of `/private/var`.
+  private static let privateSymlinkAliases = ["/private/var/", "/private/tmp/", "/private/etc/"]
+
   private func resolvedPath(for bookmark: Data) -> String? {
     var bookmarkIsStale = false
     guard
@@ -256,7 +412,7 @@ final class BookmarkStore {
   }
 
   private func activate(_ url: URL) {
-    let key = url.standardizedFileURL
+    let key = Self.identityPath(url)
     if activeAccess[key] != nil {
       return
     }
@@ -269,18 +425,23 @@ final class BookmarkStore {
 
   /// Releases the security-scoped access this store took for one file.
   ///
-  /// Keyed by the STANDARDIZED URL, and it has to be: `activate` is called with
+  /// Keyed by `identityPath`, and it has to be: `activate` is called with
   /// whatever spelling reached it — `persistFile` passes the caller's raw URL,
   /// and `restoreURLs` passes the bookmark-RESOLVED URL, which for anything
   /// under `/tmp` or `/var` differs from its standardized form. `removeFile`
   /// has always stopped with the standardized URL, so a grant taken under a
   /// non-canonical spelling was never found and leaked until process exit.
   ///
+  /// Plain standardization is not enough on its own for one caller: the Trash
+  /// prune releases by the path the file was activated at, which by then no
+  /// longer exists, and `standardizedFileURL` leaves `/private` on a path whose
+  /// target is gone. See `identityPath`.
+  ///
   /// The stop itself still goes through the EXACT URL that was activated:
   /// start/stop must balance on the same object, so canonicalizing the key is
   /// not licence to canonicalize the call.
   private func stopAccess(to url: URL) {
-    guard let access = activeAccess.removeValue(forKey: url.standardizedFileURL) else { return }
+    guard let access = activeAccess.removeValue(forKey: Self.identityPath(url)) else { return }
     if access.wasGranted {
       access.exactURL.stopAccessingSecurityScopedResource()
     }
@@ -379,7 +540,7 @@ final class BookmarkStore {
       }
 
       let standardizedURL = url.standardizedFileURL
-      guard !Self.isInTrash(standardizedURL) else { continue }
+      guard !isTrashed(standardizedURL) else { continue }
       guard seenPaths.insert(standardizedURL.path).inserted else { continue }
       guard isExistingFile(url) else {
         survivingBookmarks.append(data)
@@ -408,16 +569,27 @@ final class BookmarkStore {
     return restoredURLs
   }
 
-  /// Whether `url` lives in a Trash directory — the user's `~/.Trash` or a
-  /// volume's `/.Trashes/<uid>`. Matched on path components rather than against
-  /// one resolved Trash URL because a working set can span volumes, and every
-  /// volume has its own.
-  private static func isInTrash(_ url: URL) -> Bool {
-    url.standardizedFileURL.pathComponents.contains { $0 == ".Trash" || $0 == ".Trashes" }
-  }
 }
 
 struct RestoredWorkspaceBookmarks {
   var rootURLs: [URL]
   var fileURLs: [URL]
+}
+
+/// One persisted working-set entry the Trash prune retired, named on BOTH sides
+/// of the move it did not witness.
+///
+/// A caller reconciling a LIVE working set needs the second half. Its rows name
+/// the paths their files were opened at, and a trashed file is no longer there —
+/// so "which of my rows just died" can only be answered by the path the dropped
+/// bookmark was minted for. Answering it by file NAME instead is how a document
+/// still open from a disconnected volume could be retired because an unrelated
+/// namesake was thrown away.
+struct PrunedTrashedFile: Equatable {
+  /// Where the bookmark resolves NOW: inside a Trash.
+  let trashedURL: URL
+
+  /// The path the bookmark was minted for — the pre-trash location a live
+  /// working-set row still names. Nil when the blob carries no cached path.
+  let originURL: URL?
 }

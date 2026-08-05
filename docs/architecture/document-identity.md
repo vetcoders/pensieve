@@ -149,6 +149,20 @@ table above and decide explicitly for each one. In particular:
 - **Comparing paths?** Use one convention. `standardizedFileURL` does not resolve
   symlinks; `resolvingSymlinksInPath()` does. Mixed conventions across stores
   produce entries that never match.
+- **Comparing a path that may no longer exist?** Use
+  `BookmarkStore.identityPath`. Both `standardizedFileURL` and
+  `resolvingSymlinksInPath()` drop a leading `/private` only while the target
+  still exists, so a trashed file reads as `/var/…` from its live row and
+  `/private/var/…` from its bookmark blob. `identityPath` folds that prefix for
+  the three directories macOS publishes twice — `/private/var`, `/private/tmp`,
+  `/private/etc`, the symlink aliases — and returns every other path untouched.
+  It is an identity key, **not** a general canonicalizer: it resolves no
+  symlinks of its own, it does not fold the alias roots spelled on their own,
+  and it must never be handed back to the filesystem. Folding `/private`
+  unconditionally is the bug this narrowing fixed — it fused `/private/foo` with
+  an unrelated `/foo`, and with them their security-scoped grants.
+  `FileWatcher.canonicalPath` folds the same three aliases for FSEvents paths;
+  the two must stay in step.
 - **Adding persistence?** Key it by `persistentID`, not by URL. Every new
   URL-keyed store makes the eventual consolidation more expensive.
 - **Touching `DocumentStore.swift`?** It has 20 direct and 56 transitive

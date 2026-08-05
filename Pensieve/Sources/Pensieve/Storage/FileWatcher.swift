@@ -38,7 +38,9 @@ struct FileWatcherEvent: Equatable, Sendable {
 
   /// `resolvingSymlinksInPath()` strips the `/private` prefix only while the file still exists,
   /// but FSEvents reports removed/renamed-away items under the canonical `/private/...` form.
-  /// Strip it unconditionally so live and after-deletion events of one item compare equal.
+  /// Strip it — under the three directories macOS publishes twice (`/var`, `/tmp`, `/etc` are
+  /// symlinks into `/private`) — so live and after-deletion events of one item compare equal.
+  /// Any other `/private/…` path is a location of its own and is left alone.
   /// Every path compared against an event (roots, self-writes) must go through this one door.
   static func canonicalPath(for path: String) -> String {
     let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path

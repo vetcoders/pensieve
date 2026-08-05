@@ -115,6 +115,10 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
+  /// ⌘N's route to a tab of its own, the same seam the tab bar's "+" button
+  /// already uses (`DocumentWindowRegistry.newUntitledTab`). Unwired (tests,
+  /// headless) falls back to replacing this window's session in place.
+  var requestNewUntitledTab: (() -> Void)?
   /// The launch restore's bulk route. One call for the WHOLE working set, so
   /// the registry can join every tab to the group and bring exactly one window
   /// front at the end instead of paying a full window presentation — and the
@@ -244,6 +248,16 @@ final class AppController: ObservableObject {
   /// this window and a new tab, the empty-window close — has to ask this too.
   var hasPendingDocumentLoad: Bool { appState.documentIsLoading }
 
+  /// "Is this window already spoken for?" — the single question every open
+  /// router asks before choosing between loading in place and handing the
+  /// document to the registry. An empty, idle window is the one that may be
+  /// reused; a buffer, a conversion in flight or a staged read all claim it.
+  /// One expression so `openFile` (⌘O, Finder, recents) and
+  /// `openDocumentWindow` (every click) cannot drift apart.
+  var holdsLiveDocumentWork: Bool {
+    appState.documentSession.hasEditableBuffer || hasPendingImportWork || hasPendingDocumentLoad
+  }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a
@@ -367,6 +381,25 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Whether an explicit open of `documentID` must go to the window registry
+  /// instead of loading into THIS window.
+  ///
+  /// One predicate, two callers, because there is one policy — and it used to be
+  /// written down twice. `openDocumentWindow` (the sidebar/search click) had both
+  /// terms; `openFile` (⌘O, Finder, Open Recent, the launcher's RECENT list) had
+  /// only the first, so an idle window asked to open a document that already had
+  /// a tab elsewhere loaded it in place and put the same file on screen twice.
+  ///
+  /// - a window holding LIVE WORK is spoken for: an editable buffer, a pending
+  ///   import, or a staged read whose bytes have not landed yet. Loading over any
+  ///   of them throws the user's document away.
+  /// - a document ALREADY IN SOME TAB routes even from an idle window, precisely
+  ///   because the window is free: rendering it here would be the second copy.
+  ///   The registry activates the tab that already shows it.
+  private func routesToOwnTab(_ documentID: URL) -> Bool {
+    holdsLiveDocumentWork || documentWindowRegistry.openTabDocumentIDs.contains(documentID)
+  }
+
   func openFolder(url: URL) {
     if importsFoldersInBackground {
       folderManager.openInBackground(url: url, into: appState)
@@ -376,10 +409,11 @@ final class AppController: ObservableObject {
   }
 
   /// External/explicit file opens (⌘O, Finder, recents): tab per document.
-  /// An empty window (no editable buffer) is reused in place; once this
-  /// window shows a document, further opens route through the window registry
-  /// and appear as native tabs. Falls back to in-window load when no routing
-  /// is wired (tests, headless).
+  /// An empty, idle window is reused in place; a window holding live work — or
+  /// an open request for a document that already has a tab somewhere — routes
+  /// through the window registry and appears as a native tab. Both terms live in
+  /// `routesToOwnTab`, shared with `openDocumentWindow`. Falls back to in-window
+  /// load when no routing is wired (tests, headless).
   func openFile(url: URL) {
     let standardizedURL = url.standardizedFileURL
 
@@ -439,10 +473,7 @@ final class AppController: ObservableObject {
     // URL of a multi-file open would answer "empty, use this window", invalidate
     // the first file's claim, and the file the user clicked first would vanish
     // exactly the way an import used to.
-    if appState.documentSession.hasEditableBuffer || hasPendingImportWork
-      || hasPendingDocumentLoad,
-      let requestOpenDocumentWindow
-    {
+    if routesToOwnTab(standardizedURL), let requestOpenDocumentWindow {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
       return
@@ -865,8 +896,27 @@ final class AppController: ObservableObject {
     documentWindowRegistry.closeAllDocumentWindows()
   }
 
+  /// ⌘N / "New File…".
+  ///
+  /// A window holding LIVE WORK is spoken for — the first term of
+  /// `routesToOwnTab`, and the reason ⌘O on such a window opens a tab instead of
+  /// loading in place. ⌘N never asked, so it replaced the buffer where it fired:
+  /// the file-backed session was overwritten by the new draft, the window's
+  /// registry identity flipped from `.file(url)` to `.untitled(uuid)`, and the
+  /// document's row in the sidebar's Open Files list — which mirrors the tab
+  /// chain — was REPLACED rather than joined. One document open, ⌘N, and the
+  /// document was gone from the list.
+  ///
+  /// The tab bar's "+" button had the right behaviour all along
+  /// (`DocumentWindowRegistry.newUntitledTab`); this routes the keyboard gesture
+  /// through the same seam so the two affordances stop disagreeing.
   @discardableResult
   func createUntitledDocument() -> Bool {
+    if holdsLiveDocumentWork, let requestNewUntitledTab {
+      requestNewUntitledTab()
+      return true
+    }
+
     guard documentStore.prepareForDocumentSwitch(appState: appState) else {
       return false
     }
@@ -1198,42 +1248,41 @@ final class AppController: ObservableObject {
         ? appState.makeDocumentRef(for: id) : nil)
   }
 
-  /// Default click (Open Files list, workspace tree, search result, context-menu
-  /// "Open"): load the document in the current window, reusing the active editor
-  /// pane. This is the VS Code / Zed model — a single click never spawns a window
-  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
-  /// gesture. Clicking the currently displayed document is a no-op.
+  /// Every click that means "open this file" — the workspace tree, a search
+  /// result, the context-menu "Open" — lands exactly where ⌘O and a Finder
+  /// "Open with Pensieve" land: as a native window tab. `click = tab`
+  /// (`docs/keyboard-shortcuts-and-file-lifecycle-contract.md`, decision
+  /// 26.07). A click is an explicit open, so it must not replace the document
+  /// this window is reading: files stay visible in parallel and switching
+  /// between them is switching tabs.
+  ///
+  /// Destination is `openFile`'s policy, not a second one — literally, through
+  /// the shared `routesToOwnTab`: an empty, idle window is reused in place — the
+  /// launcher the user clicked from becomes the file's window instead of
+  /// spawning a tab beside itself and being reaped a moment later — and a window
+  /// holding live work hands the document to the registry. The registry
+  /// activates the tab already showing the document rather than opening a twin,
+  /// which is also why a document open SOMEWHERE ELSE routes even from an idle
+  /// window: loading it in place would leave the same file rendered in two tabs.
+  ///
+  /// Clicking the document this window already shows is a no-op. Falls back to
+  /// in-window selection when no routing is wired (tests, headless).
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+    let documentID = ref.id.standardizedFileURL
+    if appState.selectedDocumentID?.standardizedFileURL == documentID {
       return
     }
 
-    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
-    selectDocument(id: ref.id)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture: route through the window
-  /// registry to open the document in a native tab (or activate the window
-  /// already showing it). Clicking the currently displayed document is a no-op.
-  /// Falls back to in-window selection when no routing is wired (tests, headless).
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = resolveDocumentRef(for: id) else { return }
-
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
-      return
-    }
-
-    guard let requestOpenDocumentWindow else {
+    guard routesToOwnTab(documentID), let requestOpenDocumentWindow else {
       DebugTrace.log(
-        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
-      )
+        "openDocumentWindow -> load in this window: \(ref.id.lastPathComponent)")
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
   }
 

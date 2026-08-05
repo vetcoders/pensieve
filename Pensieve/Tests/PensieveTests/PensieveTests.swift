@@ -5955,8 +5955,12 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.activeDocumentText, "the book")
   }
 
+  /// `click = tab` (keyboard-shortcuts-and-file-lifecycle-contract, decision
+  /// 26.07): every single-open gesture — Open Files' context-menu "Open", the
+  /// workspace tree, a search result — hands the document to the window
+  /// registry, and none of them replaces the document this window is reading.
   @MainActor
-  func testDefaultClickSelectsInPlaceAndExplicitGestureRoutesToRegistry() throws {
+  func testSingleClickRoutesEveryOpenSurfaceToTheWindowRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
@@ -5967,8 +5971,12 @@ final class PensieveSmokeTests: XCTestCase {
 
     let alphaURL = folder.appendingPathComponent("alpha.md")
     let betaURL = folder.appendingPathComponent("beta.md")
+    let gammaURL = folder.appendingPathComponent("gamma.md")
+    let deltaURL = folder.appendingPathComponent("delta.md")
     try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
     try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+    try "gamma".write(to: gammaURL, atomically: true, encoding: .utf8)
+    try "delta".write(to: deltaURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
@@ -5983,46 +5991,426 @@ final class PensieveSmokeTests: XCTestCase {
     controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
 
     controller.openFolder(url: folder)
+    // This window is reading alpha; every click below targets a document it is
+    // not currently displaying.
+    controller.selectDocument(id: alphaURL.standardizedFileURL)
+    requestedRefs.removeAll()
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      "a single click opens the document through the registry, as a native tab")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "the clicking window keeps its own document; the clicked one loads in its tab")
+    XCTAssertEqual(
+      appState.activeDocumentText, "alpha",
+      "the current editor pane is never replaced by a click")
+
+    // The workspace tree rides the same route as the context-menu "Open".
+    let root = try XCTUnwrap(appState.workspaceTree.first)
+    let gammaNode = try XCTUnwrap(
+      root.children?.first(where: { $0.documentID == gammaURL.standardizedFileURL }))
+    controller.selectWorkspaceNode(gammaNode)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL],
+      "a workspace-tree click opens through the registry too")
+
+    // ...and so does a search result.
+    let deltaRef = try XCTUnwrap(
+      appState.allDocuments.first(where: { $0.id == deltaURL.standardizedFileURL }))
+    controller.selectSearchResult(
+      WorkspaceSearchResult(
+        document: deltaRef,
+        displayPath: deltaURL.lastPathComponent,
+        snippet: "delta",
+        matchKind: .body,
+        score: 1,
+        updatedAt: Date()))
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL, deltaURL.standardizedFileURL],
+      "a search-result click opens through the registry too")
+
+    // Clicking the document this window already shows stays a no-op.
     controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty, "a default click never spawns a window")
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
-    XCTAssertEqual(appState.activeDocumentText, "alpha")
-
-    // VS Code / Zed model: a default click on another document loads it in place,
-    // reusing the current window — it does NOT route to the registry.
-    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
-
-    XCTAssertTrue(
-      requestedRefs.isEmpty,
-      "a default click on another document loads in place, never routing to the registry")
     XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
-      "the current window swaps to the clicked document")
-    XCTAssertEqual(appState.activeDocumentText, "beta")
-
-    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
-
-    XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL, deltaURL.standardizedFileURL],
       "clicking the currently displayed document is a no-op")
+  }
 
-    // Only the explicit "Open in New Window" gesture routes to the registry, and
-    // only for a document the window is not already showing.
-    controller.openDocumentInNewWindow(id: alphaURL.standardizedFileURL)
+  /// The registry dedups by document identity, so a re-click has to find the
+  /// tab that already shows the file instead of building a second one.
+  @MainActor
+  func testClickOnAlreadyOpenDocumentActivatesItsExistingTab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenActivateTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
 
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired click must open synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: alphaURL.standardizedFileURL)
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(factoryCalls, 1, "re-clicking an open document must not spawn a second tab")
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
-      "the explicit gesture opens the document in a new window/tab")
+      activations, 2, "the second click activates the tab already showing the document")
     XCTAssertEqual(
+      registry.openDocuments.map(\.identity), [.file(betaURL.standardizedFileURL)],
+      "the document stays registered exactly once")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "neither click disturbs the document this window reads")
+  }
+
+  /// The launcher/empty-state window is a window, not a spare tab slot: a click
+  /// from it loads in place rather than spawning a tab beside itself only to be
+  /// reaped. The exception is a file that already has a tab — rendering it here
+  /// too would put the same document on screen twice.
+  @MainActor
+  func testClickFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired click must open synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    XCTAssertFalse(controller.holdsLiveDocumentWork, "the window under test starts idle")
+
+    // beta already lives in some other tab.
+    registry.open(DocumentRef(id: betaURL.standardizedFileURL, isAdHoc: true))
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(factoryCalls, 1, "a file that already has a tab never gets a second window")
+    XCTAssertEqual(activations, 2, "the click activates the tab that already shows it")
+    XCTAssertNotEqual(
       appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
-      "the originating window keeps its document while the new window materializes")
+      "an idle window must not render a second copy of a file that already has a tab")
 
-    controller.openDocumentInNewWindow(id: betaURL.standardizedFileURL)
+    // alpha has no tab, so this idle window is the one that takes it.
+    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
-      "the explicit gesture on the currently displayed document is a no-op")
+      factoryCalls, 1,
+      "an idle window is reused in place instead of spawning a tab beside itself")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+  }
+
+  /// The same policy, reached through the OTHER door. `openFile` is what ⌘O,
+  /// Finder, Open Recent and the launcher's RECENT list all funnel into, and it
+  /// used to ask only "does this window hold live work?" — so an idle window
+  /// asked to open a document that already had a tab elsewhere loaded it in
+  /// place and put the same file on screen twice. Mirror of
+  /// `testClickFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab`.
+  @MainActor
+  func testOpenFileFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired open must happen synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    XCTAssertFalse(controller.holdsLiveDocumentWork, "the window under test starts idle")
+
+    // beta already lives in some other tab.
+    registry.open(DocumentRef(id: betaURL.standardizedFileURL, isAdHoc: true))
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+
+    controller.openFile(url: betaURL)
+
+    XCTAssertEqual(
+      factoryCalls, 1, "⌘O on a file that already has a tab never gets a second window")
+    XCTAssertEqual(activations, 2, "the open activates the tab that already shows it")
+    XCTAssertNotEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "an idle window must not render a second copy of a file that already has a tab")
+
+    // alpha has no tab, so this idle window is the one that takes it.
+    controller.openFile(url: alphaURL)
+
+    XCTAssertEqual(
+      factoryCalls, 1,
+      "an idle window is reused in place instead of spawning a tab beside itself")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+  }
+
+  /// ⌘N over an open document must not EAT that document.
+  ///
+  /// The operator opened one file from Finder and pressed ⌘N: the file's row
+  /// vanished from the sidebar's Open Files list and was replaced by a single
+  /// "Untitled.md", titlebar included. Open Files mirrors the tab chain
+  /// (`SidebarView.openFilesList` reads `windowRegistry.openDocuments`), and
+  /// `createUntitledDocument` overwrote THIS window's session in place — so the
+  /// window's registry identity flipped from `.file(url)` to `.untitled(uuid)`
+  /// and `DocumentWindowRegistry.publish` replaced the descriptor at the same
+  /// index rather than adding one. Nothing was deleted from disk; the document
+  /// simply stopped being open.
+  ///
+  /// ⌘O from the same window already routes to a tab of its own, on the first
+  /// term of `routesToOwnTab` — and the tab bar's "+" button already opens an
+  /// untitled TAB. ⌘N was the one door that clobbered.
+  @MainActor
+  func testNewDocumentOverALiveBufferOpensATabInsteadOfEatingTheOpenFile() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileTabTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("transcript.md").standardizedFileURL
+    try "# transcript".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    for window in [documentWindow, untitledWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      documentWindow.close()
+      untitledWindow.close()
+    }
+
+    var untitledFactoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("⌘N must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { documentWindow },
+      applicationWindows: { [documentWindow, untitledWindow] },
+      makeDocumentWindow: { ref, _ in
+        XCTAssertNil(ref, "⌘N asks the factory for an untitled window")
+        untitledFactoryCalls += 1
+        return untitledWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestNewUntitledTab = { registry.newUntitledTab(from: documentWindow) }
+
+    // The window is showing the file the user opened from Finder, and the
+    // sidebar's Open Files list is that registry row.
+    appState.documentSession.load(document: DocumentRef(id: noteURL), text: "# transcript")
+    registry.attach(documentWindow, documentID: noteURL, hasEditableBuffer: true)
+    XCTAssertEqual(registry.openTabDocumentIDs, [noteURL])
+    XCTAssertTrue(controller.holdsLiveDocumentWork)
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(
+      untitledFactoryCalls, 1,
+      "⌘N over a live buffer must open its own tab, like the tab bar's + button")
+    XCTAssertEqual(
+      registry.openTabDocumentIDs, [noteURL],
+      "the open document lost its row in Open Files to the new untitled draft")
+    XCTAssertEqual(
+      appState.documentSession.url, noteURL,
+      "⌘N overwrote the file-backed buffer of the window it fired from")
+    XCTAssertEqual(appState.activeDocumentText, "# transcript")
+  }
+
+  /// The other half of the same policy: an IDLE window has nothing to lose, so
+  /// ⌘N is still answered in place instead of spawning a tab beside an empty
+  /// launcher. Without this term the fix would trade one bug for a window leak.
+  @MainActor
+  func testNewDocumentInAnIdleWindowStillFillsThatWindowInPlace() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase
+    )
+    var tabRequests = 0
+    controller.requestNewUntitledTab = { tabRequests += 1 }
+
+    XCTAssertFalse(controller.holdsLiveDocumentWork)
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(tabRequests, 0, "an idle window is the one that takes the new draft")
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
   }
 
   @MainActor

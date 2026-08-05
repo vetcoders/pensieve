@@ -283,7 +283,11 @@ final class LaunchOpensNothingTests: XCTestCase {
     }
 
     let defaults = makeEphemeralDefaults(prefix: "PensieveLaunchOpensNothing")
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    // The membership predicate is injected because `.Trash` under `/tmp` is a
+    // directory with a suggestive name, not a Trash the system knows about —
+    // see `SimulatedTrash`.
+    let bookmarkStore = BookmarkStore(
+      defaults: defaults, trashMembership: SimulatedTrash.membership(at: trash))
     let harness = LaunchHarness(
       root: root,
       support: support,
@@ -440,7 +444,8 @@ private final class LaunchHarness {
   /// model list and the window registry disagreed for a long time, and only the
   /// registry is what the user sees.
   func relaunch() throws -> RelaunchedSession {
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: defaults, trashMembership: SimulatedTrash.membership(at: trash))
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { [weak self] work in self?.deferredMainWork.append(work) },
