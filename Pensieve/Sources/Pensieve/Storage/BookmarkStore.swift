@@ -360,15 +360,32 @@ final class BookmarkStore {
   /// `/private/var/…` from the blob of its trashed self, and a correlation by
   /// path would silently never match.
   ///
-  /// The prefix is therefore removed unconditionally. This is an identity key,
-  /// never a path handed back to the filesystem, and on macOS `/var`, `/tmp` and
-  /// `/etc` are precisely the symlinks into `/private` that make the two
-  /// spellings the same file.
+  /// The prefix is therefore removed here — but ONLY under the three
+  /// directories macOS publishes twice. `/var`, `/tmp` and `/etc` are symlinks
+  /// into `/private`, which is exactly what makes the two spellings one file.
+  /// Every other `/private/…` path is an independent location and comes back
+  /// untouched: folding it would give `/private/foo` and an unrelated `/foo` one
+  /// identity key, and with it one security-scoped grant and one Trash
+  /// correlation.
+  ///
+  /// This is an identity key, never a path handed back to the filesystem, and it
+  /// is NOT a general macOS canonicalizer. It resolves no symlinks of its own
+  /// (`standardizedFileURL` does not resolve them either), and it folds only
+  /// items INSIDE the three aliases — the alias root spelled on its own
+  /// (`/private/var`) is left as it stands, because identity keys are minted for
+  /// documents, not for the roots themselves. `FileWatcher.canonicalPath` folds
+  /// the same three aliases for FSEvents paths.
   static func identityPath(_ url: URL) -> String {
     let path = url.standardizedFileURL.path
-    guard path.hasPrefix("/private/") else { return path }
-    return String(path.dropFirst("/private".count))
+    for alias in privateSymlinkAliases where path.hasPrefix(alias) {
+      return String(path.dropFirst("/private".count))
+    }
+    return path
   }
+
+  /// The only `/private` spellings `identityPath` folds. The trailing slash is
+  /// load-bearing: it keeps `/private/variants` out of `/private/var`.
+  private static let privateSymlinkAliases = ["/private/var/", "/private/tmp/", "/private/etc/"]
 
   private func resolvedPath(for bookmark: Data) -> String? {
     var bookmarkIsStale = false
