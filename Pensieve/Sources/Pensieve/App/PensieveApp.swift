@@ -301,6 +301,11 @@ struct DocumentWindowRootView: View {
     // The close confirmation is a sheet on THIS window, not an app-modal
     // alert: ⌘W on one document tab must leave every other document usable.
     controller.hostWindowProvider = { currentWindow }
+    // Same seam the tab bar's "+" button uses, so ⌘N and "+" are one gesture.
+    controller.requestNewUntitledTab = {
+      guard let currentWindow else { return }
+      DocumentWindowRegistry.shared.newUntitledTab(from: currentWindow)
+    }
     controller.requestOpenRestoredDocumentWindows = { refs in
       DocumentWindowRegistry.shared.openRestoredDocuments(refs)
     }
