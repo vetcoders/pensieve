@@ -399,9 +399,10 @@ final class RecoveredDraftsTests: XCTestCase {
   /// ROOT CAUSE. `recoveryID` used to live inside `DocumentSession.Kind.untitled`,
   /// so for a FILE-BACKED buffer the getter answered `nil` and the setter was a
   /// no-op. `stashClosingBufferAsRecoveryDraft` — the teardown path taken by every
-  /// dirty file-backed buffer while auto-save is off, which is the default — read
-  /// `nil`, minted a fresh UUID, and threw the write-back away. Every close of the
-  /// same document therefore produced ANOTHER draft file of the same text.
+  /// dirty file-backed buffer whose window dies without reaching disk (auto-save
+  /// off, or a save that failed) — read `nil`, minted a fresh UUID, and threw the
+  /// write-back away. Every close of the same document therefore produced ANOTHER
+  /// draft file of the same text.
   @MainActor
   func testRepeatedTeardownStashesOfOneFileBackedBufferKeepOneDraft() throws {
     let folder = try makeTemporaryFolder()
