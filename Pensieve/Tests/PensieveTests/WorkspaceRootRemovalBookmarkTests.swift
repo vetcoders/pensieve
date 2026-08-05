@@ -93,6 +93,32 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     )
   }
 
+  /// The union must not become a RESURRECTION either: a tab whose file the user
+  /// threw away is still a tab, and a trashed file still exists on disk — so the
+  /// existence check passes and the rewrite would mint it a brand new bookmark,
+  /// putting a dead document back into the working set the next launch restores
+  /// from. That is the one thing `pruneTrashedFiles` exists to prevent.
+  @MainActor
+  func testRemovingRootDoesNotMintAFileBookmarkForATrashedTab() async throws {
+    let scenario = try await makeScenario()
+
+    scenario.harness.manager.removeRoot(scenario.rootA, into: scenario.appState)
+    await settle(scenario.harness)
+
+    // Asserted on the PERSISTED blobs, not on what a restore hands back: the
+    // restore path refuses a trashed entry on its own, so it would hide a
+    // bookmark this rewrite had just minted — and the bookmark is the thing that
+    // must not exist.
+    let persisted = persistedFileBookmarkURLs(scenario.harness)
+    XCTAssertFalse(
+      persisted.contains(scenario.trashedTabFile),
+      """
+      A document a window still had open, but the user had thrown away, was given a fresh \
+      bookmark: persisted files were \(persisted.map(\.lastPathComponent))
+      """
+    )
+  }
+
   // MARK: - Scenario
 
   @MainActor
@@ -109,6 +135,9 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     let noteInSurvivingRoot: URL
     /// Out-of-workspace file the working set names in its own right.
     let adHocFile: URL
+    /// Document of the removed root that a window still has open in a tab, and
+    /// that the user has thrown away — it exists, in the Trash.
+    let trashedTabFile: URL
   }
 
   /// Two roots and three document windows. The load-bearing state is ordinary,
@@ -121,18 +150,23 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     let rootA = sandbox.root.appendingPathComponent("RootA", isDirectory: true)
     let rootB = sandbox.root.appendingPathComponent("RootB", isDirectory: true)
     let outside = sandbox.root.appendingPathComponent("Outside", isDirectory: true)
-    for directory in [rootA, rootB, outside] {
+    // A Trash this test owns, so nothing here goes near the operator's own.
+    let simulatedTrash = sandbox.root.appendingPathComponent("Trash", isDirectory: true)
+    for directory in [rootA, rootB, outside, simulatedTrash] {
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
     let noteInRemovedRoot = rootA.appendingPathComponent("a.md")
     let fileInNoWindow = rootA.appendingPathComponent("closed.md")
     let noteInSurvivingRoot = rootB.appendingPathComponent("b.md")
     let adHocFile = outside.appendingPathComponent("ad-hoc.md")
-    for url in [noteInRemovedRoot, fileInNoWindow, noteInSurvivingRoot, adHocFile] {
+    // Thrown away, therefore still on disk: that is what makes it a resurrection
+    // risk rather than an ordinary missing file.
+    let trashedTabFile = simulatedTrash.appendingPathComponent("thrown-away.md")
+    for url in [noteInRemovedRoot, fileInNoWindow, noteInSurvivingRoot, adHocFile, trashedTabFile] {
       try url.lastPathComponent.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    let harness = try makeHarness(in: sandbox.support)
+    let harness = try makeHarness(in: sandbox.support, simulatedTrash: simulatedTrash)
     let appState = AppState()
     harness.manager.open(url: rootA, into: appState)
     harness.manager.open(url: rootB, into: appState)
@@ -148,11 +182,17 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
 
     let windowA = makeWindow()
     let windowB = makeWindow()
+    let windowC = makeWindow()
     addTeardownBlock { @MainActor in
-      for window in [windowA, windowB] { window.close() }
+      for window in [windowA, windowB, windowC] { window.close() }
     }
     attach(noteInSurvivingRoot, to: windowA, in: harness.documentWindowRegistry)
     attach(noteInRemovedRoot, to: windowB, in: harness.documentWindowRegistry)
+    attach(trashedTabFile, to: windowC, in: harness.documentWindowRegistry)
+    XCTAssertTrue(
+      harness.bookmarkStore.isTrashed(trashedTabFile.standardizedFileURL),
+      "Precondition: the tab's file must read as thrown away, or the control proves nothing"
+    )
 
     return Scenario(
       harness: harness,
@@ -162,7 +202,8 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       noteInRemovedRoot: noteInRemovedRoot.standardizedFileURL,
       fileInNoWindow: fileInNoWindow.standardizedFileURL,
       noteInSurvivingRoot: noteInSurvivingRoot.standardizedFileURL,
-      adHocFile: adHocFile.standardizedFileURL
+      adHocFile: adHocFile.standardizedFileURL,
+      trashedTabFile: trashedTabFile.standardizedFileURL
     )
   }
 
@@ -179,6 +220,7 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     let indexDatabase: IndexDatabase
     let bookmarkStore: BookmarkStore
     let documentWindowRegistry: DocumentWindowRegistry
+    let defaults: UserDefaults
   }
 
   private func makeSandbox() throws -> Sandbox {
@@ -196,12 +238,14 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
   }
 
   @MainActor
-  private func makeHarness(in support: URL) throws -> Harness {
+  private func makeHarness(in support: URL, simulatedTrash: URL) throws -> Harness {
     let indexDatabase = IndexDatabase(
       databaseURL: support.appendingPathComponent("index.db")
     )
+    let defaults = makeEphemeralDefaults(prefix: "PensieveWorkspaceRootRemovalBookmarks")
     let bookmarkStore = BookmarkStore(
-      defaults: makeEphemeralDefaults(prefix: "PensieveWorkspaceRootRemovalBookmarks"))
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: simulatedTrash))
     let documentWindowRegistry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in },
@@ -228,7 +272,8 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       manager: manager,
       indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
-      documentWindowRegistry: documentWindowRegistry
+      documentWindowRegistry: documentWindowRegistry,
+      defaults: defaults
     )
   }
 
@@ -239,6 +284,24 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     await harness.manager.waitForPendingIndexUpdate()
     await harness.manager.waitForPendingWorkspaceIndexWrite()
     await harness.indexDatabase.waitForPendingReindex()
+  }
+
+  /// Every file the persisted bookmark set actually NAMES, read straight from the
+  /// defaults suite. `restoredFileURLs` cannot answer this: the restore path
+  /// silently withholds an entry that resolves into a Trash while the blob stays
+  /// in the key, so it would hide a bookmark that must never have been minted.
+  @MainActor
+  private func persistedFileBookmarkURLs(_ harness: Harness) -> [URL] {
+    let blobs = harness.defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data] ?? []
+    return blobs.compactMap { data -> URL? in
+      var isStale = false
+      return try? URL(
+        resolvingBookmarkData: data,
+        options: [.withSecurityScope],
+        relativeTo: nil,
+        bookmarkDataIsStale: &isStale)
+    }
+    .map(\.standardizedFileURL)
   }
 
   /// Files the NEXT launch would resolve from the persisted bookmark set.
