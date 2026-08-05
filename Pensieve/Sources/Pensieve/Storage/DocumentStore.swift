@@ -3438,12 +3438,19 @@ final class DocumentStore {
   private func loadClean(ref: DocumentRef, into appState: AppState) {
     cancelOwnDebouncesOnSessionChange(appState: appState)
 
-    // Last line of the Trash guard, and the only one that covers a document
-    // whose file was thrown away between being listed and being asked for — the
-    // window in which the row is still on screen because no scan has committed
-    // yet. A trashed file still reads perfectly, so without this the app would
-    // present it as an ordinary editable document. It leaves the working set
-    // here instead of being rendered.
+    // Last line of the Trash guard: a ref whose URL is ALREADY inside a Trash —
+    // one restored from a bookmark that followed its file there, or a row still
+    // on screen from before the retiring scan commit. A trashed file still reads
+    // perfectly, so without this the app would present a thrown-away note as an
+    // ordinary editable document. It leaves the working set here instead of
+    // being rendered.
+    //
+    // Deliberately NOT the guard for the window between a file being listed and
+    // being asked for: a file trashed in that window leaves the row naming its
+    // PRE-trash path, which is not in any Trash and reads as merely missing here.
+    // That case belongs to `registerOpenFile`, which refuses the open outright,
+    // and to the scan commit that retires the row. This is defence in depth
+    // behind them, on the one shape they can hand through.
     if bookmarkStore.isTrashed(ref.url) {
       forgetOpenFile(ref.url, into: appState)
       appState.lastError = "\(ref.url.lastPathComponent) is in the Trash."
