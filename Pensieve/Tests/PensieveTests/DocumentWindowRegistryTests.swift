@@ -5,6 +5,56 @@ import XCTest
 
 final class DocumentWindowRegistryTests: XCTestCase {
   @MainActor
+  func testUntitledFactoryAvailabilityAndStandaloneWindowPlacement() {
+    let sourceWindow = Self.makeWindow()
+    let untitledWindow = Self.makeWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+    var activations = 0
+    var factoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in XCTFail("standalone placement must not merge") },
+      orderAndActivateWindow: { window in
+        XCTAssertTrue(window === untitledWindow)
+        activations += 1
+      },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryRegistryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry)
+    registry.registerController(controller, for: sourceWindow)
+
+    XCTAssertTrue(registry.canOpenUntitledTab)
+    XCTAssertTrue(registry.window(hosting: controller) === sourceWindow)
+    XCTAssertTrue(registry.newUntitledWindow())
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+  }
+
+  @MainActor
+  func testUntitledPlacementFailsWithoutAFactory() {
+    let sourceWindow = Self.makeWindow()
+    defer { sourceWindow.close() }
+    let registry = DocumentWindowRegistry(scheduleLauncherWindowSweep: { _ in })
+
+    XCTAssertFalse(registry.canOpenUntitledTab)
+    XCTAssertFalse(registry.newUntitledTab(from: sourceWindow))
+    XCTAssertFalse(registry.newUntitledWindow())
+  }
+
+  @MainActor
   func testOpeningSameStandardizedFileTwiceFocusesExistingWindow() throws {
     let window = Self.makeWindow()
     defer { window.close() }
@@ -884,6 +934,14 @@ final class DocumentWindowRegistryTests: XCTestCase {
     window.contentView = NSView(frame: .zero)
     window.title = title
     return window
+  }
+
+  private func temporaryRegistryMetadataStore() -> WorkspaceMetadataStore {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveRegistryMetadataTests-\(UUID().uuidString)", isDirectory: true)
+    return WorkspaceMetadataStore(
+      metadataURL: folder.appendingPathComponent("workspace.json", isDirectory: false))
   }
 
   @MainActor

@@ -115,6 +115,11 @@ final class DocumentWindowRegistry: ObservableObject {
     }
   }
 
+  /// Whether New can materialize a second document instance instead of
+  /// replacing the controller's current session. The same factory serves both
+  /// tab and standalone-window placement.
+  var canOpenUntitledTab: Bool { makeDocumentWindow != nil }
+
   /// Mark the app as terminating (called from `applicationWillTerminate`) so the
   /// last-window-close handler suppresses its launcher reopen.
   func beginTermination() {
@@ -500,25 +505,47 @@ final class DocumentWindowRegistry: ObservableObject {
   /// tab group instead of the system default (a detached standalone window).
   /// Mirrors `open()`'s modal contract: deferred, not dropped, while a modal
   /// run loop blocks native tab mutation.
-  func newUntitledTab(from window: NSWindow) {
+  @discardableResult
+  func newUntitledTab(from window: NSWindow) -> Bool {
+    guard canOpenUntitledTab else {
+      DebugTrace.log("newUntitledTab -> no window factory wired")
+      return false
+    }
     guard canMutateWindowTabs() else {
       scheduleDeferredMainWork { [weak self, weak window] in
         guard let self, let window else { return }
         newUntitledTab(from: window)
       }
-      return
+      return true
     }
-    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil, .newUntitledTab) else {
-      DebugTrace.log("newUntitledTab -> no window factory wired")
-      return
-    }
+    guard let newWindow = makeUntitledWindow() else { return false }
     DebugTrace.log("newUntitledTab from '\(window.title)'")
-    untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
-    markContentWindow(newWindow)
     prepareTabbedWindow(window)
-    prepareTabbedWindow(newWindow)
     mergeWindowIntoTabs(window, newWindow)
     orderAndActivateWindow(newWindow)
+    return true
+  }
+
+  /// Opens a factory-built untitled document as an independent window. This is
+  /// the New counterpart of `newUntitledTab` when macOS resolves placement to a
+  /// new window.
+  @discardableResult
+  func newUntitledWindow() -> Bool {
+    guard let newWindow = makeUntitledWindow() else { return false }
+    DebugTrace.log("newUntitledWindow")
+    orderAndActivateWindow(newWindow)
+    return true
+  }
+
+  private func makeUntitledWindow() -> NSWindow? {
+    guard let makeDocumentWindow, let newWindow = makeDocumentWindow(nil, .newUntitledTab) else {
+      DebugTrace.log("new untitled document -> factory unavailable")
+      return nil
+    }
+    untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
+    markContentWindow(newWindow)
+    prepareTabbedWindow(newWindow)
+    return newWindow
   }
 
   @discardableResult
@@ -764,6 +791,15 @@ final class DocumentWindowRegistry: ObservableObject {
   /// association when the window closes; stale weak entries clear lazily.
   func registerController(_ controller: AppController, for window: NSWindow) {
     controllersByWindow[ObjectIdentifier(window)] = WeakController(controller)
+  }
+
+  /// Reverse lookup for placement decisions initiated by a controller. Using
+  /// the registered owner avoids borrowing whichever unrelated window happens
+  /// to be key while a menu command is resolving.
+  func window(hosting controller: AppController) -> NSWindow? {
+    applicationWindows().first { window in
+      controllersByWindow[ObjectIdentifier(window)]?.controller === controller
+    }
   }
 
   func unregisterController(for window: NSWindow) {
