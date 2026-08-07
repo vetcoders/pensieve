@@ -28,16 +28,31 @@ enum DocumentOpenPlacement: Equatable {
     }
   }
 
+  /// Reads the source window's shape — "is there one, and is it full screen?" —
+  /// and answers with the injected preference.
+  ///
+  /// Split out of `resolve(for:)` so a test can state the System Settings mode
+  /// WITHOUT restating how a window maps onto the policy's two booleans. The
+  /// matrix verifiers drive this exact entry point, which is why a test cannot
+  /// pass by hardcoding the placement it expects.
+  @MainActor
+  static func resolve(
+    preference: NSWindow.UserTabbingPreference,
+    sourceWindow: NSWindow?
+  ) -> DocumentOpenPlacement {
+    resolve(
+      preference: preference,
+      sourceIsFullScreen: sourceWindow?.styleMask.contains(.fullScreen) == true,
+      hasSourceWindow: sourceWindow != nil
+    )
+  }
+
   /// Resolves placement from the live macOS preference for each New gesture.
   ///
   /// `NSWindow.userTabbingPreference` is intentionally read on every call so a
   /// System Settings change takes effect without relaunching Pensieve.
   @MainActor
   static func resolve(for sourceWindow: NSWindow?) -> DocumentOpenPlacement {
-    resolve(
-      preference: NSWindow.userTabbingPreference,
-      sourceIsFullScreen: sourceWindow?.styleMask.contains(.fullScreen) == true,
-      hasSourceWindow: sourceWindow != nil
-    )
+    resolve(preference: NSWindow.userTabbingPreference, sourceWindow: sourceWindow)
   }
 }
