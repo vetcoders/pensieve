@@ -93,9 +93,35 @@ final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
     return MainActor.assumeIsolated { shouldClose(sender) }
   }
 
+  /// One-arg `windowWill*`/`windowDid*` selectors that are NOT snapshot-time
+  /// observer registrations: AppKit pulls these per call, re-checking
+  /// `respondsToSelector:` first, so forwarding stays safe for them and
+  /// refusing to claim them would silently cost real behavior (the undo
+  /// manager provider above all).
+  private static let pullStyleOneArgSelectors: Set<String> = [
+    "windowWillReturnUndoManager:",
+    "windowDidFailToEnterFullScreen:",
+    "windowDidFailToExitFullScreen:",
+  ]
+
   override func responds(to aSelector: Selector!) -> Bool {
     if super.responds(to: aSelector) { return true }
-    return wrapped?.responds(to: aSelector) ?? false
+    guard wrapped?.responds(to: aSelector) == true else { return false }
+    // AppKit turns every one-argument `windowWill*`/`windowDid*` selector the
+    // delegate claims into a notification-observer registration made ONCE, at
+    // delegate-set time — and that registration outlives the weak `wrapped`.
+    // Every such selector this proxy can serve is implemented statically
+    // below (so `super.responds` already said yes). Claiming any OTHER one
+    // hands AppKit a registration with no receiver left once `wrapped`
+    // deallocates: 0.4.3(689) died exactly there, on the beta's private
+    // `windowWillOrderOnScreen:` posted from `makeKeyAndOrderFront`. Unknown
+    // notification-shaped selectors are therefore never claimed — losing an
+    // exotic callback is recoverable, a SIGABRT is not. Pull-style calls
+    // (2+ args, or the listed one-arg exceptions) keep forwarding.
+    let name = NSStringFromSelector(aSelector)
+    guard name.hasPrefix("windowWill") || name.hasPrefix("windowDid") else { return true }
+    let argumentCount = name.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
+    return argumentCount != 1 || Self.pullStyleOneArgSelectors.contains(name)
   }
 
   override func forwardingTarget(for aSelector: Selector!) -> Any? {
@@ -151,4 +177,31 @@ final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
   func windowDidEnterVersionBrowser(_ n: Notification) { wrapped?.windowDidEnterVersionBrowser?(n) }
   func windowWillExitVersionBrowser(_ n: Notification) { wrapped?.windowWillExitVersionBrowser?(n) }
   func windowDidExitVersionBrowser(_ n: Notification) { wrapped?.windowDidExitVersionBrowser?(n) }
+
+  // MARK: - Private order/screen family (macOS 26/27 beta)
+  //
+  // Outside the public protocol, same snapshot-time registration trap:
+  // 0.4.3(689) aborted on `windowWillOrderOnScreen:` posted from
+  // `makeKeyAndOrderFront` while a document window attached. These are not in
+  // `NSWindowDelegate`, so forwarding goes through `perform` — if-alive,
+  // no-op otherwise.
+
+  @objc(windowWillOrderOnScreen:) func windowWillOrderOnScreen(_ n: Notification) {
+    forwardPrivateNotification("windowWillOrderOnScreen:", n)
+  }
+  @objc(windowDidOrderOnScreen:) func windowDidOrderOnScreen(_ n: Notification) {
+    forwardPrivateNotification("windowDidOrderOnScreen:", n)
+  }
+  @objc(windowWillOrderOffScreen:) func windowWillOrderOffScreen(_ n: Notification) {
+    forwardPrivateNotification("windowWillOrderOffScreen:", n)
+  }
+  @objc(windowDidOrderOffScreen:) func windowDidOrderOffScreen(_ n: Notification) {
+    forwardPrivateNotification("windowDidOrderOffScreen:", n)
+  }
+
+  private func forwardPrivateNotification(_ name: String, _ n: Notification) {
+    let sel = NSSelectorFromString(name)
+    guard let wrapped, wrapped.responds(to: sel) else { return }
+    _ = wrapped.perform(sel, with: n)
+  }
 }
