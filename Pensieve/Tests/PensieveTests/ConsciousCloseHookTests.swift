@@ -11,6 +11,7 @@ private final class SwiftUIStyleWindowDelegate: NSObject, NSWindowDelegate {
   private(set) var shouldCloseAsks = 0
   private(set) var willCloseNotifications = 0
   private(set) var didBecomeKeyNotifications = 0
+  private(set) var orderOnScreenNotifications = 0
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     shouldCloseAsks += 1
@@ -24,6 +25,21 @@ private final class SwiftUIStyleWindowDelegate: NSObject, NSWindowDelegate {
   func windowDidBecomeKey(_ notification: Notification) {
     didBecomeKeyNotifications += 1
   }
+
+  // The PRIVATE half of the beta's delegate surface: AppKit's own window
+  // delegates implement undocumented order/screen callbacks, and macOS 27
+  // posts them through the same snapshot-time observer registration as the
+  // public family. This stand-in claims one real private selector and one
+  // invented one, so the proxy's claiming policy is testable for both.
+  @objc(windowWillOrderOnScreen:) func windowWillOrderOnScreen(_ notification: Notification) {
+    orderOnScreenNotifications += 1
+  }
+
+  @objc(windowDidFrobnicate:) func windowDidFrobnicate(_ notification: Notification) {}
+
+  func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize { frameSize }
+
+  func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? { nil }
 }
 
 /// #15 P1-01 follow-up: the conscious close lifecycle must reach EVERY
@@ -186,6 +202,70 @@ final class ConsciousCloseHookTests: XCTestCase {
     // The notification center's route: raw objc dispatch of the registered
     // selector. Before the fix this aborted the process.
     _ = proxy.perform(#selector(NSWindowDelegate.windowDidBecomeKey(_:)), with: becameKey)
+  }
+
+  /// The crash pin (0.4.3/689, SIGABRT inside `makeKeyAndOrderFront` while a
+  /// document window attached): the first fix wrote out the PUBLIC
+  /// notification family, but the beta also registers the delegate for
+  /// PRIVATE one-arg selectors — `windowWillOrderOnScreen:` — and those fell
+  /// back to forwarding at a deallocated `wrapped`.
+  @MainActor
+  func testAPrivateOrderSelectorOutlivesTheWrappedDelegate() throws {
+    let window = Self.makeSwiftUIStyleWindow()
+    defer { window.close() }
+    var sceneDelegate: SwiftUIStyleWindowDelegate? = SwiftUIStyleWindowDelegate()
+    let sel = NSSelectorFromString("windowWillOrderOnScreen:")
+    let ordered = Notification(
+      name: Notification.Name("NSWindowWillOrderOnScreenNotification"), object: window)
+
+    let proxy = try autoreleasepool { () -> ConsciousCloseDelegateProxy in
+      window.delegate = sceneDelegate
+      ConsciousCloseHook.install(on: window) { _ in true }
+      let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
+      XCTAssertTrue(
+        proxy.responds(to: sel),
+        "AppKit only registers the observer because the proxy claims the private selector")
+      _ = proxy.perform(sel, with: ordered)
+      XCTAssertEqual(
+        sceneDelegate?.orderOnScreenNotifications, 1,
+        "while the wrapped delegate lives, private order callbacks must keep reaching it")
+      return proxy
+    }
+
+    sceneDelegate = nil
+    XCTAssertNil(proxy.wrapped, "the test proved nothing — the wrapped delegate never deallocated")
+    // Raw objc dispatch of the registered selector. On 0.4.3(689) this
+    // aborted the process.
+    _ = proxy.perform(sel, with: ordered)
+  }
+
+  /// The class-wide seal: a notification-shaped selector the proxy cannot
+  /// serve statically must never be CLAIMED — an unserved claim is a fatal
+  /// observer registration waiting for `wrapped` to deallocate. Pull-style
+  /// selectors stay claimable: AppKit re-checks `respondsToSelector:` before
+  /// each of those calls.
+  @MainActor
+  func testAnUnknownNotificationShapedSelectorIsNeverClaimed() throws {
+    let window = Self.makeSwiftUIStyleWindow()
+    defer { window.close() }
+    let sceneDelegate = SwiftUIStyleWindowDelegate()
+    window.delegate = sceneDelegate
+
+    ConsciousCloseHook.install(on: window) { _ in true }
+    let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
+
+    let unknown = NSSelectorFromString("windowDidFrobnicate:")
+    XCTAssertTrue(sceneDelegate.responds(to: unknown))
+    XCTAssertFalse(
+      proxy.responds(to: unknown),
+      "claiming a notification-shaped selector with no static implementation hands AppKit a registration that outlives `wrapped`")
+
+    XCTAssertTrue(
+      proxy.responds(to: NSSelectorFromString("windowWillResize:toSize:")),
+      "pull-style delegate calls (2+ args) must keep forwarding while the wrapped delegate lives")
+    XCTAssertTrue(
+      proxy.responds(to: NSSelectorFromString("windowWillReturnUndoManager:")),
+      "windowWillReturnUndoManager: is pull-style despite its notification shape — blocking it would cost document windows their undo stack")
   }
 
   /// Factory-built windows keep the route they already had — `performClose` is
