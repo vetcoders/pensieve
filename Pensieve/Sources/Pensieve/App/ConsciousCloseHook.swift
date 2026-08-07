@@ -102,4 +102,53 @@ final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
     guard wrapped?.responds(to: aSelector) == true else { return nil }
     return wrapped
   }
+
+  // MARK: - Notification family — written out, never left to forwarding
+  //
+  // AppKit snapshots `responds(to:)` ONCE, when this proxy becomes the
+  // window's delegate, and registers the proxy as a notification OBSERVER for
+  // every `windowDid*`/`windowWill*` selector it claimed. That registration
+  // outlives the answer: `wrapped` is weak, and once it deallocates a
+  // claimed-but-unimplemented selector arrives with no forwarding target left,
+  // which is `doesNotRecognizeSelector` — a SIGABRT in the middle of
+  // `makeKeyAndOrderFront`. Pull-style delegate methods can stay on the
+  // forwarding path because AppKit re-checks `respondsToSelector:` right
+  // before each of those calls; the notification family cannot, so every
+  // member is implemented here as a forward-if-alive no-op-otherwise.
+
+  func windowDidBecomeKey(_ n: Notification) { wrapped?.windowDidBecomeKey?(n) }
+  func windowDidResignKey(_ n: Notification) { wrapped?.windowDidResignKey?(n) }
+  func windowDidBecomeMain(_ n: Notification) { wrapped?.windowDidBecomeMain?(n) }
+  func windowDidResignMain(_ n: Notification) { wrapped?.windowDidResignMain?(n) }
+  func windowWillClose(_ n: Notification) { wrapped?.windowWillClose?(n) }
+  func windowWillMove(_ n: Notification) { wrapped?.windowWillMove?(n) }
+  func windowDidMove(_ n: Notification) { wrapped?.windowDidMove?(n) }
+  func windowDidResize(_ n: Notification) { wrapped?.windowDidResize?(n) }
+  func windowWillStartLiveResize(_ n: Notification) { wrapped?.windowWillStartLiveResize?(n) }
+  func windowDidEndLiveResize(_ n: Notification) { wrapped?.windowDidEndLiveResize?(n) }
+  func windowWillMiniaturize(_ n: Notification) { wrapped?.windowWillMiniaturize?(n) }
+  func windowDidMiniaturize(_ n: Notification) { wrapped?.windowDidMiniaturize?(n) }
+  func windowDidDeminiaturize(_ n: Notification) { wrapped?.windowDidDeminiaturize?(n) }
+  func windowDidExpose(_ n: Notification) { wrapped?.windowDidExpose?(n) }
+  func windowDidChangeScreen(_ n: Notification) { wrapped?.windowDidChangeScreen?(n) }
+  func windowDidChangeScreenProfile(_ n: Notification) { wrapped?.windowDidChangeScreenProfile?(n) }
+  func windowDidChangeBackingProperties(_ n: Notification) {
+    wrapped?.windowDidChangeBackingProperties?(n)
+  }
+  func windowDidUpdate(_ n: Notification) { wrapped?.windowDidUpdate?(n) }
+  func windowWillBeginSheet(_ n: Notification) { wrapped?.windowWillBeginSheet?(n) }
+  func windowDidEndSheet(_ n: Notification) { wrapped?.windowDidEndSheet?(n) }
+  func windowDidChangeOcclusionState(_ n: Notification) {
+    wrapped?.windowDidChangeOcclusionState?(n)
+  }
+  func windowWillEnterFullScreen(_ n: Notification) { wrapped?.windowWillEnterFullScreen?(n) }
+  func windowDidEnterFullScreen(_ n: Notification) { wrapped?.windowDidEnterFullScreen?(n) }
+  func windowWillExitFullScreen(_ n: Notification) { wrapped?.windowWillExitFullScreen?(n) }
+  func windowDidExitFullScreen(_ n: Notification) { wrapped?.windowDidExitFullScreen?(n) }
+  func windowWillEnterVersionBrowser(_ n: Notification) {
+    wrapped?.windowWillEnterVersionBrowser?(n)
+  }
+  func windowDidEnterVersionBrowser(_ n: Notification) { wrapped?.windowDidEnterVersionBrowser?(n) }
+  func windowWillExitVersionBrowser(_ n: Notification) { wrapped?.windowWillExitVersionBrowser?(n) }
+  func windowDidExitVersionBrowser(_ n: Notification) { wrapped?.windowDidExitVersionBrowser?(n) }
 }

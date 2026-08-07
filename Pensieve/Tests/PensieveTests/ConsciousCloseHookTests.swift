@@ -10,6 +10,7 @@ private final class SwiftUIStyleWindowDelegate: NSObject, NSWindowDelegate {
   var vetoesClose = false
   private(set) var shouldCloseAsks = 0
   private(set) var willCloseNotifications = 0
+  private(set) var didBecomeKeyNotifications = 0
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     shouldCloseAsks += 1
@@ -18,6 +19,10 @@ private final class SwiftUIStyleWindowDelegate: NSObject, NSWindowDelegate {
 
   func windowWillClose(_ notification: Notification) {
     willCloseNotifications += 1
+  }
+
+  func windowDidBecomeKey(_ notification: Notification) {
+    didBecomeKeyNotifications += 1
   }
 }
 
@@ -143,6 +148,44 @@ final class ConsciousCloseHookTests: XCTestCase {
     XCTAssertEqual(
       (window.delegate as? ConsciousCloseDelegateProxy)?.wrapped === sceneDelegate, true,
       "re-installing must not wrap the proxy in itself")
+  }
+
+  /// The crash pin (0.4.3/684, SIGABRT inside `makeKeyAndOrderFront`): AppKit
+  /// registers the delegate as a notification observer for every selector it
+  /// claims AT DELEGATE-SET TIME and then dispatches those selectors directly,
+  /// with no `responds(to:)` re-check. The proxy's `wrapped` is weak, so a
+  /// selector it once claimed must stay callable for the proxy's whole life —
+  /// forwarding to a deallocated target is `doesNotRecognizeSelector`.
+  @MainActor
+  func testAClaimedNotificationSelectorOutlivesTheWrappedDelegate() throws {
+    let window = Self.makeSwiftUIStyleWindow()
+    defer { window.close() }
+    var sceneDelegate: SwiftUIStyleWindowDelegate? = SwiftUIStyleWindowDelegate()
+    let becameKey = Notification(name: NSWindow.didBecomeKeyNotification, object: window)
+
+    // The ObjC bridge autoreleases the wrapped delegate on every forwarded
+    // call; the pool drains those extra retains so `sceneDelegate = nil` below
+    // is a REAL deallocation, not a deferred one.
+    let proxy = try autoreleasepool { () -> ConsciousCloseDelegateProxy in
+      window.delegate = sceneDelegate
+      ConsciousCloseHook.install(on: window) { _ in true }
+      let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
+      XCTAssertEqual(
+        proxy.responds(to: #selector(NSWindowDelegate.windowDidBecomeKey(_:))), true,
+        "AppKit only registers the observer because the proxy claims the selector")
+
+      proxy.windowDidBecomeKey(becameKey)
+      XCTAssertEqual(
+        sceneDelegate?.didBecomeKeyNotifications, 1,
+        "while the wrapped delegate lives, its lifecycle must keep reaching it")
+      return proxy
+    }
+
+    sceneDelegate = nil
+    XCTAssertNil(proxy.wrapped, "the test proved nothing — the wrapped delegate never deallocated")
+    // The notification center's route: raw objc dispatch of the registered
+    // selector. Before the fix this aborted the process.
+    _ = proxy.perform(#selector(NSWindowDelegate.windowDidBecomeKey(_:)), with: becameKey)
   }
 
   /// Factory-built windows keep the route they already had — `performClose` is
