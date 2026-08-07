@@ -6332,11 +6332,16 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     var untitledFactoryCalls = 0
+    var tabMerges = 0
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in XCTFail("⌘N must not defer here") },
       scheduleLauncherWindowSweep: { _ in },
-      mergeWindowIntoTabs: { _, _ in },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === documentWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { documentWindow },
       applicationWindows: { [documentWindow, untitledWindow] },
@@ -6355,9 +6360,10 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
-      documentWindowRegistry: registry
+      documentWindowRegistry: registry,
+      resolveDocumentOpenPlacement: { _ in .tabIn }
     )
-    controller.requestNewUntitledTab = { registry.newUntitledTab(from: documentWindow) }
+    registry.registerController(controller, for: documentWindow)
 
     // The window is showing the file the user opened from Finder, and the
     // sidebar's Open Files list is that registry row.
@@ -6371,6 +6377,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(
       untitledFactoryCalls, 1,
       "⌘N over a live buffer must open its own tab, like the tab bar's + button")
+    XCTAssertEqual(tabMerges, 1)
     XCTAssertEqual(
       registry.openTabDocumentIDs, [noteURL],
       "the open document lost its row in Open Files to the new untitled draft")
@@ -6378,6 +6385,111 @@ final class PensieveSmokeTests: XCTestCase {
       appState.documentSession.url, noteURL,
       "⌘N overwrote the file-backed buffer of the window it fired from")
     XCTAssertEqual(appState.activeDocumentText, "# transcript")
+  }
+
+  @MainActor
+  func testControllerCreatesNewTabWithoutPromptingOrMutatingRecoveredDraft() throws {
+    let sourceWindow = Self.makeControllerlessWindow()
+    let untitledWindow = Self.makeControllerlessWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+
+    var factoryCalls = 0
+    var promptCount = 0
+    var tabMerges = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("New must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === sourceWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
+      orderAndActivateWindow: { window in XCTAssertTrue(window === untitledWindow) },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+    let appState = AppState()
+    let recoveryID = UUID()
+    appState.documentSession.restoreUntitled(
+      title: "Recovered.md",
+      text: "contract text that must survive",
+      recoveryID: recoveryID)
+    let originalIdentity = appState.documentSession.identity
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { _ in
+        promptCount += 1
+        return .cancel
+      }),
+      documentWindowRegistry: registry,
+      resolveDocumentOpenPlacement: { _ in .tabIn })
+    registry.registerController(controller, for: sourceWindow)
+
+    XCTAssertTrue(registry.window(hosting: controller) === sourceWindow)
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(tabMerges, 1)
+    XCTAssertEqual(promptCount, 0, "New must never enter the dirty-session save prompt")
+    XCTAssertEqual(appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(appState.activeDocumentText, "contract text that must survive")
+    XCTAssertTrue(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testControllerCreatesNewWindowWithoutReplacingOccupiedSession() throws {
+    let sourceWindow = Self.makeControllerlessWindow()
+    let untitledWindow = Self.makeControllerlessWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("New must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in XCTFail("new-window placement must not merge tabs") },
+      orderAndActivateWindow: { window in
+        XCTAssertTrue(window === untitledWindow)
+        activations += 1
+      },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+    let appState = AppState()
+    appState.documentSession = .untitled(title: "Original.md")
+    appState.activeDocumentText = "original buffer"
+    let originalIdentity = appState.documentSession.identity
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry,
+      resolveDocumentOpenPlacement: { _ in .newWindow })
+    registry.registerController(controller, for: sourceWindow)
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+    XCTAssertEqual(appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(appState.activeDocumentText, "original buffer")
   }
 
   /// The other half of the same policy: an IDLE window has nothing to lose, so
@@ -6395,20 +6507,29 @@ final class PensieveSmokeTests: XCTestCase {
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
+    let unusedWindow = Self.makeControllerlessWindow()
+    defer { unusedWindow.close() }
+    var factoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      scheduleLauncherWindowSweep: { _ in },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return unusedWindow
+      })
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
-      indexDatabase: indexDatabase
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry,
+      resolveDocumentOpenPlacement: { _ in .newWindow }
     )
-    var tabRequests = 0
-    controller.requestNewUntitledTab = { tabRequests += 1 }
 
     XCTAssertFalse(controller.holdsLiveDocumentWork)
     XCTAssertTrue(controller.createUntitledDocument())
 
-    XCTAssertEqual(tabRequests, 0, "an idle window is the one that takes the new draft")
+    XCTAssertEqual(factoryCalls, 0, "an idle window is the one that takes the new draft")
     XCTAssertTrue(appState.documentSession.isUntitled)
     XCTAssertTrue(appState.documentSession.hasEditableBuffer)
   }

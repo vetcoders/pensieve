@@ -38,6 +38,7 @@ final class ApplicationStartupRestore {
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
+  typealias DocumentPlacementResolver = @MainActor (NSWindow?) -> DocumentOpenPlacement
   /// Confirms dropping a crash draft for good. Synchronous like the folder
   /// trash question: nothing is being torn down, so a plain alert is enough.
   typealias DraftDiscardConfirmation = @MainActor (RecoveryDraft) -> Bool
@@ -65,6 +66,7 @@ final class AppController: ObservableObject {
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
   private let confirmDiscardDraft: DraftDiscardConfirmation
+  private let resolveDocumentOpenPlacement: DocumentPlacementResolver
   /// Unhandled crash drafts, newest first — the model behind the launcher's
   /// "Recovered Drafts" section. Empty means the section is not shown at all.
   @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
@@ -115,10 +117,6 @@ final class AppController: ObservableObject {
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
-  /// ⌘N's route to a tab of its own, the same seam the tab bar's "+" button
-  /// already uses (`DocumentWindowRegistry.newUntitledTab`). Unwired (tests,
-  /// headless) falls back to replacing this window's session in place.
-  var requestNewUntitledTab: (() -> Void)?
   /// The launch restore's bulk route. One call for the WHOLE working set, so
   /// the registry can join every tab to the group and bring exactly one window
   /// front at the end instead of paying a full window presentation — and the
@@ -166,6 +164,9 @@ final class AppController: ObservableObject {
     agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000,
+    resolveDocumentOpenPlacement: @escaping DocumentPlacementResolver = {
+      DocumentOpenPlacement.resolve(for: $0)
+    },
     confirmFolderTrash: @escaping FolderTrashConfirmation = { url in
       let alert = NSAlert()
       alert.messageText = "Move \(url.lastPathComponent) to Trash?"
@@ -208,6 +209,7 @@ final class AppController: ObservableObject {
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
+    self.resolveDocumentOpenPlacement = resolveDocumentOpenPlacement
     self.confirmFolderTrash = confirmFolderTrash
     self.confirmSaveChanges = confirmSaveChanges
     self.confirmDiscardDraft = confirmDiscardDraft
@@ -915,18 +917,35 @@ final class AppController: ObservableObject {
   /// chain — was REPLACED rather than joined. One document open, ⌘N, and the
   /// document was gone from the list.
   ///
-  /// The tab bar's "+" button had the right behaviour all along
-  /// (`DocumentWindowRegistry.newUntitledTab`); this routes the keyboard gesture
-  /// through the same seam so the two affordances stop disagreeing.
+  /// An occupied window never enters the save/switch path. The system's live
+  /// "Prefer tabs" setting decides whether the factory-built document joins the
+  /// source tab group or opens independently. An empty launcher is still reused
+  /// in place, and clean headless tests keep their historical in-place fallback.
   @discardableResult
   func createUntitledDocument() -> Bool {
-    if holdsLiveDocumentWork, let requestNewUntitledTab {
-      requestNewUntitledTab()
-      return true
-    }
+    if holdsLiveDocumentWork {
+      if documentWindowRegistry.canOpenUntitledTab {
+        let sourceWindow =
+          documentWindowRegistry.window(hosting: self) ?? hostWindowProvider?()
+        switch resolveDocumentOpenPlacement(sourceWindow) {
+        case .tabIn:
+          guard let sourceWindow else { return false }
+          return documentWindowRegistry.newUntitledTab(from: sourceWindow)
+        case .newWindow:
+          return documentWindowRegistry.newUntitledWindow()
+        }
+      }
 
-    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
-      return false
+      // A headless controller has no factory with which to preserve a dirty or
+      // in-flight session. Fail closed: New must neither ask to save nor replace
+      // work it cannot place elsewhere. Clean editable buffers retain the legacy
+      // in-place renumbering used by focused command tests.
+      guard !appState.documentSession.isDirty,
+        !hasPendingImportWork,
+        !hasPendingDocumentLoad
+      else {
+        return false
+      }
     }
 
     appState.documentSession.createUntitled(title: nextUntitledTitle())
