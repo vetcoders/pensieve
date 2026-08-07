@@ -161,6 +161,11 @@ final class DocumentWindowRegistry: ObservableObject {
   /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
   /// and the tab-vs-window close scope is decided from exactly this list.
   private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
+  /// Where a NEW document belongs relative to the window the gesture came from.
+  /// The same resolver shape `AppController` uses for ⌘N, injected for the same
+  /// reason: `NSWindow.userTabbingPreference` is a live System Settings global
+  /// no test can set.
+  private let resolveNewDocumentPlacement: AppController.DocumentPlacementResolver
 
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
@@ -204,6 +209,9 @@ final class DocumentWindowRegistry: ObservableObject {
     tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
       window.tabbedWindows ?? [window]
     },
+    resolveNewDocumentPlacement: @escaping AppController.DocumentPlacementResolver = {
+      DocumentOpenPlacement.resolve(for: $0)
+    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
@@ -217,6 +225,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
     self.closeWindow = closeWindow
+    self.resolveNewDocumentPlacement = resolveNewDocumentPlacement
     self.makeDocumentWindow = makeDocumentWindow
   }
 
@@ -501,6 +510,30 @@ final class DocumentWindowRegistry: ObservableObject {
     return applicationWindows().contains(where: isLiveApplicationWindow)
   }
 
+  /// The native tab bar's "+" (and the system `newWindowForTab:` action), for
+  /// EVERY window class this app puts documents in.
+  ///
+  /// The single decision point the two window paths were missing. A factory
+  /// `DocumentWindow` reaches it through its own `newWindowForTab` override; a
+  /// SwiftUI scene-owned window — the launcher, which is where a recovered
+  /// draft lives — reaches it through `DocumentWindowTabBridge`. Both arrive
+  /// here ONCE, and here is where the live "Prefer tabs" preference decides
+  /// between a tab in the source group and an independent window, exactly as ⌘N
+  /// already does (`AppController.createUntitledDocument`).
+  ///
+  /// A new WINDOW still carries the shared tabbing identifier
+  /// (`makeUntitledWindow` → `prepareTabbedWindow`), so "Window ▸ Merge All
+  /// Windows" stays enabled whichever branch ran.
+  @discardableResult
+  func newDocumentForTab(from sourceWindow: NSWindow) -> Bool {
+    switch resolveNewDocumentPlacement(sourceWindow) {
+    case .tabIn:
+      return newUntitledTab(from: sourceWindow)
+    case .newWindow:
+      return newUntitledWindow()
+    }
+  }
+
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
   /// tab group instead of the system default (a detached standalone window).
   /// Mirrors `open()`'s modal contract: deferred, not dropped, while a modal
@@ -576,6 +609,15 @@ final class DocumentWindowRegistry: ObservableObject {
     if window.tabbingIdentifier != documentTabbingIdentifier {
       prepareTabbedWindow(window)
     }
+    // The other half of the same normalization. A window this app did not BUILD
+    // answers the tab bar's "+" with whatever its own class does — for the
+    // SwiftUI scene launcher (and the recovered-draft window that IS it) that
+    // is a detached scene window, placement and registry bypassed. Bridged here
+    // because this is the one seam every window class reaches on its way into
+    // the app, and because the window's real class can only be learned from a
+    // real window. Idempotent per class; `DocumentWindow` is skipped, so the
+    // factory's own override stays the single route.
+    DocumentWindowTabBridge.install(for: window)
 
     let windowID = ObjectIdentifier(window)
     var resolvedIdentity =

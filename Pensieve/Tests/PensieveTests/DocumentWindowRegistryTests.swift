@@ -923,6 +923,184 @@ final class DocumentWindowRegistryTests: XCTestCase {
         .standardizedFileURL)
   }
 
+  // MARK: - Tab bar "+" across both window classes
+
+  /// A1 + A5. The scene-owned window is normalized onto the shared tabbing
+  /// identifier by its FIRST attach, and its tab bar's "+" — which without the
+  /// bridge spawns a detached scene window AppKit never tells the registry
+  /// about — reaches the registry and merges into the window it came from.
+  @MainActor
+  func testSceneOwnedWindowTakesTheTabbingIdentifierAndRoutesItsTabBarPlus() {
+    let sceneWindow = SceneOwnedLikeWindow.make()
+    let untitledWindow = Self.makeWindow()
+    let previousHandler = DocumentWindowTabBridge.handleNewWindowForTab
+    defer {
+      DocumentWindowTabBridge.handleNewWindowForTab = previousHandler
+      sceneWindow.close()
+      untitledWindow.close()
+    }
+
+    var merges: [(target: NSWindow, joined: NSWindow)] = []
+    var factoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { target, joined in merges.append((target, joined)) },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [sceneWindow, untitledWindow] },
+      resolveNewDocumentPlacement: { _ in .tabIn },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+
+    sceneWindow.tabbingIdentifier = "SwiftUI.SceneOwned"
+    XCTAssertTrue(registry.attach(sceneWindow, documentID: nil, hasEditableBuffer: true))
+    XCTAssertEqual(sceneWindow.tabbingIdentifier, WindowChromeRecipe.documentTabbingIdentifier)
+
+    DocumentWindowTabBridge.handleNewWindowForTab = { window in
+      registry.newDocumentForTab(from: window)
+    }
+    // The way AppKit itself delivers it: an ObjC message, not a Swift call the
+    // compiler could devirtualize past the patched method table.
+    Self.sendNewWindowForTab(to: sceneWindow)
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(merges.count, 1)
+    XCTAssertTrue(merges.first?.target === sceneWindow)
+    XCTAssertTrue(merges.first?.joined === untitledWindow)
+  }
+
+  /// The bridge patches a CLASS, so it has to keep its hands off every window of
+  /// that class which is not Pensieve's — those are handed back the exact
+  /// implementation the patch displaced. The claimed window is answered once and
+  /// does not also fall through to it.
+  @MainActor
+  func testBridgeClaimsOnlyPensievesTabbingIdentifierAndPreservesTheDisplacedBehaviour() {
+    let ourWindow = SceneOwnedAnsweringWindow.make()
+    let foreignWindow = SceneOwnedAnsweringWindow.make()
+    foreignWindow.tabbingIdentifier = "SomeOtherApp.Window"
+    let previousHandler = DocumentWindowTabBridge.handleNewWindowForTab
+    defer {
+      DocumentWindowTabBridge.handleNewWindowForTab = previousHandler
+      ourWindow.close()
+      foreignWindow.close()
+    }
+
+    let registry = Self.makeIdentityRegistry()
+    XCTAssertTrue(registry.attach(ourWindow, documentID: nil, hasEditableBuffer: true))
+    XCTAssertEqual(ourWindow.tabbingIdentifier, WindowChromeRecipe.documentTabbingIdentifier)
+
+    var routed: [NSWindow] = []
+    DocumentWindowTabBridge.handleNewWindowForTab = { routed.append($0) }
+    SceneOwnedAnsweringWindow.displacedCalls = 0
+
+    Self.sendNewWindowForTab(to: foreignWindow)
+    XCTAssertTrue(routed.isEmpty)
+    XCTAssertEqual(SceneOwnedAnsweringWindow.displacedCalls, 1)
+
+    Self.sendNewWindowForTab(to: ourWindow)
+    XCTAssertEqual(routed.count, 1)
+    XCTAssertTrue(routed.first === ourWindow)
+    XCTAssertEqual(SceneOwnedAnsweringWindow.displacedCalls, 1)
+  }
+
+  /// A2. `DocumentWindow` already answers "+" itself, so the bridge refuses its
+  /// class outright — the override stays the ONE route and a single click never
+  /// creates two documents.
+  @MainActor
+  func testFactoryDocumentWindowKeepsASingleTabBarPlusRoute() {
+    let documentWindow = DocumentWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    WindowChromeRecipe.apply(to: documentWindow, title: "Untitled")
+    let previousHandler = DocumentWindowTabBridge.handleNewWindowForTab
+    defer {
+      DocumentWindowTabBridge.handleNewWindowForTab = previousHandler
+      documentWindow.close()
+    }
+
+    var factoryHookCalls = 0
+    var bridgeCalls = 0
+    documentWindow.onNewWindowForTab = { _ in factoryHookCalls += 1 }
+    DocumentWindowTabBridge.handleNewWindowForTab = { _ in bridgeCalls += 1 }
+
+    XCTAssertFalse(DocumentWindowTabBridge.install(for: documentWindow))
+    Self.sendNewWindowForTab(to: documentWindow)
+
+    XCTAssertEqual(factoryHookCalls, 1)
+    XCTAssertEqual(bridgeCalls, 0)
+  }
+
+  /// A4. "Prefer tabs = Always" merges the new document into the source window's
+  /// group.
+  @MainActor
+  func testTabBarPlusWithAlwaysTabsMergesIntoTheSourceWindow() {
+    let sourceWindow = Self.makeWindow(title: "Source")
+    let untitledWindow = Self.makeWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+
+    var merges: [(target: NSWindow, joined: NSWindow)] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("tab placement should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { target, joined in merges.append((target, joined)) },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      resolveNewDocumentPlacement: { window in
+        XCTAssertTrue(window === sourceWindow)
+        return .tabIn
+      },
+      makeDocumentWindow: { _, _ in untitledWindow })
+
+    XCTAssertTrue(registry.newDocumentForTab(from: sourceWindow))
+    XCTAssertEqual(merges.count, 1)
+    XCTAssertTrue(merges.first?.target === sourceWindow)
+    XCTAssertTrue(merges.first?.joined === untitledWindow)
+  }
+
+  /// A3. "Prefer tabs = Never" gives the new document its own window — which
+  /// still carries the shared tabbing identifier, so "Merge All Windows" is not
+  /// greyed out afterwards.
+  @MainActor
+  func testTabBarPlusWithNeverOpensASeparateWindowThatCanStillBeMerged() {
+    let sourceWindow = Self.makeWindow(title: "Source")
+    let untitledWindow = Self.makeWindow()
+    untitledWindow.tabbingIdentifier = "SwiftUI.SceneOwned"
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+
+    var activations: [NSWindow] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("window placement should not defer") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in XCTFail("Never must not merge into the source group") },
+      orderAndActivateWindow: { activations.append($0) },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      resolveNewDocumentPlacement: { _ in .newWindow },
+      makeDocumentWindow: { _, _ in untitledWindow })
+
+    XCTAssertTrue(registry.newDocumentForTab(from: sourceWindow))
+    XCTAssertEqual(activations.count, 1)
+    XCTAssertTrue(activations.first === untitledWindow)
+    XCTAssertEqual(
+      untitledWindow.tabbingIdentifier, WindowChromeRecipe.documentTabbingIdentifier,
+      "a standalone New must stay mergeable, or Window ▸ Merge All Windows greys out")
+  }
+
   @MainActor
   private static func makeWindow(title: String = "") -> NSWindow {
     let window = NSWindow(
@@ -956,5 +1134,53 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       closeWindow: closeWindow)
+  }
+
+  /// Delivers "+" the way AppKit does — an ObjC message through the class's
+  /// method table, which is the only dispatch a runtime patch can be on.
+  @MainActor
+  private static func sendNewWindowForTab(to window: NSWindow) {
+    let noSender: Any? = nil
+    _ = window.perform(#selector(NSWindow.newWindowForTab(_:)), with: noSender)
+  }
+}
+
+/// Stand-in for SwiftUI's own window class: a document-bearing window whose
+/// class this app does not own and cannot subclass in production. It implements
+/// no `newWindowForTab:`, which is the shape the bridge answers by ADDING one.
+private final class SceneOwnedLikeWindow: NSWindow {
+  @MainActor
+  static func make() -> SceneOwnedLikeWindow {
+    let window = SceneOwnedLikeWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
+  }
+}
+
+/// The other shape: a foreign window class that answers "+" ITSELF, so the
+/// bridge has to DISPLACE an implementation and keep it reachable for every
+/// window of that class which is not Pensieve's.
+private final class SceneOwnedAnsweringWindow: NSWindow {
+  nonisolated(unsafe) static var displacedCalls = 0
+
+  override func newWindowForTab(_ sender: Any?) {
+    Self.displacedCalls += 1
+  }
+
+  @MainActor
+  static func make() -> SceneOwnedAnsweringWindow {
+    let window = SceneOwnedAnsweringWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = NSView(frame: .zero)
+    return window
   }
 }
