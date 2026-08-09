@@ -13,13 +13,13 @@ struct AgentDispatchMetadata: Equatable, Sendable {
 
     switch (runID, reportPath) {
     case (let runID?, let reportPath?):
-      return "Dispatch completed: \(runID) | \(reportPath)"
+      return "Run started: \(runID) | \(reportPath)"
     case (let runID?, nil):
-      return "Dispatch completed: \(runID)"
+      return "Run started: \(runID)"
     case (nil, let reportPath?):
-      return "Dispatch completed: \(reportPath)"
+      return "Run started: \(reportPath)"
     case (nil, nil):
-      return "Dispatch completed"
+      return "Run started"
     }
   }
 

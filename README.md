@@ -35,6 +35,14 @@ Pensieve keeps Markdown as the source of truth while making exchange with Word-f
 
 The existing HTML and PDF export options remain available in the File menu.
 
+## Agent dispatch lifecycle
+
+Dispatch starts a detached Vibecrafted worker and returns a run ID. The launch
+receipt is not a completion result: the worker keeps running after the dispatch
+sheet closes, and closing the optional Terminal status window does not stop it.
+**Check status in Terminal** requests a status snapshot for that run; the worker
+itself remains owned by its Vibecrafted/vc-frame session.
+
 ## Requirements
 
 - macOS 15 or newer.
