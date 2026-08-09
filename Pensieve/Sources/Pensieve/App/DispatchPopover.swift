@@ -9,7 +9,8 @@ import SwiftUI
 /// preselected workflow, the agent picker, the remembered run root, and a
 /// summary — nothing runs until the user presses Dispatch. Dispatch is headless
 /// via the canonical uv-core entry (parseable run_id) and confirms IN the sheet
-/// ("Dispatched ✓ run: …") so the user always knows whether it fired. Presented
+/// ("Run started") so the user knows the detached worker exists without mistaking
+/// launch for completion. Presented
 /// as a `.sheet` (not a transient popover) so the "Choose…" NSOpenPanel can run
 /// as a sheet-on-sheet without dismissing it and losing the chosen folder.
 struct DispatchPopover: View {
@@ -268,13 +269,21 @@ struct DispatchPopover: View {
     case .dispatched(let runID, let reportPath):
       VStack(alignment: .leading, spacing: 8) {
         Label(
-          runID.map { "Dispatched ✓  run: \($0)" } ?? "Dispatched ✓",
+          runID.map { "Run started  ·  \($0)" } ?? "Run started",
           systemImage: "checkmark.seal.fill"
         )
         .foregroundStyle(.green)
         .font(.system(size: 12, weight: .semibold))
         .textSelection(.enabled)
         .accessibilityIdentifier("pensieve.dispatch.confirmed")
+        Text(
+          "This confirms launch, not completion. The agent keeps running in the background "
+            + "if you close this sheet or Terminal."
+        )
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
         HStack(spacing: 8) {
           if let reportPath {
             Button("Reveal report") {
@@ -282,12 +291,12 @@ struct DispatchPopover: View {
             }
           }
           if let runID, let observeAgent {
-            Button("Observe in Terminal") {
+            Button("Check status in Terminal") {
               controller.observeRunInTerminal(agent: observeAgent, runID: runID)
             }
           }
           Spacer()
-          Button("Done") { onClose() }
+          Button("Close") { onClose() }
             .keyboardShortcut(.defaultAction)
         }
       }

@@ -54,7 +54,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       metadata.reportPath,
       "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md")
     let expectedStatus =
-      "Dispatch completed: work-260615-123456"
+      "Run started: work-260615-123456"
       + " | /Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/reports/report.md"
     XCTAssertEqual(
       metadata.statusLine,
@@ -145,7 +145,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(runID, "work-260615-success")
     XCTAssertEqual(receivedReportPath, reportPath)
     let expectedStatusLine =
-      "Dispatched pensieve-dispatch-note.md → workflow (codex) in pensieve-dispatch-root"
+      "Started pensieve-dispatch-note.md → workflow (codex) in pensieve-dispatch-root"
     XCTAssertEqual(statusLine, expectedStatusLine)
     XCTAssertNil(appState.lastError)
     XCTAssertEqual(
