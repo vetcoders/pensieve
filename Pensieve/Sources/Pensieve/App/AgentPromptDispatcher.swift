@@ -127,6 +127,7 @@ enum AgentPromptLauncherError: LocalizedError {
 
 final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
+  static let workerProofTimeout: TimeInterval = 3
   static let uvToolExecutableRelativePath =
     ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
   static let defaultExecutableRelativePath =
@@ -160,6 +161,77 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     return candidates
   }
 
+  /// Finder/Dock launches inherit a system-only PATH. Vibecrafted's first
+  /// process has an absolute uv shebang, but its detached dispatcher launches
+  /// the selected agent by name (`codex`, `claude`, and so on). Supply the
+  /// standard tool locations without invoking a login shell or sourcing user
+  /// startup files.
+  static func launchEnvironment(base: [String: String], home: URL) -> [String: String] {
+    var environment = base
+    let preferred = [
+      home.appendingPathComponent(".local/bin", isDirectory: true).path,
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+      home.appendingPathComponent(".cargo/bin", isDirectory: true).path,
+      home.appendingPathComponent(".grok/bin", isDirectory: true).path,
+      home.appendingPathComponent(".vibecrafted/bin", isDirectory: true).path,
+    ]
+    let inherited = (base["PATH"] ?? "").split(separator: ":").map(String.init)
+    var seen = Set<String>()
+    environment["PATH"] = (preferred + inherited)
+      .filter { !$0.isEmpty && seen.insert($0).inserted }
+      .joined(separator: ":")
+    return environment
+  }
+
+  static func runtimeMetadataURL(runID: String, output: String, home: URL) -> URL {
+    if let transcriptPath = receiptValue(label: "transcript", in: output),
+      transcriptPath.hasPrefix("/")
+    {
+      return URL(fileURLWithPath: transcriptPath).deletingLastPathComponent()
+        .appendingPathComponent("meta.json")
+    }
+    return home.appendingPathComponent(".vibecrafted/control_plane/runtime_runs", isDirectory: true)
+      .appendingPathComponent(runID, isDirectory: true)
+      .appendingPathComponent("meta.json")
+  }
+
+  static func workerProofExists(at metadataURL: URL) -> Bool {
+    guard
+      let data = try? Data(contentsOf: metadataURL),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let workerPID = object["worker_pid"] as? NSNumber
+    else {
+      return false
+    }
+    return workerPID.intValue > 0
+  }
+
+  private static func receiptValue(label: String, in output: String) -> String? {
+    let escapedLabel = NSRegularExpression.escapedPattern(for: label)
+    guard
+      let regex = try? NSRegularExpression(
+        pattern: "(?m)^\\s*\(escapedLabel):\\s*(\\S+)\\s*$"),
+      let match = regex.firstMatch(
+        in: output, range: NSRange(output.startIndex..<output.endIndex, in: output)),
+      match.numberOfRanges > 1,
+      let valueRange = Range(match.range(at: 1), in: output)
+    else {
+      return nil
+    }
+    return String(output[valueRange])
+  }
+
+  private static func waitForWorkerProof(at metadataURL: URL) -> Bool {
+    let deadline = Date().addingTimeInterval(workerProofTimeout)
+    repeat {
+      if workerProofExists(at: metadataURL) { return true }
+      if Date() >= deadline { return false }
+      Thread.sleep(forTimeInterval: 0.05)
+    } while true
+  }
+
   static func arguments(
     workflow: String,
     agents: [String],
@@ -184,6 +256,9 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     process.executableURL = URL(fileURLWithPath: executablePath)
     process.arguments = Self.arguments(workflow: workflow, agents: agents, payload: payload)
     process.currentDirectoryURL = workingDirectoryURL
+    process.environment = Self.launchEnvironment(
+      base: ProcessInfo.processInfo.environment,
+      home: FileManager.default.homeDirectoryForCurrentUser)
 
     let stdout = Pipe()
     let stderr = Pipe()
@@ -206,7 +281,24 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     buffer.append(stdout.fileHandleForReading.availableData)
     buffer.append(stderr.fileHandleForReading.availableData)
 
-    return AgentDispatchMetadata.parse(output: buffer.text(), exitCode: process.terminationStatus)
+    let output = buffer.text()
+    let metadata = AgentDispatchMetadata.parse(output: output, exitCode: process.terminationStatus)
+    guard metadata.exitCode == 0 else { return metadata }
+    guard let runID = metadata.runID else {
+      return AgentDispatchMetadata.parse(
+        output: output + "\nVibecrafted exited successfully without a run ID.",
+        exitCode: 1)
+    }
+
+    let metadataURL = Self.runtimeMetadataURL(
+      runID: runID, output: output, home: FileManager.default.homeDirectoryForCurrentUser)
+    guard Self.waitForWorkerProof(at: metadataURL) else {
+      return AgentDispatchMetadata.parse(
+        output: output
+          + "\nVibecrafted returned a receipt for \(runID), but no worker proof appeared.",
+        exitCode: 1)
+    }
+    return metadata
   }
 }
 

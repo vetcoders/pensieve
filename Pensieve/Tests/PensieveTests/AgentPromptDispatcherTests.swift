@@ -18,6 +18,52 @@ final class AgentPromptDispatcherTests: XCTestCase {
       ])
   }
 
+  func testLaunchEnvironmentPrependsAgentBinsToFinderPathWithoutDuplicates() {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+    let environment = VibecraftedAgentPromptLauncher.launchEnvironment(
+      base: ["PATH": "/usr/bin:/bin:/opt/homebrew/bin", "KEEP": "yes"],
+      home: home)
+
+    XCTAssertEqual(environment["KEEP"], "yes")
+    XCTAssertEqual(
+      environment["PATH"],
+      [
+        "/Users/tester/.local/bin",
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/Users/tester/.cargo/bin",
+        "/Users/tester/.grok/bin",
+        "/Users/tester/.vibecrafted/bin",
+        "/usr/bin",
+        "/bin",
+      ].joined(separator: ":"))
+  }
+
+  func testRuntimeMetadataURLFollowsReceiptTranscriptPath() {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+    let url = VibecraftedAgentPromptLauncher.runtimeMetadataURL(
+      runID: "impl-123",
+      output: "transcript: /tmp/runtime/impl-123/transcript.log\n",
+      home: home)
+
+    XCTAssertEqual(url.path, "/tmp/runtime/impl-123/meta.json")
+  }
+
+  func testWorkerProofRequiresRecordedPositiveWorkerPID() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "PensieveWorkerProofTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let metadataURL = directory.appendingPathComponent("meta.json")
+
+    XCTAssertFalse(VibecraftedAgentPromptLauncher.workerProofExists(at: metadataURL))
+    try Data(#"{"worker_pid":0}"#.utf8).write(to: metadataURL)
+    XCTAssertFalse(VibecraftedAgentPromptLauncher.workerProofExists(at: metadataURL))
+    try Data(#"{"worker_pid":12345}"#.utf8).write(to: metadataURL)
+    XCTAssertTrue(VibecraftedAgentPromptLauncher.workerProofExists(at: metadataURL))
+  }
+
   func testBuildsArgumentsForFilePayloads() {
     let arguments = VibecraftedAgentPromptLauncher.arguments(
       workflow: "review",
