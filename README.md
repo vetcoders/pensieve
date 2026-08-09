@@ -44,6 +44,9 @@ Pensieve resolves the installed uv-managed Vibecrafted entrypoint directly, so
 dispatch does not depend on the reduced `PATH` inherited by apps opened from
 Finder or the Dock. A failed launch keeps the exit code and shows the final,
 actionable launcher error instead of reporting only a generic failure.
+The success state also waits for Vibecrafted's worker metadata: a detached
+dispatcher receipt without a recorded worker PID is reported as a failed launch,
+not as `Run started`.
 **Check status in Terminal** requests a status snapshot for that run; the worker
 itself remains owned by its Vibecrafted/vc-frame session.
 
