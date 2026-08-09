@@ -31,6 +31,8 @@ struct DispatchPopover: View {
   /// Agent token to observe after a launch; nil for a default swarm run,
   /// which has no single agent to observe.
   @State private var observeAgent: String?
+  @State private var isOpeningTerminalStatus = false
+  @State private var terminalStatusError: String?
 
   enum Phase: Equatable {
     case configuring
@@ -291,13 +293,32 @@ struct DispatchPopover: View {
             }
           }
           if let runID, let observeAgent {
-            Button("Check status in Terminal") {
-              controller.observeRunInTerminal(agent: observeAgent, runID: runID)
+            Button(isOpeningTerminalStatus ? "Opening Terminal…" : "Check status in Terminal") {
+              guard !isOpeningTerminalStatus else { return }
+              isOpeningTerminalStatus = true
+              terminalStatusError = nil
+              Task {
+                let outcome = await controller.observeRunInTerminal(
+                  agent: observeAgent,
+                  runID: runID)
+                isOpeningTerminalStatus = false
+                if case .failed(let message) = outcome {
+                  terminalStatusError = message
+                }
+              }
             }
+            .disabled(isOpeningTerminalStatus)
           }
           Spacer()
           Button("Close") { onClose() }
             .keyboardShortcut(.defaultAction)
+        }
+        if let terminalStatusError {
+          Text(terminalStatusError)
+            .font(.system(size: 11))
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityIdentifier("pensieve.dispatch.terminalStatusError")
         }
       }
     }
