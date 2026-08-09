@@ -1596,7 +1596,8 @@ final class AppController: ObservableObject {
   }
 
   /// Outcome of a document dispatch surfaced to the dispatch sheet for an
-  /// explicit, unmissable in-app confirmation (the user must know it fired).
+  /// explicit, unmissable in-app launch receipt. A successful receipt means
+  /// the detached worker started; it is not evidence that the worker finished.
   enum DocumentDispatchOutcome: Sendable {
     case success(runID: String?, reportPath: String?, statusLine: String)
     case failure(message: String)
@@ -1605,8 +1606,8 @@ final class AppController: ObservableObject {
   /// The ONLY UI → launch path: headless dispatch of a confirmed intent via
   /// the canonical uv-core entry, which prints a parseable launch receipt
   /// (run_id / report path) and detaches. Called exclusively by the gateway
-  /// sheet's Dispatch button; the sheet shows "Dispatched ✓ run: …" from the
-  /// returned outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
+  /// sheet's Dispatch button; the sheet shows "Run started" from the returned
+  /// outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
   /// values; the payload comes from the intent's subject snapshot. Terminal
   /// observability is a separate, user-triggered affordance
   /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
@@ -1673,7 +1674,7 @@ final class AppController: ObservableObject {
       }
       appState.lastError = nil
       let line =
-        "Dispatched \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
+        "Started \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
       transcriptionService.updateDispatchStatus(
         metadata.runID.map { "\(line) · run: \($0)" } ?? line)
       return .success(

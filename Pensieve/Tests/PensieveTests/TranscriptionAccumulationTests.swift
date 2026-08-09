@@ -634,7 +634,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(launcher.dispatchedPrompts(), ["agent ready prompt"])
     XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
     XCTAssertEqual(service.rendered, "")
-    XCTAssertEqual(service.dispatchStatus, "Dispatch completed: just-test-123 | \(reportPath)")
+    XCTAssertEqual(service.dispatchStatus, "Run started: just-test-123 | \(reportPath)")
   }
 
   func testVistaEventListenerCallbacksMarshalIntoAccumulationState() async {
