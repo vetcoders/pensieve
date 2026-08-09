@@ -386,6 +386,9 @@ final class StartupRestoreTabCostTests: XCTestCase {
       defer: false)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
+    XCTAssertTrue(
+      DocumentWindowOwnership.claimDocumentHost(window),
+      "restore fixtures model roots already claimed synchronously by DocumentWindowAccessor")
     addTeardownBlock {
       await MainActor.run { window.close() }
     }

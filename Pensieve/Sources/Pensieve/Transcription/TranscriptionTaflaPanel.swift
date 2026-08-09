@@ -53,7 +53,12 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 
   func makePanelForTesting() -> NSPanel {
-    makePanel()
+    // Keep the fixture as the controller's actual panel so a test can park and
+    // hide it before exercising `show()`. Returning an unrelated panel here
+    // would let `show()` allocate and order a second, visible native window.
+    let panel = panel ?? makePanel()
+    self.panel = panel
+    return panel
   }
 
   private func makePanel() -> NSPanel {

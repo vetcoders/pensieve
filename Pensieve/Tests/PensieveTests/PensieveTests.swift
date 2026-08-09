@@ -6843,6 +6843,7 @@ final class PensieveSmokeTests: XCTestCase {
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(targetWindow))
     defer {
       targetWindow.close()
       documentWindow.close()
@@ -6996,6 +6997,7 @@ final class PensieveSmokeTests: XCTestCase {
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(targetWindow))
     defer {
       targetWindow.close()
       documentWindow.close()

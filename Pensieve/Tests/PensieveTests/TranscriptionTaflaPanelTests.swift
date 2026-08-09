@@ -93,6 +93,13 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   func testControllerShowsAndHidesDictationWithoutActivatingItAsTheMainWindow() {
     let service = TranscriptionService()
     let controller = TranscriptionTaflaPanelController(service: service)
+    let panel = controller.makePanelForTesting()
+    panel.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+    panel.alphaValue = 0
+    defer {
+      controller.hide()
+      panel.close()
+    }
 
     controller.show()
     XCTAssertTrue(controller.isVisible)

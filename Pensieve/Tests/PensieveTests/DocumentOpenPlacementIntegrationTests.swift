@@ -228,6 +228,9 @@ final class DocumentOpenPlacementIntegrationTests: XCTestCase {
       let untitledWindow = DocumentOpenPlacementIntegrationTests.makeWindow()
       self.sourceWindow = sourceWindow
       self.untitledWindow = untitledWindow
+      XCTAssertTrue(
+        DocumentWindowOwnership.claimDocumentHost(sourceWindow),
+        "\(mode.name): the placement fixture must model a document host")
 
       let resolver: AppController.DocumentPlacementResolver = { window in
         DocumentOpenPlacement.resolve(preference: mode.preference, sourceWindow: window)
