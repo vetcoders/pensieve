@@ -336,7 +336,9 @@ struct ToolbarOverflowSink: NSViewRepresentable {
     let families = self.families
     let titles = self.modeSegmentTitles
     func assert() {
-      guard let window = nsView.window else { return }
+      guard let window = nsView.window,
+        DocumentWindowOwnership.isRootSurface(window)
+      else { return }
       ToolbarOverflowRecipe.assertOverflowMenus(on: window, families: families)
       ToolbarOverflowRecipe.assertModeSegmentTooltips(on: window, titles: titles)
     }

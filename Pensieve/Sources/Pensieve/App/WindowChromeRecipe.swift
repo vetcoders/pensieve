@@ -477,6 +477,11 @@ enum WindowChromeRecipe {
   /// strip, which is the backing colour, stayed on the previous skin.
   @discardableResult
   static func assertWindowChrome(on window: NSWindow, for theme: PensieveTheme) -> Bool {
+    // Editor/preview subviews can be re-parented during sheet animation and
+    // native-tab reshuffles. Their theme belongs to the document root; never
+    // repaint presentation chrome (sheet, panel, child or elevated surface)
+    // merely because a descendant temporarily reports that host as `window`.
+    guard DocumentWindowOwnership.isRootSurface(window) else { return false }
     var corrected = false
 
     let wantedBacking = titlebarGlassBackingColor(for: theme)
@@ -789,7 +794,10 @@ struct WindowChromeSink: NSViewRepresentable {
     private weak var window: NSWindow?
     private var observer: NSObjectProtocol?
 
-    func observe(_ window: NSWindow?) {
+    func observe(_ candidate: NSWindow?) {
+      let window = candidate.flatMap {
+        DocumentWindowOwnership.isRootSurface($0) ? $0 : nil
+      }
       guard self.window !== window else { return }
       if let observer { NotificationCenter.default.removeObserver(observer) }
       observer = nil

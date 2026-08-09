@@ -237,6 +237,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
+    DebugTrace.logWindowGraph("applicationDidFinishLaunching")
 
     surveyRecoveredDraftsOnLaunch()
 

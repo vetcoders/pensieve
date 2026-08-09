@@ -718,10 +718,14 @@ final class WindowChromeRecipeTests: XCTestCase {
       }
     }
     for window in [leading, trailing] { window.appearance = NSAppearance(named: .darkAqua) }
-    // Parked far offscreen at zero alpha: still laid out, never on a screen an
-    // operator is looking at.
-    leading.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    leading.alphaValue = 0
+    // Park BOTH participants far offscreen at zero alpha before AppKit orders
+    // or groups either one. `addTabbedWindow` may order the trailing member as
+    // it builds the native strip; hiding only the leading window can therefore
+    // flash the second fixture onto the operator's active desktop.
+    for window in [leading, trailing] {
+      window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+      window.alphaValue = 0
+    }
     leading.makeKeyAndOrderFront(nil)
     leading.addTabbedWindow(trailing, ordered: .above)
     leading.layoutIfNeeded()

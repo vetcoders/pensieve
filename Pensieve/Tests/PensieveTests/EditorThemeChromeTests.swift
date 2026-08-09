@@ -41,6 +41,42 @@ final class EditorThemeChromeTests: XCTestCase {
     color.usingColorSpace(.sRGB) ?? color
   }
 
+  @MainActor
+  func testDocumentThemeNeverRepaintsAnAttachedSheetAsWindowChrome() {
+    let parent = NSWindow(
+      contentRect: NSRect(x: -9000, y: -9000, width: 600, height: 400),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    let sheet = NSWindow(
+      contentRect: NSRect(x: -9000, y: -9000, width: 360, height: 220),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    parent.isReleasedWhenClosed = false
+    sheet.isReleasedWhenClosed = false
+    parent.alphaValue = 0
+    sheet.alphaValue = 0
+    parent.beginSheet(sheet)
+    defer {
+      if sheet.sheetParent === parent { parent.endSheet(sheet) }
+      sheet.orderOut(nil)
+      parent.orderOut(nil)
+      sheet.close()
+      parent.close()
+    }
+    XCTAssertTrue(sheet.sheetParent === parent, "fixture must be a real AppKit sheet")
+    sheet.appearance = NSAppearance(named: .darkAqua)
+    sheet.backgroundColor = .systemPink
+    let originalAppearance = sheet.appearance?.name
+    let originalBackground = srgb(sheet.backgroundColor)
+
+    XCTAssertFalse(WindowChromeRecipe.assertWindowChrome(on: sheet, for: .parchment))
+
+    XCTAssertEqual(sheet.appearance?.name, originalAppearance)
+    XCTAssertEqual(srgb(sheet.backgroundColor), originalBackground)
+  }
+
   /// Live switch ink → porcelain: the pane background AND the titlebar backing +
   /// window appearance must all move to the new skin together.
   @MainActor

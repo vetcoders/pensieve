@@ -43,6 +43,67 @@ enum DocumentCloseScope {
   case window
 }
 
+/// The native-window boundary for document tabs.
+///
+/// AppKit exposes sheets, panels, settings windows and document windows through
+/// the same `NSWindow` APIs. Treating "currently key" as "owns a document" is
+/// therefore unsafe: a SwiftUI sheet can become key between two restore steps,
+/// and `addTabbedWindow` will happily turn that transient surface into the owner
+/// of a real document tab group once it is given the shared identifier.
+///
+/// Keep the role test in one place. The structural predicate protects the
+/// `DocumentWindowAccessor` and window-following sinks before they publish a
+/// window. The stronger host predicate is for tab mutation: by then the root
+/// must also carry Pensieve's explicit document ownership token (or be the
+/// factory's `DocumentWindow` subclass).
+enum DocumentWindowOwnership {
+  static func isRootSurface(_ window: NSWindow) -> Bool {
+    !(window is NSPanel)
+      && window.sheetParent == nil
+      && window.parent == nil
+      && window.level == .normal
+      && window.styleMask.contains(.titled)
+  }
+
+  @MainActor
+  static func isDocumentHost(_ window: NSWindow) -> Bool {
+    isRootSurface(window)
+      && (window is DocumentWindow
+        || window.tabbingIdentifier == WindowChromeRecipe.documentTabbingIdentifier)
+  }
+
+  /// Claims a root that actually hosts `DocumentWindowRootView`. The accessor
+  /// performs this synchronously from `viewDidMoveToWindow`, before its deferred
+  /// registry attach, so cold-start restore can identify the scene-owned
+  /// launcher without falling back to "whatever is key". A transient surface
+  /// can never acquire the token through this entry.
+  @discardableResult
+  @MainActor
+  static func claimDocumentHost(_ window: NSWindow) -> Bool {
+    guard isRootSurface(window) else { return false }
+    if window.tabbingIdentifier != WindowChromeRecipe.documentTabbingIdentifier {
+      window.tabbingIdentifier = WindowChromeRecipe.documentTabbingIdentifier
+      DebugTrace.logWindowEvent("document-host.claim", window: window)
+    }
+    return true
+  }
+
+  /// Adding or re-parenting native tabs while any member of that group owns a
+  /// sheet asks AppKit to reconcile two independent ownership graphs at once.
+  /// Reject that individual group mutation. Do not turn this into a global
+  /// polling gate: provider onboarding can stay open indefinitely, and retrying
+  /// every pending restore tab every 100 ms would be a permanent timer storm.
+  @MainActor
+  static func isTabMutationHost(_ window: NSWindow) -> Bool {
+    guard isDocumentHost(window) else { return false }
+    let isClear = (window.tabbedWindows ?? [window]).allSatisfy { $0.attachedSheet == nil }
+    if !isClear {
+      DebugTrace.logWindowEvent("document-host.tab-mutation-blocked-by-sheet", window: window)
+    }
+    return isClear
+  }
+}
+
 @MainActor
 final class DocumentWindowRegistry: ObservableObject {
   static let shared = DocumentWindowRegistry()
@@ -347,6 +408,12 @@ final class DocumentWindowRegistry: ObservableObject {
       DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned nil")
       return nil
     }
+    guard DocumentWindowOwnership.claimDocumentHost(window) else {
+      DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory returned transient")
+      DebugTrace.logWindowEvent("registry.open.rejected-factory-window", window: window)
+      closeWindow(window)
+      return nil
+    }
     DebugTrace.log("registry.open \(documentID.lastPathComponent) -> factory created window")
 
     // Register synchronously — there is no in-flight gap: a re-click for the
@@ -363,9 +430,12 @@ final class DocumentWindowRegistry: ObservableObject {
       window: window)
 
     var didJoinTabGroup = false
-    if let target = currentMergeTarget(), target !== window {
-      prepareTabbedWindow(target)
-      prepareTabbedWindow(window)
+    if let target = currentDocumentMergeTarget(), target !== window {
+      guard prepareTabbedWindow(target), prepareTabbedWindow(window) else {
+        orderAndActivateWindow(window)
+        closeEmptyLauncherWindows(except: window)
+        return window
+      }
       // Every window in a tab group ends up sharing one frame — AppKit enforces
       // that on each insertion, and enforces it by RESIZING the windows already
       // in the group, which lays each of their view trees out synchronously.
@@ -375,12 +445,14 @@ final class DocumentWindowRegistry: ObservableObject {
       // has nothing laid out — leaves the group already consistent and the sync
       // with nothing to resize.
       window.setFrame(target.frame, display: false)
+      DebugTrace.logWindowMutation("registry.open.add-tab.begin", owner: target, member: window)
       switch presentation {
       case .activateNow:
         mergeWindowIntoTabs(target, window)
       case .joinTabGroupInBackground:
         mergeWindowIntoTabsBehind(target, window)
       }
+      DebugTrace.logWindowMutation("registry.open.add-tab.end", owner: target, member: window)
       didJoinTabGroup = true
       DebugTrace.log("merged '\(window.title)' into '\(target.title)' before first presentation")
     }
@@ -501,6 +573,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// Mirrors `open()`'s modal contract: deferred, not dropped, while a modal
   /// run loop blocks native tab mutation.
   func newUntitledTab(from window: NSWindow) {
+    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+      DebugTrace.log("newUntitledTab rejected ineligible source '\(window.title)'")
+      return
+    }
     guard canMutateWindowTabs() else {
       scheduleDeferredMainWork { [weak self, weak window] in
         guard let self, let window else { return }
@@ -512,12 +588,27 @@ final class DocumentWindowRegistry: ObservableObject {
       DebugTrace.log("newUntitledTab -> no window factory wired")
       return
     }
+    guard prepareTabbedWindow(newWindow) else {
+      DebugTrace.log("newUntitledTab rejected ineligible factory window")
+      closeWindow(newWindow)
+      return
+    }
+    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+      DebugTrace.log("newUntitledTab source became ineligible during factory creation")
+      closeWindow(newWindow)
+      return
+    }
+    guard prepareTabbedWindow(window) else {
+      DebugTrace.log("newUntitledTab source lost document ownership during factory creation")
+      closeWindow(newWindow)
+      return
+    }
     DebugTrace.log("newUntitledTab from '\(window.title)'")
     untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
     markContentWindow(newWindow)
-    prepareTabbedWindow(window)
-    prepareTabbedWindow(newWindow)
+    DebugTrace.logWindowMutation("registry.new-tab.add.begin", owner: window, member: newWindow)
     mergeWindowIntoTabs(window, newWindow)
+    DebugTrace.logWindowMutation("registry.new-tab.add.end", owner: window, member: newWindow)
     orderAndActivateWindow(newWindow)
   }
 
@@ -531,13 +622,18 @@ final class DocumentWindowRegistry: ObservableObject {
     isDirty: Bool = false,
     hasEditableBuffer: Bool = false
   ) -> Bool {
+    guard DocumentWindowOwnership.isRootSurface(window) else {
+      DebugTrace.log("registry.attach rejected transient window '\(window.title)'")
+      DebugTrace.logWindowEvent("registry.attach.rejected-transient", window: window)
+      return false
+    }
     DebugTrace.log(
       "registry.attach doc=\(documentID?.lastPathComponent ?? "nil") '\(window.title)'"
     )
     // A closed window's SwiftUI accessor can fire one last main-queue pass
     // AFTER the close; re-registering it would resurrect the window as a
     // phantom tab that is visible but half-dead.
-    if closedWindows[ObjectIdentifier(window)]?.window === window {
+    if isFactoryTombstoned(window) {
       DebugTrace.log("registry.attach rejected: window already closed")
       return false
     }
@@ -547,7 +643,7 @@ final class DocumentWindowRegistry: ObservableObject {
     // greys out when windows don't share an identifier, so non-factory windows
     // are normalized ONTO the shared identifier, never nilled into mergeless islands.
     if window.tabbingIdentifier != documentTabbingIdentifier {
-      prepareTabbedWindow(window)
+      guard prepareTabbedWindow(window) else { return false }
     }
 
     let windowID = ObjectIdentifier(window)
@@ -639,6 +735,23 @@ final class DocumentWindowRegistry: ObservableObject {
       completeAttach(window, documentID: documentID)
     } else {
       closeEmptyLauncherWindows(except: window)
+    }
+    return true
+  }
+
+  /// Whether a root accessor may publish its host into the per-window command
+  /// and close-routing surfaces before `attach` reconciles document identity.
+  ///
+  /// Duplicate identity is intentionally NOT a rejection here: that root is
+  /// still a live document host that needs its own controller and close hook,
+  /// even while the registry waits for the duplicate owner to release the
+  /// identity. A factory tombstone is different — a queued SwiftUI accessor
+  /// pass must not resurrect that half-closed native window as `currentWindow`.
+  func canPublishDocumentHost(_ window: NSWindow) -> Bool {
+    guard DocumentWindowOwnership.isDocumentHost(window) else { return false }
+    guard !isFactoryTombstoned(window) else {
+      DebugTrace.logWindowEvent("document-accessor.rejected-tombstone", window: window)
+      return false
     }
     return true
   }
@@ -912,16 +1025,33 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
-    guard let target = currentMergeTarget(),
+    guard let target = currentDocumentMergeTarget(),
       target !== window,
+      DocumentWindowOwnership.isTabMutationHost(window),
       !areWindowsInSameTabGroup(target, window)
     else {
       return
     }
 
-    prepareTabbedWindow(target)
-    prepareTabbedWindow(window)
+    guard prepareTabbedWindow(target), prepareTabbedWindow(window) else { return }
+    DebugTrace.logWindowMutation("registry.existing.add-tab.begin", owner: target, member: window)
     mergeWindowIntoTabs(target, window)
+    DebugTrace.logWindowMutation("registry.existing.add-tab.end", owner: target, member: window)
+  }
+
+  /// Resolves the injected AppKit focus candidate to a proven document host.
+  /// Never "repairs" an unknown key window by assigning it the document tabbing
+  /// identifier: Settings, a provider sheet or a helper panel must remain what
+  /// they are. A scene-owned launcher becomes eligible when its root accessor
+  /// attaches and gives it the explicit identifier.
+  private func currentDocumentMergeTarget() -> NSWindow? {
+    guard let candidate = currentMergeTarget() else { return nil }
+    guard DocumentWindowOwnership.isTabMutationHost(candidate) else {
+      DebugTrace.log("registry.merge rejected non-document target '\(candidate.title)'")
+      DebugTrace.logWindowEvent("registry.merge.rejected-target", window: candidate)
+      return nil
+    }
+    return candidate
   }
 
   private func areWindowsInSameTabGroup(_ lhs: NSWindow, _ rhs: NSWindow) -> Bool {
@@ -1079,6 +1209,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// it. Used when a window adopts a recovery draft: the work is real, the URL
   /// is not, and only the session knows.
   func markWindowAsContent(_ window: NSWindow) {
+    guard DocumentWindowOwnership.isDocumentHost(window) else {
+      DebugTrace.logWindowEvent("registry.content-promotion.rejected-host", window: window)
+      return
+    }
     markContentWindow(window)
   }
 
@@ -1100,6 +1234,10 @@ final class DocumentWindowRegistry: ObservableObject {
 
   private func registerLauncher(_ window: NSWindow) {
     purgeClosedLauncherWindows()
+    guard DocumentWindowOwnership.claimDocumentHost(window) else {
+      DebugTrace.log("registry.launcher rejected transient window '\(window.title)'")
+      return
+    }
     let windowID = ObjectIdentifier(window)
     contentWindows.removeValue(forKey: windowID)
     window.title = "Pensieve"
@@ -1116,9 +1254,18 @@ final class DocumentWindowRegistry: ObservableObject {
     contentWindows[windowID] = WeakWindow(window)
   }
 
-  private func prepareTabbedWindow(_ window: NSWindow) {
-    window.tabbingMode = .automatic
-    window.tabbingIdentifier = documentTabbingIdentifier
+  @discardableResult
+  private func prepareTabbedWindow(_ window: NSWindow) -> Bool {
+    guard DocumentWindowOwnership.claimDocumentHost(window) else { return false }
+    if window.tabbingMode != .automatic {
+      window.tabbingMode = .automatic
+    }
+    DebugTrace.logWindowEvent("document-host.prepare-tab-merge", window: window)
+    return true
+  }
+
+  private func isFactoryTombstoned(_ window: NSWindow) -> Bool {
+    closedWindows[ObjectIdentifier(window)]?.window === window
   }
 
   private func reconcileLauncherWindows() {
@@ -1195,7 +1342,29 @@ struct DocumentWindowAccessor: NSViewRepresentable {
   let representedURL: URL?
   let isDirty: Bool
   let hasEditableBuffer: Bool
+  let registry: DocumentWindowRegistry
   var onWindow: ((NSWindow) -> Void)?
+
+  @MainActor
+  init(
+    documentID: URL?,
+    identity: DocumentIdentity?,
+    title: String?,
+    representedURL: URL?,
+    isDirty: Bool,
+    hasEditableBuffer: Bool,
+    registry: DocumentWindowRegistry? = nil,
+    onWindow: ((NSWindow) -> Void)? = nil
+  ) {
+    self.documentID = documentID
+    self.identity = identity
+    self.title = title
+    self.representedURL = representedURL
+    self.isDirty = isDirty
+    self.hasEditableBuffer = hasEditableBuffer
+    self.registry = registry ?? .shared
+    self.onWindow = onWindow
+  }
 
   /// SwiftUI re-evaluates this representable on EVERY render pass of the
   /// window root — focus changes, keystrokes, published-object churn. Without
@@ -1228,6 +1397,14 @@ struct DocumentWindowAccessor: NSViewRepresentable {
 
     override func viewDidMoveToWindow() {
       super.viewDidMoveToWindow()
+      // This callback is synchronous with AppKit attaching the root view. Claim
+      // the role before notifying the registry's deferred metadata path: a
+      // cold-start `.task` can begin restore in between those two moments.
+      if let window {
+        if !DocumentWindowOwnership.claimDocumentHost(window) {
+          DebugTrace.logWindowEvent("document-accessor.rejected-host", window: window)
+        }
+      }
       onWindowChanged?()
     }
   }
@@ -1254,9 +1431,18 @@ struct DocumentWindowAccessor: NSViewRepresentable {
     attachIfNeeded(from: view, coordinator: coordinator)
   }
 
-  private func attachIfNeeded(from view: NSView, coordinator: Coordinator) {
+  func attachIfNeeded(from view: NSView, coordinator: Coordinator) {
+    guard let observedWindow = view.window,
+      DocumentWindowOwnership.isDocumentHost(observedWindow)
+    else { return }
+
     DispatchQueue.main.async {
-      guard let window = view.window else { return }
+      guard let window = view.window, window === observedWindow else { return }
+      // A root representable can be re-parented while SwiftUI/AppKit animate a
+      // sheet or reshuffle native tabs. Publishing that transient window as the
+      // document host poisons provider ownership, command routing and every
+      // later tab open before the registry has a chance to reject it.
+      guard registry.canPublishDocumentHost(window) else { return }
       let windowID = ObjectIdentifier(window)
       let unchanged =
         coordinator.lastWindowID == windowID
@@ -1269,7 +1455,7 @@ struct DocumentWindowAccessor: NSViewRepresentable {
       if unchanged { return }
 
       onWindow?(window)
-      let attached = DocumentWindowRegistry.shared.attach(
+      let attached = registry.attach(
         window,
         identity: identity,
         documentID: documentID,

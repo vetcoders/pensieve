@@ -136,6 +136,26 @@ Quits the whole application per macOS convention. If dirty buffers or recovery i
 
 ## Closing windows and tabs
 
+### Native window ownership
+
+Only a root document window may own Pensieve's native document tab group. A
+window becoming key or main is a focus event, not proof that it is a document
+host. In particular, a sheet, `NSPanel`, child window, elevated helper surface,
+Settings window, or another unknown root must never be assigned the document
+tabbing identifier and must never receive a document through
+`addTabbedWindow`.
+
+While any tab in a native group has an attached sheet, Pensieve does not mutate
+that tab group. A file opened during that interval may appear in a separate
+document window; it must not be merged through the sheet, its parent, or a
+sibling as a fallback. Once the sheet ends, ordinary document-to-document tab
+grouping may resume.
+
+Window-following UI bridges (theme chrome, toolbar overflow, command routing,
+close hooks) publish only a proven document root. A queued callback belonging
+to a factory window that has already closed must be dropped rather than
+republishing a half-dead window as the current command target.
+
 ### System window `X` button
 
 Closes the window, not a single tab. Must not cause a cycle of "window/app closes and immediately reopens." Such behavior is a bug to diagnose.
@@ -278,6 +298,13 @@ An agent implementing or refactoring menu/commands must verify:
       and opening a large file does not block the UI silently.
 - [ ] Restore after restart: workspace always comes back; open files max 12;
       a file/root from Trash does not come back; a deliberately closed file does not come back.
+- [ ] With a live provider/onboarding sheet, opening or restoring another file
+      never gives the sheet a document tab bar, changes the sheet's frame into
+      a document frame, or moves document navigation outside its root window.
+- [ ] Window-lifecycle fixtures that call `beginSheet`, `addChildWindow`,
+      `addTabbedWindow`, or `makeKeyAndOrderFront` are parked offscreen and set
+      to zero alpha before AppKit can order them; test chrome must never flash
+      on the operator's desktop.
 
 ---
 
