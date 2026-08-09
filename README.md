@@ -40,6 +40,10 @@ The existing HTML and PDF export options remain available in the File menu.
 Dispatch starts a detached Vibecrafted worker and returns a run ID. The launch
 receipt is not a completion result: the worker keeps running after the dispatch
 sheet closes, and closing the optional Terminal status window does not stop it.
+Pensieve resolves the installed uv-managed Vibecrafted entrypoint directly, so
+dispatch does not depend on the reduced `PATH` inherited by apps opened from
+Finder or the Dock. A failed launch keeps the exit code and shows the final,
+actionable launcher error instead of reporting only a generic failure.
 **Check status in Terminal** requests a status snapshot for that run; the worker
 itself remains owned by its Vibecrafted/vc-frame session. Pensieve opens a new
 status window rather than writing into an existing terminal tab. If macOS

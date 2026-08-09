@@ -4,6 +4,20 @@ import XCTest
 @testable import Pensieve
 
 final class AgentPromptDispatcherTests: XCTestCase {
+  func testExecutableCandidatesPreferOverrideThenEnvironmentIndependentUVEntrypoint() {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+
+    XCTAssertEqual(
+      VibecraftedAgentPromptLauncher.executableCandidates(
+        home: home, override: "/custom/vibecrafted"),
+      [
+        "/custom/vibecrafted",
+        "/Users/tester/.local/share/uv/tools/vibecrafted/bin/vibecrafted",
+        "/Users/tester/.local/bin/vibecrafted",
+        "/Users/tester/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted",
+      ])
+  }
+
   func testBuildsArgumentsForFilePayloads() {
     let arguments = VibecraftedAgentPromptLauncher.arguments(
       workflow: "review",
@@ -61,18 +75,37 @@ final class AgentPromptDispatcherTests: XCTestCase {
       expectedStatus)
   }
 
-  func testDispatchMetadataFailureStatusIgnoresSuccessfulReceiptFields() {
+  func testDispatchMetadataFailureStatusIncludesActionableLastOutputLine() {
     let metadata = AgentDispatchMetadata.parse(
       output: """
         run_id: work-failed
         report_path: /tmp/reports/failed.md
+        Traceback (most recent call last):
+        ImportError: cannot import name 'Self' from 'typing'
         """,
       exitCode: 42
     )
 
     XCTAssertEqual(metadata.runID, "work-failed")
     XCTAssertEqual(metadata.reportPath, "/tmp/reports/failed.md")
+    XCTAssertEqual(
+      metadata.statusLine,
+      "Dispatch failed (exit 42): ImportError: cannot import name 'Self' from 'typing'")
+  }
+
+  func testDispatchMetadataFailureStatusFallsBackWhenOutputIsEmpty() {
+    let metadata = AgentDispatchMetadata.parse(output: " \n", exitCode: 42)
     XCTAssertEqual(metadata.statusLine, "Dispatch failed (exit 42)")
+  }
+
+  func testDispatchMetadataFailureStatusStripsANSIAndBoundsDetail() {
+    let longDetail = "\u{001B}[31m" + String(repeating: "x", count: 400) + "\u{001B}[0m"
+    let metadata = AgentDispatchMetadata.parse(output: longDetail, exitCode: 1)
+
+    XCTAssertFalse(metadata.statusLine.contains("\u{001B}"))
+    XCTAssertTrue(metadata.statusLine.hasPrefix("Dispatch failed (exit 1): "))
+    XCTAssertTrue(metadata.statusLine.hasSuffix("…"))
+    XCTAssertLessThanOrEqual(metadata.statusLine.count, 307)
   }
 
   @MainActor
@@ -199,9 +232,9 @@ final class AgentPromptDispatcherTests: XCTestCase {
     guard case .failure(let message) = outcome else {
       return XCTFail("Expected non-zero launcher exit to fail dispatch")
     }
-    XCTAssertEqual(message, "Dispatch failed (exit 2)")
-    XCTAssertEqual(appState.lastError, "Dispatch failed (exit 2)")
-    XCTAssertEqual(service.dispatchStatus, "Dispatch failed (exit 2)")
+    XCTAssertEqual(message, "Dispatch failed (exit 2): failed receipt")
+    XCTAssertEqual(appState.lastError, "Dispatch failed (exit 2): failed receipt")
+    XCTAssertEqual(service.dispatchStatus, "Dispatch failed (exit 2): failed receipt")
     XCTAssertEqual(launcher.requests().map(\.payload), [.file(documentURL.path)])
   }
 

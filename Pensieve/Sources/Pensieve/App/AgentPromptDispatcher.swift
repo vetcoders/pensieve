@@ -8,7 +8,9 @@ struct AgentDispatchMetadata: Equatable, Sendable {
 
   var statusLine: String {
     if exitCode != 0 {
-      return "Dispatch failed (exit \(exitCode))"
+      let prefix = "Dispatch failed (exit \(exitCode))"
+      guard let detail = Self.failureDetail(in: output) else { return prefix }
+      return "\(prefix): \(detail)"
     }
 
     switch (runID, reportPath) {
@@ -58,6 +60,28 @@ struct AgentDispatchMetadata: Equatable, Sendable {
     }
     return nil
   }
+
+  /// Preserve the actionable end of launcher stderr without flooding the
+  /// dispatch sheet with a traceback or terminal colour escapes.
+  private static func failureDetail(in text: String) -> String? {
+    let escapePattern = "\u{001B}\\[[0-?]*[ -/]*[@-~]"
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    let plain =
+      (try? NSRegularExpression(pattern: escapePattern))?
+      .stringByReplacingMatches(in: text, range: range, withTemplate: "") ?? text
+    guard
+      let lastLine = plain.split(whereSeparator: \.isNewline).reversed()
+        .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        .first(where: { !$0.isEmpty })
+    else {
+      return nil
+    }
+    let compact = lastLine.replacingOccurrences(
+      of: #"\s+"#, with: " ", options: .regularExpression)
+    let limit = 280
+    guard compact.count > limit else { return compact }
+    return String(compact.prefix(limit - 1)) + "…"
+  }
 }
 
 protocol AgentPromptLaunching: Sendable {
@@ -103,30 +127,37 @@ enum AgentPromptLauncherError: LocalizedError {
 
 final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
+  static let uvToolExecutableRelativePath =
+    ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
   static let defaultExecutableRelativePath =
     ".local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
 
   static func resolveExecutablePath() throws -> String {
-    var candidates: [String] = []
-    if let override = ProcessInfo.processInfo.environment[executablePathEnvironmentKey],
-      !override.isEmpty
-    {
-      candidates.append(override)
-    }
     let home = FileManager.default.homeDirectoryForCurrentUser
-    // Canonical CLI entry: the `vibecrafted` symlink in ~/.local/bin → the uv-core
-    // command surface. This is the headless-friendly entry that prints a parseable
-    // launch receipt (`run_id:` / report path) and detaches the run. The legacy bash
-    // "command deck" below targets an interactive terminal/zellij session; launched
-    // from this GUI Process (no TTY) it produces no usable run — the "dispatch does
-    // nothing" the operator hit. Prefer uv-core; keep the deck as a fallback.
-    candidates.append(home.appendingPathComponent(".local/bin/vibecrafted").path)
-    candidates.append(home.appendingPathComponent(defaultExecutableRelativePath).path)
+    let candidates = executableCandidates(
+      home: home,
+      override: ProcessInfo.processInfo.environment[executablePathEnvironmentKey])
 
     for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
       return candidate
     }
     throw AgentPromptLauncherError.executableNotFound(searchedPaths: candidates)
+  }
+
+  static func executableCandidates(home: URL, override: String?) -> [String] {
+    var candidates: [String] = []
+    if let override, !override.isEmpty {
+      candidates.append(override)
+    }
+    // LaunchServices gives GUI apps a system-only PATH. Prefer uv's absolute
+    // entrypoint, whose shebang names the tool's own Python, so a normal Finder/
+    // Dock launch cannot fall through to Xcode's older /usr/bin/python3. The
+    // ~/.local/bin link may target the interactive command deck and is therefore
+    // only a compatibility fallback.
+    candidates.append(home.appendingPathComponent(uvToolExecutableRelativePath).path)
+    candidates.append(home.appendingPathComponent(".local/bin/vibecrafted").path)
+    candidates.append(home.appendingPathComponent(defaultExecutableRelativePath).path)
+    return candidates
   }
 
   static func arguments(
