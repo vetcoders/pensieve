@@ -41,7 +41,10 @@ Dispatch starts a detached Vibecrafted worker and returns a run ID. The launch
 receipt is not a completion result: the worker keeps running after the dispatch
 sheet closes, and closing the optional Terminal status window does not stop it.
 **Check status in Terminal** requests a status snapshot for that run; the worker
-itself remains owned by its Vibecrafted/vc-frame session.
+itself remains owned by its Vibecrafted/vc-frame session. Pensieve opens a new
+status window rather than writing into an existing terminal tab. If macOS
+Automation refuses the request or `osascript` fails, the dispatch sheet reports
+that observer error; the already-started worker is unaffected.
 
 ## Requirements
 

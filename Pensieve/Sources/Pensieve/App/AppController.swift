@@ -1687,40 +1687,94 @@ final class AppController: ObservableObject {
     }
   }
 
-  /// Best-effort: open Terminal tailing a launched run via the receipt's
-  /// `vibecrafted <agent> observe --run-id <id>`. User-triggered from the sheet;
-  /// failure is swallowed because the in-app confirmation is the source of truth.
-  nonisolated func observeRunInTerminal(agent: String, runID: String) {
+  enum TerminalObservationOutcome: Equatable, Sendable {
+    case opened
+    case failed(String)
+  }
+
+  /// Opens a one-shot Terminal status observer for a launched run. This is
+  /// intentionally separate from dispatch ownership: closing the Terminal
+  /// window never stops the detached worker.
+  nonisolated func observeRunInTerminal(agent: String, runID: String) async
+    -> TerminalObservationOutcome
+  {
     // Sandboxed build: osascript/Terminal automation is unavailable; only
     // reachable after a dispatch, which the sandbox guard already blocks.
-    guard SandboxCapabilities.allowsExternalAgentDispatch() else { return }
-    // Defense-in-depth before the values are composed into the Terminal command
-    // below: agent/runID are parsed from the launcher receipt, so fail closed on
-    // anything outside a strict shell-safe charset instead of relying solely on
-    // the quoting/AppleScript-escaping. (The proper fix — dropping AppleScript for
-    // `open -a Terminal` — is tracked separately as it changes terminal-spawn UX.)
+    guard SandboxCapabilities.allowsExternalAgentDispatch() else {
+      return .failed("Terminal status is unavailable in the sandboxed build.")
+    }
+    let executablePath: String
+    do {
+      executablePath = try VibecraftedAgentPromptLauncher.resolveExecutablePath()
+    } catch {
+      return .failed("Could not find Vibecrafted: \(error.localizedDescription)")
+    }
+    guard
+      let script = Self.terminalObservationAppleScript(
+        executablePath: executablePath,
+        agent: agent,
+        runID: runID)
+    else {
+      return .failed("Could not open Terminal status because the run receipt is invalid.")
+    }
+
+    return await Task.detached(priority: .userInitiated) {
+      let osa = Process()
+      osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+      osa.arguments = ["-e", script]
+      let errorPipe = Pipe()
+      osa.standardError = errorPipe
+      do {
+        try osa.run()
+      } catch {
+        return .failed("Could not start Terminal automation: \(error.localizedDescription)")
+      }
+      osa.waitUntilExit()
+      guard osa.terminationReason == .exit, osa.terminationStatus == 0 else {
+        let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let detail = String(data: data, encoding: .utf8)?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message: String
+        if let detail, !detail.isEmpty {
+          message = detail
+        } else {
+          message = "osascript exited with an error."
+        }
+        return .failed("Could not open Terminal status: \(message)")
+      }
+      return .opened
+    }.value
+  }
+
+  /// Builds the complete AppleScript as a pure, testable boundary. `do script`
+  /// comes before `activate`: on a cold Terminal launch the reverse order first
+  /// creates Terminal's startup window and then a second command window.
+  nonisolated static func terminalObservationAppleScript(
+    executablePath: String,
+    agent: String,
+    runID: String
+  ) -> String? {
+    // Defense-in-depth before receipt values are composed into a shell command.
+    // Agent and run ID come from launcher output and accept only this strict,
+    // shell-safe alphabet; the executable path is single-quoted independently.
     let allowed = CharacterSet(
       charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
     guard !agent.isEmpty, agent.unicodeScalars.allSatisfy(allowed.contains),
       !runID.isEmpty, runID.unicodeScalars.allSatisfy(allowed.contains)
-    else { return }
-    guard let exe = try? VibecraftedAgentPromptLauncher.resolveExecutablePath() else { return }
+    else { return nil }
     func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-    let command = "\(quote(exe)) \(quote(agent)) observe --run-id \(quote(runID))"
+    let command =
+      "\(quote(executablePath)) \(quote(agent)) observe --run-id \(quote(runID))"
     let asEscaped =
       command
       .replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "\"", with: "\\\"")
-    let script = """
+    return """
       tell application "Terminal"
-        activate
         do script "\(asEscaped)"
+        activate
       end tell
       """
-    let osa = Process()
-    osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    osa.arguments = ["-e", script]
-    try? osa.run()
   }
 
   func bumpFontSize(by delta: CGFloat) {

@@ -206,6 +206,41 @@ final class DispatchGatewayTests: XCTestCase {
     XCTAssertTrue(launcher.requests().isEmpty)
   }
 
+  // MARK: - Terminal status observer
+
+  func testTerminalObservationCreatesTheCommandBeforeActivatingTerminal() throws {
+    let script = try XCTUnwrap(
+      AppController.terminalObservationAppleScript(
+        executablePath: "/Users/test/.local/bin/vibecrafted",
+        agent: "codex",
+        runID: "impl-260809-041333-34989"))
+    let commandRange = try XCTUnwrap(script.range(of: "do script"))
+    let activationRange = try XCTUnwrap(script.range(of: "activate"))
+
+    XCTAssertLessThan(
+      commandRange.lowerBound,
+      activationRange.lowerBound,
+      "activating a cold Terminal first creates a startup window before the command window")
+    XCTAssertTrue(
+      script.contains("'codex' observe --run-id 'impl-260809-041333-34989'"))
+    XCTAssertFalse(
+      script.contains("in front window"),
+      "a status check must not inject a command into an arbitrary user tab")
+  }
+
+  func testTerminalObservationRejectsUnsafeReceiptTokens() {
+    XCTAssertNil(
+      AppController.terminalObservationAppleScript(
+        executablePath: "/Users/test/.local/bin/vibecrafted",
+        agent: "codex; open /tmp/payload",
+        runID: "impl-safe"))
+    XCTAssertNil(
+      AppController.terminalObservationAppleScript(
+        executablePath: "/Users/test/.local/bin/vibecrafted",
+        agent: "codex",
+        runID: "impl-safe$(payload)"))
+  }
+
   // MARK: - Agent picker universe
 
   @MainActor
