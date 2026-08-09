@@ -90,8 +90,25 @@ terminate_app() {
     pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
     sleep 0.1
   done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 && die "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census"
+  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    printf '\033[33m[fail]\033[0m %s\n' \
+      "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census" >&2
+    return 1
+  fi
   return 0
+}
+
+# Run an Accessibility AppleScript with GNU timeout when available. A function
+# keeps the no-timeout path explicit; expanding an empty command-prefix array is
+# an `unbound variable` error under macOS' Bash 3.2 when `set -u` is active.
+run_ax_osascript() {
+  local timeout_seconds="$1"
+  shift
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout --signal=TERM "$timeout_seconds" osascript "$@"
+  else
+    osascript "$@"
+  fi
 }
 
 # Force macOS/SwiftUI state restoration to fire on the next launch regardless of
@@ -228,11 +245,6 @@ run_restored_menu_probe() {
   log "restored-window menu-bar probe (P1-02 arbiter: value-based WindowGroup scene)"
   arm_restoration_default
 
-  local restored_ax_runner=()
-  if command -v gtimeout >/dev/null 2>&1; then
-    restored_ax_runner=(gtimeout --signal=TERM 90)
-  fi
-
   # Clear whatever instance an earlier phase left behind so `open` yields exactly
   # one process and the bare-name AppleScript target is unambiguous.
   terminate_app
@@ -279,7 +291,7 @@ run_restored_menu_probe() {
   done
   pgrep -x "$APP_NAME" >/dev/null 2>&1 || die "restored-probe: relaunch never started $APP_NAME"
 
-  ${restored_ax_runner[@]+"${restored_ax_runner[@]}"} osascript - "$APP_NAME" <<'APPLESCRIPT'
+  run_ax_osascript 90 - "$APP_NAME" <<'APPLESCRIPT'
 on run argv
   set appName to item 1 of argv
   my waitForProcess(appName, 15)
@@ -442,22 +454,54 @@ SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
 SMOKE_SUPPORT="$SMOKE_ROOT/support"
 cleanup() {
+  local cleanup_status=0
+  local step_status=0
   kill "$CAFFEINATE_PID" 2>/dev/null || true
   # Every exit path -- success, assertion failure, or an error raised inside
   # osascript -- must leave zero live smoke processes, otherwise the survivor
   # becomes the orphan that corrupts the next run's census.
   terminate_app
+  step_status=$?
+  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+    cleanup_status="$step_status"
+  fi
   # Revert any smoke-domain default the restored-window probe armed. It was
   # never written to the operator's domain, but leaving it set would make the
   # next run's restoration state depend on the previous one.
   disarm_restoration_default
+  step_status=$?
+  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+    cleanup_status="$step_status"
+  fi
   # The staged bundle, its Application Support tree and the witness document
   # all live under SMOKE_ROOT; the run owns that directory outright.
   if [[ -n "${SMOKE_ROOT:-}" && "$SMOKE_ROOT" == */pensieve-toolbar-smoke.* ]]; then
     rm -rf "$SMOKE_ROOT"
+    step_status=$?
+    if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+      cleanup_status="$step_status"
+    fi
   fi
+  return "$cleanup_status"
 }
-trap cleanup EXIT
+
+# Bash 3.2 can replace a failing main-script status with the final successful
+# command from an EXIT trap. Preserve the original status explicitly: a smoke
+# that aborts before launching the app must never be reported as green merely
+# because cleanup succeeded.
+on_exit() {
+  local original_status="$?"
+  local cleanup_status=0
+  trap - EXIT
+  set +e
+  cleanup
+  cleanup_status=$?
+  if [[ "$original_status" -ne 0 ]]; then
+    exit "$original_status"
+  fi
+  exit "$cleanup_status"
+}
+trap on_exit EXIT
 
 mkdir -p "$SMOKE_SUPPORT"
 APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
@@ -488,9 +532,9 @@ EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.aiRewrite
 )
 BASE_EXPECTED_IDENTIFIER_COUNT="${#EXPECTED_TOOLBAR_IDENTIFIERS[@]}"
-# macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is fatal
-# ("unbound variable"); guard the append on the element count.
-if [[ ${#EXTRA_EXPECTED_IDENTIFIERS[@]} -gt 0 ]]; then
+# On macOS' Bash 3.2, expanding an explicitly declared but empty array under
+# `set -u` is still an unbound-variable error. Guard the expansion itself.
+if [[ "${#EXTRA_EXPECTED_IDENTIFIERS[@]}" -gt 0 ]]; then
   EXPECTED_TOOLBAR_IDENTIFIERS+=("${EXTRA_EXPECTED_IDENTIFIERS[@]}")
 fi
 
@@ -521,10 +565,6 @@ open_smoke_app -n -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
 }
 
 log "probing Accessibility surface"
-ax_runner=()
-if command -v gtimeout >/dev/null 2>&1; then
-  ax_runner=(gtimeout --signal=TERM 60)
-fi
 ax_census_status=0
 # The AppleScript body is written to a temp file BEFORE the osascript call
 # rather than piped in via a heredoc inside this command substitution: bash
@@ -922,7 +962,7 @@ log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
 
-ax_census_output=$(${ax_runner[@]+"${ax_runner[@]}"} osascript "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+ax_census_output=$(run_ax_osascript 60 "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
   "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1) || ax_census_status=$?
 rm -f "$ax_census_script"
 printf '%s\n' "$ax_census_output"
