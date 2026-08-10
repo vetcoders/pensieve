@@ -5,10 +5,12 @@ set -euo pipefail
 # renamed, re-signed copy under $SMOKE_ROOT and drives that instead, so the two
 # identities the run touches -- the process name every pkill/System Events call
 # resolves, and the defaults domain cfprefsd scopes reads and writes to -- both
-# belong to the smoke alone. Before this, `pkill -x Pensieve` killed the
-# operator's live app by name, and every harness launch wrote its temp-file
-# bookmarks into the operator's io.vetcoders.pensieve domain until her real Open
-# Files entries were evicted.
+# belong to the smoke alone. The harness also deletes that smoke-only defaults
+# domain at the start and end of every run: a fixed smoke bundle id is isolated
+# from the operator, but is not isolated from earlier smoke runs by itself.
+# Before this, `pkill -x Pensieve` killed the operator's live app by name, and
+# every harness launch wrote its temp-file bookmarks into the operator's
+# io.vetcoders.pensieve domain until her real Open Files entries were evicted.
 SOURCE_APP_PATH="dist/Pensieve.app"
 APP_PATH=""
 APP_NAME="PensieveSmoke"
@@ -52,6 +54,28 @@ canonical_defaults_bool() {
     0 | false | FALSE | no | NO) printf 'false\n' ;;
     *) return 1 ;;
   esac
+}
+
+# The whole defaults domain belongs to this harness. A fixed smoke bundle id
+# protects the operator's production preferences, but cfprefsd otherwise keeps
+# workspace bookmarks from every deleted $SMOKE_ROOT forever. Start and finish
+# with a truly empty smoke identity so one run cannot inherit another run's
+# documents, launch setting, or window cosmetics.
+reset_smoke_defaults_domain() {
+  defaults delete "$APP_ID" >/dev/null 2>&1 || true
+}
+
+# Individual probes in one run still share the smoke identity. The preceding
+# zero-window probe deliberately registers its external-open witness in the
+# working set, so restore-ON must retire that probe-owned state before seeding
+# its own single-document restore. With exactly one working-set entry, the AX
+# window title is a valid restore oracle; with native tabs it only names the
+# selected tab and cannot prove membership of every background tab.
+reset_smoke_working_set() {
+  defaults delete "$APP_ID" Pensieve.workspace.fileBookmarks >/dev/null 2>&1 || true
+  if defaults read "$APP_ID" Pensieve.workspace.fileBookmarks >/dev/null 2>&1; then
+    die "could not reset the smoke-only working set before the restore-ON probe"
+  fi
 }
 
 # Shell out to a tiny Swift snippet that queries CoreGraphics' window server
@@ -621,17 +645,18 @@ APPLESCRIPT
 run_restore_on_external_open_probe() {
   log "restore-ON external-open probe"
   terminate_app
+  reset_smoke_working_set
   arm_pensieve_restore_on
 
-  local document_title="${SMOKE_DOCUMENT##*/}"
+  local document_title="${SMOKE_RESTORE_DOCUMENT##*/}"
   document_title="${document_title%.md}"
   local external_title="${SMOKE_EXTERNAL_DOCUMENT##*/}"
   external_title="${external_title%.md}"
 
   log "restore-ON probe: launch #1 seeds a restorable session with [$document_title]"
-  open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
+  open_smoke_app -a "$APP_PATH" "$SMOKE_RESTORE_DOCUMENT" || {
     sleep 0.5
-    open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT"
+    open_smoke_app -a "$APP_PATH" "$SMOKE_RESTORE_DOCUMENT"
   }
   local _
   for _ in {1..120}; do
@@ -900,6 +925,14 @@ cleanup() {
   if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
     cleanup_status="$step_status"
   fi
+  # No smoke preference is operator-owned. Retiring the complete domain is
+  # what keeps the fixed bundle id isolated between runs, including failures
+  # that occur after a temporary document has been registered as a bookmark.
+  reset_smoke_defaults_domain
+  step_status=$?
+  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+    cleanup_status="$step_status"
+  fi
   # The staged bundle, its Application Support tree and the witness document
   # all live under SMOKE_ROOT; the run owns that directory outright.
   if [[ -n "${SMOKE_ROOT:-}" && "$SMOKE_ROOT" == */pensieve-toolbar-smoke.* ]]; then
@@ -946,6 +979,7 @@ SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURC
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
 SMOKE_EXTERNAL_DOCUMENT="$SMOKE_ROOT/external-after-zero-windows.md"
+SMOKE_RESTORE_DOCUMENT="$SMOKE_ROOT/restore-on-seed.md"
 SMOKE_SUPPORT="$SMOKE_ROOT/support"
 
 mkdir -p "$SMOKE_SUPPORT"
@@ -953,6 +987,12 @@ APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
 stage_smoke_app "$SOURCE_APP_PATH" "$APP_PATH" "$SMOKE_SUPPORT"
 printf '# Toolbar cold-frame witness\n\nEditable staged document.\n' >"$SMOKE_DOCUMENT"
 printf '# External open after zero windows\n' >"$SMOKE_EXTERNAL_DOCUMENT"
+printf '# Restore-ON seed\n' >"$SMOKE_RESTORE_DOCUMENT"
+
+# Kill any survivor before touching cfprefsd, then make the fixed smoke domain
+# run-local. Every later preference belongs to this invocation alone.
+terminate_app
+reset_smoke_defaults_domain
 
 EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.share
