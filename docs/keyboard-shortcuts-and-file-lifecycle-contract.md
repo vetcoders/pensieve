@@ -54,6 +54,15 @@ Rebuilding the workspace around that tab is configuration hydration only. Its
 asynchronous completion must not clear or replace the new untitled buffer, even
 while the buffer is still empty and therefore not dirty.
 
+When no stable document controller is attached yet, New requests are counted,
+not collapsed into a Boolean. The first request may create the single
+`newUntitledTab` host; a second or third request made before that host attaches
+is replayed into a separate editable tab after attachment. If a Finder/open
+request is already creating an explicit-document host, that host keeps the
+document intent and every concurrent New request is replayed afterwards. No New
+gesture may replace the external document, be deduplicated away, or create a
+second host while the first one is in flight.
+
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
 
 Actual state of build 528 (the launcher shows both shortcuts separately) —
@@ -237,25 +246,31 @@ normal macOS document-app state (Finder-launched TextEdit, Xcode), so the File
 menu must stay usable rather than collapse to the system default. In that state
 Pensieve offers exactly:
 
-- **New File** (`Cmd+N`) and **New Tab** (`Cmd+T`) — one new window carrying the
-  `newUntitledTab` intent, so it comes up with an editable draft, not an empty
-  launcher;
+- **New File** (`Cmd+N`) and **New Tab** (`Cmd+T`) — the first request creates
+  one window carrying the `newUntitledTab` intent, so it comes up with an
+  editable draft, not an empty launcher; further requests made before that
+  host attaches are counted and replayed as additional tabs;
 - **Open File…** (`Cmd+O`) — the same native picker as with a window on screen;
 - **Open Recent** — the same system-backed list, including **Clear Menu**;
 - **Open Folder…** (`Shift+Cmd+O`) — opens the folder as a workspace.
 
 Items that act ON a document (Save, Save As, Export, Share, Close, and the
 Mode/Format/Agents menus) stay absent: they need a session this state has none
-of. About and Quit remain the standard items.
+of. Application-global commands do not depend on a document target: **About
+Pensieve** always shows the app's own panel populated from `BuildIdentity`, and
+**Quit Pensieve** always runs the protected all-window quit decision. Both stay
+installed while the app has zero document windows and during command-target
+rebuild gaps.
 
 Every one of those zero-window invocations travels the lanes the app already
 owns: an open is handed to the same coordinator entry a Finder/`open`/Dock drop
 uses (so the one-host guard covers it, and an `Cmd+O` arriving while a host is
 already being built for an external open does not create a second one), and New
-asks the window registry for one host through the single factory every
-windowless entry point shares. No shortcut is rebound and no window is created
-by a path of the menu's own. With a window on screen, all of these items behave
-exactly as they always have and act on that window.
+enters the coordinator's counted pending-New lane. One in-flight host consumes
+at most its own creation intent; every remaining New is replayed through the
+attached controller. No shortcut is rebound and no window is created by a path
+of the menu's own. With a window on screen, all of these items behave exactly as
+they always have and act on that window.
 
 ### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
@@ -351,10 +366,13 @@ covers the host the pass ADOPTS after its original host closes mid-pass: a
 survivor carrying a sheet is not merged into, the pending ref waits for the next
 turn, and the pass keeps parking until the group can take it.
 
-The pass ends with exactly one closing order, and that order activates the app
-only when Pensieve is still the app the user is in. A restore that finishes
-after the user has switched away orders its final tab into place without pulling
-focus back across the app boundary.
+The pass ends with at most one closing order. It may activate the restored
+frontmost tab only when Pensieve is still active and the current key window is
+one of that restore transaction's participants. If the user creates or selects
+a non-restore tab while the pass is yielding between turns, restore completion
+must preserve that newer selection and skip its final activation. A restore
+that finishes after the user has switched away may order its final tab into
+place without pulling focus back across the app boundary.
 
 Window-following UI bridges (theme chrome, toolbar overflow, command routing,
 close hooks) publish only a proven document root. A queued callback belonging
@@ -767,7 +785,14 @@ An agent implementing or refactoring menu/commands must verify:
       and creates a native tab; an idle launcher may fill in place.
 - [ ] Repeated New commands (`file → Cmd+N → Cmd+T`) add one tab per command;
       a newly created empty tab is never mistaken for the idle launcher.
+- [ ] From zero document windows, two or three rapid `Cmd+N` / `Cmd+T`
+      gestures create one host and one editable tab per gesture; none is lost.
+- [ ] If a Finder/open host is in flight when New is invoked, exactly one host
+      opens the external file and the New request appears as an additional
+      editable tab after attachment.
 - [ ] `Cmd+O` opens the file picker, `Shift+Cmd+O` the folder picker (workspace).
+- [ ] From zero document windows, `Shift+Cmd+O` creates one host, selects the
+      chosen folder as the workspace root, and does not synthesize a document.
 - [ ] `Cmd+S` saves an existing file, and for untitled it triggers Save As.
 - [ ] `Shift+Cmd+S` triggers Save As.
 - [ ] `Cmd+W` and the tab's `X` close the active tab and protect dirty buffer/recovery.
@@ -777,6 +802,8 @@ An agent implementing or refactoring menu/commands must verify:
 - [ ] With Settings (or About) as the only remaining window: a Finder open of a
       `.md` file opens it in a new document host, and a Dock click creates
       exactly one empty launcher.
+- [ ] With zero document windows, About shows Pensieve's `BuildIdentity` panel
+      and `Cmd+Q` still runs the protected application quit flow.
 - [ ] `Cmd+M` minimizes the window, `Cmd+,` opens Settings, and `Cmd+Q` quits the application.
 - [ ] `Cmd+F` searches in the document, and `Shift+Cmd+F` in the workspace.
 - [ ] Close All protects unsaved files and recovery items.

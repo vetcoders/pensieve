@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bar's `+` create an editable tab in the current document host regardless of
   macOS's global "Prefer tabs when opening documents" setting. An idle launcher
   may take the first draft in place; an occupied host never turns New into an
-  unrelated standalone window.
+  unrelated standalone window. During a zero-window attach gap, rapid New
+  requests are counted rather than collapsed: one host is created and every
+  gesture becomes its own editable tab. If Finder is already opening a file,
+  that same host keeps the requested file and queued New gestures follow as
+  tabs instead of replacing it or spawning another host.
 - **Typewriter now follows your Mac's light/dark setting**, and it does it with two palettes of its own rather than by turning into a system theme. Set your Mac to dark and the window is the dark one — `#171717` titlebar over a dark source panel; set it to light and the same skin turns the window and the source panel white. The **page stays white either way**: the sheet is what you are reading, and it is paper in both halves, so the preview never follows the window into dark. Switching the system setting re-dresses open windows live, and an exported PDF is always the light sheet — exporting from a dark Mac no longer produced a dark document. Both halves stay on Typewriter's one grey ramp with no colour at all. A theme saved as Typewriter stays Typewriter; there is nothing to re-pick.
 - The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, mid grey on Typewriter — which stays achromatic, one step up its own grey ramp. `Default` and `Raw` keep the accent chosen in System Settings.
 - **Closing a document is now a conscious decision, not a silent teardown.** A dirty untitled document asks Save As… / Don't Save / Cancel; a dirty document that already has a location asks Save / Don't Save / Cancel; a clean, untouched document still closes without asking. Cancel, or a save that fails, always leaves the window open with nothing discarded. The same pass now gates the red close button, ⌘W, Dock quit, and Quit Pensieve alike, so none of them can drop unsaved work behind another window's back.
@@ -43,11 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Open Recent and Open Folder all vanished, ⌘N, ⌘O and ⌘T did nothing, and the
   only way back into the app was clicking the Dock icon. With zero windows the
   File menu now keeps New File (⌘N), New Tab (⌘T), Open File… (⌘O), Open Recent
-  and Open Folder… (⇧⌘O) — New opens one window already holding an empty
-  draft, and Open lands its file in one new window, the same single window a
-  Finder open creates. Nothing here can produce a second window behind your
-  back, and with a window on screen every one of these behaves exactly as
-  before.
+  and Open Folder… (⇧⌘O). The app-global About item also keeps Pensieve's own
+  build-identity panel, and Quit keeps the protected all-window decision even
+  while no document command target exists. New opens a host already holding an
+  empty draft; rapid additional New requests become tabs in that host. Open
+  lands its file in the same guarded host lane a Finder open uses. With a window
+  on screen every one of these behaves exactly as before.
 - **Opening a file no longer disappears into a windowless Pensieve process.**
   After the last window is closed, Finder/Open With or `open` now creates one
   explicit-document host and drains the queued URL into it instead of waiting
@@ -55,7 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Startup restore now remains one transaction across modal and close turns.**
   A modal pause keeps the same ref pending and the onboarding gate closed; if
   the pinned host closes between turns, later tabs re-pin to a live restore
-  survivor and the final ordering never resurrects the closed window.
+  survivor and the final ordering never resurrects the closed window. If the
+  user creates or selects a non-restore tab while that multi-turn pass is still
+  running, completion now preserves the newer selection instead of stealing
+  focus back to the last restored tab.
 - **One live recovery copy now follows the live buffer instead of its latest
   window label.** Renaming/rekeying a buffer preserves its recovery identity;
   actually replacing that buffer releases the claim so the launcher can offer
