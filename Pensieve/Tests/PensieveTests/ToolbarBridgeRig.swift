@@ -43,7 +43,17 @@ final class ToolbarBridgeRig {
   /// pane, the same toolbar, and no editor and no preview anywhere in the tree.
   /// Every AppKit-side chrome pass this app had used to hang off one of those
   /// two panes, so that window received none of it.
-  init(defaults: UserDefaults, width: CGFloat = 1600, hostsEditor: Bool = true) {
+  ///
+  /// `ambientControlSize` sets the INHERITED control size the toolbar is built
+  /// under, which is the only way a test can tell a DECLARED size from an
+  /// ambient one. Reading `NSControl.controlSize` back cannot: it reports the
+  /// resolved value, and on an OS whose ambient default already IS the declared
+  /// size the two are indistinguishable — which is exactly the shape that let a
+  /// macOS 27 regression pass a green macOS 26 runner.
+  init(
+    defaults: UserDefaults, width: CGFloat = 1600, hostsEditor: Bool = true,
+    ambientControlSize: ControlSize? = nil
+  ) {
     appState = AppState(defaults: defaults)
     appState.documentSession = .untitled()
     appState.documentSession.text = "hello brave new world"
@@ -58,16 +68,22 @@ final class ToolbarBridgeRig {
       defer: false)
     window.isReleasedWhenClosed = false
     window.toolbarStyle = WindowChromeRecipe.toolbarStyle
-    let hosting = NSHostingView(
-      rootView: AnyView(
-        ToolbarBridgeHost(
-          appState: appState, controller: controller, themeManager: themeManager,
-          hostsEditor: hostsEditor
-        )
-        // The chrome contract every production window root carries
-        // (`DocumentWindowRootView`). A rig that left it off would be modelling
-        // a window this app never builds.
-        .pensieveSkinAppearance(themeManager)))
+    var rootView = AnyView(
+      ToolbarBridgeHost(
+        appState: appState, controller: controller, themeManager: themeManager,
+        hostsEditor: hostsEditor
+      )
+      // The chrome contract every production window root carries
+      // (`DocumentWindowRootView`). A rig that left it off would be modelling
+      // a window this app never builds.
+      .pensieveSkinAppearance(themeManager))
+    // OUTSIDE the host, so it lands in the environment the toolbar declaration
+    // inherits — the same place a future SDK would raise the toolbar's own
+    // default — rather than overriding anything the declaration states itself.
+    if let ambientControlSize {
+      rootView = AnyView(rootView.controlSize(ambientControlSize))
+    }
+    let hosting = NSHostingView(rootView: rootView)
     // The same bridge the factory tab path uses to carry `.toolbar` content
     // from a SwiftUI root into an AppKit window.
     hosting.sceneBridgingOptions = [.toolbars, .title]
@@ -358,11 +374,15 @@ extension XCTestCase {
   /// at all: with no `NSToolbar` there is nothing for these suites to read, and
   /// a failure there would be about the environment, not the toolbelt.
   @MainActor
-  func makeToolbarRig(prefix: String, width: CGFloat = 1600, hostsEditor: Bool = true) throws
+  func makeToolbarRig(
+    prefix: String, width: CGFloat = 1600, hostsEditor: Bool = true,
+    ambientControlSize: ControlSize? = nil
+  ) throws
     -> ToolbarBridgeRig
   {
     let rig = ToolbarBridgeRig(
-      defaults: makeEphemeralDefaults(prefix: prefix), width: width, hostsEditor: hostsEditor)
+      defaults: makeEphemeralDefaults(prefix: prefix), width: width, hostsEditor: hostsEditor,
+      ambientControlSize: ambientControlSize)
     guard rig.window.toolbar != nil else {
       rig.tearDown()
       throw XCTSkip("headless window did not bridge a SwiftUI toolbar")
