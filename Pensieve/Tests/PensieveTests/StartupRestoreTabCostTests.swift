@@ -398,6 +398,59 @@ final class StartupRestoreTabCostTests: XCTestCase {
     XCTAssertTrue(probe.orderedWithoutActivation.last === probe.createdWindows.last)
   }
 
+  /// The app can stay frontmost while the user creates or selects a fresh tab
+  /// between two restore turns. "Pensieve is active" is therefore not enough
+  /// authority for the restore to select its own last tab at completion: the
+  /// selected window must also belong to this restore transaction.
+  func testRestoreCompletionPreservesAUserCreatedNonRestoreTab() {
+    let probe = RestoreCostProbe()
+    let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
+    let userTab = makeWindow(frame: target.frame)
+    probe.windows.append(contentsOf: [target, userTab])
+    var selectedWindow: NSWindow? = target
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      scheduleRestoreStep: { [weak probe] work in probe?.restoreSteps.append(work) },
+      mergeWindowIntoTabsBehind: { _, window in probe.backgroundMerges.append(window) },
+      orderAndActivateWindow: { probe.activations.append($0) },
+      orderWindowWithoutActivating: { probe.orderedWithoutActivation.append($0) },
+      isApplicationActive: { true },
+      currentKeyWindow: { selectedWindow },
+      currentMergeTarget: { target },
+      setStartupRestoreInProgress: { _ in },
+      makeDocumentWindow: { [weak probe] _, _ in
+        guard let probe else { return nil }
+        let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        probe.windows.append(window)
+        probe.createdWindows.append(window)
+        return window
+      })
+    let refs = (0..<3).map {
+      DocumentRef(
+        id: URL(fileURLWithPath: "/tmp/pensieve-restore-user-tab-\($0).md"),
+        isAdHoc: true)
+    }
+
+    registry.openRestoredDocuments(refs)
+    XCTAssertEqual(probe.createdWindows.count, 1)
+
+    // Models a successful New Tab gesture while the remaining restore steps
+    // are still queued. The new host is deliberately outside the restore's
+    // participant set even if AppKit later places it in the same tab group.
+    selectedWindow = userTab
+    while !probe.restoreSteps.isEmpty {
+      probe.restoreSteps.removeFirst()()
+    }
+
+    XCTAssertEqual(probe.createdWindows.count, refs.count)
+    XCTAssertTrue(
+      probe.activations.isEmpty,
+      "restore completion selected its last restored tab over the user's newer tab")
+    XCTAssertTrue(probe.orderedWithoutActivation.isEmpty)
+  }
+
   func testRestoreSuspendsOnboardingForExactlyTheRestorePass() {
     let probe = RestoreCostProbe()
     let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
@@ -705,6 +758,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       isApplicationActive: { true },
+      currentKeyWindow: { resolvedTarget },
       currentMergeTarget: { resolvedTarget },
       setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in

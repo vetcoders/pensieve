@@ -165,6 +165,15 @@ final class DocumentWindowRegistry: ObservableObject {
   private var restoreMergeTarget: WeakWindow?
   private var restoreStepScheduled = false
   private var restorePassInProgress = false
+  /// Every document host that belongs to the current restore transaction.
+  ///
+  /// The pass spans many event-loop turns. A window the user creates or selects
+  /// during that time is intentionally NOT added here, even when AppKit places
+  /// it in the same native tab group. That gives `finishRestorePass` an
+  /// ownership test stronger than "Pensieve is active": it can distinguish the
+  /// restore's own selected tab from a newer user selection and avoid stealing
+  /// that selection at completion.
+  private var restoreParticipantWindows: [ObjectIdentifier: WeakWindow] = [:]
   /// Windows closed while the current restore transaction is alive. Reusable
   /// SwiftUI scene windows cannot be factory-tombstoned forever, but they must
   /// not be re-selected as this pass's host during their close turn.
@@ -247,6 +256,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// pins can state which side of that they are exercising instead of inheriting
   /// whatever the test host's activation state happens to be.
   private let isApplicationActive: @MainActor () -> Bool
+  /// The actual selected/key surface at restore completion. Kept separate from
+  /// `currentMergeTarget`: merge routing is pinned for the transaction, while
+  /// this value answers whether the user selected something outside it.
+  private let currentKeyWindow: @MainActor () -> NSWindow?
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
@@ -291,6 +304,9 @@ final class DocumentWindowRegistry: ObservableObject {
       window.orderFront(nil)
     },
     isApplicationActive: @escaping @MainActor () -> Bool = { NSApplication.shared.isActive },
+    currentKeyWindow: @escaping @MainActor () -> NSWindow? = {
+      NSApplication.shared.keyWindow
+    },
     currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
       NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
         ?? NSApplication.shared.windows.first
@@ -318,6 +334,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.orderAndActivateWindow = orderAndActivateWindow
     self.orderWindowWithoutActivating = orderWindowWithoutActivating
     self.isApplicationActive = isApplicationActive
+    self.currentKeyWindow = currentKeyWindow
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
@@ -376,8 +393,12 @@ final class DocumentWindowRegistry: ObservableObject {
     if !restorePassInProgress {
       restorePassInProgress = true
       restoreClosedWindows.removeAll()
+      restoreParticipantWindows.removeAll()
       restoreMergeTarget = currentMergeTarget().flatMap(restoreEligibleDocumentHost).map(
         WeakWindow.init)
+      if let target = restoreMergeTarget?.window {
+        noteRestoreParticipant(target)
+      }
       setStartupRestoreInProgress(true)
     }
     pendingRestoreRefs.append(contentsOf: refs)
@@ -426,6 +447,7 @@ final class DocumentWindowRegistry: ObservableObject {
         restoreEligibleDocumentHost)
     {
       restoreMergeTarget = WeakWindow(transactionSurvivor)
+      noteRestoreParticipant(transactionSurvivor)
       // Adoption is a host change, not a licence to mutate: the survivor can be
       // carrying a sheet on the very turn it is adopted. Without this the ref
       // went to `open(_:presentation:mergeTargetSelection:)`, whose validation
@@ -444,6 +466,7 @@ final class DocumentWindowRegistry: ObservableObject {
       let candidate = currentMergeTarget().flatMap(restoreEligibleDocumentHost)
     {
       restoreMergeTarget = WeakWindow(candidate)
+      noteRestoreParticipant(candidate)
       guard canMutateWindowTabs(), DocumentWindowOwnership.isTabMutationHost(candidate) else {
         scheduleNextRestoreStep()
         return
@@ -465,6 +488,7 @@ final class DocumentWindowRegistry: ObservableObject {
       if restoreMergeTarget?.window == nil {
         restoreMergeTarget = WeakWindow(window)
       }
+      noteRestoreParticipant(window)
       restoreFrontmostWindow = WeakWindow(window)
     }
     guard !pendingRestoreRefs.isEmpty else {
@@ -500,6 +524,8 @@ final class DocumentWindowRegistry: ObservableObject {
     let frontmost =
       restoreFrontmostWindow?.window.flatMap(restoreEligibleDocumentHost)
       ?? restoreMergeTarget?.window.flatMap(restoreEligibleDocumentHost)
+    let selectedWindow = currentKeyWindow()
+    let userSelectedOutsideRestore = selectedWindow.map { !isRestoreParticipant($0) } ?? false
     restoreFrontmostWindow = nil
     restoreMergeTarget = nil
     restoreClosedWindows.removeAll()
@@ -512,16 +538,25 @@ final class DocumentWindowRegistry: ObservableObject {
       // for. When the app is NOT frontmost the window still takes its place in
       // the window order — so the restore's chosen tab is what they find when
       // they come back — without pulling focus across the app boundary.
-      if isApplicationActive() {
+      if isApplicationActive(), !userSelectedOutsideRestore {
         orderAndActivateWindow(frontmost)
-      } else {
+      } else if !isApplicationActive() {
         orderWindowWithoutActivating(frontmost)
       }
     }
+    restoreParticipantWindows.removeAll()
     // Final tab selection is part of the transaction. Releasing onboarding
     // before this ordering could attach its sheet to the previous selected tab
     // and make AppKit re-parent the group under an active sheet one last time.
     setStartupRestoreInProgress(false)
+  }
+
+  private func noteRestoreParticipant(_ window: NSWindow) {
+    restoreParticipantWindows[ObjectIdentifier(window)] = WeakWindow(window)
+  }
+
+  private func isRestoreParticipant(_ window: NSWindow) -> Bool {
+    restoreParticipantWindows[ObjectIdentifier(window)]?.window === window
   }
 
   @discardableResult
