@@ -120,6 +120,102 @@ enum CommandTargetResolution {
   }
 }
 
+/// How the File menu acts when it was built with NO command target — the
+/// deliberate zero-window state a Mac document app keeps living in after its
+/// last window closes (`Shift+Cmd+W`).
+///
+/// Every action here funnels into the lanes the app already owns for a window
+/// it does not have yet: an open goes through `LaunchIntentCoordinator.handle`,
+/// the same entry a Finder/`open`/Dock drop uses, so the coordinator's
+/// one-shot host guard covers a menu-driven open too and a launcher already on
+/// its way is never doubled; New goes through the registry's single
+/// `openDocumentHost(intent:)` factory. Nothing here creates a window by
+/// itself.
+///
+/// `adoptedController` is re-read AT ACTION TIME rather than captured in the
+/// branch. SwiftUI builds a `Commands` body ahead of the click, so a root that
+/// adopts the surface in between leaves the installed menu one rebuild behind
+/// reality; asking again at click time keeps ⌘N acting on the window that is
+/// now on screen instead of putting a second one beside it.
+struct ZeroWindowCommandLane {
+  var adoptedController: @MainActor () -> AppController? = {
+    CommandSurfaceContext.shared.controller
+  }
+  var openExternalURLs: @MainActor ([URL]) -> Void = { urls in
+    LaunchIntentCoordinator.shared.handle(urls: urls)
+  }
+  var openDocumentHost: @MainActor (LaunchIntent) -> Void = { intent in
+    DocumentWindowRegistry.shared.openDocumentHost(intent: intent)
+  }
+
+  /// ⌘O, ⇧⌘O and Open Recent. Handed to the coordinator whether or not a root
+  /// exists: `handle(urls:)` routes to the focused window when there is one and
+  /// materializes exactly one host when there is not — the same double-open and
+  /// one-shot guards an external open relies on.
+  @MainActor
+  func open(urls: [URL]) {
+    guard !urls.isEmpty else { return }
+    openExternalURLs(urls)
+  }
+
+  /// ⌘N / ⌘T. With a root on screen this is the ordinary New (an idle launcher
+  /// takes the draft in place, an occupied host gets a native tab); with none it
+  /// asks the registry for one host carrying the `.newUntitledTab` intent, which
+  /// is what makes the new window come up with an editable draft.
+  @MainActor
+  func newDocument() {
+    if let controller = adoptedController() {
+      _ = controller.createUntitledDocument()
+    } else {
+      openDocumentHost(.newUntitledTab)
+    }
+  }
+}
+
+/// The native pickers the File menu opens. Shared by the live and the
+/// zero-window command surfaces so both offer exactly the same file types and
+/// the same prompts — a second copy is how the two menus drift apart.
+enum DocumentOpenPanel {
+  static var markdownContentTypes: [UTType] {
+    [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+      .plainText,
+    ].compactMap { $0 }
+  }
+
+  static var documentImportContentTypes: [UTType] {
+    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
+  }
+
+  static var openableContentTypes: [UTType] {
+    markdownContentTypes + documentImportContentTypes
+  }
+
+  @MainActor
+  static func chooseFileToOpen() -> URL? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = openableContentTypes
+    panel.prompt = "Open"
+    guard panel.runModal() == .OK else { return nil }
+    return panel.url
+  }
+
+  @MainActor
+  static func chooseFolderToOpen() -> URL? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Open"
+    guard panel.runModal() == .OK else { return nil }
+    return panel.url
+  }
+}
+
 struct PensieveCommands: Commands {
   @FocusedValue(\.appState) private var focusedAppState: AppState?
   @FocusedObject private var focusedController: AppController?
@@ -139,6 +235,67 @@ struct PensieveCommands: Commands {
         themeManager: themeManager,
         recentDocuments: target.controller.recentDocuments
       )
+    } else {
+      // Closing the last window leaves the process alive on purpose, and every
+      // item above needs a document root to act on — so the whole File menu used
+      // to vanish with it: no New, no Open, no Open Recent, and ⌘N/⌘O/⌘T dead.
+      // A Mac document app keeps a working File menu with zero windows; this is
+      // that menu, and it is the ONLY branch that runs without a root.
+      ZeroWindowCommands(recentDocuments: RecentDocumentsStore.shared)
+    }
+  }
+}
+
+/// The File menu that survives the last window. Deliberately a subset: every
+/// item that acts ON a document (Save, Export, Close, Format, Mode, Agents)
+/// needs the session this state does not have, and About/Quit keep the standard
+/// items SwiftUI supplies here, exactly as they do today.
+private struct ZeroWindowCommands: Commands {
+  @ObservedObject var recentDocuments: RecentDocumentsStore
+  var lane = ZeroWindowCommandLane()
+
+  var body: some Commands {
+    CommandGroup(replacing: .newItem) {
+      Button("New File") {
+        lane.newDocument()
+      }
+      .keyboardShortcut("n", modifiers: [.command])
+
+      Button("New Tab") {
+        lane.newDocument()
+      }
+      .keyboardShortcut("t", modifiers: [.command])
+
+      Divider()
+
+      Button("Open File…") {
+        guard let url = DocumentOpenPanel.chooseFileToOpen() else { return }
+        lane.open(urls: [url])
+      }
+      .keyboardShortcut("o", modifiers: [.command])
+
+      Menu("Open Recent") {
+        ForEach(recentDocuments.recentDocuments, id: \.self) { url in
+          Button(RecentDocumentsStore.menuTitle(for: url)) {
+            lane.open(urls: [url])
+          }
+        }
+
+        if !recentDocuments.recentDocuments.isEmpty {
+          Divider()
+        }
+
+        Button("Clear Menu") {
+          recentDocuments.clear()
+        }
+        .disabled(recentDocuments.recentDocuments.isEmpty)
+      }
+
+      Button("Open Folder…") {
+        guard let url = DocumentOpenPanel.chooseFolderToOpen() else { return }
+        lane.open(urls: [url])
+      }
+      .keyboardShortcut("o", modifiers: [.command, .shift])
     }
   }
 }
@@ -596,19 +753,12 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func openFile() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = false
-    panel.allowsMultipleSelection = false
-    panel.allowedContentTypes = openableContentTypes
-    panel.prompt = "Open"
-    if panel.runModal() == .OK, let url = panel.url {
-      // The File menu is an explicit document-open gesture, just like Open
-      // Recent and Finder/Dock opens. Let the controller reuse an idle window
-      // or route to the existing/new native tab; loading in place here would
-      // replace a live document before the tab policy gets a chance to act.
-      controller.openFile(url: url)
-    }
+    guard let url = DocumentOpenPanel.chooseFileToOpen() else { return }
+    // The File menu is an explicit document-open gesture, just like Open
+    // Recent and Finder/Dock opens. Let the controller reuse an idle window
+    // or route to the existing/new native tab; loading in place here would
+    // replace a live document before the tab policy gets a chance to act.
+    controller.openFile(url: url)
   }
 
   private func importDocument() {
@@ -625,14 +775,8 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func openFolder() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.prompt = "Open"
-    if panel.runModal() == .OK, let url = panel.url {
-      controller.openFolder(url: url)
-    }
+    guard let url = DocumentOpenPanel.chooseFolderToOpen() else { return }
+    controller.openFolder(url: url)
   }
 
   private func createFolder() {
@@ -667,20 +811,10 @@ private struct ActivePensieveCommands: Commands {
     }
   }
 
-  private var markdownContentTypes: [UTType] {
-    [
-      UTType(filenameExtension: "md"),
-      UTType(filenameExtension: "markdown"),
-      .plainText,
-    ].compactMap { $0 }
-  }
+  private var markdownContentTypes: [UTType] { DocumentOpenPanel.markdownContentTypes }
 
   private var documentImportContentTypes: [UTType] {
-    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
-  }
-
-  private var openableContentTypes: [UTType] {
-    markdownContentTypes + documentImportContentTypes
+    DocumentOpenPanel.documentImportContentTypes
   }
 
   private var sidebarActionTargetURL: URL? {

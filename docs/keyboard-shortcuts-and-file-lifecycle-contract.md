@@ -232,6 +232,31 @@ document host, and a Dock click still creates exactly one empty launcher.
 Treating any visible window as a live surface left the opened file parked
 invisibly and made the Dock icon inert for the rest of the session.
 
+**The menu bar keeps working with zero windows.** A windowless Pensieve is a
+normal macOS document-app state (Finder-launched TextEdit, Xcode), so the File
+menu must stay usable rather than collapse to the system default. In that state
+Pensieve offers exactly:
+
+- **New File** (`Cmd+N`) and **New Tab** (`Cmd+T`) — one new window carrying the
+  `newUntitledTab` intent, so it comes up with an editable draft, not an empty
+  launcher;
+- **Open File…** (`Cmd+O`) — the same native picker as with a window on screen;
+- **Open Recent** — the same system-backed list, including **Clear Menu**;
+- **Open Folder…** (`Shift+Cmd+O`) — opens the folder as a workspace.
+
+Items that act ON a document (Save, Save As, Export, Share, Close, and the
+Mode/Format/Agents menus) stay absent: they need a session this state has none
+of. About and Quit remain the standard items.
+
+Every one of those zero-window invocations travels the lanes the app already
+owns: an open is handed to the same coordinator entry a Finder/`open`/Dock drop
+uses (so the one-host guard covers it, and an `Cmd+O` arriving while a host is
+already being built for an external open does not create a second one), and New
+asks the window registry for one host through the single factory every
+windowless entry point shares. No shortcut is rebound and no window is created
+by a path of the menu's own. With a window on screen, all of these items behave
+exactly as they always have and act on that window.
+
 ### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed

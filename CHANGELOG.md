@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The File menu no longer disappears with your last window.** Closing every
+  window keeps Pensieve running, but the menu bar went with them: New, Open,
+  Open Recent and Open Folder all vanished, ⌘N, ⌘O and ⌘T did nothing, and the
+  only way back into the app was clicking the Dock icon. With zero windows the
+  File menu now keeps New File (⌘N), New Tab (⌘T), Open File… (⌘O), Open Recent
+  and Open Folder… (⇧⌘O) — New opens one window already holding an empty
+  draft, and Open lands its file in one new window, the same single window a
+  Finder open creates. Nothing here can produce a second window behind your
+  back, and with a window on screen every one of these behaves exactly as
+  before.
 - **Opening a file no longer disappears into a windowless Pensieve process.**
   After the last window is closed, Finder/Open With or `open` now creates one
   explicit-document host and drains the queued URL into it instead of waiting

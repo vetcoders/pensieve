@@ -539,6 +539,142 @@ final class LaunchIntentTests: XCTestCase {
       "the file must not leak into an unrelated focused window while the launcher is attached")
   }
 
+  // MARK: - The File menu with zero windows
+
+  /// P2-04. Closing the last window leaves the process alive on purpose, and
+  /// every File item needed a document root — so the whole menu vanished with
+  /// the window: no New, no Open, no Open Recent, ⌘N/⌘O/⌘T dead, and the only
+  /// way back into the app was the Dock icon. A menu open must instead take the
+  /// SAME lane an external open takes: exactly one host, and the chosen file
+  /// opens in it.
+  @MainActor
+  func testZeroWindowMenuOpenCreatesOneHostAndOpensTheDocument() async throws {
+    let host = try makeRestoreHarness(documentNames: [])
+    let requested = host.folder.appendingPathComponent("menu-open.md").standardizedFileURL
+    try "# Menu open".write(to: requested, atomically: true, encoding: .utf8)
+    var requestedIntents: [LaunchIntent] = []
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { false },
+      openExternalDocumentHost: {
+        requestedIntents.append(.explicitDocument)
+        return true
+      })
+    let lane = ZeroWindowCommandLane(
+      adoptedController: { nil },
+      openExternalURLs: { coordinator.handle(urls: $0) },
+      openDocumentHost: { _ in XCTFail("Open must not build a window outside the open lane") })
+
+    // The user picked a file in the open panel with nothing on screen.
+    lane.open(urls: [requested])
+
+    XCTAssertEqual(
+      requestedIntents, [.explicitDocument],
+      "a menu open in the zero-window state did not ask for a document host")
+
+    // The factory-built root attaches and drains the queued URL, exactly as it
+    // does after a Finder open.
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: host.controller, intent: try XCTUnwrap(requestedIntents.first))
+    await coordinator.waitForStartupDecision()
+    await host.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(host.appState.documentSession.url, requested)
+    XCTAssertEqual(host.appState.selectedDocumentID, requested)
+  }
+
+  /// The menu shares the coordinator's one-shot guard rather than owning a
+  /// second one: an ⌘O landing while a launcher requested by a Finder open is
+  /// still on its way must not spawn a second host.
+  @MainActor
+  func testZeroWindowMenuOpenDoesNotDoubleAHostAlreadyOnItsWay() {
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { false },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return true
+      })
+    let lane = ZeroWindowCommandLane(
+      adoptedController: { nil },
+      openExternalURLs: { coordinator.handle(urls: $0) },
+      openDocumentHost: { _ in XCTFail("Open must not build a window outside the open lane") })
+
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/pensieve-finder-open.md")])
+    lane.open(urls: [URL(fileURLWithPath: "/tmp/pensieve-menu-open.md")])
+
+    XCTAssertEqual(
+      hostRequests, 1,
+      "a menu open behind an in-flight external open must reuse the host being built")
+  }
+
+  /// ⌘N with nothing on screen: one host, carrying the intent that makes the
+  /// new window come up with an editable draft rather than an empty launcher.
+  @MainActor
+  func testZeroWindowMenuNewFileAsksForOneUntitledHost() {
+    var requestedIntents: [LaunchIntent] = []
+    let lane = ZeroWindowCommandLane(
+      adoptedController: { nil },
+      openExternalURLs: { _ in XCTFail("New must not travel the external-open lane") },
+      openDocumentHost: { requestedIntents.append($0) })
+
+    lane.newDocument()
+
+    XCTAssertEqual(requestedIntents, [.newUntitledTab])
+  }
+
+  /// THE CONTROL PIN. The zero-window branch is additive: with a root on
+  /// screen — including a root that adopted the surface AFTER SwiftUI built
+  /// this menu — New still goes through that window's own New (idle launcher
+  /// takes the draft in place, occupied host gets a tab) and asks for no
+  /// second window.
+  @MainActor
+  func testMenuNewFileWithALiveRootTargetsThatRootInsteadOfANewHost() throws {
+    let live = try makeRestoreHarness(documentNames: [])
+    let lane = ZeroWindowCommandLane(
+      adoptedController: { live.controller },
+      openExternalURLs: { _ in XCTFail("New must not travel the external-open lane") },
+      openDocumentHost: { _ in XCTFail("New must not build a window while a root is alive") })
+
+    lane.newDocument()
+
+    XCTAssertTrue(
+      live.appState.documentSession.hasEditableBuffer,
+      "New must create the draft in the window that is actually on screen")
+    XCTAssertTrue(live.appState.documentSession.isUntitled)
+  }
+
+  /// The same control for Open: with a root alive the coordinator routes the
+  /// file into it and no host is requested — the byte-identical behavior the
+  /// live menu has today.
+  @MainActor
+  func testMenuOpenWithALiveRootLandsInThatRootWithoutANewHost() async throws {
+    let live = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let requested = live.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { live.controller },
+      hasLiveDocumentCapableWindow: { true },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return true
+      })
+    let lane = ZeroWindowCommandLane(
+      adoptedController: { live.controller },
+      openExternalURLs: { coordinator.handle(urls: $0) },
+      openDocumentHost: { _ in XCTFail("Open must not build a window while a root is alive") })
+
+    lane.open(urls: [requested])
+    await live.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(hostRequests, 0)
+    XCTAssertEqual(live.appState.selectedDocumentID, requested)
+    XCTAssertEqual(live.appState.documentSession.url, requested)
+  }
+
   // MARK: - Restore session on launch (S2-A)
 
   /// An absent key is a first launch, not "off" — the setting must default to
