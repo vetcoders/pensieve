@@ -90,26 +90,56 @@ EOF
 # removes that ambiguity at the source. Graceful quit first, then SIGTERM, then
 # SIGKILL as a last resort, waiting for the process to actually disappear at
 # each stage so `open -n` never races a survivor.
+wait_for_app_exit() {
+  local tracked_pids="$1"
+  local attempts="$2"
+  local attempt=0
+  local pid
+
+  while [[ "$attempt" -lt "$attempts" ]]; do
+    if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+      local tracked_pid_is_alive=0
+      for pid in $tracked_pids; do
+        if kill -0 "$pid" >/dev/null 2>&1; then
+          tracked_pid_is_alive=1
+          break
+        fi
+      done
+      [[ "$tracked_pid_is_alive" -eq 0 ]] && return 0
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 terminate_app() {
-  osascript -e "with timeout of 2 seconds" \
+  # A caller preparing a restoration relaunch can grant the graceful quit a
+  # bounded settling period. Cleanup callers keep the default zero-period path
+  # and move directly to the existing SIGTERM/SIGKILL fallback.
+  local graceful_attempts="${1:-0}"
+  local quit_timeout=2
+  local tracked_pids
+  [[ "$graceful_attempts" -gt 0 ]] && quit_timeout=5
+  tracked_pids="$(pgrep -x "$APP_NAME" 2>/dev/null || true)"
+
+  osascript -e "with timeout of $quit_timeout seconds" \
     -e "tell application id \"$APP_ID\" to quit" \
     -e "end timeout" >/dev/null 2>&1 || true
-  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-  for _ in {1..30}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
-    sleep 0.1
-  done
-  pkill -9 -x "$APP_NAME" >/dev/null 2>&1 || true
-  for _ in {1..20}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
-    sleep 0.1
-  done
-  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-    printf '\033[33m[fail]\033[0m %s\n' \
-      "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census" >&2
-    return 1
+  if [[ "$graceful_attempts" -gt 0 ]] \
+    && wait_for_app_exit "$tracked_pids" "$graceful_attempts"; then
+    return 0
   fi
-  return 0
+
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+  wait_for_app_exit "$tracked_pids" 30 && return 0
+
+  pkill -9 -x "$APP_NAME" >/dev/null 2>&1 || true
+  wait_for_app_exit "$tracked_pids" 20 && return 0
+
+  printf '\033[33m[fail]\033[0m %s\n' \
+    "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census" >&2
+  return 1
 }
 
 # Run an Accessibility AppleScript with GNU timeout when available. A function
@@ -374,17 +404,8 @@ end joined
 APPLESCRIPT
 
   log "saved-state probe: graceful quit with AppKit restoration armed"
-  osascript -e "with timeout of 5 seconds" \
-    -e "tell application id \"$APP_ID\" to quit" \
-    -e "end timeout" >/dev/null 2>&1 || true
-  for _ in {1..60}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-    sleep 0.5
-  fi
+  terminate_app 60 \
+    || die "saved-state probe: the seeded process survived the pre-relaunch termination barrier"
 
   log "saved-state probe: relaunch with Pensieve restore still OFF"
   open_smoke_app -a "$APP_PATH" || {
@@ -672,17 +693,8 @@ end joined
 APPLESCRIPT
 
   log "restore-ON probe: graceful quit, then relaunch with restore ON"
-  osascript -e "with timeout of 5 seconds" \
-    -e "tell application id \"$APP_ID\" to quit" \
-    -e "end timeout" >/dev/null 2>&1 || true
-  for _ in {1..60}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-    sleep 0.5
-  fi
+  terminate_app 60 \
+    || die "restore-ON probe: the seeded process survived the pre-relaunch termination barrier"
 
   open_smoke_app -a "$APP_PATH" || {
     sleep 0.5
