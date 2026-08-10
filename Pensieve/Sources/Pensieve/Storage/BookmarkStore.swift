@@ -12,9 +12,15 @@ final class BookmarkStore {
   /// One tracked security-scope access attempt: the URL access was actually
   /// STARTED on (start/stop must balance on the same object) and whether the
   /// start succeeded. Filed under `identityPath` — see `stopAccess(to:)`.
+  ///
+  /// `bookmark` is the persisted blob this grant was taken alongside, when the
+  /// activation happened next to one. It is the ONLY way back to this entry for
+  /// a caller that holds a blob whose minted path it cannot read — see
+  /// `stopAccess(forBookmark:)`.
   private struct ActiveAccess {
     let exactURL: URL
     let wasGranted: Bool
+    var bookmark: Data?
   }
 
   /// A freshly minted persisted blob together with the URL that carries the
@@ -42,6 +48,11 @@ final class BookmarkStore {
   private let startSecurityScopedAccess: (URL) -> Bool
   private let stopSecurityScopedAccess: (URL) -> Void
 
+  /// How the Trash prune reads the path a blob was minted for. Injectable for
+  /// one reason only: a blob that answers NIL is the case whose bookkeeping used
+  /// to leak, and no fixture can mint a real bookmark that fails this read.
+  private let bookmarkedOrigin: (Data) -> URL?
+
   init(
     defaults: UserDefaults = .standard,
     trashMembership: @escaping (URL) -> Bool = TrashLocation.contains,
@@ -50,12 +61,14 @@ final class BookmarkStore {
     },
     stopSecurityScopedAccess: @escaping (URL) -> Void = {
       $0.stopAccessingSecurityScopedResource()
-    }
+    },
+    bookmarkedOrigin: @escaping (Data) -> URL? = BookmarkStore.bookmarkedOriginURL
   ) {
     self.defaults = defaults
     self.trashMembership = trashMembership
     self.startSecurityScopedAccess = startSecurityScopedAccess
     self.stopSecurityScopedAccess = stopSecurityScopedAccess
+    self.bookmarkedOrigin = bookmarkedOrigin
   }
 
   /// Whether `url` names a document that has been thrown away.
@@ -147,7 +160,7 @@ final class BookmarkStore {
       bookmarks.append(data)
     }
     defaults.set(bookmarks, forKey: fileBookmarksKey)
-    activate(url)
+    activate(url, bookmark: data)
     appState.lastError = nil
   }
 
@@ -188,7 +201,7 @@ final class BookmarkStore {
     }
     appState.bookmarkData = roots.first?.data
     for root in roots { activate(root.resolvedURL) }
-    for file in files { activate(file.resolvedURL) }
+    for file in files { activate(file.resolvedURL, bookmark: file.data) }
     appState.lastError = nil
   }
 
@@ -334,9 +347,16 @@ final class BookmarkStore {
       // grant for the rest of the process. The landing path is released too:
       // both lookups are no-ops when absent, and only one of them can ever be
       // the key that exists.
-      let origin = Self.bookmarkedOriginURL(for: data)
+      //
+      // A blob that carries no cached path names no activation key at all, and
+      // that entry is leaving the working set on this pass either way — so the
+      // grant is released through the blob itself rather than left dangling
+      // with nothing that could ever name it again.
+      let origin = bookmarkedOrigin(data)
       if let origin {
         stopAccess(to: origin)
+      } else {
+        stopAccess(forBookmark: data)
       }
       stopAccess(to: resolved.standardizedFileURL)
       trashed.append(
@@ -357,9 +377,10 @@ final class BookmarkStore {
   ///
   /// Read without resolving, so it costs no filesystem work and cannot mount
   /// anything (see `pruneTrashedFiles`). A blob that carries no cached path
-  /// answers nil and the caller then retires nothing on its account — the row
-  /// survives, which is the safe direction.
-  private static func bookmarkedOriginURL(for bookmark: Data) -> URL? {
+  /// answers nil. The caller still retires that row after proving its resolved
+  /// target is in the Trash, and balances any tracked grant through the blob
+  /// tag recorded at activation time.
+  nonisolated private static func bookmarkedOriginURL(for bookmark: Data) -> URL? {
     guard let path = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
     else { return nil }
     return URL(fileURLWithPath: path)
@@ -415,6 +436,16 @@ final class BookmarkStore {
     return url.standardizedFileURL.path
   }
 
+  /// Mints a blob for `url` and immediately resolves it, because in the App
+  /// Store sandbox the security-scope extension is carried by the RESOLVED URL,
+  /// not by a standardized URL rebuilt from a path.
+  ///
+  /// `.withoutMounting` for the same reason `pruneTrashedFiles` gives, and at no
+  /// cost here: `url.bookmarkData` on the line above already needed a live file,
+  /// so the volume this resolve names is mounted by definition on every path
+  /// that reaches it. What the option removes is the main-actor stall a resolve
+  /// is otherwise ALLOWED to take — mounting a volume that went away between the
+  /// mint and the resolve — during a workspace rewrite the operator is watching.
   private func makeWorkspaceBookmark(for url: URL) throws -> WorkspaceBookmark {
     let data = try url.bookmarkData(
       options: [.withSecurityScope],
@@ -424,7 +455,7 @@ final class BookmarkStore {
     var bookmarkIsStale = false
     let resolvedURL = try URL(
       resolvingBookmarkData: data,
-      options: [.withSecurityScope],
+      options: [.withSecurityScope, .withoutMounting],
       relativeTo: nil,
       bookmarkDataIsStale: &bookmarkIsStale
     )
@@ -442,9 +473,19 @@ final class BookmarkStore {
     }
   }
 
-  private func activate(_ url: URL) {
+  /// Takes (once) the security-scoped access for `url`, and records which
+  /// persisted blob that access belongs to.
+  ///
+  /// The blob is re-recorded even when the grant is already held, because the
+  /// key survives a re-persist while the BYTES do not: `persistFile` mints fresh
+  /// bookmark data for a file it already tracks, and a stale tag would point at
+  /// a blob no longer in the working set.
+  private func activate(_ url: URL, bookmark: Data? = nil) {
     let key = Self.identityPath(url)
     if activeAccess[key] != nil {
+      if bookmark != nil {
+        activeAccess[key]?.bookmark = bookmark
+      }
       return
     }
 
@@ -452,7 +493,7 @@ final class BookmarkStore {
     if !wasGranted {
       DebugTrace.log("bookmark security-scope grant not obtained path=\(url.path)")
     }
-    activeAccess[key] = ActiveAccess(exactURL: url, wasGranted: wasGranted)
+    activeAccess[key] = ActiveAccess(exactURL: url, wasGranted: wasGranted, bookmark: bookmark)
   }
 
   /// Releases the security-scoped access this store took for one file.
@@ -473,7 +514,33 @@ final class BookmarkStore {
   /// start/stop must balance on the same object, so canonicalizing the key is
   /// not licence to canonicalize the call.
   private func stopAccess(to url: URL) {
-    guard let access = activeAccess.removeValue(forKey: Self.identityPath(url)) else { return }
+    stopAccess(atKey: Self.identityPath(url))
+  }
+
+  /// Releases the grant taken alongside one persisted blob, for the caller that
+  /// has the blob but cannot name the path it was minted for.
+  ///
+  /// `pruneTrashedFiles` is that caller. It normally releases under the
+  /// ACTIVATION key — the pre-trash path, read back out of the blob — and when
+  /// the blob carries no cached path there is no such key to derive: releasing
+  /// by the Trash LANDING path alone looks up a key that was never written, so
+  /// the entry left the working set while its grant stayed live for the rest of
+  /// the process. The blob recorded at activation time is the remaining handle
+  /// on that entry, and it is exact: it is the very data the caller is dropping.
+  private func stopAccess(forBookmark bookmark: Data) {
+    // One identity normally has one entry. Release every exact blob match
+    // anyway: an older build or future alias bug may have filed the same
+    // persisted grant under more than one key, and once the blob is being
+    // retired none of those entries has a surviving owner. Entries retagged to
+    // a newer blob are deliberately untouched.
+    let keys = activeAccess.compactMap { key, access in
+      access.bookmark == bookmark ? key : nil
+    }
+    for key in keys { stopAccess(atKey: key) }
+  }
+
+  private func stopAccess(atKey key: String) {
+    guard let access = activeAccess.removeValue(forKey: key) else { return }
     if access.wasGranted {
       stopSecurityScopedAccess(access.exactURL)
     }
@@ -579,7 +646,7 @@ final class BookmarkStore {
         continue
       }
 
-      activate(url)
+      activate(url, bookmark: data)
       // A stale bookmark is REPLACED here rather than re-persisted through
       // `persistFile`: appending a refreshed blob while the stale one stays in
       // the key is how a working set grows a second entry for a file it already
@@ -591,6 +658,10 @@ final class BookmarkStore {
           includingResourceValuesForKeys: nil,
           relativeTo: nil))
         : nil
+      // Minting the replacement needs the grant, so it happens AFTER the
+      // activation — which is why the tag is re-filed here rather than passed
+      // once: the grant has to answer to the blob that is actually persisted.
+      if let refreshed { activate(url, bookmark: refreshed) }
       survivingBookmarks.append(refreshed ?? data)
       restoredURLs.append(url)
     }

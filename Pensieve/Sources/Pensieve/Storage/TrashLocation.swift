@@ -52,6 +52,14 @@ enum TrashLocation {
         in: [],
         toItemAt: standardized
       )) != nil
+    // Deliberate: an ANSWERED relationship query is taken as final, so the two
+    // fallbacks below are reachable only when `getRelationship` THREW. That is
+    // the accepted trade — the query is authoritative about the Trash of the
+    // item's own volume, and second-guessing a `.other` it returned for a live
+    // item would mean re-deciding by path shape exactly where the system just
+    // decided by identity. The fallbacks exist for the item that is already
+    // GONE (nothing left to ask about) and for a query that errored, not as a
+    // second opinion. Do not re-file this as an unreachable-branch bug.
     if relationshipIsKnown {
       return relationship == .contains || relationship == .same
     }

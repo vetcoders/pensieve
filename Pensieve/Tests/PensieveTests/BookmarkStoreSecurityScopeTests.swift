@@ -235,6 +235,184 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
     XCTAssertEqual(store.activeSecurityScopeCount, 0)
   }
 
+  /// Moves `name` into a Trash this suite owns, the way the system does: a plain
+  /// move, which leaves the bookmark perfectly resolvable — at its new home.
+  private func seedTrashedFile(named name: String) throws -> (originURL: URL, trash: URL) {
+    let trash = folder.appendingPathComponent("Trash", isDirectory: true)
+    try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+    let noteURL = folder.appendingPathComponent(name)
+    try name.write(to: noteURL, atomically: true, encoding: .utf8)
+    return (noteURL, trash)
+  }
+
+  /// P3-6. The prune releases under the ACTIVATION key — the path the file had
+  /// BEFORE it was thrown away, which it reads back out of the bookmark blob.
+  /// A blob that cannot name the path it was minted for leaves the prune with no
+  /// key to look up at all: the entry left the persisted working set while its
+  /// grant stayed live for the rest of the process, and nothing could ever name
+  /// that grant again.
+  ///
+  /// The nil origin is INJECTED because no fixture can mint a real bookmark
+  /// whose cached path fails to read — which is exactly why the leak survived
+  /// the suite that covers the ordinary prune.
+  func testPruningABlobThatCannotNameItsOriginStillReleasesTheGrant() throws {
+    let seeded = try seedTrashedFile(named: "origin-less.md")
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: seeded.trash),
+      startSecurityScopedAccess: { _ in true },
+      stopSecurityScopedAccess: { stopped.append($0) },
+      bookmarkedOrigin: { _ in nil })
+
+    try store.persistFile(url: seeded.originURL, into: AppState())
+    XCTAssertEqual(
+      store.grantedSecurityScopeCount, 1, "premise: persisting a file takes one live grant")
+    try FileManager.default.moveItem(
+      at: seeded.originURL, to: seeded.trash.appendingPathComponent("origin-less.md"))
+
+    let pruned = store.pruneTrashedFiles()
+
+    XCTAssertEqual(pruned.count, 1, "premise: the trashed entry is the one being retired")
+    XCTAssertNil(
+      pruned.first?.originURL, "premise: this leg is about a blob that names no minted path")
+    XCTAssertEqual(
+      store.grantedSecurityScopeCount, 0,
+      "the retired entry's security-scoped grant survived the prune: it was taken under the "
+        + "pre-trash path, and with no origin to name that key the store can only find it through "
+        + "the blob it was activated alongside")
+    XCTAssertEqual(store.activeSecurityScopeCount, 0)
+    XCTAssertEqual(
+      stopped, [seeded.originURL],
+      "the stop must still go through the EXACT URL access was started on")
+  }
+
+  /// The control leg: with a readable origin the prune balances the same way, so
+  /// the pin above is about the missing-origin path and not about the prune
+  /// having been broken for everyone.
+  func testPruningABlobThatNamesItsOriginKeepsBalancingTheGrant() throws {
+    let seeded = try seedTrashedFile(named: "origin-bearing.md")
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: seeded.trash),
+      startSecurityScopedAccess: { _ in true },
+      stopSecurityScopedAccess: { stopped.append($0) })
+
+    try store.persistFile(url: seeded.originURL, into: AppState())
+    try FileManager.default.moveItem(
+      at: seeded.originURL, to: seeded.trash.appendingPathComponent("origin-bearing.md"))
+
+    let pruned = store.pruneTrashedFiles()
+
+    XCTAssertEqual(
+      pruned.compactMap(\.originURL).map(BookmarkStore.identityPath),
+      [BookmarkStore.identityPath(seeded.originURL)],
+      "premise: a real blob does name the path it was minted for")
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0)
+    XCTAssertEqual(stopped, [seeded.originURL])
+  }
+
+  func testRepeatedPersistKeepsOneGrantAndNilOriginPruneBalancesItOnce() throws {
+    let seeded = try seedTrashedFile(named: "repeated.md")
+    var started: [URL] = []
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: seeded.trash),
+      startSecurityScopedAccess: { url in
+        started.append(url)
+        return true
+      },
+      stopSecurityScopedAccess: { stopped.append($0) },
+      bookmarkedOrigin: { _ in nil })
+
+    try store.persistFile(url: seeded.originURL, into: AppState())
+    try store.persistFile(url: seeded.originURL, into: AppState())
+
+    XCTAssertEqual(started, [seeded.originURL], "re-persist must not take a second grant")
+    XCTAssertEqual(store.grantedSecurityScopeCount, 1)
+    XCTAssertEqual(
+      (defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data])?.count, 1,
+      "re-persist must keep exactly one working-set row")
+
+    try FileManager.default.moveItem(
+      at: seeded.originURL, to: seeded.trash.appendingPathComponent("repeated.md"))
+    XCTAssertEqual(store.pruneTrashedFiles().count, 1)
+    XCTAssertEqual(stopped, [seeded.originURL])
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0)
+  }
+
+  func testStaleBookmarkRefreshRetagsTheGrantBeforeNilOriginPrune() throws {
+    let trash = folder.appendingPathComponent("Trash", isDirectory: true)
+    try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+    let originalURL = folder.appendingPathComponent("before-rename.md")
+    let renamedURL = folder.appendingPathComponent("after-rename.md")
+    try "renamed".write(to: originalURL, atomically: true, encoding: .utf8)
+
+    let writer = BookmarkStore(defaults: defaults)
+    try writer.persistFile(url: originalURL, into: AppState())
+    let originalBlob = try XCTUnwrap(
+      (defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data])?.first)
+    try FileManager.default.moveItem(at: originalURL, to: renamedURL)
+
+    var stopped: [URL] = []
+    let reader = BookmarkStore(
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: trash),
+      startSecurityScopedAccess: { _ in true },
+      stopSecurityScopedAccess: { stopped.append($0) },
+      bookmarkedOrigin: { _ in nil })
+
+    let restored = reader.restoreWorkspace(into: AppState())
+    XCTAssertEqual(restored.fileURLs.map(\.standardizedFileURL), [renamedURL.standardizedFileURL])
+    let refreshedBlob = try XCTUnwrap(
+      (defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data])?.first)
+    XCTAssertNotEqual(
+      refreshedBlob, originalBlob,
+      "moving the file must make this fixture stale so the retag path is actually exercised")
+
+    let trashedURL = trash.appendingPathComponent(renamedURL.lastPathComponent)
+    try FileManager.default.moveItem(at: renamedURL, to: trashedURL)
+    XCTAssertEqual(reader.pruneTrashedFiles().count, 1)
+    XCTAssertEqual(
+      stopped.count, 1,
+      "the grant stayed tagged with the stale blob, so the nil-origin prune could not find it")
+    XCTAssertEqual(reader.grantedSecurityScopeCount, 0)
+    XCTAssertEqual(reader.activeSecurityScopeCount, 0)
+  }
+
+  func testLegacyDuplicateBookmarkRestoresOneGrantAndPrunesItOnce() throws {
+    let seeded = try seedTrashedFile(named: "duplicate.md")
+    let bookmark = try seeded.originURL.bookmarkData(
+      options: [.withSecurityScope],
+      includingResourceValuesForKeys: nil,
+      relativeTo: nil)
+    defaults.set([bookmark, bookmark], forKey: "Pensieve.workspace.fileBookmarks")
+
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      trashMembership: SimulatedTrash.membership(at: seeded.trash),
+      startSecurityScopedAccess: { _ in true },
+      stopSecurityScopedAccess: { stopped.append($0) },
+      bookmarkedOrigin: { _ in nil })
+
+    XCTAssertEqual(
+      store.restoreWorkspace(into: AppState()).fileURLs.map(\.standardizedFileURL),
+      [seeded.originURL.standardizedFileURL])
+    XCTAssertEqual(store.grantedSecurityScopeCount, 1)
+    XCTAssertEqual(
+      (defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data])?.count, 1,
+      "restore must retire the duplicate row without duplicating the live grant")
+
+    try FileManager.default.moveItem(
+      at: seeded.originURL, to: seeded.trash.appendingPathComponent("duplicate.md"))
+    XCTAssertEqual(store.pruneTrashedFiles().count, 1)
+    XCTAssertEqual(stopped.count, 1)
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0)
+  }
+
   func testFailedWorkspaceReplacementPreservesPreviouslyPersistedRoots() throws {
     let store = BookmarkStore(defaults: defaults)
     let state = AppState()
