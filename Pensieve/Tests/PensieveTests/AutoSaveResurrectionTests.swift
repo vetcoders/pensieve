@@ -179,7 +179,10 @@ final class AutoSaveResurrectionTests: XCTestCase {
     for text in ["first", "second", "third"] {
       appState.activeDocumentText = text
       store.documentDidChange(appState: appState)
-      try await Task.sleep(nanoseconds: 80_000_000)
+      try await waitUntil { recoveryStore.loadDrafts().first?.text == text }
+      XCTAssertEqual(
+        recoveryStore.loadDrafts().count, 1,
+        "every debounce tick must update the buffer's one recovery identity")
     }
 
     let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
