@@ -596,7 +596,11 @@ private struct ActivePensieveCommands: Commands {
     panel.allowedContentTypes = openableContentTypes
     panel.prompt = "Open"
     if panel.runModal() == .OK, let url = panel.url {
-      controller.openFileInCurrentWindow(url: url)
+      // The File menu is an explicit document-open gesture, just like Open
+      // Recent and Finder/Dock opens. Let the controller reuse an idle window
+      // or route to the existing/new native tab; loading in place here would
+      // replace a live document before the tab policy gets a chance to act.
+      controller.openFile(url: url)
     }
   }
 
