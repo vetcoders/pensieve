@@ -219,6 +219,47 @@ final class TrashedWorkingSetTests: XCTestCase {
     XCTAssertTrue(restoredFileURLs().isEmpty)
   }
 
+  /// Finder's Put Back makes the file eligible to open again, but it does not
+  /// reverse the deliberate working-set retirement. Only a fresh explicit open
+  /// may mint a new bookmark for the restored path.
+  func testPuttingBackATrashedFileRequiresAnExplicitReopenToRejoinTheWorkingSet() async throws {
+    _ = try writeNote("root-note.md", in: workspace)
+    let originalURL = try writeNote("put-back.md", in: outside)
+    let harness = try makeHarness()
+
+    await harness.openWorkspace()
+    XCTAssertNotNil(
+      harness.folderManager.registerOpenFile(url: originalURL, into: harness.appState))
+    XCTAssertEqual(harness.openFileURLs, [originalURL])
+    XCTAssertEqual(persistedFileBookmarkCount(), 1)
+
+    let trashedURL = try trash(originalURL)
+    harness.folderManager.refresh(into: harness.appState, force: true)
+    await harness.folderManager.waitForPendingForcedRefresh()
+
+    XCTAssertTrue(harness.openFileURLs.isEmpty)
+    XCTAssertEqual(persistedFileBookmarkCount(), 0)
+    XCTAssertTrue(restoredFileURLs().isEmpty)
+
+    try FileManager.default.moveItem(at: trashedURL, to: originalURL)
+
+    XCTAssertTrue(
+      harness.openFileURLs.isEmpty,
+      "Put Back restores filesystem content, not the retired live working-set row")
+    XCTAssertEqual(
+      persistedFileBookmarkCount(), 0,
+      "Put Back must not silently resurrect the bookmark that Trash retirement removed")
+    XCTAssertTrue(restoredFileURLs().isEmpty)
+
+    XCTAssertNotNil(
+      harness.folderManager.registerOpenFile(url: originalURL, into: harness.appState),
+      "an explicit reopen after Put Back is allowed and mints fresh working-set state")
+    XCTAssertEqual(harness.openFileURLs, [originalURL])
+    XCTAssertEqual(persistedFileBookmarkCount(), 1)
+    XCTAssertEqual(restoredFileURLs(), [originalURL])
+    XCTAssertNil(harness.appState.lastError)
+  }
+
   /// An ad-hoc file can be the entire working set, with no workspace root for
   /// FSEvents to watch. Returning from Finder must still retire a file thrown
   /// away behind Pensieve's back during the same running process.
