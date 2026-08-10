@@ -36,15 +36,27 @@ struct AgentDispatchMetadata: Equatable, Sendable {
     self.observeAgent = observeAgent
     self.exitCode = exitCode
     self.output = output
-    // Existing test doubles construct successful metadata directly. Treat
-    // those explicit successes as spawn-confirmed unless they opt into the
-    // accepted-but-unconfirmed state. Parsed launcher output starts in the
-    // unconfirmed state below and is promoted only after metadata inspection.
+    // Fail toward uncertainty. Only `classified(workerSpawnRecorded:)` — fed by
+    // an actual worker spawn record — may promote a receipt to
+    // `.workerSpawnRecorded`; metadata built directly carries no such proof, so
+    // a well-formed success starts accepted-but-unconfirmed. A receipt that is
+    // not even a well-formed success (non-zero exit, or no run ID) stays
+    // rejected: that is a fact, not uncertainty. Every production path passes
+    // `launchVerification` explicitly.
     self.launchVerification =
       launchVerification
       ?? (exitCode == 0 && runID != nil
-        ? .workerSpawnRecorded : .rejected)
+        ? .acceptedUnconfirmed : .rejected)
   }
+
+  /// The ONE explanation of an accepted-but-unconfirmed launch. The dispatch
+  /// sheet paints it under an orange receipt; the dictation tafla has no such
+  /// chrome and carries the same sentence in its status line. One copy, so
+  /// neither surface can quietly downgrade the uncertainty.
+  static let unconfirmedLaunchExplanation =
+    "Vibecrafted accepted this run, but Pensieve did not see its worker spawn record "
+    + "within the confirmation window. The run may still start or already be running. "
+    + "Check its status before dispatching again."
 
   var statusLine: String {
     if launchVerification == .rejected {

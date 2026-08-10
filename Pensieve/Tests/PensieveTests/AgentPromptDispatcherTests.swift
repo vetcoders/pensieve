@@ -4,6 +4,36 @@ import XCTest
 @testable import Pensieve
 
 final class AgentPromptDispatcherTests: XCTestCase {
+  /// A receipt built without a stated verification has NO spawn proof behind
+  /// it — the default must fail toward uncertainty instead of minting a
+  /// "Run started" the app never earned. A malformed receipt is still rejected:
+  /// that is a fact, not uncertainty.
+  func testDirectlyBuiltMetadataDefaultsToUnconfirmedRatherThanClaimingASpawn() {
+    let accepted = AgentDispatchMetadata(
+      runID: "work-default-init", reportPath: nil, exitCode: 0, output: "receipt")
+    XCTAssertEqual(accepted.launchVerification, .acceptedUnconfirmed)
+    XCTAssertEqual(accepted.statusLine, "Run accepted (launch unconfirmed): work-default-init")
+
+    let noRunID = AgentDispatchMetadata(
+      runID: nil, reportPath: nil, exitCode: 0, output: "receipt")
+    XCTAssertEqual(noRunID.launchVerification, .rejected)
+
+    let nonZeroExit = AgentDispatchMetadata(
+      runID: "work-default-init", reportPath: nil, exitCode: 3, output: "boom")
+    XCTAssertEqual(nonZeroExit.launchVerification, .rejected)
+
+    // Only an explicit statement — the launcher's own classification, or a test
+    // double that says so — may claim a recorded spawn.
+    let confirmed = AgentDispatchMetadata(
+      runID: "work-default-init", reportPath: nil, exitCode: 0, output: "receipt",
+      launchVerification: .workerSpawnRecorded)
+    XCTAssertEqual(confirmed.launchVerification, .workerSpawnRecorded)
+    XCTAssertEqual(
+      AgentDispatchMetadata.parse(output: "run_id: work-parsed", exitCode: 0)
+        .classified(workerSpawnRecorded: true).launchVerification,
+      .workerSpawnRecorded)
+  }
+
   func testExecutableCandidatesPreferOverrideThenEnvironmentIndependentUVEntrypoint() {
     let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
 
@@ -279,7 +309,10 @@ final class AgentPromptDispatcherTests: XCTestCase {
         reportPath: reportPath,
         exitCode: 0,
         output: "receipt",
-        observeAgent: "codex"
+        observeAgent: "codex",
+        // Stated, never inferred: only a real spawn record proves a launch, so
+        // a double that wants the started-run path has to say so.
+        launchVerification: .workerSpawnRecorded
       )
     )
     let controller = AppController(
@@ -477,7 +510,8 @@ final class AgentPromptDispatcherTests: XCTestCase {
         runID: "work-current-doc",
         reportPath: nil,
         exitCode: 0,
-        output: "receipt"
+        output: "receipt",
+        launchVerification: .workerSpawnRecorded
       )
     )
     let controller = AppController(
@@ -534,7 +568,8 @@ final class AgentPromptDispatcherTests: XCTestCase {
         runID: "work-untitled-doc",
         reportPath: nil,
         exitCode: 0,
-        output: "receipt"
+        output: "receipt",
+        launchVerification: .workerSpawnRecorded
       )
     )
     let controller = AppController(

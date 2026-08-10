@@ -364,6 +364,100 @@ final class DispatchGatewayTests: XCTestCase {
         observeAgent: "swarm"))
   }
 
+  // MARK: - Receipt actions (what a launch receipt earns)
+
+  /// A receipt whose output carried no `agent:` line still names a run the user
+  /// can follow: the status affordance falls back to the first configured
+  /// agent instead of vanishing. With no agents configured at all there is
+  /// nothing to observe with — the action is simply absent.
+  @MainActor
+  func testReceiptWithoutAnAgentLineStillOffersStatusViaTheFirstConfiguredAgent() {
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: work-no-agent-line
+        report: /tmp/reports/work-no-agent-line.md
+        """,
+      exitCode: 0)
+    XCTAssertNil(receipt.observeAgent, "precondition: the receipt names no observe agent")
+
+    let withAgents = DispatchPopover.receiptActions(
+      runID: receipt.runID,
+      reportPath: receipt.reportPath,
+      observeAgent: receipt.observeAgent,
+      configuredAgents: ["codex", "claude"],
+      runIsLaunched: true)
+    XCTAssertEqual(withAgents.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+    XCTAssertEqual(
+      withAgents.observe,
+      DispatchPopover.ReceiptActions.Observe(agent: "codex", runID: "work-no-agent-line"))
+
+    // The receipt's own agent still wins over the fallback.
+    XCTAssertEqual(
+      DispatchPopover.receiptActions(
+        runID: "work-no-agent-line",
+        reportPath: nil,
+        observeAgent: "swarm",
+        configuredAgents: ["codex", "claude"],
+        runIsLaunched: true
+      ).observe,
+      DispatchPopover.ReceiptActions.Observe(agent: "swarm", runID: "work-no-agent-line"))
+
+    let withoutAgents = DispatchPopover.receiptActions(
+      runID: receipt.runID,
+      reportPath: receipt.reportPath,
+      observeAgent: receipt.observeAgent,
+      configuredAgents: [],
+      runIsLaunched: true)
+    XCTAssertNil(withoutAgents.observe, "nothing to observe with, so no status action")
+    XCTAssertEqual(withoutAgents.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+  }
+
+  /// A rejected launch never started a run. Its receipt may still carry a run
+  /// ID and a report the launcher wrote — the report is real and stays
+  /// revealable — but "Check status" would point at a run that does not exist.
+  @MainActor
+  func testRejectedReceiptRevealsItsReportButOffersNoStatusCheck() {
+    let rejected = AgentDispatchMetadata.parse(
+      output: """
+        run_id: work-rejected
+        agent: codex
+        report: /tmp/reports/work-rejected.md
+        refused: workflow gate
+        """,
+      exitCode: 2)
+    XCTAssertEqual(rejected.launchVerification, .rejected, "precondition")
+
+    let phase = DispatchPopover.resolvedPhase(
+      for: .rejected(
+        message: rejected.statusLine,
+        runID: rejected.runID,
+        reportPath: rejected.reportPath,
+        observeAgent: rejected.observeAgent))
+    guard case .failed(_, let runID, let reportPath, let observeAgent) = phase else {
+      return XCTFail("Expected a rejected outcome to render as the failed phase")
+    }
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      configuredAgents: ["codex"],
+      runIsLaunched: false)
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/work-rejected.md")
+    XCTAssertNil(actions.observe, "a run that never started has no status to check")
+
+    // The same identifiers on a launched run DO earn the status action — the
+    // difference is the launch, not the receipt.
+    XCTAssertNotNil(
+      DispatchPopover.receiptActions(
+        runID: runID,
+        reportPath: reportPath,
+        observeAgent: observeAgent,
+        configuredAgents: ["codex"],
+        runIsLaunched: true
+      ).observe)
+  }
+
   // MARK: - Helpers
 
   @MainActor
@@ -449,7 +543,10 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
     lock.unlock()
     return result
       ?? AgentDispatchMetadata(
-        runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt")
+        runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt",
+        // Explicit: metadata built directly carries no spawn proof, so the
+        // started-run path has to be asked for.
+        launchVerification: .workerSpawnRecorded)
   }
 
   func requests() -> [Request] {
@@ -477,7 +574,8 @@ private final class BlockingLauncher: AgentPromptLaunching, @unchecked Sendable 
     lock.unlock()
     gate.wait()
     return AgentDispatchMetadata(
-      runID: "blocking-test", reportPath: nil, exitCode: 0, output: "receipt")
+      runID: "blocking-test", reportPath: nil, exitCode: 0, output: "receipt",
+      launchVerification: .workerSpawnRecorded)
   }
 
   func startedCount() -> Int {

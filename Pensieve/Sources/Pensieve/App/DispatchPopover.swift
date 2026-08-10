@@ -252,8 +252,11 @@ struct DispatchPopover: View {
         Text(message)
           .font(.system(size: 11)).foregroundStyle(.red).lineLimit(3)
           .frame(maxWidth: .infinity, alignment: .leading)
+        // A rejected or failed launch never started a run: only the report
+        // file, if the launcher already wrote one, is real.
         dispatchReceiptActions(
-          runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+          runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+          runIsLaunched: false)
       }
       if intent.subjectIsEmpty {
         Text("This document is empty. Write something before dispatching.")
@@ -304,7 +307,8 @@ struct DispatchPopover: View {
         .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
         HStack(spacing: 8) {
           dispatchReceiptActions(
-            runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+            runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+            runIsLaunched: true)
           Spacer()
           Button("Close") { onClose() }
             .keyboardShortcut(.defaultAction)
@@ -320,18 +324,15 @@ struct DispatchPopover: View {
         .font(.system(size: 12, weight: .semibold))
         .textSelection(.enabled)
         .accessibilityIdentifier("pensieve.dispatch.unconfirmed")
-        Text(
-          "Vibecrafted accepted this run, but Pensieve did not see its worker spawn record "
-            + "within the confirmation window. The run may still start or already be running. "
-            + "Check its status before dispatching again."
-        )
-        .font(.system(size: 11))
-        .foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-        .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
+        Text(AgentDispatchMetadata.unconfirmedLaunchExplanation)
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
         HStack(spacing: 8) {
           dispatchReceiptActions(
-            runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+            runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+            runIsLaunched: true)
           Spacer()
           Button("Close") { onClose() }
             .keyboardShortcut(.defaultAction)
@@ -340,19 +341,67 @@ struct DispatchPopover: View {
     }
   }
 
+  /// What a receipt may offer, for every phase that shows one. The rules live
+  /// in the pure resolver below; this is only their rendering.
   @ViewBuilder private func dispatchReceiptActions(
-    runID: String?, reportPath: String?, observeAgent: String?
+    runID: String?, reportPath: String?, observeAgent: String?, runIsLaunched: Bool
   ) -> some View {
-    if let reportPath {
+    let actions = Self.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      configuredAgents: controller.availableAgents,
+      runIsLaunched: runIsLaunched)
+    if let reportPath = actions.revealReportPath {
       Button("Reveal report") {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: reportPath)])
       }
     }
-    if let runID, let observeAgent {
+    if let observe = actions.observe {
       Button("Check status in Terminal") {
-        controller.observeRunInTerminal(agent: observeAgent, runID: runID)
+        controller.observeRunInTerminal(agent: observe.agent, runID: observe.runID)
       }
     }
+  }
+
+  /// The affordances a launch receipt earns.
+  struct ReceiptActions: Equatable {
+    /// The report file is real as soon as the launcher wrote it — a rejected
+    /// run may still have one, so revealing it never depends on the launch.
+    let revealReportPath: String?
+    /// Present only for a run that actually started.
+    let observe: Observe?
+
+    struct Observe: Equatable {
+      let agent: String
+      let runID: String
+    }
+  }
+
+  /// The single seam deciding what a receipt offers. Pure, so both rules are
+  /// pinnable without a hosted view:
+  ///
+  /// - the receipt's `agent:` line is the authority for
+  ///   `vibecrafted <agent> observe`, but a receipt that omits it (older
+  ///   launcher, trimmed output) still names a run the user can follow — fall
+  ///   back to the first configured agent rather than dropping the only status
+  ///   affordance;
+  /// - a run that never started has no status to check, whatever identifiers
+  ///   its rejection receipt carries.
+  static func receiptActions(
+    runID: String?,
+    reportPath: String?,
+    observeAgent: String?,
+    configuredAgents: [String],
+    runIsLaunched: Bool
+  ) -> ReceiptActions {
+    let agent = observeAgent ?? configuredAgents.first
+    guard runIsLaunched, let runID, let agent, !agent.isEmpty else {
+      return ReceiptActions(revealReportPath: reportPath, observe: nil)
+    }
+    return ReceiptActions(
+      revealReportPath: reportPath,
+      observe: ReceiptActions.Observe(agent: agent, runID: runID))
   }
 
   private func runDispatch() async {
