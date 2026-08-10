@@ -219,6 +219,13 @@ final class DocumentWindowRegistry: ObservableObject {
   /// constructions instead of twelve full SwiftUI layout + preview renders.
   private let mergeWindowIntoTabsBehind: @MainActor (NSWindow, NSWindow) -> Void
   private let orderAndActivateWindow: @MainActor (NSWindow) -> Void
+  /// Ordering WITHOUT taking application focus, for the end of a restore pass
+  /// the user has already walked away from. See `finishRestorePass`.
+  private let orderWindowWithoutActivating: @MainActor (NSWindow) -> Void
+  /// Whether Pensieve is the app the user is currently in. A seam so the restore
+  /// pins can state which side of that they are exercising instead of inheriting
+  /// whatever the test host's activation state happens to be.
+  private let isApplicationActive: @MainActor () -> Bool
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
@@ -259,6 +266,10 @@ final class DocumentWindowRegistry: ObservableObject {
       window.makeKeyAndOrderFront(nil)
       NSApplication.shared.activate(ignoringOtherApps: true)
     },
+    orderWindowWithoutActivating: @escaping @MainActor (NSWindow) -> Void = { window in
+      window.orderFront(nil)
+    },
+    isApplicationActive: @escaping @MainActor () -> Bool = { NSApplication.shared.isActive },
     currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
       NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
         ?? NSApplication.shared.windows.first
@@ -284,6 +295,8 @@ final class DocumentWindowRegistry: ObservableObject {
     self.mergeWindowIntoTabs = mergeWindowIntoTabs
     self.mergeWindowIntoTabsBehind = mergeWindowIntoTabsBehind
     self.orderAndActivateWindow = orderAndActivateWindow
+    self.orderWindowWithoutActivating = orderWindowWithoutActivating
+    self.isApplicationActive = isApplicationActive
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
@@ -392,6 +405,18 @@ final class DocumentWindowRegistry: ObservableObject {
         restoreEligibleDocumentHost)
     {
       restoreMergeTarget = WeakWindow(transactionSurvivor)
+      // Adoption is a host change, not a licence to mutate: the survivor can be
+      // carrying a sheet on the very turn it is adopted. Without this the ref
+      // went to `open(_:presentation:mergeTargetSelection:)`, whose validation
+      // rejects a sheeted target, and the document fanned out as a standalone
+      // window — the split restore the pinned and candidate paths already park
+      // for.
+      guard canMutateWindowTabs(),
+        DocumentWindowOwnership.isTabMutationHost(transactionSurvivor)
+      else {
+        scheduleNextRestoreStep()
+        return
+      }
     }
 
     if restoreMergeTarget?.window == nil,
@@ -428,6 +453,20 @@ final class DocumentWindowRegistry: ObservableObject {
     scheduleNextRestoreStep()
   }
 
+  /// Books the next turn of the pass — both for progress (one tab per turn) and
+  /// for PARKING: every gate above answers a refusal by re-booking this same
+  /// step instead of ejecting the ref.
+  ///
+  /// The tradeoff is deliberate and is a polling one. While a modal or a sheet
+  /// holds the host, the pass re-asks on the restore scheduler's cadence (20 ms)
+  /// and makes no progress, so a modal that never goes away keeps the remaining
+  /// refs — and the onboarding gate this pass owns — pending for as long as it
+  /// hangs. That is fail-closed by choice: the alternative is the mis-merge this
+  /// hardening exists to prevent, where a blocked ref leaves the transaction,
+  /// follows whatever window is key later, and splits the restore across roots.
+  /// The polling is bounded to the life of one restore pass, and the ban on
+  /// polling gates in `DocumentWindowOwnership.isTabMutationHost` is about
+  /// process-wide retry timers, not this transaction's own turn schedule.
   private func scheduleNextRestoreStep() {
     guard !restoreStepScheduled else { return }
     restoreStepScheduled = true
@@ -445,7 +484,18 @@ final class DocumentWindowRegistry: ObservableObject {
     restoreClosedWindows.removeAll()
     restorePassInProgress = false
     if let frontmost {
-      orderAndActivateWindow(frontmost)
+      // A restore pass spans many run-loop turns and can run for seconds on a
+      // large working set. The user is free to switch to another app while it
+      // does, and this closing order is not a reason to yank them back:
+      // activation is only ever the completion of something they asked Pensieve
+      // for. When the app is NOT frontmost the window still takes its place in
+      // the window order — so the restore's chosen tab is what they find when
+      // they come back — without pulling focus across the app boundary.
+      if isApplicationActive() {
+        orderAndActivateWindow(frontmost)
+      } else {
+        orderWindowWithoutActivating(frontmost)
+      }
     }
     // Final tab selection is part of the transaction. Releasing onboarding
     // before this ordering could attach its sheet to the previous selected tab
@@ -630,6 +680,27 @@ final class DocumentWindowRegistry: ObservableObject {
       return true
     }
     return applicationWindows().contains(where: isLiveApplicationWindow)
+  }
+
+  /// Whether the app still has a window that could HOST A DOCUMENT.
+  ///
+  /// `applicationHasLiveWindow()` answers the broader question — "is any surface
+  /// of this app alive" — and Settings, About and every other auxiliary window
+  /// answers it `true` while being structurally unable to take a file. An
+  /// external open (Finder double-click, `open`, Dock drop) arriving at a
+  /// process whose only remaining window is Settings therefore found no target
+  /// controller, was told a live window existed, never asked for a host, and
+  /// parked its URL in `pendingURLs` forever. Callers deciding whether a
+  /// DOCUMENT surface has to be materialized ask this one instead.
+  func hasLiveDocumentCapableWindow() -> Bool {
+    purgeClosedLauncherWindows()
+    if launcherWindows.values.contains(where: { $0.window != nil })
+      || contentWindows.values.contains(where: { $0.window != nil })
+      || windowsByDocumentID.values.contains(where: { $0.window != nil })
+    {
+      return true
+    }
+    return applicationWindows().contains(where: isLiveDocumentCapableWindow)
   }
 
   /// The native tab bar's "+" (and the system `newWindowForTab:` action), for
@@ -1376,6 +1447,16 @@ final class DocumentWindowRegistry: ObservableObject {
       || windowsByDocumentID.values.contains { $0.window === window }
       || window.representedURL != nil
       || (!window.title.isEmpty && window.title != "Pensieve" && window.title != "<untitled>")
+  }
+
+  /// The document-capable half of `isLiveApplicationWindow`: same liveness
+  /// evidence, but only for a window that carries Pensieve's document-host
+  /// token. A SwiftUI scene launcher acquires that token synchronously in
+  /// `DocumentWindowAccessor.viewDidMoveToWindow` (see
+  /// `DocumentWindowOwnership.claimDocumentHost`), so an untracked launcher
+  /// still counts here — while Settings, About and panels never do.
+  private func isLiveDocumentCapableWindow(_ window: NSWindow) -> Bool {
+    DocumentWindowOwnership.isDocumentHost(window) && isLiveApplicationWindow(window)
   }
 
   private func registerLauncher(_ window: NSWindow) {

@@ -4,12 +4,14 @@ import Foundation
 @MainActor
 final class LaunchIntentCoordinator: ObservableObject {
   static let shared = LaunchIntentCoordinator(
-    hasLiveApplicationWindow: { DocumentWindowRegistry.shared.applicationHasLiveWindow() },
+    hasLiveDocumentCapableWindow: {
+      DocumentWindowRegistry.shared.hasLiveDocumentCapableWindow()
+    },
     openExternalDocumentHost: {
       let registry = DocumentWindowRegistry.shared
       if registry.makeDocumentWindow != nil {
         registry.openLauncherWindow(intent: .explicitDocument)
-        return registry.applicationHasLiveWindow()
+        return registry.hasLiveDocumentCapableWindow()
       } else {
         return NSApp.sendAction(
           #selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
@@ -35,7 +37,13 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// is deliberately alive with zero windows. The URL stays in `pendingURLs`;
   /// the new root drains it when its controller attaches, preserving the same
   /// explicit-document launch path as a cold Finder open.
-  private let hasLiveApplicationWindow: @MainActor () -> Bool
+  ///
+  /// The question is deliberately "is a DOCUMENT-capable window alive", not "is
+  /// any window alive": a visible Settings or About window cannot take a file,
+  /// so counting it as a live surface left the external open with no target
+  /// controller, no host request, and a URL parked in `pendingURLs` for the rest
+  /// of the session.
+  private let hasLiveDocumentCapableWindow: @MainActor () -> Bool
   private let openExternalDocumentHost: @MainActor () -> Bool
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
@@ -68,12 +76,12 @@ final class LaunchIntentCoordinator: ObservableObject {
     focusedControllerProvider: @escaping @MainActor () -> AppController? = {
       CommandSurfaceContext.shared.controller
     },
-    hasLiveApplicationWindow: @escaping @MainActor () -> Bool = { false },
+    hasLiveDocumentCapableWindow: @escaping @MainActor () -> Bool = { false },
     openExternalDocumentHost: @escaping @MainActor () -> Bool = { false }
   ) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
     self.focusedControllerProvider = focusedControllerProvider
-    self.hasLiveApplicationWindow = hasLiveApplicationWindow
+    self.hasLiveDocumentCapableWindow = hasLiveDocumentCapableWindow
     self.openExternalDocumentHost = openExternalDocumentHost
   }
 
@@ -151,7 +159,7 @@ final class LaunchIntentCoordinator: ObservableObject {
       // The zero-window process is intentional, but an external open is also
       // an explicit request for a surface. Keep the URLs queued and create one
       // host; its root will attach above and drain them exactly once.
-      if !hasLiveApplicationWindow(), !isExternalOpenWindowRequested {
+      if !hasLiveDocumentCapableWindow(), !isExternalOpenWindowRequested {
         isExternalOpenWindowRequested = openExternalDocumentHost()
       }
       return
@@ -318,17 +326,22 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  /// Clicking the Dock icon with no windows open reopens an EMPTY launcher.
-  /// Closing every document is a conscious act; reactivating the app is not a
-  /// request to undo it, so nothing is selected back into the new window.
+  /// Clicking the Dock icon with no DOCUMENT window open reopens an EMPTY
+  /// launcher. Closing every document is a conscious act; reactivating the app
+  /// is not a request to undo it, so nothing is selected back into the new
+  /// window.
+  ///
+  /// AppKit's `hasVisibleWindows` counts every surface, Settings and About
+  /// included, so trusting it alone made the Dock icon inert for a session whose
+  /// last remaining window cannot hold a document. The decision is the registry's
+  /// document-capable answer alone, and `flag` is deliberately not consulted.
   func applicationShouldHandleReopen(
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
   ) -> Bool {
-    guard !flag else { return true }
     Task { @MainActor in
       let registry = DocumentWindowRegistry.shared
-      guard !registry.applicationHasLiveWindow() else { return }
+      guard !registry.hasLiveDocumentCapableWindow() else { return }
       if registry.makeDocumentWindow != nil {
         registry.openLauncherWindow(intent: .dockReopen)
       } else {

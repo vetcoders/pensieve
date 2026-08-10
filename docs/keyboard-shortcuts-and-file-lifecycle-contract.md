@@ -225,6 +225,13 @@ exactly one document host for the queued URL and opens that file there. The
 request must not remain hidden until a later Dock click, and the new host must
 not restore the previous working set around the explicitly opened document.
 
+"Zero windows" means zero DOCUMENT windows. A Settings, About or other auxiliary
+window still standing does not count as a surface that can hold a file: with one
+of those as the only remaining window, a Finder open still creates exactly one
+document host, and a Dock click still creates exactly one empty launcher.
+Treating any visible window as a live surface left the opened file parked
+invisibly and made the Dock icon inert for the rest of the session.
+
 ### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed
@@ -314,7 +321,15 @@ pass, and provider onboarding stays unpresented until every restored tab has
 joined and the final tab has been selected. A sheet, Settings window or helper
 surface becoming key must never redirect a later restore step or split the
 working set into additional windows. Pensieve still never mutates a tab group
-while it owns an attached sheet; it prevents that overlap instead.
+while it owns an attached sheet; it prevents that overlap instead. That rule
+covers the host the pass ADOPTS after its original host closes mid-pass: a
+survivor carrying a sheet is not merged into, the pending ref waits for the next
+turn, and the pass keeps parking until the group can take it.
+
+The pass ends with exactly one closing order, and that order activates the app
+only when Pensieve is still the app the user is in. A restore that finishes
+after the user has switched away orders its final tab into place without pulling
+focus back across the app boundary.
 
 Window-following UI bridges (theme chrome, toolbar overflow, command routing,
 close hooks) publish only a proven document root. A queued callback belonging
@@ -734,6 +749,9 @@ An agent implementing or refactoring menu/commands must verify:
 - [ ] The system `X` protects dirty/recovery buffers, then closes the last
       window without an automatic reopen; the process stays alive with zero
       windows, and a later Dock click creates exactly one empty launcher.
+- [ ] With Settings (or About) as the only remaining window: a Finder open of a
+      `.md` file opens it in a new document host, and a Dock click creates
+      exactly one empty launcher.
 - [ ] `Cmd+M` minimizes the window, `Cmd+,` opens Settings, and `Cmd+Q` quits the application.
 - [ ] `Cmd+F` searches in the document, and `Shift+Cmd+F` in the workspace.
 - [ ] Close All protects unsaved files and recovery items.

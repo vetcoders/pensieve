@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 @testable import Pensieve
@@ -354,7 +355,7 @@ final class LaunchIntentTests: XCTestCase {
     let coordinator = LaunchIntentCoordinator(
       settleDelayNanoseconds: 0,
       focusedControllerProvider: { nil },
-      hasLiveApplicationWindow: { false },
+      hasLiveDocumentCapableWindow: { false },
       openExternalDocumentHost: {
         requestedIntents.append(.explicitDocument)
         return true
@@ -384,6 +385,61 @@ final class LaunchIntentTests: XCTestCase {
     )
   }
 
+  /// THE SETTINGS TRAP. The user closed every document and left Settings (or
+  /// About) open, then double-clicked a file in the Finder. There is no
+  /// controller to route to — the document surfaces are gone — and the window
+  /// that IS still up cannot hold a document. Answering "a window is visible"
+  /// meant no host was ever requested and the URL sat in the coordinator's
+  /// queue for the rest of the session: the file simply never opened.
+  ///
+  /// Wired through the REAL registry predicate, because the bug was in what the
+  /// registry counted, not in the coordinator's branch.
+  @MainActor
+  func testExternalOpenCreatesAHostWhenOnlyANonDocumentWindowIsAlive() {
+    let settingsWindow = NSWindow(
+      contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    settingsWindow.isReleasedWhenClosed = false
+    settingsWindow.alphaValue = 0
+    settingsWindow.contentView = NSView(frame: .zero)
+    settingsWindow.title = "Settings"
+    addTeardownBlock {
+      await MainActor.run {
+        settingsWindow.orderOut(nil)
+        settingsWindow.close()
+      }
+    }
+    let registry = DocumentWindowRegistry(
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      applicationWindows: { [settingsWindow] })
+
+    XCTAssertTrue(
+      registry.applicationHasLiveWindow(),
+      "the fixture must model a process that still HAS a window, or the pin below is vacuous")
+    XCTAssertFalse(
+      registry.hasLiveDocumentCapableWindow(),
+      "a Settings window carries no document-host token and can never take a file")
+
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { registry.hasLiveDocumentCapableWindow() },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return true
+      })
+
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/pensieve-settings-open-first.md")])
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/pensieve-settings-open-second.md")])
+
+    XCTAssertEqual(
+      hostRequests, 1,
+      "an external open behind a Settings-only window must materialize exactly one document host")
+  }
+
   /// Several URL events can arrive before SwiftUI attaches the newly requested
   /// root. They all belong to that one host; the coordinator must not request a
   /// second window during the attachment gap.
@@ -392,7 +448,7 @@ final class LaunchIntentTests: XCTestCase {
     var hostRequests = 0
     let coordinator = LaunchIntentCoordinator(
       focusedControllerProvider: { nil },
-      hasLiveApplicationWindow: { false },
+      hasLiveDocumentCapableWindow: { false },
       openExternalDocumentHost: {
         hostRequests += 1
         return true
@@ -415,7 +471,7 @@ final class LaunchIntentTests: XCTestCase {
     var hostRequests = 0
     let coordinator = LaunchIntentCoordinator(
       focusedControllerProvider: { nil },
-      hasLiveApplicationWindow: { true },
+      hasLiveDocumentCapableWindow: { true },
       openExternalDocumentHost: {
         hostRequests += 1
         return true
@@ -438,7 +494,7 @@ final class LaunchIntentTests: XCTestCase {
     var hostRequests = 0
     let coordinator = LaunchIntentCoordinator(
       focusedControllerProvider: { nil },
-      hasLiveApplicationWindow: { false },
+      hasLiveDocumentCapableWindow: { false },
       openExternalDocumentHost: {
         hostRequests += 1
         return false
