@@ -47,4 +47,52 @@ final class AppSupportLocationTests: XCTestCase {
 
     XCTAssertEqual(resolved?.path, NSHomeDirectory())
   }
+
+  func testXCTestDetectionAcceptsEverySupportedHostSignal() {
+    XCTAssertTrue(
+      AppSupportLocation.isRunningTests(
+        environment: ["XCTestConfigurationFilePath": "/tmp/test.xctestconfiguration"],
+        processName: "PensieveTests",
+        isXCTestRuntimeLoaded: false))
+    XCTAssertTrue(
+      AppSupportLocation.isRunningTests(
+        environment: [:], processName: "PensievePackageTests.xctest",
+        isXCTestRuntimeLoaded: false))
+    XCTAssertTrue(
+      AppSupportLocation.isRunningTests(
+        environment: [:], processName: "PensieveTests",
+        isXCTestRuntimeLoaded: true))
+    XCTAssertFalse(
+      AppSupportLocation.isRunningTests(
+        environment: [:], processName: "Pensieve", isXCTestRuntimeLoaded: false))
+  }
+
+  func testTheCurrentTestHostIsDetectedWithoutInjectedSignals() {
+    XCTAssertTrue(AppSupportLocation.isRunningTests())
+  }
+
+  func testRecoveryDefaultsToTemporaryStorageInsideATestProcess() {
+    let resolved = RecoveryStore.defaultDirectoryURL(
+      fileManager: .default, environment: [:], isTestProcess: true)
+    let production = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/Pensieve/Recovery", isDirectory: true)
+
+    XCTAssertTrue(resolved.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+    XCTAssertNotEqual(resolved.standardizedFileURL, production.standardizedFileURL)
+  }
+
+  func testExplicitSupportOverrideWinsInsideATestProcess() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pensieve-explicit-test-root-\(UUID().uuidString)", isDirectory: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+    let resolved = RecoveryStore.defaultDirectoryURL(
+      fileManager: .default,
+      environment: [AppSupportLocation.overrideEnvironmentKey: root.path],
+      isTestProcess: true)
+
+    XCTAssertEqual(
+      resolved.standardizedFileURL,
+      root.appendingPathComponent("Recovery", isDirectory: true).standardizedFileURL)
+  }
 }

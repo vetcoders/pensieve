@@ -283,6 +283,21 @@ Clarification (04.08, Monika — "they don't disappear without my decision"):
 - If the number of drafts ever needs to be surfaced, it is shown to the user as
   information — never acted on by deleting.
 
+Clarification (10.08, launcher pagination and test isolation):
+
+- **Five drafts per launcher page.** The Recovered Drafts section paginates its
+  presentation in groups of five and shows both the visible item range and the
+  page count. Previous/Next navigation keeps every unhandled draft reachable.
+  This is a UI bound only: it does not reintroduce a storage cap, retention, or
+  automatic deletion. If an action removes the last item on a page, the current
+  page is clamped to the new last page instead of leaving an empty surface.
+- **Tests fail closed outside production Recovery.** A test must inject its own
+  `RecoveryStore`; the shared/default fallback is nevertheless process-scoped
+  under the temporary directory whenever Pensieve is hosted by XCTest. An
+  explicit `PENSIEVE_SUPPORT_DIR` still takes precedence for canary runs. A
+  forgotten test dependency may therefore contaminate its own test process,
+  never `~/Library/Application Support/Pensieve/Recovery`.
+
 Clarification (05.08, after the file-backed half of bug I):
 
 - **"One buffer" includes a FILE-BACKED buffer.** A named document whose window

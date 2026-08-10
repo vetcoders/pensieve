@@ -41,4 +41,33 @@ enum AppSupportLocation {
     try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
     return root
   }
+
+  /// True when the current executable is an XCTest host.
+  ///
+  /// Tests occasionally reach a production singleton by mistake. That is a
+  /// test bug, but it must never turn into writes under the operator's real
+  /// Application Support directory. The checks intentionally overlap: SwiftPM
+  /// and Xcode do not expose exactly the same environment, while a loaded
+  /// XCTest runtime is the stable final signal for both.
+  static func isRunningTests(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    processName: String = ProcessInfo.processInfo.processName,
+    isXCTestRuntimeLoaded: Bool =
+      NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil
+  ) -> Bool {
+    environment["XCTestConfigurationFilePath"] != nil
+      || environment["XCTestBundlePath"] != nil
+      || processName.hasSuffix(".xctest")
+      || isXCTestRuntimeLoaded
+  }
+
+  /// Process-scoped fallback for a test that forgot to inject its own store.
+  /// Explicit `PENSIEVE_SUPPORT_DIR` still wins so canary runs can inspect one
+  /// known root after the suite exits.
+  static func testProcessRoot(fileManager: FileManager = .default) -> URL {
+    let root = fileManager.temporaryDirectory.appendingPathComponent(
+      "PensieveTests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    return root
+  }
 }

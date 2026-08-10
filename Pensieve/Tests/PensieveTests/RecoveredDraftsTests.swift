@@ -4,6 +4,40 @@ import XCTest
 
 @testable import Pensieve
 
+final class RecoveredDraftsPaginationTests: XCTestCase {
+  func testAFullPageContainsFiveDrafts() {
+    let pagination = RecoveredDraftsPagination(itemCount: 146, requestedPageIndex: 0)
+
+    XCTAssertEqual(pagination.pageCount, 30)
+    XCTAssertEqual(pagination.itemRange, 0..<5)
+    XCTAssertEqual(pagination.itemRangeLabel, "1–5 of 146")
+  }
+
+  func testTheLastPageContainsTheRemainder() {
+    let pagination = RecoveredDraftsPagination(itemCount: 146, requestedPageIndex: 29)
+
+    XCTAssertEqual(pagination.itemRange, 145..<146)
+    XCTAssertEqual(pagination.itemRangeLabel, "146–146 of 146")
+  }
+
+  func testARequestedPageIsClampedAfterDraftsAreRemoved() {
+    let pagination = RecoveredDraftsPagination(itemCount: 4, requestedPageIndex: 29)
+
+    XCTAssertEqual(pagination.pageIndex, 0)
+    XCTAssertEqual(pagination.pageCount, 1)
+    XCTAssertEqual(pagination.itemRange, 0..<4)
+  }
+
+  func testAnEmptyCollectionHasNoPagesOrRange() {
+    let pagination = RecoveredDraftsPagination(itemCount: 0, requestedPageIndex: 3)
+
+    XCTAssertEqual(pagination.pageIndex, 0)
+    XCTAssertEqual(pagination.pageCount, 0)
+    XCTAssertTrue(pagination.itemRange.isEmpty)
+    XCTAssertEqual(pagination.itemRangeLabel, "0 of 0")
+  }
+}
+
 /// W2-D: recovery stops being magic.
 ///
 /// Two properties are under test, both provable on the FILESYSTEM rather than

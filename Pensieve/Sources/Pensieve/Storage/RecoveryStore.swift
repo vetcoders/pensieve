@@ -180,9 +180,19 @@ final class RecoveryStore {
     directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("title")
   }
 
-  private static func defaultDirectoryURL(fileManager: FileManager) -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot(fileManager: fileManager) {
+  static func defaultDirectoryURL(
+    fileManager: FileManager,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    isTestProcess: Bool? = nil
+  ) -> URL {
+    if let overrideRoot = AppSupportLocation.overrideRoot(
+      environment: environment, fileManager: fileManager)
+    {
       return overrideRoot.appendingPathComponent("Recovery", isDirectory: true)
+    }
+    if isTestProcess ?? AppSupportLocation.isRunningTests(environment: environment) {
+      return AppSupportLocation.testProcessRoot(fileManager: fileManager)
+        .appendingPathComponent("Recovery", isDirectory: true)
     }
     let appSupport =
       fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first

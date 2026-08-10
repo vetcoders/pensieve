@@ -314,8 +314,42 @@ struct DocumentEmptyStateView: View {
 ///
 /// Deliberately quiet — it is a footnote under the empty state, and it renders
 /// nothing at all when there is no unhandled draft, which is the normal case.
+struct RecoveredDraftsPagination: Equatable {
+  static let pageSize = 5
+
+  let itemCount: Int
+  let pageIndex: Int
+
+  init(itemCount: Int, requestedPageIndex: Int) {
+    self.itemCount = max(0, itemCount)
+    let lastPageIndex = max(0, Self.pageCount(for: itemCount) - 1)
+    self.pageIndex = min(max(0, requestedPageIndex), lastPageIndex)
+  }
+
+  var pageCount: Int {
+    Self.pageCount(for: itemCount)
+  }
+
+  var itemRange: Range<Int> {
+    let lowerBound = pageIndex * Self.pageSize
+    let upperBound = min(lowerBound + Self.pageSize, itemCount)
+    return lowerBound..<upperBound
+  }
+
+  var itemRangeLabel: String {
+    guard !itemRange.isEmpty else { return "0 of 0" }
+    return "\(itemRange.lowerBound + 1)–\(itemRange.upperBound) of \(itemCount)"
+  }
+
+  private static func pageCount(for itemCount: Int) -> Int {
+    guard itemCount > 0 else { return 0 }
+    return (itemCount + pageSize - 1) / pageSize
+  }
+}
+
 struct RecoveredDraftsSection: View {
   @EnvironmentObject private var controller: AppController
+  @State private var requestedPageIndex = 0
   /// The launcher pane's own skin tokens. The section sits INSIDE the themed
   /// empty state, so a system colour here would reinstate exactly the grey card
   /// on a cream/ink pane the empty-state palette exists to prevent.
@@ -326,13 +360,50 @@ struct RecoveredDraftsSection: View {
     // "0 drafts" row would turn the ordinary launcher into a permanent crash
     // reminder.
     if !controller.recoveredDrafts.isEmpty {
+      let pagination = RecoveredDraftsPagination(
+        itemCount: controller.recoveredDrafts.count,
+        requestedPageIndex: requestedPageIndex)
       VStack(alignment: .leading, spacing: 8) {
-        Text("Recovered Drafts")
-          .font(.headline)
-          .foregroundStyle(Color(palette.secondaryText))
+        HStack {
+          Text("Recovered Drafts")
+            .font(.headline)
+            .foregroundStyle(Color(palette.secondaryText))
+          Spacer()
+          Text(pagination.itemRangeLabel)
+            .font(.caption)
+            .foregroundStyle(Color(palette.tertiaryText))
+            .accessibilityIdentifier("pensieve.recoveredDrafts.range")
+        }
 
-        ForEach(controller.recoveredDrafts) { draft in
+        ForEach(Array(controller.recoveredDrafts[pagination.itemRange])) { draft in
           RecoveredDraftRow(draft: draft, palette: palette)
+        }
+
+        if pagination.pageCount > 1 {
+          HStack(spacing: 8) {
+            Button("Previous") {
+              requestedPageIndex = max(0, pagination.pageIndex - 1)
+            }
+            .disabled(pagination.pageIndex == 0)
+            .accessibilityIdentifier("pensieve.recoveredDrafts.previousPage")
+
+            Spacer()
+
+            Text("Page \(pagination.pageIndex + 1) of \(pagination.pageCount)")
+              .font(.caption)
+              .foregroundStyle(Color(palette.secondaryText))
+              .accessibilityIdentifier("pensieve.recoveredDrafts.page")
+
+            Spacer()
+
+            Button("Next") {
+              requestedPageIndex = min(
+                pagination.pageCount - 1, pagination.pageIndex + 1)
+            }
+            .disabled(pagination.pageIndex == pagination.pageCount - 1)
+            .accessibilityIdentifier("pensieve.recoveredDrafts.nextPage")
+          }
+          .controlSize(.small)
         }
       }
       .padding(16)
@@ -342,6 +413,12 @@ struct RecoveredDraftsSection: View {
           .fill(Color(palette.keyCapFill))
       )
       .accessibilityIdentifier("pensieve.recoveredDrafts")
+      .onChange(of: controller.recoveredDrafts.count) { _, count in
+        requestedPageIndex =
+          RecoveredDraftsPagination(
+            itemCount: count, requestedPageIndex: requestedPageIndex
+          ).pageIndex
+      }
     }
   }
 }
