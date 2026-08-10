@@ -26,7 +26,10 @@ Pensieve follows macOS conventions but has its own model: **workspace + files + 
 
 ### `Cmd+T` — New Empty Tab
 
-Creates an empty, editable untitled/unsaved tab in the current window and moves focus to the editor. Does not create a file on disk. `Cmd+S` triggers the Save As flow for it.
+Creates an empty, editable untitled/unsaved tab in the current window and moves
+focus to the editor. Does not create a file on disk. `Cmd+S` triggers the Save
+As flow for it. `Cmd+N` invokes this same operation in v1 and therefore carries
+the same editability and focus contract.
 
 Clarifications (decisions 26.07/31.07, canon item 2):
 
@@ -129,7 +132,11 @@ the same atomic operation, so there is no window in which the file can go and
 be recreated. The `fileExists` check ahead of it is a fast path that chooses a
 human-readable message; deleting it would change wording, never whether the
 file comes back. Any future rewrite of the write layer must keep this
-property — a plain atomic write reintroduces the bug.
+property — a plain atomic write reintroduces the bug. Because the atomic swap
+publishes a new inode, Pensieve copies the existing file's filesystem metadata
+(mode, ownership, ACLs, extended attributes/Finder tags and creation metadata)
+onto the replacement before the swap while preserving the new content's
+modification time. Failure to preserve that metadata aborts before publication.
 
 **Integrated error and recovery behavior (10.08).** When the file is gone or an
 original write otherwise fails, the dirty buffer first enters the data-loss
@@ -365,12 +372,14 @@ Clarification (10.08, launcher pagination and test isolation):
   This is a UI bound only: it does not reintroduce a storage cap, retention, or
   automatic deletion. If an action removes the last item on a page, the current
   page is clamped to the new last page instead of leaving an empty surface.
-- **Tests fail closed outside production Recovery.** A test must inject its own
-  `RecoveryStore`; the shared/default fallback is nevertheless process-scoped
-  under the temporary directory whenever Pensieve is hosted by XCTest. An
+- **Tests fail closed outside production Application Support.** A test should
+  inject its own stores; every default fallback that otherwise derives
+  `~/Library/Application Support/Pensieve` — Recovery, workspace metadata, the
+  search index and document AI session state — is nevertheless process-scoped
+  under one temporary directory whenever Pensieve is hosted by XCTest. An
   explicit `PENSIEVE_SUPPORT_DIR` still takes precedence for canary runs. A
   forgotten test dependency may therefore contaminate its own test process,
-  never `~/Library/Application Support/Pensieve/Recovery`.
+  never the operator's production support directory.
 
 Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10: A):
 
@@ -385,12 +394,19 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   recovery fallback changes the condition from data loss to ordinary status.
 - **One live buffer owns exactly one recovery identity.** Repeated edits,
   debounce ticks, close flushes and quit flushes update that item in place.
-  Content equality is never used to collapse different buffers.
+  A rename/rekey of that same live buffer preserves the identity; replacing the
+  buffer with another document releases its claim so the launcher can offer the
+  emergency copy immediately. Content equality is never used to collapse
+  different buffers. A stale launcher row may not Save As or Discard an item
+  currently claimed by a live buffer.
 - **File-backed recovery is self-describing.** Its record persists the
   standardized original path in a `.source` sidecar. The launcher labels it
   **Unsaved changes — <filename>**, shows the full original path and timestamp,
   and states that this is an emergency copy. A file-backed recovery entry must
-  never masquerade as another ordinary `umowa.md`/`Untitled.md`.
+  never masquerade as another ordinary `umowa.md`/`Untitled.md`. Turning a
+  record into an ordinary untitled draft must remove the old source association
+  successfully before publishing its new payload; a stale sidecar must never
+  redirect unrelated text back to the previous file.
 - **Opening recovery never overwrites the original.** It opens a dirty recovered
   buffer, displays the original path, and waits for an explicit decision:
   **Save to Original / Save As… / Don't Save / Cancel**. Cmd+S on that buffer
@@ -401,7 +417,10 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   working set, persists any required file bookmark and adds it to native
   Recents, but does not open or select it in the launcher.
   Don't Save removes it only as a conscious rejection. Cancel and any failed
-  write leave both the buffer and recovery item intact.
+  write leave both the buffer and recovery item intact. If the filesystem
+  refuses to retire the recovery payload after Don't Save, that decision is not
+  complete: close/quit is vetoed, the buffer stays dirty and the recovery item
+  remains claimed for a safe retry instead of returning as a ghost on relaunch.
 - **An untouched empty draft closes silently.** A draft asks where to save only
   after it contains unsaved changes.
 - **Close and quit fail closed.** If an original-file write fails, Pensieve
@@ -410,10 +429,10 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   the buffer remains dirty, and the error explicitly says the only copy is
   still in memory. A teardown notification is only a final backstop; it is not
   allowed to be the first place a fallible user-content write is attempted.
-- **No test writes production recovery.** Tests inject an isolated
-  `RecoveryStore`; XCTest's default fallback is process-scoped under the
-  temporary directory. Runtime smoke uses its own staged identity and support
-  directory.
+- **No test writes production Application Support.** Tests inject isolated
+  stores; XCTest's shared fallback for Recovery, workspace metadata, index and
+  document AI state is process-scoped under one temporary directory. Runtime
+  smoke uses its own staged identity and support directory.
 
 The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
 source metadata across store reload, non-overwriting recovery open, explicit
@@ -476,7 +495,9 @@ Three rules follow, and each is pinned:
 2. **Dismissing the banner does not reset the condition.** The latch survives,
    so an identical failure repeating on the next autosave tick has nothing new
    to say and the banner the user put away stays away. Without this a full disk
-   would resurrect a dismissed banner every 1.5 seconds.
+   would resurrect a dismissed banner every 1.5 seconds. One original-write +
+   recovery-write attempt publishes one final compound failure identity; its
+   two internal errors must not alternate the surface back open.
 3. **A resolved loss that happens again IS news.** The dedupe is scoped to one
    unresolved condition, not to a message string forever, so the surface re-arms
    — dismissal included. A genuinely different failure arriving while the first
@@ -583,16 +604,25 @@ Close All must never cause silent data loss.
   does not exist for the app. Membership is asked of the filesystem (every volume
   has its own Trash, a sandboxed build a container-relative one), not matched
   against a hardcoded `~/.Trash`, so a directory merely NAMED `.Trash` is not one.
+  The fallback for a missing volume accepts only the real mount-root shape
+  `/Volumes/<volume>/.Trashes/<uid>/...`; a nested user folder with the same
+  component names is ordinary content.
   The rule holds at every point a file can become, or stay, an open document:
   - launch restore drops such an entry and its bookmark;
-  - a **running** app retires it on the next scan commit, whether Pensieve or
-    Finder did the trashing — the row leaves Open Files without waiting for a
-    relaunch;
+  - a **running** app retires a workspace file on the next watched scan commit.
+    An ad-hoc file outside every workspace root is reconciled when Pensieve
+    becomes active again (for example, after returning from Finder), so its row
+    also leaves Open Files without waiting for a relaunch;
   - opening one is refused with "<name> is in the Trash. Put it back to open it.",
     so no route (Recents, drag, a stale sidebar row) can re-add it;
   - selecting one refuses to put its content in the editor and retires the row;
   - after Pensieve's own **Move to Trash**, bookmarks are pruned by where they
-    LAND, which also covers every document inside a trashed folder.
+    LAND, which also covers every document inside a trashed folder. If the
+    selected buffer had already produced an emergency recovery copy, clearing
+    that buffer releases its live ownership claim but does not delete the copy:
+    the single recovery entry becomes immediately available for an explicit
+    Save / Save As / Don't Save decision instead of staying hidden until the
+    next process launch. It never recreates the trashed original automatically.
 
   A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
   mid-replacement, or on an unplugged volume) and only drops out of what a
@@ -616,7 +646,10 @@ Close All must never cause silent data loss.
   live tab chain across every window: a document of the removed root that a
   window still has open gets a file bookmark of its own, a document covered by a
   surviving root does not (its root already grants access), and a file that is in
-  neither source still loses its bookmark — nothing is resurrected.
+  neither source still loses its bookmark — nothing is resurrected. In the
+  sandboxed lane every freshly minted bookmark is resolved before old grants are
+  released, and the resolved security-scoped URL is the one activated; a plain
+  `DocumentRef` URL is not treated as if it carried a grant.
 - **Quit gives the working set a bounded durability flush.** Quit starts an
   explicit `cfprefsd` synchronization and waits for it for up to one second
   before continuing with the remaining drain phases. A normal flush is durable

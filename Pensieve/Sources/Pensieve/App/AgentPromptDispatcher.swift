@@ -1,50 +1,146 @@
 import Foundation
 
+enum AgentLaunchVerification: Equatable, Sendable {
+  /// The runtime metadata recorded a positive worker PID. This proves that the
+  /// detached launcher spawned a worker; it does not prove that worker is
+  /// still alive when Pensieve reads the receipt.
+  case workerSpawnRecorded
+  /// Vibecrafted exited successfully and returned a run ID, but the detached
+  /// worker's spawn record did not appear within Pensieve's bounded wait.
+  case acceptedUnconfirmed
+  /// The launcher exited non-zero or returned an invalid success receipt.
+  case rejected
+}
+
 struct AgentDispatchMetadata: Equatable, Sendable {
   let runID: String?
   let reportPath: String?
+  /// Canonical `agent:` token from the launch receipt. This is the authority
+  /// for `vibecrafted <agent> observe`; it may differ from positional input
+  /// (and a default swarm has no positional input at all).
+  let observeAgent: String?
   let exitCode: Int32
   let output: String
+  let launchVerification: AgentLaunchVerification
+
+  init(
+    runID: String?,
+    reportPath: String?,
+    exitCode: Int32,
+    output: String,
+    observeAgent: String? = nil,
+    launchVerification: AgentLaunchVerification? = nil
+  ) {
+    self.runID = runID
+    self.reportPath = reportPath
+    self.observeAgent = observeAgent
+    self.exitCode = exitCode
+    self.output = output
+    // Existing test doubles construct successful metadata directly. Treat
+    // those explicit successes as spawn-confirmed unless they opt into the
+    // accepted-but-unconfirmed state. Parsed launcher output starts in the
+    // unconfirmed state below and is promoted only after metadata inspection.
+    self.launchVerification =
+      launchVerification
+      ?? (exitCode == 0 && runID != nil
+        ? .workerSpawnRecorded : .rejected)
+  }
 
   var statusLine: String {
-    if exitCode != 0 {
-      let prefix = "Dispatch failed (exit \(exitCode))"
+    if launchVerification == .rejected {
+      let prefix = exitCode == 0 ? "Dispatch rejected" : "Dispatch failed (exit \(exitCode))"
       guard let detail = Self.failureDetail(in: output) else { return prefix }
       return "\(prefix): \(detail)"
     }
 
+    let prefix =
+      launchVerification == .acceptedUnconfirmed
+      ? "Run accepted (launch unconfirmed)"
+      : "Run started"
     switch (runID, reportPath) {
     case (let runID?, let reportPath?):
-      return "Run started: \(runID) | \(reportPath)"
+      return "\(prefix): \(runID) | \(reportPath)"
     case (let runID?, nil):
-      return "Run started: \(runID)"
+      return "\(prefix): \(runID)"
     case (nil, let reportPath?):
-      return "Run started: \(reportPath)"
+      return "\(prefix): \(reportPath)"
     case (nil, nil):
-      return "Run started"
+      return prefix
     }
   }
 
   static func parse(output: String, exitCode: Int32) -> AgentDispatchMetadata {
-    AgentDispatchMetadata(
-      runID: firstMatch(
-        in: output,
-        patterns: [
-          #"(?m)^\s*run_id:\s*([^\s]+)\s*$"#,
-          #"(?m)^\s*Run ID:\s*([^\s]+)\s*$"#,
-        ]),
-      reportPath: firstMatch(
-        in: output,
-        patterns: [
-          #"(?m)^\s*Report path:\s*(\S+)\s*$"#,
-          #"(?m)^\s*report_path:\s*(\S+)\s*$"#,
-          // Last-resort fallback: an absolute local path; the lookbehind keeps it from
-          // matching inside URLs ("https://host/reports/x.md") or protocol-relative refs.
-          #"(?<![/:])(/[^/\s][^\s]*/reports/[^\s]+\.md)"#,
-        ]),
+    let runID = firstMatch(
+      in: output,
+      patterns: [
+        #"(?m)^\s*run_id:\s*([^\s]+)\s*$"#,
+        #"(?m)^\s*Run ID:\s*([^\s]+)\s*$"#,
+      ])
+    let reportPath = firstMatch(
+      in: output,
+      patterns: [
+        #"(?m)^\s*report:\s*(\S+)\s*$"#,
+        #"(?m)^\s*Report path:\s*(\S+)\s*$"#,
+        #"(?m)^\s*report_path:\s*(\S+)\s*$"#,
+        // Last-resort fallback: an absolute local path; the lookbehind keeps it from
+        // matching inside URLs ("https://host/reports/x.md") or protocol-relative refs.
+        #"(?<![/:])(/[^/\s][^\s]*/reports/[^\s]+\.md)"#,
+      ])
+    let observeAgent = firstMatch(
+      in: output,
+      patterns: [
+        // The value is later composed into a Terminal command. Parse only the
+        // CLI's shell-safe agent-token alphabet; malformed receipt values fail
+        // closed and simply omit the optional status action.
+        #"(?m)^\s*agent:\s*([A-Za-z0-9._-]+)\s*$"#
+      ])
+    return AgentDispatchMetadata(
+      runID: runID,
+      reportPath: reportPath,
       exitCode: exitCode,
-      output: output
+      output: output,
+      observeAgent: observeAgent,
+      launchVerification: exitCode == 0 && runID != nil ? .acceptedUnconfirmed : .rejected
     )
+  }
+
+  func classified(workerSpawnRecorded: Bool) -> AgentDispatchMetadata {
+    guard exitCode == 0 else {
+      return replacingVerification(with: .rejected)
+    }
+    guard let runID else {
+      return replacingVerification(
+        with: .rejected,
+        appending: "Vibecrafted exited successfully without a run ID.")
+    }
+    guard workerSpawnRecorded else {
+      return replacingVerification(
+        with: .acceptedUnconfirmed,
+        appending:
+          "Vibecrafted accepted run \(runID), but its worker spawn record did not appear "
+          + "within the confirmation window. The detached run may still start "
+          + "or already be running.")
+    }
+    return replacingVerification(with: .workerSpawnRecorded)
+  }
+
+  private func replacingVerification(
+    with launchVerification: AgentLaunchVerification,
+    appending detail: String? = nil
+  ) -> AgentDispatchMetadata {
+    let combinedOutput: String
+    if let detail {
+      combinedOutput = output.isEmpty ? detail : output + "\n" + detail
+    } else {
+      combinedOutput = output
+    }
+    return AgentDispatchMetadata(
+      runID: runID,
+      reportPath: reportPath,
+      exitCode: exitCode,
+      output: combinedOutput,
+      observeAgent: observeAgent,
+      launchVerification: launchVerification)
   }
 
   private static func firstMatch(in text: String, patterns: [String]) -> String? {
@@ -127,7 +223,8 @@ enum AgentPromptLauncherError: LocalizedError {
 
 final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
-  static let workerProofTimeout: TimeInterval = 3
+  static let vibecraftedHomeEnvironmentKey = "VIBECRAFTED_HOME"
+  static let workerSpawnRecordTimeout: TimeInterval = 3
   static let uvToolExecutableRelativePath =
     ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
   static let defaultExecutableRelativePath =
@@ -185,19 +282,34 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     return environment
   }
 
-  static func runtimeMetadataURL(runID: String, output: String, home: URL) -> URL {
+  static func runtimeMetadataURL(
+    runID: String,
+    output: String,
+    home: URL,
+    environment: [String: String] = [:]
+  ) -> URL {
     if let transcriptPath = receiptValue(label: "transcript", in: output),
       transcriptPath.hasPrefix("/")
     {
       return URL(fileURLWithPath: transcriptPath).deletingLastPathComponent()
         .appendingPathComponent("meta.json")
     }
-    return home.appendingPathComponent(".vibecrafted/control_plane/runtime_runs", isDirectory: true)
+    let configuredHome = environment[vibecraftedHomeEnvironmentKey]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let runtimeHome: URL
+    if let configuredHome, !configuredHome.isEmpty {
+      runtimeHome = URL(
+        fileURLWithPath: (configuredHome as NSString).expandingTildeInPath,
+        isDirectory: true)
+    } else {
+      runtimeHome = home.appendingPathComponent(".vibecrafted", isDirectory: true)
+    }
+    return runtimeHome.appendingPathComponent("control_plane/runtime_runs", isDirectory: true)
       .appendingPathComponent(runID, isDirectory: true)
       .appendingPathComponent("meta.json")
   }
 
-  static func workerProofExists(at metadataURL: URL) -> Bool {
+  static func workerSpawnRecorded(at metadataURL: URL) -> Bool {
     guard
       let data = try? Data(contentsOf: metadataURL),
       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -223,10 +335,10 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     return String(output[valueRange])
   }
 
-  private static func waitForWorkerProof(at metadataURL: URL) -> Bool {
-    let deadline = Date().addingTimeInterval(workerProofTimeout)
+  private static func waitForWorkerSpawnRecord(at metadataURL: URL) -> Bool {
+    let deadline = Date().addingTimeInterval(workerSpawnRecordTimeout)
     repeat {
-      if workerProofExists(at: metadataURL) { return true }
+      if workerSpawnRecorded(at: metadataURL) { return true }
       if Date() >= deadline { return false }
       Thread.sleep(forTimeInterval: 0.05)
     } while true
@@ -256,9 +368,10 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     process.executableURL = URL(fileURLWithPath: executablePath)
     process.arguments = Self.arguments(workflow: workflow, agents: agents, payload: payload)
     process.currentDirectoryURL = workingDirectoryURL
-    process.environment = Self.launchEnvironment(
+    let launchEnvironment = Self.launchEnvironment(
       base: ProcessInfo.processInfo.environment,
       home: FileManager.default.homeDirectoryForCurrentUser)
+    process.environment = launchEnvironment
 
     let stdout = Pipe()
     let stderr = Pipe()
@@ -283,22 +396,16 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
 
     let output = buffer.text()
     let metadata = AgentDispatchMetadata.parse(output: output, exitCode: process.terminationStatus)
-    guard metadata.exitCode == 0 else { return metadata }
-    guard let runID = metadata.runID else {
-      return AgentDispatchMetadata.parse(
-        output: output + "\nVibecrafted exited successfully without a run ID.",
-        exitCode: 1)
+    guard metadata.exitCode == 0, let runID = metadata.runID else {
+      return metadata.classified(workerSpawnRecorded: false)
     }
 
     let metadataURL = Self.runtimeMetadataURL(
-      runID: runID, output: output, home: FileManager.default.homeDirectoryForCurrentUser)
-    guard Self.waitForWorkerProof(at: metadataURL) else {
-      return AgentDispatchMetadata.parse(
-        output: output
-          + "\nVibecrafted returned a receipt for \(runID), but no worker proof appeared.",
-        exitCode: 1)
-    }
-    return metadata
+      runID: runID,
+      output: output,
+      home: FileManager.default.homeDirectoryForCurrentUser,
+      environment: launchEnvironment)
+    return metadata.classified(workerSpawnRecorded: Self.waitForWorkerSpawnRecord(at: metadataURL))
   }
 }
 

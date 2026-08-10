@@ -959,6 +959,240 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertNil(appState.documentSession.recoveryID)
   }
 
+  // MARK: - Claim handoff when a buffer is replaced
+
+  @MainActor
+  func testSwitchingAfterRecoveryFallbackReleasesTheAbandonedDraftClaim() throws {
+    let folder = try makeTemporaryFolder()
+    let originalURL = folder.appendingPathComponent("original.md")
+    let nextURL = folder.appendingPathComponent("next.md")
+    try "old bytes".write(to: originalURL, atomically: true, encoding: .utf8)
+    try "next bytes".write(to: nextURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: true),
+      replaceExistingDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: originalURL.standardizedFileURL), text: "old bytes")
+    appState.activeDocumentText = "edit protected by recovery"
+    appState.documentSession.isDirty = true
+
+    documentStore.load(
+      ref: DocumentRef(id: nextURL.standardizedFileURL), into: appState)
+
+    let abandoned = try XCTUnwrap(store.loadDrafts().first)
+    XCTAssertEqual(appState.documentSession.url, nextURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "next bytes")
+    XCTAssertFalse(
+      store.isDraftOpen(id: abandoned.id),
+      "the replaced buffer kept its recovery claim after it stopped existing")
+    XCTAssertEqual(documentStore.recoveredDrafts().map(\.id), [abandoned.id])
+  }
+
+  @MainActor
+  func testFailedSynchronousSwitchKeepsTheSurvivingBuffersDraftClaimed() throws {
+    let folder = try makeTemporaryFolder()
+    let originalURL = folder.appendingPathComponent("original.md")
+    let missingURL = folder.appendingPathComponent("missing.md")
+    try "old bytes".write(to: originalURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: true),
+      replaceExistingDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: originalURL.standardizedFileURL), text: "old bytes")
+    appState.activeDocumentText = "still-live edit"
+    appState.documentSession.isDirty = true
+
+    documentStore.load(
+      ref: DocumentRef(id: missingURL.standardizedFileURL), into: appState)
+
+    let surviving = try XCTUnwrap(store.loadDrafts().first)
+    XCTAssertEqual(appState.documentSession.url, originalURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "still-live edit")
+    XCTAssertEqual(appState.documentSession.recoveryID, surviving.id)
+    XCTAssertTrue(
+      store.isDraftOpen(id: surviving.id),
+      "a failed replacement released the claim of the buffer still on screen")
+    XCTAssertTrue(documentStore.recoveredDrafts().isEmpty)
+  }
+
+  @MainActor
+  func testRekeyingALiveBufferPreservesOneRecoveryIdentity() throws {
+    let folder = try makeTemporaryFolder()
+    let originalURL = folder.appendingPathComponent("before.md")
+    let movedURL = folder.appendingPathComponent("after.md")
+    try "on disk".write(to: originalURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: originalURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "unsaved edit"
+    appState.documentSession.isDirty = true
+    XCTAssertTrue(
+      documentStore.savePendingChangesOnClose(
+        appState: appState, releasesDraftClaim: false))
+    let first = try XCTUnwrap(store.loadDrafts().first)
+
+    // Rename/move re-keys this SAME live buffer through the document setter.
+    appState.documentSession.document = DocumentRef(id: movedURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.recoveryID, first.id)
+    XCTAssertTrue(
+      documentStore.savePendingChangesOnClose(
+        appState: appState, releasesDraftClaim: false))
+
+    let drafts = store.loadDrafts()
+    XCTAssertEqual(drafts.map(\.id), [first.id])
+    XCTAssertEqual(drafts.first?.sourceURL, movedURL.standardizedFileURL)
+    XCTAssertTrue(store.isDraftOpen(id: first.id))
+  }
+
+  @MainActor
+  func testStaleLauncherCannotSaveAsADraftClaimedByAnotherWindow() throws {
+    let folder = try makeTemporaryFolder()
+    let targetURL = folder.appendingPathComponent("must-not-exist.md")
+    let store = try makeRecoveryStore(in: folder)
+    let draft = try seedDraft(
+      in: store, text: "live recovered work", ageInDays: 0, keepOpen: true)
+    var pickerCalls = 0
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: store,
+      savePanelURLProvider: { _ in
+        pickerCalls += 1
+        return targetURL
+      })
+    let staleLauncher = AppState()
+
+    XCTAssertNil(documentStore.saveRecoveredDraftAs(draft, into: staleLauncher))
+
+    XCTAssertEqual(pickerCalls, 0, "the stale launcher reached a destructive save panel")
+    XCTAssertFalse(fileExists(targetURL))
+    XCTAssertTrue(fileExists(draft.url))
+    XCTAssertTrue(store.isDraftOpen(id: draft.id))
+  }
+
+  @MainActor
+  func testStaleLauncherCannotDiscardADraftClaimedByAnotherWindow() throws {
+    let store = try makeRecoveryStore()
+    let draft = try seedDraft(
+      in: store, text: "live recovered work", ageInDays: 0, keepOpen: true)
+    let documentStore = makeTestDocumentStore(recoveryStore: store)
+
+    XCTAssertFalse(documentStore.discardRecoveredDraft(draft))
+
+    XCTAssertTrue(fileExists(draft.url))
+    XCTAssertTrue(store.isDraftOpen(id: draft.id))
+  }
+
+  func testUntitledRewriteFailsClosedWhenAStaleSourceAssociationCannotBeRemoved() throws {
+    let folder = try makeTemporaryFolder()
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let sourceURL = folder.appendingPathComponent("source.md")
+    let id = UUID()
+    let store = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "source" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    _ = try store.saveDraft(
+      id: id, title: "Unsaved changes — source.md", text: "old protected text",
+      sourceURL: sourceURL)
+    store.markDraftClosed(id: id)
+
+    XCTAssertThrowsError(
+      try store.saveDraft(id: id, title: "Untitled.md", text: "unrelated untitled text"))
+
+    let surviving = try XCTUnwrap(store.loadDrafts().first)
+    XCTAssertEqual(surviving.id, id)
+    XCTAssertEqual(surviving.text, "old protected text")
+    XCTAssertEqual(surviving.sourceURL, sourceURL.standardizedFileURL)
+  }
+
+  func testDeleteDraftFailureKeepsTheVisiblePayloadClaimAndSidecars() throws {
+    let folder = try makeTemporaryFolder()
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let sourceURL = folder.appendingPathComponent("source.md")
+    let id = UUID()
+    let payloadURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".md")
+    let titleURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".title")
+    let sourceSidecarURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".source")
+    let store = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    _ = try store.saveDraft(
+      id: id,
+      title: "source.md",
+      text: "protected recovery bytes",
+      sourceURL: sourceURL)
+
+    XCTAssertTrue(fileExists(payloadURL))
+    XCTAssertTrue(fileExists(titleURL))
+    XCTAssertTrue(fileExists(sourceSidecarURL))
+
+    XCTAssertFalse(store.deleteDraft(id: id))
+
+    XCTAssertTrue(fileExists(payloadURL))
+    XCTAssertTrue(fileExists(titleURL))
+    XCTAssertTrue(fileExists(sourceSidecarURL))
+    XCTAssertTrue(store.isDraftOpen(id: id))
+    XCTAssertEqual(store.loadDrafts().map(\.id), [id])
+  }
+
+  func testDeleteDraftSuccessRetiresTheVisibleDraftEvenWhenSidecarCleanupFails() throws {
+    let folder = try makeTemporaryFolder()
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let sourceURL = folder.appendingPathComponent("source.md")
+    let id = UUID()
+    let payloadURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".md")
+    let titleURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".title")
+    let sourceSidecarURL = recoveryDirectory.appendingPathComponent(id.uuidString + ".source")
+    let store = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "title" || url.pathExtension == "source" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    _ = try store.saveDraft(
+      id: id,
+      title: "source.md",
+      text: "protected recovery bytes",
+      sourceURL: sourceURL)
+
+    XCTAssertTrue(fileExists(payloadURL))
+    XCTAssertTrue(fileExists(titleURL))
+    XCTAssertTrue(fileExists(sourceSidecarURL))
+
+    XCTAssertTrue(store.deleteDraft(id: id))
+
+    XCTAssertFalse(fileExists(payloadURL))
+    XCTAssertTrue(fileExists(titleURL))
+    XCTAssertTrue(fileExists(sourceSidecarURL))
+    XCTAssertFalse(store.isDraftOpen(id: id))
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+  }
+
   // MARK: - Launcher model
 
   @MainActor

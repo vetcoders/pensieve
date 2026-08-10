@@ -168,9 +168,11 @@ table above and decide explicitly for each one. In particular:
   the two must stay in step.
 - **Adding persistence?** Key it by `persistentID`, not by URL. Every new
   URL-keyed store makes the eventual consolidation more expensive.
-- **Touching `DocumentStore.swift`?** It has 20 direct and 56 transitive
-  consumers. Run `loct impact Pensieve/Sources/Pensieve/Storage/DocumentStore.swift`
-  before changing a signature.
+- **Touching `DocumentStore.swift`?** It is a high-fan-out hub and its consumer
+  count changes as the app evolves. Run
+  `loct impact Pensieve/Sources/Pensieve/Storage/DocumentStore.swift` against
+  the current tree before changing a signature; do not rely on a historical
+  count copied into documentation.
 
 ---
 

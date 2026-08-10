@@ -195,6 +195,124 @@ final class WindowErrorSurfaceTests: XCTestCase {
       "dismissing the banner made the app forget the work is still unsafe")
   }
 
+  /// A file-backed unattended save has two destinations: the original and its
+  /// emergency recovery copy. When both fail, the user must see ONE stable
+  /// condition. Publishing the original failure first and the compound failure
+  /// second makes an identical retry look different and reopens a banner the
+  /// user just dismissed.
+  @MainActor
+  func testDismissedCompoundAutosaveFailureStaysDismissedAcrossAnotherEdit() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("umowa.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let appState = AppState()
+    var writeAttempts = 0
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: try makeUnwritableRecoveryStore(in: folder),
+      replaceExistingDocument: { _, _ in
+        writeAttempts += 1
+        throw CocoaError(.fileWriteNoPermission)
+      })
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+
+    appState.activeDocumentText = "first unsafe edit"
+    store.documentDidChange(appState: appState)
+    try await waitUntil {
+      appState.unresolvedDataLoss?.message.contains("Could not write recovery copy") == true
+    }
+    let stableFailure = try XCTUnwrap(appState.unresolvedDataLoss)
+    appState.dismissVisibleError()
+    XCTAssertEqual(WindowErrorSurface.resolve(for: appState.currentError), .none)
+
+    appState.activeDocumentText = "second unsafe edit"
+    store.documentDidChange(appState: appState)
+    try await waitUntil { writeAttempts >= 2 }
+
+    XCTAssertEqual(
+      appState.unresolvedDataLoss, stableFailure,
+      "an identical compound failure changed identity between autosave ticks")
+    XCTAssertEqual(
+      WindowErrorSurface.resolve(for: appState.currentError), .none,
+      "an identical compound retry resurrected the dismissed banner")
+  }
+
+  /// Choosing Save in an auto-save-OFF close asks for the ORIGINAL write. A
+  /// successful recovery fallback protects the bytes, but it must not pretend
+  /// that request succeeded or let the window disappear over a stale file.
+  @MainActor
+  func testExplicitCloseSaveFallsBackToRecoveryButStillVetoesTheClose() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("explicit-save.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
+    let store = makeTestDocumentStore(
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "protected edit"
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      store.finishClose(
+        decision: .confirm(.savePathed), response: .save, appState: appState))
+
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.text, "protected edit")
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "on disk")
+    XCTAssertEqual(recoveryStore.loadDrafts().map(\.text), ["protected edit"])
+    XCTAssertNil(appState.unresolvedDataLoss)
+    XCTAssertEqual(appState.currentError?.severity, .status)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertTrue(appState.currentError?.message.contains("original file was not overwritten") == true)
+  }
+
+  /// The explicit close route used to publish original failure X and recovery
+  /// failure Y separately. Retrying the same Save therefore re-armed a dismissed
+  /// banner. It now shares the same single compound identity as unattended save.
+  @MainActor
+  func testDismissedCompoundExplicitCloseFailureStaysDismissedAcrossRetry() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("explicit-both-fail.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let store = makeTestDocumentStore(
+      recoveryStore: try makeUnwritableRecoveryStore(in: folder),
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "memory only"
+    appState.documentSession.isDirty = true
+
+    XCTAssertFalse(
+      store.finishClose(
+        decision: .confirm(.savePathed), response: .save, appState: appState))
+    let stableFailure = try XCTUnwrap(appState.unresolvedDataLoss)
+    XCTAssertTrue(stableFailure.message.contains("Could not save explicit-both-fail.md"))
+    XCTAssertTrue(stableFailure.message.contains("Could not write recovery copy"))
+    appState.dismissVisibleError()
+    XCTAssertEqual(WindowErrorSurface.resolve(for: appState.currentError), .none)
+
+    XCTAssertFalse(
+      store.finishClose(
+        decision: .confirm(.savePathed), response: .save, appState: appState))
+
+    XCTAssertEqual(appState.unresolvedDataLoss, stableFailure)
+    XCTAssertEqual(
+      WindowErrorSurface.resolve(for: appState.currentError), .none,
+      "an identical explicit retry resurrected the dismissed compound failure")
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+  }
+
   /// RULE 3 — once the loss is RESOLVED, the same problem happening again is
   /// news, and the window says so. This is the boundary of rule 2: the dedupe
   /// must be scoped to one unresolved condition, not to a message string
@@ -302,6 +420,19 @@ final class WindowErrorSurfaceTests: XCTestCase {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
     return folder
+  }
+
+  @MainActor
+  private func waitUntil(
+    timeout: TimeInterval = 2,
+    condition: @escaping @MainActor () -> Bool
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if condition() { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("Timed out waiting for condition")
   }
 
   @MainActor

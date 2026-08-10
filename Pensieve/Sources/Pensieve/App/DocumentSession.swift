@@ -96,14 +96,13 @@ struct DocumentSession: Equatable {
     }
     set {
       kind = newValue.map(Kind.fileBacked) ?? .empty
-      // A new document is a new identity, so it inherits nothing: keeping the
-      // previous buffer's recovery ID here would let this session's next stash
-      // overwrite a draft that belongs to work the user has not decided about.
-      // The two callers that PUBLISH the current buffer under a path — `saveAs`
-      // and `saveExisting` — retire their own draft explicitly before they get
-      // here, which is why dropping the association is safe rather than leaky.
-      storedRecoveryID = nil
-      storedRecoverySourceURL = nil
+      // Assigning a document does NOT necessarily replace the buffer. Rename
+      // and move re-key the SAME live buffer through this setter; dropping its
+      // recovery ID there strands the old claimed draft and lets the next tick
+      // mint a second one. Real buffer replacements use `load`,
+      // `beginLoading`, `createUntitled`, `restoreUntitled`, or `clear`, all of
+      // which reset the association explicitly. Successful saves retire it via
+      // `retireRecoveryAssociation()` after the recovery file is deleted.
     }
   }
 
@@ -224,6 +223,13 @@ struct DocumentSession: Equatable {
     self.storedRecoverySourceURL = nil
     self.text = ""
     self.isDirty = false
+  }
+
+  /// The current buffer reached its intended durable destination, so its
+  /// emergency recovery record no longer belongs to it.
+  mutating func retireRecoveryAssociation() {
+    storedRecoveryID = nil
+    storedRecoverySourceURL = nil
   }
 
   mutating func createUntitled(title: String = "Untitled.md") {

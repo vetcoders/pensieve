@@ -63,6 +63,11 @@ final class AppController: ObservableObject {
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
   private let confirmDiscardDraft: DraftDiscardConfirmation
+  /// Finder can move an ad-hoc working-set file to Trash while no watched
+  /// workspace root covers it. Reconcile when Pensieve becomes active again;
+  /// the publisher is process-wide, but each window sees the same shared
+  /// WorkspaceStore and subsequent passes are harmless no-ops.
+  private var appActivationCancellable: AnyCancellable?
   /// Unhandled crash drafts, newest first — the model behind the launcher's
   /// "Recovered Drafts" section. Empty means the section is not shown at all.
   @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
@@ -207,6 +212,14 @@ final class AppController: ObservableObject {
     self.confirmDiscardDraft = confirmDiscardDraft
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
+    }
+    self.appActivationCancellable = NotificationCenter.default.publisher(
+      for: NSApplication.didBecomeActiveNotification
+    ).sink { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.folderManager.reconcileExternalWorkingSetChanges(into: self.appState)
+      }
     }
   }
 
@@ -565,6 +578,7 @@ final class AppController: ObservableObject {
       switch outcome {
       case .success(let imported):
         guard documentStore.prepareForDocumentSwitch(appState: appState) else { return }
+        documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
         appState.selectedDocumentID = nil
         appState.documentSession.restoreUntitled(
           title: imported.suggestedFileName,
@@ -650,6 +664,7 @@ final class AppController: ObservableObject {
     let targetURL = availableSiblingURL(
       for: directoryURL.appendingPathComponent("Untitled").appendingPathExtension("md")
     )
+    documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
     appState.documentSession.createUntitled(title: targetURL.lastPathComponent)
     appState.selectedDocumentID = nil
     appState.lastError = nil
@@ -852,8 +867,11 @@ final class AppController: ObservableObject {
 
   /// Phase-2 apply for a deferred multi-window pass: performs the destructive
   /// step phase 1 deferred for this window — dropping an untitled draft the user
-  /// chose to Discard and marking it clean. `.settled` is a no-op.
-  func applyDeferredDirtySessionResolution(_ resolution: DocumentStore.DirtySessionResolution) {
+  /// chose to Discard and marking it clean. `.settled` is a no-op. Returns false
+  /// if the recovery payload could not be retired, which vetoes the teardown.
+  func applyDeferredDirtySessionResolution(
+    _ resolution: DocumentStore.DirtySessionResolution
+  ) -> Bool {
     documentStore.applyDeferredDirtySessionResolution(resolution, appState: appState)
   }
 
@@ -881,6 +899,10 @@ final class AppController: ObservableObject {
     //   resurrects and no stale `isDirty` trips the teardown save hook, THEN
     //   close the windows. No explicit per-window clear is needed: closing a
     //   window discards its `AppState` (and thus its session) outright.
+    //   Recovery retirement is the remaining fallible apply step. If it fails,
+    //   stop before closing any window; choices already applied earlier in this
+    //   phase remain conscious Discards, while the failed owner stays dirty and
+    //   recoverable rather than disappearing behind a false success.
     //
     // DELIBERATE DIVERGENCE from the conscious-close work landing in this same
     // stack: the Save/Don't Save/Cancel SHEET (`closeActiveDocument`,
@@ -926,7 +948,12 @@ final class AppController: ObservableObject {
     }
 
     for (owner, resolution) in deferred {
-      owner.applyDeferredDirtySessionResolution(resolution)
+      guard owner.applyDeferredDirtySessionResolution(resolution) else {
+        // A recorded Discard still has one fallible step: retiring its durable
+        // recovery payload. If that fails, keep every window alive rather than
+        // turning a failed cleanup into an apparent successful close.
+        return
+      }
     }
     // Phase 2 also retires the FILES from the working set, for the same reason
     // the single-row close does: this affordance empties the Open Files list,
@@ -939,7 +966,7 @@ final class AppController: ObservableObject {
     documentWindowRegistry.closeAllDocumentWindows()
   }
 
-  /// ⌘N / "New File…".
+  /// ⌘N / "New File".
   ///
   /// A window holding LIVE WORK is spoken for — the first term of
   /// `routesToOwnTab`, and the reason ⌘O on such a window opens a tab instead of
@@ -1075,7 +1102,9 @@ final class AppController: ObservableObject {
     deferred.append((self, ownResolution))
 
     for (controller, resolution) in deferred {
-      controller.applyDeferredDirtySessionResolution(resolution)
+      guard controller.applyDeferredDirtySessionResolution(resolution) else {
+        return false
+      }
     }
     // This pass has SETTLED, so the AppKit terminate hook must not run a second
     // one. ⌘Q reaches that hook through its own `NSApplication.terminate(_:)`
@@ -1296,7 +1325,11 @@ final class AppController: ObservableObject {
   @discardableResult
   func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
     guard confirmDiscardDraft(draft) else { return false }
-    documentStore.discardRecoveredDraft(draft)
+    guard documentStore.discardRecoveredDraft(draft) else {
+      appState.lastError = "This recovered draft is already open in another window."
+      refreshRecoveredDrafts()
+      return false
+    }
     refreshRecoveredDrafts()
     return true
   }
@@ -1617,10 +1650,18 @@ final class AppController: ObservableObject {
     transcriptionService: TranscriptionService,
     onSuccess: (@MainActor @Sendable () -> Void)?
   ) {
-    if metadata.exitCode == 0 {
+    switch metadata.launchVerification {
+    case .workerSpawnRecorded:
       onSuccess?()
       appState.lastError = nil
-    } else {
+
+    case .acceptedUnconfirmed:
+      // The detached run may already be alive. Keep the dictated prompt so a
+      // bounded proof timeout cannot erase the user's only editable copy, but
+      // do not present the accepted receipt as an application error either.
+      appState.lastError = nil
+
+    case .rejected:
       appState.lastError = metadata.statusLine
     }
     transcriptionService.updateDispatchStatus(metadata.statusLine)
@@ -1730,16 +1771,23 @@ final class AppController: ObservableObject {
   }
 
   /// Outcome of a document dispatch surfaced to the dispatch sheet for an
-  /// explicit, unmissable in-app launch receipt. A successful receipt means
-  /// the detached worker started; it is not evidence that the worker finished.
+  /// explicit, unmissable in-app launch receipt. A spawn record proves that
+  /// the detached launcher created a worker, not that the worker is still
+  /// alive. A successful launcher receipt without that bounded proof remains
+  /// inspectable and must never be rewritten as a failed launch.
   enum DocumentDispatchOutcome: Sendable {
-    case success(runID: String?, reportPath: String?, statusLine: String)
+    case success(
+      runID: String?, reportPath: String?, observeAgent: String?, statusLine: String)
+    case acceptedUnconfirmed(
+      runID: String, reportPath: String?, observeAgent: String?, statusLine: String)
+    case rejected(
+      message: String, runID: String?, reportPath: String?, observeAgent: String?)
     case failure(message: String)
   }
 
-  /// The ONLY UI → launch path: headless dispatch of a confirmed intent via
-  /// the canonical uv-core entry, which prints a parseable launch receipt
-  /// (run_id / report path) and detaches. Called exclusively by the gateway
+  /// The canonical document-sheet → launch path: headless dispatch of a
+  /// confirmed intent via the canonical uv-core entry, which prints a parseable
+  /// launch receipt (run_id / agent / report path) and detaches. Called by the gateway
   /// sheet's Dispatch button; the sheet shows "Run started" from the returned
   /// outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
   /// values; the payload comes from the intent's subject snapshot. Terminal
@@ -1801,18 +1849,50 @@ final class AppController: ObservableObject {
           workflow: workflow, agents: agents,
           payload: payload, workingDirectoryURL: rootURL)
       }.value
-      guard metadata.exitCode == 0 else {
+      switch metadata.launchVerification {
+      case .rejected:
         appState.lastError = metadata.statusLine
         transcriptionService.updateDispatchStatus(metadata.statusLine)
-        return .failure(message: metadata.statusLine)
+        return .rejected(
+          message: metadata.statusLine,
+          runID: metadata.runID,
+          reportPath: metadata.reportPath,
+          observeAgent: metadata.observeAgent)
+
+      case .acceptedUnconfirmed:
+        guard let runID = metadata.runID else {
+          let message = "Dispatch rejected: Vibecrafted returned no run ID."
+          appState.lastError = message
+          transcriptionService.updateDispatchStatus(message)
+          return .rejected(
+            message: message,
+            runID: nil,
+            reportPath: metadata.reportPath,
+            observeAgent: metadata.observeAgent)
+        }
+        appState.lastError = nil
+        let line =
+          "Accepted \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent); "
+          + "worker launch unconfirmed"
+        transcriptionService.updateDispatchStatus("\(line) · run: \(runID)")
+        return .acceptedUnconfirmed(
+          runID: runID,
+          reportPath: metadata.reportPath,
+          observeAgent: metadata.observeAgent,
+          statusLine: line)
+
+      case .workerSpawnRecorded:
+        appState.lastError = nil
+        let line =
+          "Started \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
+        transcriptionService.updateDispatchStatus(
+          metadata.runID.map { "\(line) · run: \($0)" } ?? line)
+        return .success(
+          runID: metadata.runID,
+          reportPath: metadata.reportPath,
+          observeAgent: metadata.observeAgent,
+          statusLine: line)
       }
-      appState.lastError = nil
-      let line =
-        "Started \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
-      transcriptionService.updateDispatchStatus(
-        metadata.runID.map { "\(line) · run: \($0)" } ?? line)
-      return .success(
-        runID: metadata.runID, reportPath: metadata.reportPath, statusLine: line)
     } catch {
       let message = "Dispatch failed: \(error.localizedDescription)"
       appState.lastError = message

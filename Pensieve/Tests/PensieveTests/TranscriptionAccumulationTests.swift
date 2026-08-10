@@ -601,19 +601,18 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertTrue(launcher.dispatchedPrompts().isEmpty)
   }
 
-  func testAppControllerRoutesAgentTargetThroughLauncherWithoutRealDispatch() async {
+  func testAgentTranscriptionClearsOnlyAfterWorkerSpawnIsRecorded() async {
     let appState = AppState()
     let service = TranscriptionService(cadenceCommitNanoseconds: 0)
     let reportPath =
       "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
     let launcher = MockAgentPromptLauncher(
-      result: AgentDispatchMetadata.parse(
-        output: """
-          run_id: just-test-123
-          Report path: \(reportPath)
-          """,
-        exitCode: 0
-      )
+      result: AgentDispatchMetadata(
+        runID: "just-test-123",
+        reportPath: reportPath,
+        exitCode: 0,
+        output: "",
+        launchVerification: .workerSpawnRecorded)
     )
     let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-agent-root")
     let controller = AppController(
@@ -635,6 +634,76 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
     XCTAssertEqual(service.rendered, "")
     XCTAssertEqual(service.dispatchStatus, "Run started: just-test-123 | \(reportPath)")
+    XCTAssertNil(appState.lastError)
+  }
+
+  func testAgentTranscriptionSurvivesAcceptedButUnconfirmedLaunch() async {
+    let appState = AppState()
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let reportPath =
+      "/Users/tester/.vibecrafted/artifacts/vetcoders/pensieve/2026_0609/reports/test.md"
+    let launcher = MockAgentPromptLauncher(
+      result: AgentDispatchMetadata.parse(
+        output: """
+          run_id: just-test-123
+          Report path: \(reportPath)
+          """,
+        exitCode: 0)
+    )
+    let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-agent-root")
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: workspaceRoot
+    )
+
+    service.receiveFinal("agent prompt awaiting proof", language: "en")
+
+    XCTAssertTrue(controller.sendTranscription(target: .agent))
+    await waitForDispatchStatus(service, containing: "just-test-123")
+
+    XCTAssertEqual(launcher.dispatchedPrompts(), ["agent prompt awaiting proof"])
+    XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
+    XCTAssertEqual(service.rendered, "agent prompt awaiting proof")
+    XCTAssertEqual(
+      service.dispatchStatus,
+      "Run accepted (launch unconfirmed): just-test-123 | \(reportPath)")
+    XCTAssertNil(appState.lastError)
+  }
+
+  func testAgentTranscriptionSurvivesRejectedExitZeroReceiptWithoutRunID() async {
+    let appState = AppState()
+    let service = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let launcher = MockAgentPromptLauncher(
+      result: AgentDispatchMetadata.parse(
+        output: "Vibecrafted exited successfully without a run ID.",
+        exitCode: 0)
+    )
+    let workspaceRoot = URL(fileURLWithPath: "/tmp/pensieve-agent-root")
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: service,
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: workspaceRoot
+    )
+
+    service.receiveFinal("agent prompt rejected safely", language: "en")
+
+    XCTAssertTrue(controller.sendTranscription(target: .agent))
+    await waitForDispatchStatus(service, containing: "Dispatch rejected")
+
+    XCTAssertEqual(launcher.dispatchedPrompts(), ["agent prompt rejected safely"])
+    XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
+    XCTAssertEqual(service.rendered, "agent prompt rejected safely")
+    XCTAssertEqual(
+      service.dispatchStatus,
+      "Dispatch rejected: Vibecrafted exited successfully without a run ID.")
+    XCTAssertEqual(appState.lastError, service.dispatchStatus)
   }
 
   func testVistaEventListenerCallbacksMarshalIntoAccumulationState() async {

@@ -4,8 +4,9 @@ import XCTest
 
 /// S5: a diagnostic run must be able to keep its Application Support state out
 /// of the operator's. The override is the only lever that does that without
-/// moving the operator's real directory aside, so its contract is pinned here:
-/// silent by default, absolute-only, and ready to be written into.
+/// moving the operator's real directory aside. Tests also share one temporary
+/// root across every default store, so an accidentally reached singleton cannot
+/// read or write the operator's production state.
 final class AppSupportLocationTests: XCTestCase {
 
   func testAbsentVariableLeavesEveryCallerOnItsOwnDerivation() {
@@ -94,5 +95,51 @@ final class AppSupportLocationTests: XCTestCase {
     XCTAssertEqual(
       resolved.standardizedFileURL,
       root.appendingPathComponent("Recovery", isDirectory: true).standardizedFileURL)
+  }
+
+  func testEveryDefaultStoreSharesOneTemporaryRootInsideATestProcess() throws {
+    let expectedRoot = AppSupportLocation.isolationRoot(
+      environment: [:], fileManager: .default, isTestProcess: true)
+    let productionRoot = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/Pensieve", isDirectory: true)
+
+    let recoveryRoot = RecoveryStore.defaultDirectoryURL(
+      fileManager: .default, environment: [:], isTestProcess: true)
+      .deletingLastPathComponent()
+    let workspaceRoot = WorkspaceMetadataStore.applicationSupportDirectory(
+      environment: [:], fileManager: .default, isTestProcess: true)
+    let indexRoot = try IndexDatabase.applicationSupportDirectory(
+      environment: [:], fileManager: .default, isTestProcess: true)
+    let aiSessionRoot = DocumentAISessionStore.defaultFileURL(
+      environment: [:], fileManager: .default, isTestProcess: true)
+      .deletingLastPathComponent()
+
+    for root in [recoveryRoot, workspaceRoot, indexRoot, aiSessionRoot] {
+      XCTAssertEqual(root.standardizedFileURL, expectedRoot?.standardizedFileURL)
+      XCTAssertNotEqual(root.standardizedFileURL, productionRoot.standardizedFileURL)
+    }
+  }
+
+  func testExplicitSupportOverrideWinsForEveryDefaultStoreInsideATestProcess() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pensieve-all-store-override-\(UUID().uuidString)", isDirectory: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    let environment = [AppSupportLocation.overrideEnvironmentKey: root.path]
+
+    let resolvedRoots = try [
+      RecoveryStore.defaultDirectoryURL(
+        fileManager: .default, environment: environment, isTestProcess: true)
+        .deletingLastPathComponent(),
+      WorkspaceMetadataStore.applicationSupportDirectory(
+        environment: environment, fileManager: .default, isTestProcess: true),
+      IndexDatabase.applicationSupportDirectory(
+        environment: environment, fileManager: .default, isTestProcess: true),
+      DocumentAISessionStore.defaultFileURL(
+        environment: environment, fileManager: .default, isTestProcess: true)
+        .deletingLastPathComponent(),
+    ]
+
+    XCTAssertTrue(
+      resolvedRoots.allSatisfy { $0.standardizedFileURL == root.standardizedFileURL })
   }
 }

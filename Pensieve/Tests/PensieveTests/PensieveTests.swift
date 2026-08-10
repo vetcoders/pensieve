@@ -1140,7 +1140,8 @@ final class PensieveSmokeTests: XCTestCase {
     // name after the folders and documents rather than being silently dropped.
     let children = try XCTUnwrap(appState.workspaceTree.first?.children)
     XCTAssertEqual(
-      children.map(\.name), ["Alpha", "Zeta", "2", "10", "index.db", "index.db-shm", "index.db-wal"]
+      children.map(\.name),
+      ["Alpha", "Zeta", "2", "10", "index.db", "index.db-shm", "index.db-wal"]
     )
     XCTAssertEqual(
       children.map(\.kind),
@@ -3923,6 +3924,52 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(stateB.documentSession.isDirty)
   }
 
+  /// A Don't Save answer is not complete until its recovery payload is really
+  /// gone. If that retirement fails, quit must remain vetoed and must not arm
+  /// the one-shot pass latch over a still-dirty live buffer.
+  @MainActor
+  func testQuitIsVetoedWhenRecoveryRetirementAfterDiscardFails() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+    let recovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let state = AppState()
+    let store = makeTestDocumentStore(
+      recoveryStore: recovery,
+      dirtySessionPrompt: { _ in .discard })
+    let controller = AppController(
+      appState: state,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry)
+    XCTAssertTrue(controller.createUntitledDocument())
+    state.activeDocumentText = "keep this live when retirement fails"
+    state.activeDocumentDirty = true
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: state, releasesDraftClaim: false))
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+    registry.registerController(controller, for: window)
+
+    XCTAssertFalse(controller.applicationShouldTerminate())
+
+    XCTAssertTrue(state.activeDocumentDirty)
+    XCTAssertEqual(state.activeDocumentText, "keep this live when retirement fails")
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id))
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(state.lastError?.contains("Could not discard the recovery copy") == true)
+  }
+
   /// A Cancel in ANY window aborts the whole quit; every window keeps its work.
   @MainActor
   func testQuitCancelledInAnotherWindowAbortsTheWholeQuit() {
@@ -4906,6 +4953,66 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(
       discardRecovery.loadDrafts().isEmpty,
       "the deferred Discard must drop the recovery draft on a successful pass")
+  }
+
+  /// Phase 2 still has one fallible operation: retiring the durable recovery
+  /// payload after the user chose Discard. A failed retirement must veto the
+  /// teardown just like a failed Save does; otherwise the window disappears
+  /// while its draft remains claimed and invisible until relaunch.
+  @MainActor
+  func testClearOpenFilesRecoveryRetirementFailureKeepsTheWindowAndClaimAlive() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let recovery = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let state = AppState()
+    let store = makeTestDocumentStore(
+      recoveryStore: recovery,
+      dirtySessionPrompt: { _ in .discard })
+    let controller = AppController(
+      appState: state,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(controller.createUntitledDocument())
+    state.activeDocumentText = "recovery bytes that must remain owned"
+    state.activeDocumentDirty = true
+    XCTAssertTrue(
+      store.savePendingChangesOnClose(appState: state, releasesDraftClaim: false),
+      "fixture: the live buffer must keep ownership of the seeded recovery payload")
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+    let identity = try XCTUnwrap(state.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        window, identity: identity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(controller, for: window)
+
+    controller.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "failed recovery retirement must veto every close")
+    XCTAssertTrue(state.activeDocumentDirty, "the live buffer must remain guarded as unsaved")
+    XCTAssertEqual(state.activeDocumentText, "recovery bytes that must remain owned")
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id), "the surviving payload keeps its live claim")
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(state.lastError?.contains("Could not discard the recovery copy") == true)
   }
 
   /// Case 5 — the test the "keep Save in phase 1" decision rests on. A Discard

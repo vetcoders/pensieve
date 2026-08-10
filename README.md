@@ -37,16 +37,24 @@ The existing HTML and PDF export options remain available in the File menu.
 
 ## Agent dispatch lifecycle
 
-Dispatch starts a detached Vibecrafted worker and returns a run ID. The launch
-receipt is not a completion result: the worker keeps running after the dispatch
-sheet closes, and closing the optional Terminal status window does not stop it.
-Pensieve resolves the installed uv-managed Vibecrafted entrypoint directly, so
-dispatch does not depend on the reduced `PATH` inherited by apps opened from
-Finder or the Dock. A failed launch keeps the exit code and shows the final,
-actionable launcher error instead of reporting only a generic failure.
-The success state also waits for Vibecrafted's worker metadata: a detached
-dispatcher receipt without a recorded worker PID is reported as a failed launch,
-not as `Run started`.
+Dispatch asks Vibecrafted to start a detached worker and returns a run ID. The
+launch receipt is not a completion result: the run can continue after the
+dispatch sheet closes, and closing the optional Terminal status window does not
+stop it. Pensieve resolves the installed uv-managed Vibecrafted entrypoint by
+absolute path and supplies the standard agent binary directories that a
+Finder/Dock launch omits from `PATH`; custom version-manager layouts can use
+`PENSIEVE_VIBECRAFTED_PATH` to select a wrapper that establishes their required
+environment. The override chooses the Vibecrafted executable; it does not add
+version-manager shim directories to an agent's `PATH` by itself.
+
+A positive worker PID in Vibecrafted metadata is shown as **Run started**. It is
+a spawn record, not a promise that the worker is still alive. If Vibecrafted
+exits successfully with a valid run ID but that spawn record does not arrive
+within the bounded confirmation window, Pensieve shows **Run accepted · launch
+unconfirmed** and keeps the run/report controls available. It does not call the
+run failed or encourage a duplicate dispatch. A genuinely rejected launch keeps
+its real exit code, run ID and report path when available, and shows the final
+actionable launcher error.
 **Check status in Terminal** requests a status snapshot for that run; the worker
 itself remains owned by its Vibecrafted/vc-frame session.
 

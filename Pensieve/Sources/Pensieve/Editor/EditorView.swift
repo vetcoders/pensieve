@@ -37,6 +37,8 @@ struct EditorView: View {
         asciiSafeTables: appState.asciiSafeTables,
         aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
         documentID: appState.aiDocumentID,
+        documentIdentity: appState.documentSession.identity,
+        editorFocusRequest: appState.editorFocusRequest,
         scrollSyncCoordinator: scrollSyncCoordinator,
         scrollSyncEnabled: appState.scrollSyncEnabled && appState.mode == .split,
         isDirty: documentDirty,
@@ -172,6 +174,8 @@ struct EditorRepresentable: NSViewRepresentable {
   let asciiSafeTables: Bool
   let aiAutocompleteEnabled: Bool
   let documentID: String
+  let documentIdentity: DocumentIdentity?
+  let editorFocusRequest: EditorFocusRequest?
   let scrollSyncCoordinator: ScrollSyncCoordinator?
   let scrollSyncEnabled: Bool
   @Binding var isDirty: Bool
@@ -201,6 +205,8 @@ struct EditorRepresentable: NSViewRepresentable {
     asciiSafeTables: Bool,
     aiAutocompleteEnabled: Bool,
     documentID: String = "transient",
+    documentIdentity: DocumentIdentity? = nil,
+    editorFocusRequest: EditorFocusRequest? = nil,
     scrollSyncCoordinator: ScrollSyncCoordinator? = nil,
     scrollSyncEnabled: Bool = false,
     isDirty: Binding<Bool>,
@@ -226,6 +232,8 @@ struct EditorRepresentable: NSViewRepresentable {
     self.asciiSafeTables = asciiSafeTables
     self.aiAutocompleteEnabled = aiAutocompleteEnabled
     self.documentID = documentID
+    self.documentIdentity = documentIdentity
+    self.editorFocusRequest = editorFocusRequest
     self.scrollSyncCoordinator = scrollSyncCoordinator
     self.scrollSyncEnabled = scrollSyncEnabled
     self._isDirty = isDirty
@@ -283,6 +291,9 @@ struct EditorRepresentable: NSViewRepresentable {
     )
     surface.typewriterScrollEnabled = editorMode == .focus
     context.coordinator.surface = surface
+    surface.applyEditorFocusRequest(
+      editorFocusRequest,
+      currentSessionIdentity: documentIdentity)
     return surface.scrollView
   }
 
@@ -366,6 +377,9 @@ struct EditorRepresentable: NSViewRepresentable {
     ) {
       findQuery = selectedText
     }
+    surface.applyEditorFocusRequest(
+      editorFocusRequest,
+      currentSessionIdentity: documentIdentity)
   }
 
   /// Remembers what the source panel is currently painted in, so the expensive
@@ -453,6 +467,15 @@ struct EditorRepresentable: NSViewRepresentable {
   }
 }
 
+private final class EditorSurfaceScrollView: NSScrollView {
+  var onWindowChanged: (() -> Void)?
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    onWindowChanged?()
+  }
+}
+
 final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   let scrollView: NSScrollView
   let textView: MarkdownTextView
@@ -515,6 +538,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var hasNotifiedFindState = false
   private var lastNotifiedFindCount = -1
   private var lastNotifiedFindActiveIndex: Int?
+  private var pendingEditorFocusRequest: EditorFocusRequest?
 
   init(
     text: String,
@@ -548,7 +572,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textContainer.widthTracksTextView = true
     textLayoutManager.textContainer = textContainer
 
-    scrollView = NSScrollView(frame: .zero)
+    scrollView = EditorSurfaceScrollView(frame: .zero)
     scrollView.hasVerticalScroller = true
     scrollView.borderType = .noBorder
     scrollView.drawsBackground = true
@@ -577,6 +601,10 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.asciiSafeTables = asciiSafeTables
 
     super.init()
+
+    (scrollView as? EditorSurfaceScrollView)?.onWindowChanged = { [weak self] in
+      self?.fulfillPendingEditorFocusRequest()
+    }
 
     autocompleteController.configureDocument(id: documentID)
 
@@ -731,6 +759,46 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   /// answered by identity instead of by a scan.
   private func recordSyncedText(_ text: String) {
     syncedTextObject = text as NSString
+  }
+
+  /// Applies a request only to the session that created it. A mismatch means the
+  /// session was synchronously replaced before the editor mounted (for example,
+  /// workspace-file creation) and consumes the stale request without touching
+  /// the responder chain. A matching request waits for an NSWindow when needed.
+  func applyEditorFocusRequest(
+    _ request: EditorFocusRequest?,
+    currentSessionIdentity: DocumentIdentity?
+  ) {
+    guard let request else {
+      pendingEditorFocusRequest = nil
+      return
+    }
+    guard !request.isConsumed else {
+      if pendingEditorFocusRequest === request {
+        pendingEditorFocusRequest = nil
+      }
+      return
+    }
+    guard request.sessionIdentity == currentSessionIdentity else {
+      pendingEditorFocusRequest = nil
+      request.consume()
+      return
+    }
+
+    pendingEditorFocusRequest = request
+    fulfillPendingEditorFocusRequest()
+  }
+
+  private func fulfillPendingEditorFocusRequest() {
+    guard let request = pendingEditorFocusRequest else { return }
+    guard !request.isConsumed else {
+      pendingEditorFocusRequest = nil
+      return
+    }
+    guard let window = textView.window else { return }
+    guard window.makeFirstResponder(textView) else { return }
+    request.consume()
+    pendingEditorFocusRequest = nil
   }
 
   // No default parameter values on purpose: a defaulted behavior flag already

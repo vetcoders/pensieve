@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import UniformTypeIdentifiers
 
@@ -38,6 +39,11 @@ final class FolderManager {
   private let metadataStore: WorkspaceMetadataStore
   private let indexDatabase: IndexDatabase
   private let bookmarkStore: BookmarkStore
+  /// Recovery claims belong to live buffers, not filesystem paths. A successful
+  /// Move to Trash can clear the selected session before its window teardown
+  /// runs, so FolderManager must release that buffer's claim at the same
+  /// boundary instead of leaving the draft hidden until relaunch.
+  private let recoveryStore: RecoveryStore
   /// The live tab chain across EVERY window. Consulted when the persisted
   /// bookmark set is rebuilt, because the working set alone does not know which
   /// documents other windows still have open.
@@ -140,6 +146,7 @@ final class FolderManager {
     metadataStore: WorkspaceMetadataStore = .shared,
     indexDatabase: IndexDatabase? = nil,
     bookmarkStore: BookmarkStore? = nil,
+    recoveryStore: RecoveryStore = .shared,
     documentWindowRegistry: DocumentWindowRegistry? = nil,
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
     workspaceSubstrate: WorkspaceSubstrate = .shared,
@@ -155,6 +162,7 @@ final class FolderManager {
     self.metadataStore = metadataStore
     self.indexDatabase = indexDatabase ?? .shared
     self.bookmarkStore = bookmarkStore ?? .shared
+    self.recoveryStore = recoveryStore
     self.documentWindowRegistry = documentWindowRegistry ?? .shared
     self.workspaceBuilder = workspaceBuilder ?? WorkspaceScanner.cancellableBuilder
     self.workspaceSubstrate = workspaceSubstrate
@@ -497,6 +505,11 @@ final class FolderManager {
     if let selected = appState.selectedDocumentID,
       isSameOrDescendant(selected.path, of: sourcePath)
     {
+      // `clear()` severs the only in-memory link to this recovery ID. Release
+      // the claim first: the payload remains a valid emergency copy, but it is
+      // no longer owned by a live buffer and must be visible immediately rather
+      // than reappearing as a mysterious draft only after process restart.
+      recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
     }
@@ -2358,9 +2371,10 @@ final class FolderManager {
   ///
   /// Every scan commit passes through here — the explicit refresh after
   /// Pensieve's own `Move to Trash` and the debounced watcher refresh that
-  /// follows a trashing done in Finder — so this is the one seam where a LIVE
-  /// working set learns about it, instead of the app carrying a dead row until
-  /// the next launch (where the restore guard finally drops it).
+  /// follows a trashing done in Finder. Application activation also calls this
+  /// seam, which is load-bearing for ad-hoc files outside every watched
+  /// workspace root: returning from Finder is when their live working-set rows
+  /// are reconciled instead of surviving until the next launch.
   ///
   /// Two shapes, because trashing hides the same event behind two different
   /// symptoms:
@@ -2411,6 +2425,15 @@ final class FolderManager {
       let identity = BookmarkStore.identityPath(url)
       return vanishedPaths.contains(identity) && retiredPaths.contains(identity)
     }
+  }
+
+  /// Reconciles filesystem mutations made while another application was in
+  /// front. Workspace roots already have FSEvents coverage; this activation
+  /// pass is the bounded counterpart for ad-hoc files, whose arbitrary parent
+  /// directories Pensieve deliberately does not watch recursively.
+  func reconcileExternalWorkingSetChanges(into appState: AppState) {
+    guard !isQuiescedForTermination else { return }
+    reconcileTrashedOpenFiles(into: appState)
   }
 
   /// Decides what an open/restore flow puts on screen once its walk lands,
@@ -3413,6 +3436,14 @@ final class DocumentStore {
   func saveRecoveredDraftAs(_ draft: RecoveryDraft, into appState: AppState) -> URL? {
     self.appState = appState
 
+    guard
+      appState.documentSession.recoveryID == draft.id
+        || !recoveryStore.isDraftOpen(id: draft.id)
+    else {
+      appState.lastError = "This recovered draft is already open in another window."
+      return nil
+    }
+
     guard let url = savePanelURLProvider(appState) else { return nil }
 
     // A draft this window already adopted is just an unsaved document: the
@@ -3437,8 +3468,8 @@ final class DocumentStore {
       // recovery copy", not "open it in this launcher".
       registerSavedDocument(ref, previousID: nil, appState: appState, select: false)
       indexDocument(ref, draft.text, appState)
-      recoveryStore.deleteDraft(id: draft.id)
-      appState.lastError = nil
+      let retired = recoveryStore.deleteDraft(id: draft.id)
+      appState.lastError = retired ? nil : recoveryRetirementFailureMessage(for: draft.title)
       return targetURL
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
@@ -3451,8 +3482,10 @@ final class DocumentStore {
   }
 
   /// Drops `draft` for good. The caller owns the confirmation.
-  func discardRecoveredDraft(_ draft: RecoveryDraft) {
-    recoveryStore.deleteDraft(id: draft.id)
+  @discardableResult
+  func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
+    guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
+    return recoveryStore.deleteDraft(id: draft.id)
   }
 
   func load(ref: DocumentRef, into appState: AppState) {
@@ -3514,6 +3547,7 @@ final class DocumentStore {
   private func loadSynchronously(ref: DocumentRef, into appState: AppState) {
     do {
       let text = try String(contentsOf: ref.url, encoding: .utf8)
+      releaseRecoveryClaimBeforeReplacingSession(appState: appState)
       appState.selectedDocumentID = ref.id
       appState.documentSession.load(document: ref, text: text)
       appState.lastError = nil
@@ -3535,6 +3569,7 @@ final class DocumentStore {
   /// `AppController.noteRecentDocumentIfOpened` reads to decide whether the open
   /// actually landed). The ONLY thing that arrives late is the text.
   private func loadInBackground(ref: DocumentRef, claim: UInt64, into appState: AppState) {
+    releaseRecoveryClaimBeforeReplacingSession(appState: appState)
     appState.selectedDocumentID = ref.id
     appState.documentSession.beginLoading(document: ref)
     appState.lastError = nil
@@ -3588,6 +3623,7 @@ final class DocumentStore {
       // wanted?" — no. Without this the read would land afterwards and reopen
       // the file the user just closed.
       appState.cancelPendingDocumentLoad()
+      releaseRecoveryClaimBeforeReplacingSession(appState: appState)
       appState.selectedDocumentID = nil
       appState.documentSession.clear()
       return true
@@ -3672,11 +3708,14 @@ final class DocumentStore {
 
     case (.confirm(.savePathed), .save):
       let openSessionID = appState.documentSession.id
-      guard saveExisting(appState: appState, indexNow: true, trigger: .explicit) else {
-        // Preserve the attempted edit even though the explicit Save did not do
-        // what the user asked. The close remains vetoed so the visible error can
-        // be acted on; the recovery copy protects the buffer meanwhile.
-        _ = persistRecoverySnapshot(appState: appState, clearsErrorsOnSuccess: false)
+      guard
+        saveExistingOrRecoveryFallback(
+          appState: appState, indexNow: true, trigger: .explicit) == .original
+      else {
+        // A recovery fallback protects the bytes, but it does not satisfy the
+        // explicit Save the user chose. Keep the window open with the honest
+        // recovery-safe status (or the single compound failure when both writes
+        // failed) so the original file is never presented as current.
         appState.selectedDocumentID = openSessionID
         return false
       }
@@ -3697,14 +3736,14 @@ final class DocumentStore {
       // "Don't Save" on a draft is a conscious throw-away, so the crash-recovery
       // copy goes with it — leaving it behind would resurrect the very text the
       // user just declined to keep.
-      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
 
     case (.confirm(.saveRecoveredFile), .discard):
-      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
 
     case (.confirm(.savePathed), .discard):
       // The buffer is dropped; whatever is already on disk stays as it is.
-      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
       break
 
     case (.confirm(.saveAsUntitled), .saveAs):
@@ -3773,8 +3812,13 @@ final class DocumentStore {
       registerSavedDocument(ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
-      recoveryStore.deleteDraft(id: recoveryID)
+      let retiredRecovery = recoveryStore.deleteDraft(id: recoveryID)
       appState.resolveError()
+      if retiredRecovery {
+        appState.documentSession.retireRecoveryAssociation()
+      } else {
+        appState.lastError = recoveryRetirementFailureMessage(for: targetURL.lastPathComponent)
+      }
       // Same publication, same exposure: saving AS an existing file makes our bytes that file's
       // content, so a settled window already open on it holds a buffer this write has just made
       // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
@@ -4028,6 +4072,13 @@ final class DocumentStore {
     return saveDirtySessionIfNeeded(appState: appState)
   }
 
+  /// Releases the in-process ownership claim exactly when a caller is about to
+  /// replace the current buffer. Do not call this from the earlier dirty guard:
+  /// a later validation or failed synchronous read may leave that buffer alive.
+  func releaseRecoveryClaimBeforeReplacingSession(appState: AppState) {
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+  }
+
   /// Debounced persistence for the live buffer (1.5s after the last edit, the
   /// interval this path has always used — the setting decides WHETHER a
   /// file-backed document is written, it does not introduce a new cadence).
@@ -4051,10 +4102,10 @@ final class DocumentStore {
     // writes nothing. See `Autosaver.armedSaveOwner`.
     autosaver.scheduleSave(owner: appState) { [weak self, weak appState] in
       guard let self, let appState else { return }
-      if appState.documentSession.isUntitled
-        || !self.savingSettings.autoSavesPathedDocuments
-      {
+      if appState.documentSession.isUntitled {
         _ = self.persistRecoverySnapshot(appState: appState)
+      } else if !self.savingSettings.autoSavesPathedDocuments {
+        self.persistPathedRecoverySnapshotWithoutOverwritingOriginal(appState: appState)
       } else {
         _ = self.saveExistingOrRecoveryFallback(
           appState: appState, indexNow: false, trigger: .unattended)
@@ -4092,14 +4143,31 @@ final class DocumentStore {
       // DATA LOSS: this write IS the durable copy. It failed, so the text exists
       // only in the buffer and dies with the process.
       let recoveryFailure = "Could not write recovery copy: \(error.localizedDescription)"
-      if let precedingFailure {
-        appState.reportDataLoss(
-          "\(precedingFailure) \(recoveryFailure) The window will stay open to protect your edits.")
-      } else {
-        appState.reportDataLoss(recoveryFailure)
-      }
+      let message =
+        if let precedingFailure {
+          "\(precedingFailure) \(recoveryFailure) The window will stay open to protect your edits."
+        } else {
+          recoveryFailure
+        }
+      appState.reportDataLoss(message)
+      NSLog("%@", message)
       return false
     }
+  }
+
+  /// With auto-save OFF, a background recovery tick protects the buffer but
+  /// deliberately does not update its original file. A successful snapshot may
+  /// retire a memory-only data-loss latch, but it must replace that latch with
+  /// an honest status instead of implying the original save later succeeded.
+  /// Routine recovery ticks also leave unrelated status messages alone.
+  private func persistPathedRecoverySnapshotWithoutOverwritingOriginal(appState: AppState) {
+    let originalFailure = appState.unresolvedDataLoss?.message
+    guard persistRecoverySnapshot(appState: appState, clearsErrorsOnSuccess: false) else {
+      return
+    }
+    guard let originalFailure else { return }
+    appState.resolveError()
+    appState.lastError = recoverySafeStatus(after: originalFailure)
   }
 
   /// Attempts the requested file write and, if it fails, immediately persists
@@ -4111,13 +4179,17 @@ final class DocumentStore {
     indexNow: Bool,
     trigger: SaveTrigger
   ) -> DurableSaveOutcome {
-    if saveExisting(appState: appState, indexNow: indexNow, trigger: trigger) {
+    let originalFailure: String
+    switch attemptSaveExisting(appState: appState, indexNow: indexNow, trigger: trigger) {
+    case .saved:
       return .original
+    case .notApplicable:
+      return .failed
+    case .failed(let message):
+      originalFailure = message
+      NSLog("%@", message)
     }
 
-    let originalFailure =
-      appState.currentError?.message
-      ?? "Could not save \(appState.documentSession.displayTitle)."
     guard
       persistRecoverySnapshot(
         appState: appState,
@@ -4131,9 +4203,25 @@ final class DocumentStore {
     // false. Keep the original save failure as an ordinary visible status: the
     // file is stale, but a durable emergency copy exists.
     appState.resolveError()
-    appState.lastError =
-      "\(originalFailure) A recovery copy is safe; the original file was not overwritten."
+    appState.lastError = recoverySafeStatus(after: originalFailure)
     return .recovery
+  }
+
+  private func recoverySafeStatus(after originalFailure: String) -> String {
+    "\(originalFailure) A recovery copy is safe; the original file was not overwritten."
+  }
+
+  private func recoveryRetirementFailureMessage(for title: String) -> String {
+    "Saved \(title), but could not retire its recovery copy. It remains protected and can be discarded after the storage error is resolved."
+  }
+
+  private func retireRecoveryForConsciousDiscard(appState: AppState) -> Bool {
+    guard recoveryStore.deleteDraft(id: appState.documentSession.recoveryID) else {
+      appState.lastError =
+        "Could not discard the recovery copy. The document will stay open so you can retry."
+      return false
+    }
+    return true
   }
 
   /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
@@ -4189,16 +4277,17 @@ final class DocumentStore {
       ownerIsDirty: { [weak appState] in
         guard let appState else { return false }
         return appState.documentSession.hasEditableBuffer && appState.documentSession.isDirty
-      }
-    ) { [weak self, weak appState] in
-      guard let self, let appState, let ref = appState.documentSession.document else { return }
-      // Deliberately NOT a `retireSettledForeignIndexDebounces` site, unlike the two save paths. The
-      // retire is licensed by having just written the file: it cancels a neighbour's row because the
-      // row replacing it is built from the bytes now on disk. A debounce publishes an in-memory
-      // buffer without writing anything, so it has no such claim — cancelling a neighbour's entry
-      // from here would be the plain freshness loss the flush-over-cancel rule forbids.
-      self.indexDocument(ref, appState.documentSession.text, appState)
-    }
+      },
+      { [weak self, weak appState] in
+        guard let self, let appState, let ref = appState.documentSession.document else { return }
+        // Deliberately NOT a `retireSettledForeignIndexDebounces` site, unlike the two save paths.
+        // The retire is licensed by having just written the file: it cancels a neighbour's row
+        // because the row replacing it is built from the bytes now on disk. A debounce publishes an
+        // in-memory buffer without writing anything, so it has no such claim — cancelling a
+        // neighbour's entry from here would be the plain freshness loss the flush-over-cancel rule
+        // forbids.
+        self.indexDocument(ref, appState.documentSession.text, appState)
+      })
   }
 
   /// The user's resolution of a dirty session, split so a multi-window pass can
@@ -4293,14 +4382,11 @@ final class DocumentStore {
       outcome = saveExistingOrRecoveryFallback(
         appState: appState, indexNow: true, trigger: trigger)
     case .explicit:
-      if saveExisting(appState: appState, indexNow: true, trigger: trigger) {
-        outcome = .original
-      } else {
-        _ = persistRecoverySnapshot(appState: appState, clearsErrorsOnSuccess: false)
-        outcome = .failed
-      }
+      outcome = saveExistingOrRecoveryFallback(
+        appState: appState, indexNow: true, trigger: trigger)
     }
-    guard outcome != .failed else {
+    let didSettle = trigger == .explicit ? outcome == .original : outcome != .failed
+    guard didSettle else {
       appState.selectedDocumentID = openSessionID
       return nil
     }
@@ -4310,24 +4396,28 @@ final class DocumentStore {
   /// APPLY half: performs the deferred destructive step recorded by decide.
   /// `.settled` is a no-op; the two Discard cases each drop what makes their
   /// edit recoverable. Neither clears the session, the identity or the buffer —
-  /// the caller tears the window down separately.
+  /// the caller tears the window down separately. Returns `false` when the
+  /// durable recovery payload could not be retired; callers must then keep the
+  /// window/process alive instead of presenting the Discard as completed.
   private func applyDirtySessionResolution(
     _ resolution: DirtySessionResolution, appState: AppState
-  ) {
+  ) -> Bool {
     switch resolution {
     case .settled:
-      break
+      return true
     case .discardUntitled:
-      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
+      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
       appState.documentSession.isDirty = false
+      return true
     case .discardPathedEdit:
+      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
       // The pending debounced write must not resurrect the dropped edit; the
       // file on disk keeps the bytes it already had. Scoped to THIS window's
       // session — a blanket cancel would also disarm another window's armed
       // save, which is a data-loss path of its own.
       autosaver.cancelSave(ownedBy: appState)
-      recoveryStore.deleteDraft(id: appState.documentSession.recoveryID)
       appState.documentSession.isDirty = false
+      return true
     }
   }
 
@@ -4344,12 +4434,13 @@ final class DocumentStore {
   /// Phase-2 apply for a multi-window external close: performs the destructive
   /// step deferred in phase 1. Called only once every window confirmed without a
   /// Cancel, and BEFORE the windows are torn down, so a dropped draft can't
-  /// resurrect and a stale `isDirty` can't trip the teardown save hook.
+  /// resurrect and a stale `isDirty` can't trip the teardown save hook. A
+  /// failed recovery retirement returns `false` and vetoes teardown.
   func applyDeferredDirtySessionResolution(
     _ resolution: DirtySessionResolution, appState: AppState
-  ) {
+  ) -> Bool {
     self.appState = appState
-    applyDirtySessionResolution(resolution, appState: appState)
+    return applyDirtySessionResolution(resolution, appState: appState)
   }
 
   /// Settles the current buffer before something replaces it WITHIN this window:
@@ -4374,8 +4465,7 @@ final class DocumentStore {
     guard let resolution = decideDirtySessionResolution(appState: appState) else {
       return false
     }
-    applyDirtySessionResolution(resolution, appState: appState)
-    return true
+    return applyDirtySessionResolution(resolution, appState: appState)
   }
 
   private func documentRef(for url: URL, appState: AppState) -> DocumentRef {
@@ -4389,12 +4479,35 @@ final class DocumentStore {
     return appState.makeDocumentRef(for: standardizedURL)
   }
 
+  private enum ExistingSaveAttempt {
+    case saved
+    case failed(String)
+    case notApplicable
+  }
+
   @discardableResult
   private func saveExisting(
     appState: AppState,
     indexNow: Bool,
     trigger: SaveTrigger
   ) -> Bool {
+    switch attemptSaveExisting(appState: appState, indexNow: indexNow, trigger: trigger) {
+    case .saved:
+      return true
+    case .notApplicable:
+      return false
+    case .failed(let message):
+      appState.reportDataLoss(message)
+      NSLog("%@", message)
+      return false
+    }
+  }
+
+  private func attemptSaveExisting(
+    appState: AppState,
+    indexNow: Bool,
+    trigger: SaveTrigger
+  ) -> ExistingSaveAttempt {
     self.appState = appState
     // This write makes THIS session's armed autosave redundant and nobody else's: an ordinary ⌘S in
     // one window must not delete another window's pending autosave. When this runs as the debounce's
@@ -4410,7 +4523,7 @@ final class DocumentStore {
     // equivalent, because only `.fileBacked` and `.loading` ever carry a URL.
     guard appState.documentSession.hasEditableBuffer,
       let url = appState.documentSession.url
-    else { return false }
+    else { return .notApplicable }
 
     // A file-backed write may UPDATE the user's file. It may not bring one back.
     //
@@ -4451,13 +4564,7 @@ final class DocumentStore {
       let message =
         "Could not save \(url.lastPathComponent): it is no longer on disk."
         + " Your changes are still here — use Save As… to write them somewhere."
-      // The edit reached no durable destination and the live buffer is its only
-      // copy. This must use the data-loss latch introduced by the recovery
-      // error surface; a plain status write can be displaced by an unrelated
-      // success and would understate the same failure caught below.
-      appState.reportDataLoss(message)
-      NSLog(message)
-      return false
+      return .failed(message)
     }
     let ref = documentRef(for: url, appState: appState)
     // Read BEFORE the write: `documentSession.document` below drops the
@@ -4479,10 +4586,15 @@ final class DocumentStore {
       // bytes are on disk that stash is not recoverable work any more, and
       // leaving it would have the launcher offering content the user already
       // saved — forever, since nothing sweeps drafts.
-      recoveryStore.deleteDraft(id: stashedRecoveryID)
+      let retiredRecovery = recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       appState.resolveError()
+      if retiredRecovery {
+        appState.documentSession.retireRecoveryAssociation()
+      } else {
+        appState.lastError = recoveryRetirementFailureMessage(for: url.lastPathComponent)
+      }
       if indexNow {
         // Only THIS session's debounce, and only when it is armed for the document just written: the
         // write below supersedes it, so leaving it would duplicate the same row. A debounce armed for
@@ -4503,14 +4615,10 @@ final class DocumentStore {
         retireSettledForeignIndexDebounces(for: ref.id, by: appState)
         indexDocument(ref, appState.documentSession.text, appState)
       }
-      return true
+      return .saved
     } catch {
       let message = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
-      // DATA LOSS: the edit reached no file, so the buffer is the only copy
-      // of it and the document on disk is stale.
-      appState.reportDataLoss(message)
-      NSLog(message)
-      return false
+      return .failed(message)
     }
   }
 
@@ -4567,19 +4675,27 @@ final class DocumentStore {
     try text.write(to: temporaryURL, atomically: true, encoding: .utf8)
     defer { try? FileManager.default.removeItem(at: temporaryURL) }
 
-    // The swap moves INODES, so the note would otherwise silently take the
-    // temporary file's mode instead of keeping its own.
-    if let permissions = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
-      .posixPermissions] as? NSNumber
-    {
-      try? FileManager.default.setAttributes(
-        [.posixPermissions: permissions], ofItemAtPath: temporaryURL.path)
+    // The swap moves INODES. Copy the original inode's metadata before the
+    // exchange or every unattended save silently drops Finder tags/xattrs,
+    // ACLs, ownership, creation date and the file's mode. The freshly written
+    // content still owns its new modification time, so restore that one field
+    // after copying the original metadata.
+    let newModificationDate =
+      (try FileManager.default.attributesOfItem(atPath: temporaryURL.path))[.modificationDate]
+      as? Date
+    try copyMetadataForReplacement(from: url, to: temporaryURL)
+    if let newModificationDate {
+      try FileManager.default.setAttributes(
+        [.modificationDate: newModificationDate], ofItemAtPath: temporaryURL.path)
     }
 
     var failure: Int32 = 0
     let swapped = temporaryURL.withUnsafeFileSystemRepresentation { source in
       url.withUnsafeFileSystemRepresentation { target in
-        guard let source, let target else { return Int32(-1) }
+        guard let source, let target else {
+          failure = EINVAL
+          return Int32(-1)
+        }
         let result = renameatx_np(AT_FDCWD, source, AT_FDCWD, target, UInt32(RENAME_SWAP))
         failure = errno
         return result
@@ -4600,6 +4716,32 @@ final class DocumentStore {
     default:
       throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
     }
+  }
+
+  /// Copies only filesystem metadata; the temporary file's freshly encoded
+  /// Markdown bytes stay untouched. Any failure aborts before `RENAME_SWAP`, so
+  /// the original path and inode remain exactly as they were.
+  private nonisolated static func copyMetadataForReplacement(
+    from sourceURL: URL,
+    to destinationURL: URL
+  ) throws {
+    var failure: Int32 = 0
+    let copied = sourceURL.withUnsafeFileSystemRepresentation { source in
+      destinationURL.withUnsafeFileSystemRepresentation { destination in
+        guard let source, let destination else {
+          failure = EINVAL
+          return Int32(-1)
+        }
+        let result = copyfile(source, destination, nil, copyfile_flags_t(COPYFILE_METADATA))
+        failure = errno
+        return result
+      }
+    }
+    guard copied != 0 else { return }
+    if failure == ENOENT {
+      throw DocumentWriteError.targetNoLongerExists(sourceURL)
+    }
+    throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
   }
 
   private func registerSavedDocument(

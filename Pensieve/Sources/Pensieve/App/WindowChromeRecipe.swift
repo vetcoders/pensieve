@@ -907,7 +907,10 @@ struct SidebarChromeInsetSink: NSViewRepresentable {
     private weak var window: NSWindow?
     private var observer: NSObjectProtocol?
 
-    func observe(_ window: NSWindow?) {
+    func observe(_ candidate: NSWindow?) {
+      let window = candidate.flatMap {
+        DocumentWindowOwnership.isRootSurface($0) ? $0 : nil
+      }
       if self.window !== window {
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil

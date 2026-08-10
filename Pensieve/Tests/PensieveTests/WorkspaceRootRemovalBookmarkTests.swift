@@ -42,6 +42,31 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     )
   }
 
+  /// Root removal rewrites the complete bookmark set. The surviving live
+  /// grants must be restarted from the newly RESOLVED bookmark URLs, because a
+  /// plain standardized URL does not carry a sandbox extension in the MAS
+  /// lane.
+  @MainActor
+  func testRemovingRootReactivatesSurvivingAccessFromResolvedBookmarks() async throws {
+    let scenario = try await makeScenario()
+
+    scenario.harness.manager.removeRoot(scenario.rootA, into: scenario.appState)
+    await settle(scenario.harness)
+
+    let persisted =
+      persistedRootBookmarkURLs(scenario.harness)
+      + persistedBookmarkURLs(key: "Pensieve.workspace.fileBookmarks", in: scenario.harness)
+    let activeCount = scenario.harness.bookmarkStore.activeSecurityScopeCount
+    let finalActivationPass = Array(scenario.harness.securityScopeProbe.started.suffix(activeCount))
+
+    XCTAssertEqual(finalActivationPass, persisted)
+    XCTAssertEqual(
+      scenario.harness.bookmarkStore.grantedSecurityScopeCount,
+      persisted.count,
+      "every surviving root/file bookmark must hold a real live grant in the injected MAS seam"
+    )
+  }
+
   /// The union must not become a resurrection: a document of the removed root
   /// that no window holds, and that the working set never named, stays gone.
   @MainActor
@@ -215,12 +240,19 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
   }
 
   @MainActor
+  private final class SecurityScopeProbe {
+    var started: [URL] = []
+    var stopped: [URL] = []
+  }
+
+  @MainActor
   private struct Harness {
     let manager: FolderManager
     let indexDatabase: IndexDatabase
     let bookmarkStore: BookmarkStore
     let documentWindowRegistry: DocumentWindowRegistry
     let defaults: UserDefaults
+    let securityScopeProbe: SecurityScopeProbe
   }
 
   private func makeSandbox() throws -> Sandbox {
@@ -243,9 +275,16 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       databaseURL: support.appendingPathComponent("index.db")
     )
     let defaults = makeEphemeralDefaults(prefix: "PensieveWorkspaceRootRemovalBookmarks")
+    let securityScopeProbe = SecurityScopeProbe()
     let bookmarkStore = BookmarkStore(
       defaults: defaults,
-      trashMembership: SimulatedTrash.membership(at: simulatedTrash))
+      trashMembership: SimulatedTrash.membership(at: simulatedTrash),
+      startSecurityScopedAccess: { url in
+        securityScopeProbe.started.append(url)
+        return true
+      },
+      stopSecurityScopedAccess: { securityScopeProbe.stopped.append($0) }
+    )
     let documentWindowRegistry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in },
@@ -273,7 +312,8 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
       documentWindowRegistry: documentWindowRegistry,
-      defaults: defaults
+      defaults: defaults,
+      securityScopeProbe: securityScopeProbe
     )
   }
 
@@ -292,7 +332,18 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
   /// in the key, so it would hide a bookmark that must never have been minted.
   @MainActor
   private func persistedFileBookmarkURLs(_ harness: Harness) -> [URL] {
-    let blobs = harness.defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data] ?? []
+    persistedBookmarkURLs(key: "Pensieve.workspace.fileBookmarks", in: harness)
+      .map(\.standardizedFileURL)
+  }
+
+  @MainActor
+  private func persistedRootBookmarkURLs(_ harness: Harness) -> [URL] {
+    persistedBookmarkURLs(key: "Pensieve.workspace.rootBookmarks", in: harness)
+  }
+
+  @MainActor
+  private func persistedBookmarkURLs(key: String, in harness: Harness) -> [URL] {
+    let blobs = harness.defaults.array(forKey: key) as? [Data] ?? []
     return blobs.compactMap { data -> URL? in
       var isStale = false
       return try? URL(
@@ -301,7 +352,6 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
         relativeTo: nil,
         bookmarkDataIsStale: &isStale)
     }
-    .map(\.standardizedFileURL)
   }
 
   /// Files the NEXT launch would resolve from the persisted bookmark set.

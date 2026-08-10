@@ -24,11 +24,44 @@ final class EditorToolbarBridgeTests: XCTestCase {
     let picker = try XCTUnwrap(
       rig.modePickerControl(),
       "the mode picker must bridge to a segmented control with one segment per mode")
+    XCTAssertEqual(
+      picker.accessibilityIdentifier(), EditorToolbelt.modePickerIdentifier,
+      "the toolbar recipe must stamp the bridged control with its AppKit identity")
     XCTAssertEqual(picker.segmentCount, EditorMode.allCases.count)
     for segment in 0..<picker.segmentCount {
       XCTAssertTrue(
         picker.isEnabled(forSegment: segment),
         "mode segment \(segment) came back disabled — the picker is nested in a ControlGroup again")
+    }
+  }
+
+  /// macOS 27 changed the ambient toolbar control size. The declaration pins
+  /// regular explicitly so a future SDK default cannot silently grow the
+  /// toolbar past its width budget again.
+  @MainActor
+  func testEveryBridgedToolbarControlUsesRegularControlSize() throws {
+    let rig = try makeRig()
+    defer { rig.tearDown() }
+
+    var controls: [NSControl] = []
+    func collect(from view: NSView) {
+      if let control = view as? NSControl { controls.append(control) }
+      for subview in view.subviews { collect(from: subview) }
+    }
+    for item in rig.toolbar?.items ?? [] {
+      if let view = item.view { collect(from: view) }
+      if let group = item as? NSToolbarItemGroup {
+        for subitem in group.subitems {
+          if let view = subitem.view { collect(from: view) }
+        }
+      }
+    }
+
+    XCTAssertFalse(controls.isEmpty, "premise: the bridged toolbar must expose controls")
+    for control in controls {
+      XCTAssertEqual(
+        control.controlSize, .regular,
+        "\(type(of: control)) inherited the OS toolbar default instead of the pinned regular size")
     }
   }
 

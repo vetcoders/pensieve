@@ -243,13 +243,21 @@ final class DocumentAISessionStore: @unchecked Sendable {
     ProviderFingerprint.digest(documentID)
   }
 
-  private static func defaultFileURL() -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot() {
-      return overrideRoot.appendingPathComponent("document-ai-sessions.json")
+  static func defaultFileURL(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fileManager: FileManager = .default,
+    isTestProcess: Bool? = nil
+  ) -> URL {
+    if let isolationRoot = AppSupportLocation.isolationRoot(
+      environment: environment,
+      fileManager: fileManager,
+      isTestProcess: isTestProcess)
+    {
+      return isolationRoot.appendingPathComponent("document-ai-sessions.json")
     }
     let root =
-      FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-      .first ?? FileManager.default.temporaryDirectory
+      fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+      .first ?? fileManager.temporaryDirectory
     return root.appendingPathComponent("Pensieve", isDirectory: true)
       .appendingPathComponent("document-ai-sessions.json")
   }

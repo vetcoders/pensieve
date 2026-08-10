@@ -559,6 +559,87 @@ final class WindowChromeRecipeTests: XCTestCase {
       WindowChromeRecipe.toolbarChipBezelColor(for: .porcelain))
   }
 
+  /// The mode tooltip repair derives identity from the authored `.view` family
+  /// and stamps it onto the bridge. A same-shape control in another family must
+  /// never inherit the mode names.
+  @MainActor
+  func testModeTooltipRepairRejectsASameShapeImpostor() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.contentView = nil }
+
+    let modePicker = NSSegmentedControl()
+    modePicker.segmentCount = EditorMode.allCases.count
+    modePicker.trackingMode = .selectOne
+
+    let impostor = NSSegmentedControl()
+    impostor.segmentCount = EditorMode.allCases.count
+    impostor.trackingMode = .selectOne
+    impostor.setAccessibilityIdentifier("pensieve.test.sameShapeImpostor")
+
+    let familyIdentifiers: [EditorToolbelt.ToolbarFamilyIdentifier] = [
+      .documentDispatch, .history, .editing, .view, .previewRuntime, .assistants,
+    ]
+    let families = familyIdentifiers.map {
+      ToolbarOverflowFamily(identifier: $0, title: $0.rawValue, commands: [])
+    }
+    let toolbar = NSToolbar(identifier: "pensieve.test.mode-tooltips")
+    let delegate = StubGroupedToolbarDelegate(
+      views: [
+        [impostor], [NSView()], [NSView()], [modePicker], [NSView()], [NSView()],
+      ])
+    toolbar.delegate = delegate
+    window.toolbar = toolbar
+
+    let titles = EditorMode.allCases.map(\.label)
+    XCTAssertTrue(
+      ToolbarOverflowRecipe.assertModeSegmentTooltips(
+        on: window, families: families, titles: titles))
+    XCTAssertEqual(
+      (0..<modePicker.segmentCount).map { modePicker.toolTip(forSegment: $0) ?? "" }, titles)
+    XCTAssertTrue(
+      (0..<impostor.segmentCount).allSatisfy { impostor.toolTip(forSegment: $0) == nil },
+      "a same-shape toolbar control inherited the mode names without the mode picker identity")
+    XCTAssertFalse(
+      ToolbarOverflowRecipe.assertModeSegmentTooltips(
+        on: window, families: families, titles: titles),
+      "a converged identity-targeted tooltip repair must stay silent")
+  }
+
+  /// Sidebar geometry belongs only to managed root surfaces. A panel can carry
+  /// titlebar accessories too, but must never feed its height into a document
+  /// sidebar through a transient SwiftUI attachment.
+  @MainActor
+  func testSidebarChromeInsetSinkIgnoresTransientPanels() {
+    func accessory(height: CGFloat) -> NSTitlebarAccessoryViewController {
+      let controller = NSTitlebarAccessoryViewController()
+      controller.layoutAttribute = .bottom
+      controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: height))
+      return controller
+    }
+
+    let panel = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    panel.addTitlebarAccessoryViewController(accessory(height: 37))
+    defer {
+      panel.contentView = nil
+      panel.close()
+    }
+
+    var reported: [CGFloat] = []
+    let coordinator = SidebarChromeInsetSink.Coordinator()
+    coordinator.onChange = { reported.append($0) }
+    coordinator.observe(panel)
+
+    XCTAssertEqual(reported, [0], "a transient panel must publish no document-sidebar inset")
+  }
+
   // MARK: - Native tab bar
 
   /// `VibrantDark` and `DarkAqua` are the same SIDE. Comparing raw names would
@@ -920,5 +1001,43 @@ private final class StubToolbarDelegate: NSObject, NSToolbarDelegate {
     let item = NSToolbarItem(itemIdentifier: itemIdentifier)
     item.view = itemIdentifier == Self.chipsIdentifier ? views[0] : views[1]
     return item
+  }
+}
+
+/// A toolbar with one explicit item group per authored family. This mirrors the
+/// family boundary the production tooltip repair uses instead of pretending
+/// SwiftUI copied its AX identifier onto the bridged AppKit view.
+@MainActor
+private final class StubGroupedToolbarDelegate: NSObject, NSToolbarDelegate {
+  private let views: [[NSView]]
+  private let identifiers: [NSToolbarItem.Identifier]
+
+  init(views: [[NSView]]) {
+    self.views = views
+    self.identifiers = views.indices.map { NSToolbarItem.Identifier("pensieve.test.group.\($0)") }
+  }
+
+  func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    identifiers
+  }
+
+  func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+    identifiers
+  }
+
+  func toolbar(
+    _ toolbar: NSToolbar,
+    itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+    willBeInsertedIntoToolbar flag: Bool
+  ) -> NSToolbarItem? {
+    guard let index = identifiers.firstIndex(of: itemIdentifier) else { return nil }
+    let group = NSToolbarItemGroup(itemIdentifier: itemIdentifier)
+    group.subitems = views[index].enumerated().map { viewIndex, view in
+      let item = NSToolbarItem(
+        itemIdentifier: NSToolbarItem.Identifier("\(itemIdentifier.rawValue).\(viewIndex)"))
+      item.view = view
+      return item
+    }
+    return group
   }
 }

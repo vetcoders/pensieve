@@ -46,6 +46,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A modal pause keeps the same ref pending and the onboarding gate closed; if
   the pinned host closes between turns, later tabs re-pin to a live restore
   survivor and the final ordering never resurrects the closed window.
+- **One live recovery copy now follows the live buffer instead of its latest
+  window label.** Renaming/rekeying a buffer preserves its recovery identity;
+  actually replacing that buffer releases the claim so the launcher can offer
+  the emergency copy immediately. A stale launcher row cannot Save As or
+  Discard a copy currently owned by a live tab, and converting a file-backed
+  record to an untitled one fails closed if its old source-path sidecar cannot
+  be removed. Moving the selected source file to Trash also releases the live
+  claim before clearing its session, so the one emergency copy is visible now
+  instead of returning only after relaunch. An original-write plus
+  recovery-write failure is reported as one
+  stable condition, so its two internal errors cannot resurrect a dismissed
+  banner on every debounce tick. When auto-save is off and recovery succeeds,
+  Pensieve says the emergency copy is safe and the original is stale instead of
+  silently clearing the prior save failure. If a conscious Discard cannot
+  retire its recovery payload, Clear/quit now stops with the live buffer still
+  dirty instead of closing and letting the claimed copy reappear after restart.
+- **Unattended saves preserve the file around the Markdown.** The atomic
+  replace-existing write publishes a new inode, so Pensieve now carries across
+  the original mode, ownership, ACLs, extended attributes/Finder tags and
+  creation metadata while keeping the replacement content's new modification
+  time. If that metadata cannot be preserved, the original remains untouched.
+- **Live Trash reconciliation now covers ad-hoc files without mistaking a
+  lookalike folder for macOS Trash.** Workspace files still leave Open Files on
+  their watched scan; files opened outside every workspace are checked when
+  Pensieve becomes active again after Finder. The missing-volume fallback only
+  accepts `/Volumes/<volume>/.Trashes/<uid>/...`, not an arbitrary nested folder
+  with the same component names, and healthy files no longer pay an unnecessary
+  per-volume Trash lookup on every scan.
+- **The sandboxed bookmark rewrite keeps the grants it promises.** Fresh
+  bookmarks are resolved before old security scopes are released, and the
+  resolved security-scoped URLs — not plain document URLs — are activated for
+  the surviving roots and tabs. Failed grants are distinguishable and traced.
+  Under XCTest, Recovery, workspace metadata, the search index and document AI
+  state now share one process-scoped temporary Application Support root unless
+  an explicit smoke root is supplied, so a forgotten singleton cannot write to
+  the operator's production data.
 
 - **Saving a recovered draft from the launcher no longer creates a file that
   Pensieve immediately forgets.** The file was written and the recovery copy
@@ -95,14 +131,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until every restored tab has joined and the final tab is selected.
 - **Agent dispatch now says what actually happened.** The green confirmation
   previously read “Dispatched” and ended with a “Done” button even though the
-  receipt only proved that a detached worker had started. It now says **Run
-  started**, explains that closing the sheet or Terminal does not stop the
-  worker, calls the Terminal action a status check, and labels dismissal
-  **Close**. A launch receipt is no longer presented as completed work.
+  receipt was not a completion result. A recorded positive worker PID now says
+  **Run started** without claiming the worker is still alive. A valid run ID
+  whose spawn record misses the bounded wait says **Run accepted · launch
+  unconfirmed**, keeps Reveal/Check Status available and warns against a
+  duplicate dispatch instead of fabricating `exit 1`. A genuine rejection keeps
+  its real exit code and any run/report identifiers. Closing the sheet or
+  Terminal still does not stop a detached run.
 - **The isolated UI smoke no longer turns an early failure into a successful
   exit on the system Bash.** Optional timeout prefixes and toolbar expectations
   are now safe when empty under macOS Bash 3.2, and cleanup preserves the
-  smoke's original exit status instead of replacing or reclassifying it.
+  smoke's original exit status instead of replacing or reclassifying it. INT
+  and TERM now exit as 130/143 even when sent only to the script, and cleanup is
+  installed before `caffeinate` or staging begins so an early error cannot leave
+  a process keeping the operator's display awake. The staged identity also uses
+  its own Keychain service, so smoke cannot read the operator's production AI
+  provider key.
 - **A large document no longer pins the app at full CPU for as long as it stays open.** Once a multi-megabyte note was on screen, the editor kept asking whether its text had changed by reading the entire document and comparing it character by character — twice for every pass the interface made, and it makes them continuously. On a 17 MB file that answer took longer to produce than the interval between the questions, so the app sat at 100% CPU indefinitely, ignoring the keyboard and the mouse, with nothing on screen to explain why. The editor now recognises unchanged text without reading it, so the question costs the same whether the document is a paragraph or a novel. A side effect of the old comparison is fixed with it: text that differed from what was on screen only in how its accents were composed counted as "unchanged" and never reached the editor.
 - **Opening a large document no longer freezes the window.** Reading a multi-megabyte note, colouring it, and rendering its preview all happened in the instant the click was handled, so the app stopped answering for as long as all three took together — no spinner, no title, nothing to say the click had even landed. A document over a megabyte now opens in stages: the window or tab takes the file's name and place immediately and shows an "Opening …" spinner for it, while the file is read in the background and the colouring and preview arrive as they are ready. Documents under that size open exactly as before, in one go. Whatever you do next wins — opening another file, or closing the window, drops the read instead of letting it arrive on top of you — and the document stays read-only until its text is really there, so a ⌘S during the open cannot write an empty file over the one being read.
 - **A very large note no longer freezes a second time, moments after it has opened.** Staging the open put the file on screen quickly, and then — a fraction of a second later — the window locked up again for minutes, with the spinner already gone and the text already showing. Colouring a document happens in pieces small enough to fit between frames, but one pass never went through that: the one that runs after an edit touches a code fence. Opening a file counts as such an edit, so the pass that had just been carefully spread out was queued up again right behind it, whole. On a 17 MB note that is the entire file re-coloured in one go, and the same freeze came back on every restart that restored it, and on every keystroke on a fence line afterwards. That pass is now cut into the same small pieces as the rest: what is on screen is coloured at once and the remainder follows in the background, for code blocks and ordinary prose alike. Notes below a megabyte are coloured in one pass exactly as before.

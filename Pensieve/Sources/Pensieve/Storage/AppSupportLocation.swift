@@ -7,10 +7,12 @@ import Foundation
 /// independently — `RecoveryStore`, `WorkspaceMetadataStore` (which
 /// `WorkspaceCacheStore` builds on), `IndexDatabase` and `DocumentAISession` —
 /// and each carries its own fallback for the day the directory cannot be
-/// resolved. There is no shared base URL to redirect, so the override lives
-/// here and every site consults it in one line before running the code it
-/// always ran. With the variable unset `overrideRoot` returns nil and each
-/// site's behavior is unchanged, byte for byte.
+/// resolved. There is no shared base URL to redirect, so the isolation choice
+/// lives here and every site consults it before running its ordinary fallback.
+/// With the variable unset in a production process, `isolationRoot` returns
+/// nil and each site's behavior is unchanged. Inside XCTest, all four stores
+/// share one process-scoped temporary root so an accidentally reached
+/// production singleton cannot touch the operator's state.
 ///
 /// Why an explicit variable rather than `HOME`: `NSHomeDirectory()` reads
 /// `getpwuid`, not the environment, so
@@ -24,6 +26,7 @@ import Foundation
 enum AppSupportLocation {
   /// Absolute path to use in place of `Application Support/Pensieve`.
   static let overrideEnvironmentKey = "PENSIEVE_SUPPORT_DIR"
+  private static let testProcessNonce = UUID().uuidString
 
   /// The replacement root, or `nil` when the caller should derive its own.
   ///
@@ -61,12 +64,29 @@ enum AppSupportLocation {
       || isXCTestRuntimeLoaded
   }
 
+  /// Shared isolation decision for every store that otherwise derives the
+  /// operator's `Application Support/Pensieve` directory. The explicit smoke
+  /// root wins; an accidental production singleton inside XCTest then falls
+  /// back to one process-scoped temporary root; ordinary production gets nil.
+  static func isolationRoot(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fileManager: FileManager = .default,
+    isTestProcess: Bool? = nil
+  ) -> URL? {
+    if let overrideRoot = overrideRoot(environment: environment, fileManager: fileManager) {
+      return overrideRoot
+    }
+    guard isTestProcess ?? isRunningTests(environment: environment) else { return nil }
+    return testProcessRoot(fileManager: fileManager)
+  }
+
   /// Process-scoped fallback for a test that forgot to inject its own store.
   /// Explicit `PENSIEVE_SUPPORT_DIR` still wins so canary runs can inspect one
   /// known root after the suite exits.
   static func testProcessRoot(fileManager: FileManager = .default) -> URL {
     let root = fileManager.temporaryDirectory.appendingPathComponent(
-      "PensieveTests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+      "PensieveTests-\(ProcessInfo.processInfo.processIdentifier)-\(testProcessNonce)",
+      isDirectory: true)
     try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
     return root
   }

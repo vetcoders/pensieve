@@ -147,5 +147,26 @@ final class TrashLocationTests: XCTestCase {
     XCTAssertFalse(
       TrashLocation.contains(lookalike.appendingPathComponent("note.md")),
       "a directory named .Trash somewhere else is not a Trash the system knows about")
+
+    let nestedVolumeLookalike =
+      scratch
+      .appendingPathComponent("ordinary", isDirectory: true)
+      .appendingPathComponent(".Trashes", isDirectory: true)
+      .appendingPathComponent(String(getuid()), isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: nestedVolumeLookalike, withIntermediateDirectories: true)
+    XCTAssertFalse(
+      TrashLocation.contains(nestedVolumeLookalike.appendingPathComponent("note.md")),
+      "an existing user directory shaped like .Trashes/<uid> is not a system Trash")
+
+    let goneNestedLookalike =
+      scratch
+      .appendingPathComponent("gone", isDirectory: true)
+      .appendingPathComponent(".Trashes", isDirectory: true)
+      .appendingPathComponent(String(getuid()), isDirectory: true)
+      .appendingPathComponent("never-existed.md")
+    XCTAssertFalse(
+      TrashLocation.contains(goneNestedLookalike),
+      "a missing user path shaped like .Trashes/<uid> is not a detached volume Trash")
   }
 }

@@ -30,11 +30,11 @@ final class EditorToolbarWidthBudgetTests: XCTestCase {
   ///   * ~48pt — the sidebar toggle `NavigationSplitView` puts in the leading
   ///     area of the shipping window and this rig has no column to toggle.
   ///
-  /// 1450 − 92 − 300 − 48 ≈ 1010, rounded down to a round 1000. Today's toolbar
-  /// measures 944pt, so a new control has ~56pt of slack — about one and a half
-  /// icon segments. That tightness is deliberate: past this line a new control
-  /// has to be paid for by removing or shrinking another one, not by pushing a
-  /// family behind the chevron.
+  /// 1450 − 92 − 300 − 48 ≈ 1010, rounded down to a round 1000. The regular-size
+  /// toolbar measures 944pt on macOS 26 and 905pt on macOS 27, leaving 56–95pt
+  /// of OS-dependent slack. That tightness is deliberate: past this line a new
+  /// control has to be paid for by removing or shrinking another one, not by
+  /// pushing a family behind the chevron.
   static let itemWidthBudget: CGFloat = 1000
 
   /// The widest window that is still allowed to clip.

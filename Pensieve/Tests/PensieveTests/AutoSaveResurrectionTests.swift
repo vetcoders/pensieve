@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 @testable import Pensieve
@@ -122,6 +123,36 @@ final class AutoSaveResurrectionTests: XCTestCase {
       try FileManager.default.contentsOfDirectory(atPath: folder.path).filter {
         $0.hasPrefix(".pensieve-save-")
       }, [], "the temporary file must not survive the write")
+  }
+
+  /// `RENAME_SWAP` publishes a different inode. The anti-resurrection guarantee
+  /// is not allowed to buy atomic bytes by stripping the metadata attached to
+  /// the user's original file on every autosave.
+  func testTheReplaceOnlyWritePreservesExtendedMetadataAndAdvancesModificationTime() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("tagged.md")
+    try "old".write(to: noteURL, atomically: true, encoding: .utf8)
+    let oldModificationDate = Date(timeIntervalSince1970: 1_600_000_000)
+    try FileManager.default.setAttributes(
+      [
+        .posixPermissions: NSNumber(value: Int16(0o640)),
+        .modificationDate: oldModificationDate,
+      ],
+      ofItemAtPath: noteURL.path)
+    let attributeName = "com.vetcoders.pensieve.autosave-test"
+    let attributeValue = Data("keep this metadata".utf8)
+    try setExtendedAttribute(attributeName, value: attributeValue, at: noteURL)
+
+    try DocumentStore.replaceExistingItem("new", at: noteURL)
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "new")
+    XCTAssertEqual(try extendedAttribute(attributeName, at: noteURL), attributeValue)
+    let attributes = try FileManager.default.attributesOfItem(atPath: noteURL.path)
+    XCTAssertEqual(
+      attributes[.posixPermissions] as? NSNumber, NSNumber(value: Int16(0o640)))
+    XCTAssertGreaterThan(
+      try XCTUnwrap(attributes[.modificationDate] as? Date), oldModificationDate,
+      "copying metadata restored the old mtime and hid the content update")
   }
 
   /// Refusing the write must not cost the user a single character. The buffer
@@ -385,6 +416,63 @@ final class AutoSaveResurrectionTests: XCTestCase {
       try? FileManager.default.removeItem(at: folder)
     }
     return folder
+  }
+
+  private func setExtendedAttribute(_ name: String, value: Data, at url: URL) throws {
+    var failure: Int32 = 0
+    let result = value.withUnsafeBytes { bytes in
+      url.withUnsafeFileSystemRepresentation { path in
+        name.withCString { attributeName in
+          guard let path else {
+            failure = EINVAL
+            return Int32(-1)
+          }
+          let result = setxattr(
+            path, attributeName, bytes.baseAddress, bytes.count, 0, 0)
+          failure = errno
+          return result
+        }
+      }
+    }
+    guard result != 0 else { return }
+    throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+  }
+
+  private func extendedAttribute(_ name: String, at url: URL) throws -> Data {
+    var failure: Int32 = 0
+    let size = url.withUnsafeFileSystemRepresentation { path in
+      name.withCString { attributeName in
+        guard let path else {
+          failure = EINVAL
+          return Int(-1)
+        }
+        let result = getxattr(path, attributeName, nil, 0, 0, 0)
+        failure = errno
+        return result
+      }
+    }
+    guard size >= 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+    }
+    var data = Data(count: size)
+    let read = data.withUnsafeMutableBytes { bytes in
+      url.withUnsafeFileSystemRepresentation { path in
+        name.withCString { attributeName in
+          guard let path else {
+            failure = EINVAL
+            return Int(-1)
+          }
+          let result = getxattr(path, attributeName, bytes.baseAddress, bytes.count, 0, 0)
+          failure = errno
+          return result
+        }
+      }
+    }
+    guard read >= 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+    }
+    data.count = read
+    return data
   }
 
   @MainActor

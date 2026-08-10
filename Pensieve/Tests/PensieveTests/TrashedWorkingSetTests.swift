@@ -125,6 +125,26 @@ final class TrashedWorkingSetTests: XCTestCase {
       "a bookmark that followed its file to a live location still describes an open document")
   }
 
+  func testPruningATrashedFolderRetiresEveryBookmarkedDocumentInsideIt() throws {
+    let folder = outside.appendingPathComponent("ThrownFolder", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let firstURL = try writeNote("first.md", in: folder)
+    let secondURL = try writeNote("second.md", in: folder)
+    let store = makeBookmarkStore()
+    try store.persistFile(url: firstURL, into: AppState())
+    try store.persistFile(url: secondURL, into: AppState())
+
+    try trash(folder)
+
+    let pruned = store.pruneTrashedFiles()
+    XCTAssertEqual(
+      Set(pruned.compactMap(\.originURL).map(BookmarkStore.identityPath)),
+      Set([firstURL, secondURL].map(BookmarkStore.identityPath)),
+      "the assertion follows the same /private alias fold as bookmark identity")
+    XCTAssertEqual(persistedFileBookmarkCount(), 0)
+    XCTAssertTrue(restoredFileURLs().isEmpty)
+  }
+
   // MARK: - Live working set
 
   /// Pensieve's own `Move to Trash`. The in-memory row is dropped by
@@ -149,6 +169,36 @@ final class TrashedWorkingSetTests: XCTestCase {
       "and leaves the persisted working set, so the next launch cannot resurrect it")
   }
 
+  /// Moving the selected file to Trash clears its live session before the
+  /// owning window teardown sees it. The recovery payload must survive, but its
+  /// in-process claim must not: otherwise the launcher hides the only durable
+  /// copy until relaunch and presents it later as a returning ghost.
+  func testTrashingTheSelectedFileReleasesItsRecoveryClaimBeforeClearingTheSession() async throws {
+    let adHocURL = try writeNote("claimed.md", in: outside)
+    let harness = try makeHarness()
+    let ref = try XCTUnwrap(
+      harness.folderManager.registerOpenFile(url: adHocURL, into: harness.appState))
+    harness.appState.selectedDocumentID = ref.id
+    harness.appState.documentSession.load(document: ref, text: "saved")
+    harness.appState.documentSession.isDirty = true
+    let draft = try harness.recoveryStore.saveDraft(
+      id: nil,
+      title: adHocURL.lastPathComponent,
+      text: "unsaved edit",
+      sourceURL: adHocURL)
+    harness.appState.documentSession.recoveryID = draft.id
+
+    XCTAssertTrue(harness.recoveryStore.isDraftOpen(id: draft.id), "precondition: live claim")
+
+    let didTrash = await harness.folderManager.moveToTrash(url: adHocURL, into: harness.appState)
+
+    XCTAssertTrue(didTrash)
+    XCTAssertNil(harness.appState.documentSession.recoveryID)
+    XCTAssertFalse(harness.recoveryStore.isDraftOpen(id: draft.id))
+    XCTAssertEqual(harness.recoveryStore.unclaimedDrafts().map(\.id), [draft.id])
+    XCTAssertEqual(harness.recoveryStore.loadDrafts().map(\.text), ["unsaved edit"])
+  }
+
   /// Trashed in Finder, behind the app's back. The next scan commit — here the
   /// explicit refresh, in the app the debounced watcher refresh — is where the
   /// live working set finds out, instead of carrying a dead row until relaunch.
@@ -167,6 +217,32 @@ final class TrashedWorkingSetTests: XCTestCase {
 
     XCTAssertTrue(harness.openFileURLs.isEmpty)
     XCTAssertTrue(restoredFileURLs().isEmpty)
+  }
+
+  /// An ad-hoc file can be the entire working set, with no workspace root for
+  /// FSEvents to watch. Returning from Finder must still retire a file thrown
+  /// away behind Pensieve's back during the same running process.
+  func testBecomingActiveReconcilesATrashedAdHocFileWithoutAWorkspaceRoot() async throws {
+    let adHocURL = try writeNote("activation-ad-hoc.md", in: outside)
+    let harness = try makeHarness()
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: adHocURL, into: harness.appState))
+    XCTAssertTrue(harness.appState.workspaceRoots.isEmpty)
+
+    let controller = AppController(
+      appState: harness.appState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      indexDatabase: harness.indexDatabase)
+    try trash(adHocURL)
+
+    NotificationCenter.default.post(
+      name: NSApplication.didBecomeActiveNotification,
+      object: NSApp)
+    await Task.yield()
+
+    XCTAssertTrue(harness.openFileURLs.isEmpty)
+    XCTAssertTrue(restoredFileURLs().isEmpty)
+    withExtendedLifetime(controller) {}
   }
 
   /// A refresh that finds nothing wrong must leave the working set exactly as it
@@ -317,6 +393,8 @@ final class TrashedWorkingSetHarness {
   let appState = AppState()
   let folderManager: FolderManager
   let documentStore: DocumentStore
+  let indexDatabase: IndexDatabase
+  let recoveryStore: RecoveryStore
   private let workspace: URL
 
   init(workspace: URL, support: URL, bookmarkStore: BookmarkStore, trashDirectory: URL) throws {
@@ -325,17 +403,23 @@ final class TrashedWorkingSetHarness {
 
     let indexDatabase = IndexDatabase(
       databaseURL: support.appendingPathComponent("index.db", isDirectory: false))
+    let documentWindowRegistry = DocumentWindowRegistry()
+    let recoveryStore = RecoveryStore(
+      directoryURL: support.appendingPathComponent("Recovery", isDirectory: true))
+    self.indexDatabase = indexDatabase
+    self.recoveryStore = recoveryStore
     self.documentStore = DocumentStore(
       indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
-      recoveryStore: RecoveryStore(
-        directoryURL: support.appendingPathComponent("Recovery", isDirectory: true))
+      recoveryStore: recoveryStore
     )
     self.folderManager = FolderManager(
       metadataStore: WorkspaceMetadataStore(
         metadataURL: support.appendingPathComponent("workspace.json", isDirectory: false)),
       indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
+      recoveryStore: recoveryStore,
+      documentWindowRegistry: documentWindowRegistry,
       workspaceSubstrate: WorkspaceSubstrate(store: WorkspaceCacheStore(baseDirectory: support)),
       recycleItems: { urls, completion in
         var moved: [URL: URL] = [:]

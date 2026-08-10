@@ -224,6 +224,19 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertNil(try store.loadAPIKey())
   }
 
+  func testKeychainServiceCanBeIsolatedForAStagedRuntime() {
+    XCTAssertEqual(
+      KeychainProviderAPIKeyStore.defaultService(environment: [:]),
+      KeychainProviderAPIKeyStore.service)
+    XCTAssertEqual(
+      KeychainProviderAPIKeyStore.defaultService(
+        environment: [
+          KeychainProviderAPIKeyStore.serviceEnvironmentKey:
+            "io.vetcoders.pensieve.smoke.completion-provider"
+        ]),
+      "io.vetcoders.pensieve.smoke.completion-provider")
+  }
+
   func testWhitespaceEndpointOrModelNeverTouchesEnvironment() {
     let defaults = makeDefaults()
     let environment = InMemoryProviderEnvironment()

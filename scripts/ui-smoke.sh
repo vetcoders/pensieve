@@ -13,10 +13,13 @@ SOURCE_APP_PATH="dist/Pensieve.app"
 APP_PATH=""
 APP_NAME="PensieveSmoke"
 APP_ID="io.vetcoders.pensieve.smoke"
+SMOKE_KEYCHAIN_SERVICE="${APP_ID}.completion-provider"
 SMOKE_SIGNING_MODE=""
 COLD_ONLY=0
 MENU_RESTORED_ONLY=0
 EXTRA_EXPECTED_IDENTIFIERS=()
+CAFFEINATE_PID=""
+SMOKE_ROOT=""
 
 # Saved-state isolation probe state. The probe deliberately asks AppKit to keep
 # windows while telling Pensieve NOT to restore its working set. A relaunch must
@@ -185,7 +188,10 @@ disarm_pensieve_restore_default() {
 # LSEnvironment; repeating it here means a launch stays isolated even if
 # LaunchServices ever declines to honor LSEnvironment for a staged bundle.
 open_smoke_app() {
-  open --env "PENSIEVE_SUPPORT_DIR=$SMOKE_SUPPORT" "$@"
+  open \
+    --env "PENSIEVE_SUPPORT_DIR=$SMOKE_SUPPORT" \
+    --env "PENSIEVE_KEYCHAIN_SERVICE=$SMOKE_KEYCHAIN_SERVICE" \
+    "$@"
 }
 
 plist_set_string() {
@@ -198,7 +204,7 @@ plist_set_string() {
 # Build the isolated bundle the whole run drives: a copy of the app under test
 # with a smoke-only identity.
 #
-# Three things have to change together, because each one closes a different
+# Four things have to change together, because each one closes a different
 # leak. The EXECUTABLE name is what the kernel reports as the process name, so
 # `pkill -x` / `pgrep -x` / `tell process` resolve the smoke and can never reach
 # the operator's running app. The BUNDLE IDENTIFIER is what cfprefsd keys
@@ -208,6 +214,8 @@ plist_set_string() {
 # Application Support derivations, which the other two cannot reach:
 # NSHomeDirectory() reads getpwuid, so FileManager resolves the operator's real
 # ~/Library/Application Support no matter what identity the bundle carries.
+# PENSIEVE_KEYCHAIN_SERVICE gives the staged app a separate provider-key query,
+# so smoke cannot even read the operator's production completion credential.
 #
 # The override is written into the staged Info.plist as LSEnvironment (the app
 # gets it however LaunchServices starts it) and passed again on each `open
@@ -240,6 +248,9 @@ stage_smoke_app() {
     || die "could not add LSEnvironment to $plist"
   /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PENSIEVE_SUPPORT_DIR string $support" "$plist" \
     >/dev/null || die "could not set PENSIEVE_SUPPORT_DIR in $plist"
+  /usr/libexec/PlistBuddy \
+    -c "Add :LSEnvironment:PENSIEVE_KEYCHAIN_SERVICE string $SMOKE_KEYCHAIN_SERVICE" "$plist" \
+    >/dev/null || die "could not set PENSIEVE_KEYCHAIN_SERVICE in $plist"
 
   # Every edit above broke the inherited seal, so the copy has to be signed
   # again or macOS refuses to launch it. Developer ID when the same identity
@@ -590,23 +601,15 @@ done
 
 [[ -d "$SOURCE_APP_PATH" ]] || die "App bundle not found: $SOURCE_APP_PATH (run make release-local or make release first)"
 
-# Real AX clicks require the display to be awake; a sleeping display
-# (displaysleep) makes popover clicks land randomly, so wake it now and
-# hold it awake for the duration of the smoke to keep this deterministic
-# on an unattended machine.
-caffeinate -u -t 2 || true
-caffeinate -dsu &
-CAFFEINATE_PID=$!
-
-SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURCE_APP_PATH")"
-SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
-SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
-SMOKE_EXTERNAL_DOCUMENT="$SMOKE_ROOT/external-after-zero-windows.md"
-SMOKE_SUPPORT="$SMOKE_ROOT/support"
+# Install cleanup before starting any process or creating any run-owned path.
+# A failure while canonicalizing SOURCE_APP_PATH or allocating SMOKE_ROOT must
+# not strand a caffeinate process that keeps the operator's display awake.
 cleanup() {
   local cleanup_status=0
   local step_status=0
-  kill "$CAFFEINATE_PID" 2>/dev/null || true
+  if [[ -n "${CAFFEINATE_PID:-}" ]]; then
+    kill "$CAFFEINATE_PID" 2>/dev/null || true
+  fi
   # Every exit path -- success, assertion failure, or an error raised inside
   # osascript -- must leave zero live smoke processes, otherwise the survivor
   # becomes the orphan that corrupts the next run's census.
@@ -643,11 +646,13 @@ cleanup() {
 # Bash 3.2 can replace a failing main-script status with the final successful
 # command from an EXIT trap. Preserve the original status explicitly: a smoke
 # that aborts before launching the app must never be reported as green merely
-# because cleanup succeeded.
+# because cleanup succeeded. An explicit signal trap also prevents a SIGINT or
+# SIGTERM delivered to this script alone (rather than its process group) from
+# falling through as a successful run.
 on_exit() {
   local original_status="$?"
   local cleanup_status=0
-  trap - EXIT
+  trap - EXIT INT TERM
   set +e
   cleanup
   cleanup_status=$?
@@ -657,6 +662,22 @@ on_exit() {
   exit "$cleanup_status"
 }
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Real AX clicks require the display to be awake; a sleeping display
+# (displaysleep) makes popover clicks land randomly, so wake it now and
+# hold it awake for the duration of the smoke to keep this deterministic
+# on an unattended machine.
+caffeinate -u -t 2 || true
+caffeinate -dsu &
+CAFFEINATE_PID=$!
+
+SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURCE_APP_PATH")"
+SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
+SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
+SMOKE_EXTERNAL_DOCUMENT="$SMOKE_ROOT/external-after-zero-windows.md"
+SMOKE_SUPPORT="$SMOKE_ROOT/support"
 
 mkdir -p "$SMOKE_SUPPORT"
 APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
@@ -700,7 +721,7 @@ BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/C
 EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$APP_NAME"
 log "source bundle=$SOURCE_APP_PATH commit=$BUNDLE_COMMIT version=$BUNDLE_VERSION build=$BUNDLE_BUILD"
 log "staged bundle=$APP_PATH executable=$EXECUTABLE_PATH id=$APP_ID signature=$SMOKE_SIGNING_MODE"
-log "isolated support dir=$SMOKE_SUPPORT (PENSIEVE_SUPPORT_DIR)"
+log "isolated support dir=$SMOKE_SUPPORT keychain=$SMOKE_KEYCHAIN_SERVICE"
 
 if [[ $MENU_RESTORED_ONLY -eq 1 ]]; then
   run_saved_state_isolation_probe
@@ -867,6 +888,11 @@ on settledToolbarCensus(appName, expectedIdentifiers, excludedIdentifiers, timeo
     end if
     delay 0.1
   end repeat
+  if (count of latestCensus) is 0 then
+    -- Machine-readable classification for the bash-side WindowServer check.
+    -- Keep it independent of the human error prose below.
+    error "PENSIEVE_AX_EMPTY_CENSUS"
+  end if
   if (count of latestUnexpected) > 0 then
     error "Toolbar census unexpectedly exposes: " & my joined(latestUnexpected, ", ") & ¬
       "; observed: " & my joined(latestCensus, ", ")
@@ -984,7 +1010,7 @@ tell application "System Events"
 end tell
 delay 0.5
 
-assertMenuItem(appName, "File", "New File…")
+assertMenuItem(appName, "File", "New File")
 assertMenuItem(appName, "File", "Open File…")
 assertMenuItem(appName, "File", "Open Recent")
 assertMenuItem(appName, "File", "Open Folder…")
@@ -1115,7 +1141,7 @@ tell application "System Events"
       tell menu bar item "File"
         click
         delay 0.2
-        click menu item "New File…" of menu 1
+        click menu item "New File" of menu 1
       end tell
     end tell
     delay 0.5
@@ -1124,17 +1150,14 @@ tell application "System Events"
     log "AX_CENSUS_UNTITLED=" & my joined(untitledCensus, ",")
 
     -- A toolbar census can prove the editing chrome exists while missing the
-    -- product failure this probe is for: a native Untitled tab whose body is
-    -- still the launcher. Resolve the actual NSTextView, make it first responder,
-    -- type through the real responder chain, and require the model-backed AX
-    -- value to change. `click editorElement` is not a physical mouse click:
-    -- System Events asks the element for AXPress, which NSTextView does not
-    -- implement on macOS 27, so it can leave the previous control focused even
-    -- though normal in-app clicking works.
+    -- product failures this probe is for: a native Untitled tab whose body is
+    -- still the launcher, or an editor that exists but did not receive the
+    -- first-responder handoff promised by New File/New Tab. Check product-owned
+    -- focus BEFORE the smoke mutates anything; setting AXFocused here would
+    -- manufacture the state under test and mask the regression.
     set editorElement to my windowElementByIdentifier(appName, "pensieve.editor", 50)
-    set focused of editorElement to true
     if focused of editorElement is not true then
-      error "Untitled editor refused first-responder focus"
+      error "New File did not move first-responder focus to the Untitled editor"
     end if
     set witnessText to "pensieve-new-tab-smoke-witness"
     keystroke witnessText
@@ -1187,7 +1210,7 @@ if [[ $ax_census_status -ne 0 ]]; then
   # session) -- an environment condition, not a product bug. A partial census
   # (some identifiers observed, some missing) is never this case and always
   # stays a real FAIL.
-  ax_census_env_pattern='observed:  \(-2700\)|observed: ;'
+  ax_census_env_pattern='PENSIEVE_AX_EMPTY_CENSUS'
   if [[ "$ax_census_output" =~ $ax_census_env_pattern ]]; then
     window_server_state="$(dump_window_server_state)"
     printf '%s\n' "$window_server_state"

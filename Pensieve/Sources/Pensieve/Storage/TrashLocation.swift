@@ -47,11 +47,13 @@ enum TrashLocation {
       (try? FileManager.default.getRelationship(
         &relationship,
         of: .trashDirectory,
-        in: .userDomainMask,
+        // Foundation's contract uses an empty mask here so it can choose the
+        // Trash appropriate for the item's own volume.
+        in: [],
         toItemAt: standardized
       )) != nil
-    if relationshipIsKnown, relationship == .contains || relationship == .same {
-      return true
+    if relationshipIsKnown {
+      return relationship == .contains || relationship == .same
     }
 
     if trashDirectories(appropriateFor: standardized).contains(where: { trash in
@@ -73,14 +75,17 @@ enum TrashLocation {
   private nonisolated static func isInsideAVolumeTrash(_ url: URL) -> Bool {
     let components = url.pathComponents
     let ownTrashDirectory = String(getuid())
-    for (index, component) in components.enumerated() where component == ".Trashes" {
-      let uidIndex = index + 1
-      guard uidIndex < components.count, components[uidIndex] == ownTrashDirectory else {
-        continue
-      }
-      return true
-    }
-    return false
+    // A detached external volume can no longer be queried, but macOS's mount
+    // layout still gives one narrow, trustworthy fallback:
+    // `/Volumes/<volume>/.Trashes/<uid>/…`. Do not accept the same components
+    // at arbitrary depth — users may have an ordinary directory with that name.
+    guard components.count >= 6,
+      components[0] == "/",
+      components[1] == "Volumes",
+      components[3] == ".Trashes",
+      components[4] == ownTrashDirectory
+    else { return false }
+    return true
   }
 
   /// Trash directories worth comparing a path against: the home Trash plus, when

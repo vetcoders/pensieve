@@ -159,7 +159,7 @@ private struct ActivePensieveCommands: Commands {
 
     // File menu
     CommandGroup(replacing: .newItem) {
-      Button("New File…") {
+      Button("New File") {
         controller.createUntitledDocument()
       }
       .keyboardShortcut("n", modifiers: [.command])

@@ -119,7 +119,8 @@ enum ToolbarOverflowRecipe {
     controller.attach(
       to: window, families: families, modeSegmentTitles: modeSegmentTitles)
 
-    var corrected = assertModeSegmentTooltips(on: window, titles: modeSegmentTitles)
+    var corrected = assertModeSegmentTooltips(
+      on: window, families: families, titles: modeSegmentTitles)
     for (group, family) in zip(groups, families) where !family.commands.isEmpty {
       if controller.apply(family, to: group) { corrected = true }
     }
@@ -136,20 +137,57 @@ enum ToolbarOverflowRecipe {
   /// nothing else survives. So the tooltips are written on the AppKit side, the
   /// same place the chip tint has to be written for the same kind of reason.
   ///
-  /// Matched by tracking mode and segment count, the same discriminator
-  /// `WindowChromeRecipe.isToggleChipGroup` uses: the mode picker is this
-  /// toolbar's only `.selectOne` control.
+  /// SwiftUI exposes the authored AX identifier to Accessibility clients but
+  /// does not copy it onto the bridged `NSSegmentedControl`'s AppKit property
+  /// (measured: `accessibilityIdentifier()` is empty). Locate the control inside
+  /// the authored `.view` toolbar family instead, then stamp the AppKit identity
+  /// for later repairs. A same-shape control in another family can therefore
+  /// never inherit the mode names merely because it looks similar.
   @MainActor
   @discardableResult
-  static func assertModeSegmentTooltips(on window: NSWindow, titles: [String]) -> Bool {
+  static func assertModeSegmentTooltips(
+    on window: NSWindow,
+    families: [ToolbarOverflowFamily],
+    titles: [String]
+  ) -> Bool {
+    guard let toolbar = window.toolbar else { return false }
+    let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
+    guard groups.count == families.count,
+      let viewFamilyIndex = families.firstIndex(where: { $0.identifier == .view })
+    else { return false }
+
+    var controls: [NSSegmentedControl] = []
+    func collect(from view: NSView) {
+      if let control = view as? NSSegmentedControl { controls.append(control) }
+      for subview in view.subviews { collect(from: subview) }
+    }
+    let viewGroup = groups[viewFamilyIndex]
+    if let view = viewGroup.view { collect(from: view) }
+    for subitem in viewGroup.subitems {
+      if let view = subitem.view { collect(from: view) }
+    }
+
+    let candidates = controls.filter {
+      $0.trackingMode == .selectOne && $0.segmentCount == titles.count
+    }
+    let identified = candidates.filter {
+      $0.accessibilityIdentifier() == EditorToolbelt.modePickerIdentifier
+    }
     var corrected = false
-    for control in WindowChromeRecipe.toolbarSegmentedControls(in: window)
-    where control.trackingMode == .selectOne && control.segmentCount == titles.count {
-      for (index, title) in titles.enumerated()
-      where control.toolTip(forSegment: index) != title {
-        control.setToolTip(title, forSegment: index)
-        corrected = true
-      }
+    let control: NSSegmentedControl
+    if identified.count == 1 {
+      control = identified[0]
+    } else {
+      guard identified.isEmpty, candidates.count == 1 else { return false }
+      control = candidates[0]
+      control.setAccessibilityIdentifier(EditorToolbelt.modePickerIdentifier)
+      corrected = true
+    }
+
+    for (index, title) in titles.enumerated()
+    where control.toolTip(forSegment: index) != title {
+      control.setToolTip(title, forSegment: index)
+      corrected = true
     }
     return corrected
   }
@@ -189,9 +227,10 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// the difference is only that the editor's representable re-runs often enough
   /// to hide it, and this pass does not.
   ///
-  /// `didUpdate` fires on every window update cycle, so the handler stays a
-  /// pointer-cheap identifier check and rebuilds nothing while the forms are
-  /// still ours.
+  /// `didUpdate` fires on every window update cycle. The menu-form half stays a
+  /// pointer-cheap identifier check; the tooltip half walks the toolbar's small
+  /// view-backed control tree and only writes when a mode segment lost its
+  /// authored name. Neither half rebuilds a converged toolbar.
   func attach(
     to window: NSWindow,
     families: [ToolbarOverflowFamily],
@@ -224,10 +263,9 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// acts on exactly the state the operator is looking at.
   @discardableResult
   func repairClobberedBridge() -> Bool {
-    guard let window else { return false }
+    guard let window, let toolbar = window.toolbar else { return false }
     var repaired = ToolbarOverflowRecipe.assertModeSegmentTooltips(
-      on: window, titles: modeSegmentTitles)
-    guard let toolbar = window.toolbar else { return repaired }
+      on: window, families: families, titles: modeSegmentTitles)
     let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
     guard groups.count == families.count, groups.count == wantedIdentifiers.count,
       !groups.isEmpty

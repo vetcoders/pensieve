@@ -91,6 +91,75 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
     XCTAssertTrue(cleared.fileURLs.isEmpty)
   }
 
+  /// `replaceWorkspace` is the destructive rewrite used by root removal. It
+  /// must drop the old grants only after it has minted AND resolved every new
+  /// bookmark, then start access on the resolved URLs carrying those grants —
+  /// never on plain URLs reconstructed from their paths.
+  func testWorkspaceReplacementActivatesURLsResolvedFromFreshBookmarks() throws {
+    let noteURL = folder.appendingPathComponent("replacement.md")
+    try "replacement".write(to: noteURL, atomically: true, encoding: .utf8)
+    var started: [URL] = []
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      startSecurityScopedAccess: { url in
+        started.append(url)
+        return true
+      },
+      stopSecurityScopedAccess: { stopped.append($0) }
+    )
+
+    try store.replaceWorkspace(rootURLs: [folder], fileURLs: [noteURL], into: AppState())
+
+    let rootData = try XCTUnwrap(
+      (defaults.array(forKey: "Pensieve.workspace.rootBookmarks") as? [Data])?.first)
+    let fileData = try XCTUnwrap(
+      (defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data])?.first)
+    let expected = try [rootData, fileData].map { data -> URL in
+      var stale = false
+      return try URL(
+        resolvingBookmarkData: data,
+        options: [.withSecurityScope],
+        relativeTo: nil,
+        bookmarkDataIsStale: &stale)
+    }
+
+    XCTAssertEqual(started, expected)
+    XCTAssertEqual(store.activeSecurityScopeCount, 2)
+    XCTAssertEqual(store.grantedSecurityScopeCount, 2)
+
+    store.clear(into: AppState())
+    XCTAssertEqual(stopped, expected, "stop must balance the exact resolved URLs that were started")
+    XCTAssertEqual(store.activeSecurityScopeCount, 0)
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0)
+  }
+
+  func testFailedSecurityScopeStartIsTrackedButNotCountedAsAGrant() throws {
+    let noteURL = folder.appendingPathComponent("ungranted.md")
+    try "ungranted".write(to: noteURL, atomically: true, encoding: .utf8)
+    var attempted: [URL] = []
+    var stopped: [URL] = []
+    let store = BookmarkStore(
+      defaults: defaults,
+      startSecurityScopedAccess: { url in
+        attempted.append(url)
+        return false
+      },
+      stopSecurityScopedAccess: { stopped.append($0) }
+    )
+
+    try store.persistFile(url: noteURL, into: AppState())
+
+    XCTAssertEqual(attempted, [noteURL])
+    XCTAssertEqual(store.activeSecurityScopeCount, 1, "the failed attempt remains deduplicated")
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0, "a failed start is not a live grant")
+
+    store.removeFile(url: noteURL)
+    XCTAssertEqual(store.activeSecurityScopeCount, 0)
+    XCTAssertEqual(store.grantedSecurityScopeCount, 0)
+    XCTAssertTrue(stopped.isEmpty, "a failed start must never receive an unmatched stop")
+  }
+
   func testRestoreDropsBookmarksWhoseTargetsVanished() throws {
     let ghostFolder = folder.appendingPathComponent("ghost", isDirectory: true)
     try FileManager.default.createDirectory(at: ghostFolder, withIntermediateDirectories: true)

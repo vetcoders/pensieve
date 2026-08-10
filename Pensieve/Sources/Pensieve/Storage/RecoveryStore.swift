@@ -64,14 +64,20 @@ final class RecoveryStore {
   /// draft except `deleteDraft`, which only ever runs off one of those actions.
   private let directoryURL: URL
   private let fileManager: FileManager
+  private let removeItem: (URL) throws -> Void
 
   /// Drafts a window is holding open and editing RIGHT NOW. They are not
   /// "unhandled", so no other launcher surface may offer them: two buffers on
   /// one recovery ID autosave over each other.
   private var openDraftIDs: Set<UUID> = []
 
-  init(directoryURL: URL? = nil, fileManager: FileManager = .default) {
+  init(
+    directoryURL: URL? = nil,
+    fileManager: FileManager = .default,
+    removeItem: ((URL) throws -> Void)? = nil
+  ) {
     self.fileManager = fileManager
+    self.removeItem = removeItem ?? { try fileManager.removeItem(at: $0) }
     self.directoryURL = directoryURL ?? Self.defaultDirectoryURL(fileManager: fileManager)
   }
 
@@ -100,8 +106,11 @@ final class RecoveryStore {
         to: sourceURLSidecar(for: id), options: .atomic)
     } else {
       // Reusing a recovery ID after the buffer became a normal untitled draft
-      // must not retain an older file association.
-      try? fileManager.removeItem(at: sourceURLSidecar(for: id))
+      // must not retain an older file association. This is required metadata,
+      // not cleanup: if the stale sidecar cannot be removed, publishing new
+      // untitled bytes would later offer "Save to Original" for the WRONG file.
+      // Fail before touching the visible payload instead.
+      try removeItemIfPresent(at: sourceURLSidecar(for: id))
     }
     try text.write(to: url, atomically: true, encoding: .utf8)
     try? Data(resolvedTitle.utf8).write(to: titleURL(for: id), options: .atomic)
@@ -135,20 +144,47 @@ final class RecoveryStore {
       .sorted { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
   }
 
-  func deleteDraft(id: UUID?) {
-    guard let id else { return }
+  /// Retires a recovery record only after its visible payload is confirmed gone.
+  ///
+  /// The `.md` file is the launcher's source of truth. If removing it fails, the
+  /// draft still exists and remains claimed by the live buffer that owns it; the
+  /// title/source sidecars are left untouched so a later retry cannot turn the
+  /// record into an ambiguous ghost. Sidecars become invisible once the payload
+  /// is gone, so their cleanup is best effort and logged rather than allowed to
+  /// turn a completed retirement back into a user-visible failure.
+  @discardableResult
+  func deleteDraft(id: UUID?) -> Bool {
+    guard let id else { return true }
+
+    do {
+      try removeItemIfPresent(at: draftURL(for: id))
+    } catch {
+      NSLog("Could not retire recovery draft %@: %@", id.uuidString, error.localizedDescription)
+      return false
+    }
+
     openDraftIDs.remove(id)
-    removeDraftFiles(id: id)
+    removeSidecarIfPresent(at: titleURL(for: id), draftID: id)
+    removeSidecarIfPresent(at: sourceURLSidecar(for: id), draftID: id)
+    return true
   }
 
-  /// Drops BOTH files a draft is made of. Removing only the `.md` leaves the
-  /// `.title` sidecar behind — invisible (the directory listing only reads
-  /// `.md`) and never collected by anything, so the recovery directory grows a
-  /// permanent orphan per retired draft.
-  private func removeDraftFiles(id: UUID) {
-    try? fileManager.removeItem(at: draftURL(for: id))
-    try? fileManager.removeItem(at: titleURL(for: id))
-    try? fileManager.removeItem(at: sourceURLSidecar(for: id))
+  private func removeSidecarIfPresent(at url: URL, draftID: UUID) {
+    do {
+      try removeItemIfPresent(at: url)
+    } catch {
+      NSLog(
+        "Could not remove recovery sidecar %@ for %@: %@", url.lastPathComponent,
+        draftID.uuidString, error.localizedDescription)
+    }
+  }
+
+  private func removeItemIfPresent(at url: URL) throws {
+    do {
+      try removeItem(url)
+    } catch let error as CocoaError where error.code == .fileNoSuchFile {
+      // No old association is the desired state.
+    }
   }
 
   // MARK: - Claim tracking
@@ -247,13 +283,12 @@ final class RecoveryStore {
     environment: [String: String] = ProcessInfo.processInfo.environment,
     isTestProcess: Bool? = nil
   ) -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot(
-      environment: environment, fileManager: fileManager)
+    if let isolationRoot = AppSupportLocation.isolationRoot(
+      environment: environment,
+      fileManager: fileManager,
+      isTestProcess: isTestProcess)
     {
-      return overrideRoot.appendingPathComponent("Recovery", isDirectory: true)
-    }
-    if isTestProcess ?? AppSupportLocation.isRunningTests(environment: environment) {
-      return AppSupportLocation.testProcessRoot(fileManager: fileManager)
+      return isolationRoot
         .appendingPathComponent("Recovery", isDirectory: true)
     }
     let appSupport =

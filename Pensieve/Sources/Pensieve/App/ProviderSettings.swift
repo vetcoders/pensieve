@@ -84,14 +84,24 @@ enum ProviderSettingsError: LocalizedError {
 
 struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
   static let service = "io.vetcoders.pensieve.completion-provider"
+  static let serviceEnvironmentKey = "PENSIEVE_KEYCHAIN_SERVICE"
   static let account = "api-key"
 
   let service: String
   let account: String
 
-  init(service: String = Self.service, account: String = Self.account) {
-    self.service = service
+  init(service: String? = nil, account: String = Self.account) {
+    self.service = service ?? Self.defaultService()
     self.account = account
+  }
+
+  static func defaultService(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) -> String {
+    guard let override = environment[serviceEnvironmentKey], !override.isEmpty else {
+      return service
+    }
+    return override
   }
 
   func loadAPIKey() throws -> String? {

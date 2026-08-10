@@ -9,29 +9,53 @@ final class BookmarkStore {
   private let rootBookmarksKey = "Pensieve.workspace.rootBookmarks"
   private let fileBookmarksKey = "Pensieve.workspace.fileBookmarks"
 
-  /// One live security-scoped grant: the URL access was actually STARTED on
-  /// (start/stop must balance on the same object) and whether the start
-  /// succeeded. Filed under `identityPath` — see `stopAccess(to:)`.
+  /// One tracked security-scope access attempt: the URL access was actually
+  /// STARTED on (start/stop must balance on the same object) and whether the
+  /// start succeeded. Filed under `identityPath` — see `stopAccess(to:)`.
   private struct ActiveAccess {
     let exactURL: URL
     let wasGranted: Bool
   }
 
+  /// A freshly minted persisted blob together with the URL that carries the
+  /// security-scope extension obtained by resolving that exact blob.
+  private struct WorkspaceBookmark {
+    let data: Data
+    let resolvedURL: URL
+  }
+
   private var activeAccess: [String: ActiveAccess] = [:]
 
-  /// How many security-scoped grants this store is still holding. A leaked
-  /// grant has no observable effect until the process exits, so this is the
-  /// only seam a test can measure the balance through.
+  /// How many access attempts this store is still tracking, including URLs
+  /// that did not need or could not obtain a security-scoped grant.
   var activeSecurityScopeCount: Int { activeAccess.count }
 
+  /// How many security-scoped grants this store actually obtained and still
+  /// has to balance. Keeping this separate from `activeSecurityScopeCount`
+  /// makes a failed `startAccessingSecurityScopedResource()` observable rather
+  /// than indistinguishable from a live App Store sandbox grant.
+  var grantedSecurityScopeCount: Int {
+    activeAccess.values.count(where: \.wasGranted)
+  }
+
   private let trashMembership: (URL) -> Bool
+  private let startSecurityScopedAccess: (URL) -> Bool
+  private let stopSecurityScopedAccess: (URL) -> Void
 
   init(
     defaults: UserDefaults = .standard,
-    trashMembership: @escaping (URL) -> Bool = TrashLocation.contains
+    trashMembership: @escaping (URL) -> Bool = TrashLocation.contains,
+    startSecurityScopedAccess: @escaping (URL) -> Bool = {
+      $0.startAccessingSecurityScopedResource()
+    },
+    stopSecurityScopedAccess: @escaping (URL) -> Void = {
+      $0.stopAccessingSecurityScopedResource()
+    }
   ) {
     self.defaults = defaults
     self.trashMembership = trashMembership
+    self.startSecurityScopedAccess = startSecurityScopedAccess
+    self.stopSecurityScopedAccess = stopSecurityScopedAccess
   }
 
   /// Whether `url` names a document that has been thrown away.
@@ -139,41 +163,32 @@ final class BookmarkStore {
   /// this key rather than a fact about today's callers.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
     let roots = try rootURLs.map { url in
-      (
-        url.standardizedFileURL,
-        try url.bookmarkData(
-          options: [.withSecurityScope],
-          includingResourceValuesForKeys: nil,
-          relativeTo: nil
-        )
-      )
+      try makeWorkspaceBookmark(for: url)
     }
     var seenFilePaths: Set<String> = []
     let files =
       try fileURLs
       .filter { seenFilePaths.insert($0.standardizedFileURL.path).inserted }
       .map { url in
-        (
-          url.standardizedFileURL,
-          try url.bookmarkData(
-            options: [.withSecurityScope],
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-          )
-        )
+        try makeWorkspaceBookmark(for: url)
       }
 
+    // Resolve every freshly minted bookmark BEFORE dropping the old grants.
+    // In the App Store sandbox the extension is carried by the resolved URL,
+    // not by a plain standardized URL reconstructed from its path. If any
+    // bookmark cannot resolve, the previous persisted workspace and all of its
+    // live grants remain intact.
     stopAllAccess()
-    defaults.set(roots.map(\.1), forKey: rootBookmarksKey)
-    defaults.set(files.map(\.1), forKey: fileBookmarksKey)
-    if let firstRoot = roots.first?.1 {
+    defaults.set(roots.map(\.data), forKey: rootBookmarksKey)
+    defaults.set(files.map(\.data), forKey: fileBookmarksKey)
+    if let firstRoot = roots.first?.data {
       defaults.set(firstRoot, forKey: legacyFolderBookmarkKey)
     } else {
       defaults.removeObject(forKey: legacyFolderBookmarkKey)
     }
-    appState.bookmarkData = roots.first?.1
-    for root in roots { activate(root.0) }
-    for file in files { activate(file.0) }
+    appState.bookmarkData = roots.first?.data
+    for root in roots { activate(root.resolvedURL) }
+    for file in files { activate(file.resolvedURL) }
     appState.lastError = nil
   }
 
@@ -400,6 +415,22 @@ final class BookmarkStore {
     return url.standardizedFileURL.path
   }
 
+  private func makeWorkspaceBookmark(for url: URL) throws -> WorkspaceBookmark {
+    let data = try url.bookmarkData(
+      options: [.withSecurityScope],
+      includingResourceValuesForKeys: nil,
+      relativeTo: nil
+    )
+    var bookmarkIsStale = false
+    let resolvedURL = try URL(
+      resolvingBookmarkData: data,
+      options: [.withSecurityScope],
+      relativeTo: nil,
+      bookmarkDataIsStale: &bookmarkIsStale
+    )
+    return WorkspaceBookmark(data: data, resolvedURL: resolvedURL)
+  }
+
   func clear(into appState: AppState, error: String? = nil) {
     stopAllAccess()
     defaults.removeObject(forKey: legacyFolderBookmarkKey)
@@ -417,10 +448,11 @@ final class BookmarkStore {
       return
     }
 
-    activeAccess[key] = ActiveAccess(
-      exactURL: url,
-      wasGranted: url.startAccessingSecurityScopedResource()
-    )
+    let wasGranted = startSecurityScopedAccess(url)
+    if !wasGranted {
+      DebugTrace.log("bookmark security-scope grant not obtained path=\(url.path)")
+    }
+    activeAccess[key] = ActiveAccess(exactURL: url, wasGranted: wasGranted)
   }
 
   /// Releases the security-scoped access this store took for one file.
@@ -443,13 +475,13 @@ final class BookmarkStore {
   private func stopAccess(to url: URL) {
     guard let access = activeAccess.removeValue(forKey: Self.identityPath(url)) else { return }
     if access.wasGranted {
-      access.exactURL.stopAccessingSecurityScopedResource()
+      stopSecurityScopedAccess(access.exactURL)
     }
   }
 
   private func stopAllAccess() {
     for access in activeAccess.values where access.wasGranted {
-      access.exactURL.stopAccessingSecurityScopedResource()
+      stopSecurityScopedAccess(access.exactURL)
     }
     activeAccess.removeAll()
   }

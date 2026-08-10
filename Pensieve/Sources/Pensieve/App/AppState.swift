@@ -72,11 +72,32 @@ enum EditRecency {
   }
 }
 
+/// A one-shot request for the source editor to become first responder for one
+/// specific document session. The request object owns its consumed bit so a
+/// SwiftUI remount cannot replay an already handled focus change.
+final class EditorFocusRequest {
+  let id = UUID()
+  let sessionIdentity: DocumentIdentity
+  private(set) var isConsumed = false
+
+  init(sessionIdentity: DocumentIdentity) {
+    self.sessionIdentity = sessionIdentity
+  }
+
+  @discardableResult
+  func consume() -> Bool {
+    guard !isConsumed else { return false }
+    isConsumed = true
+    return true
+  }
+}
+
 @Observable
 @MainActor
 final class AppState {
   let workspaceStore: WorkspaceStore
   let windowModel: DocumentWindowModel
+  private(set) var editorFocusRequest: EditorFocusRequest?
 
   /// When this window's session was last EDITED, on `EditRecency`'s process-wide scale. `0` means
   /// "never edited in this process", which is where every window starts and where a window that only
@@ -192,7 +213,16 @@ final class AppState {
 
   var documentSession: DocumentSession {
     get { windowModel.documentSession }
-    set { windowModel.documentSession = newValue }
+    set {
+      let previousIdentity = windowModel.documentSession.identity
+      windowModel.documentSession = newValue
+
+      guard let newIdentity = newValue.identity,
+        newIdentity != previousIdentity,
+        case .untitled = newIdentity
+      else { return }
+      editorFocusRequest = EditorFocusRequest(sessionIdentity: newIdentity)
+    }
   }
 
   // Discrete metadata mirrors (see DocumentWindowModel). Window chrome reads

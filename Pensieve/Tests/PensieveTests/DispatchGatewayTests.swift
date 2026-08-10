@@ -320,16 +320,61 @@ final class DispatchGatewayTests: XCTestCase {
     XCTAssertEqual(launcher.requests().map(\.workflow), ["research", "research"])
   }
 
+  @MainActor
+  func testDefaultSwarmCarriesReceiptObserveAgentThroughControllerAndPhase() async throws {
+    let provider = FakeWorkflowCapabilitiesProvider(
+      result: .success(try WorkflowCapabilitiesFixtures.decoded()))
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: research-default-swarm
+        agent: swarm
+        report: /tmp/reports/research-default-swarm.md
+        """,
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
+    let (controller, _, launcher) = makeController(
+      capabilities: provider,
+      launcherResult: receipt)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-swarm-receipt.md").standardizedFileURL
+    let rootURL = URL(fileURLWithPath: "/tmp", isDirectory: true).standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .fileURL(fileURL), workflow: "research", source: .sidebar),
+      workflow: "research",
+      agents: [],
+      rootURL: rootURL)
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted default swarm receipt to remain inspectable")
+    }
+    XCTAssertEqual(runID, "research-default-swarm")
+    XCTAssertEqual(reportPath, "/tmp/reports/research-default-swarm.md")
+    XCTAssertEqual(observeAgent, "swarm")
+    XCTAssertEqual(launcher.requests().map(\.agents), [[]])
+    XCTAssertEqual(
+      DispatchPopover.resolvedPhase(for: outcome),
+      .acceptedUnconfirmed(
+        runID: "research-default-swarm",
+        reportPath: "/tmp/reports/research-default-swarm.md",
+        observeAgent: "swarm"))
+  }
+
   // MARK: - Helpers
 
   @MainActor
   private func makeController(
-    capabilities: WorkflowCapabilitiesProviding? = nil
+    capabilities: WorkflowCapabilitiesProviding? = nil,
+    launcherResult: AgentDispatchMetadata? = nil
   )
     -> (AppController, AppState, GatewayRecordingLauncher)
   {
     let appState = AppState()
-    let launcher = GatewayRecordingLauncher()
+    let launcher = GatewayRecordingLauncher(result: launcherResult)
     let controller = AppController(
       appState: appState,
       folderManager: .shared,
@@ -381,7 +426,12 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
   }
 
   private let lock = NSLock()
+  private let result: AgentDispatchMetadata?
   private var recordedRequests: [Request] = []
+
+  init(result: AgentDispatchMetadata? = nil) {
+    self.result = result
+  }
 
   func dispatch(
     workflow: String,
@@ -397,8 +447,9 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
         payload: payload,
         workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
     lock.unlock()
-    return AgentDispatchMetadata(
-      runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt")
+    return result
+      ?? AgentDispatchMetadata(
+        runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt")
   }
 
   func requests() -> [Request] {
