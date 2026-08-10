@@ -33,6 +33,62 @@ final class ApplicationStartupRestore {
   }
 }
 
+/// Becoming active is an APPLICATION event, so the working-set reconcile it
+/// triggers is subscribed ONCE per process — not once per window.
+///
+/// It used to be armed in every `AppController.init`: with N windows open, one
+/// activation ran N identical passes over the SAME shared working set (each a
+/// `stat` plus a Trash `getRelationship` per open file, all on the main actor).
+/// The subscription now lives here and fans out to one live controller per
+/// distinct working set.
+@MainActor
+final class AppActivationReconciler {
+  static let shared = AppActivationReconciler()
+
+  /// Which working set a controller's reconcile would touch. Two windows of the
+  /// same app share the process's one `WorkspaceStore` (`PensieveApp` builds it
+  /// and hands it to every window's `AppState`), so they collapse to a single
+  /// pass; a test harness with its own store still gets its own.
+  struct WorkingSetKey: Hashable {
+    let folderManager: ObjectIdentifier
+    let workingSet: ObjectIdentifier
+  }
+
+  /// Weak by construction: a closed window's controller drops out on dealloc,
+  /// so the process-wide subscription can outlive every window without holding
+  /// one alive and without dangling. Last window closed ⇒ the pass is a no-op;
+  /// a controller that appears later is served again.
+  private let controllers = NSHashTable<AppController>.weakObjects()
+  private var cancellable: AnyCancellable?
+
+  private init() {}
+
+  /// Registers a window's controller and arms the one subscription on first
+  /// use. Nothing is ever unregistered by hand.
+  func register(_ controller: AppController) {
+    controllers.add(controller)
+    guard cancellable == nil else { return }
+    cancellable = NotificationCenter.default.publisher(
+      for: NSApplication.didBecomeActiveNotification
+    ).sink { _ in
+      Task { @MainActor in AppActivationReconciler.shared.reconcile() }
+    }
+  }
+
+  func reconcile() {
+    for controller in Self.reconcilePass(over: controllers.allObjects) {
+      controller.reconcileWorkingSetForAppActivation()
+    }
+  }
+
+  /// One controller per distinct working set, in registration order. Pure, so
+  /// the fan-out rule is pinnable without posting a notification.
+  static func reconcilePass(over controllers: [AppController]) -> [AppController] {
+    var seen = Set<WorkingSetKey>()
+    return controllers.filter { seen.insert($0.workingSetKey).inserted }
+  }
+}
+
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
@@ -68,11 +124,26 @@ final class AppController: ObservableObject {
   private let confirmDiscardDraft: DraftDiscardConfirmation
   private let confirmQuitAfterRecoveryRetirementFailure:
     QuitAfterRecoveryRetirementFailureConfirmation
+  /// How many app-activation reconcile passes THIS controller ran. Per instance
+  /// on purpose: the fan-out pin reads it instead of a process-wide counter, so
+  /// whatever else is alive in the test bundle cannot move it.
+  private(set) var appActivationReconcilePassCount = 0
+
+  /// Identifies the working set this controller's activation reconcile touches.
+  /// See `AppActivationReconciler.WorkingSetKey`.
+  var workingSetKey: AppActivationReconciler.WorkingSetKey {
+    AppActivationReconciler.WorkingSetKey(
+      folderManager: ObjectIdentifier(folderManager),
+      workingSet: ObjectIdentifier(appState.workspaceStore))
+  }
+
   /// Finder can move an ad-hoc working-set file to Trash while no watched
-  /// workspace root covers it. Reconcile when Pensieve becomes active again;
-  /// the publisher is process-wide, but each window sees the same shared
-  /// WorkspaceStore and subsequent passes are harmless no-ops.
-  private var appActivationCancellable: AnyCancellable?
+  /// workspace root covers it. Returning to Pensieve is where the live working
+  /// set finds out. Driven by `AppActivationReconciler`, once per activation.
+  func reconcileWorkingSetForAppActivation() {
+    appActivationReconcilePassCount += 1
+    folderManager.reconcileExternalWorkingSetChanges(into: appState)
+  }
   /// Unhandled crash drafts, newest first — the model behind the launcher's
   /// "Recovered Drafts" section. Empty means the section is not shown at all.
   @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
@@ -235,14 +306,7 @@ final class AppController: ObservableObject {
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
-    self.appActivationCancellable = NotificationCenter.default.publisher(
-      for: NSApplication.didBecomeActiveNotification
-    ).sink { [weak self] _ in
-      Task { @MainActor [weak self] in
-        guard let self else { return }
-        self.folderManager.reconcileExternalWorkingSetChanges(into: self.appState)
-      }
-    }
+    AppActivationReconciler.shared.register(self)
   }
 
   /// Whether this window's session holds work the user could lose — an
@@ -1707,17 +1771,24 @@ final class AppController: ObservableObject {
     case .workerSpawnRecorded:
       onSuccess?()
       appState.lastError = nil
+      transcriptionService.updateDispatchStatus(metadata.statusLine)
 
     case .acceptedUnconfirmed:
       // The detached run may already be alive. Keep the dictated prompt so a
       // bounded proof timeout cannot erase the user's only editable copy, but
       // do not present the accepted receipt as an application error either.
       appState.lastError = nil
+      // The tafla has no orange receipt chrome to carry the uncertainty the way
+      // the dispatch sheet does, and its status line renders in exactly the same
+      // secondary caption a started run gets. So the line itself has to say what
+      // is unconfirmed — the sheet's own sentence, from the one copy.
+      transcriptionService.updateDispatchStatus(
+        "\(metadata.statusLine) — \(AgentDispatchMetadata.unconfirmedLaunchExplanation)")
 
     case .rejected:
       appState.lastError = metadata.statusLine
+      transcriptionService.updateDispatchStatus(metadata.statusLine)
     }
-    transcriptionService.updateDispatchStatus(metadata.statusLine)
     isAgentDispatchInFlight = false
   }
 

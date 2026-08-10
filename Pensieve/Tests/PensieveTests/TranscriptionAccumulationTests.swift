@@ -668,9 +668,16 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(launcher.dispatchedPrompts(), ["agent prompt awaiting proof"])
     XCTAssertEqual(launcher.workingDirectoryURLs(), [workspaceRoot])
     XCTAssertEqual(service.rendered, "agent prompt awaiting proof")
+    // The tafla renders this line in the same secondary caption a started run
+    // gets, so the uncertainty has to be IN the line — the dispatch sheet's own
+    // sentence, not a terse prefix the eye reads as success.
     XCTAssertEqual(
       service.dispatchStatus,
-      "Run accepted (launch unconfirmed): just-test-123 | \(reportPath)")
+      "Run accepted (launch unconfirmed): just-test-123 | \(reportPath) — "
+        + AgentDispatchMetadata.unconfirmedLaunchExplanation)
+    XCTAssertTrue(
+      service.dispatchStatus?.contains("did not see its worker spawn record") == true,
+      "an unconfirmed dictation launch must explain itself, not just label itself")
     XCTAssertNil(appState.lastError)
   }
 

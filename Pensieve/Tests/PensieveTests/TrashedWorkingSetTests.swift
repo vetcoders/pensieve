@@ -283,7 +283,90 @@ final class TrashedWorkingSetTests: XCTestCase {
 
     XCTAssertTrue(harness.openFileURLs.isEmpty)
     XCTAssertTrue(restoredFileURLs().isEmpty)
+    XCTAssertEqual(
+      controller.appActivationReconcilePassCount, 1,
+      "one activation, one pass — the reconcile is a process event, not a per-window one")
     withExtendedLifetime(controller) {}
+  }
+
+  /// Becoming active is an APPLICATION event over ONE shared working set. Every
+  /// extra window used to add an identical pass — N × (stat + Trash
+  /// relationship) per open file on the main actor — so two live windows must
+  /// still produce exactly one reconcile, and it must be the one that works.
+  func testTwoLiveWindowsShareASingleActivationReconcilePass() async throws {
+    let adHocURL = try writeNote("activation-two-windows.md", in: outside)
+    let harness = try makeHarness()
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: adHocURL, into: harness.appState))
+
+    // Two windows of the same app: distinct controllers, one shared working set
+    // (production hands every window's AppState the same WorkspaceStore).
+    let first = AppController(
+      appState: harness.appState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      indexDatabase: harness.indexDatabase)
+    let secondState = AppState(
+      workspaceStore: harness.appState.workspaceStore,
+      defaults: defaults)
+    let second = AppController(
+      appState: secondState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      indexDatabase: harness.indexDatabase)
+
+    XCTAssertEqual(
+      AppActivationReconciler.reconcilePass(over: [first, second]).count, 1,
+      "two windows over one working set are one unit of work")
+
+    try trash(adHocURL)
+    NotificationCenter.default.post(
+      name: NSApplication.didBecomeActiveNotification,
+      object: NSApp)
+    await Task.yield()
+
+    XCTAssertEqual(
+      first.appActivationReconcilePassCount + second.appActivationReconcilePassCount, 1,
+      "one activation must not fan out into one pass per window")
+    XCTAssertTrue(
+      harness.openFileURLs.isEmpty,
+      "the single pass still has to retire the file thrown away behind the app's back")
+    withExtendedLifetime((first, second)) {}
+  }
+
+  /// A window whose controller is gone must not keep a pass alive, and the
+  /// process subscription must survive it: the next activation still reconciles
+  /// through whatever window is left.
+  func testActivationSurvivesAClosedWindowAndStillReconcilesThroughTheLiveOne() async throws {
+    let adHocURL = try writeNote("activation-closed-window.md", in: outside)
+    let harness = try makeHarness()
+    XCTAssertNotNil(harness.folderManager.registerOpenFile(url: adHocURL, into: harness.appState))
+
+    let closedState = AppState(
+      workspaceStore: WorkspaceStore(defaults: defaults),
+      defaults: defaults)
+    var closed: AppController? = AppController(
+      appState: closedState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      indexDatabase: harness.indexDatabase)
+    XCTAssertNotNil(closed)
+    closed = nil
+
+    let live = AppController(
+      appState: harness.appState,
+      folderManager: harness.folderManager,
+      documentStore: harness.documentStore,
+      indexDatabase: harness.indexDatabase)
+
+    try trash(adHocURL)
+    NotificationCenter.default.post(
+      name: NSApplication.didBecomeActiveNotification,
+      object: NSApp)
+    await Task.yield()
+
+    XCTAssertEqual(live.appActivationReconcilePassCount, 1)
+    XCTAssertTrue(harness.openFileURLs.isEmpty)
+    withExtendedLifetime(live) {}
   }
 
   /// A refresh that finds nothing wrong must leave the working set exactly as it
