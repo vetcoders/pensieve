@@ -129,7 +129,13 @@ final class BookmarkStoreSecurityScopeTests: XCTestCase {
     XCTAssertEqual(store.grantedSecurityScopeCount, 2)
 
     store.clear(into: AppState())
-    XCTAssertEqual(stopped, expected, "stop must balance the exact resolved URLs that were started")
+    XCTAssertEqual(
+      stopped.count, expected.count,
+      "every granted security scope must receive exactly one matching stop")
+    XCTAssertEqual(
+      Set(stopped), Set(expected),
+      "stop must balance the exact resolved URLs that were started; dictionary traversal order is not a contract"
+    )
     XCTAssertEqual(store.activeSecurityScopeCount, 0)
     XCTAssertEqual(store.grantedSecurityScopeCount, 0)
   }
