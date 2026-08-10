@@ -198,7 +198,7 @@ struct EditorToolbelt: ToolbarContent {
 
   /// Titlebar breadcrumb (5.2): the containing-folder chain for the active
   /// document, joined by " › ". Workspace-rooted when the file lives under a
-  /// root (`10_projects › vetcoders › reports`), otherwise the last few
+  /// root (`10_projects › Vetcoders › reports`), otherwise the last few
   /// tilde-abbreviated parent components. The `navigationSubtitle` carries this
   /// path because the dirty "Edited" state already lives in the status bar.
   static func breadcrumbSubtitle(for url: URL?, workspaceRoots: [WorkspaceRoot]) -> String {
