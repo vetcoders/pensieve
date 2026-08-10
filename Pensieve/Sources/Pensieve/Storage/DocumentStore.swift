@@ -4318,10 +4318,11 @@ final class DocumentStore {
     // window. That is the shipped behaviour for a file-backed buffer that
     // cannot reach disk, not a new lane opened here.
     //
-    // Deliberately NOT stashing a draft on every refused tick: a file-backed
-    // session cannot carry a draft id (`DocumentSession.recoveryID` is defined
-    // for untitled sessions only), so each stash would mint a NEW draft and a
-    // minute of typing would pile up one per debounce.
+    // Deliberately NOT stashing a draft on every refused tick: recovery drafts
+    // are the teardown backstop, while the live window still owns the buffer.
+    // Writing a draft on every debounce would turn a transient save failure
+    // into continuous recovery I/O and blur whether the user actually closed
+    // the document.
     //
     // The check below is a FAST PATH, not the guarantee. It answers the common
     // case cheaply and with a message written for a human, but between it and
@@ -4333,7 +4334,11 @@ final class DocumentStore {
       let message =
         "Could not save \(url.lastPathComponent): it is no longer on disk."
         + " Your changes are still here — use Save As… to write them somewhere."
-      appState.lastError = message
+      // The edit reached no durable destination and the live buffer is its only
+      // copy. This must use the data-loss latch introduced by the recovery
+      // error surface; a plain status write can be displaced by an unrelated
+      // success and would understate the same failure caught below.
+      appState.reportDataLoss(message)
       NSLog(message)
       return false
     }

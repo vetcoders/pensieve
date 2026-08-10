@@ -235,6 +235,10 @@ final class AutoSaveResurrectionTests: XCTestCase {
       "the window must go on holding the only copy of the text")
     XCTAssertTrue(appState.documentSession.isDirty)
     XCTAssertEqual(appState.selectedDocumentID, appState.documentSession.id)
+    XCTAssertEqual(
+      appState.unresolvedDataLoss?.severity, .dataLoss,
+      "refusing an unattended recreate must latch the same data-loss state as a failed write")
+    XCTAssertTrue(appState.unresolvedDataLoss?.message.contains("no longer on disk") == true)
   }
 
   /// The window-teardown flush is the same kind of write — nobody asked for it —
