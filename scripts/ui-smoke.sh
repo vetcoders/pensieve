@@ -43,6 +43,14 @@ ok() {
   printf '\033[32m[ ok ]\033[0m %s\n' "$*"
 }
 
+canonical_defaults_bool() {
+  case "$1" in
+    1 | true | TRUE | yes | YES) printf 'true\n' ;;
+    0 | false | FALSE | no | NO) printf 'false\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 # Shell out to a tiny Swift snippet that queries CoreGraphics' window server
 # directly, bypassing the Accessibility tree entirely. Used only to classify a
 # census failure: an empty AX census can mean the app truly has no window (a
@@ -133,7 +141,11 @@ arm_restoration_default() {
 disarm_restoration_default() {
   [[ "$RESTORATION_DEFAULT_ARMED" -eq 1 ]] || return 0
   if [[ "$QAKW_WAS_SET" -eq 1 ]]; then
-    defaults write "$APP_ID" NSQuitAlwaysKeepsWindows -bool "$PRIOR_QAKW" 2>/dev/null || true
+    local prior_bool
+    prior_bool="$(canonical_defaults_bool "$PRIOR_QAKW")" \
+      || die "saved-state probe captured a non-boolean NSQuitAlwaysKeepsWindows value: $PRIOR_QAKW"
+    defaults write "$APP_ID" NSQuitAlwaysKeepsWindows -bool "$prior_bool" >/dev/null 2>&1 \
+      || return 1
   else
     defaults delete "$APP_ID" NSQuitAlwaysKeepsWindows 2>/dev/null || true
   fi
@@ -141,6 +153,10 @@ disarm_restoration_default() {
 }
 
 arm_pensieve_restore_off() {
+  if [[ "$PENSIEVE_RESTORE_DEFAULT_ARMED" -eq 1 ]]; then
+    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool false
+    return 0
+  fi
   if PRIOR_PENSIEVE_RESTORE="$(defaults read "$APP_ID" Pensieve.restoreSessionOnLaunch 2>/dev/null)"; then
     PENSIEVE_RESTORE_WAS_SET=1
   else
@@ -154,8 +170,11 @@ arm_pensieve_restore_off() {
 disarm_pensieve_restore_default() {
   [[ "$PENSIEVE_RESTORE_DEFAULT_ARMED" -eq 1 ]] || return 0
   if [[ "$PENSIEVE_RESTORE_WAS_SET" -eq 1 ]]; then
-    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool "$PRIOR_PENSIEVE_RESTORE" \
-      2>/dev/null || true
+    local prior_bool
+    prior_bool="$(canonical_defaults_bool "$PRIOR_PENSIEVE_RESTORE")" \
+      || die "saved-state probe captured a non-boolean restore value: $PRIOR_PENSIEVE_RESTORE"
+    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool "$prior_bool" \
+      >/dev/null 2>&1 || return 1
   else
     defaults delete "$APP_ID" Pensieve.restoreSessionOnLaunch 2>/dev/null || true
   fi
@@ -425,6 +444,120 @@ on joined(itemsList, delimiter)
 end joined
 APPLESCRIPT
 }
+
+# Closing the final window intentionally leaves Pensieve alive with no windows.
+# A later Finder/Open With event is nevertheless an explicit request for a
+# document surface: it must create exactly one host immediately, rather than
+# queueing the URL invisibly until an unrelated Dock reopen.
+run_zero_window_external_open_probe() {
+  log "zero-window external-open probe"
+  terminate_app
+  arm_pensieve_restore_off
+
+  open_smoke_app -a "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -a "$APP_PATH"
+  }
+
+  run_ax_osascript 45 - "$APP_NAME" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set closeButton to first button of window 1 whose value of attribute "AXSubrole" is "AXCloseButton"
+    perform action "AXPress" of closeButton
+    repeat with i from 1 to 100
+      if (count of windows) is 0 then exit repeat
+      delay 0.1
+    end repeat
+    if (count of windows) is not 0 then
+      error "closing the final launcher did not reach the zero-window state"
+    end if
+  end tell
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
+APPLESCRIPT
+
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "closing the final window terminated $APP_NAME instead of leaving a zero-window process"
+
+  # `open` can return -600 while LaunchServices is reconnecting to a just-
+  # windowless process even when the event is delivered. The AX assertion below
+  # is the source of truth; do not retry and risk sending the same URL twice.
+  open_smoke_app -a "$APP_PATH" "$SMOKE_EXTERNAL_DOCUMENT" >/dev/null 2>&1 || true
+
+  local external_title="${SMOKE_EXTERNAL_DOCUMENT##*/}"
+  external_title="${external_title%.md}"
+  run_ax_osascript 45 - "$APP_NAME" "$external_title" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set documentTitle to item 2 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set windowCount to count of windows
+    set allTitles to title of every window
+  end tell
+  if windowCount is not 1 then
+    error "external open from zero windows created " & windowCount & " windows={" & my joined(allTitles, ",") & "}"
+  end if
+  if (item 1 of allTitles as text) does not contain documentTitle then
+    error "external open created a window but did not show [" & documentTitle & "]; windows={" & my joined(allTitles, ",") & "}"
+  end if
+  log "ZERO_WINDOW_EXTERNAL_OPEN=PASS title=[" & (item 1 of allTitles as text) & "]"
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
+
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+}
 if [[ $# -gt 0 && "$1" != --* ]]; then
   SOURCE_APP_PATH="$1"
   shift
@@ -468,6 +601,7 @@ CAFFEINATE_PID=$!
 SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURCE_APP_PATH")"
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
+SMOKE_EXTERNAL_DOCUMENT="$SMOKE_ROOT/external-after-zero-windows.md"
 SMOKE_SUPPORT="$SMOKE_ROOT/support"
 cleanup() {
   local cleanup_status=0
@@ -528,6 +662,7 @@ mkdir -p "$SMOKE_SUPPORT"
 APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
 stage_smoke_app "$SOURCE_APP_PATH" "$APP_PATH" "$SMOKE_SUPPORT"
 printf '# Toolbar cold-frame witness\n\nEditable staged document.\n' >"$SMOKE_DOCUMENT"
+printf '# External open after zero windows\n' >"$SMOKE_EXTERNAL_DOCUMENT"
 
 EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.share
@@ -1075,4 +1210,6 @@ ok "native UI smoke passed"
 if [[ $COLD_ONLY -eq 0 ]]; then
   run_saved_state_isolation_probe
   ok "Saved Application State isolation probe passed"
+  run_zero_window_external_open_probe
+  ok "Zero-window external-open probe passed"
 fi
