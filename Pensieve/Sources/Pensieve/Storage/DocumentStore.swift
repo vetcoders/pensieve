@@ -4123,7 +4123,15 @@ final class DocumentStore {
     // writes nothing. See `Autosaver.armedSaveOwner`.
     autosaver.scheduleSave(owner: appState) { [weak self, weak appState] in
       guard let self, let appState else { return }
-      if appState.documentSession.isUntitled {
+      if appState.documentSession.recoverySourceURL != nil {
+        // An adopted file-backed recovery is still represented as untitled so
+        // opening it cannot overwrite its source. It nevertheless carries an
+        // original-write condition that an ordinary untitled tick must not
+        // clear. Keep refreshing the same recovery ID while preserving (or,
+        // after a recovery failure, restoring) the truthful stale-original
+        // status from `pendingOriginalSaveFailure`.
+        self.persistPathedRecoverySnapshotWithoutOverwritingOriginal(appState: appState)
+      } else if appState.documentSession.isUntitled {
         _ = self.persistRecoverySnapshot(appState: appState)
       } else if !self.savingSettings.autoSavesPathedDocuments {
         self.persistPathedRecoverySnapshotWithoutOverwritingOriginal(appState: appState)

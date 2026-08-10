@@ -284,7 +284,9 @@ final class RecoveredDraftsTests: XCTestCase {
   }
 
   @MainActor
-  func testFailedCmdSSaveToOriginalRefreshesTheSameDraftAndLaterSuccessRetiresIt() throws {
+  func testFailedCmdSSaveToOriginalRefreshesTheSameDraftAndLaterSuccessRetiresIt()
+    async throws
+  {
     let folder = try makeTemporaryFolder()
     let sourceURL = folder.appendingPathComponent("umowa.md")
     try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
@@ -297,7 +299,7 @@ final class RecoveredDraftsTests: XCTestCase {
     recoveryStore.markDraftClosed(id: draft.id)
     var originalWriteShouldFail = true
     let documentStore = makeTestDocumentStore(
-      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60_000),
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: recoveryStore,
       writeDocument: { text, url in
@@ -326,10 +328,31 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
     XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
 
+    appState.activeDocumentText = "newest edit after failed original save"
+    documentStore.documentDidChange(appState: appState)
+    try await waitUntilDrafts(
+      in: recoveryStore,
+      contain: "newest edit after failed original save")
+
+    let draftsAfterRecoveryTick = recoveryStore.loadDrafts()
+    XCTAssertEqual(draftsAfterRecoveryTick.count, 1)
+    let tickDraft = try XCTUnwrap(draftsAfterRecoveryTick.first)
+    XCTAssertEqual(tickDraft.id, draft.id)
+    XCTAssertEqual(tickDraft.sourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertEqual(appState.documentSession.recoverySourceURL, sourceURL.standardizedFileURL)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertNil(appState.unresolvedDataLoss)
+    XCTAssertTrue(appState.currentError?.message.contains("Could not save umowa.md") == true)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
+
     originalWriteShouldFail = false
     documentStore.save(appState: appState)
 
-    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "latest recovered edit")
+    XCTAssertEqual(
+      try String(contentsOf: sourceURL, encoding: .utf8),
+      "newest edit after failed original save")
     XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
     XCTAssertEqual(appState.documentSession.url, sourceURL.standardizedFileURL)
     XCTAssertNil(appState.documentSession.recoveryID)

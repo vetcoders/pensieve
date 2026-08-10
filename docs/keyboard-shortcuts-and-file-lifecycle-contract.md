@@ -444,9 +444,11 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   to Original fails, Pensieve immediately refreshes that buffer's existing
   recovery item with the latest bytes while preserving the same recovery ID and
   original-path association. The buffer remains dirty and the original remains
-  stale. This recovery fallback protects the bytes but does not satisfy a Save
-  decision made during document close or global quit: both operations remain
-  vetoed until the original itself is current.
+  stale. Later edits keep updating that same item without clearing the honest
+  stale-original/recovery-safe status. This recovery fallback protects the
+  bytes but does not satisfy a Save decision made during document close or
+  global quit: both operations remain vetoed until the original itself is
+  current.
 - **A successful save retires the recovery item.** Saving to the original or a
   new destination removes the item only after the destination write succeeds.
   A launcher-level Save As also registers that destination in Pensieve's
