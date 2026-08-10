@@ -44,6 +44,11 @@ final class CommandSurfaceContext: ObservableObject {
   /// a PAIR: a mixed state/controller pair would let a menu action mutate one
   /// window's state through another window's controller.
   func adopt(appState: AppState, controller: AppController) {
+    // This signal is intentionally sent even when the pair is unchanged. A
+    // window accessor can resolve after the root's early `.task` already
+    // adopted the same controller; that later turn is precisely when a New
+    // gesture queued during the attach gap becomes safe to replay.
+    LaunchIntentCoordinator.shared.commandTargetDidBecomeAvailable(controller)
     guard self.appState !== appState || self.controller !== controller else { return }
     self.appState = appState
     self.controller = controller
@@ -132,20 +137,12 @@ enum CommandTargetResolution {
 /// `openDocumentHost(intent:)` factory. Nothing here creates a window by
 /// itself.
 ///
-/// `adoptedController` is re-read AT ACTION TIME rather than captured in the
-/// branch. SwiftUI builds a `Commands` body ahead of the click, so a root that
-/// adopts the surface in between leaves the installed menu one rebuild behind
-/// reality; asking again at click time keeps ⌘N acting on the window that is
-/// now on screen instead of putting a second one beside it.
 struct ZeroWindowCommandLane {
-  var adoptedController: @MainActor () -> AppController? = {
-    CommandSurfaceContext.shared.controller
-  }
   var openExternalURLs: @MainActor ([URL]) -> Void = { urls in
     LaunchIntentCoordinator.shared.handle(urls: urls)
   }
-  var openDocumentHost: @MainActor (LaunchIntent) -> Void = { intent in
-    DocumentWindowRegistry.shared.openDocumentHost(intent: intent)
+  var requestNewDocument: @MainActor () -> Void = {
+    LaunchIntentCoordinator.shared.requestNewDocument()
   }
 
   /// ⌘O, ⇧⌘O and Open Recent. Handed to the coordinator whether or not a root
@@ -158,17 +155,13 @@ struct ZeroWindowCommandLane {
     openExternalURLs(urls)
   }
 
-  /// ⌘N / ⌘T. With a root on screen this is the ordinary New (an idle launcher
-  /// takes the draft in place, an occupied host gets a native tab); with none it
-  /// asks the registry for one host carrying the `.newUntitledTab` intent, which
-  /// is what makes the new window come up with an editable draft.
+  /// ⌘N / ⌘T. The coordinator resolves the controller again at action time and
+  /// counts the gesture while a host is attaching. One `.newUntitledTab` host
+  /// consumes the first request; rapid later requests are replayed as native
+  /// tabs rather than being dropped or spawning competing roots.
   @MainActor
   func newDocument() {
-    if let controller = adoptedController() {
-      _ = controller.createUntitledDocument()
-    } else {
-      openDocumentHost(.newUntitledTab)
-    }
+    requestNewDocument()
   }
 }
 
@@ -216,6 +209,60 @@ enum DocumentOpenPanel {
   }
 }
 
+/// Commands that belong to the APPLICATION rather than to one document root.
+/// Their lane stays installed while the process has zero windows and during a
+/// focused-value rebuild, so About remains Pensieve's BuildIdentity surface and
+/// ⌘Q can never fall back to SwiftUI's unguarded default termination command.
+struct ApplicationCommandLane {
+  var resolveTermination: @MainActor () -> NSApplication.TerminateReply = {
+    DocumentWindowRegistry.shared.resolveTerminationRequest()
+  }
+  var terminate: @MainActor () -> Void = {
+    NSApplication.shared.terminate(nil)
+  }
+  var showAbout: @MainActor () -> Void = {
+    PensieveAboutPanel.show()
+  }
+
+  @MainActor
+  func quit() {
+    guard resolveTermination() == .terminateNow else { return }
+    terminate()
+  }
+}
+
+@MainActor
+private enum PensieveAboutPanel {
+  static func show() {
+    let identity = BuildIdentity.current
+    let alert = NSAlert()
+    alert.messageText = identity.aboutTitle
+    alert.informativeText = identity.aboutDetails
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
+  }
+}
+
+private struct GlobalPensieveCommands: Commands {
+  var lane = ApplicationCommandLane()
+
+  var body: some Commands {
+    CommandGroup(replacing: .appInfo) {
+      Button("About Pensieve") {
+        lane.showAbout()
+      }
+    }
+
+    CommandGroup(replacing: .appTermination) {
+      Button("Quit Pensieve") {
+        lane.quit()
+      }
+      .keyboardShortcut("q", modifiers: [.command])
+    }
+  }
+}
+
 struct PensieveCommands: Commands {
   @FocusedValue(\.appState) private var focusedAppState: AppState?
   @FocusedObject private var focusedController: AppController?
@@ -223,6 +270,8 @@ struct PensieveCommands: Commands {
   @ObservedObject private var surface = CommandSurfaceContext.shared
 
   var body: some Commands {
+    GlobalPensieveCommands()
+
     if let target = CommandTargetResolution.resolve(
       focusedState: focusedAppState,
       focusedController: focusedController,
@@ -248,8 +297,8 @@ struct PensieveCommands: Commands {
 
 /// The File menu that survives the last window. Deliberately a subset: every
 /// item that acts ON a document (Save, Export, Close, Format, Mode, Agents)
-/// needs the session this state does not have, and About/Quit keep the standard
-/// items SwiftUI supplies here, exactly as they do today.
+/// needs the session this state does not have. Application-global About and the
+/// protected Quit live outside this branch in `GlobalPensieveCommands`.
 private struct ZeroWindowCommands: Commands {
   @ObservedObject var recentDocuments: RecentDocumentsStore
   var lane = ZeroWindowCommandLane()
@@ -308,12 +357,6 @@ private struct ActivePensieveCommands: Commands {
   @ObservedObject var recentDocuments: RecentDocumentsStore
 
   var body: some Commands {
-    CommandGroup(replacing: .appInfo) {
-      Button("About Pensieve") {
-        showAboutPanel()
-      }
-    }
-
     // File menu
     CommandGroup(replacing: .newItem) {
       Button("New File") {
@@ -450,15 +493,6 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut(.delete, modifiers: [.command])
       .disabled(sidebarActionTargetURL == nil)
-    }
-
-    CommandGroup(replacing: .appTermination) {
-      Button("Quit Pensieve") {
-        if controller.applicationShouldTerminate() {
-          NSApplication.shared.terminate(nil)
-        }
-      }
-      .keyboardShortcut("q", modifiers: [.command])
     }
 
     // File menu — replace the default Save/Close group so ⌘W closes the
@@ -892,13 +926,4 @@ private struct ActivePensieveCommands: Commands {
     appState.findFocusToken &+= 1
   }
 
-  private func showAboutPanel() {
-    let identity = BuildIdentity.current
-    let alert = NSAlert()
-    alert.messageText = identity.aboutTitle
-    alert.informativeText = identity.aboutDetails
-    alert.alertStyle = .informational
-    alert.addButton(withTitle: "OK")
-    alert.runModal()
-  }
 }

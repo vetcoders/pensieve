@@ -539,7 +539,132 @@ final class LaunchIntentTests: XCTestCase {
       "the file must not leak into an unrelated focused window while the launcher is attached")
   }
 
+  // MARK: - Dock reopen ownership
+
+  @MainActor
+  func testDockReopenWithZeroWindowsCreatesOneHostAndConsumesTheRequest() {
+    let launcher = Self.makeWindow()
+    defer { launcher.close() }
+    var hostRequests = 0
+    let registry = DocumentWindowRegistry(
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [] },
+      makeDocumentWindow: { _, intent in
+        XCTAssertEqual(intent, .dockReopen)
+        hostRequests += 1
+        return launcher
+      })
+    let delegate = PensieveAppDelegate()
+    delegate.reopenWindowRegistryOverride = registry
+
+    XCTAssertFalse(
+      delegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: false))
+    XCTAssertEqual(hostRequests, 1)
+  }
+
+  @MainActor
+  func testDockReopenWithOnlySettingsCreatesOneHostAndConsumesTheRequest() {
+    let settings = Self.makeWindow(title: "Settings")
+    let launcher = Self.makeWindow()
+    defer {
+      settings.close()
+      launcher.close()
+    }
+    var hostRequests = 0
+    let registry = DocumentWindowRegistry(
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [settings] },
+      makeDocumentWindow: { _, intent in
+        XCTAssertEqual(intent, .dockReopen)
+        hostRequests += 1
+        return launcher
+      })
+    let delegate = PensieveAppDelegate()
+    delegate.reopenWindowRegistryOverride = registry
+
+    XCTAssertFalse(
+      delegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: true))
+    XCTAssertEqual(hostRequests, 1)
+  }
+
+  @MainActor
+  func testDockReopenWithOnlyAboutPanelCreatesOneHostAndConsumesTheRequest() {
+    let about = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 280, height: 180),
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: true)
+    about.isReleasedWhenClosed = false
+    about.title = "About Pensieve"
+    let launcher = Self.makeWindow()
+    defer {
+      about.close()
+      launcher.close()
+    }
+    var hostRequests = 0
+    let registry = DocumentWindowRegistry(
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [about] },
+      makeDocumentWindow: { _, intent in
+        XCTAssertEqual(intent, .dockReopen)
+        hostRequests += 1
+        return launcher
+      })
+    let delegate = PensieveAppDelegate()
+    delegate.reopenWindowRegistryOverride = registry
+
+    XCTAssertFalse(
+      delegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: true))
+    XCTAssertEqual(hostRequests, 1)
+  }
+
+  @MainActor
+  func testDockReopenWithAnExistingDocumentCreatesNothingAndDefersToAppKit() {
+    let document = Self.makeWindow(title: "document.md")
+    defer { document.close() }
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(document))
+    var hostRequests = 0
+    let registry = DocumentWindowRegistry(
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [document] },
+      makeDocumentWindow: { _, _ in
+        hostRequests += 1
+        return Self.makeWindow()
+      })
+    let delegate = PensieveAppDelegate()
+    delegate.reopenWindowRegistryOverride = registry
+
+    XCTAssertTrue(
+      delegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: true))
+    XCTAssertEqual(hostRequests, 0)
+  }
+
   // MARK: - The File menu with zero windows
+
+  @MainActor
+  func testApplicationGlobalQuitHonorsTheProtectedTerminationReply() {
+    var reply: NSApplication.TerminateReply = .terminateCancel
+    var terminateCalls = 0
+    let lane = ApplicationCommandLane(
+      resolveTermination: { reply },
+      terminate: { terminateCalls += 1 },
+      showAbout: {})
+
+    lane.quit()
+    XCTAssertEqual(terminateCalls, 0, "a cancelled dirty-session pass still terminated the app")
+
+    reply = .terminateNow
+    lane.quit()
+    XCTAssertEqual(terminateCalls, 1)
+  }
 
   /// P2-04. Closing the last window leaves the process alive on purpose, and
   /// every File item needed a document root — so the whole menu vanished with
@@ -562,9 +687,8 @@ final class LaunchIntentTests: XCTestCase {
         return true
       })
     let lane = ZeroWindowCommandLane(
-      adoptedController: { nil },
       openExternalURLs: { coordinator.handle(urls: $0) },
-      openDocumentHost: { _ in XCTFail("Open must not build a window outside the open lane") })
+      requestNewDocument: { XCTFail("Open must not travel the New lane") })
 
     // The user picked a file in the open panel with nothing on screen.
     lane.open(urls: [requested])
@@ -598,9 +722,8 @@ final class LaunchIntentTests: XCTestCase {
         return true
       })
     let lane = ZeroWindowCommandLane(
-      adoptedController: { nil },
       openExternalURLs: { coordinator.handle(urls: $0) },
-      openDocumentHost: { _ in XCTFail("Open must not build a window outside the open lane") })
+      requestNewDocument: { XCTFail("Open must not travel the New lane") })
 
     coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/pensieve-finder-open.md")])
     lane.open(urls: [URL(fileURLWithPath: "/tmp/pensieve-menu-open.md")])
@@ -615,14 +738,222 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   func testZeroWindowMenuNewFileAsksForOneUntitledHost() {
     var requestedIntents: [LaunchIntent] = []
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { false },
+      openUntitledDocumentHost: {
+        requestedIntents.append(.newUntitledTab)
+        return true
+      })
     let lane = ZeroWindowCommandLane(
-      adoptedController: { nil },
       openExternalURLs: { _ in XCTFail("New must not travel the external-open lane") },
-      openDocumentHost: { requestedIntents.append($0) })
+      requestNewDocument: { coordinator.requestNewDocument() })
 
     lane.newDocument()
 
     XCTAssertEqual(requestedIntents, [.newUntitledTab])
+  }
+
+  /// A stable controller may transiently reject New while its source window is
+  /// unresolved. That gesture is a one-shot failure, not permission to create a
+  /// surprise tab when another command later happens to expose a controller.
+  @MainActor
+  func testFailedNewOnAStableControllerDoesNotBecomeALaterGhostTab() throws {
+    let live = try makeRestoreHarness(documentNames: [])
+    var attempts = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { live.controller },
+      hasLiveDocumentCapableWindow: { true },
+      createUntitledDocument: { _ in
+        attempts += 1
+        return false
+      })
+
+    coordinator.requestNewDocument()
+    XCTAssertEqual(attempts, 1)
+
+    coordinator.commandTargetDidBecomeAvailable(live.controller)
+    XCTAssertEqual(attempts, 1, "a failed stable New survived as a queued ghost")
+  }
+
+  /// The inverse attach gap: AppKit has a document-capable root, but SwiftUI's
+  /// command pair has not published its controller yet. Do not create a second
+  /// host and do not discard New; replay it exactly once when adoption lands.
+  @MainActor
+  func testNewWaitsForAControllerPublishedByAnAlreadyLiveDocumentHost() throws {
+    let live = try makeRestoreHarness(documentNames: [])
+    var hostRequests = 0
+    var replayedRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { true },
+      openUntitledDocumentHost: {
+        hostRequests += 1
+        return true
+      },
+      createUntitledDocument: { _ in
+        replayedRequests += 1
+        return true
+      })
+
+    coordinator.requestNewDocument()
+    XCTAssertEqual(hostRequests, 0, "a command-target gap spawned a duplicate document host")
+    XCTAssertEqual(replayedRequests, 0)
+
+    coordinator.commandTargetDidBecomeAvailable(live.controller)
+    coordinator.commandTargetDidBecomeAvailable(live.controller)
+    XCTAssertEqual(replayedRequests, 1, "one queued New was lost or replayed twice")
+  }
+
+  /// Creating a native tab can publish its root synchronously. That adoption
+  /// re-enters the coordinator before the outer factory call returns; the
+  /// counted request must already be claimed and the nested drain must be a
+  /// no-op, otherwise one key press creates two tabs.
+  @MainActor
+  func testPendingNewDrainIsSafeAgainstSynchronousControllerAdoption() throws {
+    let live = try makeRestoreHarness(documentNames: [])
+    var createCalls = 0
+    var didReenter = false
+    var coordinator: LaunchIntentCoordinator!
+    coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { true },
+      createUntitledDocument: { _ in
+        createCalls += 1
+        if !didReenter {
+          didReenter = true
+          coordinator.commandTargetDidBecomeAvailable(live.controller)
+        }
+        return true
+      })
+
+    coordinator.requestNewDocument()
+    coordinator.commandTargetDidBecomeAvailable(live.controller)
+
+    XCTAssertEqual(createCalls, 1, "reentrant adoption consumed one New request twice")
+  }
+
+  /// The factory returns before the new host's SwiftUI controller attaches.
+  /// Every key press in that gap is still a separate user gesture: the host
+  /// accounts for one, and the queue must replay the other one or two as tabs.
+  @MainActor
+  func testTwoAndThreeRapidZeroWindowNewRequestsLoseNoTabs() async throws {
+    for requestCount in [2, 3] {
+      let host = try makeRestoreHarness(documentNames: [])
+      var requestedIntents: [LaunchIntent] = []
+      var replayedNewRequests = 0
+      let coordinator = LaunchIntentCoordinator(
+        settleDelayNanoseconds: 0,
+        focusedControllerProvider: { nil },
+        hasLiveDocumentCapableWindow: { false },
+        openUntitledDocumentHost: {
+          requestedIntents.append(.newUntitledTab)
+          return true
+        },
+        createUntitledDocument: { _ in
+          replayedNewRequests += 1
+          return true
+        })
+      let lane = ZeroWindowCommandLane(
+        openExternalURLs: { _ in XCTFail("New must not travel the external-open lane") },
+        requestNewDocument: { coordinator.requestNewDocument() })
+
+      for _ in 0..<requestCount {
+        lane.newDocument()
+      }
+
+      XCTAssertEqual(
+        requestedIntents, [.newUntitledTab],
+        "rapid New requests spawned competing document hosts")
+      XCTAssertEqual(replayedNewRequests, 0, "New replayed before its host attached")
+
+      coordinator.startWhenLaunchIntentsSettle(
+        controller: host.controller,
+        intent: try XCTUnwrap(requestedIntents.first))
+      await coordinator.waitForStartupDecision()
+
+      XCTAssertTrue(host.appState.documentSession.isUntitled)
+      XCTAssertTrue(host.appState.documentSession.hasEditableBuffer)
+      XCTAssertEqual(
+        replayedNewRequests, requestCount - 1,
+        "the attaching host consumed more than one New gesture")
+    }
+  }
+
+  /// Finder owns the host request, then New arrives before that host attaches.
+  /// The URL must keep the host's explicit-document intent and the New gesture
+  /// must become a tab after the file is loaded — neither may replace the other.
+  @MainActor
+  func testFinderHostInFlightThenNewUsesOneHostAndLosesNeitherIntent() async throws {
+    let host = try makeRestoreHarness(documentNames: [])
+    let requested = host.folder.appendingPathComponent("finder-then-new.md").standardizedFileURL
+    try "# Finder then New".write(to: requested, atomically: true, encoding: .utf8)
+    var requestedHostIntents: [LaunchIntent] = []
+    var replayedNewRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { false },
+      openExternalDocumentHost: {
+        requestedHostIntents.append(.explicitDocument)
+        return true
+      },
+      openUntitledDocumentHost: {
+        requestedHostIntents.append(.newUntitledTab)
+        return true
+      },
+      createUntitledDocument: { _ in
+        replayedNewRequests += 1
+        return true
+      })
+
+    coordinator.handle(urls: [requested])
+    coordinator.requestNewDocument()
+
+    XCTAssertEqual(requestedHostIntents, [.explicitDocument])
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: host.controller,
+      intent: try XCTUnwrap(requestedHostIntents.first))
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(host.appState.documentSession.url, requested)
+    XCTAssertEqual(host.appState.selectedDocumentID, requested)
+    XCTAssertEqual(replayedNewRequests, 1)
+  }
+
+  /// Exact zero-window Open Folder pin. A directory is an unsupported launch
+  /// "file" on purpose: it travels through the same coordinator queue, then
+  /// `AppController.openFile` recognizes it as a workspace root once the host
+  /// attaches.
+  @MainActor
+  func testZeroWindowMenuOpenFolderCreatesOneHostAndRestoresThatWorkspace() async throws {
+    let host = try makeRestoreHarness(documentNames: [])
+    let chosenFolder = host.folder.appendingPathComponent("chosen-workspace", isDirectory: true)
+    try FileManager.default.createDirectory(at: chosenFolder, withIntermediateDirectories: true)
+    var requestedIntents: [LaunchIntent] = []
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { nil },
+      hasLiveDocumentCapableWindow: { false },
+      openExternalDocumentHost: {
+        requestedIntents.append(.explicitDocument)
+        return true
+      })
+    let lane = ZeroWindowCommandLane(
+      openExternalURLs: { coordinator.handle(urls: $0) },
+      requestNewDocument: { XCTFail("Open Folder must not travel the New lane") })
+
+    lane.open(urls: [chosenFolder])
+    XCTAssertEqual(requestedIntents, [.explicitDocument])
+
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: host.controller,
+      intent: try XCTUnwrap(requestedIntents.first))
+    await coordinator.waitForStartupDecision()
+    await host.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(host.appState.workspaceRoots.map(\.url), [chosenFolder.standardizedFileURL])
+    XCTAssertNil(host.appState.documentSession.url)
   }
 
   /// THE CONTROL PIN. The zero-window branch is additive: with a root on
@@ -633,10 +964,16 @@ final class LaunchIntentTests: XCTestCase {
   @MainActor
   func testMenuNewFileWithALiveRootTargetsThatRootInsteadOfANewHost() throws {
     let live = try makeRestoreHarness(documentNames: [])
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { live.controller },
+      hasLiveDocumentCapableWindow: { true },
+      openUntitledDocumentHost: {
+        XCTFail("New must not build a window while a root is alive")
+        return true
+      })
     let lane = ZeroWindowCommandLane(
-      adoptedController: { live.controller },
       openExternalURLs: { _ in XCTFail("New must not travel the external-open lane") },
-      openDocumentHost: { _ in XCTFail("New must not build a window while a root is alive") })
+      requestNewDocument: { coordinator.requestNewDocument() })
 
     lane.newDocument()
 
@@ -663,9 +1000,8 @@ final class LaunchIntentTests: XCTestCase {
         return true
       })
     let lane = ZeroWindowCommandLane(
-      adoptedController: { live.controller },
       openExternalURLs: { coordinator.handle(urls: $0) },
-      openDocumentHost: { _ in XCTFail("Open must not build a window while a root is alive") })
+      requestNewDocument: { XCTFail("Open must not travel the New lane") })
 
     lane.open(urls: [requested])
     await live.folderManager.waitForPendingWorkspaceBuild()
