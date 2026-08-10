@@ -158,34 +158,24 @@ final class DocumentWindowRegistry: ObservableObject {
   /// Documents that reached the screen without the registry presenting them —
   /// see `noteDocumentAlreadyOnScreen`. Consumed by the attach that reports one.
   private var documentsAlreadyOnScreen: Set<URL> = []
-  private var launcherReopenPending = false
-  private var launcherReopenAwaitingFactory = false
-  /// Set once the app starts quitting so the last document window's close does
-  /// not resurrect a launcher mid-termination.
+  /// Set once the app starts quitting so deferred window maintenance does not
+  /// mutate the window graph while AppKit tears the application down.
   private var isTerminating = false
   /// Set when a quit prompt pass has already run AND consented for the terminate
   /// request currently in flight. One-shot: `consumeTerminationPassLatch()`
   /// disarms it on read.
   private var hasSettledTerminationPass = false
   /// Observers and factory bindings.
-  var makeDocumentWindow: DocumentWindowFactoryClosure? {
-    didSet {
-      guard makeDocumentWindow != nil, launcherReopenAwaitingFactory else { return }
-      launcherReopenAwaitingFactory = false
-      requestLauncherReopenIfAppWouldBeWindowless()
-    }
-  }
+  var makeDocumentWindow: DocumentWindowFactoryClosure?
 
   /// Whether New can materialize a second document instance instead of
-  /// replacing the controller's current session. The same factory serves both
-  /// tab and standalone-window placement.
+  /// replacing the controller's current session.
   var canOpenUntitledTab: Bool { makeDocumentWindow != nil }
 
-  /// Mark the app as terminating (called from `applicationWillTerminate`) so the
-  /// last-window-close handler suppresses its launcher reopen.
+  /// Mark the app as terminating (called from `applicationWillTerminate`) so
+  /// deferred sweeps and close-scope resolution stop mutating window state.
   func beginTermination() {
     isTerminating = true
-    launcherReopenAwaitingFactory = false
   }
 
   /// Opens a new empty launcher window. Used when the app is reactivated from
@@ -222,12 +212,6 @@ final class DocumentWindowRegistry: ObservableObject {
   /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
   /// and the tab-vs-window close scope is decided from exactly this list.
   private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
-  /// Where a NEW document belongs relative to the window the gesture came from.
-  /// The same resolver shape `AppController` uses for ⌘N, injected for the same
-  /// reason: `NSWindow.userTabbingPreference` is a live System Settings global
-  /// no test can set.
-  private let resolveNewDocumentPlacement: AppController.DocumentPlacementResolver
-
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
     scheduleDeferredMainWork: @escaping (@escaping DeferredMainWork) -> Void = { work in
@@ -270,9 +254,6 @@ final class DocumentWindowRegistry: ObservableObject {
     tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
       window.tabbedWindows ?? [window]
     },
-    resolveNewDocumentPlacement: @escaping AppController.DocumentPlacementResolver = {
-      DocumentOpenPlacement.resolve(for: $0)
-    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
@@ -286,7 +267,6 @@ final class DocumentWindowRegistry: ObservableObject {
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
     self.closeWindow = closeWindow
-    self.resolveNewDocumentPlacement = resolveNewDocumentPlacement
     self.makeDocumentWindow = makeDocumentWindow
   }
 
@@ -481,9 +461,14 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   /// The single close lifecycle for factory callbacks and process-wide AppKit
-  /// notifications. Both routes reconcile registry state and request the same
-  /// coalesced last-window reopen; only never-reused factory windows are
-  /// tombstoned against late SwiftUI attach callbacks.
+  /// notifications. Both routes reconcile registry state; only never-reused
+  /// factory windows are tombstoned against late SwiftUI attach callbacks.
+  ///
+  /// Closing the last window deliberately leaves the process windowless. A
+  /// later Dock activation is the sole owner of creating a replacement
+  /// launcher (`applicationShouldHandleReopen`). Creating one here made the red
+  /// close button appear ineffective and could restore an older document into
+  /// a brand-new native window while the closing window was still fading out.
   func handleWindowClosed(
     _ window: NSWindow,
     tombstonePolicy: WindowCloseTombstonePolicy
@@ -492,12 +477,11 @@ final class DocumentWindowRegistry: ObservableObject {
     if tombstonePolicy == .factoryWindow {
       closedWindows[ObjectIdentifier(window)] = WeakWindow(window)
     }
-    requestLauncherReopenIfAppWouldBeWindowless()
   }
 
   /// Compatibility entry for process-wide reusable SwiftUI/AppKit scene closes.
   /// Production routes may call the explicit policy API directly; this wrapper
-  /// preserves the merged PR #10 contract without tombstoning reusable scenes.
+  /// reconciles the scene without tombstoning a reusable window.
   func handleApplicationWindowClosed(_ window: NSWindow) {
     handleWindowClosed(window, tombstonePolicy: .reusableWindow)
   }
@@ -524,49 +508,6 @@ final class DocumentWindowRegistry: ObservableObject {
     fallbackUntitledIdentities.removeValue(forKey: windowID)
   }
 
-  /// After the last document window closes the app is left with no window and
-  /// no focused controller — the New command (which targets the focused
-  /// window's `AppState`) then has nothing to act on, so the user can neither
-  /// see the empty-state surface nor start a new document. Re-open a launcher so
-  /// a window stays alive on the empty state, matching the VS Code-style "last
-  /// editor closed, window remains" behaviour. Deferred so it runs after AppKit
-  /// finishes the in-progress close; suppressed during termination so Quit is
-  /// never fought by a resurrected launcher, and a no-op when any other document
-  /// or launcher window is still alive.
-  ///
-  /// The replacement launcher starts with `.dockReopen`: the user emptied the
-  /// app on purpose, so the workspace comes back but no document is picked for
-  /// them. Starting it as a cold launch is what made `Close` on the last
-  /// document look like a no-op — the launcher immediately absorbed
-  /// `documents.first` back in.
-  private func requestLauncherReopenIfAppWouldBeWindowless() {
-    guard !isTerminating, !launcherReopenPending else { return }
-    guard !hasContentWindow else {
-      launcherReopenAwaitingFactory = false
-      return
-    }
-    guard makeDocumentWindow != nil else {
-      launcherReopenAwaitingFactory = true
-      return
-    }
-    launcherReopenAwaitingFactory = false
-    launcherReopenPending = true
-    scheduleDeferredMainWork { [weak self] in
-      guard let self else { return }
-      self.launcherReopenPending = false
-      guard !self.isTerminating else { return }
-      self.purgeClosedLauncherWindows()
-      guard !self.hasContentWindow else { return }
-      let hasLauncher = self.launcherWindows.values.contains { $0.window != nil }
-      guard !hasLauncher else { return }
-      let hasLiveDocumentWindow = self.windowsByDocumentID.values.contains {
-        $0.window?.contentView != nil
-      }
-      guard !hasLiveDocumentWindow else { return }
-      self.openLauncherWindow(intent: .dockReopen)
-    }
-  }
-
   /// Whether the app still has a window that can carry real product UI.
   /// AppKit/SwiftUI can retain invisible placeholder scenes in `NSApp.windows`;
   /// those phantoms must not block cold-start recovery or count as survivors
@@ -589,25 +530,16 @@ final class DocumentWindowRegistry: ObservableObject {
   /// `DocumentWindow` reaches it through its own `newWindowForTab` override; a
   /// SwiftUI scene-owned window — the launcher, which is where a recovered
   /// draft lives — reaches it through `DocumentWindowTabBridge`. Both arrive
-  /// here ONCE, and here is where the live "Prefer tabs" preference decides
-  /// between a tab in the source group and an independent window, exactly as ⌘N
-  /// already does (`AppController.createUntitledDocument`).
-  ///
-  /// A new WINDOW still carries the shared tabbing identifier
-  /// (`makeUntitledWindow` → `prepareTabbedWindow`), so "Window ▸ Merge All
-  /// Windows" stays enabled whichever branch ran.
+  /// here ONCE. In Pensieve v1 this gesture is deterministic: it always creates
+  /// a tab in the source group, exactly like ⌘N / ⌘T, and never delegates
+  /// placement to macOS's global tab preference.
   @discardableResult
   func newDocumentForTab(from sourceWindow: NSWindow) -> Bool {
     guard DocumentWindowOwnership.isDocumentHost(sourceWindow) else {
       DebugTrace.log("newDocumentForTab rejected ineligible source '\(sourceWindow.title)'")
       return false
     }
-    switch resolveNewDocumentPlacement(sourceWindow) {
-    case .tabIn:
-      return newUntitledTab(from: sourceWindow)
-    case .newWindow:
-      return newUntitledWindow()
-    }
+    return newUntitledTab(from: sourceWindow)
   }
 
   /// The tab bar's "+" button: opens a NEW untitled document tab in the same
@@ -646,17 +578,6 @@ final class DocumentWindowRegistry: ObservableObject {
     DebugTrace.logWindowMutation("registry.new-tab.add.begin", owner: window, member: newWindow)
     mergeWindowIntoTabs(window, newWindow)
     DebugTrace.logWindowMutation("registry.new-tab.add.end", owner: window, member: newWindow)
-    orderAndActivateWindow(newWindow)
-    return true
-  }
-
-  /// Opens a factory-built untitled document as an independent window. This is
-  /// the New counterpart of `newUntitledTab` when macOS resolves placement to a
-  /// new window.
-  @discardableResult
-  func newUntitledWindow() -> Bool {
-    guard let newWindow = makeUntitledWindow() else { return false }
-    DebugTrace.log("newUntitledWindow")
     orderAndActivateWindow(newWindow)
     return true
   }
@@ -959,6 +880,21 @@ final class DocumentWindowRegistry: ObservableObject {
     applicationWindows().first { window in
       controllersByWindow[ObjectIdentifier(window)]?.controller === controller
     }
+  }
+
+  /// Whether `window` is the one native surface New may intentionally reuse.
+  ///
+  /// Buffer state alone cannot answer this. A factory-created untitled tab is
+  /// briefly empty while its SwiftUI controller attaches, but it is already a
+  /// user-created document surface and a second New must create another tab.
+  /// Only a window still owned by the launcher's registry role is reusable.
+  func isReusableLauncherWindow(_ window: NSWindow) -> Bool {
+    let windowID = ObjectIdentifier(window)
+    return launcherWindows[windowID]?.window === window
+      && contentWindows[windowID]?.window == nil
+      && untitledTabWindows[windowID]?.window == nil
+      && !windowsByIdentity.values.contains { $0.window === window }
+      && !windowHoldsLiveWork(window)
   }
 
   func unregisterController(for window: NSWindow) {

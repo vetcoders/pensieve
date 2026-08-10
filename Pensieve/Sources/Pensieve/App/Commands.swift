@@ -164,6 +164,11 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut("n", modifiers: [.command])
 
+      Button("New Tab") {
+        controller.createUntitledDocument()
+      }
+      .keyboardShortcut("t", modifiers: [.command])
+
       Divider()
 
       Button("Open File…") {

@@ -88,6 +88,13 @@ make gates
 
 The Mac App Store packaging lane exists as `make release-appstore`, but App Store Connect submission, signing identities, and the final MAS truth-clicks stay with the human operator.
 
+## Product contract
+
+The canonical definition of keyboard shortcuts and the lifecycle of files,
+tabs, windows, and recovery is
+[`docs/keyboard-shortcuts-and-file-lifecycle-contract.md`](docs/keyboard-shortcuts-and-file-lifecycle-contract.md).
+Implementations, tests, reports, and external mirrors do not override it.
+
 ## Background & Heritage
 
 Pensieve is the spiritual successor to an older Objective-C markdown editor (by Satoshi Iwaki) that served as our daily driver for over a year. We kept the essence (and the CSS) but rebuilt the engine entirely in modern Swift to drop legacy debt and gain native Apple Silicon performance.

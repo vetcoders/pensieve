@@ -245,8 +245,8 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
     // tabs are not), so they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
-    // row. The shared lifecycle is idempotent and also restores one launcher
-    // after the final content window closes.
+    // row. The shared lifecycle is idempotent. It never creates a replacement
+    // window: an explicit Dock reopen is the sole owner of that transition.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
@@ -295,8 +295,10 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   ) -> Bool {
     guard !flag else { return true }
     Task { @MainActor in
-      if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-        DocumentWindowRegistry.shared.openLauncherWindow(intent: .dockReopen)
+      let registry = DocumentWindowRegistry.shared
+      guard !registry.applicationHasLiveWindow() else { return }
+      if registry.makeDocumentWindow != nil {
+        registry.openLauncherWindow(intent: .dockReopen)
       } else {
         NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
       }

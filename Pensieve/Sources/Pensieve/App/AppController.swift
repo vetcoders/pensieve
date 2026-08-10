@@ -11,14 +11,12 @@ private enum DocumentImportOutcome: Sendable {
 /// The application's ONE startup restore, as a process-wide fact.
 ///
 /// Bringing the working set back is something the APPLICATION does once, when
-/// it starts — not something every window that runs
-/// `start(intent:)` does. Every launcher takes that same path: the
-/// one the registry re-opens after the last document window closes, and the one
-/// a Dock reopen makes. And closing a WINDOW deliberately leaves its files in
-/// the working set — retiring a file is what closing the DOCUMENT does (⌘W, a
-/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — so a
-/// per-controller gate meant closing the last document window immediately
-/// reopened it: the user could not close it at all.
+/// it starts — not something every window that runs `start(intent:)` does.
+/// Launchers created later by an explicit Dock reopen must not repeat that
+/// startup restore. Closing a WINDOW deliberately leaves its files in the
+/// working set — retiring a file is what closing the DOCUMENT does (⌘W, a
+/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — while
+/// closing the last window leaves the running app windowless until Dock reopen.
 ///
 /// Production shares `.shared`; a test that simulates a launch holds its own
 /// instance, because "once per process" is otherwise once per test BUNDLE.
@@ -38,7 +36,6 @@ final class ApplicationStartupRestore {
 @MainActor
 final class AppController: ObservableObject {
   typealias FolderTrashConfirmation = @MainActor (URL) -> Bool
-  typealias DocumentPlacementResolver = @MainActor (NSWindow?) -> DocumentOpenPlacement
   /// Confirms dropping a crash draft for good. Synchronous like the folder
   /// trash question: nothing is being torn down, so a plain alert is enough.
   typealias DraftDiscardConfirmation = @MainActor (RecoveryDraft) -> Bool
@@ -66,7 +63,6 @@ final class AppController: ObservableObject {
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
   private let confirmDiscardDraft: DraftDiscardConfirmation
-  private let resolveDocumentOpenPlacement: DocumentPlacementResolver
   /// Unhandled crash drafts, newest first — the model behind the launcher's
   /// "Recovered Drafts" section. Empty means the section is not shown at all.
   @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
@@ -164,9 +160,6 @@ final class AppController: ObservableObject {
     agentWorkspaceRoot: URL? = nil,
     importsFoldersInBackground: Bool = false,
     workspaceSearchDebounceNanoseconds: UInt64 = 250_000_000,
-    resolveDocumentOpenPlacement: @escaping DocumentPlacementResolver = {
-      DocumentOpenPlacement.resolve(for: $0)
-    },
     confirmFolderTrash: @escaping FolderTrashConfirmation = { url in
       let alert = NSAlert()
       alert.messageText = "Move \(url.lastPathComponent) to Trash?"
@@ -209,7 +202,6 @@ final class AppController: ObservableObject {
     self.transcriptionService = transcriptionService ?? TranscriptionService()
     self.importsFoldersInBackground = importsFoldersInBackground
     self.workspaceSearchDebounceNanoseconds = workspaceSearchDebounceNanoseconds
-    self.resolveDocumentOpenPlacement = resolveDocumentOpenPlacement
     self.confirmFolderTrash = confirmFolderTrash
     self.confirmSaveChanges = confirmSaveChanges
     self.confirmDiscardDraft = confirmDiscardDraft
@@ -945,23 +937,26 @@ final class AppController: ObservableObject {
   /// chain — was REPLACED rather than joined. One document open, ⌘N, and the
   /// document was gone from the list.
   ///
-  /// An occupied window never enters the save/switch path. The system's live
-  /// "Prefer tabs" setting decides whether the factory-built document joins the
-  /// source tab group or opens independently. An empty launcher is still reused
-  /// in place, and clean headless tests keep their historical in-place fallback.
+  /// An occupied window never enters the save/switch path. New is deterministic
+  /// in Pensieve v1: the factory-built document joins the source window's native
+  /// tab group, regardless of macOS's "Prefer tabs when opening documents"
+  /// setting. Reuse is restricted to a window the registry still classifies as
+  /// the idle launcher. A user-created untitled tab may briefly have no buffer
+  /// while SwiftUI attaches its controller, but its native role already makes a
+  /// second New another tab. Clean headless tests retain their in-place fallback.
   @discardableResult
   func createUntitledDocument() -> Bool {
-    if holdsLiveDocumentWork {
+    let sourceWindow =
+      documentWindowRegistry.window(hosting: self) ?? hostWindowProvider?()
+    let sourceRequiresNewTab =
+      sourceWindow.map {
+        !documentWindowRegistry.isReusableLauncherWindow($0)
+      } ?? false
+
+    if holdsLiveDocumentWork || sourceRequiresNewTab {
       if documentWindowRegistry.canOpenUntitledTab {
-        let sourceWindow =
-          documentWindowRegistry.window(hosting: self) ?? hostWindowProvider?()
-        switch resolveDocumentOpenPlacement(sourceWindow) {
-        case .tabIn:
-          guard let sourceWindow else { return false }
-          return documentWindowRegistry.newUntitledTab(from: sourceWindow)
-        case .newWindow:
-          return documentWindowRegistry.newUntitledWindow()
-        }
+        guard let sourceWindow else { return false }
+        return documentWindowRegistry.newUntitledTab(from: sourceWindow)
       }
 
       // A headless controller has no factory with which to preserve a dirty or

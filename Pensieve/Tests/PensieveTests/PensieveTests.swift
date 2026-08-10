@@ -6360,8 +6360,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
-      documentWindowRegistry: registry,
-      resolveDocumentOpenPlacement: { _ in .tabIn }
+      documentWindowRegistry: registry
     )
     registry.registerController(controller, for: documentWindow)
 
@@ -6433,8 +6432,7 @@ final class PensieveSmokeTests: XCTestCase {
         promptCount += 1
         return .cancel
       }),
-      documentWindowRegistry: registry,
-      resolveDocumentOpenPlacement: { _ in .tabIn })
+      documentWindowRegistry: registry)
     registry.registerController(controller, for: sourceWindow)
 
     XCTAssertTrue(registry.window(hosting: controller) === sourceWindow)
@@ -6449,24 +6447,30 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testControllerCreatesNewWindowWithoutReplacingOccupiedSession() throws {
+  func testControllerCreatesNewTabWithoutReplacingOccupiedUntitledSession() throws {
     let sourceWindow = Self.makeControllerlessWindow()
     let untitledWindow = Self.makeControllerlessWindow()
     defer {
       sourceWindow.close()
       untitledWindow.close()
     }
+    XCTAssertTrue(
+      DocumentWindowOwnership.claimDocumentHost(sourceWindow),
+      "the controller fixture must model a document host")
 
     var factoryCalls = 0
-    var activations = 0
+    var tabMerges = 0
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in XCTFail("New must not defer here") },
       scheduleLauncherWindowSweep: { _ in },
-      mergeWindowIntoTabs: { _, _ in XCTFail("new-window placement must not merge tabs") },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === sourceWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
       orderAndActivateWindow: { window in
         XCTAssertTrue(window === untitledWindow)
-        activations += 1
       },
       applicationWindows: { [sourceWindow, untitledWindow] },
       makeDocumentWindow: { ref, intent in
@@ -6483,14 +6487,13 @@ final class PensieveSmokeTests: XCTestCase {
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
       documentStore: makeTestDocumentStore(),
-      documentWindowRegistry: registry,
-      resolveDocumentOpenPlacement: { _ in .newWindow })
+      documentWindowRegistry: registry)
     registry.registerController(controller, for: sourceWindow)
 
     XCTAssertTrue(controller.createUntitledDocument())
 
     XCTAssertEqual(factoryCalls, 1)
-    XCTAssertEqual(activations, 1)
+    XCTAssertEqual(tabMerges, 1)
     XCTAssertEqual(appState.documentSession.identity, originalIdentity)
     XCTAssertEqual(appState.activeDocumentText, "original buffer")
   }
@@ -6525,8 +6528,7 @@ final class PensieveSmokeTests: XCTestCase {
         metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
       documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
       indexDatabase: indexDatabase,
-      documentWindowRegistry: registry,
-      resolveDocumentOpenPlacement: { _ in .newWindow }
+      documentWindowRegistry: registry
     )
 
     XCTAssertFalse(controller.holdsLiveDocumentWork)

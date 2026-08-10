@@ -1,11 +1,14 @@
 # Pensieve — Keyboard Shortcuts, File & Recovery Contract v0.1
 
-> **Author: Monika (2026-08-03). Details filled in from settled product
-> decisions (dates inline).** Items marked **[OPEN]** await a decision — list
-> at the end.
-> Operator's Polish working copy lives outside the repo.
+> **Owner: Monika. Established 2026-08-03; current through 2026-08-10.**
+> Settled decisions carry their dates inline. Items marked **[OPEN]** await a
+> product decision; **[IMPLEMENTATION GAP]** means the decision is settled but
+> the current code does not yet satisfy it.
 
-This document is the source of truth for keyboard shortcuts, menus, and the lifecycle of files, tabs, windows and recovery in Pensieve. Changing a command's semantics requires updating this contract.
+This is the single source of truth for keyboard shortcuts, menus, and the
+lifecycle of files, tabs, windows and recovery in Pensieve. A report, test,
+implementation detail or external mirror cannot override it. Changing a
+command's semantics requires an explicit product decision and an update here.
 
 Pensieve follows macOS conventions but has its own model: **workspace + files + tabs**.
 
@@ -32,12 +35,15 @@ Clarifications (decisions 26.07/31.07, canon item 2):
 
 ### `Cmd+N` — New
 
-Creates a new untitled document instance without switching or saving the current
-session. An **idle** window takes the draft in place; an occupied window follows
-macOS's live "Prefer tabs when opening documents" policy and opens either a
-native tab or an independent window. Headless controllers without a window
-factory retain clean in-place title sequencing and refuse to overwrite dirty or
-in-flight work.
+In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab with an
+untitled buffer in the current window. An **idle** launcher may take that buffer
+in place; an occupied window must preserve its current session and add a native
+tab. A user-created empty tab is already occupied for placement purposes, even
+before its editable buffer finishes attaching: another `Cmd+N` or `Cmd+T` must
+add another tab, never reuse that tab in place. The macOS "Prefer tabs when
+opening documents" setting does not turn this command into an
+independent-window command. Splitting `Cmd+N` (new window) from `Cmd+T` (new tab)
+requires the still-open multi-window product decision.
 
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
 
@@ -172,7 +178,10 @@ be cleared of ALL targets of a dying editor during teardown).
 
 Closes the whole window with all its tabs — the equivalent of the red button.
 A tidying gesture: it does NOT remove files from Open Files (they come back on restore).
-For dirty tabs, the window-close flow applies (batch modal).
+For dirty tabs, the window-close flow applies (batch modal). After the last
+window closes, the Pensieve process remains alive with zero windows; it does
+not create a launcher automatically. Clicking Pensieve in the Dock later
+creates exactly one empty launcher.
 
 ### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
@@ -244,7 +253,30 @@ republishing a half-dead window as the current command target.
 
 ### System window `X` button
 
-Closes the window, not a single tab. Must not cause a cycle of "window/app closes and immediately reopens." Such behavior is a bug to diagnose.
+Closes the window, not a single tab. Dirty buffers and recovery items must
+complete the Save / Don't Save / Cancel flow before AppKit tears the window
+down; Cancel or a save failure leaves the window open. A successful close of
+the last window leaves the running app windowless. It must not create a
+launcher, restore another document, or cause a cycle of "window/app closes and
+immediately reopens." Such behavior is a bug. The only replacement-window path
+is a later explicit Dock activation, which creates exactly one empty launcher.
+
+The close decision is atomic across the window:
+
+- If no tab has unsaved changes and none is a recovery item, the window closes
+  without a prompt.
+- If exactly one tab requires a decision, Pensieve shows **Save / Don't Save /
+  Cancel**.
+- If several tabs require decisions, Pensieve shows the batch-close surface
+  specified below. **Review Changes…** visits the active tab first, then the
+  remaining tabs from left to right.
+- `Cancel` at any stage aborts closing the whole window. Saves already completed
+  remain saved; unresolved tabs remain open and unchanged.
+- A save error stops the sequence, identifies the affected file, and leaves the
+  window open.
+- AppKit may close the window only after every dirty, untitled, and recovery
+  item has been saved successfully or explicitly discarded. No response, a
+  dismissed picker, or an error never means `Discard`.
 
 ### `X` button on a tab
 
@@ -482,6 +514,27 @@ more cautious than the native Discard Changes — relevant for recovery items).
 Micro-refinement to consider during implementation: narrowing the
 confirmation to only batches that contain recovery items.
 
+The two deliberate extensions over AppKit's native batch alert are normative
+and must not be "corrected" back toward pure nativeness: **Save All** is an
+additional convenience action, and **Discard All** requires the extra
+confirmation described above.
+
+`Save All` runs in this order:
+
+1. Save dirty files that already have paths; they need no picker.
+2. Visit untitled and recovery tabs one at a time, active tab first and then
+   left to right, presenting a separate native **Save As** picker for each.
+3. After a successful Save As, assign the chosen path to the untitled tab. A
+   recovery item may be retired only after the file is confirmed on disk.
+4. Canceling any picker aborts the whole Close All. Completed saves remain;
+   canceled and not-yet-visited tabs retain their content and dirty/recovery
+   state.
+5. A save error stops on that file, keeps the window open, and never retires its
+   recovery item. The user may retry, switch to **Review Changes…**, or cancel.
+
+`Cancel`, dismissing a picker, and a save error are never equivalent to
+`Discard`.
+
 ## Close All Open Files
 
 If all files are saved and no recovery item requires a decision, the app may close all files without an additional prompt.
@@ -531,7 +584,7 @@ Close All must never cause silent data loss.
   trashed file leaving Open Files without waiting for a relaunch. Its
   bookmarks (the root's own and every file bookmark it granted) are pruned
   at the same time. Recovery is manual: put the folder back from the Trash,
-  then re-add it as a workspace root. **[OPEN — implementation pending]**:
+  then re-add it as a workspace root. **[IMPLEMENTATION GAP]**:
   this PR only implements the individual-file half of "Trash is dead"; the
   root half described here is decided but not yet built.
 
@@ -568,12 +621,17 @@ Close All must never cause silent data loss.
 An agent implementing or refactoring menu/commands must verify:
 
 - [ ] `Cmd+T` creates an empty tab with no file on disk.
-- [x] `Cmd+N` preserves the current buffer and follows the macOS tab/window preference; an idle window fills in place.
+- [ ] `Cmd+N` does the same as `Cmd+T` in v1: it preserves the current buffer
+      and creates a native tab; an idle launcher may fill in place.
+- [ ] Repeated New commands (`file → Cmd+N → Cmd+T`) add one tab per command;
+      a newly created empty tab is never mistaken for the idle launcher.
 - [ ] `Cmd+O` opens the file picker, `Shift+Cmd+O` the folder picker (workspace).
 - [ ] `Cmd+S` saves an existing file, and for untitled it triggers Save As.
 - [ ] `Shift+Cmd+S` triggers Save As.
 - [ ] `Cmd+W` and the tab's `X` close the active tab and protect dirty buffer/recovery.
-- [ ] The system `X` closes the window without an automatic reopen.
+- [ ] The system `X` protects dirty/recovery buffers, then closes the last
+      window without an automatic reopen; the process stays alive with zero
+      windows, and a later Dock click creates exactly one empty launcher.
 - [ ] `Cmd+M` minimizes the window, `Cmd+,` opens Settings, and `Cmd+Q` quits the application.
 - [ ] `Cmd+F` searches in the document, and `Shift+Cmd+F` in the workspace.
 - [ ] Close All protects unsaved files and recovery items.
@@ -604,78 +662,27 @@ An agent implementing or refactoring menu/commands must verify:
 
 ---
 
-## Open decisions and items to verify
+## Open decisions and implementation gaps
 
-0. **List of currently open items (state as of 03.08, after this morning's decisions):**
-   - **[OPEN — implementation pending]** workspace ROOT in Trash: behavior
-     **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
-     "Trash is dead" section above); not yet built in this PR;
-   - **[OPEN]** native Save sheet for untitled on close
-     (Monika's 03.08 proposal, separate UX cut);
-   - **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
-   - **[OPEN — implementation pending]** `Shift+Cmd+T` Reopen Closed Tab:
-     shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
-     (see the `Shift+Cmd+T` section above); the feature itself is not yet
-     implemented.
+**Current list:**
 
-   **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
-   markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
-   bold/italic/link), switching editor/split/preview mode, sidebar toggle,
-   zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing to be assigned to it pending
-   the multi-window decision.
+- **[IMPLEMENTATION GAP]** workspace ROOT in Trash: behavior
+  **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
+  "Trash is dead" section above); not yet built in this PR;
+- **[OPEN]** native Save sheet for untitled on close
+  (Monika's 03.08 proposal, separate UX cut);
+- **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
+- **[IMPLEMENTATION GAP]** `Shift+Cmd+T` Reopen Closed Tab:
+  shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
+  (see the `Shift+Cmd+T` section above); the feature itself is not yet
+  implemented.
 
-   RESOLVED today: ⌘W and Open Files (see the `Cmd+W` section — closing a
-   tab removes the file from the session; window/quit/crash do not remove it); the
-   last tab (launcher); the shape of the batch modal (the "Batch close modal" section).
+**To be inventoried in v0.2** (exist in the UI, semantics to be written down):
+markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
+bold/italic/link), switching editor/split/preview mode, sidebar toggle,
+zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing to be assigned to it pending
+the multi-window decision.
 
-1. **Last tab after `Cmd+W`** — RESOLVED: shows the startup screen
-   (launcher), does not quit the app.
-2. **System `X` and dirty tabs** — SPEC IN FORCE (not an open
-   decision; to be moved into the "Closing windows and tabs" section for v0.2).
-   03.08 implementation delta: the PR #15 line has a two-phase pass (decisions
-   for all windows BEFORE any mutation, Cancel aborts the whole thing) —
-   in the spirit of this flow, but WITHOUT the batch modal
-   (Review Changes… / Save All / Discard All); the batch modal is a separate
-   UX cut after the campaign. The following flow applies when closing a window:
-   - If no tab has unsaved changes and none is a recovery item, the window closes without an additional prompt.
-   - If only one tab requires a decision, the app shows the native prompt: **Save / Don't Save / Cancel**.
-   - If several tabs require a decision, the app first shows the batch modal with the options:
-     - **Review Changes…** — the default option; step through the files in order, with a **Save / Don't Save / Cancel** decision for each;
-     - **Save All** — a quick save of all files; untitled and recovery tabs require subsequent Save As pickers;
-     - **Discard All** — discarding all changes only after an additional, unambiguous confirmation;
-     - **Cancel** — aborts closing and leaves the whole window unchanged.
-   - In **Review Changes…** mode, files are presented in a predictable order: the active tab first, then subsequent tabs from left to right.
-   - `Cancel` at any stage aborts closing the whole window. Saves already performed remain saved, but unresolved tabs are neither closed nor discarded.
-   - A save error stops the process, indicates the specific file, and leaves the window open.
-   - The window closes only once every dirty, untitled, and recovery item has been successfully saved or explicitly discarded. No decision never means `Discard`.
-3. **Save All for untitled/recovery** — SPEC IN FORCE (not an
-   open decision; key rules: paths files first, without pickers;
-   untitled/recovery one at a time via native Save As — NEVER an
-   automatic save under generated names; canceling any picker aborts the
-   entire Close All; completed saves remain; a recovery item disappears only after a
-   confirmed save).
-
-   **Compatibility with the native model (03.08 analysis, Monika + Fable):** the
-   flow is compatible with NSDocument/NSDocumentController on every safety
-   rule (pathed without a picker, untitled via the native Save sheet,
-   Cancel aborts the whole thing, no rollback, error blocks, Review as default).
-   TWO DELIBERATE extensions relative to the native alert — not to be
-   "corrected" back toward pure nativeness:
-   - **Save All** — the native batch alert doesn't have it (only Review /
-     Discard / Cancel); our extension, safe;
-   - **Discard All with an extra confirmation** — the native Discard Changes
-     deletes without a second question; we are deliberately more cautious here
-     (the "zero silent data loss" principle, relevant for recovery items).
-
-   The operation proceeds in the following order:
-   - First the app saves dirty files that already have a path on disk. These saves do not require pickers.
-   - Then it handles untitled and recovery tabs in order: the active tab first, then the rest from left to right.
-   - For each such tab it shows a separate native **Save As** picker. Several independent buffers must not be saved automatically under generated names.
-   - After a successful save, the untitled tab receives the chosen path and becomes a regular saved file. A recovery item can be removed from recovery only after the file has been confirmed saved to disk.
-   - Canceling any picker **aborts the entire Close All**. The window stays open; the canceled and still-unresolved tabs keep their content and dirty/recovery status.
-   - Files saved before the cancellation remain saved — the operation does not try to undo completed saves.
-   - A save error stops the sequence at the specific file, shows a readable message, and leaves the window open. A recovery item cannot be removed after a failed save.
-   - After resolving the error, the user can retry the save, move to **Review Changes…**, or cancel the close.
-   - The window or all tabs close only once every dirty, untitled, and recovery item has been successfully saved or explicitly discarded.
-
-**Safety rule:** `Cancel`, closing a picker, and a save error are never equivalent to `Discard`.
+Settled behavior belongs in the normative sections above, not in this list.
+In particular, `Cmd+W` and Open Files, the last-tab launcher, system-window
+close, and the batch-close/Save All sequence are resolved contracts.

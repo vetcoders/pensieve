@@ -5,22 +5,25 @@ import XCTest
 
 final class DocumentWindowRegistryTests: XCTestCase {
   @MainActor
-  func testUntitledFactoryAvailabilityAndStandaloneWindowPlacement() {
+  func testUntitledFactoryAvailabilityAndDeterministicTabPlacement() {
     let sourceWindow = Self.makeWindow()
     let untitledWindow = Self.makeWindow()
     defer {
       sourceWindow.close()
       untitledWindow.close()
     }
-    var activations = 0
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(sourceWindow))
+    var merges = 0
     var factoryCalls = 0
     let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
       scheduleLauncherWindowSweep: { _ in },
-      mergeWindowIntoTabs: { _, _ in XCTFail("standalone placement must not merge") },
-      orderAndActivateWindow: { window in
-        XCTAssertTrue(window === untitledWindow)
-        activations += 1
+      mergeWindowIntoTabs: { target, joined in
+        XCTAssertTrue(target === sourceWindow)
+        XCTAssertTrue(joined === untitledWindow)
+        merges += 1
       },
+      orderAndActivateWindow: { _ in },
       applicationWindows: { [sourceWindow, untitledWindow] },
       makeDocumentWindow: { ref, intent in
         XCTAssertNil(ref)
@@ -38,9 +41,9 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
     XCTAssertTrue(registry.canOpenUntitledTab)
     XCTAssertTrue(registry.window(hosting: controller) === sourceWindow)
-    XCTAssertTrue(registry.newUntitledWindow())
+    XCTAssertTrue(registry.newDocumentForTab(from: sourceWindow))
     XCTAssertEqual(factoryCalls, 1)
-    XCTAssertEqual(activations, 1)
+    XCTAssertEqual(merges, 1)
   }
 
   @MainActor
@@ -51,7 +54,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
     XCTAssertFalse(registry.canOpenUntitledTab)
     XCTAssertFalse(registry.newUntitledTab(from: sourceWindow))
-    XCTAssertFalse(registry.newUntitledWindow())
   }
 
   @MainActor
@@ -637,8 +639,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
       "the process-wide willClose reconciler must remove the closing window's document")
     XCTAssertEqual(
       deferredWork.count,
-      1,
-      "the process-wide close route must request one deferred launcher reconciliation")
+      0,
+      "the process-wide close route must reconcile state without creating a launcher")
   }
 
   @MainActor
@@ -667,7 +669,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
-  func testGlobalCloseOfLastDocumentSchedulesLauncherReopen() throws {
+  func testGlobalCloseOfLastDocumentLeavesTheProcessWindowless() throws {
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-global-close.md").standardizedFileURL
     let documentWindow = Self.makeWindow()
     let launcherWindow = Self.makeWindow()
@@ -694,13 +696,11 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.open(DocumentRef(id: documentID))
     registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
 
-    XCTAssertEqual(deferredWork.count, 1, "the process-wide close route must request reopening")
-    guard let reopen = deferredWork.first else {
-      return XCTFail("the process-wide close route did not request reopening")
-    }
-    reopen()
+    XCTAssertTrue(
+      deferredWork.isEmpty,
+      "the process-wide close route must not schedule a replacement window")
     XCTAssertEqual(factoryRefs.compactMap { $0 }.map(\.id), [documentID])
-    XCTAssertEqual(factoryRefs.filter { $0 == nil }.count, 1)
+    XCTAssertEqual(factoryRefs.filter { $0 == nil }.count, 0)
 
     XCTAssertTrue(
       registry.attach(documentWindow, documentID: documentID),
@@ -708,7 +708,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
-  func testGlobalCloseBeforeFactoryWiringKeepsDeferredLauncherRequest() throws {
+  func testGlobalCloseBeforeFactoryWiringDoesNotArmALaterLauncherRequest() throws {
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-early-global-close.md").standardizedFileURL
     let documentWindow = Self.makeWindow()
     let launcherWindow = Self.makeWindow()
@@ -733,7 +733,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
     XCTAssertTrue(
       deferredWork.isEmpty,
-      "the reopen cannot execute until the scene root wires the window factory")
+      "closing before factory wiring must not queue hidden replacement work")
 
     registry.makeDocumentWindow = { ref, _ in
       XCTAssertNil(ref)
@@ -742,18 +742,14 @@ final class DocumentWindowRegistryTests: XCTestCase {
     }
     XCTAssertEqual(
       deferredWork.count,
-      1,
-      "wiring the factory must release the one pending close-lifecycle request")
-    guard let reopen = deferredWork.first else {
-      return XCTFail("the early global close dropped its deferred launcher request")
-    }
-    reopen()
+      0,
+      "wiring the factory later must not resurrect a window closed earlier")
 
-    XCTAssertEqual(launcherFactoryCalls, 1)
+    XCTAssertEqual(launcherFactoryCalls, 0)
   }
 
   @MainActor
-  func testDuplicateFactoryAndGlobalCloseSignalsScheduleOneLauncherReopen() throws {
+  func testDuplicateFactoryAndGlobalCloseSignalsOnlyReconcileOnce() throws {
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-dual-close.md").standardizedFileURL
     let documentWindow = Self.makeWindow()
     let launcherWindow = Self.makeWindow()
@@ -778,8 +774,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
     registry.handleWindowClosed(documentWindow, tombstonePolicy: .reusableWindow)
 
     XCTAssertEqual(
-      deferredWork.count, 1,
-      "factory callback plus willClose must coalesce into one deferred launcher request")
+      deferredWork.count, 0,
+      "factory callback plus willClose must never schedule a replacement launcher")
     XCTAssertFalse(
       registry.attach(documentWindow, documentID: documentID),
       "a factory-tombstoned window must reject a late SwiftUI reattach")
@@ -887,8 +883,52 @@ final class DocumentWindowRegistryTests: XCTestCase {
   }
 
   @MainActor
-  func testClosingTheLastDocumentWindowReopensALauncher() throws {
+  func testClosingTheLastDocumentWindowStaysWindowlessUntilExplicitDockReopen() throws {
     let docID = URL(fileURLWithPath: "/tmp/pensieve-last-doc.md").standardizedFileURL
+    let docWindow = Self.makeWindow()
+    let launcherWindow = Self.makeWindow()
+    defer {
+      docWindow.close()
+      launcherWindow.close()
+    }
+
+    var factoryRequests: [(DocumentRef?, LaunchIntent)] = []
+    var deferredWork: [() -> Void] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { deferredWork.append($0) },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { nil },
+      applicationWindows: { [] },
+      makeDocumentWindow: { ref, intent in
+        factoryRequests.append((ref, intent))
+        return ref == nil ? launcherWindow : docWindow
+      }
+    )
+
+    registry.open(DocumentRef(id: docID))
+    XCTAssertEqual(factoryRequests.count, 1, "opening a document builds exactly one window")
+    XCTAssertEqual(factoryRequests[0].0?.id, docID)
+
+    // The red close button is allowed to leave the process alive with zero
+    // windows. It must not manufacture a launcher or restore an older file.
+    registry.handleDocumentWindowClosed(docWindow)
+    XCTAssertTrue(deferredWork.isEmpty)
+    for work in deferredWork { work() }
+    XCTAssertEqual(factoryRequests.count, 1)
+
+    // A later explicit Dock activation owns the one permitted replacement.
+    registry.openLauncherWindow(intent: .dockReopen)
+    XCTAssertEqual(factoryRequests.count, 2)
+    XCTAssertNil(factoryRequests[1].0)
+    XCTAssertEqual(factoryRequests[1].1, .dockReopen)
+  }
+
+  @MainActor
+  func testGlobalWillCloseDoesNotCreateAReplacementWindow() throws {
+    let docID = URL(fileURLWithPath: "/tmp/pensieve-scene-close.md").standardizedFileURL
     let docWindow = Self.makeWindow()
     let launcherWindow = Self.makeWindow()
     defer {
@@ -913,74 +953,13 @@ final class DocumentWindowRegistryTests: XCTestCase {
     )
 
     registry.open(DocumentRef(id: docID))
-    XCTAssertEqual(factoryRefs.count, 1, "opening a document builds exactly one window")
-    XCTAssertEqual(factoryRefs[0]?.id, docID)
-
-    // Closing the LAST document window must not leave the app windowless: it
-    // reopens an empty launcher so the user can start a new document (⌘N).
-    registry.handleDocumentWindowClosed(docWindow)
-    XCTAssertEqual(deferredWork.count, 1)
-    for work in deferredWork { work() }
-
-    XCTAssertTrue(
-      factoryRefs.contains { $0 == nil },
-      "closing the last document window must reopen an empty launcher")
-  }
-
-  @MainActor
-  func testGlobalWillCloseReopensLauncherAndReapIgnoresPhantomScene() throws {
-    let docID = URL(fileURLWithPath: "/tmp/pensieve-scene-close.md").standardizedFileURL
-    let docWindow = Self.makeWindow()
-    let phantomScene = Self.makeWindow(title: "<untitled>")
-    let launcherWindow = Self.makeWindow()
-    defer {
-      docWindow.close()
-      phantomScene.close()
-      launcherWindow.close()
-    }
-
-    var factoryRefs: [DocumentRef?] = []
-    var deferredWork: [() -> Void] = []
-    var sweepWork: [() -> Void] = []
-    var closedIDs: [ObjectIdentifier] = []
-    let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { deferredWork.append($0) },
-      scheduleLauncherWindowSweep: { sweepWork.append($0) },
-      mergeWindowIntoTabs: { _, _ in },
-      orderAndActivateWindow: { _ in },
-      currentMergeTarget: { nil },
-      applicationWindows: { [phantomScene, launcherWindow] },
-      closeWindow: { closedIDs.append(ObjectIdentifier($0)) },
-      makeDocumentWindow: { ref, _ in
-        factoryRefs.append(ref)
-        return ref == nil ? launcherWindow : docWindow
-      }
-    )
-
-    registry.open(DocumentRef(id: docID))
     registry.handleApplicationWindowClosed(docWindow)
 
-    while !deferredWork.isEmpty {
-      deferredWork.removeFirst()()
-    }
-    while !sweepWork.isEmpty {
-      sweepWork.removeFirst()()
-    }
-    while !deferredWork.isEmpty {
-      deferredWork.removeFirst()()
-    }
-
-    XCTAssertEqual(
-      factoryRefs.filter { $0 == nil }.count,
-      1,
-      "closing the final reusable scene via Command-W must create exactly one launcher")
-    XCTAssertTrue(
-      registry.applicationHasLiveWindow(),
-      "the replacement launcher must remain the app's live window")
+    XCTAssertTrue(deferredWork.isEmpty)
+    XCTAssertEqual(factoryRefs.count, 1)
     XCTAssertFalse(
-      closedIDs.contains(ObjectIdentifier(launcherWindow)),
-      "an invisible phantom scene must not let the reap sweep delete the only launcher")
+      factoryRefs.contains { $0 == nil },
+      "global willClose handling must reconcile state without creating a replacement launcher")
   }
 
   @MainActor
@@ -1307,7 +1286,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       currentMergeTarget: { nil },
       applicationWindows: { [sceneWindow, untitledWindow] },
-      resolveNewDocumentPlacement: { _ in .tabIn },
       makeDocumentWindow: { ref, intent in
         XCTAssertNil(ref)
         XCTAssertEqual(intent, .newUntitledTab)
@@ -1395,10 +1373,9 @@ final class DocumentWindowRegistryTests: XCTestCase {
     XCTAssertEqual(bridgeCalls, 0)
   }
 
-  /// A4. "Prefer tabs = Always" merges the new document into the source window's
-  /// group.
+  /// Native tab creation is deterministic and merges into the source group.
   @MainActor
-  func testTabBarPlusWithAlwaysTabsMergesIntoTheSourceWindow() {
+  func testTabBarPlusAlwaysMergesIntoTheSourceWindow() {
     let sourceWindow = Self.makeWindow(title: "Source")
     let untitledWindow = Self.makeWindow()
     defer {
@@ -1415,49 +1392,12 @@ final class DocumentWindowRegistryTests: XCTestCase {
       mergeWindowIntoTabs: { target, joined in merges.append((target, joined)) },
       orderAndActivateWindow: { _ in },
       applicationWindows: { [sourceWindow, untitledWindow] },
-      resolveNewDocumentPlacement: { window in
-        XCTAssertTrue(window === sourceWindow)
-        return .tabIn
-      },
       makeDocumentWindow: { _, _ in untitledWindow })
 
     XCTAssertTrue(registry.newDocumentForTab(from: sourceWindow))
     XCTAssertEqual(merges.count, 1)
     XCTAssertTrue(merges.first?.target === sourceWindow)
     XCTAssertTrue(merges.first?.joined === untitledWindow)
-  }
-
-  /// A3. "Prefer tabs = Never" gives the new document its own window — which
-  /// still carries the shared tabbing identifier, so "Merge All Windows" is not
-  /// greyed out afterwards.
-  @MainActor
-  func testTabBarPlusWithNeverOpensASeparateWindowThatCanStillBeMerged() {
-    let sourceWindow = Self.makeWindow(title: "Source")
-    let untitledWindow = Self.makeWindow()
-    untitledWindow.tabbingIdentifier = "SwiftUI.SceneOwned"
-    defer {
-      sourceWindow.close()
-      untitledWindow.close()
-    }
-    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(sourceWindow))
-
-    var activations: [NSWindow] = []
-    let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { true },
-      scheduleDeferredMainWork: { _ in XCTFail("window placement should not defer") },
-      scheduleLauncherWindowSweep: { _ in },
-      mergeWindowIntoTabs: { _, _ in XCTFail("Never must not merge into the source group") },
-      orderAndActivateWindow: { activations.append($0) },
-      applicationWindows: { [sourceWindow, untitledWindow] },
-      resolveNewDocumentPlacement: { _ in .newWindow },
-      makeDocumentWindow: { _, _ in untitledWindow })
-
-    XCTAssertTrue(registry.newDocumentForTab(from: sourceWindow))
-    XCTAssertEqual(activations.count, 1)
-    XCTAssertTrue(activations.first === untitledWindow)
-    XCTAssertEqual(
-      untitledWindow.tabbingIdentifier, WindowChromeRecipe.documentTabbingIdentifier,
-      "a standalone New must stay mergeable, or Window ▸ Merge All Windows greys out")
   }
 
   @MainActor

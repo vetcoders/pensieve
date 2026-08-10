@@ -511,11 +511,14 @@ final class LaunchIntentTests: XCTestCase {
     registry.open(DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-intent.md")))
     XCTAssertEqual(requestedIntents, [.explicitDocument])
 
-    // Closing the last document window puts a launcher back — as a mid-session
-    // reopen, NOT as a cold launch that would absorb a document straight back.
+    // Closing the last document window does not request any new intent.
     registry.handleDocumentWindowClosed(documentWindow)
-    XCTAssertEqual(deferredWork.count, 1)
+    XCTAssertTrue(deferredWork.isEmpty)
     for work in deferredWork { work() }
+    XCTAssertEqual(requestedIntents, [.explicitDocument])
+
+    // Only an explicit Dock reopen is allowed to create a replacement launcher.
+    registry.openLauncherWindow(intent: .dockReopen)
     XCTAssertEqual(requestedIntents, [.explicitDocument, .dockReopen])
 
     registry.newUntitledTab(from: launcherWindow)

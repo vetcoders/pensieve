@@ -83,11 +83,8 @@ struct DocumentWindowFactory {
       defer: false)
     WindowChromeRecipe.apply(to: window, title: document?.title ?? "Untitled")
     window.onNewWindowForTab = { sourceWindow in
-      // ONE call, to the ONE decision point — the same the scene-owned windows
-      // reach through `DocumentWindowTabBridge`. `newUntitledTab` is no longer
-      // called from here directly: "+" honours "Prefer tabs" like ⌘N does, and
-      // routing straight to the tab branch was the half of that contract the
-      // factory path was missing.
+      // ONE call, to the ONE deterministic tab-creation path — the same route
+      // scene-owned windows reach through `DocumentWindowTabBridge`.
       DocumentWindowRegistry.shared.newDocumentForTab(from: sourceWindow)
     }
     window.onClose = { closedWindow in

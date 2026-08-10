@@ -129,8 +129,7 @@ final class TerminationSequence {
     // scene and its own cancellation is swallowed — see `LaunchIntentCoordinator`.
     launchIntentCoordinator.quiesceForTermination()
     let controllers = registry.liveDocumentControllers()
-    // The last document window closing during Quit must not resurrect a launcher; tell the registry
-    // the app is going away before anything else touches its windows.
+    // Stop deferred window maintenance before anything else touches the app's windows.
     registry.beginTermination()
     for controller in controllers {
       controller.quiesceForTermination()
