@@ -188,6 +188,9 @@ private final class CloseOriginalImplementation {
 final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
   var shouldClose: @MainActor (NSWindow) -> Bool
   weak var wrapped: NSWindowDelegate?
+  /// Selectors this proxy has already reported refusing, so the trace names each
+  /// one once instead of on every `responds(to:)` AppKit asks.
+  private var refusedSelectorNames: Set<String> = []
 
   init(wrapping wrapped: NSWindowDelegate?, shouldClose: @escaping @MainActor (NSWindow) -> Bool) {
     self.wrapped = wrapped
@@ -242,7 +245,22 @@ final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
     let name = NSStringFromSelector(aSelector)
     guard name.hasPrefix("windowWill") || name.hasPrefix("windowDid") else { return true }
     let argumentCount = name.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
-    return argumentCount != 1 || Self.pullStyleOneArgSelectors.contains(name)
+    if argumentCount == 1, !Self.pullStyleOneArgSelectors.contains(name) {
+      // The refusal above is invisible from the outside: AppKit simply never
+      // registers the observer and the wrapped delegate silently stops hearing
+      // that callback. Name it once per selector so a "why did SwiftUI stop
+      // getting X" trace has the answer in it instead of a gap. Once, because
+      // `responds(to:)` is asked on every delegate-set and every pull-style
+      // dispatch.
+      if refusedSelectorNames.insert(name).inserted {
+        DebugTrace.log(
+          "conscious-close.proxy refused claim selector='\(name)' "
+            + "claimant='\(wrapped.map { String(describing: type(of: $0)) } ?? "nil")' "
+            + "reason=notification-family-one-arg-outlives-weak-delegate")
+      }
+      return false
+    }
+    return true
   }
 
   override func forwardingTarget(for aSelector: Selector!) -> Any? {
