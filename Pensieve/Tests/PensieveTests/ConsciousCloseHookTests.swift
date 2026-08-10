@@ -59,7 +59,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testAWindowThatIsNotADocumentWindowStillAsksBeforeItCloses() throws {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
 
     ConsciousCloseHook.install(on: window) { _ in
@@ -80,7 +80,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testPerformCloseRoutesASwiftUIStyleWindowThroughTheHook() {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
 
     ConsciousCloseHook.install(on: window) { _ in
@@ -93,13 +93,116 @@ final class ConsciousCloseHookTests: XCTestCase {
     XCTAssertNotNil(window.contentView, "a vetoed close must leave the window standing")
   }
 
+  /// Native tab chrome does not consistently send the same message as the red
+  /// window button. On the operator's macOS 27 build, AXPress was inert but the
+  /// real tab "x" called `close()` directly: the dirty bytes reached the
+  /// willClose recovery fallback and the Save / Don't Save / Cancel guard was
+  /// never consulted. Protect the terminal close primitive as well as
+  /// `performClose` so both AppKit routes have the same contract.
+  @MainActor
+  func testDirectCloseRoutesASwiftUIStyleWindowThroughTheHook() {
+    let window = Self.makeSwiftUIStyleWindow()
+    var asked = 0
+    var willCloseNotifications = 0
+    let token = NotificationCenter.default.addObserver(
+      forName: NSWindow.willCloseNotification, object: window, queue: .main
+    ) { _ in
+      willCloseNotifications += 1
+    }
+    defer { NotificationCenter.default.removeObserver(token) }
+
+    ConsciousCloseHook.install(on: window) { _ in
+      asked += 1
+      return false
+    }
+    window.close()
+
+    XCTAssertEqual(asked, 1, "a direct native-tab close bypassed the conscious close hook")
+    XCTAssertEqual(willCloseNotifications, 0, "a vetoed direct close still tore the window down")
+  }
+
+  /// A close that needs no question still evaluates the guard exactly once.
+  /// `performClose` reaches `close()` internally, so the delegate consent must
+  /// arm a one-shot pass through the terminal bridge rather than running the
+  /// save decision twice.
+  @MainActor
+  func testAllowedPerformCloseAsksOnceAndClosesOnce() {
+    let window = Self.makeSwiftUIStyleWindow()
+    var asked = 0
+    var willCloseNotifications = 0
+    let token = NotificationCenter.default.addObserver(
+      forName: NSWindow.willCloseNotification, object: window, queue: .main
+    ) { _ in
+      willCloseNotifications += 1
+    }
+    defer { NotificationCenter.default.removeObserver(token) }
+
+    ConsciousCloseHook.install(on: window) { _ in
+      asked += 1
+      return true
+    }
+    window.performClose(nil)
+
+    XCTAssertEqual(asked, 1, "performClose evaluated the same close decision twice")
+    XCTAssertEqual(willCloseNotifications, 1)
+  }
+
+  /// Save / Don't Save has already settled when the controller closes from the
+  /// sheet completion. That terminal close must not put up the same question a
+  /// second time.
+  @MainActor
+  func testCloseAfterConsentBypassesExactlyOneGuardPass() {
+    let window = Self.makeSwiftUIStyleWindow()
+    var asked = 0
+    var willCloseNotifications = 0
+    let token = NotificationCenter.default.addObserver(
+      forName: NSWindow.willCloseNotification, object: window, queue: .main
+    ) { _ in
+      willCloseNotifications += 1
+    }
+    defer { NotificationCenter.default.removeObserver(token) }
+
+    ConsciousCloseHook.install(on: window) { _ in
+      asked += 1
+      return false
+    }
+    ConsciousCloseHook.closeAfterConsent(window)
+
+    XCTAssertEqual(asked, 0, "settled sheet completion asked the document again")
+    XCTAssertEqual(willCloseNotifications, 1)
+  }
+
+  /// A delegate may return consent without AppKit immediately continuing into
+  /// `close()`. That abandoned route must not silently authorize a later tab
+  /// close; its one-shot pass expires on the next main-queue turn.
+  @MainActor
+  func testUnusedDelegateConsentCannotBypassALaterDirectClose() async throws {
+    let window = Self.makeSwiftUIStyleWindow()
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
+    var asked = 0
+
+    ConsciousCloseHook.install(on: window) { _ in
+      asked += 1
+      return asked == 1
+    }
+    XCTAssertEqual(window.delegate?.windowShouldClose?(window), true)
+
+    let mainQueueDrained = expectation(description: "one-shot close consent expired")
+    DispatchQueue.main.async { mainQueueDrained.fulfill() }
+    await fulfillment(of: [mainQueueDrained], timeout: 1)
+
+    window.close()
+    XCTAssertEqual(asked, 2, "an unused delegate consent leaked into a later direct close")
+    XCTAssertNotNil(window.contentView, "the later direct close was not vetoed")
+  }
+
   /// The hook is an ADDITION, not a takeover: everything it does not answer
   /// itself still reaches the delegate SwiftUI installed, or the scene loses
   /// its own lifecycle the moment a document window is guarded.
   @MainActor
   func testTheHookKeepsForwardingToTheDelegateItWrapped() {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
@@ -123,7 +226,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testAVetoFromTheWrappedDelegateWinsAndSkipsTheSessionGuard() {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     sceneDelegate.vetoesClose = true
     window.delegate = sceneDelegate
@@ -146,7 +249,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testReinstallingRefreshesTheHookInsteadOfStackingProxies() {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
@@ -175,7 +278,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testAClaimedNotificationSelectorOutlivesTheWrappedDelegate() throws {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     var sceneDelegate: SwiftUIStyleWindowDelegate? = SwiftUIStyleWindowDelegate()
     let becameKey = Notification(name: NSWindow.didBecomeKeyNotification, object: window)
 
@@ -212,7 +315,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testAPrivateOrderSelectorOutlivesTheWrappedDelegate() throws {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     var sceneDelegate: SwiftUIStyleWindowDelegate? = SwiftUIStyleWindowDelegate()
     let sel = NSSelectorFromString("windowWillOrderOnScreen:")
     let ordered = Notification(
@@ -247,7 +350,7 @@ final class ConsciousCloseHookTests: XCTestCase {
   @MainActor
   func testAnUnknownNotificationShapedSelectorIsNeverClaimed() throws {
     let window = Self.makeSwiftUIStyleWindow()
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
@@ -258,14 +361,20 @@ final class ConsciousCloseHookTests: XCTestCase {
     XCTAssertTrue(sceneDelegate.responds(to: unknown))
     XCTAssertFalse(
       proxy.responds(to: unknown),
-      "claiming a notification-shaped selector with no static implementation hands AppKit a registration that outlives `wrapped`")
+      """
+      claiming a notification-shaped selector with no static implementation hands AppKit a \
+      registration that outlives `wrapped`
+      """)
 
     XCTAssertTrue(
       proxy.responds(to: NSSelectorFromString("windowWillResize:toSize:")),
       "pull-style delegate calls (2+ args) must keep forwarding while the wrapped delegate lives")
     XCTAssertTrue(
       proxy.responds(to: NSSelectorFromString("windowWillReturnUndoManager:")),
-      "windowWillReturnUndoManager: is pull-style despite its notification shape — blocking it would cost document windows their undo stack")
+      """
+      windowWillReturnUndoManager: is pull-style despite its notification shape — blocking it \
+      would cost document windows their undo stack
+      """)
   }
 
   /// Factory-built windows keep the route they already had — `performClose` is
@@ -279,8 +388,15 @@ final class ConsciousCloseHookTests: XCTestCase {
       backing: .buffered,
       defer: true)
     window.isReleasedWhenClosed = false
-    defer { window.close() }
+    defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
+    var willCloseNotifications = 0
+    let token = NotificationCenter.default.addObserver(
+      forName: NSWindow.willCloseNotification, object: window, queue: .main
+    ) { _ in
+      willCloseNotifications += 1
+    }
+    defer { NotificationCenter.default.removeObserver(token) }
 
     ConsciousCloseHook.install(on: window) { _ in
       asked += 1
@@ -290,6 +406,11 @@ final class ConsciousCloseHookTests: XCTestCase {
     XCTAssertNil(window.delegate, "a DocumentWindow needs no delegate proxy; it overrides close")
     window.performClose(nil)
     XCTAssertEqual(asked, 1)
+    XCTAssertEqual(willCloseNotifications, 0)
+
+    window.close()
+    XCTAssertEqual(asked, 2, "a factory tab's direct close bypassed its own guard")
+    XCTAssertEqual(willCloseNotifications, 0)
   }
 
   @MainActor

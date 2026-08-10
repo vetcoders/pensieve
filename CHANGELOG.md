@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The native tab `X` can no longer bypass the unsaved-work close guard.** On
+  macOS 27 the real tab control reaches `NSWindow.close()` directly, while the
+  existing protection covered `performClose` / `windowShouldClose` and the
+  later teardown notification could only write a recovery copy. A dirty
+  file-backed tab could therefore disappear without Save / Don't Save / Cancel
+  even with auto-save OFF. Both AppKit close routes are now guarded, a settled
+  sheet gets a one-shot non-recursive close, and the scene-window guard is also
+  refreshed when SwiftUI replaces its delegate without changing document
+  metadata.
 - **Recovered edits to an existing file are no longer anonymous ghosts.** With auto-save off, Pensieve now keeps a periodic emergency copy while leaving the original file untouched; with auto-save on, the same recovery path is the immediate fallback when writing the original fails. Each live buffer updates one recovery identity, and a file-backed record carries the original path, appears as **Unsaved changes — <filename>**, and states that it is an emergency copy. Opening it never writes anything by itself: the recovered buffer offers **Save to Original**, **Save As…**, **Don't Save**, and **Cancel**, and retires only after a successful explicit save or a conscious rejection.
 - **Close and quit no longer consent before the last fallible content write.** Pensieve attempts the original file and then RecoveryStore while the window can still veto teardown. If neither destination accepts the bytes, red-X close and quit stay open with the dirty buffer intact and a data-loss message. A successful recovery fallback permits an unattended close or quit because the bytes are durable, but keeps the original-file failure visible and never claims that the stale original was saved.
 - **macOS no longer restores a second document/window graph behind Pensieve.** Managed launcher and document windows opt out of AppKit Saved Application State, and the legacy value-based SwiftUI document scene has been removed. The Restore Session setting and Pensieve's working set are now the one source of truth, so restore OFF cannot be contradicted by an older system-saved window payload.

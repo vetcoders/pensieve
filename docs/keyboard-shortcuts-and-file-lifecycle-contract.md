@@ -151,10 +151,11 @@ Closes the active tab/file, but **does not quit the application**.
 - With multiple tabs, closes only the active one.
 - With the last tab, the window shows the startup screen (launcher), it does not
   quit the app.
-- For unsaved changes or recovery, displays a native prompt
-  (macOS naming: **Save / Don't Save / Cancel**; for untitled —
-  Monika's 03.08 proposal: a full native sheet with a "Save As" field,
-  tags, and inline location, like TextEdit/Pages — separate UX cut).
+- Applies the close-decision matrix below. In particular, a dirty file-backed
+  buffer with auto-save OFF displays the native **Save / Don't Save / Cancel**
+  prompt. For untitled documents, Monika's 03.08 proposal is a full native
+  sheet with a "Save As" field, tags, and inline location, like TextEdit/Pages
+  — a separate UX cut.
 - `Cancel` aborts closing; **Cancel = zero mutation** (no draft or
   buffer may be destroyed before the prompt is resolved).
 - **RESOLVED (Monika, 03.08):** closing a single tab
@@ -162,6 +163,28 @@ Closes the active tab/file, but **does not quit the application**.
   from Open Files and from the session**. Closing the whole window via the red
   button does NOT remove it (a tidying gesture — files come back). Quit, crash,
   and emergency exit NEVER remove it — files come back after restart.
+
+#### Close-decision matrix (canonical, Monika + Maciej, 10.08.2026)
+
+This matrix is the single per-document rule for `Cmd+W`, a tab's `X`, the
+system window `X`, `Shift+Cmd+W`, and quit. Whole-window and quit flows aggregate
+the same decisions across their tabs; they do not invent a second saving policy.
+
+- A clean buffer, or an untouched empty draft, closes without a prompt.
+- A dirty file-backed buffer with **Automatically save… ON** is flushed without
+  a prompt. Closing proceeds only after the current bytes are durable: first in
+  the original file, or — if that write fails — in RecoveryStore. If both
+  destinations fail, close is vetoed and the only in-memory copy remains open.
+- A dirty file-backed buffer with **Automatically save… OFF** always asks
+  **Save / Don't Save / Cancel**. RecoveryStore may protect the buffer from a
+  crash, but it never substitutes for this conscious question.
+- A dirty untitled buffer always asks **Save As… / Don't Save / Cancel**, in
+  either auto-save mode.
+- A recovered file-backed buffer is never written over its original merely by
+  opening or closing it. Its conscious choices are **Save to Original / Save
+  As… / Don't Save / Cancel**.
+- `Cancel`, a dismissed save picker, or failure to make the current bytes
+  durable vetoes the close. There is no implicit discard path.
 
 ### `Cmd+Z` / `Shift+Cmd+Z` — Undo / Redo
 
@@ -247,15 +270,24 @@ close hooks) publish only a proven document root. A queued callback belonging
 to a factory window that has already closed must be dropped rather than
 republishing a half-dead window as the current command target.
 
+The close hook must protect both AppKit entry points: `performClose` /
+`windowShouldClose` and the terminal `NSWindow.close()` used directly by native
+tab chrome on current macOS builds. `willCloseNotification` is too late to ask
+or veto and remains only a final recovery backstop. A programmatic close after
+Save or Don't Save has already settled may bypass the guard exactly once; it
+must not ask twice or leave a reusable bypass armed for a later gesture.
+
 ### System window `X` button
 
-Closes the window, not a single tab. Dirty buffers and recovery items must
-complete the Save / Don't Save / Cancel flow before AppKit tears the window
-down; Cancel or a save failure leaves the window open. A successful close of
-the last window leaves the running app windowless. It must not create a
-launcher, restore another document, or cause a cycle of "window/app closes and
-immediately reopens." Such behavior is a bug. The only replacement-window path
-is a later explicit Dock activation, which creates exactly one empty launcher.
+Closes the window, not a single tab. Every tab must complete the canonical
+close-decision matrix before AppKit tears the window down; auto-save ON may
+settle a file-backed tab without a question, while auto-save OFF, untitled and
+recovery cases retain their explicit choices. Cancel or a save failure leaves
+the window open. A successful close of the last window leaves the running app
+windowless. It must not create a launcher, restore another document, or cause a
+cycle of "window/app closes and immediately reopens." Such behavior is a bug.
+The only replacement-window path is a later explicit Dock activation, which
+creates exactly one empty launcher.
 
 The close decision is atomic across the window:
 

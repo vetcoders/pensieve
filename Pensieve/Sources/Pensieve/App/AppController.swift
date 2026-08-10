@@ -1222,7 +1222,9 @@ final class AppController: ObservableObject {
       // `willCloseNotification` guard is a no-op on the now-clean session. Cancel
       // or a failed save leaves the window — and its buffer — intact.
       guard didClose else { return }
-      window?.close()
+      if let window {
+        ConsciousCloseHook.closeAfterConsent(window)
+      }
     }
     return false
   }

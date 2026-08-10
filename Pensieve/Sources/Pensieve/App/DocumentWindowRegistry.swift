@@ -1465,6 +1465,16 @@ struct DocumentWindowAccessor: NSViewRepresentable {
       // document host poisons provider ownership, command routing and every
       // later tab open before the registry has a chance to reject it.
       guard registry.canPublishDocumentHost(window) else { return }
+
+      // Window protection is a per-pass side effect, not registry metadata.
+      // SwiftUI can replace its AppKitWindow delegate while native tabs are
+      // selected or reshuffled without changing the document identity, title,
+      // URL or dirty state below. The registry attach may be coalesced in that
+      // case, but `onWindow` must still re-wrap the current delegate; otherwise
+      // the next tab "x" bypasses Save / Don't Save / Cancel and reaches the
+      // too-late willClose recovery fallback.
+      onWindow?(window)
+
       let windowID = ObjectIdentifier(window)
       let unchanged =
         coordinator.lastWindowID == windowID
@@ -1476,7 +1486,6 @@ struct DocumentWindowAccessor: NSViewRepresentable {
         && coordinator.lastHasEditableBuffer == hasEditableBuffer
       if unchanged { return }
 
-      onWindow?(window)
       let attached = registry.attach(
         window,
         identity: identity,

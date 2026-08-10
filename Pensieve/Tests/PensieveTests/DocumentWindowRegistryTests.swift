@@ -106,6 +106,59 @@ final class DocumentWindowRegistryTests: XCTestCase {
       "repeated SwiftUI updates keep the ownership claim idempotent")
   }
 
+  /// SwiftUI may replace its scene window delegate while native tabs are being
+  /// selected or reshuffled. Registry metadata can remain byte-for-byte
+  /// unchanged during that replacement, but the close guard still has to be
+  /// refreshed: otherwise the next tab "x" bypasses Save / Don't Save / Cancel
+  /// and reaches the too-late willClose recovery fallback.
+  @MainActor
+  func testUnchangedAccessorPassRestoresCloseHookAfterDelegateReplacement() async throws {
+    let window = Self.makeWindow(title: "Scene Document")
+    let observingView = DocumentWindowAccessor.WindowObservingView(frame: .zero)
+    let registry = DocumentWindowRegistry(
+      scheduleLauncherWindowSweep: { _ in },
+      currentMergeTarget: { nil })
+    var closeGuardAsks = 0
+    let accessor = DocumentWindowAccessor(
+      documentID: URL(fileURLWithPath: "/tmp/pensieve-close-hook.md"),
+      identity: .file(URL(fileURLWithPath: "/tmp/pensieve-close-hook.md")),
+      title: "Scene Document",
+      representedURL: URL(fileURLWithPath: "/tmp/pensieve-close-hook.md"),
+      isDirty: true,
+      hasEditableBuffer: true,
+      registry: registry,
+      onWindow: { guardedWindow in
+        ConsciousCloseHook.install(on: guardedWindow) { _ in
+          closeGuardAsks += 1
+          return false
+        }
+      })
+    let coordinator = accessor.makeCoordinator()
+    defer {
+      window.orderOut(nil)
+      window.close()
+    }
+
+    window.contentView = observingView
+    accessor.attachIfNeeded(from: observingView, coordinator: coordinator)
+    await Self.drainMainQueue()
+    XCTAssertTrue(window.delegate is ConsciousCloseDelegateProxy)
+
+    let replacement = AccessorReplacementWindowDelegate()
+    window.delegate = replacement
+    XCTAssertTrue(window.delegate === replacement, "the fixture never removed the close hook")
+
+    // No document metadata changed. This is the exact pass the registry may
+    // coalesce, while the side-effect that protects the real window may not be.
+    accessor.attachIfNeeded(from: observingView, coordinator: coordinator)
+    await Self.drainMainQueue()
+
+    let restored = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
+    XCTAssertTrue(restored.wrapped === replacement)
+    XCTAssertEqual(restored.windowShouldClose(window), false)
+    XCTAssertEqual(closeGuardAsks, 1)
+  }
+
   @MainActor
   func testQueuedAccessorPassCannotRepublishAFactoryTombstone() async {
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-late-accessor.md")
@@ -1414,6 +1467,13 @@ final class DocumentWindowRegistryTests: XCTestCase {
     return window
   }
 
+  @MainActor
+  private static func drainMainQueue() async {
+    await withCheckedContinuation { continuation in
+      DispatchQueue.main.async { continuation.resume() }
+    }
+  }
+
   private func temporaryRegistryMetadataStore() -> WorkspaceMetadataStore {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
@@ -1458,6 +1518,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
     _ = window.perform(#selector(NSWindow.newWindowForTab(_:)), with: noSender)
   }
 }
+
+private final class AccessorReplacementWindowDelegate: NSObject, NSWindowDelegate {}
 
 /// Stand-in for SwiftUI's own window class: a document-bearing window whose
 /// class this app does not own and cannot subclass in production. It implements
