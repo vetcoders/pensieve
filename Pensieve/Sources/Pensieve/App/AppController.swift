@@ -1973,6 +1973,11 @@ final class AppController: ObservableObject {
           workflow: workflow, agents: agents,
           payload: payload, workingDirectoryURL: rootURL)
       }.value
+      // The receipt's `agent:` token is authoritative. Older/trimmed receipts
+      // may omit it; only an explicitly dispatched positional agent is a safe
+      // fallback. A default swarm has no positional authority, so it gets no
+      // guessed Terminal observer action.
+      let observeAgent = metadata.observeAgent ?? agents.first
       switch metadata.launchVerification {
       case .rejected:
         appState.lastError = metadata.statusLine
@@ -1992,7 +1997,7 @@ final class AppController: ObservableObject {
             message: message,
             runID: nil,
             reportPath: metadata.reportPath,
-            observeAgent: metadata.observeAgent)
+            observeAgent: observeAgent)
         }
         appState.lastError = nil
         let line =
@@ -2002,7 +2007,7 @@ final class AppController: ObservableObject {
         return .acceptedUnconfirmed(
           runID: runID,
           reportPath: metadata.reportPath,
-          observeAgent: metadata.observeAgent,
+          observeAgent: observeAgent,
           statusLine: line)
 
       case .workerSpawnRecorded:
@@ -2014,7 +2019,7 @@ final class AppController: ObservableObject {
         return .success(
           runID: metadata.runID,
           reportPath: metadata.reportPath,
-          observeAgent: metadata.observeAgent,
+          observeAgent: observeAgent,
           statusLine: line)
       }
     } catch {

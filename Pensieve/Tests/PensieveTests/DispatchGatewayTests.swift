@@ -366,50 +366,105 @@ final class DispatchGatewayTests: XCTestCase {
 
   // MARK: - Receipt actions (what a launch receipt earns)
 
-  /// A receipt whose output carried no `agent:` line still names a run the user
-  /// can follow: the status affordance falls back to the first configured
-  /// agent instead of vanishing. With no agents configured at all there is
-  /// nothing to observe with — the action is simply absent.
+  /// An older/trimmed receipt may omit `agent:`, but a single-agent dispatch
+  /// still has one explicit positional authority. That dispatched token — not
+  /// the first item in the configured-agent list — is what the status action
+  /// must observe.
   @MainActor
-  func testReceiptWithoutAnAgentLineStillOffersStatusViaTheFirstConfiguredAgent() {
+  func testSingleAgentReceiptWithoutAgentUsesTheExplicitDispatchedAgentForStatus() async {
     let receipt = AgentDispatchMetadata.parse(
       output: """
         run_id: work-no-agent-line
         report: /tmp/reports/work-no-agent-line.md
         """,
-      exitCode: 0)
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
     XCTAssertNil(receipt.observeAgent, "precondition: the receipt names no observe agent")
 
-    let withAgents = DispatchPopover.receiptActions(
-      runID: receipt.runID,
-      reportPath: receipt.reportPath,
-      observeAgent: receipt.observeAgent,
-      configuredAgents: ["codex", "claude"],
-      runIsLaunched: true)
-    XCTAssertEqual(withAgents.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+    let (controller, _, launcher) = makeController(launcherResult: receipt)
     XCTAssertEqual(
-      withAgents.observe,
+      controller.availableAgents.first, "claude",
+      "precondition: production ordering starts with a different agent than the default")
+    XCTAssertEqual(controller.defaultAgent, "codex", "precondition: the explicit default lane")
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-no-agent-line.md").standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(subject: .fileURL(fileURL), workflow: "review", source: .sidebar),
+      workflow: "review",
+      agents: ["codex"],
+      rootURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted single-agent receipt to remain inspectable")
+    }
+    XCTAssertEqual(observeAgent, "codex")
+    XCTAssertEqual(launcher.requests().map(\.agents), [["codex"]])
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      runIsLaunched: true)
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+    XCTAssertEqual(
+      actions.observe,
       DispatchPopover.ReceiptActions.Observe(agent: "codex", runID: "work-no-agent-line"))
+  }
 
-    // The receipt's own agent still wins over the fallback.
-    XCTAssertEqual(
-      DispatchPopover.receiptActions(
-        runID: "work-no-agent-line",
-        reportPath: nil,
-        observeAgent: "swarm",
-        configuredAgents: ["codex", "claude"],
-        runIsLaunched: true
-      ).observe,
-      DispatchPopover.ReceiptActions.Observe(agent: "swarm", runID: "work-no-agent-line"))
+  /// A default swarm has no positional agent. If its receipt also omits
+  /// `agent:`, neither the controller nor the view may guess an observer from
+  /// the configured-agent order; the report remains a real, revealable artifact.
+  @MainActor
+  func testDefaultSwarmReceiptWithoutAgentOffersNoStatusButKeepsTheReport() async throws {
+    let provider = FakeWorkflowCapabilitiesProvider(
+      result: .success(try WorkflowCapabilitiesFixtures.decoded()))
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: research-default-no-agent
+        report: /tmp/reports/research-default-no-agent.md
+        """,
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
+    XCTAssertNil(receipt.observeAgent, "precondition: the receipt names no observe agent")
 
-    let withoutAgents = DispatchPopover.receiptActions(
-      runID: receipt.runID,
-      reportPath: receipt.reportPath,
-      observeAgent: receipt.observeAgent,
-      configuredAgents: [],
+    let (controller, _, launcher) = makeController(
+      capabilities: provider,
+      launcherResult: receipt)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-default-no-agent.md").standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .fileURL(fileURL), workflow: "research", source: .sidebar),
+      workflow: "research",
+      agents: [],
+      rootURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted default swarm receipt to remain inspectable")
+    }
+    XCTAssertNil(observeAgent, "a default swarm has no positional observer authority")
+    XCTAssertEqual(launcher.requests().map(\.agents), [[]])
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
       runIsLaunched: true)
-    XCTAssertNil(withoutAgents.observe, "nothing to observe with, so no status action")
-    XCTAssertEqual(withoutAgents.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+    XCTAssertNil(actions.observe, "no receipt or positional agent means no status action")
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/research-default-no-agent.md")
+
+    XCTAssertEqual(
+      DispatchPopover.resolvedPhase(for: outcome),
+      .acceptedUnconfirmed(
+        runID: "research-default-no-agent",
+        reportPath: "/tmp/reports/research-default-no-agent.md",
+        observeAgent: nil))
   }
 
   /// A rejected launch never started a run. Its receipt may still carry a run
@@ -441,7 +496,6 @@ final class DispatchGatewayTests: XCTestCase {
       runID: runID,
       reportPath: reportPath,
       observeAgent: observeAgent,
-      configuredAgents: ["codex"],
       runIsLaunched: false)
     XCTAssertEqual(actions.revealReportPath, "/tmp/reports/work-rejected.md")
     XCTAssertNil(actions.observe, "a run that never started has no status to check")
@@ -453,7 +507,6 @@ final class DispatchGatewayTests: XCTestCase {
         runID: runID,
         reportPath: reportPath,
         observeAgent: observeAgent,
-        configuredAgents: ["codex"],
         runIsLaunched: true
       ).observe)
   }

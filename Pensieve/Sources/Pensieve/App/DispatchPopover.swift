@@ -350,7 +350,6 @@ struct DispatchPopover: View {
       runID: runID,
       reportPath: reportPath,
       observeAgent: observeAgent,
-      configuredAgents: controller.availableAgents,
       runIsLaunched: runIsLaunched)
     if let reportPath = actions.revealReportPath {
       Button("Reveal report") {
@@ -381,27 +380,24 @@ struct DispatchPopover: View {
   /// The single seam deciding what a receipt offers. Pure, so both rules are
   /// pinnable without a hosted view:
   ///
-  /// - the receipt's `agent:` line is the authority for
-  ///   `vibecrafted <agent> observe`, but a receipt that omits it (older
-  ///   launcher, trimmed output) still names a run the user can follow — fall
-  ///   back to the first configured agent rather than dropping the only status
-  ///   affordance;
+  /// - the resolved `observeAgent` is the authority for
+  ///   `vibecrafted <agent> observe`. `AppController` may derive it from the
+  ///   one explicitly dispatched positional agent when an older receipt omits
+  ///   `agent:`; this view never guesses from the configured-agent list;
   /// - a run that never started has no status to check, whatever identifiers
   ///   its rejection receipt carries.
   static func receiptActions(
     runID: String?,
     reportPath: String?,
     observeAgent: String?,
-    configuredAgents: [String],
     runIsLaunched: Bool
   ) -> ReceiptActions {
-    let agent = observeAgent ?? configuredAgents.first
-    guard runIsLaunched, let runID, let agent, !agent.isEmpty else {
+    guard runIsLaunched, let runID, let observeAgent, !observeAgent.isEmpty else {
       return ReceiptActions(revealReportPath: reportPath, observe: nil)
     }
     return ReceiptActions(
       revealReportPath: reportPath,
-      observe: ReceiptActions.Observe(agent: agent, runID: runID))
+      observe: ReceiptActions.Observe(agent: observeAgent, runID: runID))
   }
 
   private func runDispatch() async {
