@@ -6395,6 +6395,9 @@ final class PensieveSmokeTests: XCTestCase {
       sourceWindow.close()
       untitledWindow.close()
     }
+    XCTAssertTrue(
+      DocumentWindowOwnership.claimDocumentHost(sourceWindow),
+      "the controller fixture must model the document root claimed by its window accessor")
 
     var factoryCalls = 0
     var promptCount = 0
