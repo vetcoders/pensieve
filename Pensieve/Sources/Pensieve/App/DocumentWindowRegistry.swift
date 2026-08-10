@@ -204,6 +204,27 @@ final class DocumentWindowRegistry: ObservableObject {
     }
   }
 
+  /// The app's ONE way to materialize a document host when none exists: the
+  /// factory launcher above, or — before SwiftUI has installed that factory —
+  /// the `NSDocumentController` fallback that lets AppKit build the first scene.
+  ///
+  /// Every windowless entry point funnels here (cold-launch fallback, Dock
+  /// reopen, an external file open, and the zero-window File menu), so the
+  /// "which of the two paths applies" decision exists once. A second copy of it
+  /// is how one caller ends up creating a host the others cannot see.
+  ///
+  /// Returns whether a document-capable surface actually resulted, so a caller
+  /// with a one-shot guard (see `LaunchIntentCoordinator`) can tell a real host
+  /// from a factory that refused.
+  @discardableResult
+  func openDocumentHost(intent: LaunchIntent) -> Bool {
+    guard makeDocumentWindow != nil else {
+      return NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+    }
+    openLauncherWindow(intent: intent)
+    return hasLiveDocumentCapableWindow()
+  }
+
   private let canMutateWindowTabs: @MainActor () -> Bool
   private let scheduleDeferredMainWork: (@escaping DeferredMainWork) -> Void
   private let scheduleLauncherWindowSweep: (@escaping DeferredMainWork) -> Void

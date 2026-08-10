@@ -8,14 +8,7 @@ final class LaunchIntentCoordinator: ObservableObject {
       DocumentWindowRegistry.shared.hasLiveDocumentCapableWindow()
     },
     openExternalDocumentHost: {
-      let registry = DocumentWindowRegistry.shared
-      if registry.makeDocumentWindow != nil {
-        registry.openLauncherWindow(intent: .explicitDocument)
-        return registry.hasLiveDocumentCapableWindow()
-      } else {
-        return NSApp.sendAction(
-          #selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
-      }
+      DocumentWindowRegistry.shared.openDocumentHost(intent: .explicitDocument)
     })
 
   typealias StartupDecisionHandler = @MainActor () -> Void
@@ -317,11 +310,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     Task { @MainActor in
       await Task.yield()
       if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
-        if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-          DocumentWindowRegistry.shared.openLauncherWindow(intent: .coldLaunch)
-        } else {
-          NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
-        }
+        DocumentWindowRegistry.shared.openDocumentHost(intent: .coldLaunch)
       }
     }
   }
@@ -342,11 +331,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     Task { @MainActor in
       let registry = DocumentWindowRegistry.shared
       guard !registry.hasLiveDocumentCapableWindow() else { return }
-      if registry.makeDocumentWindow != nil {
-        registry.openLauncherWindow(intent: .dockReopen)
-      } else {
-        NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
-      }
+      registry.openDocumentHost(intent: .dockReopen)
     }
     return true
   }

@@ -1045,6 +1045,50 @@ final class DocumentWindowRegistryTests: XCTestCase {
       "a tracked launcher remains live even before AppKit makes it visible")
   }
 
+  /// Every windowless entry point (cold-start fallback, Dock reopen, an
+  /// external file open, the zero-window File menu) materializes its host
+  /// through this ONE call, so the intent it states has to reach the factory
+  /// unchanged and the answer has to report a surface that really exists.
+  @MainActor
+  func testOpenDocumentHostBuildsOneLauncherCarryingTheStatedIntent() throws {
+    let launcherWindow = Self.makeWindow()
+    defer { launcherWindow.close() }
+
+    var requestedIntents: [LaunchIntent] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [] },
+      makeDocumentWindow: { _, intent in
+        requestedIntents.append(intent)
+        return launcherWindow
+      }
+    )
+
+    XCTAssertTrue(registry.openDocumentHost(intent: .newUntitledTab))
+    XCTAssertEqual(requestedIntents, [.newUntitledTab])
+    XCTAssertTrue(registry.hasLiveDocumentCapableWindow())
+  }
+
+  /// A factory that refuses must be reported as "no host", or a caller holding
+  /// a one-shot guard (`LaunchIntentCoordinator`) would latch on a window that
+  /// never appeared and never try again.
+  @MainActor
+  func testOpenDocumentHostReportsAFactoryThatProducedNothing() throws {
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in },
+      applicationWindows: { [] },
+      makeDocumentWindow: { _, _ in nil }
+    )
+
+    XCTAssertFalse(registry.openDocumentHost(intent: .dockReopen))
+  }
+
   @MainActor
   func testClosingOneOfSeveralDocumentWindowsDoesNotReopenALauncher() throws {
     let alphaID = URL(fileURLWithPath: "/tmp/pensieve-keep-alpha.md").standardizedFileURL
