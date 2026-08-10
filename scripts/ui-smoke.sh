@@ -754,10 +754,10 @@ on assertMenuItem(appName, menuName, itemName)
   end tell
 end assertMenuItem
 
-on toolbarElementByDescription(appName, targetDescription)
+on toolbarElementByAccessibleName(appName, targetName)
   -- AX attribute propagation can lag behind the identifier-based toolbar
   -- census: a control can exist (and already show up by identifier) before
-  -- its localized description is queryable. Retry with a bounded backoff
+  -- its localized accessible name is queryable. Retry with a bounded backoff
   -- instead of failing on the first miss.
   repeat with attemptNumber from 1 to 5
     tell application "System Events"
@@ -765,17 +765,28 @@ on toolbarElementByDescription(appName, targetDescription)
         set toolbarElements to entire contents of toolbar 1 of window 1
         repeat with elementRef in toolbarElements
           set elementDescription to ""
+          set elementTitle to ""
           try
             set elementDescription to get description of elementRef
           end try
-          if elementDescription is targetDescription then return contents of elementRef
+          try
+            set elementTitle to get title of elementRef
+          end try
+          -- macOS 27 exposes native SwiftUI toolbar menu names through
+          -- AXTitle while AXDescription remains the generic "menu button".
+          -- Older bridges used AXDescription. Require the exact authored name
+          -- in either standard accessible-name slot so a raw symbol name or an
+          -- anonymous menu still fails this assertion.
+          if elementDescription is targetName or elementTitle is targetName then
+            return contents of elementRef
+          end if
         end repeat
       end tell
     end tell
     if attemptNumber < 5 then delay 1
   end repeat
-  error "Missing toolbar control: " & targetDescription
-end toolbarElementByDescription
+  error "Missing toolbar control with accessible name: " & targetName
+end toolbarElementByAccessibleName
 
 on windowElementByIdentifier(appName, targetIdentifier, timeoutTenths)
   repeat with attemptNumber from 1 to timeoutTenths
@@ -904,7 +915,7 @@ tell application "System Events"
     set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "split restore")
 
-    set appearanceControl to my toolbarElementByDescription(appName, "Preview Appearance")
+    set appearanceControl to my toolbarElementByAccessibleName(appName, "Preview Appearance")
     if (role of appearanceControl) is not "AXMenuButton" then
       error "Preview Appearance must be a native menu button, got " & (role of appearanceControl)
     end if
@@ -927,7 +938,7 @@ tell application "System Events"
     -- Dismissing a native menu invalidates its AXUIElement; reacquiring the
     -- toolbar control mirrors a later user click instead of testing a stale
     -- Accessibility handle.
-    set appearanceControl to my toolbarElementByDescription(appName, "Preview Appearance")
+    set appearanceControl to my toolbarElementByAccessibleName(appName, "Preview Appearance")
     click appearanceControl
     delay 0.3
     if (count of menus of appearanceControl) is 0 then
@@ -945,7 +956,7 @@ tell application "System Events"
     -- cannot see that at all: AXIdentifier survives the move untouched, so a
     -- census-only check would have stayed green on a control no assistive tool
     -- can name. Keep this lookup name-based.
-    set rewriteControl to my toolbarElementByDescription(appName, "Rewrite with AI")
+    set rewriteControl to my toolbarElementByAccessibleName(appName, "Rewrite with AI")
     if (role of rewriteControl) is not "AXMenuButton" then
       error "Rewrite with AI must be a native menu button, got " & (role of rewriteControl)
     end if
@@ -979,10 +990,17 @@ tell application "System Events"
 
     -- A toolbar census can prove the editing chrome exists while missing the
     -- product failure this probe is for: a native Untitled tab whose body is
-    -- still the launcher. Resolve the actual NSTextView, click it, type through
-    -- the real responder chain, and require the model-backed AX value to change.
+    -- still the launcher. Resolve the actual NSTextView, make it first responder,
+    -- type through the real responder chain, and require the model-backed AX
+    -- value to change. `click editorElement` is not a physical mouse click:
+    -- System Events asks the element for AXPress, which NSTextView does not
+    -- implement on macOS 27, so it can leave the previous control focused even
+    -- though normal in-app clicking works.
     set editorElement to my windowElementByIdentifier(appName, "pensieve.editor", 50)
-    click editorElement
+    set focused of editorElement to true
+    if focused of editorElement is not true then
+      error "Untitled editor refused first-responder focus"
+    end if
     set witnessText to "pensieve-new-tab-smoke-witness"
     keystroke witnessText
     set witnessLanded to false
