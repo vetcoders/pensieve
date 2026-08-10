@@ -2443,6 +2443,14 @@ final class FolderManager {
     into appState: AppState
   ) {
     guard !appState.documentSession.isDirty else { return }
+    // Workspace hydration is allowed to rebuild configuration around the
+    // window; it is not allowed to turn a user-created empty tab back into the
+    // launcher. A fresh Untitled buffer is intentionally clean, so the dirty
+    // guard alone does not protect it from this asynchronous restore tail.
+    guard !appState.documentSession.isUntitled else {
+      DebugTrace.log("selectRestoredDocument kept the active untitled buffer")
+      return
+    }
     guard selection.survivesConsciousClose(in: appState) else {
       DebugTrace.log("selectRestoredDocument skipped: document closed while the open flow ran")
       return

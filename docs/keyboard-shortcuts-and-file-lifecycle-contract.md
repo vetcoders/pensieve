@@ -47,6 +47,10 @@ split `Cmd+N` (New Window) from `Cmd+T` (New Tab), but that is a future contract
 change — not an open ambiguity in v1 and not authority to restore the old
 behavior piecemeal.
 
+Rebuilding the workspace around that tab is configuration hydration only. Its
+asynchronous completion must not clear or replace the new untitled buffer, even
+while the buffer is still empty and therefore not dirty.
+
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
 
 Actual state of build 528 (the launcher shows both shortcuts separately) —

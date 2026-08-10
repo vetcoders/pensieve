@@ -69,7 +69,7 @@ final class LaunchIntentTests: XCTestCase {
   }
 
   @MainActor
-  func testNewUntitledTabRestoresTheWorkspaceWithoutSelectingADocument() async throws {
+  func testNewUntitledTabRestoresTheWorkspaceAndCreatesAnEditableDraft() async throws {
     let harness = try makeRestoreHarness(documentNames: ["alpha.md", "zebra.md"])
 
     harness.controller.start(intent: .newUntitledTab)
@@ -78,7 +78,34 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertFalse(harness.appState.documents.isEmpty)
     XCTAssertNil(
       harness.appState.selectedDocumentID,
-      "the tab bar's + must produce an EMPTY tab, not the first document of the workspace")
+      "the tab bar's + must not select the first document of the workspace")
+    XCTAssertTrue(
+      harness.appState.documentSession.hasEditableBuffer,
+      "a native Untitled tab must contain an editable draft, not the launcher")
+    XCTAssertTrue(harness.appState.documentSession.isUntitled)
+    XCTAssertEqual(harness.appState.documentSession.displayTitle, "Untitled.md")
+    XCTAssertEqual(harness.appState.documentSession.text, "")
+    XCTAssertFalse(harness.appState.documentSession.isDirty)
+    XCTAssertNil(harness.appState.documentSession.url)
+    XCTAssertTrue(
+      harness.recoveryStore.loadDrafts().isEmpty,
+      "creating an empty tab must not persist a recovery draft")
+  }
+
+  @MainActor
+  func testNewUntitledTabDoesNotConsumeTheApplicationStartupRestore() throws {
+    let startupRestore = ApplicationStartupRestore()
+    let harness = try makeRestoreHarness(
+      documentNames: [], startupRestore: startupRestore)
+
+    harness.controller.start(intent: .newUntitledTab)
+
+    XCTAssertTrue(
+      startupRestore.claimStartupRestore(),
+      "New consumed the one application-level cold-start restore")
+    XCTAssertFalse(
+      startupRestore.claimStartupRestore(),
+      "the startup restore token must still remain single-use")
   }
 
   @MainActor
@@ -107,9 +134,17 @@ final class LaunchIntentTests: XCTestCase {
 
       harness.controller.start(intent: intent)
 
-      XCTAssertFalse(
-        harness.appState.documentSession.hasEditableBuffer,
-        "\(intent) hijacked the window with the recovery draft")
+      if intent == .newUntitledTab {
+        XCTAssertTrue(
+          harness.appState.documentSession.hasEditableBuffer,
+          "a New-tab intent must create its own empty editable draft")
+        XCTAssertTrue(harness.appState.documentSession.isUntitled)
+        XCTAssertEqual(harness.appState.documentSession.text, "")
+      } else {
+        XCTAssertFalse(
+          harness.appState.documentSession.hasEditableBuffer,
+          "\(intent) hijacked the window with the recovery draft")
+      }
       XCTAssertEqual(
         harness.recoveryStore.loadDrafts().first?.text, "crash draft",
         "\(intent) consumed the draft — the launcher would have nothing left to offer")
@@ -559,7 +594,8 @@ final class LaunchIntentTests: XCTestCase {
   private func makeRestoreHarness(
     documentNames: [String],
     workspaceBuilder: WorkspaceScanner.Builder? = nil,
-    restoreSessionOnLaunch: Bool = true
+    restoreSessionOnLaunch: Bool = true,
+    startupRestore: ApplicationStartupRestore? = nil
   ) throws -> RestoreHarness {
     let folder = try makeTemporaryFolder("workspace")
     for name in documentNames {
@@ -603,6 +639,7 @@ final class LaunchIntentTests: XCTestCase {
       indexDatabase: indexDatabase,
       launchSettings: launchSettings,
       documentWindowRegistry: DocumentWindowRegistry(canMutateWindowTabs: { true }),
+      startupRestore: startupRestore ?? .shared,
       importsFoldersInBackground: true
     )
     addTeardownBlock {

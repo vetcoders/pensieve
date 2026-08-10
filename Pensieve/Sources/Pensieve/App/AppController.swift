@@ -284,6 +284,19 @@ final class AppController: ObservableObject {
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
     guard intent.restoresWorkspace else { return }
+
+    // A factory-built New tab is not a launcher waiting to be restored. Its
+    // root starts bufferless while SwiftUI attaches, so materialize the empty
+    // editable draft here before the launcher sweep can mistake it for idle.
+    // It must also never claim the process-wide cold-start restore: New creates
+    // one document and may rebuild workspace configuration, but it does not
+    // reopen the previous working set.
+    if intent == .newUntitledTab {
+      folderManager.restoreLastFolderInBackground(into: appState)
+      beginUntitledSession()
+      return
+    }
+
     // Claim the application's one startup restore BEFORE anything else in this
     // branch can return early: whichever window gets here first IS the launch,
     // and every launcher after it must be an empty launcher.
@@ -971,9 +984,7 @@ final class AppController: ObservableObject {
       }
     }
 
-    appState.documentSession.createUntitled(title: nextUntitledTitle())
-    appState.selectedDocumentID = nil
-    appState.lastError = nil
+    beginUntitledSession()
     return true
   }
 
@@ -1877,6 +1888,12 @@ final class AppController: ObservableObject {
     }
     nextUntitledIndex = index + 1
     return untitledTitle(for: index)
+  }
+
+  private func beginUntitledSession() {
+    appState.documentSession.createUntitled(title: nextUntitledTitle())
+    appState.selectedDocumentID = nil
+    appState.lastError = nil
   }
 
   private func untitledTitle(for index: Int) -> String {

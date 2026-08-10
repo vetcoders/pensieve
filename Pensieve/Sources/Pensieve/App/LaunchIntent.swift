@@ -29,7 +29,7 @@ enum LaunchIntent: Equatable, Sendable {
   /// app; the workspace comes back, the documents do not.
   case dockReopen
 
-  /// The tab bar's "+" — a new, deliberately empty tab.
+  /// The tab bar's "+" — a new tab containing an empty, editable draft.
   case newUntitledTab
 
   /// The window exists FOR a specific document (Finder/`open` URL, a document

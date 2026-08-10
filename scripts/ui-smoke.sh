@@ -777,6 +777,22 @@ on toolbarElementByDescription(appName, targetDescription)
   error "Missing toolbar control: " & targetDescription
 end toolbarElementByDescription
 
+on windowElementByIdentifier(appName, targetIdentifier, timeoutTenths)
+  repeat with attemptNumber from 1 to timeoutTenths
+    tell application "System Events" to tell process appName
+      set windowElements to entire contents of window 1
+      repeat with elementRef in windowElements
+        try
+          set identifierValue to value of attribute "AXIdentifier" of elementRef
+          if identifierValue is targetIdentifier then return contents of elementRef
+        end try
+      end repeat
+    end tell
+    delay 0.1
+  end repeat
+  error "Timed out waiting for window element: " & targetIdentifier
+end windowElementByIdentifier
+
 on run argv
 set appName to item 1 of argv
 set coldOnly to item 2 of argv is "1"
@@ -960,6 +976,29 @@ tell application "System Events"
     set untitledCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(appName, coldPosition, coldSize, "file-backed to untitled transition")
     log "AX_CENSUS_UNTITLED=" & my joined(untitledCensus, ",")
+
+    -- A toolbar census can prove the editing chrome exists while missing the
+    -- product failure this probe is for: a native Untitled tab whose body is
+    -- still the launcher. Resolve the actual NSTextView, click it, type through
+    -- the real responder chain, and require the model-backed AX value to change.
+    set editorElement to my windowElementByIdentifier(appName, "pensieve.editor", 50)
+    click editorElement
+    set witnessText to "pensieve-new-tab-smoke-witness"
+    keystroke witnessText
+    set witnessLanded to false
+    repeat with attemptNumber from 1 to 30
+      try
+        if (value of editorElement as text) contains witnessText then
+          set witnessLanded to true
+          exit repeat
+        end if
+      end try
+      delay 0.1
+    end repeat
+    if not witnessLanded then
+      error "Untitled editor exists but did not accept typed text"
+    end if
+    log "NEW_UNTITLED_EDITABLE=PASS"
 
     if (count of windows) is 0 then error appName & " has no windows after menu probing"
   end tell
