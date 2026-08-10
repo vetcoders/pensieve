@@ -83,11 +83,70 @@ enum AppSupportLocation {
   /// Process-scoped fallback for a test that forgot to inject its own store.
   /// Explicit `PENSIEVE_SUPPORT_DIR` still wins so canary runs can inspect one
   /// known root after the suite exits.
+  ///
+  /// The directory is registered for removal when the process exits. Nothing
+  /// else ever deletes it — it is named per pid AND per process nonce, so a
+  /// later run cannot recognize an earlier one's — and every test process that
+  /// reached a production singleton once left one behind in `$TMPDIR` forever.
+  /// Cleanup is deliberately hung off process exit rather than a suite
+  /// teardown: the root is shared by every store in the process, so no single
+  /// test owns the moment it stops being needed.
   static func testProcessRoot(fileManager: FileManager = .default) -> URL {
     let root = fileManager.temporaryDirectory.appendingPathComponent(
       "PensieveTests-\(ProcessInfo.processInfo.processIdentifier)-\(testProcessNonce)",
       isDirectory: true)
     try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let registered = registerForRemovalAtProcessExit(
+      root,
+      registrar: { handler in atexit_b(handler) },
+      removeItem: { path in try? fileManager.removeItem(atPath: path) })
+    if !registered {
+      DebugTrace.log("test support cleanup registration failed path=\(root.path)")
+    }
     return root
+  }
+
+  /// Roots this process has asked the runtime to delete on exit.
+  ///
+  /// Exposed because the REGISTRATION is the only half a test can observe: a
+  /// pin on the removal itself would have to outlive the process doing the
+  /// asserting. Nothing in the app reads this.
+  static var rootsRegisteredForRemovalAtExit: Set<String> {
+    registrationLock.lock()
+    defer { registrationLock.unlock() }
+    return registeredRoots
+  }
+
+  typealias ProcessExitHandler = @convention(block) () -> Void
+
+  private nonisolated(unsafe) static var registeredRoots: Set<String> = []
+  private static let registrationLock = NSLock()
+
+  /// Hands one directory to `atexit`, exactly once per path.
+  ///
+  /// Unreachable from a shipping process by construction: the only caller is
+  /// `testProcessRoot`, and the only route into that is `isolationRoot` AFTER
+  /// `isRunningTests` said yes. An `atexit` handler that deleted a directory in
+  /// a production launch would be a far worse bug than the leak it fixes, so
+  /// the guard stays where it already is rather than being duplicated into a
+  /// second, drift-prone copy here.
+  /// Returns true when this path already had a handler or this call registered
+  /// one successfully. Kept internal so tests can drive registration failure
+  /// and execute the captured callback without terminating the test process.
+  @discardableResult
+  static func registerForRemovalAtProcessExit(
+    _ root: URL,
+    registrar: (_ handler: @escaping ProcessExitHandler) -> Int32,
+    removeItem: @escaping (String) -> Void
+  ) -> Bool {
+    let path = root.path
+    registrationLock.lock()
+    defer { registrationLock.unlock() }
+    guard !registeredRoots.contains(path) else { return true }
+
+    let result = registrar { removeItem(path) }
+    guard result == 0 else { return false }
+    registeredRoots.insert(path)
+    return true
   }
 }
