@@ -795,10 +795,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       pendingEditorFocusRequest = nil
       return
     }
+    // No window yet: the surface is mounted but not hosted. Keep waiting —
+    // `viewDidMoveToWindow` brings us straight back here.
     guard let window = textView.window else { return }
-    guard window.makeFirstResponder(textView) else { return }
+    // The ATTEMPT spends the request, not its success. A refused
+    // makeFirstResponder (the current responder declining to resign, a window
+    // that will not take key) used to leave the request armed, so an unrelated
+    // re-render minutes later could still yank focus into the editor. One shot
+    // means one shot.
     request.consume()
     pendingEditorFocusRequest = nil
+    _ = window.makeFirstResponder(textView)
   }
 
   // No default parameter values on purpose: a defaulted behavior flag already

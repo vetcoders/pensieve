@@ -93,6 +93,49 @@ final class EditorFocusRequestTests: XCTestCase {
     XCTAssertTrue(staleRequest.isConsumed)
   }
 
+  /// The ATTEMPT spends the request, not its success. When the responder chain
+  /// refuses the change — here the current control declines to resign — the
+  /// request must still be spent, or it sits armed and yanks focus into the
+  /// editor on some later, unrelated re-render.
+  @MainActor
+  func testRefusedFocusChangeStillSpendsTheRequestInsteadOfStealingFocusLater() throws {
+    let appState = AppState()
+    appState.documentSession.createUntitled()
+    let request = try XCTUnwrap(appState.editorFocusRequest)
+    let surface = MarkdownEditorSurface(text: "draft survives", fontSize: 14)
+    let sentinel = StubbornFocusSentinel(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 320))
+    let window = NSWindow(
+      contentRect: container.bounds,
+      styleMask: [.titled, .closable],
+      backing: .buffered,
+      defer: false)
+    window.contentView = container
+    container.addSubview(surface.scrollView)
+    container.addSubview(sentinel)
+    XCTAssertTrue(window.makeFirstResponder(sentinel))
+
+    surface.applyEditorFocusRequest(
+      request,
+      currentSessionIdentity: appState.documentSession.identity)
+
+    XCTAssertTrue(
+      window.firstResponder === sentinel, "precondition: the focus change was refused")
+    XCTAssertTrue(request.isConsumed, "a refused apply must still spend the one-shot request")
+
+    // A later pass over the same session — the control now willing to resign —
+    // must NOT be able to replay the spent request.
+    sentinel.refusesToResign = false
+    surface.applyEditorFocusRequest(
+      request,
+      currentSessionIdentity: appState.documentSession.identity)
+
+    XCTAssertTrue(
+      window.firstResponder === sentinel,
+      "a spent request must never take focus on a later update")
+    XCTAssertEqual(surface.textStorage.string, "draft survives")
+  }
+
   @MainActor
   func testControllerNewRequestTraversesTheLiveEditorViewAndTakesFirstResponder() throws {
     let rig = WindowErrorChromeRig(
@@ -131,4 +174,13 @@ final class EditorFocusRequestTests: XCTestCase {
 
 private final class FocusSentinel: NSView {
   override var acceptsFirstResponder: Bool { true }
+}
+
+/// A control that declines to hand over first responder — the ordinary AppKit
+/// reason `makeFirstResponder` returns false (a field mid-validation, a sheet's
+/// own responder). Flip `refusesToResign` to let it go.
+private final class StubbornFocusSentinel: NSView {
+  var refusesToResign = true
+  override var acceptsFirstResponder: Bool { true }
+  override func resignFirstResponder() -> Bool { !refusesToResign }
 }
