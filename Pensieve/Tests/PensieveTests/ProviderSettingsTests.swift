@@ -324,6 +324,32 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertEqual(coordinator.presentingWindowID, ObjectIdentifier(nextWindow))
   }
 
+  func testOnboardingCoordinatorWithdrawsPresentationDuringStartupRestore() {
+    let coordinator = ProviderOnboardingCoordinator(
+      autocompleteEnabled: true,
+      providerConfigured: false)
+    let window = NSObject()
+    let windowID = ObjectIdentifier(window)
+
+    // The first onAppear may claim the sheet before the controller has built
+    // the working set. Beginning restore must withdraw that pending claim.
+    coordinator.evaluate(windowID: windowID, isKeyWindow: true)
+    XCTAssertEqual(coordinator.presentingWindowID, windowID)
+
+    coordinator.setStartupRestoreInProgress(true)
+    XCTAssertNil(coordinator.presentingWindowID)
+    coordinator.evaluate(windowID: windowID, isKeyWindow: true)
+    XCTAssertNil(
+      coordinator.presentingWindowID,
+      "onboarding became key while startup was still mutating the native tab group")
+
+    coordinator.setStartupRestoreInProgress(false)
+    coordinator.evaluate(windowID: windowID, isKeyWindow: true)
+    XCTAssertEqual(
+      coordinator.presentingWindowID, windowID,
+      "onboarding did not become eligible again after the restore transaction settled")
+  }
+
   func testSavingSettingsClearsTypedUnavailableLatchForNextRequest() async throws {
     let attempts = ProviderAttemptCounter()
     let engine = MockVistaAutocompleteEngine(completionHandler: { _, _ in

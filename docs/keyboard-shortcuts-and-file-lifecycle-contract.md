@@ -265,6 +265,14 @@ document window; it must not be merged through the sheet, its parent, or a
 sibling as a fallback. Once the sheet ends, ordinary document-to-document tab
 grouping may resume.
 
+Startup restore is one indivisible exception to the timing above, not to its
+safety rule. The restore pins the initial document host for its whole multi-turn
+pass, and provider onboarding stays unpresented until every restored tab has
+joined and the final tab has been selected. A sheet, Settings window or helper
+surface becoming key must never redirect a later restore step or split the
+working set into additional windows. Pensieve still never mutates a tab group
+while it owns an attached sheet; it prevents that overlap instead.
+
 Window-following UI bridges (theme chrome, toolbar overflow, command routing,
 close hooks) publish only a proven document root. A queued callback belonging
 to a factory window that has already closed must be dropped rather than
@@ -663,6 +671,9 @@ An agent implementing or refactoring menu/commands must verify:
 - [ ] With a live provider/onboarding sheet, opening or restoring another file
       never gives the sheet a document tab bar, changes the sheet's frame into
       a document frame, or moves document navigation outside its root window.
+- [ ] Startup restore keeps one pinned document host across run-loop turns;
+      provider onboarding appears only after all restored tabs have joined and
+      the final tab has been selected.
 - [ ] Window-lifecycle fixtures that call `beginSheet`, `addChildWindow`,
       `addTabbedWindow`, or `makeKeyAndOrderFront` are parked offscreen and set
       to zero alpha before AppKit can order them; test chrome must never flash

@@ -105,6 +105,93 @@ final class StartupRestoreTabCostTests: XCTestCase {
       "spreading the pass over turns must not turn one closing activation into one per tab")
   }
 
+  /// A provider/onboarding sheet becomes key after the first restored tab has
+  /// joined. Before the fix the next turn asked `NSApp.keyWindow` again, got
+  /// the sheet, rejected it as transient, and presented the document as a
+  /// standalone window. One restore transaction owns one document host even
+  /// when focus changes between its run-loop turns.
+  func testRestorePinsItsDocumentHostAcrossKeyWindowChanges() {
+    let probe = RestoreCostProbe()
+    let launchWindow = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
+    let transientKeyWindow = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 390, height: 210),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: false)
+    transientKeyWindow.isReleasedWhenClosed = false
+    addTeardownBlock { await MainActor.run { transientKeyWindow.close() } }
+    probe.windows.append(launchWindow)
+    var currentTarget: NSWindow? = launchWindow
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      scheduleRestoreStep: { [weak probe] work in probe?.restoreSteps.append(work) },
+      mergeWindowIntoTabsBehind: { target, window in
+        probe.backgroundMergeTargets.append(target)
+        probe.backgroundMerges.append(window)
+      },
+      orderAndActivateWindow: { probe.activations.append($0) },
+      currentMergeTarget: { currentTarget },
+      setStartupRestoreInProgress: { _ in },
+      makeDocumentWindow: { [weak probe] _, _ in
+        guard let probe else { return nil }
+        let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        probe.windows.append(window)
+        probe.createdWindows.append(window)
+        return window
+      })
+    let refs = (0..<3).map {
+      DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-restore-owner-\($0).md"), isAdHoc: true)
+    }
+
+    registry.openRestoredDocuments(refs)
+    currentTarget = transientKeyWindow
+    while !probe.restoreSteps.isEmpty {
+      probe.restoreSteps.removeFirst()()
+    }
+
+    XCTAssertEqual(probe.backgroundMergeTargets.count, refs.count)
+    XCTAssertTrue(
+      probe.backgroundMergeTargets.allSatisfy { $0 === launchWindow },
+      "a later restore turn followed the transient key window instead of the pass's original host")
+  }
+
+  func testRestoreSuspendsOnboardingForExactlyTheRestorePass() {
+    let probe = RestoreCostProbe()
+    let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
+    probe.windows.append(target)
+    var gateTransitions: [Bool] = []
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      scheduleRestoreStep: { [weak probe] work in probe?.restoreSteps.append(work) },
+      mergeWindowIntoTabsBehind: { _, window in probe.backgroundMerges.append(window) },
+      orderAndActivateWindow: { probe.activations.append($0) },
+      currentMergeTarget: { target },
+      setStartupRestoreInProgress: { gateTransitions.append($0) },
+      makeDocumentWindow: { [weak probe] _, _ in
+        guard let probe else { return nil }
+        let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        probe.windows.append(window)
+        probe.createdWindows.append(window)
+        return window
+      })
+    let refs = (0..<3).map {
+      DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-restore-gate-\($0).md"), isAdHoc: true)
+    }
+
+    registry.openRestoredDocuments(refs)
+    XCTAssertEqual(gateTransitions, [true])
+    while !probe.restoreSteps.isEmpty {
+      probe.restoreSteps.removeFirst()()
+    }
+    XCTAssertEqual(
+      gateTransitions, [true, false],
+      "the onboarding gate did not cover the whole multi-turn restore transaction exactly once")
+  }
+
   /// THE FRAME PIN — the other half, and the reason the sync had work to do at
   /// all. The factory sizes a new window to its own recipe, so every insertion
   /// handed AppKit a frame that disagreed with the group's. A window adopts the
@@ -240,6 +327,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       mergeWindowIntoTabsBehind: { _, window in probe.backgroundMerges.append(window) },
       orderAndActivateWindow: { probe.activations.append($0) },
       currentMergeTarget: { target },
+      setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
         let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
@@ -368,6 +456,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       currentMergeTarget: { resolvedTarget },
+      setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
         let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
@@ -399,6 +488,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
 @MainActor
 private final class RestoreCostProbe {
   var foregroundMerges: [NSWindow] = []
+  var backgroundMergeTargets: [NSWindow] = []
   var backgroundMerges: [NSWindow] = []
   var framesMatchingTargetAtMerge: [Bool] = []
   var activations: [NSWindow] = []

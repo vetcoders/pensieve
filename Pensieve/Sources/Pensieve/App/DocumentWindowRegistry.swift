@@ -30,6 +30,14 @@ enum DocumentWindowPresentation {
   case joinTabGroupInBackground
 }
 
+private enum DocumentMergeTargetSelection {
+  /// Interactive opens follow the document window that is current now.
+  case current
+  /// A startup restore is one transaction spread over several run-loop turns.
+  /// Its owner is captured once; focus changes cannot redirect later tabs.
+  case fixed(NSWindow?)
+}
+
 /// How much a close that arrived through one window actually closed.
 ///
 /// The Open Files working set turns on this distinction: retiring a document is
@@ -154,6 +162,7 @@ final class DocumentWindowRegistry: ObservableObject {
   /// already booked for a later run-loop turn.
   private var pendingRestoreRefs: [DocumentRef] = []
   private var restoreFrontmostWindow: WeakWindow?
+  private var restoreMergeTarget: WeakWindow?
   private var restoreStepScheduled = false
   /// Documents that reached the screen without the registry presenting them —
   /// see `noteDocumentAlreadyOnScreen`. Consumed by the attach that reports one.
@@ -208,6 +217,7 @@ final class DocumentWindowRegistry: ObservableObject {
   private let currentMergeTarget: @MainActor () -> NSWindow?
   private let applicationWindows: @MainActor () -> [NSWindow]
   private let closeWindow: @MainActor (NSWindow) -> Void
+  private let setStartupRestoreInProgress: @MainActor (Bool) -> Void
   /// The windows sharing `window`'s native tab group, `window` included. A seam
   /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
   /// and the tab-vs-window close scope is decided from exactly this list.
@@ -254,6 +264,9 @@ final class DocumentWindowRegistry: ObservableObject {
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
     },
+    setStartupRestoreInProgress: @escaping @MainActor (Bool) -> Void = { inProgress in
+      ProviderOnboardingCoordinator.shared.setStartupRestoreInProgress(inProgress)
+    },
     tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
       window.tabbedWindows ?? [window]
     },
@@ -270,6 +283,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
     self.closeWindow = closeWindow
+    self.setStartupRestoreInProgress = setStartupRestoreInProgress
     self.makeDocumentWindow = makeDocumentWindow
   }
 
@@ -319,6 +333,11 @@ final class DocumentWindowRegistry: ObservableObject {
   /// rest of the working set arrives, and the pass still ends in exactly one
   /// ordering.
   func openRestoredDocuments(_ refs: [DocumentRef]) {
+    guard !refs.isEmpty else { return }
+    if restoreMergeTarget == nil, pendingRestoreRefs.isEmpty, !restoreStepScheduled {
+      restoreMergeTarget = currentDocumentMergeTarget().map(WeakWindow.init)
+      setStartupRestoreInProgress(true)
+    }
     pendingRestoreRefs.append(contentsOf: refs)
     guard !restoreStepScheduled else { return }
     openNextRestoredDocument()
@@ -343,7 +362,11 @@ final class DocumentWindowRegistry: ObservableObject {
     restoreStepScheduled = false
     if !pendingRestoreRefs.isEmpty {
       let ref = pendingRestoreRefs.removeFirst()
-      if let window = open(ref, presentation: .joinTabGroupInBackground) {
+      if let window = open(
+        ref,
+        presentation: .joinTabGroupInBackground,
+        mergeTargetSelection: .fixed(restoreMergeTarget?.window)
+      ) {
         restoreFrontmostWindow = WeakWindow(window)
       }
     }
@@ -360,14 +383,21 @@ final class DocumentWindowRegistry: ObservableObject {
   private func finishRestorePass() {
     let frontmost = restoreFrontmostWindow?.window
     restoreFrontmostWindow = nil
-    guard let frontmost else { return }
-    orderAndActivateWindow(frontmost)
+    restoreMergeTarget = nil
+    if let frontmost {
+      orderAndActivateWindow(frontmost)
+    }
+    // Final tab selection is part of the transaction. Releasing onboarding
+    // before this ordering could attach its sheet to the previous selected tab
+    // and make AppKit re-parent the group under an active sheet one last time.
+    setStartupRestoreInProgress(false)
   }
 
   @discardableResult
   private func open(
     _ ref: DocumentRef,
-    presentation: DocumentWindowPresentation
+    presentation: DocumentWindowPresentation,
+    mergeTargetSelection: DocumentMergeTargetSelection = .current
   ) -> NSWindow? {
     let documentID = ref.id.standardizedFileURL
     let identity = DocumentIdentity.file(documentID).standardized
@@ -427,7 +457,14 @@ final class DocumentWindowRegistry: ObservableObject {
       window: window)
 
     var didJoinTabGroup = false
-    if let target = currentDocumentMergeTarget(), target !== window {
+    let mergeTarget: NSWindow?
+    switch mergeTargetSelection {
+    case .current:
+      mergeTarget = currentDocumentMergeTarget()
+    case .fixed(let candidate):
+      mergeTarget = candidate.flatMap(validatedDocumentMergeTarget)
+    }
+    if let target = mergeTarget, target !== window {
       guard prepareTabbedWindow(target), prepareTabbedWindow(window) else {
         orderAndActivateWindow(window)
         closeEmptyLauncherWindows(except: window)
@@ -1068,6 +1105,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// attaches and gives it the explicit identifier.
   private func currentDocumentMergeTarget() -> NSWindow? {
     guard let candidate = currentMergeTarget() else { return nil }
+    return validatedDocumentMergeTarget(candidate)
+  }
+
+  private func validatedDocumentMergeTarget(_ candidate: NSWindow) -> NSWindow? {
     guard DocumentWindowOwnership.isTabMutationHost(candidate) else {
       DebugTrace.log("registry.merge rejected non-document target '\(candidate.title)'")
       DebugTrace.logWindowEvent("registry.merge.rejected-target", window: candidate)

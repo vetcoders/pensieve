@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Panels, child windows, Settings and other transient surfaces remain outside
   the document navigation graph, and a queued callback cannot republish a
   factory window after it has closed.
+- **Restoring a session no longer splits its tabs into extra windows when AI
+  onboarding appears.** Session restore arrives over several run-loop turns;
+  the onboarding sheet could become the key window between two of them, so the
+  next document rejected the sheet and fell back to a standalone window. One
+  restore now pins one document host for the whole pass, and onboarding waits
+  until every restored tab has joined and the final tab is selected.
 - **Agent dispatch now says what actually happened.** The green confirmation
   previously read “Dispatched” and ended with a “Done” button even though the
   receipt only proved that a detached worker had started. It now says **Run

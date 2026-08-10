@@ -94,6 +94,12 @@ struct ContentView: View {
       providerOnboardingCoordinator.setAutocompleteEnabled(appState.aiAutocompleteEnabled)
       evaluateProviderOnboarding()
     }
+    .onChange(of: providerOnboardingCoordinator.startupRestoreInProgress) {
+      _, restoreInProgress in
+      if !restoreInProgress {
+        evaluateProviderOnboarding()
+      }
+    }
     .onReceive(
       NotificationCenter.default.publisher(
         for: NSWindow.didBecomeKeyNotification)
