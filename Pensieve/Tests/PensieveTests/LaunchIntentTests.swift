@@ -341,6 +341,115 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertEqual(focused.appState.documentSession.url, requested)
   }
 
+  /// Closing the final window deliberately leaves a live process with no
+  /// controller. A later Finder/Open With event must materialize one host for
+  /// its queued URL; otherwise the file remains invisible until an unrelated
+  /// Dock click happens to create a launcher.
+  @MainActor
+  func testExternalOpenCreatesAHostWhenTheProcessHasZeroWindows() async throws {
+    let reopened = try makeRestoreHarness(documentNames: [])
+    let requested = reopened.folder.appendingPathComponent("finder-open.md").standardizedFileURL
+    try "# Finder open".write(to: requested, atomically: true, encoding: .utf8)
+    var requestedIntents: [LaunchIntent] = []
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { nil },
+      hasLiveApplicationWindow: { false },
+      openExternalDocumentHost: {
+        requestedIntents.append(.explicitDocument)
+        return true
+      })
+
+    coordinator.handle(urls: [requested])
+
+    XCTAssertEqual(
+      requestedIntents, [.explicitDocument],
+      "an external open in the zero-window state did not request a document host")
+    XCTAssertNil(
+      reopened.appState.documentSession.url,
+      "the fixture has no controller attached yet, so the URL must remain queued")
+
+    // The factory-built root attaches exactly as it does after the request
+    // above. Attaching drains the queued URL before the launch decision runs.
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: reopened.controller, intent: try XCTUnwrap(requestedIntents.first))
+    await coordinator.waitForStartupDecision()
+    await reopened.folderManager.waitForPendingWorkspaceBuild()
+
+    XCTAssertEqual(reopened.appState.documentSession.url, requested)
+    XCTAssertEqual(reopened.appState.selectedDocumentID, requested)
+    XCTAssertTrue(
+      reopened.appState.workspaceRoots.isEmpty,
+      "a Finder-open host must keep the explicit-document intent, not restore a workspace around it"
+    )
+  }
+
+  /// Several URL events can arrive before SwiftUI attaches the newly requested
+  /// root. They all belong to that one host; the coordinator must not request a
+  /// second window during the attachment gap.
+  @MainActor
+  func testExternalOpenBurstRequestsOnlyOneHostBeforeAttach() {
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveApplicationWindow: { false },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return true
+      })
+
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/first.md")])
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/second.md")])
+
+    XCTAssertEqual(hostRequests, 1)
+  }
+
+  /// A root may already exist while its SwiftUI controller is still attaching.
+  /// That timing gap must keep the URL queued without creating a duplicate;
+  /// the eventual attach drains it through the same explicit-document path.
+  @MainActor
+  func testExternalOpenWaitsForALiveWindowsControllerWithoutCreatingAnotherHost() async throws {
+    let attaching = try makeRestoreHarness(documentNames: [])
+    let requested = attaching.folder.appendingPathComponent("attaching.md").standardizedFileURL
+    try "# attaching".write(to: requested, atomically: true, encoding: .utf8)
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveApplicationWindow: { true },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return true
+      })
+
+    coordinator.handle(urls: [requested])
+    XCTAssertEqual(hostRequests, 0)
+
+    coordinator.startWhenLaunchIntentsSettle(
+      controller: attaching.controller, intent: .explicitDocument)
+    await coordinator.waitForStartupDecision()
+
+    XCTAssertEqual(attaching.appState.documentSession.url, requested)
+  }
+
+  /// A factory failure must not permanently latch the coordinator into a state
+  /// where every later Finder open stays queued without another host attempt.
+  @MainActor
+  func testExternalOpenRetriesAfterHostCreationFails() {
+    var hostRequests = 0
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { nil },
+      hasLiveApplicationWindow: { false },
+      openExternalDocumentHost: {
+        hostRequests += 1
+        return false
+      })
+
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/first.md")])
+    coordinator.handle(urls: [URL(fileURLWithPath: "/tmp/second.md")])
+
+    XCTAssertEqual(hostRequests, 2)
+  }
+
   /// The attached launcher controller keeps priority while it is alive, so the
   /// focused fallback never diverts an open away from the window that is
   /// legitimately handling this launch. Here the launcher is attached FIRST

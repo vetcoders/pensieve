@@ -3,7 +3,18 @@ import Foundation
 
 @MainActor
 final class LaunchIntentCoordinator: ObservableObject {
-  static let shared = LaunchIntentCoordinator()
+  static let shared = LaunchIntentCoordinator(
+    hasLiveApplicationWindow: { DocumentWindowRegistry.shared.applicationHasLiveWindow() },
+    openExternalDocumentHost: {
+      let registry = DocumentWindowRegistry.shared
+      if registry.makeDocumentWindow != nil {
+        registry.openLauncherWindow(intent: .explicitDocument)
+        return registry.applicationHasLiveWindow()
+      } else {
+        return NSApp.sendAction(
+          #selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+      }
+    })
 
   typealias StartupDecisionHandler = @MainActor () -> Void
 
@@ -20,9 +31,16 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// opened document. Falling back to the focused controller closes that hole
   /// while leaving cold launch (launcher attached, no window key yet) unchanged.
   private let focusedControllerProvider: @MainActor () -> AppController?
+  /// Materializes a document host for an external file-open event when the app
+  /// is deliberately alive with zero windows. The URL stays in `pendingURLs`;
+  /// the new root drains it when its controller attaches, preserving the same
+  /// explicit-document launch path as a cold Finder open.
+  private let hasLiveApplicationWindow: @MainActor () -> Bool
+  private let openExternalDocumentHost: @MainActor () -> Bool
   private var pendingURLs: [URL] = []
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
+  private var isExternalOpenWindowRequested = false
   /// Set when launch URLs were actually opened into a window and CONSUMED by
   /// the next start decision.
   ///
@@ -49,10 +67,14 @@ final class LaunchIntentCoordinator: ObservableObject {
     settleDelayNanoseconds: UInt64 = 0,
     focusedControllerProvider: @escaping @MainActor () -> AppController? = {
       CommandSurfaceContext.shared.controller
-    }
+    },
+    hasLiveApplicationWindow: @escaping @MainActor () -> Bool = { false },
+    openExternalDocumentHost: @escaping @MainActor () -> Bool = { false }
   ) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
     self.focusedControllerProvider = focusedControllerProvider
+    self.hasLiveApplicationWindow = hasLiveApplicationWindow
+    self.openExternalDocumentHost = openExternalDocumentHost
   }
 
   /// The controller an incoming file open should be routed to: the cold-start
@@ -81,6 +103,7 @@ final class LaunchIntentCoordinator: ObservableObject {
     startupTask = nil
     startupDecisionHandler = nil
     pendingURLs.removeAll()
+    isExternalOpenWindowRequested = false
   }
 
   /// Starts `controller` once any launch URLs have settled. `intent` is the one
@@ -124,7 +147,15 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
-    guard let target = openTargetController else { return }
+    guard let target = openTargetController else {
+      // The zero-window process is intentional, but an external open is also
+      // an explicit request for a surface. Keep the URLs queued and create one
+      // host; its root will attach above and drain them exactly once.
+      if !hasLiveApplicationWindow(), !isExternalOpenWindowRequested {
+        isExternalOpenWindowRequested = openExternalDocumentHost()
+      }
+      return
+    }
     // The URLs already landed in this window; spend the launch-document intent
     // here so the NEXT window is judged on its own.
     _ = consumeLaunchDocumentOpen()
@@ -138,6 +169,7 @@ final class LaunchIntentCoordinator: ObservableObject {
 
   private func attach(controller: AppController) {
     self.controller = controller
+    isExternalOpenWindowRequested = false
     drainPendingURLs()
   }
 
@@ -170,8 +202,8 @@ final class LaunchIntentCoordinator: ObservableObject {
 
     // `openFile` picks the destination per window state: an empty window is
     // reused in place (cold start), a window already showing a document routes
-    // to the registry so the file lands as a native tab — the system "Prefer
-    // tabs when opening documents" contract. Special-casing the first URL into
+    // to the registry so the file lands as a native tab — Pensieve's
+    // deterministic click/open contract. Special-casing the first URL into
     // `openFileInCurrentWindow` replaced the document the user was reading
     // whenever a Finder/Dock open arrived at a running app.
     for url in supportedFileURLs {
@@ -326,8 +358,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   /// `@NSApplicationDelegateAdaptor` instance, and a file probe written from
   /// inside this method landed on an AppleScript quit. ⌘Q keeps its own pass in
   /// `Commands.swift` (unchanged) because `NSApplication.terminate(_:)` does NOT
-  /// reliably reach this hook — `NSSupportsSuddenTermination` is true in
-  /// `Info.plist`, and a programmatic terminate can exit the process outright.
+  /// reliably reach this hook on every programmatic route. The shipped bundle
+  /// explicitly sets `NSSupportsSuddenTermination` to false so AppKit reaches
+  /// the final `applicationWillTerminate` durability phase after consent.
   /// Moving the pass OFF the menu item is therefore a data-loss regression, which
   /// is what the 2026-07-29 attempt hit.
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -338,13 +371,12 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     MainActor.assumeIsolated {
-      // This notification is the one termination hook the app actually receives:
-      // `applicationShouldTerminate(_:)` on THIS delegate is never invoked under
-      // `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so wiring anything
-      // there would have looked right and done nothing. Every quit path — Dock, logout, shutdown,
-      // the custom ⌘Q item — arrives here, which is why the whole termination contract (final
-      // window saves → index drain → truncating checkpoint) has exactly one owner and it hangs off
-      // this call. See `TerminationSequence`.
+      // `applicationShouldTerminate(_:)` is the synchronous consent/veto
+      // phase. Once it returns `.terminateNow`, every quit path arrives here
+      // for the final durability sequence: quiesce producers, flush accepted
+      // user bytes, persist the working set, drain the index and checkpoint.
+      // Keeping those roles separate avoids both an unvetoable quit and a
+      // duplicate final flush. See `TerminationSequence`.
       TerminationSequence(
         registry: terminationWindowRegistryOverride ?? .shared,
         indexDatabase: terminationIndexDatabaseOverride ?? .shared,

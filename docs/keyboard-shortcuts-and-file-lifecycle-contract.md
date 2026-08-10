@@ -202,6 +202,12 @@ window closes, the Pensieve process remains alive with zero windows; it does
 not create a launcher automatically. Clicking Pensieve in the Dock later
 creates exactly one empty launcher.
 
+Opening a supported file from Finder, `open`, or another application while the
+process has zero windows is a different explicit intent: Pensieve creates
+exactly one document host for the queued URL and opens that file there. The
+request must not remain hidden until a later Dock click, and the new host must
+not restore the previous working set around the explicitly opened document.
+
 ### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed

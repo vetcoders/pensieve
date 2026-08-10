@@ -164,6 +164,11 @@ final class DocumentWindowRegistry: ObservableObject {
   private var restoreFrontmostWindow: WeakWindow?
   private var restoreMergeTarget: WeakWindow?
   private var restoreStepScheduled = false
+  private var restorePassInProgress = false
+  /// Windows closed while the current restore transaction is alive. Reusable
+  /// SwiftUI scene windows cannot be factory-tombstoned forever, but they must
+  /// not be re-selected as this pass's host during their close turn.
+  private var restoreClosedWindows: [ObjectIdentifier: WeakWindow] = [:]
   /// Documents that reached the screen without the registry presenting them —
   /// see `noteDocumentAlreadyOnScreen`. Consumed by the attach that reports one.
   private var documentsAlreadyOnScreen: Set<URL> = []
@@ -334,8 +339,11 @@ final class DocumentWindowRegistry: ObservableObject {
   /// ordering.
   func openRestoredDocuments(_ refs: [DocumentRef]) {
     guard !refs.isEmpty else { return }
-    if restoreMergeTarget == nil, pendingRestoreRefs.isEmpty, !restoreStepScheduled {
-      restoreMergeTarget = currentDocumentMergeTarget().map(WeakWindow.init)
+    if !restorePassInProgress {
+      restorePassInProgress = true
+      restoreClosedWindows.removeAll()
+      restoreMergeTarget = currentMergeTarget().flatMap(restoreEligibleDocumentHost).map(
+        WeakWindow.init)
       setStartupRestoreInProgress(true)
     }
     pendingRestoreRefs.append(contentsOf: refs)
@@ -360,20 +368,68 @@ final class DocumentWindowRegistry: ObservableObject {
 
   private func openNextRestoredDocument() {
     restoreStepScheduled = false
-    if !pendingRestoreRefs.isEmpty {
-      let ref = pendingRestoreRefs.removeFirst()
-      if let window = open(
-        ref,
-        presentation: .joinTabGroupInBackground,
-        mergeTargetSelection: .fixed(restoreMergeTarget?.window)
-      ) {
-        restoreFrontmostWindow = WeakWindow(window)
+    guard !pendingRestoreRefs.isEmpty else {
+      finishRestorePass()
+      return
+    }
+
+    if let pinned = restoreMergeTarget?.window {
+      if restoreEligibleDocumentHost(pinned) == nil {
+        restoreMergeTarget = nil
+        if restoreFrontmostWindow?.window === pinned {
+          restoreFrontmostWindow = nil
+        }
+      } else if !canMutateWindowTabs()
+        || !DocumentWindowOwnership.isTabMutationHost(pinned)
+      {
+        scheduleNextRestoreStep()
+        return
       }
+    }
+
+    if restoreMergeTarget?.window == nil,
+      let transactionSurvivor = restoreFrontmostWindow?.window.flatMap(
+        restoreEligibleDocumentHost)
+    {
+      restoreMergeTarget = WeakWindow(transactionSurvivor)
+    }
+
+    if restoreMergeTarget?.window == nil,
+      let candidate = currentMergeTarget().flatMap(restoreEligibleDocumentHost)
+    {
+      restoreMergeTarget = WeakWindow(candidate)
+      guard canMutateWindowTabs(), DocumentWindowOwnership.isTabMutationHost(candidate) else {
+        scheduleNextRestoreStep()
+        return
+      }
+    } else if !canMutateWindowTabs() {
+      scheduleNextRestoreStep()
+      return
+    }
+
+    let ref = pendingRestoreRefs.removeFirst()
+    if let window = open(
+      ref,
+      presentation: .joinTabGroupInBackground,
+      mergeTargetSelection: .fixed(restoreMergeTarget?.window)
+    ) {
+      // If the original host disappeared, the first successfully created
+      // replacement becomes the host for the rest of THIS transaction. Never
+      // follow a later arbitrary key window between restore turns.
+      if restoreMergeTarget?.window == nil {
+        restoreMergeTarget = WeakWindow(window)
+      }
+      restoreFrontmostWindow = WeakWindow(window)
     }
     guard !pendingRestoreRefs.isEmpty else {
       finishRestorePass()
       return
     }
+    scheduleNextRestoreStep()
+  }
+
+  private func scheduleNextRestoreStep() {
+    guard !restoreStepScheduled else { return }
     restoreStepScheduled = true
     scheduleRestoreStep { [weak self] in
       self?.openNextRestoredDocument()
@@ -381,9 +437,13 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func finishRestorePass() {
-    let frontmost = restoreFrontmostWindow?.window
+    let frontmost =
+      restoreFrontmostWindow?.window.flatMap(restoreEligibleDocumentHost)
+      ?? restoreMergeTarget?.window.flatMap(restoreEligibleDocumentHost)
     restoreFrontmostWindow = nil
     restoreMergeTarget = nil
+    restoreClosedWindows.removeAll()
+    restorePassInProgress = false
     if let frontmost {
       orderAndActivateWindow(frontmost)
     }
@@ -540,6 +600,15 @@ final class DocumentWindowRegistry: ObservableObject {
   private func reconcileClosedWindowState(_ window: NSWindow) {
     let windowID = ObjectIdentifier(window)
     DebugTrace.log("registry.reconcileClosed '\(window.title)'")
+    if restorePassInProgress {
+      restoreClosedWindows[windowID] = WeakWindow(window)
+      if restoreMergeTarget?.window === window {
+        restoreMergeTarget = nil
+      }
+      if restoreFrontmostWindow?.window === window {
+        restoreFrontmostWindow = nil
+      }
+    }
     releaseStaleDocumentMappings(for: window, keeping: nil)
     removeDescriptors(for: window, keeping: nil)
     contentWindows.removeValue(forKey: windowID)
@@ -1109,9 +1178,23 @@ final class DocumentWindowRegistry: ObservableObject {
   }
 
   private func validatedDocumentMergeTarget(_ candidate: NSWindow) -> NSWindow? {
-    guard DocumentWindowOwnership.isTabMutationHost(candidate) else {
+    guard restoreEligibleDocumentHost(candidate) != nil,
+      DocumentWindowOwnership.isTabMutationHost(candidate)
+    else {
       DebugTrace.log("registry.merge rejected non-document target '\(candidate.title)'")
       DebugTrace.logWindowEvent("registry.merge.rejected-target", window: candidate)
+      return nil
+    }
+    return candidate
+  }
+
+  private func restoreEligibleDocumentHost(_ candidate: NSWindow) -> NSWindow? {
+    let windowID = ObjectIdentifier(candidate)
+    guard candidate.contentView != nil,
+      !isFactoryTombstoned(candidate),
+      restoreClosedWindows[windowID]?.window !== candidate,
+      DocumentWindowOwnership.isDocumentHost(candidate)
+    else {
       return nil
     }
     return candidate

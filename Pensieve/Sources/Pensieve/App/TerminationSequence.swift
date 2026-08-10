@@ -243,10 +243,12 @@ final class TerminationSequence {
     await subBudget.value
   }
 
-  /// Synchronous entry for `applicationWillTerminate`, which cannot await — and which is the ONLY
-  /// termination hook this app receives, because `applicationShouldTerminate(_:)` is never invoked
-  /// under `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so AppKit's
-  /// `.terminateLater` reply is not available to us.
+  /// Synchronous final-durability entry for `applicationWillTerminate`, which
+  /// cannot await. `applicationShouldTerminate(_:)` runs the earlier
+  /// consent/veto pass; after consent, this hook owns the one-way sequence that
+  /// must finish before process exit. The consent pass is synchronous and
+  /// returns `.terminateNow` / `.terminateCancel`, so no `.terminateLater`
+  /// handshake is needed here.
   ///
   /// Blocking the main thread outright would deadlock: the index writes being waited for are
   /// main-actor jobs dispatched to this very thread. Pumping the run loop instead keeps servicing

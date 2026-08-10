@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **New is deterministic in Pensieve v1.** `Cmd+N`, `Cmd+T`, and the native tab
+  bar's `+` create an editable tab in the current document host regardless of
+  macOS's global "Prefer tabs when opening documents" setting. An idle launcher
+  may take the first draft in place; an occupied host never turns New into an
+  unrelated standalone window.
 - **Typewriter now follows your Mac's light/dark setting**, and it does it with two palettes of its own rather than by turning into a system theme. Set your Mac to dark and the window is the dark one — `#171717` titlebar over a dark source panel; set it to light and the same skin turns the window and the source panel white. The **page stays white either way**: the sheet is what you are reading, and it is paper in both halves, so the preview never follows the window into dark. Switching the system setting re-dresses open windows live, and an exported PDF is always the light sheet — exporting from a dark Mac no longer produced a dark document. Both halves stay on Typewriter's one grey ramp with no colour at all. A theme saved as Typewriter stays Typewriter; there is nothing to re-pick.
 - The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, mid grey on Typewriter — which stays achromatic, one step up its own grey ramp. `Default` and `Raw` keep the accent chosen in System Settings.
 - **Closing a document is now a conscious decision, not a silent teardown.** A dirty untitled document asks Save As… / Don't Save / Cancel; a dirty document that already has a location asks Save / Don't Save / Cancel; a clean, untouched document still closes without asking. Cancel, or a save that fails, always leaves the window open with nothing discarded. The same pass now gates the red close button, ⌘W, Dock quit, and Quit Pensieve alike, so none of them can drop unsaved work behind another window's back.
@@ -32,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Clicking a file opens it as a tab instead of taking over the one you are reading.** A click in the workspace tree, on a search result, or on the context menu's "Open" used to swap the document out from under the current window — the VS Code model — so reading two files meant losing your place in the first. A click is an explicit open, so it now lands exactly where ⌘O and a Finder "Open with Pensieve" land: a native tab next to the one you are in, with your current document untouched. A file that is already open is brought forward rather than opened twice, whichever window you click it from, and an empty window still takes the file itself instead of putting a second tab beside itself. "Open in New Window" is gone from the context menu: with every open landing as a tab it was a second button for "Open".
 
 ### Fixed
+
+- **Opening a file no longer disappears into a windowless Pensieve process.**
+  After the last window is closed, Finder/Open With or `open` now creates one
+  explicit-document host and drains the queued URL into it instead of waiting
+  invisibly for a later Dock click to happen to create a launcher.
+- **Startup restore now remains one transaction across modal and close turns.**
+  A modal pause keeps the same ref pending and the onboarding gate closed; if
+  the pinned host closes between turns, later tabs re-pin to a live restore
+  survivor and the final ordering never resurrects the closed window.
 
 - **Saving a recovered draft from the launcher no longer creates a file that
   Pensieve immediately forgets.** The file was written and the recovery copy
