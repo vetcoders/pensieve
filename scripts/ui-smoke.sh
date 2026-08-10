@@ -155,9 +155,14 @@ disarm_restoration_default() {
   RESTORATION_DEFAULT_ARMED=0
 }
 
-arm_pensieve_restore_off() {
+# Point the smoke domain's own startup-restore setting at a known value. The
+# prior value is snapshotted exactly once, on the first arm of the run, so a
+# probe that flips the setting the other way still disarms back to what the
+# domain held before the run started.
+arm_pensieve_restore() {
+  local wanted="$1"
   if [[ "$PENSIEVE_RESTORE_DEFAULT_ARMED" -eq 1 ]]; then
-    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool false
+    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool "$wanted"
     return 0
   fi
   if PRIOR_PENSIEVE_RESTORE="$(defaults read "$APP_ID" Pensieve.restoreSessionOnLaunch 2>/dev/null)"; then
@@ -166,8 +171,16 @@ arm_pensieve_restore_off() {
     PENSIEVE_RESTORE_WAS_SET=0
     PRIOR_PENSIEVE_RESTORE=""
   fi
-  defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool false
+  defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool "$wanted"
   PENSIEVE_RESTORE_DEFAULT_ARMED=1
+}
+
+arm_pensieve_restore_off() {
+  arm_pensieve_restore false
+}
+
+arm_pensieve_restore_on() {
+  arm_pensieve_restore true
 }
 
 disarm_pensieve_restore_default() {
@@ -538,6 +551,250 @@ on run argv
     error "external open created a window but did not show [" & documentTitle & "]; windows={" & my joined(allTitles, ",") & "}"
   end if
   log "ZERO_WINDOW_EXTERNAL_OPEN=PASS title=[" & (item 1 of allTitles as text) & "]"
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
+
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+}
+
+# The same zero-window external open, with Pensieve's OWN startup restore ON.
+#
+# `run_zero_window_external_open_probe` runs with restore OFF, so the launch it
+# exercises never reopens a working set — and the branch that decides what a
+# launch owes the operator reads BOTH the intent and that setting
+# (`AppController`: `intent != .coldLaunch || launchSettings.restoreSession-
+# OnLaunch`). With restore ON the same external open arrives at a process that
+# has already populated itself once, which is the combination no probe covered:
+# a restore that consumed the launch could leave the Finder's document with no
+# window at all, or bring the restored session back on top of it.
+#
+# Two launches, which is the floor for a restore scenario: one to seed a
+# restorable working set, one to restore it. The external open itself is an
+# event to the ALREADY RUNNING process, not a third launch.
+run_restore_on_external_open_probe() {
+  log "restore-ON external-open probe"
+  terminate_app
+  arm_pensieve_restore_on
+
+  local document_title="${SMOKE_DOCUMENT##*/}"
+  document_title="${document_title%.md}"
+  local external_title="${SMOKE_EXTERNAL_DOCUMENT##*/}"
+  external_title="${external_title%.md}"
+
+  log "restore-ON probe: launch #1 seeds a restorable session with [$document_title]"
+  open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
+    sleep 0.5
+    open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT"
+  }
+  local _
+  for _ in {1..120}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "restore-ON probe: seeding launch never started $APP_NAME"
+
+  run_ax_osascript 45 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set documentTitle to item 2 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set frontmost to true
+    delay 0.5
+    set allTitles to title of every window
+  end tell
+
+  repeat with candidateTitle in allTitles
+    if (candidateTitle as text) contains documentTitle then
+      log "RESTORE_ON_SEED=PASS title=[" & (candidateTitle as text) & "]"
+      return "seeded"
+    end if
+  end repeat
+  error "restore-ON probe: nothing to restore — no window titled [" & documentTitle & "] in {" & my joined(allTitles, ",") & "}"
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
+
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+
+  log "restore-ON probe: graceful quit, then relaunch with restore ON"
+  osascript -e "with timeout of 5 seconds" \
+    -e "tell application id \"$APP_ID\" to quit" \
+    -e "end timeout" >/dev/null 2>&1 || true
+  for _ in {1..60}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+    sleep 0.5
+  fi
+
+  open_smoke_app -a "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -a "$APP_PATH"
+  }
+  for _ in {1..120}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "restore-ON probe: relaunch never started $APP_NAME"
+
+  # The relaunch has to prove the restore actually fired before the zero-window
+  # state means anything: a session that never came back would leave the rest of
+  # this probe testing the restore-OFF path under a restore-ON default.
+  run_ax_osascript 60 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set documentTitle to item 2 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set frontmost to true
+    delay 0.8
+    set allTitles to title of every window
+  end tell
+
+  set restoredIt to false
+  repeat with candidateTitle in allTitles
+    if (candidateTitle as text) contains documentTitle then set restoredIt to true
+  end repeat
+  if not restoredIt then
+    error "restore ON did not reopen [" & documentTitle & "]; windows={" & my joined(allTitles, ",") & "}"
+  end if
+  log "RESTORE_ON_RELAUNCH=PASS windows={" & my joined(allTitles, ",") & "}"
+
+  -- Down to zero windows, one close at a time. The restored documents are
+  -- untouched since they were written by this script, so no save sheet can
+  -- interrupt the walk.
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to 40
+      if (count of windows) is 0 then exit repeat
+      set closeButton to first button of window 1 whose value of attribute "AXSubrole" is "AXCloseButton"
+      perform action "AXPress" of closeButton
+      delay 0.25
+    end repeat
+    if (count of windows) is not 0 then
+      error "closing every restored window did not reach the zero-window state; left {" & my joined((title of every window), ",") & "}"
+    end if
+  end tell
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
+
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "restore-ON probe: closing the restored windows terminated $APP_NAME instead of leaving a zero-window process"
+
+  # Same caveat as the restore-OFF probe: `open` can report -600 while
+  # LaunchServices reconnects to a windowless process that still receives the
+  # event. The AX assertion below is the source of truth; never retry the send.
+  open_smoke_app -a "$APP_PATH" "$SMOKE_EXTERNAL_DOCUMENT" >/dev/null 2>&1 || true
+
+  run_ax_osascript 45 - "$APP_NAME" "$external_title" "$document_title" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set documentTitle to item 2 of argv
+  set restoredTitle to item 3 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set windowCount to count of windows
+    set allTitles to title of every window
+  end tell
+  if windowCount is not 1 then
+    error "external open from zero windows with restore ON created " & windowCount & " windows={" & my joined(allTitles, ",") & "}"
+  end if
+  if (item 1 of allTitles as text) contains restoredTitle then
+    error "the restored session came back on top of the external open: window shows [" & (item 1 of allTitles as text) & "] instead of [" & documentTitle & "]"
+  end if
+  if (item 1 of allTitles as text) does not contain documentTitle then
+    error "external open with restore ON created a window but did not show [" & documentTitle & "]; windows={" & my joined(allTitles, ",") & "}"
+  end if
+  log "RESTORE_ON_EXTERNAL_OPEN=PASS title=[" & (item 1 of allTitles as text) & "]"
 end run
 
 on waitForProcess(appName, timeoutSeconds)
@@ -1235,4 +1492,6 @@ if [[ $COLD_ONLY -eq 0 ]]; then
   ok "Saved Application State isolation probe passed"
   run_zero_window_external_open_probe
   ok "Zero-window external-open probe passed"
+  run_restore_on_external_open_probe
+  ok "Restore-ON external-open probe passed"
 fi
