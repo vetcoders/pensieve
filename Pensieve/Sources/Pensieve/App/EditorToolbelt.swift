@@ -103,11 +103,20 @@ struct EditorToolbelt: ToolbarContent {
   }
 
   var body: some ToolbarContent {
+    // Every control pins `.controlSize(.regular)` because macOS 27 (26A5388g)
+    // raised the toolbar's AMBIENT default control size: the same declarations
+    // that measured 944pt on macOS 26 came back at 1017pt — over the 1000pt
+    // budget — purely from inherited sizing (measured per item: e.g. the
+    // editing family 353pt vs 315pt pinned). The pin restores the pre-27
+    // geometry (905pt total) without shrinking anything the operator sees;
+    // `.small` would save another 210pt but changes the visual language and
+    // stays a deliberate product decision, not a default.
     ToolbarItemGroup {
       ControlGroup {
         shareButton
         dispatchButton
       }
+      .controlSize(.regular)
     } label: {
       Label("Document and Dispatch", systemImage: "doc")
     }
@@ -115,6 +124,7 @@ struct EditorToolbelt: ToolbarContent {
     if showsEditToolbelt {
       ToolbarItemGroup {
         ToolbarHistoryControls()
+          .controlSize(.regular)
       } label: {
         Label("History", systemImage: "arrow.uturn.backward")
       }
@@ -123,9 +133,11 @@ struct EditorToolbelt: ToolbarContent {
         ControlGroup {
           richMarkdownToggle
         }
+        .controlSize(.regular)
         ControlGroup {
           formatButtons
         }
+        .controlSize(.regular)
       } label: {
         Label("Editing", systemImage: "textformat")
       }
@@ -133,9 +145,11 @@ struct EditorToolbelt: ToolbarContent {
 
     ToolbarItemGroup {
       modePicker
+        .controlSize(.regular)
 
       if Self.showsAppearanceControls(for: appState.mode) {
         AppearanceToolbarMenu(themeManager: themeManager)
+          .controlSize(.regular)
       }
     } label: {
       Label("View", systemImage: "rectangle.split.2x1")
@@ -143,10 +157,12 @@ struct EditorToolbelt: ToolbarContent {
 
     ToolbarItemGroup {
       reloadButton
+        .controlSize(.regular)
       ControlGroup {
         autoReloadToggle
         scrollSyncToggle
       }
+      .controlSize(.regular)
     } label: {
       Label("Preview Runtime", systemImage: "arrow.clockwise")
     }
@@ -156,7 +172,9 @@ struct EditorToolbelt: ToolbarContent {
         dictationToggle
         autocompleteToggle
       }
+      .controlSize(.regular)
       rewriteMenu
+        .controlSize(.regular)
     } label: {
       Label("Assistants", systemImage: "sparkles")
     }
