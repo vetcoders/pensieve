@@ -51,12 +51,16 @@ A positive worker PID in Vibecrafted metadata is shown as **Run started**. It is
 a spawn record, not a promise that the worker is still alive. If Vibecrafted
 exits successfully with a valid run ID but that spawn record does not arrive
 within the bounded confirmation window, Pensieve shows **Run accepted · launch
-unconfirmed** and keeps the run/report controls available. It does not call the
-run failed or encourage a duplicate dispatch. A genuinely rejected launch keeps
-its real exit code, run ID and report path when available, and shows the final
-actionable launcher error.
-**Check status in Terminal** requests a status snapshot for that run; the worker
-itself remains owned by its Vibecrafted/vc-frame session.
+unconfirmed**, preserves the run ID and any report path, and does not call the
+run failed or encourage a duplicate dispatch. **Reveal report** appears only
+when the launcher returned a report path. **Check status in Terminal** appears
+only when the observer agent is authoritative: either the receipt names it or
+the dispatch explicitly selected one positional agent. Pensieve does not guess
+an observer for a default swarm. A genuinely rejected launch keeps its real exit
+code, run ID and report path when available, and shows the final actionable
+launcher error without offering a status check for a run that never started.
+The status action requests one snapshot; the worker itself remains owned by its
+Vibecrafted/vc-frame session.
 
 ## Requirements
 

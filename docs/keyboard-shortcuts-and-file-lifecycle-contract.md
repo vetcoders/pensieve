@@ -26,10 +26,13 @@ Pensieve follows macOS conventions but has its own model: **workspace + files + 
 
 ### `Cmd+T` — New Empty Tab
 
-Creates an empty, editable untitled/unsaved tab in the current window and moves
-focus to the editor. Does not create a file on disk. `Cmd+S` triggers the Save
-As flow for it. `Cmd+N` invokes this same operation in v1 and therefore carries
-the same editability and focus contract.
+Creates an empty, editable untitled/unsaved tab in the current window and issues
+one focus request bound to that document session. Pensieve waits until the
+editor is hosted, then attempts `makeFirstResponder` exactly once. If AppKit
+refuses the attempt, the current responder stays in place and no later render or
+remount may replay it. The command does not create a file on disk. `Cmd+S`
+triggers the Save As flow for it. `Cmd+N` invokes this same operation in v1 and
+therefore carries the same editability and one-shot focus contract.
 
 Clarifications (decisions 26.07/31.07, canon item 2):
 
@@ -145,7 +148,10 @@ property — a plain atomic write reintroduces the bug. Because the atomic swap
 publishes a new inode, Pensieve copies the existing file's filesystem metadata
 (mode, ownership, ACLs, extended attributes/Finder tags and creation metadata)
 onto the replacement before the swap while preserving the new content's
-modification time. Failure to preserve that metadata aborts before publication.
+modification time. On volumes that support and permit those metadata operations,
+the full set is preserved. `ENOTSUP`, `EPERM` and `EACCES` are deliberately
+best-effort so replacement can proceed on SMB, exFAT and restricted volumes;
+unexpected I/O failures and a missing target still abort before publication.
 
 **Integrated error and recovery behavior (10.08).** When the file is gone or an
 original write otherwise fails, the dirty buffer first enters the data-loss
@@ -783,6 +789,9 @@ An agent implementing or refactoring menu/commands must verify:
 - [ ] `Cmd+T` creates an empty tab with no file on disk.
 - [ ] `Cmd+N` does the same as `Cmd+T` in v1: it preserves the current buffer
       and creates a native tab; an idle launcher may fill in place.
+- [ ] New makes one session-bound editor-focus attempt after the editor is
+      hosted; if AppKit refuses it, a later SwiftUI render/remount cannot replay
+      the request or steal focus from the current responder.
 - [ ] Repeated New commands (`file → Cmd+N → Cmd+T`) add one tab per command;
       a newly created empty tab is never mistaken for the idle launcher.
 - [ ] From zero document windows, two or three rapid `Cmd+N` / `Cmd+T`

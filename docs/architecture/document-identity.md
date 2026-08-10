@@ -49,18 +49,11 @@ registries, and "forget document X" would be a single call.
 
 ## Where it stopped
 
-`persistentID` has **four occurrences across three files** in the whole
-repository:
-
-| Site                               | Purpose                           |
-| ---------------------------------- | --------------------------------- |
-| `DocumentSession.swift:18`         | the definition                    |
-| `DocumentSession.swift:83`         | `persistentAIDocumentID`          |
-| `DocumentWindowModel.swift:38`     | `aiDocumentID` for the AI session |
-| `DocumentWindowRegistry.swift:382` | a string inside a debug log line  |
-
-No persistence layer uses it. The unifying key currently unifies one thing: the
-AI conversation keyed to a document.
+`DocumentSession` defines `persistentID`. `DocumentWindowModel` consumes it as
+the AI-session identity, while `DocumentWindowRegistry` includes it in identity
+diagnostics. No persistence store uses it: the durable working set, bookmarks
+and RecoveryStore still keep their own keys. The exact call-site count is not an
+architectural invariant and must not be copied into this document.
 
 ---
 
@@ -72,7 +65,7 @@ AI conversation keyed to a document.
 | Window registry           | `DocumentWindowRegistry`     | `DocumentIdentity` + `ObjectIdentifier(NSWindow)` | no                |
 | File bookmarks            | `BookmarkStore`              | path + bookmark `Data` bytes                      | yes               |
 | Workspace roots           | `BookmarkStore`              | separate defaults key                             | yes               |
-| Recovery drafts           | `RecoveryStore`              | draft `UUID`, one file each                       | yes               |
+| Recovery drafts           | `RecoveryStore`              | draft `UUID` + payload/sidecars                    | yes               |
 | Untitled documents        | `DocumentSession`            | in-memory `UUID` + optional `recoveryID`          | only via recovery |
 
 `BookmarkStore` alone holds three defaults keys:
@@ -87,6 +80,12 @@ The first is named `legacy` in the source — a single-folder bookmark supersede
 by multi-root `rootBookmarks`. The migration started and the old path stayed.
 That is the same half-finished pattern as `DocumentIdentity` itself, one layer
 down.
+
+One RecoveryStore record is not one filesystem object. Its UUID names a visible
+Markdown payload (`.md`), a title sidecar (`.title`), and, for a file-backed
+buffer, a required original-path sidecar (`.source`). The ownership claim that
+keeps two live windows from adopting the same record exists only in process; a
+crash drops the claim while leaving the record available at the next launch.
 
 ---
 
@@ -108,8 +107,9 @@ defects:
 - **Close a document from another window** — identity routing exists in the
   registry, but the completion captures the _calling_ window's controller.
 
-Each was found by clicking, not by a test, because no single type forces the
-stores to agree.
+These are historical examples found first through runtime clicking because no
+single type forced the stores to agree. Targeted regression tests now cover the
+repaired paths; the underlying multi-store coordination risk remains.
 
 The launcher-level recovered-draft Save As route now closes one of those fan-out
 gaps explicitly: after the destination write succeeds it registers the file in
@@ -144,9 +144,12 @@ the persistence half.
 When you add or change an operation on a document, walk all six rows of the
 table above and decide explicitly for each one. In particular:
 
-- **Adding a way to close/remove a document?** It must reach `forgetOpenFile`,
-  which is the choke point that clears the bookmark. Bypassing it is what makes
-  files immortal.
+- **Adding a way to close/remove a document?** An ordinary close/remove must
+  reach `forgetOpenFile`, which clears the working-set row and matching
+  bookmark. Trash is intentionally different: a moved bookmark resolves to its
+  Trash landing path, so that lane uses `pruneTrashedFiles()` and releases its
+  security scope through the cached pre-trash origin or, when no origin exists,
+  through the bookmark blob itself.
 - **Adding a way to create/save a document?** Compare against `saveAs` — that is
   the path that registers bookmark, working set and recents together.
 - **Comparing paths?** Use one convention. `standardizedFileURL` does not resolve

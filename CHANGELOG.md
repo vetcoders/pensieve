@@ -101,14 +101,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replace-existing write publishes a new inode, so Pensieve now carries across
   the original mode, ownership, ACLs, extended attributes/Finder tags and
   creation metadata while keeping the replacement content's new modification
-  time. If that metadata cannot be preserved, the original remains untouched.
+  time on volumes that support and permit it. `ENOTSUP`, `EPERM` and `EACCES`
+  make metadata preservation best-effort so content replacement can still work
+  on SMB, exFAT and restricted volumes; unexpected I/O failures and a missing
+  target still abort before publication.
 - **Live Trash reconciliation now covers ad-hoc files without mistaking a
   lookalike folder for macOS Trash.** Workspace files still leave Open Files on
   their watched scan; files opened outside every workspace are checked when
   Pensieve becomes active again after Finder. The missing-volume fallback only
   accepts `/Volumes/<volume>/.Trashes/<uid>/...`, not an arbitrary nested folder
   with the same component names, and healthy files no longer pay an unnecessary
-  per-volume Trash lookup on every scan.
+  per-volume Trash lookup on every scan. Activation reconciliation is subscribed
+  once per process and runs one pass per distinct shared working set, rather
+  than repeating the same file checks once for every open window.
 - **The sandboxed bookmark rewrite keeps the grants it promises.** Fresh
   bookmarks are resolved before old security scopes are released, and the
   resolved security-scoped URLs — not plain document URLs — are activated for
@@ -169,10 +174,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receipt was not a completion result. A recorded positive worker PID now says
   **Run started** without claiming the worker is still alive. A valid run ID
   whose spawn record misses the bounded wait says **Run accepted · launch
-  unconfirmed**, keeps Reveal/Check Status available and warns against a
-  duplicate dispatch instead of fabricating `exit 1`. A genuine rejection keeps
-  its real exit code and any run/report identifiers. Closing the sheet or
-  Terminal still does not stop a detached run.
+  unconfirmed**, preserves the run ID and any report path, and warns against a
+  duplicate dispatch instead of fabricating `exit 1`. Reveal appears only when
+  a report path exists; Check Status appears only when the receipt names the
+  observer agent or the dispatch explicitly selected one positional agent. A
+  default swarm gets no guessed Terminal command, and a genuine rejection gets
+  no status action for a run that never started while retaining its real exit
+  code and any run/report identifiers. Dictated dispatches use the same
+  accepted-but-unconfirmed explanation. Closing the sheet or Terminal still
+  does not stop a detached run.
+- **A new draft's focus request cannot arrive late.** New creates one request
+  bound to that document session and waits until its editor has a window before
+  trying to make it first responder. The attempt itself consumes the request:
+  if AppKit refuses it, the current responder remains in place and a later
+  SwiftUI render cannot replay the request and steal focus.
 - **The isolated UI smoke no longer turns an early failure into a successful
   exit on the system Bash.** Optional timeout prefixes and toolbar expectations
   are now safe when empty under macOS Bash 3.2, and cleanup preserves the
@@ -241,7 +256,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The toolbar's Mode picker answers a click again.** It was drawn as a single greyed-out "Mode" chip that opened nothing while the diamond next to it still worked. A segmented picker cannot live inside a segmented control: declaring it inside the family's `ControlGroup` made macOS fold the whole picker into one disabled segment carrying its title. The picker is now declared directly in its toolbar group and comes back as one live segment per mode.
 - **The toolbar's format buttons edit the document again.** Bold, Italic, Strike, Quote, Code, Link and the two list actions shared a control group with the Rich Markdown toggle, which put the whole control into on/off tracking — a click lit the segment like a sticky state instead of running a one-shot action. The format actions now sit in a group of their own and stay momentary, matching the floating selection bar and the Format menu.
-- **The whole toolbar fits an ordinary window again.** The Mode picker was drawn as four titled segments behind a 300 pt width floor — 300 pt of a 1096 pt toolbar for one control — and macOS answered by pushing the three trailing families (Mode, Reload/Auto Reload/Scroll Sync, Dictation/AI Autocomplete/Rewrite) behind the "»" chevron at a 1450 pt window. Mode now shows icon segments, each naming itself on hover, which brings the toolbar to 944 pt and the point where macOS starts hiding families from ~1366 pt down to ~1200 pt.
+- **The whole toolbar fits an ordinary window again.** The Mode picker was drawn as four titled segments behind a 300 pt width floor — 300 pt of a 1096 pt toolbar for one control — and macOS answered by pushing the three trailing families (Mode, Reload/Auto Reload/Scroll Sync, Dictation/AI Autocomplete/Rewrite) behind the "»" chevron at a 1450 pt window. Mode now shows icon segments, each naming itself on hover. The complete declared toolbar measures 944 pt on macOS 26 and 905 pt on macOS 27; the regression test hosts it under an ambient `.mini` control size so it fails unless Pensieve explicitly restores the intended `.regular` geometry.
 - **The "»" overflow menu lists every control it hides, exactly once.** Its entries come only from what each toolbar family can describe about itself, and a family bridged into a segmented control describes nothing — so Auto Reload Preview, Scroll Sync, Dictation and AI Autocomplete simply ceased to exist on a narrow window, while Reload Preview and Rewrite with AI appeared twice each, once as a button and once as a chevroned parent of themselves. Every family now carries a named menu of its own controls, with live check marks for the toggles and the same actions the chips run.
 - A theme carried over from an older build is migrated once instead of on every launch: the retired name (`glass`, `pergament`, `klinika`, `maszynopis`, …) was mapped to its surviving skin in memory only, so the dead value stayed in preferences until you picked a theme by hand. The migrated name is now written back where it is resolved.
 - `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.
