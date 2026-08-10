@@ -68,6 +68,30 @@ final class EditorToolbarBridgeTests: XCTestCase {
       "an icon-only mode segment with no tooltip leaves the operator guessing which layout it is")
   }
 
+  /// SwiftUI's late toolbar derivation can clear the AppKit-side tooltip after
+  /// the sink authored it. The same window-update repair that restores menu
+  /// forms must restore this accessibility contract without another SwiftUI
+  /// body pass.
+  @MainActor
+  func testAModeTooltipClearedBetweenPassesIsRepairedOnAWindowUpdate() throws {
+    let rig = try makeRig()
+    defer { rig.tearDown() }
+
+    let picker = try XCTUnwrap(rig.modePickerControl())
+    let segment = picker.segmentCount - 1
+    picker.setToolTip(nil, forSegment: segment)
+
+    for _ in 0..<40 {
+      if picker.toolTip(forSegment: segment) == EditorMode.allCases[segment].label { break }
+      rig.window.update()
+      rig.settle(0.02)
+    }
+
+    XCTAssertEqual(
+      picker.toolTip(forSegment: segment), EditorMode.allCases[segment].label,
+      "a late toolbar derivation cleared the mode tooltip and the window-update repair ignored it")
+  }
+
   // MARK: - Format actions
 
   @MainActor
@@ -195,7 +219,7 @@ final class EditorToolbarBridgeTests: XCTestCase {
   /// only triggers are a body re-evaluation and the runloop turn after it, and a
   /// clobber that lands later than that would stay on screen until the operator
   /// happened to type. Same shape, same trigger and same measured reason as
-  /// `ToolbarOverflowController.repairClobberedForms`.
+  /// `ToolbarOverflowController.repairClobberedBridge`.
   @MainActor
   func testAChipClearedBetweenPassesIsRepairedOnAWindowUpdate() throws {
     let rig = try makeRig(hostsEditor: false)

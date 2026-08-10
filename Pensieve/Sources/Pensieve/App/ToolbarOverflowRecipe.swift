@@ -99,7 +99,11 @@ enum ToolbarOverflowRecipe {
   /// `EditorToolbarOverflowTests` pins the shapes against each other.
   @MainActor
   @discardableResult
-  static func assertOverflowMenus(on window: NSWindow, families: [ToolbarOverflowFamily]) -> Bool {
+  static func assertOverflowMenus(
+    on window: NSWindow,
+    families: [ToolbarOverflowFamily],
+    modeSegmentTitles: [String] = EditorMode.allCases.map(\.label)
+  ) -> Bool {
     guard let toolbar = window.toolbar else { return false }
     let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
     guard groups.count == families.count, !groups.isEmpty else { return false }
@@ -112,9 +116,10 @@ enum ToolbarOverflowRecipe {
       controllers.setObject(controller, forKey: window)
     }
 
-    controller.attach(to: window, families: families)
+    controller.attach(
+      to: window, families: families, modeSegmentTitles: modeSegmentTitles)
 
-    var corrected = false
+    var corrected = assertModeSegmentTooltips(on: window, titles: modeSegmentTitles)
     for (group, family) in zip(groups, families) where !family.commands.isEmpty {
       if controller.apply(family, to: group) { corrected = true }
     }
@@ -166,11 +171,14 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// window update cycle — which on a typing pass is often — so it reads a
   /// cached value instead of rebuilding six of them per keystroke.
   private var wantedIdentifiers: [NSUserInterfaceItemIdentifier] = []
+  /// The AppKit bridge drops SwiftUI's `.help()` content, so these names have
+  /// to survive independently of the body pass that first authored them.
+  private var modeSegmentTitles: [String] = []
   private weak var window: NSWindow?
   private var windowObserver: NSObjectProtocol?
 
   /// Watches the window for a toolbar that came back wearing SwiftUI's derived
-  /// form again.
+  /// form again or lost its AppKit-authored mode tooltips.
   ///
   /// The sink alone is not enough, and that is measured, not assumed: a form
   /// taken away between two SwiftUI passes is NEVER restored by waiting — the
@@ -184,9 +192,14 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// `didUpdate` fires on every window update cycle, so the handler stays a
   /// pointer-cheap identifier check and rebuilds nothing while the forms are
   /// still ours.
-  func attach(to window: NSWindow, families: [ToolbarOverflowFamily]) {
+  func attach(
+    to window: NSWindow,
+    families: [ToolbarOverflowFamily],
+    modeSegmentTitles: [String]
+  ) {
     self.families = families
     wantedIdentifiers = families.map { ToolbarOverflowRecipe.formIdentifier(for: $0.identifier) }
+    self.modeSegmentTitles = modeSegmentTitles
     guard self.window !== window else { return }
     self.window = window
     if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
@@ -194,7 +207,7 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
       forName: NSWindow.didUpdateNotification, object: window, queue: .main
     ) { [weak self] _ in
       MainActor.assumeIsolated {
-        _ = self?.repairClobberedForms()
+        _ = self?.repairClobberedBridge()
       }
     }
   }
@@ -203,19 +216,23 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
     if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
   }
 
-  /// Re-applies only the families whose group is no longer carrying our form.
+  /// Restores AppKit-authored state that a late SwiftUI bridge pass can clear.
+  /// Re-applies only the families whose group is no longer carrying our form,
+  /// and independently restores any missing mode-segment tooltip.
   /// Deliberately does NOT re-derive the commands: the closures already captured
   /// the window's `AppState`/`AppController`, so a repair between SwiftUI passes
   /// acts on exactly the state the operator is looking at.
   @discardableResult
-  func repairClobberedForms() -> Bool {
-    guard let window, let toolbar = window.toolbar else { return false }
+  func repairClobberedBridge() -> Bool {
+    guard let window else { return false }
+    var repaired = ToolbarOverflowRecipe.assertModeSegmentTooltips(
+      on: window, titles: modeSegmentTitles)
+    guard let toolbar = window.toolbar else { return repaired }
     let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
     guard groups.count == families.count, groups.count == wantedIdentifiers.count,
       !groups.isEmpty
-    else { return false }
+    else { return repaired }
 
-    var repaired = false
     for (index, group) in groups.enumerated() {
       let family = families[index]
       guard !family.commands.isEmpty,
@@ -337,8 +354,8 @@ struct ToolbarOverflowSink: NSViewRepresentable {
     let titles = self.modeSegmentTitles
     func assert() {
       guard let window = nsView.window else { return }
-      ToolbarOverflowRecipe.assertOverflowMenus(on: window, families: families)
-      ToolbarOverflowRecipe.assertModeSegmentTooltips(on: window, titles: titles)
+      ToolbarOverflowRecipe.assertOverflowMenus(
+        on: window, families: families, modeSegmentTitles: titles)
     }
     assert()
     // The first update lands before the bridge has built the toolbar items, and

@@ -106,7 +106,7 @@ final class EditorToolbeltTests: XCTestCase {
     let file = URL(fileURLWithPath: "/w/proj/10_projects/vetcoders/reports/file.md")
     XCTAssertEqual(
       EditorToolbelt.breadcrumbSubtitle(for: file, workspaceRoots: [root]),
-      "proj › 10_projects › vetcoders › reports")
+      "proj › 10_projects › Vetcoders › reports")
   }
 
   func testBreadcrumbForFileDirectlyInRootIsJustTheRoot() {
