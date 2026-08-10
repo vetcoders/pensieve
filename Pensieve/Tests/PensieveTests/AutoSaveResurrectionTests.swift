@@ -155,6 +155,64 @@ final class AutoSaveResurrectionTests: XCTestCase {
       "copying metadata restored the old mtime and hid the content update")
   }
 
+  /// SMB and exFAT can accept a replacement write while refusing the metadata
+  /// copy that precedes it. Drive those volume-specific errno values on APFS
+  /// and prove they cannot kill an otherwise valid auto-save.
+  func testTheReplaceOnlyWriteContinuesWhenMetadataIsUnsupportedOrDenied() throws {
+    let folder = try makeTemporaryFolder()
+
+    for errorCode in [ENOTSUP, EPERM, EACCES] {
+      let noteURL = folder.appendingPathComponent("metadata-error-\(errorCode).md")
+      try "old".write(to: noteURL, atomically: true, encoding: .utf8)
+      var copyAttempts = 0
+
+      try DocumentStore.replaceExistingItem(
+        "new",
+        at: noteURL,
+        metadataCopier: { _, _ in
+          copyAttempts += 1
+          throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode))
+        })
+
+      XCTAssertEqual(copyAttempts, 1)
+      XCTAssertEqual(
+        try String(contentsOf: noteURL, encoding: .utf8), "new",
+        "metadata errno \(errorCode) blocked the content replacement")
+    }
+
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: folder.path).filter {
+        $0.hasPrefix(".pensieve-save-")
+      }, [], "the temporary files must not survive successful replacements")
+  }
+
+  /// The compatibility exception is deliberately narrow. A real metadata I/O
+  /// failure must still leave the original bytes untouched and report failure.
+  func testTheReplaceOnlyWriteStillAbortsForUnexpectedMetadataFailure() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("metadata-io-error.md")
+    try "old".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    XCTAssertThrowsError(
+      try DocumentStore.replaceExistingItem(
+        "new",
+        at: noteURL,
+        metadataCopier: { _, _ in
+          throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        })
+    ) { error in
+      let nsError = error as NSError
+      XCTAssertEqual(nsError.domain, NSPOSIXErrorDomain)
+      XCTAssertEqual(nsError.code, Int(EIO))
+    }
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "old")
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(atPath: folder.path).filter {
+        $0.hasPrefix(".pensieve-save-")
+      }, [], "the temporary file must be cleaned up after a refused replacement")
+  }
+
   /// Refusing the write must not cost the user a single character. The buffer
   /// stays exactly as typed and stays DIRTY, which is what keeps the close
   /// question honest and the tab's unsaved marker truthful.

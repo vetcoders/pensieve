@@ -4668,6 +4668,21 @@ final class DocumentStore {
   /// nothing is created. The bytes land whole or not at all, exactly as the
   /// atomic write they replace.
   nonisolated static func replaceExistingItem(_ text: String, at url: URL) throws {
+    try replaceExistingItem(
+      text,
+      at: url,
+      metadataCopier: { sourceURL, destinationURL in
+        try copyMetadataForReplacement(from: sourceURL, to: destinationURL)
+      })
+  }
+
+  /// The injectable metadata copier lets tests reproduce volume-specific
+  /// `copyfile` failures without requiring an SMB or exFAT mount.
+  nonisolated static func replaceExistingItem(
+    _ text: String,
+    at url: URL,
+    metadataCopier: (URL, URL) throws -> Void
+  ) throws {
     let temporaryURL = url.deletingLastPathComponent()
       .appendingPathComponent(".pensieve-save-\(UUID().uuidString)")
     // A directory that has gone with the file fails here, which is the same
@@ -4683,7 +4698,15 @@ final class DocumentStore {
     let newModificationDate =
       (try FileManager.default.attributesOfItem(atPath: temporaryURL.path))[.modificationDate]
       as? Date
-    try copyMetadataForReplacement(from: url, to: temporaryURL)
+    do {
+      try metadataCopier(url, temporaryURL)
+    } catch {
+      // Some network and removable volumes can replace file contents but do
+      // not support (or permit) COPYFILE_METADATA. Metadata is best-effort on
+      // those volumes; keeping this narrow preserves hard failures such as I/O
+      // errors, while ENOENT still maps to the anti-resurrection refusal below.
+      guard isNonFatalMetadataCopyError(error) else { throw error }
+    }
     if let newModificationDate {
       try FileManager.default.setAttributes(
         [.modificationDate: newModificationDate], ofItemAtPath: temporaryURL.path)
@@ -4718,9 +4741,18 @@ final class DocumentStore {
     }
   }
 
+  private nonisolated static func isNonFatalMetadataCopyError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    guard nsError.domain == NSPOSIXErrorDomain else { return false }
+    return nsError.code == Int(ENOTSUP)
+      || nsError.code == Int(EPERM)
+      || nsError.code == Int(EACCES)
+  }
+
   /// Copies only filesystem metadata; the temporary file's freshly encoded
-  /// Markdown bytes stay untouched. Any failure aborts before `RENAME_SWAP`, so
-  /// the original path and inode remain exactly as they were.
+  /// Markdown bytes stay untouched. The caller treats only unsupported or
+  /// denied metadata as best-effort; every other failure aborts before
+  /// `RENAME_SWAP`, so the original path and inode remain exactly as they were.
   private nonisolated static func copyMetadataForReplacement(
     from sourceURL: URL,
     to destinationURL: URL
