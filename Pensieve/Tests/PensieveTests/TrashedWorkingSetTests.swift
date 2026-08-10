@@ -398,6 +398,8 @@ final class TrashedWorkingSetTests: XCTestCase {
     let store = makeBookmarkStore()
     try store.persistFile(url: noteURL, into: AppState())
     let trashedURL = try trash(noteURL)
+    XCTAssertEqual(persistedFileBookmarkCount(), 1, "precondition: persisted working-set blob")
+    XCTAssertEqual(store.activeSecurityScopeCount, 1, "precondition: live grant attempt")
 
     let harness = try makeHarness(bookmarkStore: store)
     let ref = DocumentRef(id: trashedURL, isAdHoc: true)
@@ -410,6 +412,12 @@ final class TrashedWorkingSetTests: XCTestCase {
       "the content of a thrown-away file must never reach the editor")
     XCTAssertTrue(harness.openFileURLs.isEmpty)
     XCTAssertTrue(restoredFileURLs().isEmpty)
+    XCTAssertEqual(
+      persistedFileBookmarkCount(), 0,
+      "the render guard must retire the blob, not merely rely on restore filtering Trash URLs")
+    XCTAssertEqual(
+      store.activeSecurityScopeCount, 0,
+      "the render guard must release the grant under the bookmark's pre-Trash origin")
     XCTAssertEqual(harness.appState.lastError, "shown.md is in the Trash.")
   }
 

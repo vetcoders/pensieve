@@ -3524,6 +3524,12 @@ final class DocumentStore {
     // and to the scan commit that retires the row. This is defence in depth
     // behind them, on the one shape they can hand through.
     if bookmarkStore.isTrashed(ref.url) {
+      // Retire by the bookmark's LANDING location before `forgetOpenFile`
+      // removes by the URL handed to this window. The landing prune also knows
+      // the bookmark's pre-Trash origin, which is the key under which its live
+      // security-scope grant was acquired. Once `removeFile` drops the blob,
+      // that origin is no longer recoverable and the grant leaks until exit.
+      bookmarkStore.pruneTrashedFiles()
       forgetOpenFile(ref.url, into: appState)
       appState.lastError = "\(ref.url.lastPathComponent) is in the Trash."
       appState.selectedDocumentID = appState.documentSession.id
@@ -4718,6 +4724,13 @@ final class DocumentStore {
     // A directory that has gone with the file fails here, which is the same
     // refusal one step earlier.
     try text.write(to: temporaryURL, atomically: true, encoding: .utf8)
+    // Do not sweep older siblings with this prefix here. Before RENAME_SWAP an
+    // interrupted writer's temporary file contains the NEW buffer and can be
+    // its only durable copy: SIGKILL never reaches the recovery fallback. After
+    // the swap the same path contains superseded original bytes. Safely telling
+    // those phases apart needs a versioned transaction journal plus a
+    // cross-process lock and recovery adoption for the pre-publish phase; age
+    // or filename alone is not evidence that deleting the payload is safe.
     defer { try? FileManager.default.removeItem(at: temporaryURL) }
 
     // The swap moves INODES. Copy the original inode's metadata before the
