@@ -65,6 +65,15 @@ struct DocumentSession: Equatable {
   /// buffer remains untitled until the user explicitly chooses Save to Original
   /// or Save As, so merely opening recovery can never overwrite this URL.
   private var storedRecoverySourceURL: URL?
+  /// The last failed write to this buffer's original file, kept separately from
+  /// the visible data-loss message.
+  ///
+  /// A failed original write followed by a failed recovery write produces one
+  /// compound error for the window. If a later recovery tick succeeds, it must
+  /// still describe the ORIGINAL as stale — not reuse that compound message and
+  /// claim that the already-resolved recovery failure is current. This value is
+  /// therefore buffer-scoped state, never text parsed back out of the banner.
+  private var storedOriginalSaveFailure: String?
   var text: String
   var isDirty: Bool
 
@@ -170,6 +179,10 @@ struct DocumentSession: Equatable {
     storedRecoverySourceURL?.standardizedFileURL
   }
 
+  var pendingOriginalSaveFailure: String? {
+    storedOriginalSaveFailure
+  }
+
   var hasEditableBuffer: Bool {
     switch kind {
     // `.loading` is false BY DESIGN, not by omission. Its buffer is an empty
@@ -210,6 +223,7 @@ struct DocumentSession: Equatable {
     self.kind = .fileBacked(document)
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = false
   }
@@ -221,6 +235,7 @@ struct DocumentSession: Equatable {
     self.kind = .loading(document)
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
   }
@@ -232,12 +247,21 @@ struct DocumentSession: Equatable {
     storedRecoverySourceURL = nil
   }
 
+  mutating func recordOriginalSaveFailure(_ message: String) {
+    storedOriginalSaveFailure = message
+  }
+
+  mutating func clearOriginalSaveFailure() {
+    storedOriginalSaveFailure = nil
+  }
+
   mutating func createUntitled(title: String = "Untitled.md") {
     self.kind = .untitled(title: title, identity: .untitled(UUID()))
     // A brand new buffer owns no draft. The one it eventually writes is ITS own,
     // and the draft the replaced buffer wrote stays where the user can find it.
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
   }
@@ -251,6 +275,7 @@ struct DocumentSession: Equatable {
     self.kind = .untitled(title: title, identity: .recovered(recoveryID))
     self.storedRecoveryID = recoveryID
     self.storedRecoverySourceURL = sourceURL?.standardizedFileURL
+    self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = true
   }

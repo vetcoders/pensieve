@@ -57,11 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of returning only after relaunch. An original-write plus
   recovery-write failure is reported as one
   stable condition, so its two internal errors cannot resurrect a dismissed
-  banner on every debounce tick. When auto-save is off and recovery succeeds,
-  Pensieve says the emergency copy is safe and the original is stale instead of
-  silently clearing the prior save failure. If a conscious Discard cannot
-  retire its recovery payload, document close and Clear Open Files stop with the
-  live buffer still dirty. Global quit now offers a deliberate **Quit Anyway**
+  banner on every debounce tick. A failed explicit Cmd+S now uses that same
+  immediate recovery fallback without claiming that the stale original was
+  saved; a later successful original write still retires the emergency copy.
+  When auto-save is off and a later recovery tick succeeds, Pensieve keeps the
+  original-write failure separate from the resolved recovery failure and says
+  the emergency copy is safe instead of publishing a contradictory status. If
+  a conscious Discard cannot retire its recovery payload, document close and
+  Clear Open Files stop with the live buffer still dirty. Global quit now offers
+  a deliberate **Quit Anyway**
   escape hatch after the safe **Keep Pensieve Open** default: one confirmation
   settles the remaining Discards in that quit pass while retaining the failed
   recovery copies and warning that they may reappear after restart. Cancel and

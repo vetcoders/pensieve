@@ -3699,7 +3699,7 @@ final class DocumentStore {
     case (.saveWithoutPrompting, _):
       // Auto-save answering the save question for the user is an UNATTENDED
       // write — it may update the user's file but must never bring one back
-      // (see `saveExisting`). "Save" clicked in the prompt is the user asking
+      // (see `attemptSaveExisting`). "Save" clicked in the prompt is the user asking
       // for this exact write, so it stays explicit. Either way, a save that
       // does not happen aborts the close and leaves the window holding the
       // only copy of the text.
@@ -3795,7 +3795,8 @@ final class DocumentStore {
     if let sourceURL = appState.documentSession.recoverySourceURL {
       _ = saveAs(appState: appState, to: sourceURL)
     } else {
-      _ = saveExisting(appState: appState, indexNow: true, trigger: .explicit)
+      _ = saveExistingOrRecoveryFallback(
+        appState: appState, indexNow: true, trigger: .explicit)
     }
   }
 
@@ -3818,6 +3819,7 @@ final class DocumentStore {
       registerSavedDocument(ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
+      appState.documentSession.clearOriginalSaveFailure()
       let retiredRecovery = recoveryStore.deleteDraft(id: recoveryID)
       appState.resolveError()
       if retiredRecovery {
@@ -3908,7 +3910,7 @@ final class DocumentStore {
     // expressible as one disposition because `Autosaver` held at most one debounce and the only
     // question was whose it was; now every window may hold one, so the same classification runs over
     // all of them — clean owners' bodies land here, dirty owners' bodies stay armed, including this
-    // session's own, which the `saveExisting(indexNow: true)` below re-issues after its bytes land.
+    // session's own, which the save below re-issues after its bytes land.
     // See `Autosaver.flushIndexDebouncesWithSettledOwners()`.
     autosaver.flushIndexDebouncesWithSettledOwners()
     guard appState.documentSession.hasEditableBuffer,
@@ -3922,10 +3924,10 @@ final class DocumentStore {
     // that window's index debounce to — its bytes would then stay in memory while its index write
     // fires at 5 s over them, which is the FTS-ahead-of-disk ordering this guard exists to forbid,
     // this time in a RUNNING app. Left armed, a foreign save simply fires on its own schedule; ours
-    // is redundant because `saveExisting(indexNow: true)` below writes the same bytes now, and
+    // is redundant because the save below writes the same bytes now, and
     // cancelling it is what keeps that from becoming a second write.
     cancelArmedSaveIfOwned(by: appState)
-    // Cancelling the index debounce is right when it is OURS — `saveExisting(indexNow: true)` below
+    // Cancelling the index debounce is right when it is OURS — the save below
     // re-issues that write after the bytes land — and wrong when it belongs to another dirty window:
     // dropping it there would be the cancel this whole guard exists to avoid. Deferred means LEFT
     // ARMED, not cancelled; that owner's own close still runs the sweep above, and if its window
@@ -3994,8 +3996,8 @@ final class DocumentStore {
   /// debounces and window A then switches, clears, restores or saves-as; the ownership check above
   /// preserved B's SAVE, while an unconditional `cancelIndex()` here threw away the index write that
   /// save exists to publish. B's 1.5 s autosave then lands its edited text through
-  /// `saveExisting(indexNow: false)` and nothing re-issues the FTS row — and for an AD-HOC document
-  /// there is no workspace scan to repair it, so the stale row is permanent.
+  /// `saveExistingOrRecoveryFallback(indexNow: false)` and nothing re-issues the FTS row — and for
+  /// an AD-HOC document there is no workspace scan to repair it, so the stale row is permanent.
   ///
   /// Cancel, not flush, for our OWN debounce: every caller here is on its way to replace this
   /// session's document, and the paths that publish text (`saveAs`) index it explicitly afterwards.
@@ -4028,7 +4030,8 @@ final class DocumentStore {
 
   /// Retires every OTHER window's armed index debounce over the document `appState` has just written,
   /// for the owners that are SETTLED. Called by the save paths that publish an index row of their own
-  /// (`saveExisting(indexNow: true)`, `saveAs`), immediately before they publish it.
+  /// (`saveExistingOrRecoveryFallback(indexNow: true)`, `saveAs`), immediately before they publish
+  /// it.
   ///
   /// The defect this closes: two windows on one file. Window A edits, its 1.5 s autosave lands A's
   /// bytes and marks A CLEAN, and its 5 s index debounce stays armed — correctly, that debounce is
@@ -4167,11 +4170,17 @@ final class DocumentStore {
   /// an honest status instead of implying the original save later succeeded.
   /// Routine recovery ticks also leave unrelated status messages alone.
   private func persistPathedRecoverySnapshotWithoutOverwritingOriginal(appState: AppState) {
-    let originalFailure = appState.unresolvedDataLoss?.message
-    guard persistRecoverySnapshot(appState: appState, clearsErrorsOnSuccess: false) else {
+    let hadUnresolvedDataLoss = appState.unresolvedDataLoss != nil
+    let originalFailure = appState.documentSession.pendingOriginalSaveFailure
+    guard
+      persistRecoverySnapshot(
+        appState: appState,
+        clearsErrorsOnSuccess: false,
+        precedingFailure: originalFailure)
+    else {
       return
     }
-    guard let originalFailure else { return }
+    guard hadUnresolvedDataLoss else { return }
     appState.resolveError()
     appState.lastError = recoverySafeStatus(after: originalFailure)
   }
@@ -4193,6 +4202,7 @@ final class DocumentStore {
       return .failed
     case .failed(let message):
       originalFailure = message
+      appState.documentSession.recordOriginalSaveFailure(message)
       NSLog("%@", message)
     }
 
@@ -4213,8 +4223,10 @@ final class DocumentStore {
     return .recovery
   }
 
-  private func recoverySafeStatus(after originalFailure: String) -> String {
-    "\(originalFailure) A recovery copy is safe; the original file was not overwritten."
+  private func recoverySafeStatus(after originalFailure: String?) -> String {
+    let safeStatus = "A recovery copy is safe; the original file was not overwritten."
+    guard let originalFailure else { return safeStatus }
+    return "\(originalFailure) \(safeStatus)"
   }
 
   private func recoveryRetirementFailureMessage(for title: String) -> String {
@@ -4241,7 +4253,7 @@ final class DocumentStore {
   /// Preserves a dirty FILE-BACKED buffer as a recovery draft when its window is
   /// tearing down without reaching disk — auto-save is off, an auto-save write
   /// just failed, or the file it belongs to is no longer on disk for an
-  /// unattended write to update (see `saveExisting`). This closing backstop
+  /// unattended write to update (see `attemptSaveExisting`). This closing backstop
   /// never clears `appState.lastError`: when the stash follows a
   /// FAILED save that error must stay surfaced (a recovery draft AND a visible
   /// error), so the user learns the file on disk is stale rather than believing
@@ -4521,24 +4533,6 @@ final class DocumentStore {
     case notApplicable
   }
 
-  @discardableResult
-  private func saveExisting(
-    appState: AppState,
-    indexNow: Bool,
-    trigger: SaveTrigger
-  ) -> Bool {
-    switch attemptSaveExisting(appState: appState, indexNow: indexNow, trigger: trigger) {
-    case .saved:
-      return true
-    case .notApplicable:
-      return false
-    case .failed(let message):
-      appState.reportDataLoss(message)
-      NSLog("%@", message)
-      return false
-    }
-  }
-
   private func attemptSaveExisting(
     appState: AppState,
     indexNow: Bool,
@@ -4585,10 +4579,10 @@ final class DocumentStore {
     // window. That is the shipped behaviour for a file-backed buffer that
     // cannot reach disk, not a new lane opened here.
     //
-    // `saveExisting` itself only reports the refused original write. Its caller
-    // owns the recovery policy: unattended auto-save immediately falls back to
-    // RecoveryStore, while an explicit Save keeps its platform-style failure
-    // semantics and lets the close/quit guard decide whether to snapshot.
+    // `attemptSaveExisting` only reports the original write result to its caller.
+    // Every file-backed save route — including an explicit Cmd+S — immediately
+    // falls back to RecoveryStore on failure, while keeping the session dirty so
+    // nobody can mistake the stale original for a completed save.
     //
     // The check below is a FAST PATH, not the guarantee. It answers the common
     // case cheaply and with a message written for a human, but between it and
@@ -4625,6 +4619,7 @@ final class DocumentStore {
       let retiredRecovery = recoveryStore.deleteDraft(id: stashedRecoveryID)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
+      appState.documentSession.clearOriginalSaveFailure()
       appState.resolveError()
       if retiredRecovery {
         appState.documentSession.retireRecoveryAssociation()

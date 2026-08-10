@@ -145,7 +145,13 @@ attempts a RecoveryStore snapshot. A successful fallback keeps the original
 untouched, leaves the session dirty, resolves the data-loss latch and shows an
 ordinary persistent status saying that the emergency copy is safe. If recovery
 also fails, data loss remains latched and close/quit is vetoed. The error surface
-and the explicit recovered-file actions are normative below.
+and the explicit recovered-file actions are normative below. This applies to a
+direct `Cmd+S` as well as unattended auto-save: a failed explicit original write
+falls back immediately, but only a later successful original write completes the
+Save and retires that recovery copy. The original-write failure and the recovery
+write result remain separate conditions, so a later successful recovery tick
+never repeats a resolved recovery error or implies that the original became
+current.
 
 ### `Shift+Cmd+S` — Save As…
 
@@ -530,7 +536,7 @@ Three rules follow, and each is pinned:
    is still unresolved also re-arms.
 
 **What retires the latch.** Only `AppState.resolveError()`, called where a
-durable write for that buffer actually lands: a successful `saveExisting`,
+durable write for that buffer actually lands: a successful original-file save,
 `saveAs`, or recovery write. When the original stays stale but recovery lands,
 the data-loss latch is retired and replaced by a status that explicitly says
 the original was not overwritten.
