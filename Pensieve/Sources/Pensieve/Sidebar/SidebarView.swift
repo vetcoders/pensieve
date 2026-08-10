@@ -58,6 +58,7 @@ struct SidebarView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .pensieveSidebarChromeInset()
     .onAppear {
       reconcileWorkspaceRootExpansion()
     }

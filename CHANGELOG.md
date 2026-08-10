@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A native tab bar no longer covers the top of the sidebar.** When a window
+  gained tabs, AppKit added a strip below the toolbar while SwiftUI kept laying
+  out the sidebar from the toolbar edge. The workspace title, creation buttons
+  and search field could therefore sit beneath the full-width titlebar
+  background. Pensieve now measures the public bottom titlebar accessories and
+  applies exactly that height to the sidebar; an untabbed launcher keeps its
+  original layout.
 - **The native tab `X` can no longer bypass the unsaved-work close guard.** On
   macOS 27 the real tab control reaches `NSWindow.close()` directly, while the
   existing protection covered `performClose` / `windowShouldClose` and the

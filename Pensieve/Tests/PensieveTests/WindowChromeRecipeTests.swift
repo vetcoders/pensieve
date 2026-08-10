@@ -773,6 +773,122 @@ final class WindowChromeRecipeTests: XCTestCase {
       WindowChromeRecipe.assertTabBarAppearance(on: leading, for: .ink),
       "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
   }
+
+  // MARK: - Sidebar chrome inset
+
+  @MainActor
+  func testBelowToolbarChromeHeightIsZeroWithoutABottomAccessory() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
+
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0)
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: nil), 0)
+  }
+
+  /// `titlebarAccessoryViewControllers` raises on an untitled helper window,
+  /// so the style-mask guard is part of the production safety contract.
+  @MainActor
+  func testBelowToolbarChromeHeightSurvivesAWindowThatCannotHaveAccessories() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
+      styleMask: [.borderless],
+      backing: .buffered,
+      defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+
+    XCTAssertFalse(window.styleMask.contains(.titled), "premise: no titlebar to carry accessories")
+    XCTAssertEqual(WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0)
+  }
+
+  @MainActor
+  func testBelowToolbarChromeHeightCountsOnlyTheBottomAccessories() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
+
+    func accessory(_ attribute: NSLayoutConstraint.Attribute, height: CGFloat)
+      -> NSTitlebarAccessoryViewController
+    {
+      let controller = NSTitlebarAccessoryViewController()
+      controller.layoutAttribute = attribute
+      controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 1300, height: height))
+      return controller
+    }
+
+    window.addTitlebarAccessoryViewController(accessory(.right, height: 28))
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0,
+      "a toolbar-band accessory was billed to the sidebar")
+
+    window.addTitlebarAccessoryViewController(accessory(.bottom, height: 36))
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: window), 36,
+      "the strip below the toolbar is the height the sidebar has to skip")
+  }
+
+  /// A real native tab group pins the visual defect geometrically. Both
+  /// participants stay transparent and far offscreen while AppKit builds the
+  /// tab strip, so the test cannot flash a fixture onto the active desktop.
+  @MainActor
+  func testARealTabGroupsBandGrowsByExactlyTheSidebarChromeInset() throws {
+    func makeWindow(_ title: String) -> NSWindow {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        styleMask: WindowChromeRecipe.documentStyleMask,
+        backing: .buffered,
+        defer: false)
+      WindowChromeRecipe.apply(to: window, title: title)
+      window.contentView = NSView(frame: .zero)
+      return window
+    }
+
+    let leading = makeWindow("Sidebar Chrome Leading")
+    let trailing = makeWindow("Sidebar Chrome Trailing")
+    defer {
+      for window in [leading, trailing] {
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+      }
+    }
+    for window in [leading, trailing] {
+      window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
+      window.alphaValue = 0
+    }
+    leading.makeKeyAndOrderFront(nil)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+
+    let untabbedBand = WindowChromeRecipe.titlebarGlassHeight(for: leading)
+    XCTAssertEqual(
+      WindowChromeRecipe.belowToolbarChromeHeight(in: leading), 0,
+      "premise: a lone window has nothing below its toolbar")
+
+    leading.addTabbedWindow(trailing, ordered: .above)
+    leading.layoutIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+
+    guard leading.tabGroup?.isTabBarVisible == true else {
+      throw XCTSkip("headless host did not build a native tab bar")
+    }
+
+    let inset = WindowChromeRecipe.belowToolbarChromeHeight(in: leading)
+    XCTAssertGreaterThan(
+      inset, 0, "the visible tab bar is not being counted as chrome below the toolbar")
+    XCTAssertEqual(
+      WindowChromeRecipe.titlebarGlassHeight(for: leading) - untabbedBand, inset, accuracy: 1,
+      "the band the tab bar adds is exactly what the sidebar column has to skip")
+  }
 }
 
 /// Minimal toolbar delegate handing back two view-backed items — the AppKit

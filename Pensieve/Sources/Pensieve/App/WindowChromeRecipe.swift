@@ -648,6 +648,24 @@ enum WindowChromeRecipe {
       contentLayoutHeight: window.contentLayoutRect.height)
   }
 
+  /// Height of the chrome AppKit lays out below the toolbar. In a managed
+  /// document window this is the native tab bar, represented as a bottom
+  /// titlebar accessory.
+  ///
+  /// SwiftUI's split-view sidebar budgets for the toolbar but not for this
+  /// additional strip. Without an explicit inset its first row is painted
+  /// beneath the full-width titlebar background whenever the tab bar appears.
+  /// Read the public accessory geometry instead of inferring a gap from the
+  /// SwiftUI layout; the latter changes after applying the inset and would
+  /// oscillate. Untitled helper windows are guarded because asking them for
+  /// titlebar accessories raises an AppKit exception.
+  static func belowToolbarChromeHeight(in window: NSWindow?) -> CGFloat {
+    guard let window, window.styleMask.contains(.titled) else { return 0 }
+    return window.titlebarAccessoryViewControllers
+      .filter { $0.layoutAttribute == .bottom && !$0.view.isHidden }
+      .reduce(0) { $0 + max(0, $1.view.frame.height) }
+  }
+
   static func contentLayoutRect(in view: NSView) -> NSRect? {
     guard let window = view.window else { return nil }
     return view.convert(window.contentLayoutRect, from: nil)
@@ -870,6 +888,100 @@ struct WindowChromeSink: NSViewRepresentable {
       coordinator.observe(view.window)
       coordinator.assertChrome()
     }
+  }
+}
+
+/// Reports the hosting window's below-toolbar chrome height to SwiftUI.
+///
+/// The native tab bar can appear or disappear between SwiftUI body passes, so
+/// the sink follows the same `NSWindow.didUpdateNotification` boundary as the
+/// other AppKit-authored chrome repairs. It only publishes changed values,
+/// keeping an idle window converged instead of feeding its own layout updates.
+struct SidebarChromeInsetSink: NSViewRepresentable {
+  let onChange: (CGFloat) -> Void
+
+  @MainActor
+  final class Coordinator {
+    var onChange: (CGFloat) -> Void = { _ in }
+    private var reported: CGFloat?
+    private weak var window: NSWindow?
+    private var observer: NSObjectProtocol?
+
+    func observe(_ window: NSWindow?) {
+      if self.window !== window {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        self.window = window
+        if let window {
+          observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification, object: window, queue: .main
+          ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.report() }
+          }
+        }
+      }
+      report()
+    }
+
+    func report() {
+      let height = WindowChromeRecipe.belowToolbarChromeHeight(in: window)
+      guard reported != height else { return }
+      reported = height
+      onChange(height)
+    }
+
+    deinit {
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+  }
+
+  final class SinkView: NSView {
+    var onWindowChanged: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      onWindowChanged?()
+    }
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  func makeNSView(context: Context) -> NSView {
+    let view = SinkView(frame: .zero)
+    view.isHidden = true
+    configure(view, coordinator: context.coordinator)
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    guard let view = nsView as? SinkView else { return }
+    configure(view, coordinator: context.coordinator)
+  }
+
+  private func configure(_ view: SinkView, coordinator: Coordinator) {
+    coordinator.onChange = onChange
+    view.onWindowChanged = { [weak view] in coordinator.observe(view?.window) }
+    coordinator.observe(view.window)
+  }
+}
+
+private struct SidebarChromeInsetModifier: ViewModifier {
+  @State private var inset: CGFloat = 0
+
+  func body(content: Content) -> some View {
+    content
+      .safeAreaInset(edge: .top, spacing: 0) {
+        Color.clear.frame(height: inset)
+      }
+      .background(SidebarChromeInsetSink { inset = $0 })
+  }
+}
+
+extension View {
+  /// Keeps the sidebar's first row clear of a native tab strip. The inset is
+  /// zero for an untabbed window, so the normal launcher layout is unchanged.
+  func pensieveSidebarChromeInset() -> some View {
+    modifier(SidebarChromeInsetModifier())
   }
 }
 
