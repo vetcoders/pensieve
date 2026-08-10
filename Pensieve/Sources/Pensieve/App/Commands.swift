@@ -574,7 +574,9 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func saveActiveDocument() {
-    if appState.documentSession.isUntitled {
+    if appState.documentSession.isUntitled
+      && appState.documentSession.recoverySourceURL == nil
+    {
       saveActiveDocumentAs()
     } else {
       controller.saveActiveDocument()

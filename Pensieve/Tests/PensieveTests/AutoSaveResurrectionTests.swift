@@ -157,17 +157,11 @@ final class AutoSaveResurrectionTests: XCTestCase {
       "the document stays open and editable — the file left, the work did not")
   }
 
-  /// A refused write writes NOTHING, anywhere — not the file, and not a draft
-  /// per debounce tick either.
-  ///
-  /// Stashing on every tick was the obvious reaction and it is wrong here: a
-  /// FILE-BACKED session cannot carry a draft id (`DocumentSession.recoveryID`
-  /// is defined for untitled sessions only), so each stash mints a NEW draft and
-  /// a minute of typing buries the user in copies. Durability for this buffer is
-  /// owned by the teardown guard, one draft at the moment the buffer would
-  /// otherwise die — pinned below.
+  /// A refused original-file write falls back on every debounce tick, but one
+  /// live buffer owns one recovery identity. Repeated failures update that
+  /// record instead of burying the user in copies.
   @MainActor
-  func testARefusedAutoSaveDoesNotPileUpADraftPerTick() async throws {
+  func testARefusedAutoSaveUpdatesOneRecoveryCopyAcrossTicks() async throws {
     let folder = try makeTemporaryFolder()
     let noteURL = folder.appendingPathComponent("repeat.md").standardizedFileURL
     try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
@@ -188,22 +182,21 @@ final class AutoSaveResurrectionTests: XCTestCase {
       try await Task.sleep(nanoseconds: 80_000_000)
     }
 
-    XCTAssertTrue(
-      recoveryStore.loadDrafts().isEmpty,
-      "the live buffer is the copy while the window holds it; drafts are for when it dies")
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recoveryStore.loadDrafts().count, 1)
+    XCTAssertEqual(recovery.text, "third")
+    XCTAssertEqual(recovery.sourceURL, noteURL)
     XCTAssertEqual(appState.documentSession.text, "third")
     XCTAssertTrue(appState.documentSession.isDirty)
   }
 
   /// The conscious close (⌘W) of a document whose file went missing, with
   /// auto-save ON. Auto-save answers the save question for the user, so this
-  /// close is an unattended write — it must not put the file back. A close whose
-  /// save does not happen is REFUSED and the window goes on holding the text,
-  /// which is the shipped behaviour for a save that fails (see
-  /// `testCloseActiveDocumentRefusesWhenDirtySaveFails`); this cut adds a reason
-  /// to refuse, not a new way to close.
+  /// close is an unattended write — it must not put the file back. RecoveryStore
+  /// is the required second destination: once that fallback succeeds the bytes
+  /// are durable and close may proceed without recreating the original.
   @MainActor
-  func testAConsciousCloseKeepsTheWorkWhenTheFileIsGone() throws {
+  func testAConsciousCloseFallsBackToRecoveryWhenTheFileIsGone() throws {
     let folder = try makeTemporaryFolder()
     let noteURL = folder.appendingPathComponent("closed.md").standardizedFileURL
     try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
@@ -225,20 +218,17 @@ final class AutoSaveResurrectionTests: XCTestCase {
 
     try FileManager.default.removeItem(at: noteURL)
 
-    XCTAssertFalse(
+    XCTAssertTrue(
       store.finishClose(decision: .saveWithoutPrompting, response: nil, appState: appState),
-      "a close whose save did not happen must not drop the session")
+      "a durable recovery fallback should allow an unattended close")
     XCTAssertEqual(writeCount, 0)
     XCTAssertFalse(FileManager.default.fileExists(atPath: noteURL.path))
-    XCTAssertEqual(
-      appState.documentSession.text, "typed before ⌘W",
-      "the window must go on holding the only copy of the text")
-    XCTAssertTrue(appState.documentSession.isDirty)
-    XCTAssertEqual(appState.selectedDocumentID, appState.documentSession.id)
-    XCTAssertEqual(
-      appState.unresolvedDataLoss?.severity, .dataLoss,
-      "refusing an unattended recreate must latch the same data-loss state as a failed write")
-    XCTAssertTrue(appState.unresolvedDataLoss?.message.contains("no longer on disk") == true)
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.text, "typed before ⌘W")
+    XCTAssertEqual(recovery.sourceURL, noteURL)
+    XCTAssertFalse(appState.documentSession.hasEditableBuffer)
+    XCTAssertNil(appState.unresolvedDataLoss)
+    XCTAssertTrue(appState.lastError?.contains("recovery copy is safe") == true)
   }
 
   /// The window-teardown flush is the same kind of write — nobody asked for it —

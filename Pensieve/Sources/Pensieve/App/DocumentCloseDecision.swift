@@ -3,6 +3,7 @@ import Foundation
 /// Answer to a "do you want to save the changes?" confirmation.
 enum SaveChangesResponse: Equatable {
   case save
+  case saveAs
   case discard
   case cancel
 }
@@ -13,6 +14,7 @@ enum SaveChangesResponse: Equatable {
 enum DocumentClosePrompt: Equatable {
   case saveAsUntitled
   case savePathed
+  case saveRecoveredFile
 }
 
 /// What `File > Close` (⌘W) must do with the active session — decided BEFORE
@@ -49,6 +51,9 @@ enum DocumentCloseDecision: Equatable {
   ) -> DocumentCloseDecision {
     guard session.hasEditableBuffer, session.isDirty else {
       return .closeWithoutPrompting
+    }
+    if session.recoverySourceURL != nil {
+      return .confirm(.saveRecoveredFile)
     }
     if session.isUntitled {
       return .confirm(.saveAsUntitled)

@@ -109,7 +109,7 @@ final class WindowErrorSurfaceTests: XCTestCase {
     XCTAssertTrue(WindowErrorSurface.resolve(for: appState.currentError).showsBanner)
     let latched = try XCTUnwrap(
       appState.unresolvedDataLoss, "losing the only copy of the text latched nothing")
-    XCTAssertTrue(latched.message.contains("recovery draft"))
+    XCTAssertTrue(latched.message.contains("recovery copy"))
   }
 
   // MARK: - The three latch rules
@@ -142,7 +142,7 @@ final class WindowErrorSurfaceTests: XCTestCase {
       "a routine message took the line away from an unresolved data loss")
     XCTAssertNotNil(appState.unresolvedDataLoss, "the latch was cleared by a status write")
     XCTAssertTrue(
-      try XCTUnwrap(appState.currentError).message.contains("recovery draft"),
+      try XCTUnwrap(appState.currentError).message.contains("recovery copy"),
       "the window is showing the routine message instead of the loss")
   }
 

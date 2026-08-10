@@ -61,6 +61,10 @@ struct DocumentSession: Equatable {
   /// nothing on disk ever converging. Keeping it here is what makes "one buffer,
   /// one draft" true for all of them.
   private var storedRecoveryID: UUID?
+  /// Original file protected by an adopted file-backed recovery record. The
+  /// buffer remains untitled until the user explicitly chooses Save to Original
+  /// or Save As, so merely opening recovery can never overwrite this URL.
+  private var storedRecoverySourceURL: URL?
   var text: String
   var isDirty: Bool
 
@@ -99,6 +103,7 @@ struct DocumentSession: Equatable {
       // and `saveExisting` — retire their own draft explicitly before they get
       // here, which is why dropping the association is safe rather than leaky.
       storedRecoveryID = nil
+      storedRecoverySourceURL = nil
     }
   }
 
@@ -162,6 +167,10 @@ struct DocumentSession: Equatable {
     }
   }
 
+  var recoverySourceURL: URL? {
+    storedRecoverySourceURL?.standardizedFileURL
+  }
+
   var hasEditableBuffer: Bool {
     switch kind {
     // `.loading` is false BY DESIGN, not by omission. Its buffer is an empty
@@ -201,6 +210,7 @@ struct DocumentSession: Equatable {
   mutating func load(document: DocumentRef, text: String) {
     self.kind = .fileBacked(document)
     self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
     self.text = text
     self.isDirty = false
   }
@@ -211,6 +221,7 @@ struct DocumentSession: Equatable {
   mutating func beginLoading(document: DocumentRef) {
     self.kind = .loading(document)
     self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
     self.text = ""
     self.isDirty = false
   }
@@ -220,13 +231,20 @@ struct DocumentSession: Equatable {
     // A brand new buffer owns no draft. The one it eventually writes is ITS own,
     // and the draft the replaced buffer wrote stays where the user can find it.
     self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
     self.text = ""
     self.isDirty = false
   }
 
-  mutating func restoreUntitled(title: String, text: String, recoveryID: UUID) {
+  mutating func restoreUntitled(
+    title: String,
+    text: String,
+    recoveryID: UUID,
+    sourceURL: URL? = nil
+  ) {
     self.kind = .untitled(title: title, identity: .recovered(recoveryID))
     self.storedRecoveryID = recoveryID
+    self.storedRecoverySourceURL = sourceURL?.standardizedFileURL
     self.text = text
     self.isDirty = true
   }

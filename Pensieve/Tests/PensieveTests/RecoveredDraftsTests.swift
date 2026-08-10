@@ -175,6 +175,115 @@ final class RecoveredDraftsTests: XCTestCase {
   // MARK: - Open
 
   @MainActor
+  func testFileBackedRecoveryMetadataSurvivesReloadAndMakesTheEntryUnambiguous() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("umowa.md")
+    let store = try makeRecoveryStore(in: folder)
+    let saved = try store.saveDraft(
+      id: nil,
+      title: "umowa.md",
+      text: "unsaved revision",
+      sourceURL: sourceURL)
+    store.markDraftClosed(id: saved.id)
+
+    let reloadedStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+    let reloaded = try XCTUnwrap(reloadedStore.loadDrafts().first)
+
+    XCTAssertEqual(reloaded.id, saved.id)
+    XCTAssertEqual(reloaded.sourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(reloaded.displayTitle, "Unsaved changes — umowa.md")
+    XCTAssertEqual(reloaded.text, "unsaved revision")
+  }
+
+  @MainActor
+  func testAFileBackedRecoveryIsNotDiscoverableWhenItsSourceMetadataCannotBeWritten() throws {
+    let folder = try makeTemporaryFolder()
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: recoveryDirectory, withIntermediateDirectories: true)
+    let id = UUID()
+    // A non-empty directory at the exact sidecar path makes the required atomic
+    // metadata write fail while the recovery directory itself remains writable.
+    let blockedSidecar = recoveryDirectory.appendingPathComponent(id.uuidString + ".source")
+    try FileManager.default.createDirectory(
+      at: blockedSidecar,
+      withIntermediateDirectories: false)
+    try Data("occupied".utf8).write(to: blockedSidecar.appendingPathComponent("blocker"))
+    let store = RecoveryStore(directoryURL: recoveryDirectory)
+
+    XCTAssertThrowsError(
+      try store.saveDraft(
+        id: id,
+        title: "umowa.md",
+        text: "must not become an ambiguous ghost",
+        sourceURL: folder.appendingPathComponent("umowa.md")))
+
+    XCTAssertTrue(
+      store.loadDrafts().isEmpty,
+      "a file-backed recovery became visible without the metadata that identifies its original")
+    XCTAssertFalse(
+      FileManager.default.fileExists(
+        atPath: recoveryDirectory.appendingPathComponent(id.uuidString + ".md").path))
+  }
+
+  @MainActor
+  func testOpeningFileBackedRecoveryNeverOverwritesTheOriginalUntilSave() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("umowa.md")
+    try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let draft = try store.saveDraft(
+      id: nil,
+      title: "umowa.md",
+      text: "recovered unsaved revision",
+      sourceURL: sourceURL)
+    store.markDraftClosed(id: draft.id)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder), recoveryStore: store)
+    let appState = AppState()
+
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.recoverySourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.displayTitle, "Unsaved changes — umowa.md")
+    XCTAssertEqual(
+      documentStore.closeDecision(appState: appState),
+      .confirm(.saveRecoveredFile))
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
+  }
+
+  @MainActor
+  func testSaveToOriginalFromRecoveredBufferIsExplicitAndRetiresRecovery() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("umowa.md")
+    try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
+    let store = try makeRecoveryStore(in: folder)
+    let draft = try store.saveDraft(
+      id: nil,
+      title: "umowa.md",
+      text: "recovered unsaved revision",
+      sourceURL: sourceURL)
+    store.markDraftClosed(id: draft.id)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder), recoveryStore: store)
+    let appState = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+
+    XCTAssertTrue(
+      documentStore.finishClose(
+        decision: .confirm(.saveRecoveredFile),
+        response: .save,
+        appState: appState))
+
+    XCTAssertEqual(
+      try String(contentsOf: sourceURL, encoding: .utf8), "recovered unsaved revision")
+    XCTAssertTrue(store.loadDrafts().isEmpty)
+    XCTAssertFalse(appState.documentSession.hasEditableBuffer)
+  }
+
+  @MainActor
   func testOpenAdoptsTheDraftAndLeavesTheFileUntilItIsDecided() throws {
     let folder = try makeTemporaryFolder()
     let store = try makeRecoveryStore(in: folder)
@@ -358,16 +467,13 @@ final class RecoveredDraftsTests: XCTestCase {
 
   // MARK: - A failed draft write is never reported as a success
 
-  // SCOPE, stated because the two `CloseFlush` names overreach: these drive
-  // `DocumentStore` directly on a live `AppState`. They prove the RETURN VALUE
-  // and the state of the buffer after a failed write — NOT what a real Close or
-  // Quit does with that answer. Both teardown call sites (`PensieveApp`'s
-  // willClose hook and `TerminationSequence.flushPendingWindowSaves`) still
-  // DISCARD the result and run past their veto point; that gap is open and named
-  // in the lifecycle contract's Recovery section (GAP 1). The import test below
-  // is the one that goes through a real controller end to end.
+  // These drive the teardown backstop directly on a live `AppState`: they pin
+  // the truthful return value and buffer state after a failed write. Real red-X
+  // and quit flows consume the same result earlier, at their veto point; the
+  // controller-level pins live in `DocumentCloseLifecycleTests` and the quit
+  // lifecycle tests.
 
-  /// P0. `saveRecoveryDraft` caught its write error, set `appState.lastError` and
+  /// P0. The old recovery writer caught its error, set `appState.lastError` and
   /// returned NOTHING, and the untitled branch of `savePendingChangesOnClose`
   /// answered `true` regardless. The one caller whose buffer SURVIVES that flush —
   /// `importDocument` — read that `true` as "the work is safe" and cleared the

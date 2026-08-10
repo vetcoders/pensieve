@@ -242,12 +242,15 @@ final class DocumentWindowRegistry: ObservableObject {
     },
     orderAndActivateWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.makeKeyAndOrderFront(nil)
-      NSApp.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate(ignoringOtherApps: true)
     },
     currentMergeTarget: @escaping @MainActor () -> NSWindow? = {
-      NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow ?? NSApp.windows.first
+      NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+        ?? NSApplication.shared.windows.first
     },
-    applicationWindows: @escaping @MainActor () -> [NSWindow] = { NSApp.windows },
+    applicationWindows: @escaping @MainActor () -> [NSWindow] = {
+      NSApplication.shared.windows
+    },
     closeWindow: @escaping @MainActor (NSWindow) -> Void = { window in
       window.close()
     },

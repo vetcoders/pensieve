@@ -146,12 +146,14 @@ final class AutoSaveSettingTests: XCTestCase {
     let folder = try makeTemporaryFolder()
     let noteURL = folder.appendingPathComponent("off.md")
     try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
 
     let appState = AppState()
     var writeCount = 0
     let store = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
       indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
       savingSettings: makeAutoSaveSettings(enabled: false),
       writeDocument: { text, url in
         writeCount += 1
@@ -162,14 +164,56 @@ final class AutoSaveSettingTests: XCTestCase {
     appState.activeDocumentText = "edited with auto-save off"
     store.documentDidChange(appState: appState)
 
-    // Long enough for the (cancelled) write to betray itself.
-    try await Task.sleep(nanoseconds: 200_000_000)
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "edited with auto-save off"
+    }
 
     XCTAssertEqual(writeCount, 0, "auto-save off must not write the user's file on its own")
     XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "initial")
     XCTAssertTrue(
       appState.documentSession.isDirty,
       "the edit stays unsaved, which is what makes the close question honest")
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.sourceURL, noteURL.standardizedFileURL)
+    XCTAssertEqual(recovery.displayTitle, "Unsaved changes — off.md")
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().count, 1,
+      "one live file-backed buffer must own exactly one recovery record")
+  }
+
+  @MainActor
+  func testFailedAutoSaveFallsBackToARecoveryCopyWithoutOverwritingTheOriginal() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("removed-before-autosave.md")
+    try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: true))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "initial")
+    try FileManager.default.removeItem(at: noteURL)
+
+    appState.activeDocumentText = "edit protected by fallback"
+    store.documentDidChange(appState: appState)
+
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "edit protected by fallback"
+    }
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: noteURL.path))
+    XCTAssertTrue(appState.documentSession.isDirty, "the original file is still stale")
+    XCTAssertNil(
+      appState.unresolvedDataLoss,
+      "a durable recovery copy means the failed original write is status, not data loss")
+    XCTAssertEqual(appState.currentError?.severity, .status)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.sourceURL, noteURL.standardizedFileURL)
   }
 
   /// The setting is read when the debounce FIRES, so switching auto-save off also
@@ -324,6 +368,10 @@ final class AutoSaveSettingTests: XCTestCase {
     XCTAssertEqual(
       recoveryStore.loadDrafts().map(\.text), ["edit that cannot reach disk"],
       "a failed close-save must fall back to a recovery draft, not lose the edit")
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertFalse(
+      recoveryStore.isDraftOpen(id: recovery.id),
+      "the dying window kept its fallback claimed and hid it from the launcher")
     XCTAssertNotNil(
       appState.lastError, "the save failure must stay surfaced, not be masked by the draft write")
   }

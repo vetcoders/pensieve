@@ -3299,7 +3299,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testSelectionRefusesWhenDirtySessionCannotBeSaved() throws {
+  func testSelectionUsesRecoveryFallbackWhenDirtyOriginalCannotBeSaved() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveDirtyRefusalTests-\(UUID().uuidString)", isDirectory: true)
     let deletedFolder = folder.appendingPathComponent("Deleted", isDirectory: true)
@@ -3318,10 +3318,14 @@ final class PensieveSmokeTests: XCTestCase {
       DocumentRef(id: alphaURL.standardizedFileURL),
       DocumentRef(id: betaURL.standardizedFileURL),
     ]
+    let recoveryStore = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        recoveryStore: recoveryStore)
     )
     controller.selectDocument(id: alphaURL.standardizedFileURL)
 
@@ -3331,15 +3335,13 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.selectDocument(id: betaURL.standardizedFileURL)
 
-    XCTAssertEqual(
-      appState.selectedDocumentID?.resolvingSymlinksInPath(),
-      alphaURL.standardizedFileURL.resolvingSymlinksInPath())
-    XCTAssertEqual(
-      appState.documentSession.url?.resolvingSymlinksInPath(),
-      alphaURL.standardizedFileURL.resolvingSymlinksInPath())
-    XCTAssertEqual(appState.documentSession.text, "alpha unsaved")
-    XCTAssertTrue(appState.documentSession.isDirty)
-    XCTAssertTrue(appState.lastError?.contains("Could not save alpha.md") == true)
+    XCTAssertEqual(appState.selectedDocumentID, betaURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.url, betaURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.text, "beta original")
+    XCTAssertFalse(appState.documentSession.isDirty)
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.text, "alpha unsaved")
+    XCTAssertEqual(recovery.sourceURL, alphaURL.standardizedFileURL)
   }
 
   @MainActor
@@ -3502,7 +3504,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testCloseActiveDocumentRefusesWhenDirtySaveFails() throws {
+  func testCloseActiveDocumentRefusesWhenOriginalAndRecoveryWritesFail() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveCloseRefusalTests-\(UUID().uuidString)", isDirectory: true)
     let writable = folder.appendingPathComponent("Writable", isDirectory: true)
@@ -3514,10 +3516,14 @@ final class PensieveSmokeTests: XCTestCase {
     let noteURL = writable.appendingPathComponent("doomed.md")
     try "original".write(to: noteURL, atomically: true, encoding: .utf8)
 
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecovery")
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
     let appState = AppState()
     appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
     let indexDatabase = temporaryIndexDatabase(in: folder)
-    let documentStore = makeTestDocumentStore(indexDatabase: indexDatabase)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: indexDatabase,
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL))
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
@@ -3821,6 +3827,43 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(prompted)
     XCTAssertTrue(appState.documentSession.isUntitled)
     XCTAssertTrue(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testQuitIsVetoedWhenOriginalAndRecoveryWritesBothFail() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitDoubleFailure-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("only-copy.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
+
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "original")
+    appState.activeDocumentText = "only in memory"
+    appState.activeDocumentDirty = true
+    try FileManager.default.removeItem(at: noteURL)
+
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL),
+      savingSettings: makeAutoSaveSettings(enabled: true))
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore)
+
+    XCTAssertFalse(controller.applicationShouldTerminate())
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.text, "only in memory")
+    XCTAssertEqual(appState.currentError?.severity, .dataLoss)
+    XCTAssertTrue(appState.currentError?.message.contains("window will stay open") == true)
   }
 
   /// ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
@@ -4866,16 +4909,12 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   /// Case 5 — the test the "keep Save in phase 1" decision rests on. A Discard
-  /// window is confirmed FIRST (its Discard deferred), then a pathed window's
-  /// force-save FAILS with an I/O error. That failure is the only thing left
-  /// that can abort the pass — and it must, WITHOUT the earlier deferred Discard
-  /// leaking to execution. If the abort path (decide's
-  /// `guard !isDirty else { return nil }`) did not fire, phase 2 would run and
-  /// the Discard window's draft would be dropped; asserting the draft survives
-  /// proves the save genuinely failed and aborted rather than silently
-  /// succeeding.
+  /// window is confirmed FIRST (its Discard deferred), then both durable writes
+  /// for a pathed window fail: the original and RecoveryStore. That double
+  /// failure is the only thing left that can abort the pass — and it must,
+  /// WITHOUT the earlier deferred Discard leaking to execution.
   @MainActor
-  func testClearOpenFilesSaveIOFailureAbortsPassAndSparesDeferredDiscard() throws {
+  func testClearOpenFilesDoubleWriteFailureAbortsPassAndSparesDeferredDiscard() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveClearSaveFailTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -4911,15 +4950,17 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
     let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
 
-    // Window A: a pathed doc, dirtied, whose write throws. saveExisting catches
-    // the throw and returns false, leaving the session dirty — the decide guard
-    // then returns nil (abort). Attached SECOND so the failure trips after B.
+    // Window A: a pathed doc whose original and fallback both throw. Attached
+    // SECOND so the double failure trips after B's deferred decision.
     let fileURL = folder.appendingPathComponent("cannot-write.md")
     try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecoveryA")
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
     let failState = AppState()
     let failStore = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: folder),
       bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL),
       writeDocument: { _, _ in throw NSError(domain: "PensieveTestWriteFailure", code: 1) })
     let failController = AppController(
       appState: failState,

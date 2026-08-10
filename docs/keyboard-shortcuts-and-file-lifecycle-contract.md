@@ -42,8 +42,10 @@ tab. A user-created empty tab is already occupied for placement purposes, even
 before its editable buffer finishes attaching: another `Cmd+N` or `Cmd+T` must
 add another tab, never reuse that tab in place. The macOS "Prefer tabs when
 opening documents" setting does not turn this command into an
-independent-window command. Splitting `Cmd+N` (new window) from `Cmd+T` (new tab)
-requires the still-open multi-window product decision.
+independent-window command. A later mature multi-window feature may consciously
+split `Cmd+N` (New Window) from `Cmd+T` (New Tab), but that is a future contract
+change — not an open ambiguity in v1 and not authority to restore the old
+behavior piecemeal.
 
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
 
@@ -125,23 +127,14 @@ human-readable message; deleting it would change wording, never whether the
 file comes back. Any future rewrite of the write layer must keep this
 property — a plain atomic write reintroduces the bug.
 
-**Integration requirement for #45 (error surface).** When this line is
-integrated with #45, "the file is gone and the buffer is dirty" must **not**
-reach the UI as an ordinary `lastError` / `.status` notice. Under the 45.1a
-contract this is a **data-loss** class: the user's text now exists in no file,
-and the only copy is in a window they may close. It must be classified and
-surfaced as such — persistent, not auto-dismissing, and naming the recovery
-action (Save As…). Losing this classification during integration turns a
-data-loss warning into a toast.
-
-Known limits, deliberately not claimed:
-
-- while a document sits in the refused state, its buffer is durable only in
-  memory until the window tears down — the same guarantee a dirty file-backed
-  buffer has today with auto-save OFF, or after a save that failed;
-- the refusal is not announced in the UI. `AppState.lastError` is set, but it
-  has no renderer, so the observable signal is that the file does not come back
-  and the document stays dirty. A visible surface for it is a separate cut.
+**Integrated error and recovery behavior (10.08).** When the file is gone or an
+original write otherwise fails, the dirty buffer first enters the data-loss
+class because its only current copy may be in memory. Pensieve immediately
+attempts a RecoveryStore snapshot. A successful fallback keeps the original
+untouched, leaves the session dirty, resolves the data-loss latch and shows an
+ordinary persistent status saying that the emergency copy is safe. If recovery
+also fails, data loss remains latched and close/quit is vetoed. The error surface
+and the explicit recovered-file actions are normative below.
 
 ### `Shift+Cmd+S` — Save As…
 
@@ -153,8 +146,7 @@ Closes the active tab/file, but **does not quit the application**.
 
 - With multiple tabs, closes only the active one.
 - With the last tab, the window shows the startup screen (launcher), it does not
-  quit the app (decision recorded further below in "Open decisions",
-  item 1 — resolved).
+  quit the app.
 - For unsaved changes or recovery, displays a native prompt
   (macOS naming: **Save / Don't Save / Cancel**; for untitled —
   Monika's 03.08 proposal: a full native sheet with a "Save As" field,
@@ -330,79 +322,50 @@ Clarification (10.08, launcher pagination and test isolation):
   forgotten test dependency may therefore contaminate its own test process,
   never `~/Library/Application Support/Pensieve/Recovery`.
 
-Clarification (05.08, after the file-backed half of bug I):
+Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10: A):
 
-- **"One buffer" includes a FILE-BACKED buffer.** A named document whose window
-  tears down without reaching disk (auto-save off, or a save that failed) is
-  stashed as a recovery item too, and that stash follows the same rule: the
-  buffer keeps ONE item across every close, every quit flush and every window on
-  the same file. It must not mint a new UUID per stash. (It did:
-  `recoveryID` lived inside the untitled session shape, so a file-backed buffer
-  read `nil` and its write-back was dropped, and with no sweep left to hide it a
-  single unsaved document grew the recovery directory without bound.)
-- A **successful save from the SAME session** retires the stash it was standing
-  in for — the same closed list as before ("being saved as a regular file"), now
-  also applying to a plain ⌘S on a named document. The scope is exact: the
-  association lives on the live `DocumentSession`, so retirement holds only while
-  the buffer that wrote the stash is the one saving. A stash produced by a window
-  TEARING DOWN is orphaned from every later session on the same file — reopening
-  that file in a fresh window and saving it does NOT retire the stash, and the
-  launcher keeps offering content that is by then already on disk until it is
-  explicitly discarded. (Retiring such a stash by URL is a pending product
-  decision, not current behavior.)
+- **Crash recovery is independent of auto-save.** An edited untitled draft is
+  periodically written to RecoveryStore in either auto-save mode. An edited
+  file-backed buffer with auto-save OFF is also periodically written there,
+  while the original file remains byte-for-byte untouched.
+- **Auto-save failure falls back immediately.** With auto-save ON, Pensieve
+  first attempts the original file. If that write fails, the same bytes are
+  written to RecoveryStore immediately. The original failure stays visible,
+  the session stays dirty because the original is stale, and a successful
+  recovery fallback changes the condition from data loss to ordinary status.
+- **One live buffer owns exactly one recovery identity.** Repeated edits,
+  debounce ticks, close flushes and quit flushes update that item in place.
+  Content equality is never used to collapse different buffers.
+- **File-backed recovery is self-describing.** Its record persists the
+  standardized original path in a `.source` sidecar. The launcher labels it
+  **Unsaved changes — <filename>**, shows the full original path and timestamp,
+  and states that this is an emergency copy. A file-backed recovery entry must
+  never masquerade as another ordinary `umowa.md`/`Untitled.md`.
+- **Opening recovery never overwrites the original.** It opens a dirty recovered
+  buffer, displays the original path, and waits for an explicit decision:
+  **Save to Original / Save As… / Don't Save / Cancel**. Cmd+S on that buffer
+  means Save to Original; Save As writes only the chosen destination.
+- **A successful save retires the recovery item.** Saving to the original or a
+  new destination removes the item only after the destination write succeeds.
+  Don't Save removes it only as a conscious rejection. Cancel and any failed
+  write leave both the buffer and recovery item intact.
+- **An untouched empty draft closes silently.** A draft asks where to save only
+  after it contains unsaved changes.
+- **Close and quit fail closed.** If an original-file write fails, Pensieve
+  attempts the recovery fallback before allowing teardown. If neither the
+  original nor RecoveryStore accepts the bytes, the window/quit remains open,
+  the buffer remains dirty, and the error explicitly says the only copy is
+  still in memory. A teardown notification is only a final backstop; it is not
+  allowed to be the first place a fallible user-content write is attempted.
+- **No test writes production recovery.** Tests inject an isolated
+  `RecoveryStore`; XCTest's default fallback is process-scoped under the
+  temporary directory. Runtime smoke uses its own staged identity and support
+  directory.
 
-Clarification (05.08, after the "silent failed recovery write" bug) — PARTIAL,
-with one named gap below:
-
-- **A recovery write reports whether the bytes reached disk.** Every path that
-  persists a recovery item now returns that result instead of a constant, and a
-  caller may only treat the work as safe when the write actually succeeded. This
-  is a precondition for honest behavior, not the behavior itself: what a caller
-  does with the result is the caller's, and today only one consumes it.
-- **Where the guarantee holds: a surface that SURVIVES the operation and reads
-  the result.** Today that is exactly one caller, `importDocument`. There, a
-  failed recovery write means: the buffer stays OPEN and stays DIRTY holding the
-  full text, `lastError` is set and is NOT cleared by a later step in the same
-  operation, nothing on the user's disk is written or removed, and no recovery
-  item is listed that does not exist as a file.
-- **GAP 1 — close and quit consume nothing.** Both teardown flush sites
-  (`PensieveApp`'s `willCloseNotification` hook and
-  `TerminationSequence.flushPendingWindowSaves`) discard the result, and both run
-  PAST the veto point — after `windowShouldClose` / `applicationShouldTerminate`
-  have already consented. `lastError` is per-window state
-  (`AppState.lastError` → `DocumentWindowModel.lastError`), so a window that dies
-  carrying the error takes the error with it. On these paths a failed stash is
-  still a silent loss. In ordinary use the conscious close settles the buffer
-  BEFORE teardown, so the flush finds nothing dirty and the gap does not bite;
-  it bites on teardowns that bypass the conscious close — which is exactly what
-  the stash exists as a backstop for.
-- **GAP 2 — no renderer — CLOSED (05.08, same line of work).** `AppState.lastError`
-  used to be written in many places and read by no view, so "the error stays on
-  screen" described the STATE and nothing the user could see. It now renders;
-  see "Error surface" below for exactly what appears and when. GAP 1 remains an
-  open follow-up, not settled behavior — see
-  `2026-08-05_notatka-45-1-close-quit-flush.md` in the project notes.
-- **What is NOT guaranteed even where the guarantee holds.** Pensieve does not
-  relocate the recovery directory and does not save the work anywhere else. It
-  performs no retry of its own; the next write EVENT (an edit re-arming autosave)
-  may retry and may report the failure again. The content lives in the buffer
-  only, so it survives exactly as long as the process does — an unresolved
-  failure means a crash or a Force Quit still loses that text. Resolving it is
-  the user's Save As….
-- **Import (Word/PDF) is the sharp case.** The conversion result has no file
-  behind it, so the recovery item is its only copy. A conversion that lands with
-  a failed recovery write is treated as a partial success — converted text in the
-  buffer, error recorded — never as a completed import. (It was: the import path
-  cleared `lastError` unconditionally right after the flush, and the flush
-  returned success regardless of the write, so the app itself could not tell the
-  two apart.)
-- Tests. `testAnImportWhoseRecoveryWriteFailsKeepsTheErrorAndTheBuffer` holds the
-  import path end to end through `AppController`.
-  `testACloseFlushReportsAFailedUntitledDraftWriteInsteadOfSuccess` and
-  `testACloseFlushReportsAFailedStashOfAFileBackedBuffer` pin the two flush
-  branches at the `DocumentStore` level — they prove the RETURN VALUE and the
-  buffer state, and deliberately not the behavior of a real Close or Quit, which
-  is GAP 1.
+The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
+source metadata across store reload, non-overwriting recovery open, explicit
+Save to Original, one-buffer/one-record identity, and red-X veto when both
+durable destinations fail.
 
 ### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
 
@@ -418,14 +381,15 @@ raised, never by matching its message text:
   housekeeping did not land — and nothing the user typed is at risk. Examples:
   "Open a workspace folder before creating a workspace file", a workspace that
   will not open, a recovered draft that could not be saved under a new name
-  (the draft file is still on disk, so the work survives).
+  (the draft file is still on disk, so the work survives), and a failed write
+  to the original file whose RecoveryStore fallback succeeded.
 - **Data loss.** Pensieve failed to put content anywhere durable AND the only
-  remaining copy is the in-memory buffer. Exactly four sites raise it today:
-  `saveExisting` and `saveAs` (the edit reached no file), the untitled recovery
-  draft write and the closing-buffer stash (the write that WAS the durable
-  copy), plus `importDocument` composing its own sentence on top of the last of
-  those. Status is the default precisely so that the loud class stays opt-in: a
-  new error has to be argued into it and cannot fall into it.
+  remaining copy is the in-memory buffer. A failed original-file write may
+  raise this condition provisionally, but an immediate successful recovery
+  fallback resolves it to status. If the fallback also fails, data loss stays
+  latched and close/quit is vetoed. Status is the default precisely so that the
+  loud class stays opt-in: a new error has to be argued into it and cannot fall
+  into it.
 
 **One surface, and it is passive.** Pensieve has NO modal error path. Both
 classes show the same standing line in the window that recorded the failure and
@@ -467,10 +431,9 @@ Three rules follow, and each is pinned:
 
 **What retires the latch.** Only `AppState.resolveError()`, called where a
 durable write for that buffer actually lands: a successful `saveExisting`,
-`saveAs`, or recovery-draft write. A successful closing-buffer STASH
-deliberately does not — that path runs precisely because the file the user asked
-to write is stale, and a backstop copy they never asked for must not take "could
-not save X" off the screen.
+`saveAs`, or recovery write. When the original stays stale but recovery lands,
+the data-loss latch is retired and replaced by a status that explicitly says
+the original was not overwritten.
 
 Tests. `WindowErrorChromeRenderTests` drives a real window hosting the real
 `ContentView` and measures the live layout, so "the banner is mounted" is read
@@ -489,9 +452,11 @@ Creating a new document must not force a recovery decision. A recovery item can 
 - being explicitly discarded;
 - being closed with confirmed rejection of changes.
 
-When closing a recovery item, the app shows a native prompt:
-**Save / Don't Save / Cancel** (macOS naming; "Discard" appears
-only in the batch modal as **Discard All**). It must not be removed without asking.
+When closing an ordinary untitled recovery item, the app shows the native
+**Save / Don't Save / Cancel** prompt and Save opens Save As. A recovery item
+that protects an existing file shows **Save to Original / Save As… / Don't
+Save / Cancel**. "Discard" appears only in the batch modal as **Discard All**.
+No recovery item is removed without one of these explicit decisions.
 
 ---
 
@@ -501,8 +466,9 @@ only in the batch modal as **Discard All**). It must not be removed without aski
 2. **Save All** — a convenience shortcut (deliberate extension; the native alert doesn't have it).
 3. **Discard All** — a clear, destructive option.
 4. **Cancel** — always safely aborts the operation.
-5. Every untitled/recovery document gets its own native **Save As** — never
-   an automatic save under a generated name.
+5. Every ordinary untitled recovery document gets its own native **Save As**.
+   File-backed recovery offers **Save to Original** or **Save As…**; neither
+   route writes automatically under a generated name.
 6. Zero rollback for completed saves.
 7. Recovery disappears only after a successful save or explicit rejection.
 
@@ -547,11 +513,15 @@ Close All must never cause silent data loss.
 
 ---
 
-## Session and restore at launch (03.08 addendum)
+## Session and restore at launch (finalized 10.08.2026)
 
 - **Workspace is configuration — it always comes back** (decision 26.07, W9). The
   "Restore session on launch" toggle controls only the files that get opened
-  and the auto-select.
+  and the auto-select. Workspace roots remain indexed and protected in either
+  setting; they are not session entries and do not expire.
+- With restore OFF, a cold launch creates exactly **one empty launcher** and
+  opens zero documents. Workspace roots and the sidebar still return.
+- With restore ON, Pensieve restores the saved working set and its selection.
 - Startup restore opens at most **12 most recent** files of the working set
   (decision 03.08, interim pending a true session snapshot — target model:
   "tabs from the moment of quit", variant b from 31.07).
@@ -599,11 +569,13 @@ Close All must never cause silent data loss.
   own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
   change made to those defaults in the meantime). It runs inside the quit's drain
   budget, so a stalled flush can never beachball the quit.
-- **Single source of truth for the session: the app.** macOS's own window
-  restoration (Saved Application State) must not resurrect documents alongside
-  the app's session model (bug G, 03.08 — pending session-layer audit). The
-  target is for the app to explicitly control the `isRestorable` state of its
-  windows.
+- **Single source of truth for the session: Pensieve** (decisions 7–9: A,
+  Monika + Maciej, 10.08). Every managed launcher/document window opts out of
+  AppKit Saved Application State (`isRestorable = false`), and there is no
+  value-based SwiftUI document `WindowGroup` for macOS to revive independently.
+  Existing legacy Saved Application State may remain on disk, but Pensieve
+  ignores its document/window payload: it never deletes user files, bookmarks,
+  workspace configuration or the app's working set while doing so.
 
 ## Launcher (startup screen) — 03.08 addendum
 
@@ -669,9 +641,6 @@ An agent implementing or refactoring menu/commands must verify:
 - **[IMPLEMENTATION GAP]** workspace ROOT in Trash: behavior
   **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
   "Trash is dead" section above); not yet built in this PR;
-- **[OPEN]** native Save sheet for untitled on close
-  (Monika's 03.08 proposal, separate UX cut);
-- **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
 - **[IMPLEMENTATION GAP]** `Shift+Cmd+T` Reopen Closed Tab:
   shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
   (see the `Shift+Cmd+T` section above); the feature itself is not yet
@@ -680,8 +649,7 @@ An agent implementing or refactoring menu/commands must verify:
 **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
 markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
 bold/italic/link), switching editor/split/preview mode, sidebar toggle,
-zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing to be assigned to it pending
-the multi-window decision.
+zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing is assigned to it in v1.
 
 Settled behavior belongs in the normative sections above, not in this list.
 In particular, `Cmd+W` and Open Files, the last-tab launcher, system-window

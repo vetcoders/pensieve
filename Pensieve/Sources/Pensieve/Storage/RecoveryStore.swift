@@ -6,6 +6,30 @@ struct RecoveryDraft: Equatable, Identifiable {
   let title: String
   let text: String
   let updatedAt: Date
+  /// The file whose unsaved in-memory edits this recovery record protects.
+  /// `nil` means the record belongs to a draft that never had a location.
+  let sourceURL: URL?
+
+  init(
+    id: UUID,
+    url: URL,
+    title: String,
+    text: String,
+    updatedAt: Date,
+    sourceURL: URL? = nil
+  ) {
+    self.id = id
+    self.url = url
+    self.title = title
+    self.text = text
+    self.updatedAt = updatedAt
+    self.sourceURL = sourceURL
+  }
+
+  var displayTitle: String {
+    guard let sourceURL else { return title }
+    return "Unsaved changes — \(sourceURL.lastPathComponent)"
+  }
 
   /// One-line gist for the Recovered Drafts list. The draft file carries no
   /// name of its own, so the first non-empty line is the only thing that tells
@@ -52,16 +76,34 @@ final class RecoveryStore {
   }
 
   @discardableResult
-  func saveDraft(id existingID: UUID?, title: String, text: String) throws -> RecoveryDraft {
+  func saveDraft(
+    id existingID: UUID?,
+    title: String,
+    text: String,
+    sourceURL: URL? = nil
+  ) throws -> RecoveryDraft {
     let id = existingID ?? UUID()
     try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
 
     let url = draftURL(for: id)
-    try text.write(to: url, atomically: true, encoding: .utf8)
     let resolvedTitle = title.isEmpty ? Self.fallbackTitle : title
     // The draft's own name lives in a sidecar. Without it the title died at the
     // process boundary and EVERY recovered draft came back called
     // "Recovered Untitled.md", no matter what the user had been working on.
+    // Required identity metadata lands BEFORE the visible `.md` payload. A
+    // failed `.source` write must not leave a newly discoverable file-backed
+    // recovery item that has already forgotten which original it protects.
+    // An orphan sidecar is harmless and invisible to `loadDrafts`; a visible
+    // payload without its source would be another ambiguous ghost.
+    if let sourceURL {
+      try Data(sourceURL.standardizedFileURL.path.utf8).write(
+        to: sourceURLSidecar(for: id), options: .atomic)
+    } else {
+      // Reusing a recovery ID after the buffer became a normal untitled draft
+      // must not retain an older file association.
+      try? fileManager.removeItem(at: sourceURLSidecar(for: id))
+    }
+    try text.write(to: url, atomically: true, encoding: .utf8)
     try? Data(resolvedTitle.utf8).write(to: titleURL(for: id), options: .atomic)
     // Writing a draft IS the claim: the buffer that produced it is live.
     openDraftIDs.insert(id)
@@ -73,7 +115,8 @@ final class RecoveryStore {
       url: url,
       title: resolvedTitle,
       text: text,
-      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date()
+      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date(),
+      sourceURL: sourceURL?.standardizedFileURL
     )
   }
 
@@ -105,6 +148,7 @@ final class RecoveryStore {
   private func removeDraftFiles(id: UUID) {
     try? fileManager.removeItem(at: draftURL(for: id))
     try? fileManager.removeItem(at: titleURL(for: id))
+    try? fileManager.removeItem(at: sourceURLSidecar(for: id))
   }
 
   // MARK: - Claim tracking
@@ -153,7 +197,8 @@ final class RecoveryStore {
       // generic fallback still has to hold for them.
       title: loadTitle(for: id) ?? Self.fallbackTitle,
       text: text,
-      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? .distantPast
+      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? .distantPast,
+      sourceURL: loadSourceURL(for: id)
     )
   }
 
@@ -167,6 +212,16 @@ final class RecoveryStore {
     return title
   }
 
+  private func loadSourceURL(for id: UUID) -> URL? {
+    guard let data = try? Data(contentsOf: sourceURLSidecar(for: id)),
+      let path = String(data: data, encoding: .utf8),
+      !path.isEmpty
+    else {
+      return nil
+    }
+    return URL(fileURLWithPath: path).standardizedFileURL
+  }
+
   static let fallbackTitle = "Recovered Untitled.md"
 
   private func draftURL(for id: UUID) -> URL {
@@ -178,6 +233,13 @@ final class RecoveryStore {
   /// that extension would be handed back as a second, empty draft.
   private func titleURL(for id: UUID) -> URL {
     directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("title")
+  }
+
+  /// Sidecar holding the original path for a file-backed recovery. It is plain
+  /// UTF-8 rather than a property list so a recovery record stays three small,
+  /// inspectable files and never participates in Saved Application State.
+  private func sourceURLSidecar(for id: UUID) -> URL {
+    directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("source")
   }
 
   static func defaultDirectoryURL(

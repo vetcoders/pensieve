@@ -28,6 +28,22 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(window.contentMinSize.height, WindowChromeRecipe.minimumContentSize.height)
   }
 
+  @MainActor
+  func testManagedDocumentWindowsOptOutOfAppKitSavedApplicationState() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: false)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Restoration Probe")
+    ManagedWindowRestoration.disable(on: window)
+
+    XCTAssertFalse(
+      window.isRestorable,
+      "Pensieve, not Saved Application State, is the only document-session restore owner")
+  }
+
   func testRecipePinsSharedDocumentWindowGeometry() {
     XCTAssertEqual(WindowChromeRecipe.defaultContentSize.width, 1180)
     XCTAssertEqual(WindowChromeRecipe.defaultContentSize.height, 760)

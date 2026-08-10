@@ -241,9 +241,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
 
     surveyRecoveredDraftsOnLaunch()
 
-    // Window-agnostic close lifecycle. Not every document-bearing window
-    // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
-    // tabs are not), so they have no onClose hook → their document would linger
+    // Window-agnostic close lifecycle. The scene-owned launcher and any native
+    // tab that AppKit re-hosts are not guaranteed to be a DocumentWindow, so
+    // they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
     // row. The shared lifecycle is idempotent. It never creates a replacement
     // window: an explicit Dock reopen is the sole owner of that transition.

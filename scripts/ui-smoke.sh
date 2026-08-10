@@ -18,14 +18,17 @@ COLD_ONLY=0
 MENU_RESTORED_ONLY=0
 EXTRA_EXPECTED_IDENTIFIERS=()
 
-# Restored-window menu-bar probe state. The probe forces state restoration to be
-# deterministic by writing NSQuitAlwaysKeepsWindows into the app's OWN defaults
-# domain for the duration of the run, then reverting to the pre-run state on
-# exit so the operator's real preferences are left untouched. QAKW = the
-# NSQuitAlwaysKeepsWindows key.
+# Saved-state isolation probe state. The probe deliberately asks AppKit to keep
+# windows while telling Pensieve NOT to restore its working set. A relaunch must
+# still produce one empty launcher: if a document returns, Saved Application
+# State became a second restore owner. Every override is written only to the
+# smoke identity and restored after the run. QAKW = NSQuitAlwaysKeepsWindows.
 RESTORATION_DEFAULT_ARMED=0
 QAKW_WAS_SET=0
 PRIOR_QAKW=""
+PENSIEVE_RESTORE_DEFAULT_ARMED=0
+PENSIEVE_RESTORE_WAS_SET=0
+PRIOR_PENSIEVE_RESTORE=""
 
 die() {
   printf '\033[33m[fail]\033[0m %s\n' "$*" >&2
@@ -111,7 +114,7 @@ run_ax_osascript() {
   fi
 }
 
-# Force macOS/SwiftUI state restoration to fire on the next launch regardless of
+# Force macOS/AppKit state restoration to fire on the next launch regardless of
 # the operator's global "Close windows when quitting an app" setting. Snapshot
 # whatever the app domain held first so disarm can restore it exactly.
 arm_restoration_default() {
@@ -135,6 +138,28 @@ disarm_restoration_default() {
     defaults delete "$APP_ID" NSQuitAlwaysKeepsWindows 2>/dev/null || true
   fi
   RESTORATION_DEFAULT_ARMED=0
+}
+
+arm_pensieve_restore_off() {
+  if PRIOR_PENSIEVE_RESTORE="$(defaults read "$APP_ID" Pensieve.restoreSessionOnLaunch 2>/dev/null)"; then
+    PENSIEVE_RESTORE_WAS_SET=1
+  else
+    PENSIEVE_RESTORE_WAS_SET=0
+    PRIOR_PENSIEVE_RESTORE=""
+  fi
+  defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool false
+  PENSIEVE_RESTORE_DEFAULT_ARMED=1
+}
+
+disarm_pensieve_restore_default() {
+  [[ "$PENSIEVE_RESTORE_DEFAULT_ARMED" -eq 1 ]] || return 0
+  if [[ "$PENSIEVE_RESTORE_WAS_SET" -eq 1 ]]; then
+    defaults write "$APP_ID" Pensieve.restoreSessionOnLaunch -bool "$PRIOR_PENSIEVE_RESTORE" \
+      2>/dev/null || true
+  else
+    defaults delete "$APP_ID" Pensieve.restoreSessionOnLaunch 2>/dev/null || true
+  fi
+  PENSIEVE_RESTORE_DEFAULT_ARMED=0
 }
 
 # Single launch funnel. The staged Info.plist already carries the override in
@@ -223,149 +248,57 @@ stage_smoke_app() {
     || die "staged smoke bundle failed codesign --verify; it would not launch"
 }
 
-# P1-02 arbiter. The value-based `WindowGroup(for: DocumentRef.self)` in
-# PensieveApp.swift carries no `.commands` of its own; review feared a window
-# restored INTO that group would surface a default menu bar without our custom
-# Mode/Format/Agents menus. The rebuttal: SwiftUI assembles ONE app-wide menu
-# bar from the whole scene tree, owned by the launcher group's `.commands`, so a
-# restored value-based scene inherits it. This probe delivers the runtime proof:
-# it drives a real restoration round-trip (launch -> graceful quit persists the
-# scene -> relaunch reopens it) and asserts the process menu bar exposes our
-# custom command surface while the RESTORED window is key.
+# Decision 7A (Monika + Maciej, 2026-08-10): Pensieve is the sole
+# owner of document-session restore. This probe creates the adversarial split:
+# AppKit is explicitly told to preserve windows, while Pensieve's own restore
+# setting is OFF. After a document-bearing quit/relaunch, exactly one empty
+# launcher may exist and the seeded document title must be absent.
 #
-# Note on scope: current builds open documents through the AppKit factory
-# (DocumentWindowRegistry), never `openWindow(value:)`, so a fresh document
-# cannot seed a NEW value-based scene. The value-based group is only ever fed by
-# a pre-existing (legacy) persisted scene. When the host has such a scene the
-# probe asserts against it; when it does not, the only window that comes back is
-# the launcher (which owns `.commands` and is not the surface under dispute), so
-# the probe SKIPs green rather than asserting on the wrong window. The AppleScript
-# classifies the two by the key window's title.
-run_restored_menu_probe() {
-  log "restored-window menu-bar probe (P1-02 arbiter: value-based WindowGroup scene)"
+# The legacy --menu-restored-only flag is retained as a compatible entry point,
+# but now runs this stronger saved-state isolation assertion.
+run_saved_state_isolation_probe() {
+  log "Saved Application State isolation probe (Pensieve restore OFF)"
   arm_restoration_default
-
-  # Clear whatever instance an earlier phase left behind so `open` yields exactly
-  # one process and the bare-name AppleScript target is unambiguous.
+  arm_pensieve_restore_off
   terminate_app
 
-  # Launch WITHOUT a document; SwiftUI restores the persisted value-based
-  # WindowGroup scene. A LaunchServices race can return -600 right after the
-  # prior terminate; one bounded retry clears it.
-  log "restored-probe: launch #1 (no document) to open the restorable scene"
-  open_smoke_app -a "$APP_PATH" || {
+  local document_title="${SMOKE_DOCUMENT##*/}"
+  document_title="${document_title%.md}"
+
+  log "saved-state probe: launch #1 with document [$document_title]"
+  open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT" || {
     sleep 0.5
-    open_smoke_app -a "$APP_PATH"
+    open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT"
   }
+
   local _
   for _ in {1..120}; do
     pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
     sleep 0.1
   done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 || die "restored-probe: launch #1 never started $APP_NAME"
-  sleep 3
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "saved-state probe: document launch never started $APP_NAME"
 
-  # Graceful quit persists the open scene (NSQuitAlwaysKeepsWindows armed above).
-  log "restored-probe: graceful quit to persist restoration state"
-  osascript -e "with timeout of 5 seconds" \
-    -e "tell application id \"$APP_ID\" to quit" \
-    -e "end timeout" >/dev/null 2>&1 || true
-  for _ in {1..60}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-    sleep 0.5
-  fi
-
-  # Relaunch: macOS reopens the persisted scene as the RESTORED window under test.
-  log "restored-probe: relaunch and assert restored-window menu bar"
-  open_smoke_app -a "$APP_PATH" || {
-    sleep 0.5
-    open_smoke_app -a "$APP_PATH"
-  }
-  for _ in {1..120}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 || die "restored-probe: relaunch never started $APP_NAME"
-
-  run_ax_osascript 90 - "$APP_NAME" <<'APPLESCRIPT'
+  run_ax_osascript 45 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
 on run argv
   set appName to item 1 of argv
+  set documentTitle to item 2 of argv
   my waitForProcess(appName, 15)
   my waitForWindow(appName, 15)
 
-  -- Focus the restored process explicitly so the key window (and thus the
-  -- app-wide menu bar it is serviced by) is the one under assertion.
-  tell application "System Events" to set targetPID to unix id of process appName
-  tell application "System Events"
-    set frontmost of (first process whose unix id is targetPID) to true
+  tell application "System Events" to tell process appName
+    set frontmost to true
+    delay 0.5
+    set allTitles to title of every window
   end tell
-  delay 0.6
 
-  set keyTitle to ""
-  try
-    tell application "System Events" to tell process appName
-      set keyTitle to title of (first window whose value of attribute "AXMain" is true)
-    end tell
-  end try
-  if keyTitle is missing value then set keyTitle to ""
-
-  set allTitles to {}
-  try
-    tell application "System Events" to tell process appName
-      set allTitles to title of every window
-    end tell
-  end try
-
-  set menuNames to {}
-  try
-    tell application "System Events" to tell process appName
-      set menuNames to name of every menu bar item of menu bar 1
-    end tell
-  end try
-
-  -- Classify the restored key window. A launcher / empty scene carries no
-  -- document filename title; a value-based restored DOCUMENT scene does. Only
-  -- the latter is the surface the P1-02 dispute is about.
-  -- The launcher window is titled after the running app, which is the staged
-  -- smoke bundle's name here and "Pensieve" in any bundle staged from a
-  -- differently-named source; neither is a document scene.
-  set isRestoredDoc to (keyTitle is not "") and (keyTitle is not appName) ¬
-    and (keyTitle is not "Pensieve") and (keyTitle is not "Untitled")
-
-  set missingMenus to {}
-  repeat with m in {"Mode", "Format", "Agents"}
-    if menuNames does not contain (contents of m) then set end of missingMenus to (contents of m)
+  repeat with candidateTitle in allTitles
+    if (candidateTitle as text) contains documentTitle then
+      log "SAVED_STATE_PRECONDITION=PASS title=[" & (candidateTitle as text) & "]"
+      return "document window established"
+    end if
   end repeat
-
-  set missingItems to {}
-  if not my hasMenuItem(appName, "File", "New File…") then set end of missingItems to "File>New File…"
-  if not my hasMenuItem(appName, "Mode", "Source Mode") then set end of missingItems to "Mode>Source Mode"
-  if not my hasMenuItem(appName, "Format", "Bold") then set end of missingItems to "Format>Bold"
-  if not my hasMenuItem(appName, "Agents", "Dispatch Document to Agent…") then ¬
-    set end of missingItems to "Agents>Dispatch Document to Agent…"
-
-  log "MENU_RESTORED_WITNESS_TITLE=" & keyTitle
-  log "MENU_RESTORED_WINDOWS=" & my joined(allTitles, ",")
-  log "MENU_RESTORED_MENUBAR=" & my joined(menuNames, ",")
-
-  if not isRestoredDoc then
-    log "MENU_RESTORED_RESULT=SKIP (no value-based restored document scene on host; key window title=[" & keyTitle & "])"
-    return "restored-menu probe skipped: launcher-only restore, no value-based scene"
-  end if
-
-  if (missingMenus is not {}) or (missingItems is not {}) then
-    error "P1-02 FAIL: restored value-based window [" & keyTitle & ¬
-      "] menu bar missing custom surface -> menus:{" & my joined(missingMenus, ", ") & ¬
-      "} items:{" & my joined(missingItems, ", ") & "}; actual menubar={" & ¬
-      my joined(menuNames, ", ") & "}; windows={" & my joined(allTitles, ", ") & "}"
-  end if
-
-  log "MENU_RESTORED_RESULT=PASS (restored value-based window carries Mode/Format/Agents + custom items)"
-  return "restored value-based window menu bar carries the custom command surface"
+  error "saved-state probe precondition failed: no document window titled [" & documentTitle & "] in {" & my joined(allTitles, ",") & "}"
 end run
 
 on waitForProcess(appName, timeoutSeconds)
@@ -379,26 +312,109 @@ on waitForProcess(appName, timeoutSeconds)
 end waitForProcess
 
 on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events"
-    tell process appName
-      repeat with i from 1 to (timeoutSeconds * 10)
-        if (count of windows) > 0 then return true
-        delay 0.1
-      end repeat
-    end tell
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
   end tell
-  error "Timed out waiting for a restored window"
+  error "Timed out waiting for a window"
 end waitForWindow
 
-on hasMenuItem(appName, menuName, itemName)
-  set present to false
-  try
-    tell application "System Events" to tell process appName
-      set present to (exists menu item itemName of menu 1 of menu bar item menuName of menu bar 1)
-    end tell
-  end try
-  return present
-end hasMenuItem
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+
+  log "saved-state probe: graceful quit with AppKit restoration armed"
+  osascript -e "with timeout of 5 seconds" \
+    -e "tell application id \"$APP_ID\" to quit" \
+    -e "end timeout" >/dev/null 2>&1 || true
+  for _ in {1..60}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+    sleep 0.5
+  fi
+
+  log "saved-state probe: relaunch with Pensieve restore still OFF"
+  open_smoke_app -a "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -a "$APP_PATH"
+  }
+  for _ in {1..120}; do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+    || die "saved-state probe: relaunch never started $APP_NAME"
+
+  run_ax_osascript 60 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set forbiddenDocumentTitle to item 2 of argv
+  my waitForProcess(appName, 15)
+  my waitForWindow(appName, 15)
+
+  tell application "System Events" to tell process appName
+    set frontmost to true
+    delay 0.8
+    set windowCount to count of windows
+    set allTitles to title of every window
+    set menuNames to name of every menu bar item of menu bar 1
+  end tell
+
+  repeat with candidateTitle in allTitles
+    if (candidateTitle as text) contains forbiddenDocumentTitle then
+      error "Saved Application State resurrected document [" & (candidateTitle as text) & "] while Pensieve restore was OFF; windows={" & my joined(allTitles, ",") & "}"
+    end if
+  end repeat
+
+  if windowCount is not 1 then
+    error "restore OFF must yield exactly one launcher, got " & windowCount & " windows={" & my joined(allTitles, ",") & "}"
+  end if
+
+  set missingMenus to {}
+  repeat with menuName in {"Mode", "Format", "Agents"}
+    if menuNames does not contain (contents of menuName) then
+      set end of missingMenus to (contents of menuName)
+    end if
+  end repeat
+  if missingMenus is not {} then
+    error "launcher menu bar missing custom menus {" & my joined(missingMenus, ",") & "}"
+  end if
+
+  log "SAVED_STATE_WINDOWS=" & my joined(allTitles, ",")
+  log "SAVED_STATE_MENUBAR=" & my joined(menuNames, ",")
+  log "SAVED_STATE_RESULT=PASS (one empty launcher; no AppKit-restored document)"
+  return "Pensieve is the sole document-session restore owner"
+end run
+
+on waitForProcess(appName, timeoutSeconds)
+  tell application "System Events"
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if exists process appName then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for " & appName
+end waitForProcess
+
+on waitForWindow(appName, timeoutSeconds)
+  tell application "System Events" to tell process appName
+    repeat with i from 1 to (timeoutSeconds * 10)
+      if (count of windows) > 0 then return true
+      delay 0.1
+    end repeat
+  end tell
+  error "Timed out waiting for a window"
+end waitForWindow
 
 on joined(itemsList, delimiter)
   set previousDelimiters to AppleScript's text item delimiters
@@ -465,10 +481,15 @@ cleanup() {
   if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
     cleanup_status="$step_status"
   fi
-  # Revert any smoke-domain default the restored-window probe armed. It was
+  # Revert any smoke-domain defaults the saved-state probe armed. They were
   # never written to the operator's domain, but leaving it set would make the
   # next run's restoration state depend on the previous one.
   disarm_restoration_default
+  step_status=$?
+  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+    cleanup_status="$step_status"
+  fi
+  disarm_pensieve_restore_default
   step_status=$?
   if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
     cleanup_status="$step_status"
@@ -547,8 +568,8 @@ log "staged bundle=$APP_PATH executable=$EXECUTABLE_PATH id=$APP_ID signature=$S
 log "isolated support dir=$SMOKE_SUPPORT (PENSIEVE_SUPPORT_DIR)"
 
 if [[ $MENU_RESTORED_ONLY -eq 1 ]]; then
-  run_restored_menu_probe
-  ok "restored-window menu-bar probe passed"
+  run_saved_state_isolation_probe
+  ok "Saved Application State isolation probe passed"
   exit 0
 fi
 
@@ -990,11 +1011,11 @@ fi
 ok "native UI smoke passed"
 
 # --toolbar-cold-only returns after the cold census (the toolbar AppleScript
-# exits early but bash falls through to here), so the restored-window probe runs
+# exits early but bash falls through to here), so the saved-state probe runs
 # only on a full pass. The toolbar phase leaves an activated instance running;
 # the probe manages its own launch/quit/relaunch cycle, starting with
 # terminate_app.
 if [[ $COLD_ONLY -eq 0 ]]; then
-  run_restored_menu_probe
-  ok "restored-window menu-bar probe passed"
+  run_saved_state_isolation_probe
+  ok "Saved Application State isolation probe passed"
 fi

@@ -1,6 +1,17 @@
 import AppKit
 import SwiftUI
 
+/// Pensieve's working set and `LaunchSettings` are the only session restore
+/// authority. Managed windows must never be serialized by AppKit Saved
+/// Application State, otherwise a second owner can resurrect documents that the
+/// user disabled or already closed in Pensieve.
+@MainActor
+enum ManagedWindowRestoration {
+  static func disable(on window: NSWindow) {
+    window.isRestorable = false
+  }
+}
+
 /// NSWindow subclass for document windows. Implementing `newWindowForTab(_:)`
 /// makes the native tab bar show its "+" button; the handler routes through
 /// the registry so the new untitled tab joins this window's tab group instead
@@ -82,6 +93,7 @@ struct DocumentWindowFactory {
       backing: .buffered,
       defer: false)
     WindowChromeRecipe.apply(to: window, title: document?.title ?? "Untitled")
+    ManagedWindowRestoration.disable(on: window)
     window.onNewWindowForTab = { sourceWindow in
       // ONE call, to the ONE deterministic tab-creation path — the same route
       // scene-owned windows reach through `DocumentWindowTabBridge`.

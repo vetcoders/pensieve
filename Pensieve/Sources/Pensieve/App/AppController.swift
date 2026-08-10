@@ -577,12 +577,12 @@ final class AppController: ObservableObject {
           // the app unable to tell a completed import from a failed one, so a
           // crash before Save As… took the conversion with nothing having
           // recorded the risk. The buffer is left open and dirty, and the stakes
-          // are appended to the write error `saveRecoveryDraft` already reported.
+          // are appended to the recovery-snapshot error already reported.
           //
           // Reported through `reportDataLoss`, not a plain `lastError` write:
           // the assignment lands in the STATUS slot, so it would leave the
           // sharper sentence sitting behind the unresolved data loss
-          // `saveRecoveryDraft` just latched and never reach the screen. See
+          // the snapshot write just latched and never reach the screen. See
           // the lifecycle contract's Recovery section.
           appState.reportDataLoss(
             (appState.lastError ?? "Could not write recovery draft.")
@@ -1163,10 +1163,24 @@ final class AppController: ObservableObject {
   func windowShouldClose(_ window: NSWindow) -> Bool {
     let decision = documentStore.closeDecision(appState: appState)
     guard let prompt = decision.prompt else {
-      // closeWithoutPrompting / saveWithoutPrompting: nothing to ask. Let the
-      // normal teardown run — for an auto-save-owned file it flushes on close.
-      // The session is still intact here, so the document this close settles is
-      // read now and retired only if the close turns out to be a TAB close.
+      if decision == .saveWithoutPrompting {
+        // This is still a VETO point. Persist now instead of trusting the later
+        // willClose notification, where both original and recovery writes could
+        // fail after AppKit had already committed to tearing the window down.
+        let didClose = documentStore.finishClose(
+          decision: decision,
+          response: nil,
+          appState: appState,
+          retiring: .deferred { [weak self, weak window] closedURL in
+            guard let self, let window else { return }
+            self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+          })
+        refreshRecoveredDrafts()
+        return didClose
+      }
+
+      // A clean session has nothing to persist. The document this close settles
+      // is read now and retired only if the close turns out to be a TAB close.
       if let closingURL = appState.documentSession.url {
         retireDocumentIfOnlyThisTabCloses(url: closingURL, window: window)
       }

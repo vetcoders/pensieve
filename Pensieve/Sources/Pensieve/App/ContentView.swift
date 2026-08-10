@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
   @Environment(AppState.self) private var appState
@@ -27,6 +28,13 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       VStack(spacing: 0) {
+        if let sourceURL = appState.documentSession.recoverySourceURL {
+          RecoveredFileBanner(
+            sourceURL: sourceURL,
+            saveToOriginal: { controller.saveActiveDocument() },
+            saveAs: { saveRecoveredFileAs() }
+          )
+        }
         EditorPreviewSplit()
         // Deliberately OUTSIDE the buffer gate below: the errors that most need
         // saying (a workspace that will not open, a file that has moved, a
@@ -162,6 +170,53 @@ struct ContentView: View {
     providerOnboardingCoordinator.evaluate(
       windowID: hostWindowID,
       isKeyWindow: hostWindow?.isKeyWindow == true)
+  }
+
+  private func saveRecoveredFileAs() {
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+      .plainText,
+    ].compactMap { $0 }
+    panel.canCreateDirectories = true
+    panel.directoryURL = appState.documentSession.recoverySourceURL?.deletingLastPathComponent()
+    panel.nameFieldStringValue =
+      appState.documentSession.recoverySourceURL?.lastPathComponent ?? "Recovered.md"
+    panel.prompt = "Save"
+    if panel.runModal() == .OK, let url = panel.url {
+      controller.saveActiveDocument(as: url)
+    }
+  }
+}
+
+private struct RecoveredFileBanner: View {
+  let sourceURL: URL
+  let saveToOriginal: () -> Void
+  let saveAs: () -> Void
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Image(systemName: "lifepreserver")
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Recovered unsaved changes")
+          .font(.callout.weight(.semibold))
+        Text(sourceURL.path)
+          .font(.caption)
+          .lineLimit(1)
+          .truncationMode(.middle)
+        Text("The original file has not been overwritten.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      Button("Save to Original", action: saveToOriginal)
+      Button("Save As…", action: saveAs)
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .background(.orange.opacity(0.12))
+    .accessibilityIdentifier("pensieve.recoveredFile.banner")
   }
 }
 
@@ -431,7 +486,7 @@ private struct RecoveredDraftRow: View {
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 12) {
       VStack(alignment: .leading, spacing: 2) {
-        Text(draft.title)
+        Text(draft.displayTitle)
           .font(.callout)
           .foregroundStyle(Color(palette.primaryText))
           .lineLimit(1)
@@ -442,6 +497,16 @@ private struct RecoveredDraftRow: View {
         Text(draft.updatedAt.formatted(date: .abbreviated, time: .shortened))
           .font(.caption2)
           .foregroundStyle(Color(palette.tertiaryText))
+        if let sourceURL = draft.sourceURL {
+          Text(sourceURL.path)
+            .font(.caption2)
+            .foregroundStyle(Color(palette.tertiaryText))
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Text("Emergency copy — the original file has not been overwritten.")
+            .font(.caption2)
+            .foregroundStyle(Color(palette.tertiaryText))
+        }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
