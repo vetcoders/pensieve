@@ -440,7 +440,13 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
 - **Opening recovery never overwrites the original.** It opens a dirty recovered
   buffer, displays the original path, and waits for an explicit decision:
   **Save to Original / Save As… / Don't Save / Cancel**. Cmd+S on that buffer
-  means Save to Original; Save As writes only the chosen destination.
+  means Save to Original; Save As writes only the chosen destination. If Save
+  to Original fails, Pensieve immediately refreshes that buffer's existing
+  recovery item with the latest bytes while preserving the same recovery ID and
+  original-path association. The buffer remains dirty and the original remains
+  stale. This recovery fallback protects the bytes but does not satisfy a Save
+  decision made during document close or global quit: both operations remain
+  vetoed until the original itself is current.
 - **A successful save retires the recovery item.** Saving to the original or a
   new destination removes the item only after the destination write succeeds.
   A launcher-level Save As also registers that destination in Pensieve's
@@ -468,8 +474,9 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
 
 The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
 source metadata across store reload, non-overwriting recovery open, explicit
-Save to Original, one-buffer/one-record identity, and red-X veto when both
-durable destinations fail.
+Save to Original success and failure, same-ID refresh with the latest recovered
+bytes, one-buffer/one-record identity, and red-X/global-quit veto until the
+original destination accepts the recovered buffer.
 
 ### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
 

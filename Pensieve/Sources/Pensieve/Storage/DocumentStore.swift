@@ -3731,8 +3731,9 @@ final class DocumentStore {
       guard saveAs(appState: appState, to: url) else { return false }
 
     case (.confirm(.saveRecoveredFile), .save):
-      guard let sourceURL = appState.documentSession.recoverySourceURL else { return false }
-      guard saveAs(appState: appState, to: sourceURL) else { return false }
+      guard saveRecoveredFileToOriginalOrRecoveryFallback(appState: appState) == .original else {
+        return false
+      }
 
     case (.confirm(.saveRecoveredFile), .saveAs):
       guard let url = savePanelURLProvider(appState) else { return false }
@@ -3792,8 +3793,8 @@ final class DocumentStore {
   }
 
   func save(appState: AppState) {
-    if let sourceURL = appState.documentSession.recoverySourceURL {
-      _ = saveAs(appState: appState, to: sourceURL)
+    if appState.documentSession.recoverySourceURL != nil {
+      _ = saveRecoveredFileToOriginalOrRecoveryFallback(appState: appState)
     } else {
       _ = saveExistingOrRecoveryFallback(
         appState: appState, indexNow: true, trigger: .explicit)
@@ -3802,10 +3803,25 @@ final class DocumentStore {
 
   @discardableResult
   func saveAs(appState: AppState, to url: URL) -> Bool {
+    switch attemptSaveToURL(appState: appState, url: url) {
+    case .saved:
+      return true
+    case .notApplicable:
+      return false
+    case .failed(let message):
+      // DATA LOSS: the edit reached no file, so the buffer is the only copy
+      // of it and the document on disk is stale.
+      appState.reportDataLoss(message)
+      NSLog("%@", message)
+      return false
+    }
+  }
+
+  private func attemptSaveToURL(appState: AppState, url: URL) -> FileDestinationSaveAttempt {
     self.appState = appState
     cancelOwnDebouncesOnSessionChange(appState: appState)
 
-    guard appState.documentSession.hasEditableBuffer else { return false }
+    guard appState.documentSession.hasEditableBuffer else { return .notApplicable }
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
     let previousID = appState.documentSession.id
     let recoveryID = appState.documentSession.recoveryID
@@ -3832,14 +3848,10 @@ final class DocumentStore {
       // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
       retireSettledForeignIndexDebounces(for: ref.id, by: appState)
       indexDocument(ref, appState.documentSession.text, appState)
-      return true
+      return .saved
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
-      // DATA LOSS: the edit reached no file, so the buffer is the only copy
-      // of it and the document on disk is stale.
-      appState.reportDataLoss(message)
-      NSLog(message)
-      return false
+      return .failed(message)
     }
   }
 
@@ -4223,6 +4235,50 @@ final class DocumentStore {
     return .recovery
   }
 
+  /// Saves an adopted file-backed recovery buffer back to the file named by
+  /// its `.source` sidecar. This is the single Save-to-Original route for the
+  /// banner, Cmd+S, document close and the global quit preflight.
+  ///
+  /// The adopted buffer is still an untitled recovery session, so the ordinary
+  /// existing-file path cannot address its original. A failed destination write
+  /// therefore falls back immediately to the SAME recovery record, preserving
+  /// its ID, source association and latest bytes. Recovery durability does not
+  /// satisfy an explicit Save-to-Original close/quit decision: callers that
+  /// require the original to become current accept only `.original` and keep the
+  /// window/process alive for `.recovery` as well as `.failed`.
+  private func saveRecoveredFileToOriginalOrRecoveryFallback(
+    appState: AppState
+  ) -> DurableSaveOutcome {
+    guard let sourceURL = appState.documentSession.recoverySourceURL else {
+      return .failed
+    }
+
+    let originalFailure: String
+    switch attemptSaveToURL(appState: appState, url: sourceURL) {
+    case .saved:
+      return .original
+    case .notApplicable:
+      return .failed
+    case .failed(let message):
+      originalFailure = message
+      appState.documentSession.recordOriginalSaveFailure(message)
+      NSLog("%@", message)
+    }
+
+    guard
+      persistRecoverySnapshot(
+        appState: appState,
+        clearsErrorsOnSuccess: false,
+        precedingFailure: originalFailure)
+    else {
+      return .failed
+    }
+
+    appState.resolveError()
+    appState.lastError = recoverySafeStatus(after: originalFailure)
+    return .recovery
+  }
+
   private func recoverySafeStatus(after originalFailure: String?) -> String {
     let safeStatus = "A recovery copy is safe; the original file was not overwritten."
     guard let originalFailure else { return safeStatus }
@@ -4350,10 +4406,11 @@ final class DocumentStore {
       return .settled
     }
 
-    if let sourceURL = appState.documentSession.recoverySourceURL {
+    if appState.documentSession.recoverySourceURL != nil {
       switch dirtySessionPrompt(appState.documentSession) {
       case .save:
-        return saveAs(appState: appState, to: sourceURL) ? .settled : nil
+        return saveRecoveredFileToOriginalOrRecoveryFallback(appState: appState) == .original
+          ? .settled : nil
       case .saveAs:
         guard let url = savePanelURLProvider(appState) else { return nil }
         return saveAs(appState: appState, to: url) ? .settled : nil
@@ -4669,6 +4726,12 @@ final class DocumentStore {
     case original
     case recovery
     case failed
+  }
+
+  private enum FileDestinationSaveAttempt {
+    case saved
+    case failed(String)
+    case notApplicable
   }
 
   /// A write that was refused rather than attempted.

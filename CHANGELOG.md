@@ -59,7 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stable condition, so its two internal errors cannot resurrect a dismissed
   banner on every debounce tick. A failed explicit Cmd+S now uses that same
   immediate recovery fallback without claiming that the stale original was
-  saved; a later successful original write still retires the emergency copy.
+  saved. This also covers a recovered file's Save to Original action: a failed
+  Cmd+S, close, or quit refreshes the same recovery item with the latest edit
+  and preserves its original-path association. Close and quit remain vetoed
+  until the original itself accepts the bytes; a later successful original
+  write still retires the emergency copy.
   When auto-save is off and a later recovery tick succeeds, Pensieve keeps the
   original-write failure separate from the resolved recovery failure and says
   the emergency copy is safe instead of publishing a contradictory status. If

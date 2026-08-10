@@ -284,6 +284,146 @@ final class RecoveredDraftsTests: XCTestCase {
   }
 
   @MainActor
+  func testFailedCmdSSaveToOriginalRefreshesTheSameDraftAndLaterSuccessRetiresIt() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("umowa.md")
+    try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
+    let recoveryStore = try makeRecoveryStore(in: folder)
+    let draft = try recoveryStore.saveDraft(
+      id: nil,
+      title: "umowa.md",
+      text: "recovered revision",
+      sourceURL: sourceURL)
+    recoveryStore.markDraftClosed(id: draft.id)
+    var originalWriteShouldFail = true
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      writeDocument: { text, url in
+        if originalWriteShouldFail {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      })
+    let appState = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+    appState.activeDocumentText = "latest recovered edit"
+    appState.activeDocumentDirty = true
+
+    documentStore.save(appState: appState)
+
+    let draftsAfterFailedSave = recoveryStore.loadDrafts()
+    XCTAssertEqual(draftsAfterFailedSave.count, 1)
+    let refreshedDraft = try XCTUnwrap(draftsAfterFailedSave.first)
+    XCTAssertEqual(refreshedDraft.id, draft.id)
+    XCTAssertEqual(refreshedDraft.text, "latest recovered edit")
+    XCTAssertEqual(refreshedDraft.sourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertEqual(appState.documentSession.recoverySourceURL, sourceURL.standardizedFileURL)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertNil(appState.unresolvedDataLoss)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
+
+    originalWriteShouldFail = false
+    documentStore.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "latest recovered edit")
+    XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
+    XCTAssertEqual(appState.documentSession.url, sourceURL.standardizedFileURL)
+    XCTAssertNil(appState.documentSession.recoveryID)
+    XCTAssertNil(appState.documentSession.recoverySourceURL)
+    XCTAssertFalse(appState.documentSession.isDirty)
+    XCTAssertNil(appState.currentError)
+  }
+
+  @MainActor
+  func testCloseVetoesFailedSaveToOriginalAfterRefreshingTheSameDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("close-original.md")
+    try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
+    let recoveryStore = try makeRecoveryStore(in: folder)
+    let draft = try recoveryStore.saveDraft(
+      id: nil,
+      title: "close-original.md",
+      text: "recovered revision",
+      sourceURL: sourceURL)
+    recoveryStore.markDraftClosed(id: draft.id)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    let appState = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+    appState.activeDocumentText = "latest edit before close"
+    appState.activeDocumentDirty = true
+
+    XCTAssertFalse(
+      documentStore.finishClose(
+        decision: .confirm(.saveRecoveredFile),
+        response: .save,
+        appState: appState))
+
+    let draftsAfterFailedClose = recoveryStore.loadDrafts()
+    XCTAssertEqual(draftsAfterFailedClose.count, 1)
+    let refreshedDraft = try XCTUnwrap(draftsAfterFailedClose.first)
+    XCTAssertEqual(refreshedDraft.id, draft.id)
+    XCTAssertEqual(refreshedDraft.text, "latest edit before close")
+    XCTAssertEqual(refreshedDraft.sourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertEqual(appState.documentSession.recoverySourceURL, sourceURL.standardizedFileURL)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
+  }
+
+  @MainActor
+  func testQuitVetoesFailedSaveToOriginalAfterRefreshingTheSameDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let sourceURL = folder.appendingPathComponent("quit-original.md")
+    try "original on disk".write(to: sourceURL, atomically: true, encoding: .utf8)
+    let recoveryStore = try makeRecoveryStore(in: folder)
+    let draft = try recoveryStore.saveDraft(
+      id: nil,
+      title: "quit-original.md",
+      text: "recovered revision",
+      sourceURL: sourceURL)
+    recoveryStore.markDraftClosed(id: draft.id)
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: indexDatabase,
+      recoveryStore: recoveryStore,
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+      dirtySessionPrompt: { _ in .save })
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: DocumentWindowRegistry(canMutateWindowTabs: { true }))
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+    appState.activeDocumentText = "latest edit before quit"
+    appState.activeDocumentDirty = true
+
+    XCTAssertFalse(controller.applicationShouldTerminate())
+
+    let draftsAfterFailedQuit = recoveryStore.loadDrafts()
+    XCTAssertEqual(draftsAfterFailedQuit.count, 1)
+    let refreshedDraft = try XCTUnwrap(draftsAfterFailedQuit.first)
+    XCTAssertEqual(refreshedDraft.id, draft.id)
+    XCTAssertEqual(refreshedDraft.text, "latest edit before quit")
+    XCTAssertEqual(refreshedDraft.sourceURL, sourceURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertEqual(appState.documentSession.recoverySourceURL, sourceURL.standardizedFileURL)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertEqual(try String(contentsOf: sourceURL, encoding: .utf8), "original on disk")
+  }
+
+  @MainActor
   func testOpenAdoptsTheDraftAndLeavesTheFileUntilItIsDecided() throws {
     let folder = try makeTemporaryFolder()
     let store = try makeRecoveryStore(in: folder)
