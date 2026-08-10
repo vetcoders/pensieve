@@ -47,6 +47,9 @@ final class AppController: ObservableObject {
       DocumentClosePrompt, DocumentSession, NSWindow?,
       @escaping @MainActor (SaveChangesResponse) -> Void
     ) -> Void
+  /// Asks whether a global quit may continue while leaving a recovery copy on
+  /// disk. The title identifies the document whose cleanup failed.
+  typealias QuitAfterRecoveryRetirementFailureConfirmation = @MainActor (String) -> Bool
 
   private let appState: AppState
   private let folderManager: FolderManager
@@ -63,6 +66,8 @@ final class AppController: ObservableObject {
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
   private let confirmDiscardDraft: DraftDiscardConfirmation
+  private let confirmQuitAfterRecoveryRetirementFailure:
+    QuitAfterRecoveryRetirementFailureConfirmation
   /// Finder can move an ad-hoc working-set file to Trash while no watched
   /// workspace root covers it. Reconcile when Pensieve becomes active again;
   /// the publisher is process-wide, but each window sees the same shared
@@ -191,6 +196,21 @@ final class AppController: ObservableObject {
       alert.addButton(withTitle: "Cancel")
       alert.buttons[1].keyEquivalent = "\u{1b}"
       return alert.runModal() == .alertFirstButtonReturn
+    },
+    confirmQuitAfterRecoveryRetirementFailure:
+      @escaping
+    QuitAfterRecoveryRetirementFailureConfirmation = { title in
+      let alert = NSAlert()
+      alert.messageText = "The recovery copy couldn’t be removed."
+      alert.informativeText =
+        "Pensieve can keep “\(title)” open so you can retry, or quit without removing its recovery copy. If you quit, the discarded copy may appear in Recovered Drafts the next time Pensieve opens."
+      alert.alertStyle = .warning
+      let keepOpenButton = alert.addButton(withTitle: "Keep Pensieve Open")
+      keepOpenButton.keyEquivalent = "\u{1b}"
+      let quitAnywayButton = alert.addButton(withTitle: "Quit Anyway")
+      quitAnywayButton.hasDestructiveAction = true
+      alert.window.defaultButtonCell = keepOpenButton.cell as? NSButtonCell
+      return alert.runModal() == .alertSecondButtonReturn
     }
   ) {
     self.appState = appState
@@ -210,6 +230,8 @@ final class AppController: ObservableObject {
     self.confirmFolderTrash = confirmFolderTrash
     self.confirmSaveChanges = confirmSaveChanges
     self.confirmDiscardDraft = confirmDiscardDraft
+    self.confirmQuitAfterRecoveryRetirementFailure =
+      confirmQuitAfterRecoveryRetirementFailure
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
@@ -870,9 +892,13 @@ final class AppController: ObservableObject {
   /// chose to Discard and marking it clean. `.settled` is a no-op. Returns false
   /// if the recovery payload could not be retired, which vetoes the teardown.
   func applyDeferredDirtySessionResolution(
-    _ resolution: DocumentStore.DirtySessionResolution
+    _ resolution: DocumentStore.DirtySessionResolution,
+    onRecoveryRetirementFailure: @MainActor () -> Bool = { false }
   ) -> Bool {
-    documentStore.applyDeferredDirtySessionResolution(resolution, appState: appState)
+    documentStore.applyDeferredDirtySessionResolution(
+      resolution,
+      appState: appState,
+      onRecoveryRetirementFailure: onRecoveryRetirementFailure)
   }
 
   func clearOpenFiles() {
@@ -1089,6 +1115,12 @@ final class AppController: ObservableObject {
     //   aborted the quit — leaving a still-rendered buffer that no longer
     //   survives a crash and that the next ⌘Q/close no longer asks about.
     //
+    // Filesystem cleanup in phase 2 is deliberately sequential, not described
+    // as atomic: a recovery draft successfully deleted for an earlier explicit
+    // Discard cannot be rolled back if a later deletion fails. Keeping Pensieve
+    // open preserves the failing and not-yet-applied sessions; earlier conscious
+    // Discards remain applied.
+    //
     // Self is asked LAST so the firing window's own prompt is the final word,
     // exactly as before.
     var deferred: [(controller: AppController, resolution: DocumentStore.DirtySessionResolution)] =
@@ -1101,8 +1133,25 @@ final class AppController: ObservableObject {
     guard let ownResolution = confirmDirtySessionForDeferredClose() else { return false }
     deferred.append((self, ownResolution))
 
+    var didAuthorizeRetainedRecoveryForThisQuit = false
     for (controller, resolution) in deferred {
-      guard controller.applyDeferredDirtySessionResolution(resolution) else {
+      guard
+        controller.applyDeferredDirtySessionResolution(
+          resolution,
+          onRecoveryRetirementFailure: {
+            if didAuthorizeRetainedRecoveryForThisQuit {
+              return true
+            }
+            guard
+              self.confirmQuitAfterRecoveryRetirementFailure(
+                controller.appState.documentSession.displayTitle)
+            else {
+              return false
+            }
+            didAuthorizeRetainedRecoveryForThisQuit = true
+            return true
+          })
+      else {
         return false
       }
     }

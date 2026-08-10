@@ -192,6 +192,10 @@ the same decisions across their tabs; they do not invent a second saving policy.
   As… / Don't Save / Cancel**.
 - `Cancel`, a dismissed save picker, or failure to make the current bytes
   durable vetoes the close. There is no implicit discard path.
+- If a conscious Don't Save cannot remove its recovery payload, document/tab
+  close and **Clear Open Files** also veto teardown. The global quit path has the
+  one explicit exception described under `Cmd+Q`; it does not change these
+  document-level close rules.
 
 ### `Cmd+Z` / `Shift+Cmd+Z` — Undo / Redo
 
@@ -257,7 +261,27 @@ Opens Settings/Preferences, if available.
 
 ### `Cmd+Q` — Quit Pensieve
 
-Quits the whole application per macOS convention. If dirty buffers or recovery items requiring a decision exist, the app must protect the user from data loss.
+Quits the whole application per macOS convention. It first collects the close
+decision for every document; a `Cancel`, dismissed save picker, or true
+original-plus-RecoveryStore write failure remains a hard veto with no override.
+
+If the user already chose Don't Save but Pensieve cannot remove that document's
+recovery payload, global quit presents **Keep Pensieve Open** (safe default and
+Escape) and the destructive **Quit Anyway**. Keep Pensieve Open vetoes the quit
+and leaves the failing session dirty and its payload claimed. Quit Anyway applies
+the Don't Save decision without pretending cleanup succeeded: the session becomes
+clean, the payload and its live claim remain until process exit, and the discarded
+copy may appear in Recovered Drafts on the next launch. One Quit Anyway
+confirmation authorizes the current and any remaining retirement failures in
+that same quit pass; a later quit is a new pass and asks again.
+
+The collect phase is atomic with respect to a later `Cancel`, but phase-two
+filesystem cleanup is sequential and cannot be rolled back. If an earlier
+explicit Don't Save already removed its payload before a later retirement fails,
+choosing Keep Pensieve Open leaves that earlier decision applied. The failing and
+not-yet-applied discard sessions remain dirty, and any existing recovery payloads
+remain claimed. This narrow boundary does not weaken the hard veto for unsaved
+bytes that have no durable original or recovery copy.
 
 ---
 
@@ -418,12 +442,14 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   Recents, but does not open or select it in the launcher.
   Don't Save removes it only as a conscious rejection. Cancel and any failed
   write leave both the buffer and recovery item intact. If the filesystem
-  refuses to retire the recovery payload after Don't Save, that decision is not
-  complete: close/quit is vetoed, the buffer stays dirty and the recovery item
-  remains claimed for a safe retry instead of returning as a ghost on relaunch.
+  refuses to retire the recovery payload after Don't Save, document/tab close
+  and Clear Open Files veto teardown: the buffer stays dirty and the item remains
+  claimed for a safe retry. Global quit alone may continue after the explicit
+  **Quit Anyway** confirmation; it then retains the claimed payload through
+  process exit and warns that the copy may return in Recovered Drafts on relaunch.
 - **An untouched empty draft closes silently.** A draft asks where to save only
   after it contains unsaved changes.
-- **Close and quit fail closed.** If an original-file write fails, Pensieve
+- **Content durability fails closed.** If an original-file write fails, Pensieve
   attempts the recovery fallback before allowing teardown. If neither the
   original nor RecoveryStore accepts the bytes, the window/quit remains open,
   the buffer remains dirty, and the error explicitly says the only copy is

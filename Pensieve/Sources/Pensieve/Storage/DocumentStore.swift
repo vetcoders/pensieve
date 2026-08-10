@@ -4215,8 +4215,16 @@ final class DocumentStore {
     "Saved \(title), but could not retire its recovery copy. It remains protected and can be discarded after the storage error is resolved."
   }
 
-  private func retireRecoveryForConsciousDiscard(appState: AppState) -> Bool {
+  private func retireRecoveryForConsciousDiscard(
+    appState: AppState,
+    onFailure: @MainActor () -> Bool = { false }
+  ) -> Bool {
     guard recoveryStore.deleteDraft(id: appState.documentSession.recoveryID) else {
+      if onFailure() {
+        appState.lastError =
+          "Could not remove the recovery copy. It may appear in Recovered Drafts the next time Pensieve opens."
+        return true
+      }
       appState.lastError =
         "Could not discard the recovery copy. The document will stay open so you can retry."
       return false
@@ -4400,17 +4408,31 @@ final class DocumentStore {
   /// durable recovery payload could not be retired; callers must then keep the
   /// window/process alive instead of presenting the Discard as completed.
   private func applyDirtySessionResolution(
-    _ resolution: DirtySessionResolution, appState: AppState
+    _ resolution: DirtySessionResolution,
+    appState: AppState,
+    onRecoveryRetirementFailure: @MainActor () -> Bool = { false }
   ) -> Bool {
     switch resolution {
     case .settled:
       return true
     case .discardUntitled:
-      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
+      guard
+        retireRecoveryForConsciousDiscard(
+          appState: appState,
+          onFailure: onRecoveryRetirementFailure)
+      else {
+        return false
+      }
       appState.documentSession.isDirty = false
       return true
     case .discardPathedEdit:
-      guard retireRecoveryForConsciousDiscard(appState: appState) else { return false }
+      guard
+        retireRecoveryForConsciousDiscard(
+          appState: appState,
+          onFailure: onRecoveryRetirementFailure)
+      else {
+        return false
+      }
       // The pending debounced write must not resurrect the dropped edit; the
       // file on disk keeps the bytes it already had. Scoped to THIS window's
       // session — a blanket cancel would also disarm another window's armed
@@ -4435,12 +4457,20 @@ final class DocumentStore {
   /// step deferred in phase 1. Called only once every window confirmed without a
   /// Cancel, and BEFORE the windows are torn down, so a dropped draft can't
   /// resurrect and a stale `isDirty` can't trip the teardown save hook. A
-  /// failed recovery retirement returns `false` and vetoes teardown.
+  /// failed recovery retirement returns `false` and vetoes teardown unless the
+  /// caller explicitly accepts a retained copy. Only global quit supplies that
+  /// escape hatch; window/tab close and "Clear Open Files" use the fail-closed
+  /// default.
   func applyDeferredDirtySessionResolution(
-    _ resolution: DirtySessionResolution, appState: AppState
+    _ resolution: DirtySessionResolution,
+    appState: AppState,
+    onRecoveryRetirementFailure: @MainActor () -> Bool = { false }
   ) -> Bool {
     self.appState = appState
-    return applyDirtySessionResolution(resolution, appState: appState)
+    return applyDirtySessionResolution(
+      resolution,
+      appState: appState,
+      onRecoveryRetirementFailure: onRecoveryRetirementFailure)
   }
 
   /// Settles the current buffer before something replaces it WITHIN this window:

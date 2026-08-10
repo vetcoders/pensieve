@@ -3556,6 +3556,56 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.lastError?.contains("Could not save doomed.md") == true)
   }
 
+  /// Quit Anyway is intentionally unavailable to document-level close. A ⌘W
+  /// Don't Save still fails closed when its recovery payload cannot be retired.
+  @MainActor
+  func testCloseActiveDocumentRetirementFailureHasNoQuitAnywayEscapeHatch() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let recovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(recoveryStore: recovery)
+    var quitConfirmationCount = 0
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore,
+      confirmSaveChanges: { _, _, _, respond in respond(.discard) },
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        quitConfirmationCount += 1
+        return true
+      })
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "keep this document open"
+    appState.activeDocumentDirty = true
+    XCTAssertTrue(
+      documentStore.savePendingChangesOnClose(
+        appState: appState,
+        releasesDraftClaim: false))
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+
+    var didClose: Bool?
+    controller.closeActiveDocument { didClose = $0 }
+
+    XCTAssertEqual(didClose, false)
+    XCTAssertEqual(quitConfirmationCount, 0)
+    XCTAssertTrue(appState.activeDocumentDirty)
+    XCTAssertEqual(appState.activeDocumentText, "keep this document open")
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id))
+    XCTAssertTrue(appState.lastError?.contains("Could not discard the recovery copy") == true)
+  }
+
   @MainActor
   func testControllerRoutesModeAndPreferenceCommands() {
     let appState = AppState()
@@ -3854,12 +3904,20 @@ final class PensieveSmokeTests: XCTestCase {
       indexDatabase: temporaryIndexDatabase(in: folder),
       recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL),
       savingSettings: makeAutoSaveSettings(enabled: true))
+    var retirementConfirmationCount = 0
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: documentStore)
+      documentStore: documentStore,
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        retirementConfirmationCount += 1
+        return true
+      })
 
     XCTAssertFalse(controller.applicationShouldTerminate())
+    XCTAssertEqual(
+      retirementConfirmationCount, 0,
+      "Quit Anyway never overrides a true original-plus-recovery write failure")
     XCTAssertTrue(appState.documentSession.hasEditableBuffer)
     XCTAssertTrue(appState.documentSession.isDirty)
     XCTAssertEqual(appState.documentSession.text, "only in memory")
@@ -3924,11 +3982,10 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(stateB.documentSession.isDirty)
   }
 
-  /// A Don't Save answer is not complete until its recovery payload is really
-  /// gone. If that retirement fails, quit must remain vetoed and must not arm
-  /// the one-shot pass latch over a still-dirty live buffer.
+  /// Keeping Pensieve open after a retirement failure preserves the failing
+  /// session and must not arm the one-shot pass latch over its dirty buffer.
   @MainActor
-  func testQuitIsVetoedWhenRecoveryRetirementAfterDiscardFails() throws {
+  func testQuitKeepOpenVetoesWhenRecoveryRetirementAfterDiscardFails() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveQuitRetireFail-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3949,11 +4006,16 @@ final class PensieveSmokeTests: XCTestCase {
     let store = makeTestDocumentStore(
       recoveryStore: recovery,
       dirtySessionPrompt: { _ in .discard })
+    var confirmationTitles: [String] = []
     let controller = AppController(
       appState: state,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
       documentStore: store,
-      documentWindowRegistry: registry)
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return false
+      })
     XCTAssertTrue(controller.createUntitledDocument())
     state.activeDocumentText = "keep this live when retirement fails"
     state.activeDocumentDirty = true
@@ -3961,13 +4023,220 @@ final class PensieveSmokeTests: XCTestCase {
     let draft = try XCTUnwrap(recovery.loadDrafts().first)
     registry.registerController(controller, for: window)
 
-    XCTAssertFalse(controller.applicationShouldTerminate())
+    XCTAssertEqual(
+      registry.resolveTerminationRequest(), .terminateCancel,
+      "Dock, AppleScript and logout quits use the same safe Keep Open default")
 
+    XCTAssertEqual(confirmationTitles, ["Untitled.md"])
     XCTAssertTrue(state.activeDocumentDirty)
     XCTAssertEqual(state.activeDocumentText, "keep this live when retirement fails")
     XCTAssertTrue(recovery.isDraftOpen(id: draft.id))
     XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
     XCTAssertTrue(state.lastError?.contains("Could not discard the recovery copy") == true)
+    XCTAssertFalse(
+      registry.consumeTerminationPassLatch(),
+      "Keep Pensieve Open must leave the next global quit guarded")
+  }
+
+  /// One destructive confirmation belongs to the whole global quit pass. Once
+  /// accepted, every later retirement failure in that pass may retain its
+  /// payload; the user's Don't Save decisions are still applied and the quit
+  /// latch is armed exactly as it is for an ordinary settled pass.
+  @MainActor
+  func testQuitAnywayAuthorizesAllRetirementFailuresInTheSamePass() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitAnywayTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let otherWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      otherWindow.close()
+    }
+
+    let makeFailingRecovery: (String) -> RecoveryStore = { name in
+      RecoveryStore(
+        directoryURL: folder.appendingPathComponent(name, isDirectory: true),
+        removeItem: { url in
+          if url.pathExtension == "md" {
+            throw CocoaError(.fileWriteNoPermission)
+          }
+          try FileManager.default.removeItem(at: url)
+        })
+    }
+    var confirmationTitles: [String] = []
+
+    let otherRecovery = makeFailingRecovery("RecoveryOther")
+    let otherURL = folder.appendingPathComponent("other.md")
+    try "other on disk".write(to: otherURL, atomically: true, encoding: .utf8)
+    let otherAutosaver = Autosaver(
+      saveDelayMilliseconds: 60_000,
+      indexDelayMilliseconds: 60_000)
+    let otherState = AppState()
+    let otherStore = makeTestDocumentStore(
+      autosaver: otherAutosaver,
+      bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: otherRecovery,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      dirtySessionPrompt: { _ in .discard })
+    let otherController = AppController(
+      appState: otherState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: otherStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return true
+      })
+    otherStore.load(ref: DocumentRef(id: otherURL.standardizedFileURL), into: otherState)
+    otherState.activeDocumentText = "protected recovery snapshot"
+    otherStore.documentDidChange(appState: otherState)
+    XCTAssertTrue(
+      otherStore.savePendingChangesOnClose(appState: otherState, releasesDraftClaim: false))
+    let otherDraft = try XCTUnwrap(otherRecovery.loadDrafts().first)
+    otherState.activeDocumentText = "other discarded edit"
+    otherStore.documentDidChange(appState: otherState)
+    XCTAssertTrue(otherAutosaver.armedSaveIsOwned(by: otherState))
+
+    let firingRecovery = makeFailingRecovery("RecoveryFiring")
+    let firingState = AppState()
+    let firingStore = makeTestDocumentStore(
+      recoveryStore: firingRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    let firingController = AppController(
+      appState: firingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: firingStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return true
+      })
+    XCTAssertTrue(firingController.createUntitledDocument())
+    firingState.activeDocumentText = "firing retained recovery"
+    firingState.activeDocumentDirty = true
+    XCTAssertTrue(
+      firingStore.savePendingChangesOnClose(appState: firingState, releasesDraftClaim: false))
+    let firingDraft = try XCTUnwrap(firingRecovery.loadDrafts().first)
+
+    registry.registerController(otherController, for: otherWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertTrue(firingController.applicationShouldTerminate())
+
+    XCTAssertEqual(confirmationTitles, ["other"], "the quit pass asks only once")
+    XCTAssertFalse(otherState.activeDocumentDirty)
+    XCTAssertFalse(firingState.activeDocumentDirty)
+    XCTAssertFalse(
+      otherAutosaver.armedSaveIsOwned(by: otherState),
+      "a pathed Don't Save cancels only that session's pending write")
+    XCTAssertEqual(try String(contentsOf: otherURL, encoding: .utf8), "other on disk")
+    XCTAssertEqual(otherRecovery.loadDrafts().map(\.id), [otherDraft.id])
+    XCTAssertEqual(firingRecovery.loadDrafts().map(\.id), [firingDraft.id])
+    XCTAssertTrue(otherRecovery.isDraftOpen(id: otherDraft.id))
+    XCTAssertTrue(firingRecovery.isDraftOpen(id: firingDraft.id))
+    XCTAssertTrue(otherState.lastError?.contains("may appear in Recovered Drafts") == true)
+    XCTAssertTrue(firingState.lastError?.contains("may appear in Recovered Drafts") == true)
+    XCTAssertTrue(
+      registry.consumeTerminationPassLatch(),
+      "Quit Anyway settles the pass and must cover the AppKit terminate hook")
+
+    otherState.activeDocumentDirty = true
+    firingState.activeDocumentDirty = true
+    XCTAssertTrue(firingController.applicationShouldTerminate())
+    XCTAssertEqual(
+      confirmationTitles.count, 2,
+      "authorization is scoped to one pass; a later quit must confirm again")
+    XCTAssertTrue(registry.consumeTerminationPassLatch())
+  }
+
+  /// The collect phase is atomic with respect to a later Cancel, but filesystem
+  /// cleanup in apply cannot be rolled back. If an earlier recovery retirement
+  /// succeeded before a later one failed, Keep Pensieve Open preserves the
+  /// failing session while leaving the earlier conscious Discard applied.
+  @MainActor
+  func testQuitKeepOpenPreservesFailingSessionAfterEarlierDiscardWasApplied() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitPartialApply-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let earlierWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      earlierWindow.close()
+    }
+
+    // Other windows apply before the firing controller, so this successful
+    // retirement is the irreversible earlier step in the pass.
+    let earlierRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryEarlier", isDirectory: true))
+    let earlierState = AppState()
+    let earlierStore = makeTestDocumentStore(
+      recoveryStore: earlierRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    let earlierController = AppController(
+      appState: earlierState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: earlierStore,
+      documentWindowRegistry: registry)
+    XCTAssertTrue(earlierController.createUntitledDocument())
+    earlierState.activeDocumentText = "earlier conscious discard"
+    earlierState.activeDocumentDirty = true
+    XCTAssertTrue(
+      earlierStore.savePendingChangesOnClose(appState: earlierState, releasesDraftClaim: false))
+    let earlierDraft = try XCTUnwrap(earlierRecovery.loadDrafts().first)
+
+    let failingRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryFailing", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let failingState = AppState()
+    let failingStore = makeTestDocumentStore(
+      recoveryStore: failingRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    var confirmationCount = 0
+    let firingController = AppController(
+      appState: failingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: failingStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        confirmationCount += 1
+        return false
+      })
+    XCTAssertTrue(firingController.createUntitledDocument())
+    failingState.activeDocumentText = "failing recovery stays live"
+    failingState.activeDocumentDirty = true
+    XCTAssertTrue(
+      failingStore.savePendingChangesOnClose(appState: failingState, releasesDraftClaim: false))
+    let failingDraft = try XCTUnwrap(failingRecovery.loadDrafts().first)
+
+    registry.registerController(earlierController, for: earlierWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertFalse(firingController.applicationShouldTerminate())
+
+    XCTAssertEqual(confirmationCount, 1)
+    XCTAssertFalse(
+      earlierState.activeDocumentDirty,
+      "an earlier explicit Don't Save remains applied after its payload was deleted")
+    XCTAssertTrue(earlierRecovery.loadDrafts().isEmpty)
+    XCTAssertFalse(earlierRecovery.isDraftOpen(id: earlierDraft.id))
+    XCTAssertTrue(failingState.activeDocumentDirty)
+    XCTAssertEqual(failingState.activeDocumentText, "failing recovery stays live")
+    XCTAssertEqual(failingRecovery.loadDrafts().map(\.id), [failingDraft.id])
+    XCTAssertTrue(failingRecovery.isDraftOpen(id: failingDraft.id))
+    XCTAssertFalse(registry.consumeTerminationPassLatch())
   }
 
   /// A Cancel in ANY window aborts the whole quit; every window keeps its work.

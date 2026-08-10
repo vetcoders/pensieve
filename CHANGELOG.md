@@ -60,8 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   banner on every debounce tick. When auto-save is off and recovery succeeds,
   Pensieve says the emergency copy is safe and the original is stale instead of
   silently clearing the prior save failure. If a conscious Discard cannot
-  retire its recovery payload, Clear/quit now stops with the live buffer still
-  dirty instead of closing and letting the claimed copy reappear after restart.
+  retire its recovery payload, document close and Clear Open Files stop with the
+  live buffer still dirty. Global quit now offers a deliberate **Quit Anyway**
+  escape hatch after the safe **Keep Pensieve Open** default: one confirmation
+  settles the remaining Discards in that quit pass while retaining the failed
+  recovery copies and warning that they may reappear after restart. Cancel and
+  original-plus-recovery double-write failures remain hard vetoes.
 - **Unattended saves preserve the file around the Markdown.** The atomic
   replace-existing write publishes a new inode, so Pensieve now carries across
   the original mode, ownership, ACLs, extended attributes/Finder tags and
