@@ -364,11 +364,12 @@ grouping may resume.
 Startup restore is one indivisible exception to the timing above, not to its
 safety rule. The restore pins the initial document host for its whole multi-turn
 pass, and provider onboarding stays unpresented until every restored tab has
-joined and the final tab has been selected. A sheet, Settings window or helper
-surface becoming key must never redirect a later restore step or split the
-working set into additional windows. Pensieve still never mutates a tab group
-while it owns an attached sheet; it prevents that overlap instead. That rule
-covers the host the pass ADOPTS after its original host closes mid-pass: a
+joined and the transaction has completed its final selection decision,
+including preservation of a newer user selection. A sheet, Settings window or
+helper surface becoming key must never redirect a later restore step or split
+the working set into additional windows. Pensieve still never mutates a tab
+group while it owns an attached sheet; it prevents that overlap instead. That
+rule covers the host the pass ADOPTS after its original host closes mid-pass: a
 survivor carrying a sheet is not merged into, the pending ref waits for the next
 turn, and the pass keeps parking until the group can take it.
 
@@ -696,12 +697,22 @@ Close All must never cause silent data loss.
 
 - **Workspace is configuration — it always comes back** (decision 26.07, W9). The
   "Restore session on launch" toggle controls only the files that get opened
-  and the auto-select. Workspace roots remain indexed and protected in either
-  setting; they are not session entries and do not expire.
+  and the deterministic auto-select described below. Workspace roots remain
+  indexed and protected in either setting; they are not session entries and do
+  not expire.
 - With restore OFF, a cold launch creates exactly **one empty launcher** and
   opens zero documents. Workspace roots and the sidebar still return.
-- With restore ON, Pensieve restores the saved working set and its selection.
-- Startup restore opens at most **12 most recent** files of the working set
+- With restore ON, Pensieve restores the saved working set in its persisted
+  order and, by default, selects the final restored entry. A newer user
+  selection made while the multi-turn restore is still running is preserved
+  instead. The v1 working set records file membership and order, but does
+  **not** persist a separate identity for the tab that was selected at quit.
+  Switching between already-open tabs therefore does not change what a later
+  launch selects unless it also changes the working set. Exact tab membership,
+  order and selection belong to the true session snapshot named below, not to
+  the current bookmark list.
+- Startup restore opens at most the **final 12 entries in persisted working-set
+  order**
   (decision 03.08, interim pending a true session snapshot — target model:
   "tabs from the moment of quit", variant b from 31.07).
 - Restore **must not undo a deliberate Close** by the user.
@@ -838,7 +849,12 @@ An agent implementing or refactoring menu/commands must verify:
       a document frame, or moves document navigation outside its root window.
 - [ ] Startup restore keeps one pinned document host across run-loop turns;
       provider onboarding appears only after all restored tabs have joined and
-      the final tab has been selected.
+      the transaction has completed its final selection decision, including
+      preservation of a newer user selection.
+- [ ] The restore-ON runtime probe starts from a clean smoke-only working set,
+      restores one dedicated seed, then proves a zero-window external open does
+      not replay that session. A window-title census is not used as proof of
+      background native-tab membership.
 - [ ] Window-lifecycle fixtures that call `beginSheet`, `addChildWindow`,
       `addTabbedWindow`, or `makeKeyAndOrderFront` are parked offscreen and set
       to zero alpha before AppKit can order them; test chrome must never flash
@@ -856,7 +872,12 @@ An agent implementing or refactoring menu/commands must verify:
 - **[IMPLEMENTATION GAP]** `Shift+Cmd+T` Reopen Closed Tab:
   shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
   (see the `Shift+Cmd+T` section above); the feature itself is not yet
-  implemented.
+  implemented;
+- **[IMPLEMENTATION GAP]** a true session snapshot that persists exact tab
+  membership, tab order and the selected tab at quit. The current v1 working
+  set restores at most the final 12 bookmarked files in persisted order and
+  selects the final restored entry by default; it must not be described as
+  remembering a later tab switch.
 
 **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
 markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
