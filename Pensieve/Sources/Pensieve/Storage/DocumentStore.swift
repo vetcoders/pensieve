@@ -1104,9 +1104,7 @@ final class FolderManager {
     // create/duplicate select the new document themselves. Nor does opening a
     // different workspace, which is the cold path.
     appState.selectedDocumentID = nil
-    appState.activeDocumentURL = nil
-    appState.activeDocumentText = ""
-    appState.activeDocumentDirty = false
+    clearDocumentSessionReleasingRecoveryClaim(into: appState)
   }
 
   func addExcludedURLs(_ urls: [URL], into appState: AppState) {
@@ -1432,9 +1430,17 @@ final class FolderManager {
     appState.folderURL = nil
     if !appState.documentSession.isDirty {
       appState.selectedDocumentID = nil
-      appState.documentSession.clear()
+      clearDocumentSessionReleasingRecoveryClaim(into: appState)
     }
     appState.lastError = nil
+  }
+
+  /// Session clearing is also a recovery-ownership transition. Release only at
+  /// the successful replacement boundary: dirty sessions that close-workspace
+  /// deliberately preserves keep their claim and cannot be offered elsewhere.
+  private func clearDocumentSessionReleasingRecoveryClaim(into appState: AppState) {
+    recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    appState.documentSession.clear()
   }
 
   private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
@@ -2492,9 +2498,7 @@ final class FolderManager {
       DocumentStore.shared.select(ref: ref, into: appState)
     } else {
       appState.selectedDocumentID = nil
-      appState.activeDocumentURL = nil
-      appState.activeDocumentText = ""
-      appState.activeDocumentDirty = false
+      clearDocumentSessionReleasingRecoveryClaim(into: appState)
     }
   }
 
@@ -3481,11 +3485,38 @@ final class DocumentStore {
     }
   }
 
+  enum RecoveredDraftDiscardOutcome: Equatable {
+    case discarded
+    case claimedByAnotherWindow
+    case storageFailure
+  }
+
   /// Drops `draft` for good. The caller owns the confirmation.
+  ///
+  /// A launcher row rendered before another window adopted the draft is stale
+  /// and must not affect that live buffer. The adopting window itself is the
+  /// one exception: its matching `recoveryID` is the ownership proof already
+  /// used by Save As…, and a confirmed Discard clears that buffer only after
+  /// the payload is confirmed gone.
   @discardableResult
-  func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
-    guard !recoveryStore.isDraftOpen(id: draft.id) else { return false }
-    return recoveryStore.deleteDraft(id: draft.id)
+  func discardRecoveredDraft(
+    _ draft: RecoveryDraft,
+    into appState: AppState
+  ) -> RecoveredDraftDiscardOutcome {
+    self.appState = appState
+    let ownsDraft = appState.documentSession.recoveryID == draft.id
+    guard ownsDraft || !recoveryStore.isDraftOpen(id: draft.id) else {
+      return .claimedByAnotherWindow
+    }
+    guard recoveryStore.deleteDraft(id: draft.id) else { return .storageFailure }
+
+    if ownsDraft {
+      cancelOwnDebouncesOnSessionChange(appState: appState)
+      appState.cancelPendingDocumentLoad()
+      appState.selectedDocumentID = nil
+      appState.documentSession.clear()
+    }
+    return .discarded
   }
 
   func load(ref: DocumentRef, into appState: AppState) {

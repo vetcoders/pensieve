@@ -328,7 +328,7 @@ final class AppController: ObservableObject {
     // reopen the previous working set.
     if intent == .newUntitledTab {
       folderManager.restoreLastFolderInBackground(into: appState)
-      beginUntitledSession()
+      _ = beginUntitledSession()
       return
     }
 
@@ -1037,8 +1037,7 @@ final class AppController: ObservableObject {
       }
     }
 
-    beginUntitledSession()
-    return true
+    return beginUntitledSession()
   }
 
   func restoreLastFolder() {
@@ -1374,13 +1373,18 @@ final class AppController: ObservableObject {
   @discardableResult
   func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
     guard confirmDiscardDraft(draft) else { return false }
-    guard documentStore.discardRecoveredDraft(draft) else {
-      appState.lastError = "This recovered draft is already open in another window."
+    switch documentStore.discardRecoveredDraft(draft, into: appState) {
+    case .discarded:
       refreshRecoveredDrafts()
-      return false
+      return true
+    case .claimedByAnotherWindow:
+      appState.lastError = "This recovered draft is already open in another window."
+    case .storageFailure:
+      appState.lastError =
+        "Could not discard \(draft.displayTitle). The recovery copy is still on disk; resolve the storage error and try again."
     }
     refreshRecoveredDrafts()
-    return true
+    return false
   }
 
   /// `NSApp` is an implicitly unwrapped global that stays nil until something
@@ -2029,10 +2033,14 @@ final class AppController: ObservableObject {
     return untitledTitle(for: index)
   }
 
-  private func beginUntitledSession() {
+  @discardableResult
+  private func beginUntitledSession() -> Bool {
+    guard documentStore.prepareForDocumentSwitch(appState: appState) else { return false }
+    documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
     appState.documentSession.createUntitled(title: nextUntitledTitle())
     appState.selectedDocumentID = nil
     appState.lastError = nil
+    return true
   }
 
   private func untitledTitle(for index: Int) -> String {

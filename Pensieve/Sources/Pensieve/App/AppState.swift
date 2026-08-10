@@ -444,20 +444,12 @@ final class AppState {
   /// focused window can never surface a sheet in another one.
   var pendingDispatchIntent: DispatchIntent?
 
-  var activeDocumentURL: URL? {
-    get {
-      documentSession.url
-    }
-    set {
-      guard let newValue else {
-        documentSession.clear()
-        return
-      }
-
-      let standardizedURL = newValue.standardizedFileURL
-      documentSession.document = documentRef(for: standardizedURL)
-    }
-  }
+  /// The active file location, if this window currently owns a file-backed
+  /// session. Session replacement belongs to `DocumentStore` / `FolderManager`:
+  /// they must release any RecoveryStore claim at the same successful boundary.
+  /// Keeping a public nil setter here let callers clear the buffer while
+  /// silently stranding that claim until process exit.
+  var activeDocumentURL: URL? { documentSession.url }
 
   var activeDocumentText: String {
     get {

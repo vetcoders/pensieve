@@ -73,9 +73,15 @@ final class RefreshOpensNothingTests: XCTestCase {
     selectDocument(at: alphaURL, in: appState)
     XCTAssertEqual(appState.documentSession.url?.standardizedFileURL, alphaURL)
 
+    let recovery = try harness.recoveryStore.saveDraft(
+      id: nil,
+      title: "Unsaved changes — alpha.md",
+      text: appState.documentSession.text,
+      sourceURL: alphaURL)
+    appState.documentSession.recoveryID = recovery.id
+    XCTAssertTrue(harness.recoveryStore.isDraftOpen(id: recovery.id))
+
     try FileManager.default.removeItem(at: alphaURL)
-    appState.selectedDocumentID = nil
-    appState.documentSession.clear()
     harness.manager.refresh(into: appState, force: true)
     await harness.manager.waitForPendingForcedRefresh()
 
@@ -84,6 +90,10 @@ final class RefreshOpensNothingTests: XCTestCase {
       "losing the document you were reading is not an instruction to read a different one")
     XCTAssertNil(appState.documentSession.url)
     XCTAssertEqual(appState.activeDocumentText, "")
+    XCTAssertFalse(
+      harness.recoveryStore.isDraftOpen(id: recovery.id),
+      "the refresh cleared the buffer, so its emergency copy must be offerable immediately")
+    XCTAssertEqual(harness.recoveryStore.unclaimedDrafts().map(\.id), [recovery.id])
   }
 
   /// THE REGRESSION PIN, case three: excluding the subtree the open document
@@ -186,6 +196,8 @@ final class RefreshOpensNothingTests: XCTestCase {
       "PensieveRefreshOpensNothing-\(UUID().uuidString)", isDirectory: true)
     let root = container.appendingPathComponent("Workspace", isDirectory: true)
     let support = container.appendingPathComponent("Support", isDirectory: true)
+    let recoveryStore = RecoveryStore(
+      directoryURL: support.appendingPathComponent("Recovery", isDirectory: true))
     for directory in [root, support] {
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
@@ -200,6 +212,7 @@ final class RefreshOpensNothingTests: XCTestCase {
         databaseURL: support.appendingPathComponent("index-\(UUID().uuidString).db")),
       bookmarkStore: BookmarkStore(
         defaults: makeEphemeralDefaults(prefix: "PensieveRefreshOpensNothing")),
+      recoveryStore: recoveryStore,
       workspaceSubstrate: WorkspaceSubstrate(
         store: WorkspaceCacheStore(
           baseDirectory: support.appendingPathComponent("WorkspaceCache", isDirectory: true))),
@@ -207,7 +220,7 @@ final class RefreshOpensNothingTests: XCTestCase {
       // would be racing it; every refresh here is scheduled explicitly.
       watcher: FileWatcher(sourceFactory: { @Sendable in SilentWatcherEventSource() })
     )
-    return RefreshHarness(root: root, manager: manager)
+    return RefreshHarness(root: root, manager: manager, recoveryStore: recoveryStore)
   }
 }
 
@@ -215,6 +228,7 @@ final class RefreshOpensNothingTests: XCTestCase {
 private struct RefreshHarness {
   let root: URL
   let manager: FolderManager
+  let recoveryStore: RecoveryStore
 
   @discardableResult
   func writeNote(named name: String, in folder: String? = nil) throws -> URL {

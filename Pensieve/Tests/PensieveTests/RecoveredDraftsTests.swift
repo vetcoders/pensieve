@@ -224,6 +224,7 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertFalse(
       FileManager.default.fileExists(
         atPath: recoveryDirectory.appendingPathComponent(id.uuidString + ".md").path))
+    XCTAssertFalse(store.isDraftOpen(id: id))
   }
 
   @MainActor
@@ -1253,10 +1254,165 @@ final class RecoveredDraftsTests: XCTestCase {
       in: store, text: "live recovered work", ageInDays: 0, keepOpen: true)
     let documentStore = makeTestDocumentStore(recoveryStore: store)
 
-    XCTAssertFalse(documentStore.discardRecoveredDraft(draft))
+    XCTAssertEqual(
+      documentStore.discardRecoveredDraft(draft, into: AppState()),
+      .claimedByAnotherWindow)
 
     XCTAssertTrue(fileExists(draft.url))
     XCTAssertTrue(store.isDraftOpen(id: draft.id))
+  }
+
+  @MainActor
+  func testAdoptingWindowCanDiscardItsOwnClaimedDraftWithoutLeavingALiveBuffer() throws {
+    let store = try makeRecoveryStore()
+    let draft = try seedDraft(in: store, text: "adopted recovery", ageInDays: 0)
+    let documentStore = makeTestDocumentStore(recoveryStore: store)
+    let owner = AppState()
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: owner))
+
+    XCTAssertEqual(
+      documentStore.discardRecoveredDraft(draft, into: AppState()),
+      .claimedByAnotherWindow,
+      "a stale launcher must not inherit the owner's discard exemption")
+    XCTAssertEqual(
+      documentStore.discardRecoveredDraft(draft, into: owner),
+      .discarded)
+
+    XCTAssertFalse(fileExists(draft.url))
+    XCTAssertFalse(store.isDraftOpen(id: draft.id))
+    XCTAssertFalse(owner.documentSession.hasEditableBuffer)
+    XCTAssertNil(owner.documentSession.recoveryID)
+  }
+
+  @MainActor
+  func testDiscardReportsStorageFailureInsteadOfClaimingAnotherWindowOwnsTheDraft() throws {
+    let folder = try makeTemporaryFolder()
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let store = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let draft = try seedDraft(in: store, text: "must remain recoverable", ageInDays: 0)
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder),
+        indexDatabase: indexDatabase,
+        recoveryStore: store),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: indexDatabase, recoveryStore: store),
+      indexDatabase: indexDatabase,
+      confirmDiscardDraft: { _ in true })
+
+    XCTAssertFalse(controller.discardRecoveredDraft(draft))
+
+    XCTAssertEqual(
+      appState.lastError,
+      "Could not discard \(draft.displayTitle). The recovery copy is still on disk;"
+        + " resolve the storage error and try again.")
+    XCTAssertTrue(fileExists(draft.url))
+    XCTAssertFalse(store.isDraftOpen(id: draft.id))
+  }
+
+  @MainActor
+  func testSuccessfulNewDocumentReplacementReleasesThePreviousRecoveryClaim() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let draft = try seedDraft(
+      in: store, text: "settled recovered buffer", ageInDays: 0, keepOpen: true)
+    let appState = AppState()
+    appState.documentSession.restoreUntitled(
+      title: draft.displayTitle,
+      text: draft.text,
+      recoveryID: draft.id)
+    appState.documentSession.isDirty = false
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder),
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        recoveryStore: store),
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder), recoveryStore: store),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      documentWindowRegistry: DocumentWindowRegistry(scheduleLauncherWindowSweep: { _ in }))
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertFalse(store.isDraftOpen(id: draft.id))
+    XCTAssertEqual(store.unclaimedDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertNil(appState.documentSession.recoveryID)
+  }
+
+  @MainActor
+  func testFailedNewDocumentReplacementKeepsThePreviousRecoveryClaim() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let draft = try seedDraft(
+      in: store, text: "dirty recovered buffer", ageInDays: 0, keepOpen: true)
+    let appState = AppState()
+    appState.documentSession.restoreUntitled(
+      title: draft.displayTitle,
+      text: draft.text,
+      recoveryID: draft.id)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(in: folder), recoveryStore: store),
+      documentStore: makeTestDocumentStore(recoveryStore: store),
+      documentWindowRegistry: DocumentWindowRegistry(scheduleLauncherWindowSweep: { _ in }))
+
+    XCTAssertFalse(controller.createUntitledDocument())
+
+    XCTAssertTrue(store.isDraftOpen(id: draft.id))
+    XCTAssertEqual(appState.documentSession.recoveryID, draft.id)
+    XCTAssertEqual(appState.documentSession.text, draft.text)
+    XCTAssertTrue(appState.documentSession.isDirty)
+  }
+
+  @MainActor
+  func testCloseWorkspaceReleasesOnlyTheClaimOfASessionItActuallyClears() throws {
+    let folder = try makeTemporaryFolder()
+    let store = try makeRecoveryStore(in: folder)
+    let cleanDraft = try seedDraft(
+      in: store, text: "clean buffer", ageInDays: 0, keepOpen: true)
+    let dirtyDraft = try seedDraft(
+      in: store, text: "dirty buffer", ageInDays: 0, keepOpen: true)
+    let manager = FolderManager(
+      metadataStore: temporaryMetadataStore(in: folder),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveRecoveryCloseWorkspace")),
+      recoveryStore: store)
+
+    let cleanState = AppState()
+    cleanState.documentSession.restoreUntitled(
+      title: cleanDraft.displayTitle,
+      text: cleanDraft.text,
+      recoveryID: cleanDraft.id)
+    cleanState.documentSession.isDirty = false
+    manager.closeWorkspace(into: cleanState)
+
+    XCTAssertFalse(store.isDraftOpen(id: cleanDraft.id))
+    XCTAssertFalse(cleanState.documentSession.hasEditableBuffer)
+
+    let dirtyState = AppState()
+    dirtyState.documentSession.restoreUntitled(
+      title: dirtyDraft.displayTitle,
+      text: dirtyDraft.text,
+      recoveryID: dirtyDraft.id)
+    manager.closeWorkspace(into: dirtyState)
+
+    XCTAssertTrue(store.isDraftOpen(id: dirtyDraft.id))
+    XCTAssertEqual(dirtyState.documentSession.recoveryID, dirtyDraft.id)
+    XCTAssertEqual(dirtyState.documentSession.text, dirtyDraft.text)
   }
 
   func testUntitledRewriteFailsClosedWhenAStaleSourceAssociationCannotBeRemoved() throws {

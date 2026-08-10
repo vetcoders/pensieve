@@ -50,10 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window label.** Renaming/rekeying a buffer preserves its recovery identity;
   actually replacing that buffer releases the claim so the launcher can offer
   the emergency copy immediately. A stale launcher row cannot Save As or
-  Discard a copy currently owned by a live tab, and converting a file-backed
-  record to an untitled one fails closed if its old source-path sidecar cannot
-  be removed. Moving the selected source file to Trash also releases the live
-  claim before clearing its session, so the one emergency copy is visible now
+  Discard a copy currently owned by a live tab; the owning tab itself can still
+  discard after confirmation, and a storage failure is reported honestly
+  instead of being mislabeled as another-window ownership. Converting a
+  file-backed record to an untitled one remains fail-closed if its old
+  source-path sidecar cannot be removed. Moving the selected source file to
+  Trash also releases the live claim before clearing its session, so the one
+  emergency copy is visible now
   instead of returning only after relaunch. An original-write plus
   recovery-write failure is reported as one
   stable condition, so its two internal errors cannot resurrect a dismissed
