@@ -221,6 +221,29 @@ final class ToolbarBridgeRig {
     return overflowMatches(toolbelt.overflowFamilies)
   }
 
+  /// Waits for every AppKit-authored toolbar surface the production sinks own:
+  /// overflow forms and mode-segment tooltips. macOS 27 can re-derive either
+  /// after the first SwiftUI pass, so a rig that returns earlier hands tests a
+  /// transient toolbar the operator never meaningfully interacts with.
+  @discardableResult
+  func awaitBridgeConvergence(attempts: Int = 40) -> Bool {
+    let titles = EditorMode.allCases.map(\.label)
+    func matches() -> Bool {
+      guard let picker = modePickerControl(), picker.segmentCount == titles.count else {
+        return false
+      }
+      let tooltips = (0..<picker.segmentCount).map { picker.toolTip(forSegment: $0) ?? "" }
+      return overflowMatches(toolbelt.overflowFamilies) && tooltips == titles
+    }
+
+    for _ in 0..<attempts {
+      if matches() { return true }
+      window.update()
+      settle(0.02)
+    }
+    return matches()
+  }
+
   /// Everything a failing overflow assertion needs to name its own cause on a
   /// machine nobody can attach a debugger to: the geometry the rig actually got
   /// (not the one it asked for), whether the window is really on screen, how
@@ -322,8 +345,11 @@ final class ToolbarBridgeRig {
       let down = event(.leftMouseDown, pressure: 1),
       let up = event(.leftMouseUp, pressure: 0)
     else { return }
-    NSApp.postEvent(up, atStart: true)
-    window.sendEvent(down)
+    // Posting the terminator before dispatching mouse-down used to be enough,
+    // but macOS 27 can consume that queued event before the segmented cell's
+    // tracking loop starts. Deliver it on the next runloop turn instead.
+    DispatchQueue.main.async { NSApp.postEvent(up, atStart: true) }
+    control.mouseDown(with: down)
   }
 }
 
@@ -341,6 +367,9 @@ extension XCTestCase {
       rig.tearDown()
       throw XCTSkip("headless window did not bridge a SwiftUI toolbar")
     }
+    XCTAssertTrue(
+      rig.awaitBridgeConvergence(),
+      "the production toolbar sinks never converged — " + rig.overflowDiagnostics)
     return rig
   }
 }

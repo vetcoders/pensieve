@@ -103,6 +103,11 @@ final class EditorToolbarOverflowTests: XCTestCase {
     let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
     defer { rig.tearDown() }
 
+    // Scroll Sync lives in the preview-runtime family — one of the three
+    // live-labelled groups macOS 27 re-derives after the sink's pass. Await
+    // production's own convergence (window updates driving the repair) before
+    // reading the authored entry; the rig initializer alone ends too early.
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
     let item = try XCTUnwrap(
       Self.authoredItem(named: "Scroll Sync", in: rig), "no authored Scroll Sync entry")
     let before = rig.appState.scrollSyncEnabled
@@ -266,7 +271,13 @@ final class EditorToolbarOverflowTests: XCTestCase {
   func testOverflowSyncSurvivesARebuildThatLandsAfterThePass() throws {
     let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
     defer { rig.tearDown() }
-    XCTAssertTrue(rig.overflowMatches(rig.toolbelt.overflowFamilies), rig.overflowDiagnostics)
+    // Production's own triggers, not an instant read: on macOS 27 (26A5388g)
+    // SwiftUI's late derivation pass rewrites THREE live-labelled families
+    // (view, preview runtime, assistants) after the sink ran, and the rig's
+    // initializer posts no window update of its own — so the baseline this
+    // test clobbers below has to be awaited the same way
+    // `testEveryControlGroupFamilyGetsAnAuthoredOverflowEntry` awaits it.
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
       MainActor.assumeIsolated {
