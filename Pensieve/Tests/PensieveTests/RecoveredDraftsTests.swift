@@ -374,7 +374,7 @@ final class RecoveredDraftsTests: XCTestCase {
     let refused = AppState()
     XCTAssertFalse(documentStore.openRecoveredDraft(draft, into: refused))
 
-    XCTAssertTrue(documentStore.saveRecoveredDraftAs(draft, into: adopting))
+    XCTAssertNotNil(documentStore.saveRecoveredDraftAs(draft, into: adopting))
     XCTAssertFalse(fileExists(draft.url))
 
     // The refused surface still holds the stale draft value. Nothing it can do
@@ -673,11 +673,40 @@ final class RecoveredDraftsTests: XCTestCase {
       savePanelURLProvider: { _ in targetURL })
     let draft = try seedDraft(in: store, text: "recovered body", ageInDays: 0)
 
-    XCTAssertTrue(documentStore.saveRecoveredDraftAs(draft, into: AppState()))
+    XCTAssertNotNil(documentStore.saveRecoveredDraftAs(draft, into: AppState()))
 
     XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), "recovered body")
     XCTAssertFalse(fileExists(draft.url), "the draft outlived a successful Save As…")
     XCTAssertTrue(store.loadDrafts().isEmpty)
+  }
+
+  @MainActor
+  func testLauncherSaveAsRegistersWorkingSetWithoutOpeningTheSavedFile() throws {
+    let folder = try makeTemporaryFolder()
+    let targetURL = folder.appendingPathComponent("recovered-working-set.md")
+    let store = try makeRecoveryStore(in: folder)
+    let defaults = makeEphemeralDefaults(prefix: "PensieveRecoveredDraftSaveAs")
+    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      recoveryStore: store,
+      savePanelURLProvider: { _ in targetURL })
+    let draft = try seedDraft(in: store, text: "recovered body", ageInDays: 0)
+    let appState = AppState()
+
+    let savedURL = documentStore.saveRecoveredDraftAs(draft, into: appState)
+
+    XCTAssertEqual(savedURL?.standardizedFileURL, targetURL.standardizedFileURL)
+    XCTAssertEqual(
+      appState.openFiles.map(\.url.standardizedFileURL), [targetURL.standardizedFileURL])
+    XCTAssertNil(appState.selectedDocumentID, "launcher Save As selected the saved document")
+    XCTAssertFalse(
+      appState.documentSession.hasEditableBuffer,
+      "launcher Save As adopted the saved document into the empty window")
+
+    let restored = BookmarkStore(defaults: defaults).restoreWorkspace(into: AppState())
+    XCTAssertEqual(restored.fileURLs.map(\.standardizedFileURL), [targetURL.standardizedFileURL])
   }
 
   @MainActor
@@ -690,7 +719,7 @@ final class RecoveredDraftsTests: XCTestCase {
       savePanelURLProvider: { _ in nil })
     let draft = try seedDraft(in: store, text: "recovered body", ageInDays: 0)
 
-    XCTAssertFalse(documentStore.saveRecoveredDraftAs(draft, into: AppState()))
+    XCTAssertNil(documentStore.saveRecoveredDraftAs(draft, into: AppState()))
 
     XCTAssertTrue(fileExists(draft.url), "Cancel dropped the draft")
     XCTAssertEqual(store.loadDrafts().map(\.text), ["recovered body"])
@@ -711,7 +740,7 @@ final class RecoveredDraftsTests: XCTestCase {
     let appState = AppState()
     XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
 
-    XCTAssertTrue(documentStore.saveRecoveredDraftAs(draft, into: appState))
+    XCTAssertNotNil(documentStore.saveRecoveredDraftAs(draft, into: appState))
 
     XCTAssertEqual(
       appState.documentSession.url?.standardizedFileURL, targetURL.standardizedFileURL)

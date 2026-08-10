@@ -391,6 +391,9 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   means Save to Original; Save As writes only the chosen destination.
 - **A successful save retires the recovery item.** Saving to the original or a
   new destination removes the item only after the destination write succeeds.
+  A launcher-level Save As also registers that destination in Pensieve's
+  working set, persists any required file bookmark and adds it to native
+  Recents, but does not open or select it in the launcher.
   Don't Save removes it only as a conscious rejection. Cancel and any failed
   write leave both the buffer and recovery item intact.
 - **An untouched empty draft closes silently.** A draft asks where to save only
@@ -608,11 +611,14 @@ Close All must never cause silent data loss.
   window still has open gets a file bookmark of its own, a document covered by a
   surviving root does not (its root already grants access), and a file that is in
   neither source still loses its bookmark — nothing is resurrected.
-- **The working set is durable by the time the process is gone.** Quit forces it
-  out of cfprefsd's write-back queue instead of letting the system flush it on its
-  own schedule (measured at up to ~14 s AFTER exit, late enough to overwrite a
-  change made to those defaults in the meantime). It runs inside the quit's drain
-  budget, so a stalled flush can never beachball the quit.
+- **Quit gives the working set a bounded durability flush.** Quit starts an
+  explicit `cfprefsd` synchronization and waits for it for up to one second
+  before continuing with the remaining drain phases. A normal flush is durable
+  before exit; a stalled system service may finish on its own schedule after the
+  budget expires (measured at up to ~14 s after exit). The bounded wait is a
+  deliberate tradeoff: working-set restoration can be stale in that exceptional
+  case, but quit must not beachball indefinitely and user-content writes retain
+  priority over session metadata.
 - **Single source of truth for the session: Pensieve** (decisions 7–9: A,
   Monika + Maciej, 10.08). Every managed launcher/document window opts out of
   AppKit Saved Application State (`isRestorable = false`), and there is no

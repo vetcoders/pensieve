@@ -1278,9 +1278,17 @@ final class AppController: ObservableObject {
   /// panel leaves everything untouched.
   @discardableResult
   func saveRecoveredDraftAs(_ draft: RecoveryDraft) -> Bool {
-    let didSave = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    let savedURL = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    if let savedURL {
+      recentDocuments.noteOpened(savedURL)
+      if appState.workspaceRoots.contains(where: {
+        WorkspaceScanner.contains(savedURL, in: $0.url)
+      }) {
+        folderManager.refresh(into: appState)
+      }
+    }
     refreshRecoveredDrafts()
-    return didSave
+    return savedURL != nil
   }
 
   /// `Discard`: drop the draft after the user confirms. Returns whether it was

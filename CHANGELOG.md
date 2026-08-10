@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Saving a recovered draft from the launcher no longer creates a file that
+  Pensieve immediately forgets.** The file was written and the recovery copy
+  retired, but the destination skipped the normal Save As registration path:
+  it received no Open Files membership or ad-hoc bookmark and never appeared in
+  native Recents. A successful launcher Save As now completes that fan-out while
+  leaving the launcher empty — saving a rescue copy does not silently open it.
+
 - **A native tab bar no longer covers the top of the sidebar.** When a window
   gained tabs, AppKit added a strip below the toolbar while SwiftUI kept laying
   out the sidebar from the toolbar edge. The workspace title, creation buttons

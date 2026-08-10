@@ -105,14 +105,17 @@ defects:
 - **Open through a symlink** — `forgetFile` compares `standardizedFileURL`, which
   does not resolve symlinks, while bookmark resolution returns the canonical
   path. The entry never matches and the file comes back.
-- **Save a recovered draft** — `saveRecoveredDraftAs` writes and indexes but
-  skips the registration that `saveAs` performs, so the file lands in neither
-  the working set nor recents and gets no security-scoped bookmark.
 - **Close a document from another window** — identity routing exists in the
   registry, but the completion captures the _calling_ window's controller.
 
 Each was found by clicking, not by a test, because no single type forces the
 stores to agree.
+
+The launcher-level recovered-draft Save As route now closes one of those fan-out
+gaps explicitly: after the destination write succeeds it registers the file in
+the working set, persists the ad-hoc bookmark when required, indexes it and adds
+it to native Recents. It deliberately does not select or open the saved file in
+the launcher that performed the rescue.
 
 ---
 

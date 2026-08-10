@@ -3410,16 +3410,18 @@ final class DocumentStore {
   /// survives a cancelled panel and a failed write — it is dropped only once
   /// its content is safely somewhere else.
   @discardableResult
-  func saveRecoveredDraftAs(_ draft: RecoveryDraft, into appState: AppState) -> Bool {
+  func saveRecoveredDraftAs(_ draft: RecoveryDraft, into appState: AppState) -> URL? {
     self.appState = appState
 
-    guard let url = savePanelURLProvider(appState) else { return false }
+    guard let url = savePanelURLProvider(appState) else { return nil }
 
     // A draft this window already adopted is just an unsaved document: the
     // ordinary Save As… path owns it (registration, working set, index) and
     // retires the draft on success.
     if appState.documentSession.recoveryID == draft.id {
       return saveAs(appState: appState, to: url)
+        ? WorkspaceScanner.normalizedMarkdownFileURL(for: url)
+        : nil
     }
 
     let targetURL = WorkspaceScanner.normalizedMarkdownFileURL(for: url)
@@ -3428,17 +3430,23 @@ final class DocumentStore {
         at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
       try writeDocument(draft.text, targetURL)
       selfWriteObserver(targetURL)
-      indexDocument(documentRef(for: targetURL, appState: appState), draft.text, appState)
+      let ref = documentRef(for: targetURL, appState: appState)
+      // Saving from the launcher creates a real document, so it must acquire
+      // the same working-set membership and bookmark as ordinary Save As….
+      // It must NOT adopt or select that document: the user chose "save this
+      // recovery copy", not "open it in this launcher".
+      registerSavedDocument(ref, previousID: nil, appState: appState, select: false)
+      indexDocument(ref, draft.text, appState)
       recoveryStore.deleteDraft(id: draft.id)
       appState.lastError = nil
-      return true
+      return targetURL
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
       // STATUS, not data loss: the draft file is still on disk — it is
       // retired only on a SUCCESSFUL save — so the work survives this failure.
       appState.lastError = message
       NSLog(message)
-      return false
+      return nil
     }
   }
 
@@ -4595,7 +4603,7 @@ final class DocumentStore {
   }
 
   private func registerSavedDocument(
-    _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState
+    _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState, select: Bool = true
   ) {
     let refPath = ref.id.path
     let isNewSessionURL = previousID?.path != refPath
@@ -4622,7 +4630,9 @@ final class DocumentStore {
       appState.documents.append(ref)
     }
 
-    appState.selectedDocumentID = ref.id
+    if select {
+      appState.selectedDocumentID = ref.id
+    }
   }
 
   /// Same contract as `FolderManager`'s: whatever the cap drops out of the list

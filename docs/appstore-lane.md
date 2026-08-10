@@ -44,6 +44,21 @@ bundle) cannot drift apart.
 Note for anyone editing that file: XML comments there must not contain double
 hyphens. AMFI rejects the entitlements even when `plutil` lints clean.
 
+### Recovery access is a release gate
+
+A file-backed recovery record stores its original path in a plain `.source`
+sidecar so the launcher can identify the emergency copy. That path is metadata,
+not a sandbox grant. Access after relaunch therefore depends on the original
+file or its workspace root still having a valid app-scoped bookmark in
+`BookmarkStore`.
+
+Before shipping the MAS lane, exercise this exact sandboxed runtime path: edit a
+user-selected file, leave an emergency recovery copy, relaunch, open the copy and
+use **Save to Original**. A failure to reacquire the original location is a MAS
+release blocker and requires the recovery record to carry or reference its own
+security-scoped bookmark. The Developer ID lane is not sandboxed and is
+unaffected by this residual risk.
+
 ---
 
 ## Prerequisites

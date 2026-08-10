@@ -52,8 +52,9 @@ Any operation that opens, closes, renames or forgets a document has to reach all
 of them by hand. Read `docs/architecture/document-identity.md` before touching
 that area — it is the single largest source of click-to-reproduce bugs here.
 
-**`DocumentStore.swift` is a hub** with 20 direct and 56 transitive consumers.
-Run `loct impact` on it before changing a signature.
+**`DocumentStore.swift` is a hub.** Its consumer count changes quickly as the
+lifecycle surface evolves; run `loct impact` on it before changing a signature
+instead of relying on a historical count.
 
 **`make ui-smoke` runs against an isolated smoke identity, not the operator's
 app.** It stages a renamed, re-signed copy of the built app under
