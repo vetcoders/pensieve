@@ -2,26 +2,34 @@
 set -euo pipefail
 
 # The harness never drives the bundle the operator actually uses. It stages a
-# renamed, re-signed copy under $SMOKE_ROOT and drives that instead, so the two
-# identities the run touches -- the process name every pkill/System Events call
-# resolves, and the defaults domain cfprefsd scopes reads and writes to -- both
-# belong to the smoke alone. The harness also deletes that smoke-only defaults
-# domain at the start and end of every run: a fixed smoke bundle id is isolated
-# from the operator, but is not isolated from earlier smoke runs by itself.
-# Before this, `pkill -x Pensieve` killed the operator's live app by name, and
-# every harness launch wrote its temp-file bookmarks into the operator's
-# io.vetcoders.pensieve domain until her real Open Files entries were evicted.
+# renamed, re-signed copy under $SMOKE_ROOT and drives that instead. Every
+# INDEPENDENT SCENARIO gets a new bundle identifier, executable name, bundle
+# path, support root, Keychain service and manifest. A delayed writer from one
+# scenario therefore has no namespace that the next scenario can read.
+# Cleanup retires each exact identity; no smoke path may target
+# io.vetcoders.pensieve or the operator's production data.
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck source=scripts/lib/isolated-app.sh
+source "$SCRIPT_DIR/lib/isolated-app.sh"
+
 SOURCE_APP_PATH="dist/Pensieve.app"
 APP_PATH=""
-APP_NAME="PensieveSmoke"
-APP_ID="io.vetcoders.pensieve.smoke"
-SMOKE_KEYCHAIN_SERVICE="${APP_ID}.completion-provider"
+APP_ID=""
+RUN_TOKEN=""
+APP_NAME=""
+SMOKE_KEYCHAIN_SERVICE=""
 SMOKE_SIGNING_MODE=""
 COLD_ONLY=0
 MENU_RESTORED_ONLY=0
 EXTRA_EXPECTED_IDENTIFIERS=()
 CAFFEINATE_PID=""
 SMOKE_ROOT=""
+SMOKE_CAPSULE_ROOT=""
+SMOKE_SUPPORT=""
+IDENTITY_MANIFEST=""
+OWNED_PID=""
+EXECUTABLE_PATH=""
 
 # Saved-state isolation probe state. The probe deliberately asks AppKit to keep
 # windows while telling Pensieve NOT to restore its working set. A relaunch must
@@ -56,26 +64,42 @@ canonical_defaults_bool() {
   esac
 }
 
-# The whole defaults domain belongs to this harness. A fixed smoke bundle id
-# protects the operator's production preferences, but cfprefsd otherwise keeps
-# workspace bookmarks from every deleted $SMOKE_ROOT forever. Start and finish
-# with a truly empty smoke identity so one run cannot inherit another run's
-# documents, launch setting, or window cosmetics.
+# The whole defaults domain belongs to this run-specific identity. The shared
+# isolation helper deletes it and performs a full read-back; command success by
+# itself is not evidence that cfprefsd actually retired every key.
 reset_smoke_defaults_domain() {
-  defaults delete "$APP_ID" >/dev/null 2>&1 || true
+  isolated_app_reset_defaults_domain "$APP_ID" \
+    || die "could not retire every preference in smoke domain $APP_ID"
 }
 
-# Individual probes in one run still share the smoke identity. The preceding
-# zero-window probe deliberately registers its external-open witness in the
-# working set, so restore-ON must retire that probe-owned state before seeding
-# its own single-document restore. With exactly one working-set entry, the AX
-# window title is a valid restore oracle; with native tabs it only names the
-# selected tab and cannot prove membership of every background tab.
+# The restore-ON scenario itself has multiple phases under one identity. Before
+# seeding its single-document restore, retire any file bookmarks produced by an
+# earlier phase of THAT scenario. Cross-scenario isolation is stronger: those
+# boundaries mint a different complete capsule instead of editing keys in
+# place.
 reset_smoke_working_set() {
-  defaults delete "$APP_ID" Pensieve.workspace.fileBookmarks >/dev/null 2>&1 || true
-  if defaults read "$APP_ID" Pensieve.workspace.fileBookmarks >/dev/null 2>&1; then
-    die "could not reset the smoke-only working set before the restore-ON probe"
-  fi
+  local key domain_dump
+  for key in \
+    Pensieve.workspace.fileBookmarks \
+    Pensieve.workspace.rootBookmarks \
+    Pensieve.openFolder.bookmark
+  do
+    defaults delete "$APP_ID" "$key" >/dev/null 2>&1 || true
+  done
+  domain_dump="$SMOKE_ROOT/working-set-reset.plist"
+  defaults export "$APP_ID" "$domain_dump" >/dev/null 2>&1 \
+    || die "could not read back smoke defaults after working-set reset"
+  plutil -lint "$domain_dump" >/dev/null 2>&1 \
+    || die "smoke defaults read-back is not a valid property list"
+  for key in \
+    Pensieve.workspace.fileBookmarks \
+    Pensieve.workspace.rootBookmarks \
+    Pensieve.openFolder.bookmark
+  do
+    if /usr/libexec/PlistBuddy -c "Print :$key" "$domain_dump" >/dev/null 2>&1; then
+      die "could not reset smoke-only bookmark key $key before the restore-ON probe"
+    fi
+  done
 }
 
 # Shell out to a tiny Swift snippet that queries CoreGraphics' window server
@@ -85,16 +109,16 @@ reset_smoke_working_set() {
 # active Space cannot host it (e.g. a fullscreen Screen Sharing session) --
 # an environment condition, not a product bug.
 dump_window_server_state() {
-  SMOKE_OWNER_NAME="$APP_NAME" swift - <<'EOF' 2>/dev/null || true
+  [[ -n "${OWNED_PID:-}" ]] || return 1
+  SMOKE_OWNER_PID="$OWNED_PID" swift - <<'EOF' 2>/dev/null || true
 import CoreGraphics
 import Foundation
-// Passed through the environment rather than interpolated: the heredoc is
-// quoted so the snippet stays a literal, and the owner name is the staged
-// smoke bundle's, never the operator's app.
-let owner = ProcessInfo.processInfo.environment["SMOKE_OWNER_NAME"] ?? "PensieveSmoke"
+// Passed through the environment rather than interpolated: the heredoc stays
+// literal and the census is tied to the exact process verified by the harness.
+let ownerPID = Int(ProcessInfo.processInfo.environment["SMOKE_OWNER_PID"] ?? "") ?? -1
 let wl = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
 var total = 0, onscreen = 0
-for w in wl where (w["kCGWindowOwnerName"] as? String) == owner
+for w in wl where (w["kCGWindowOwnerPID"] as? Int) == ownerPID
   && (w["kCGWindowLayer"] as? Int) == 0 {
   total += 1
   if (w["kCGWindowIsOnscreen"] as? Bool) == true { onscreen += 1 }
@@ -104,65 +128,69 @@ print("CGWINDOW_SUMMARY total=\(total) onscreen=\(onscreen)")
 EOF
 }
 
-# Terminate every running instance of the app under test and block until the
-# process table is clear. AppleScript targets the app by bare process name
-# ("tell process PensieveSmoke"), and System Events resolves that name to the
-# OLDEST matching process. A run that dies mid-osascript leaves an orphaned,
-# windowless instance alive; the next run's `open -n` then spawns a second one,
-# and the census locks onto the windowless orphan -> empty `observed:` census.
-# Guaranteeing a single instance (clean before launch, clean on every exit)
-# removes that ambiguity at the source. Graceful quit first, then SIGTERM, then
-# SIGKILL as a last resort, waiting for the process to actually disappear at
-# each stage so `open -n` never races a survivor.
-wait_for_app_exit() {
-  local tracked_pids="$1"
-  local attempts="$2"
-  local attempt=0
-  local pid
-
-  while [[ "$attempt" -lt "$attempts" ]]; do
-    if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-      local tracked_pid_is_alive=0
-      for pid in $tracked_pids; do
-        if kill -0 "$pid" >/dev/null 2>&1; then
-          tracked_pid_is_alive=1
-          break
-        fi
-      done
-      [[ "$tracked_pid_is_alive" -eq 0 ]] && return 0
+# Re-resolve the complete runtime identity immediately before any destructive
+# process control. The NSRunningApplication control helper must independently
+# validate the remembered PID, bundle id, bundle path and executable path.
+resolve_owned_pid_for_control() {
+  local resolved_pid status
+  if resolved_pid="$(verify_running_smoke_identity 2>/dev/null)"; then
+    if [[ -n "${OWNED_PID:-}" && "$resolved_pid" != "$OWNED_PID" ]]; then
+      printf '\033[33m[fail]\033[0m exact smoke identity changed pid (%s -> %s); refusing process control\n' \
+        "$OWNED_PID" "$resolved_pid" >&2
+      return 2
     fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
-  return 1
+    OWNED_PID="$resolved_pid"
+    printf '%s\n' "$resolved_pid"
+    return 0
+  else
+    status=$?
+  fi
+  if isolated_app_assert_not_running "$APP_ID" >/dev/null 2>&1; then
+    OWNED_PID=""
+    return 3
+  fi
+  printf '\033[33m[fail]\033[0m smoke bundle id is running, but its exact bundle/executable cannot be authenticated (status=%s)\n' \
+    "$status" >&2
+  return 2
 }
 
 terminate_app() {
-  # A caller preparing a restoration relaunch can grant the graceful quit a
-  # bounded settling period. Cleanup callers keep the default zero-period path
-  # and move directly to the existing SIGTERM/SIGKILL fallback.
+  # A caller preparing a restoration relaunch can grant a longer graceful
+  # timeout. Graceful wait and force escalation are one exact-identity
+  # NSRunningApplication transaction; there is deliberately no POSIX fallback.
   local graceful_attempts="${1:-0}"
-  local quit_timeout=2
-  local tracked_pids
-  [[ "$graceful_attempts" -gt 0 ]] && quit_timeout=5
-  tracked_pids="$(pgrep -x "$APP_NAME" 2>/dev/null || true)"
+  local graceful_timeout=2
+  local pid status
+  [[ "$graceful_attempts" -gt 0 ]] && graceful_timeout=5
 
-  osascript -e "with timeout of $quit_timeout seconds" \
-    -e "tell application id \"$APP_ID\" to quit" \
-    -e "end timeout" >/dev/null 2>&1 || true
-  if [[ "$graceful_attempts" -gt 0 ]] \
-    && wait_for_app_exit "$tracked_pids" "$graceful_attempts"; then
-    return 0
+  if pid="$(resolve_owned_pid_for_control)"; then
+    OWNED_PID="$pid"
+  else
+    status=$?
+    if [[ "$status" -eq 3 ]]; then OWNED_PID=""; return 0; fi
+    return 1
   fi
 
-  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-  wait_for_app_exit "$tracked_pids" 30 && return 0
-
-  pkill -9 -x "$APP_NAME" >/dev/null 2>&1 || true
-  wait_for_app_exit "$tracked_pids" 20 && return 0
-
-  printf '\033[33m[fail]\033[0m %s\n' \
-    "$APP_NAME survived SIGKILL; a live survivor would corrupt the next run's single-instance census" >&2
+  if isolated_app_control_identity \
+    terminate "$APP_ID" "$APP_PATH" "$APP_PATH/Contents/MacOS/$APP_NAME" \
+    "$pid" "$graceful_timeout"; then
+    OWNED_PID=""
+    return 0
+  else
+    status=$?
+  fi
+  case "$status" in
+    3) OWNED_PID=""; return 0 ;;
+    4)
+      printf '\033[33m[fail]\033[0m exact smoke identity changed during termination\n' >&2
+      return 1
+      ;;
+    5)
+      printf '\033[33m[fail]\033[0m %s\n' \
+        "$APP_NAME survived exact NSRunningApplication termination; a live survivor would corrupt the next run's census" >&2
+      ;;
+    *) return 1 ;;
+  esac
   return 1
 }
 
@@ -255,94 +283,321 @@ disarm_pensieve_restore_default() {
 # LSEnvironment; repeating it here means a launch stays isolated even if
 # LaunchServices ever declines to honor LSEnvironment for a staged bundle.
 open_smoke_app() {
-  open \
+  local verified_pid open_status=0 query_status
+  if open \
     --env "PENSIEVE_SUPPORT_DIR=$SMOKE_SUPPORT" \
     --env "PENSIEVE_KEYCHAIN_SERVICE=$SMOKE_KEYCHAIN_SERVICE" \
-    "$@"
+    "$@"; then
+    open_status=0
+  else
+    open_status=$?
+  fi
+
+  # LaunchServices may report -600 after it has already created the process.
+  # The exact runtime identity, not `open`'s return alone, decides whether a
+  # retry is safe. A retry is permitted only after proving no process exists.
+  if verified_pid="$(isolated_app_wait_for_running_identity \
+    "$APP_ID" "$APP_PATH" "$APP_PATH/Contents/MacOS/$APP_NAME" 120 2>/dev/null)"; then
+    OWNED_PID="$verified_pid"
+    return 0
+  fi
+  if isolated_app_assert_not_running "$APP_ID" >/dev/null 2>&1; then
+    [[ "$open_status" -ne 0 ]] && return "$open_status"
+    return 1
+  else
+    query_status=$?
+  fi
+  die "the smoke bundle id is live but its exact staged bundle/executable cannot be proven (status=$query_status); refusing a second launch"
 }
 
-plist_set_string() {
-  local plist="$1" key="$2" value="$3"
-  /usr/libexec/PlistBuddy -c "Set :$key $value" "$plist" >/dev/null 2>&1 \
-    || /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist" >/dev/null \
-    || die "could not set $key in $plist"
-}
-
-# Build the isolated bundle the whole run drives: a copy of the app under test
-# with a smoke-only identity.
-#
-# Four things have to change together, because each one closes a different
-# leak. The EXECUTABLE name is what the kernel reports as the process name, so
-# `pkill -x` / `pgrep -x` / `tell process` resolve the smoke and can never reach
-# the operator's running app. The BUNDLE IDENTIFIER is what cfprefsd keys
-# preferences on, so every default the app reads or writes -- including the
-# workspace file bookmarks that a harness run kept appending -- lands in
-# io.vetcoders.pensieve.smoke. And PENSIEVE_SUPPORT_DIR redirects the four
-# Application Support derivations, which the other two cannot reach:
-# NSHomeDirectory() reads getpwuid, so FileManager resolves the operator's real
-# ~/Library/Application Support no matter what identity the bundle carries.
-# PENSIEVE_KEYCHAIN_SERVICE gives the staged app a separate provider-key query,
-# so smoke cannot even read the operator's production completion credential.
-#
-# The override is written into the staged Info.plist as LSEnvironment (the app
-# gets it however LaunchServices starts it) and passed again on each `open
-# --env` (belt and braces if a staged bundle's LSEnvironment is ever ignored).
+# Build the isolated bundle the whole run drives through the shared staging
+# primitive used by manual smoke as well. One implementation owns executable,
+# bundle/defaults, support, Keychain, signing and cleanup invariants.
 stage_smoke_app() {
   local source="$1" staged="$2" support="$3"
-  local contents="$staged/Contents"
-  local plist="$contents/Info.plist"
+  isolated_app_stage_bundle \
+    "$source" "$staged" "$APP_NAME" "$APP_ID" "$APP_NAME" "$APP_NAME" \
+    "$support" "$SMOKE_KEYCHAIN_SERVICE" "$REPO_ROOT" \
+    "${PENSIEVE_UI_SMOKE_ALLOW_STALE_SOURCE:-0}" \
+    "${PENSIEVE_UI_SMOKE_ALLOW_DIRTY_SOURCE:-0}" \
+    || die "could not stage isolated smoke bundle from $source"
+  SMOKE_SIGNING_MODE="${ISOLATED_APP_SIGNING_MODE:-verified local signature}"
+}
 
-  rm -rf "$staged"
-  # ditto, not cp -R: it is the tool that copies a bundle's extended attributes
-  # and resource forks intact, which a code-signed bundle depends on.
-  ditto "$source" "$staged" || die "could not stage a smoke copy of $source"
-  [[ -f "$plist" ]] || die "staged bundle has no Info.plist: $plist"
+verify_running_smoke_identity() {
+  isolated_app_verify_running_identity \
+    "$APP_ID" "$APP_PATH" "$APP_PATH/Contents/MacOS/$APP_NAME"
+}
 
-  local source_executable
-  source_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null)"
-  [[ -n "$source_executable" ]] || die "source bundle declares no CFBundleExecutable: $source"
-  if [[ "$source_executable" != "$APP_NAME" ]]; then
-    mv "$contents/MacOS/$source_executable" "$contents/MacOS/$APP_NAME" \
-      || die "could not rename the staged executable to $APP_NAME"
-  fi
+authenticated_owned_pid() {
+  local verified_pid
+  verified_pid="$(verify_running_smoke_identity)" \
+    || die "the running smoke identity no longer matches its bundle and executable"
+  [[ -n "${OWNED_PID:-}" ]] \
+    || die "the smoke process has no authenticated owner PID"
+  [[ "$verified_pid" == "$OWNED_PID" ]] \
+    || die "the smoke PID changed unexpectedly ($OWNED_PID -> $verified_pid)"
+  printf '%s\n' "$verified_pid"
+}
 
-  plist_set_string "$plist" CFBundleExecutable "$APP_NAME"
-  plist_set_string "$plist" CFBundleIdentifier "$APP_ID"
-  plist_set_string "$plist" CFBundleName "$APP_NAME"
-  plist_set_string "$plist" CFBundleDisplayName "$APP_NAME"
-  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" >/dev/null 2>&1 || true
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist" >/dev/null \
-    || die "could not add LSEnvironment to $plist"
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PENSIEVE_SUPPORT_DIR string $support" "$plist" \
-    >/dev/null || die "could not set PENSIEVE_SUPPORT_DIR in $plist"
-  /usr/libexec/PlistBuddy \
-    -c "Add :LSEnvironment:PENSIEVE_KEYCHAIN_SERVICE string $SMOKE_KEYCHAIN_SERVICE" "$plist" \
-    >/dev/null || die "could not set PENSIEVE_KEYCHAIN_SERVICE in $plist"
+# A smoke is not allowed to create its first witness until the app itself has
+# proved the empty profile we claim to be testing. The new bundle identifier
+# makes inherited state impossible by construction; this runtime assertion
+# catches future stores that are accidentally added outside that capsule.
+run_fresh_launcher_baseline_probe() {
+  log "fresh-profile baseline (one empty launcher, no workspace/files/recovery/recents)"
+  terminate_app
+  open_smoke_app -n "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -n "$APP_PATH"
+  }
 
-  # Every edit above broke the inherited seal, so the copy has to be signed
-  # again or macOS refuses to launch it. Developer ID when the same identity
-  # build-release.sh uses is in the keychain, ad-hoc otherwise -- this is a
-  # locally staged copy that never leaves the machine, so either is enough.
-  rm -rf "$contents/_CodeSignature"
-  local identity="" identity_file="$HOME/.keys/signing-identity.txt"
-  if [[ -f "$identity_file" ]]; then
-    identity="$(head -n1 "$identity_file" | sed -e 's/[[:space:]]*$//')"
-    if [[ -n "$identity" ]] \
-      && ! security find-identity -v -p codesigning | grep -qF -- "$identity"; then
-      identity=""
-    fi
-  fi
-  if [[ -n "$identity" ]] && codesign --force --deep --sign "$identity" "$staged" >/dev/null 2>&1
-  then
-    SMOKE_SIGNING_MODE="Developer ID ($identity)"
-  else
-    [[ -n "$identity" ]] && log "Developer ID re-sign failed; falling back to ad-hoc"
-    codesign --force --deep --sign - "$staged" >/dev/null 2>&1 \
-      || die "could not sign the staged smoke bundle"
-    SMOKE_SIGNING_MODE="ad-hoc"
-  fi
-  codesign --verify --strict "$staged" >/dev/null 2>&1 \
-    || die "staged smoke bundle failed codesign --verify; it would not launch"
+  local verified_pid
+  verified_pid="$(verify_running_smoke_identity)" \
+    || die "fresh-profile baseline launched the wrong bundle or executable"
+  log "fresh-profile runtime identity pid=$verified_pid id=$APP_ID"
+
+  # A healthy baseline completes in roughly three seconds. Keep the outer
+  # budget above the 20 × 2-second bounded AX lookup worst case so a briefly
+  # slow WindowServer cannot turn an isolated restage into a false timeout.
+  run_ax_osascript 90 - "$verified_pid" "$APP_ID" <<'APPLESCRIPT'
+property expectedBundleID : ""
+on run argv
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
+  my makeExactProcessFrontmost(targetPID, 5)
+  delay 0.5
+
+  -- One early frame is insufficient: a store hydrated after launch could put
+  -- stale workspace or recovery rows back after the first census. Require the
+  -- exact empty launcher to remain stable for three continuous seconds.
+  repeat with sampleNumber from 1 to 20
+    set censusResult to my exactLauncherCensus(targetPID, 2)
+    set windowCount to item 1 of censusResult
+    set identifiers to item 2 of censusResult
+
+    if windowCount is not 1 then
+      error "fresh profile must keep exactly one launcher, got " & windowCount & " at sample " & sampleNumber
+    end if
+    if identifiers does not contain "pensieve.sidebar.emptyState" then
+      error "fresh profile lost the empty sidebar at sample " & sampleNumber & "; identifiers={" & my joined(identifiers, ",") & "}"
+    end if
+    repeat with forbiddenIdentifier in {"pensieve.sidebar.list.openFiles", "pensieve.sidebar.list.workspace", "pensieve.recoveredDrafts", "pensieve.recoveredDrafts.row", "pensieve.emptyState.recents"}
+      if identifiers contains (forbiddenIdentifier as text) then
+        error "fresh profile exposed stale UI [" & (forbiddenIdentifier as text) & "] at sample " & sampleNumber
+      end if
+    end repeat
+    delay 0.15
+  end repeat
+
+  log "FRESH_PROFILE_RESULT=PASS (stable 3s; one empty launcher; zero workspace/open files/recovery/recents)"
+  return "fresh profile"
+end run
+
+on makeExactProcessFrontmost(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 20)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess to set frontmost to true
+        return true
+      end try
+    end if
+    delay 0.05
+  end repeat
+  error "Timed out resolving the exact process for frontmost pid=" & targetPID
+end makeExactProcessFrontmost
+
+on exactLauncherCensus(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 20)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events"
+          tell appProcess
+            set windowCount to count of windows
+            set identifiers to {}
+            if windowCount is 1 then
+              set windowElements to entire contents of window 1
+              repeat with elementRef in windowElements
+                try
+                  set identifierValue to value of attribute "AXIdentifier" of elementRef
+                  if identifierValue is not missing value and identifierValue is not "" then
+                    set end of identifiers to identifierValue as text
+                  end if
+                end try
+              end repeat
+            end if
+          end tell
+        end tell
+        return {windowCount, identifiers}
+      end try
+    end if
+    delay 0.05
+  end repeat
+  error "Timed out taking the exact launcher census for pid=" & targetPID
+end exactLauncherCensus
+
+on processForPID(targetPID, expectedBundleID)
+  tell application "System Events"
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
+    end repeat
+  end tell
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
+end waitForProcess
+
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events"
+          tell appProcess
+          if (count of windows) > 0 then return true
+          end tell
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
+  error "Timed out waiting for a window"
+end waitForWindow
+
+on joined(itemsList, delimiter)
+  set previousDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to delimiter
+  set joinedText to itemsList as text
+  set AppleScript's text item delimiters to previousDelimiters
+  return joinedText
+end joined
+APPLESCRIPT
+
+  terminate_app 60 \
+    || die "fresh-profile baseline process survived its termination barrier"
+}
+
+clear_smoke_capsule_variables() {
+  APP_ID=""
+  RUN_TOKEN=""
+  APP_NAME=""
+  APP_PATH=""
+  SMOKE_SUPPORT=""
+  SMOKE_KEYCHAIN_SERVICE=""
+  SMOKE_CAPSULE_ROOT=""
+  IDENTITY_MANIFEST=""
+  OWNED_PID=""
+  EXECUTABLE_PATH=""
+  SMOKE_SIGNING_MODE=""
+  RESTORATION_DEFAULT_ARMED=0
+  QAKW_WAS_SET=0
+  PRIOR_QAKW=""
+  PENSIEVE_RESTORE_DEFAULT_ARMED=0
+  PENSIEVE_RESTORE_WAS_SET=0
+  PRIOR_PENSIEVE_RESTORE=""
+}
+
+mint_smoke_capsule() {
+  local minted_id capsule_root
+  isolated_app_assert_canonical_directory "$SMOKE_ROOT" "UI-smoke invocation root" \
+    || die "UI-smoke invocation root is not canonical"
+  minted_id="$(isolated_app_generate_bundle_id smoke)" \
+    || die "could not mint a new smoke scenario identity"
+
+  # Assign the complete identity together. No caller may rotate APP_ID without
+  # also rotating every derived process, bundle, support, Keychain and manifest
+  # coordinate.
+  APP_ID="$minted_id"
+  RUN_TOKEN="${APP_ID##*.}"
+  APP_NAME="Psmk${RUN_TOKEN:1}"
+  SMOKE_KEYCHAIN_SERVICE="${APP_ID}.completion-provider"
+  capsule_root="$SMOKE_ROOT/capsule-$RUN_TOKEN"
+  /bin/mkdir "$capsule_root" || die "could not create smoke scenario capsule"
+  SMOKE_CAPSULE_ROOT="$(cd -P "$capsule_root" && pwd -P)"
+  IDENTITY_MANIFEST="$SMOKE_CAPSULE_ROOT/identity.plist"
+  SMOKE_SUPPORT="$SMOKE_CAPSULE_ROOT/support"
+  APP_PATH="$SMOKE_CAPSULE_ROOT/$APP_NAME.app"
+  EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$APP_NAME"
+  OWNED_PID=""
+  SMOKE_SIGNING_MODE=""
+  RESTORATION_DEFAULT_ARMED=0
+  QAKW_WAS_SET=0
+  PRIOR_QAKW=""
+  PENSIEVE_RESTORE_DEFAULT_ARMED=0
+  PENSIEVE_RESTORE_WAS_SET=0
+  PRIOR_PENSIEVE_RESTORE=""
+
+  isolated_app_reserve_manifest \
+    "$IDENTITY_MANIFEST" "$SMOKE_CAPSULE_ROOT" "$SOURCE_APP_PATH" \
+    "$APP_PATH" "$APP_NAME" "$APP_ID" "$APP_NAME" "$SMOKE_SUPPORT" \
+    "$SMOKE_KEYCHAIN_SERVICE" "$SOURCE_COMMIT" \
+    || die "could not reserve smoke scenario cleanup authority"
+  /bin/mkdir "$SMOKE_SUPPORT" \
+    || die "could not create canonical smoke scenario support directory"
+  stage_smoke_app "$SOURCE_APP_PATH" "$APP_PATH" "$SMOKE_SUPPORT"
+  isolated_app_finalize_manifest "$IDENTITY_MANIFEST" "$SMOKE_CAPSULE_ROOT" \
+    || die "could not finalize smoke scenario identity manifest"
+  isolated_app_verify_bundle_from_manifest \
+    "$IDENTITY_MANIFEST" "$SMOKE_CAPSULE_ROOT" \
+    || die "staged smoke scenario no longer matches its manifest"
+  isolated_app_assert_profile_fresh \
+    "$APP_ID" "$SMOKE_SUPPORT" "$SMOKE_KEYCHAIN_SERVICE" \
+    || die "new smoke scenario identity was not empty: $APP_ID"
+  log "minted scenario capsule id=$APP_ID root=$SMOKE_CAPSULE_ROOT"
+}
+
+retire_current_smoke_capsule() {
+  local reason="${1:-scenario boundary}"
+  [[ -n "${APP_ID:-}" ]] || return 0
+  terminate_app 60 \
+    || die "could not stop the exact smoke process at $reason; retained $SMOKE_CAPSULE_ROOT"
+  disarm_restoration_default \
+    || die "could not disarm smoke restoration state at $reason; retained $SMOKE_CAPSULE_ROOT"
+  disarm_pensieve_restore_default \
+    || die "could not disarm Pensieve restore state at $reason; retained $SMOKE_CAPSULE_ROOT"
+  isolated_app_cleanup_manifest "$IDENTITY_MANIFEST" "$SMOKE_CAPSULE_ROOT" \
+    || die "could not retire smoke capsule at $reason; retained $SMOKE_CAPSULE_ROOT and $IDENTITY_MANIFEST"
+  clear_smoke_capsule_variables
+}
+
+rotate_smoke_capsule() {
+  local reason="${1:-scenario boundary}"
+  retire_current_smoke_capsule "$reason"
+  mint_smoke_capsule
+}
+
+prepare_next_smoke_scenario() {
+  local previous_scenario="${1:-previous scenario}"
+  # The boundary baseline gets its own throwaway identity. The product
+  # scenario that follows receives another UUID, so even writes triggered by
+  # the baseline cannot be inputs to that scenario.
+  rotate_smoke_capsule "retiring $previous_scenario"
+  run_fresh_launcher_baseline_probe
+  rotate_smoke_capsule "retiring the $previous_scenario boundary baseline"
 }
 
 # Decision 7A (Monika + Maciej, 2026-08-10): Pensieve is the sole
@@ -359,7 +614,7 @@ run_saved_state_isolation_probe() {
   arm_pensieve_restore_off
   terminate_app
 
-  local document_title="${SMOKE_DOCUMENT##*/}"
+  local document_title="${SMOKE_DOCUMENT##*/}" probe_pid
   document_title="${document_title%.md}"
 
   log "saved-state probe: launch #1 with document [$document_title]"
@@ -368,25 +623,24 @@ run_saved_state_isolation_probe() {
     open_smoke_app -a "$APP_PATH" "$SMOKE_DOCUMENT"
   }
 
-  local _
-  for _ in {1..120}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
-    || die "saved-state probe: document launch never started $APP_NAME"
-
-  run_ax_osascript 45 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 - "$probe_pid" "$APP_ID" "$document_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set documentTitle to item 2 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set documentTitle to item 3 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
-    set frontmost to true
-    delay 0.5
-    set allTitles to title of every window
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before saved-state precondition: " & targetPID
+  tell application "System Events"
+    tell appProcess
+      set frontmost to true
+      delay 0.5
+      set allTitles to title of every window
+    end tell
   end tell
 
   repeat with candidateTitle in allTitles
@@ -398,23 +652,49 @@ on run argv
   error "saved-state probe precondition failed: no document window titled [" & documentTitle & "] in {" & my joined(allTitles, ",") & "}"
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -436,26 +716,26 @@ APPLESCRIPT
     sleep 0.5
     open_smoke_app -a "$APP_PATH"
   }
-  for _ in {1..120}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
-    || die "saved-state probe: relaunch never started $APP_NAME"
-
-  run_ax_osascript 60 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 60 - "$probe_pid" "$APP_ID" "$document_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set forbiddenDocumentTitle to item 2 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set forbiddenDocumentTitle to item 3 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
-    set frontmost to true
-    delay 0.8
-    set windowCount to count of windows
-    set allTitles to title of every window
-    set menuNames to name of every menu bar item of menu bar 1
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before saved-state census: " & targetPID
+  tell application "System Events"
+    tell appProcess
+      set frontmost to true
+      delay 0.8
+      set windowCount to count of windows
+      set allTitles to title of every window
+      set menuNames to name of every menu bar item of menu bar 1
+    end tell
   end tell
 
   repeat with candidateTitle in allTitles
@@ -484,23 +764,49 @@ on run argv
   return "Pensieve is the sole document-session restore owner"
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -522,19 +828,25 @@ run_zero_window_external_open_probe() {
   log "zero-window external-open probe"
   terminate_app
   arm_pensieve_restore_off
+  local probe_pid
 
   open_smoke_app -a "$APP_PATH" || {
     sleep 0.5
     open_smoke_app -a "$APP_PATH"
   }
 
-  run_ax_osascript 45 - "$APP_NAME" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 - "$probe_pid" "$APP_ID" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before zero-window close: " & targetPID
+  tell application "System Events" to tell appProcess
     set closeButton to first button of window 1 whose value of attribute "AXSubrole" is "AXCloseButton"
     perform action "AXPress" of closeButton
     repeat with i from 1 to 100
@@ -547,28 +859,54 @@ on run argv
   end tell
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 APPLESCRIPT
 
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+  verify_running_smoke_identity >/dev/null 2>&1 \
     || die "closing the final window terminated $APP_NAME instead of leaving a zero-window process"
 
   # `open` can return -600 while LaunchServices is reconnecting to a just-
@@ -578,14 +916,19 @@ APPLESCRIPT
 
   local external_title="${SMOKE_EXTERNAL_DOCUMENT##*/}"
   external_title="${external_title%.md}"
-  run_ax_osascript 45 - "$APP_NAME" "$external_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 - "$probe_pid" "$APP_ID" "$external_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set documentTitle to item 2 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set documentTitle to item 3 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before external-open census: " & targetPID
+  tell application "System Events" to tell appProcess
     set windowCount to count of windows
     set allTitles to title of every window
   end tell
@@ -598,23 +941,49 @@ on run argv
   log "ZERO_WINDOW_EXTERNAL_OPEN=PASS title=[" & (item 1 of allTitles as text) & "]"
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -648,7 +1017,7 @@ run_restore_on_external_open_probe() {
   reset_smoke_working_set
   arm_pensieve_restore_on
 
-  local document_title="${SMOKE_RESTORE_DOCUMENT##*/}"
+  local document_title="${SMOKE_RESTORE_DOCUMENT##*/}" probe_pid
   document_title="${document_title%.md}"
   local external_title="${SMOKE_EXTERNAL_DOCUMENT##*/}"
   external_title="${external_title%.md}"
@@ -658,25 +1027,24 @@ run_restore_on_external_open_probe() {
     sleep 0.5
     open_smoke_app -a "$APP_PATH" "$SMOKE_RESTORE_DOCUMENT"
   }
-  local _
-  for _ in {1..120}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
-    || die "restore-ON probe: seeding launch never started $APP_NAME"
-
-  run_ax_osascript 45 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 - "$probe_pid" "$APP_ID" "$document_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set documentTitle to item 2 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set documentTitle to item 3 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
-    set frontmost to true
-    delay 0.5
-    set allTitles to title of every window
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before restore seed census: " & targetPID
+  tell application "System Events"
+    tell appProcess
+      set frontmost to true
+      delay 0.5
+      set allTitles to title of every window
+    end tell
   end tell
 
   repeat with candidateTitle in allTitles
@@ -688,23 +1056,49 @@ on run argv
   error "restore-ON probe: nothing to restore — no window titled [" & documentTitle & "] in {" & my joined(allTitles, ",") & "}"
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -725,27 +1119,27 @@ APPLESCRIPT
     sleep 0.5
     open_smoke_app -a "$APP_PATH"
   }
-  for _ in {1..120}; do
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
-    || die "restore-ON probe: relaunch never started $APP_NAME"
-
   # The relaunch has to prove the restore actually fired before the zero-window
   # state means anything: a session that never came back would leave the rest of
   # this probe testing the restore-OFF path under a restore-ON default.
-  run_ax_osascript 60 - "$APP_NAME" "$document_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 60 - "$probe_pid" "$APP_ID" "$document_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set documentTitle to item 2 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set documentTitle to item 3 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
-    set frontmost to true
-    delay 0.8
-    set allTitles to title of every window
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before restore relaunch census: " & targetPID
+  tell application "System Events"
+    tell appProcess
+      set frontmost to true
+      delay 0.8
+      set allTitles to title of every window
+    end tell
   end tell
 
   set restoredIt to false
@@ -760,7 +1154,9 @@ on run argv
   -- Down to zero windows, one close at a time. The restored documents are
   -- untouched since they were written by this script, so no save sheet can
   -- interrupt the walk.
-  tell application "System Events" to tell process appName
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before restored-window close: " & targetPID
+  tell application "System Events" to tell appProcess
     repeat with i from 1 to 40
       if (count of windows) is 0 then exit repeat
       set closeButton to first button of window 1 whose value of attribute "AXSubrole" is "AXCloseButton"
@@ -773,23 +1169,49 @@ on run argv
   end tell
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -802,7 +1224,7 @@ on joined(itemsList, delimiter)
 end joined
 APPLESCRIPT
 
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 \
+  verify_running_smoke_identity >/dev/null 2>&1 \
     || die "restore-ON probe: closing the restored windows terminated $APP_NAME instead of leaving a zero-window process"
 
   # Same caveat as the restore-OFF probe: `open` can report -600 while
@@ -810,15 +1232,20 @@ APPLESCRIPT
   # event. The AX assertion below is the source of truth; never retry the send.
   open_smoke_app -a "$APP_PATH" "$SMOKE_EXTERNAL_DOCUMENT" >/dev/null 2>&1 || true
 
-  run_ax_osascript 45 - "$APP_NAME" "$external_title" "$document_title" <<'APPLESCRIPT'
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 - "$probe_pid" "$APP_ID" "$external_title" "$document_title" <<'APPLESCRIPT'
+property expectedBundleID : ""
 on run argv
-  set appName to item 1 of argv
-  set documentTitle to item 2 of argv
-  set restoredTitle to item 3 of argv
-  my waitForProcess(appName, 15)
-  my waitForWindow(appName, 15)
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set documentTitle to item 3 of argv
+  set restoredTitle to item 4 of argv
+  my waitForProcess(targetPID, 15)
+  my waitForWindow(targetPID, 15)
 
-  tell application "System Events" to tell process appName
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before restore-on external-open census: " & targetPID
+  tell application "System Events" to tell appProcess
     set windowCount to count of windows
     set allTitles to title of every window
   end tell
@@ -834,23 +1261,49 @@ on run argv
   log "RESTORE_ON_EXTERNAL_OPEN=PASS title=[" & (item 1 of allTitles as text) & "]"
 end run
 
-on waitForProcess(appName, timeoutSeconds)
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events" to tell process appName
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if (count of windows) > 0 then return true
-      delay 0.1
-    end repeat
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a window"
 end waitForWindow
 
@@ -901,46 +1354,72 @@ done
 cleanup() {
   local cleanup_status=0
   local step_status=0
+  local process_stopped=0
+  local identity_cleaned=0
   if [[ -n "${CAFFEINATE_PID:-}" ]]; then
     kill "$CAFFEINATE_PID" 2>/dev/null || true
   fi
   # Every exit path -- success, assertion failure, or an error raised inside
   # osascript -- must leave zero live smoke processes, otherwise the survivor
   # becomes the orphan that corrupts the next run's census.
-  terminate_app
-  step_status=$?
-  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+  if [[ -z "${APP_ID:-}" ]]; then
+    process_stopped=1
+  elif terminate_app; then
+    process_stopped=1
+  else
+    step_status=$?
     cleanup_status="$step_status"
+    printf '\033[33m[ui]\033[0m exact smoke process could not be retired; preserving owner root for controlled retry: %s\n' \
+      "${SMOKE_ROOT:-<not-created>}" >&2
   fi
   # Revert any smoke-domain defaults the saved-state probe armed. They were
   # never written to the operator's domain, but leaving it set would make the
   # next run's restoration state depend on the previous one.
-  disarm_restoration_default
-  step_status=$?
-  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
-    cleanup_status="$step_status"
-  fi
-  disarm_pensieve_restore_default
-  step_status=$?
-  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
-    cleanup_status="$step_status"
-  fi
-  # No smoke preference is operator-owned. Retiring the complete domain is
-  # what keeps the fixed bundle id isolated between runs, including failures
-  # that occur after a temporary document has been registered as a bookmark.
-  reset_smoke_defaults_domain
-  step_status=$?
-  if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
-    cleanup_status="$step_status"
-  fi
-  # The staged bundle, its Application Support tree and the witness document
-  # all live under SMOKE_ROOT; the run owns that directory outright.
-  if [[ -n "${SMOKE_ROOT:-}" && "$SMOKE_ROOT" == */pensieve-toolbar-smoke.* ]]; then
-    rm -rf "$SMOKE_ROOT"
+  if [[ "$process_stopped" -eq 1 && -n "${APP_ID:-}" ]]; then
+    disarm_restoration_default
     step_status=$?
     if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
       cleanup_status="$step_status"
     fi
+    disarm_pensieve_restore_default
+    step_status=$?
+    if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+      cleanup_status="$step_status"
+    fi
+  fi
+  # Retire the complete run identity while the staged bundle still exists:
+  # defaults, Keychain, Open Recent, Saved State, caches/WebKit/HTTPStorages,
+  # LaunchServices, isolated support and the bundle itself. The helper refuses
+  # the production bundle id and every unscoped path.
+  if [[ "$process_stopped" -eq 1 \
+    && -n "${APP_ID:-}" && -n "${APP_PATH:-}" && -n "${SMOKE_SUPPORT:-}" ]]; then
+    # Call the manifest cleanup even if SIGINT/SIGTERM interrupted the atomic
+    # reservation before identity.plist was published. In that state the
+    # helper is allowed to remove only its exact manifest temporary and an
+    # otherwise-empty capsule; every other residue still fails closed.
+    if [[ -n "${IDENTITY_MANIFEST:-}" ]] \
+      && isolated_app_cleanup_manifest "$IDENTITY_MANIFEST" "$SMOKE_CAPSULE_ROOT"; then
+      identity_cleaned=1
+    else
+      step_status=$?
+      if [[ "$cleanup_status" -eq 0 ]]; then cleanup_status="$step_status"; fi
+      printf '\033[33m[ui]\033[0m identity cleanup failed; preserving exact bundle + manifest for retry: %s %s\n' \
+        "$APP_PATH" "${IDENTITY_MANIFEST:-<manifest-not-created>}" >&2
+    fi
+  elif [[ "$process_stopped" -eq 1 && -z "${APP_ID:-}" ]]; then
+    identity_cleaned=1
+  fi
+  # The staged bundle, its Application Support tree and the witness document
+  # all live under SMOKE_ROOT; the run owns that directory outright.
+  if [[ "$identity_cleaned" -eq 1 \
+    && -n "${SMOKE_ROOT:-}" && "$SMOKE_ROOT" == */pensieve-toolbar-smoke.* ]]; then
+    /bin/rm -R "$SMOKE_ROOT"
+    step_status=$?
+    if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
+      cleanup_status="$step_status"
+    fi
+  elif [[ -n "${SMOKE_ROOT:-}" && -e "$SMOKE_ROOT" ]]; then
+    printf '\033[33m[ui]\033[0m preserved smoke evidence root: %s\n' "$SMOKE_ROOT" >&2
   fi
   return "$cleanup_status"
 }
@@ -967,6 +1446,17 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# A fresh profile is not truthful evidence if it drives a historical binary or
+# a bundle built before uncommitted product-source changes. Keep those two
+# exceptional cases independently opt-in so one override cannot weaken both
+# provenance assertions.
+SOURCE_APP_PATH="$(cd -P "$(dirname "$SOURCE_APP_PATH")" && pwd -P)/$(basename "$SOURCE_APP_PATH")"
+SOURCE_COMMIT="$(isolated_app_assert_source_provenance \
+  "$REPO_ROOT" "$SOURCE_APP_PATH" \
+  "${PENSIEVE_UI_SMOKE_ALLOW_STALE_SOURCE:-0}" \
+  "${PENSIEVE_UI_SMOKE_ALLOW_DIRTY_SOURCE:-0}")" \
+  || die "source provenance check failed (rebuild from the current clean product sources)"
+
 # Real AX clicks require the display to be awake; a sleeping display
 # (displaysleep) makes popover clicks land randomly, so wake it now and
 # hold it awake for the duration of the smoke to keep this deterministic
@@ -975,22 +1465,16 @@ caffeinate -u -t 2 || true
 caffeinate -dsu &
 CAFFEINATE_PID=$!
 
-SOURCE_APP_PATH="$(cd "$(dirname "$SOURCE_APP_PATH")" && pwd)/$(basename "$SOURCE_APP_PATH")"
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-toolbar-smoke.XXXXXX")"
+SMOKE_ROOT="$(cd -P "$SMOKE_ROOT" && pwd -P)"
 SMOKE_DOCUMENT="$SMOKE_ROOT/toolbar-cold.md"
 SMOKE_EXTERNAL_DOCUMENT="$SMOKE_ROOT/external-after-zero-windows.md"
 SMOKE_RESTORE_DOCUMENT="$SMOKE_ROOT/restore-on-seed.md"
-SMOKE_SUPPORT="$SMOKE_ROOT/support"
+mint_smoke_capsule
 
-mkdir -p "$SMOKE_SUPPORT"
-APP_PATH="$SMOKE_ROOT/$APP_NAME.app"
-stage_smoke_app "$SOURCE_APP_PATH" "$APP_PATH" "$SMOKE_SUPPORT"
-printf '# Toolbar cold-frame witness\n\nEditable staged document.\n' >"$SMOKE_DOCUMENT"
-printf '# External open after zero windows\n' >"$SMOKE_EXTERNAL_DOCUMENT"
-printf '# Restore-ON seed\n' >"$SMOKE_RESTORE_DOCUMENT"
-
-# Kill any survivor before touching cfprefsd, then make the fixed smoke domain
-# run-local. Every later preference belongs to this invocation alone.
+# The freshly minted baseline identity is already empty. Retire it once more
+# before launch so even a queued daemon write from staging cannot become part
+# of the baseline evidence.
 terminate_app
 reset_smoke_defaults_domain
 
@@ -1027,10 +1511,20 @@ fi
 BUNDLE_COMMIT="$(/usr/libexec/PlistBuddy -c 'Print :PensieveBuildCommit' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
 BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")"
-EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$APP_NAME"
 log "source bundle=$SOURCE_APP_PATH commit=$BUNDLE_COMMIT version=$BUNDLE_VERSION build=$BUNDLE_BUILD"
 log "staged bundle=$APP_PATH executable=$EXECUTABLE_PATH id=$APP_ID signature=$SMOKE_SIGNING_MODE"
 log "isolated support dir=$SMOKE_SUPPORT keychain=$SMOKE_KEYCHAIN_SERVICE"
+log "identity manifest=$IDENTITY_MANIFEST"
+
+run_fresh_launcher_baseline_probe
+rotate_smoke_capsule "retiring initial fresh-profile baseline"
+
+# Witnesses are created only after the clean UI baseline has passed and its
+# capsule has been completely retired. Files that belong to a product scenario
+# can therefore never influence the claim that the profile began empty.
+printf '# Toolbar cold-frame witness\n\nEditable staged document.\n' >"$SMOKE_DOCUMENT"
+printf '# External open after zero windows\n' >"$SMOKE_EXTERNAL_DOCUMENT"
+printf '# Restore-ON seed\n' >"$SMOKE_RESTORE_DOCUMENT"
 
 if [[ $MENU_RESTORED_ONLY -eq 1 ]]; then
   run_saved_state_isolation_probe
@@ -1065,29 +1559,55 @@ ax_census_status=0
 # SMOKE_ROOT.
 ax_census_script="$(mktemp "$SMOKE_ROOT/pensieve-ax-census.XXXXXX")"
 cat >"$ax_census_script" <<'APPLESCRIPT'
-on waitForProcess(appName, timeoutSeconds)
+property expectedBundleID : ""
+
+on processForPID(targetPID, expectedBundleID)
   tell application "System Events"
-    repeat with i from 1 to (timeoutSeconds * 10)
-      if exists process appName then return true
-      delay 0.1
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
     end repeat
   end tell
-  error "Timed out waiting for " & appName
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
 end waitForProcess
 
-on waitForWindow(appName, timeoutSeconds)
-  tell application "System Events"
-    tell process appName
-      repeat with i from 1 to (timeoutSeconds * 10)
-        if (count of windows) > 0 then return true
-        delay 0.1
-      end repeat
-    end tell
-  end tell
+on waitForWindow(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          if (count of windows) > 0 then return true
+        end tell
+      end try
+    end if
+    delay 0.1
+  end repeat
   error "Timed out waiting for a visible window"
 end waitForWindow
 
-on toolbarCensus(appName)
+on toolbarCensus(targetPID)
   -- Census the WINDOW UNDER TEST — always `window 1`, the frontmost/key window
   -- that receives the menu-driven mode changes and whose geometry the geometry
   -- assertions pin. The rest of this script already operates on `window 1`
@@ -1106,8 +1626,10 @@ on toolbarCensus(appName)
   -- assertion flagged editing items the tested window had correctly dropped.
   set census to {}
   try
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is missing value then return census
     tell application "System Events"
-      tell process appName
+      tell appProcess
         set toolbarElements to entire contents of toolbar 1 of window 1
         repeat with elementRef in toolbarElements
           try
@@ -1153,8 +1675,10 @@ on presentExcludedIdentifiers(census, excludedIdentifiers)
   return presentItems
 end presentExcludedIdentifiers
 
-on assertWindowGeometry(appName, expectedPosition, expectedSize, stateName)
-  tell application "System Events" to tell process appName
+on assertWindowGeometry(targetPID, expectedPosition, expectedSize, stateName)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before geometry assertion: " & targetPID
+  tell application "System Events" to tell appProcess
     set actualPosition to position of window 1
     set actualSize to size of window 1
   end tell
@@ -1180,13 +1704,13 @@ end joined
 -- false-pass on a stale-but-matching read or false-fail on a torn-down-but-
 -- not-yet-observed one. Pass an empty excludedIdentifiers list when a state
 -- has nothing to exclude.
-on settledToolbarCensus(appName, expectedIdentifiers, excludedIdentifiers, timeoutTenths)
+on settledToolbarCensus(targetPID, expectedIdentifiers, excludedIdentifiers, timeoutTenths)
   set stableCount to 0
   set latestCensus to {}
   set latestMissing to {}
   set latestUnexpected to {}
   repeat with i from 1 to timeoutTenths
-    set latestCensus to my toolbarCensus(appName)
+    set latestCensus to my toolbarCensus(targetPID)
     set latestMissing to my missingIdentifiers(latestCensus, expectedIdentifiers)
     set latestUnexpected to my presentExcludedIdentifiers(latestCensus, excludedIdentifiers)
     if (latestMissing is {}) and (latestUnexpected is {}) then
@@ -1210,9 +1734,11 @@ on settledToolbarCensus(appName, expectedIdentifiers, excludedIdentifiers, timeo
     "; observed: " & my joined(latestCensus, ", ")
 end settledToolbarCensus
 
-on assertMenuItem(appName, menuName, itemName)
+on assertMenuItem(targetPID, menuName, itemName)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before menu assertion: " & targetPID
   tell application "System Events"
-    tell process appName
+    tell appProcess
       tell menu bar 1
         tell menu bar item menuName
           if not (exists menu item itemName of menu 1) then
@@ -1224,14 +1750,16 @@ on assertMenuItem(appName, menuName, itemName)
   end tell
 end assertMenuItem
 
-on toolbarElementByAccessibleName(appName, targetName)
+on toolbarElementByAccessibleName(targetPID, targetName)
   -- AX attribute propagation can lag behind the identifier-based toolbar
   -- census: a control can exist (and already show up by identifier) before
   -- its localized accessible name is queryable. Retry with a bounded backoff
   -- instead of failing on the first miss.
   repeat with attemptNumber from 1 to 5
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is missing value then error "exact smoke pid disappeared before toolbar lookup: " & targetPID
     tell application "System Events"
-      tell process appName
+      tell appProcess
         set toolbarElements to entire contents of toolbar 1 of window 1
         repeat with elementRef in toolbarElements
           set elementDescription to ""
@@ -1258,48 +1786,51 @@ on toolbarElementByAccessibleName(appName, targetName)
   error "Missing toolbar control with accessible name: " & targetName
 end toolbarElementByAccessibleName
 
-on windowElementByIdentifier(appName, targetIdentifier, timeoutTenths)
+on windowElementByIdentifier(targetPID, targetIdentifier, timeoutTenths)
   repeat with attemptNumber from 1 to timeoutTenths
-    tell application "System Events" to tell process appName
-      set windowElements to entire contents of window 1
-      repeat with elementRef in windowElements
-        try
-          set identifierValue to value of attribute "AXIdentifier" of elementRef
-          if identifierValue is targetIdentifier then return contents of elementRef
-        end try
-      end repeat
-    end tell
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      tell application "System Events" to tell appProcess
+        set windowElements to entire contents of window 1
+        repeat with elementRef in windowElements
+          try
+            set identifierValue to value of attribute "AXIdentifier" of elementRef
+            if identifierValue is targetIdentifier then return contents of elementRef
+          end try
+        end repeat
+      end tell
+    end if
     delay 0.1
   end repeat
   error "Timed out waiting for window element: " & targetIdentifier
 end windowElementByIdentifier
 
 on run argv
-set appName to item 1 of argv
-set coldOnly to item 2 of argv is "1"
-set baseExpectedCount to item 3 of argv as integer
-set expectedIdentifiers to items 4 thru -1 of argv
-set baseExpectedIdentifiers to items 4 thru (3 + baseExpectedCount) of argv
-my waitForProcess(appName, 12)
-my waitForWindow(appName, 12)
+set targetPID to item 1 of argv as integer
+set my expectedBundleID to item 2 of argv as text
+set coldOnly to item 3 of argv is "1"
+set baseExpectedCount to item 4 of argv as integer
+set expectedIdentifiers to items 5 thru -1 of argv
+set baseExpectedIdentifiers to items 5 thru (4 + baseExpectedCount) of argv
+my waitForProcess(targetPID, 12)
+my waitForWindow(targetPID, 12)
 
--- Resolve the exact running instance's PID once, up front, via System
--- Events process identity (not an app-name activate). Reused below so every
--- later re-activation targets this specific process instead of letting
--- LaunchServices resolve "Pensieve" by name, which could pick a different
--- installed copy (dist/ vs /Applications) sharing that display name.
-tell application "System Events" to set targetPID to unix id of process appName
+-- The shell resolved and authenticated this PID from bundle id, bundle path
+-- and executable path immediately before invoking this script. AppleScript
+-- never derives process authority from a display name.
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+if appProcess is missing value then error "exact smoke pid disappeared before AX census: " & targetPID
 
 -- NO-STIMULUS BOUNDARY: from process discovery through this census, the
 -- harness only reads AX state and waits. It does not activate/focus the app,
 -- click, move the pointer, resize, raise a menu, or mutate window geometry.
-set coldCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 80)
+set coldCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 80)
 set missingItems to my missingIdentifiers(coldCensus, expectedIdentifiers)
 if (count of missingItems) > 0 then
   error "Cold toolbar census missing identifiers: " & my joined(missingItems, ", ") & ¬
     "; observed: " & my joined(coldCensus, ", ")
 end if
-tell application "System Events" to tell process appName
+tell application "System Events" to tell appProcess
   set coldPosition to position of window 1
   set coldSize to size of window 1
 end tell
@@ -1315,23 +1846,23 @@ if coldOnly then return "cold toolbar AX census passed"
 -- activate", which resolves the app by name through LaunchServices and can
 -- target a different installed bundle than the one under test.
 tell application "System Events"
-  set frontmost of (first process whose unix id is targetPID) to true
+  set frontmost of appProcess to true
 end tell
 delay 0.5
 
-assertMenuItem(appName, "File", "New File")
-assertMenuItem(appName, "File", "Open File…")
-assertMenuItem(appName, "File", "Open Recent")
-assertMenuItem(appName, "File", "Open Folder…")
-assertMenuItem(appName, "File", "Close")
-assertMenuItem(appName, "Mode", "Source Mode")
-assertMenuItem(appName, "Mode", "Split Mode")
-assertMenuItem(appName, "Format", "Bold")
-assertMenuItem(appName, "Format", "Link")
+assertMenuItem(targetPID, "File", "New File")
+assertMenuItem(targetPID, "File", "Open File…")
+assertMenuItem(targetPID, "File", "Open Recent")
+assertMenuItem(targetPID, "File", "Open Folder…")
+assertMenuItem(targetPID, "File", "Close")
+assertMenuItem(targetPID, "Mode", "Source Mode")
+assertMenuItem(targetPID, "Mode", "Split Mode")
+assertMenuItem(targetPID, "Format", "Bold")
+assertMenuItem(targetPID, "Format", "Link")
 -- Dispatch entry points are menu rows that only open the confirmation sheet
 -- (W3-A gateway); their presence in the menu bar is part of the P0 contract.
-assertMenuItem(appName, "Agents", "Dispatch Document to Agent…")
-assertMenuItem(appName, "Agents", "Dispatch Document with Workflow")
+assertMenuItem(targetPID, "Agents", "Dispatch Document to Agent…")
+assertMenuItem(targetPID, "Agents", "Dispatch Document with Workflow")
 
 set editingIdentifiers to {¬
   "pensieve.toolbar.undo", "pensieve.toolbar.redo", ¬
@@ -1343,7 +1874,7 @@ set editingIdentifiers to {¬
 set previewExpectedIdentifiers to my identifiersExcluding(baseExpectedIdentifiers, editingIdentifiers)
 
 tell application "System Events"
-  tell process appName
+  tell appProcess
     -- Put the preview surface on screen so the appearance control is part of
     -- the live toolbar, then prove it is a native menu that actually opens.
     -- A plain button backed by transient SwiftUI popover state can still pass
@@ -1358,8 +1889,8 @@ tell application "System Events"
     end tell
     delay 0.5
 
-    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
-    my assertWindowGeometry(appName, coldPosition, coldSize, "split transition")
+    set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+    my assertWindowGeometry(targetPID, coldPosition, coldSize, "split transition")
     log "AX_CENSUS_SPLIT=" & my joined(splitCensus, ",")
 
     tell menu bar 1
@@ -1370,8 +1901,8 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set previewCensus to my settledToolbarCensus(appName, previewExpectedIdentifiers, editingIdentifiers, 40)
-    my assertWindowGeometry(appName, coldPosition, coldSize, "preview transition")
+    set previewCensus to my settledToolbarCensus(targetPID, previewExpectedIdentifiers, editingIdentifiers, 40)
+    my assertWindowGeometry(targetPID, coldPosition, coldSize, "preview transition")
     log "AX_CENSUS_PREVIEW=" & my joined(previewCensus, ",")
 
     tell menu bar 1
@@ -1382,10 +1913,10 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set splitCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
-    my assertWindowGeometry(appName, coldPosition, coldSize, "split restore")
+    set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+    my assertWindowGeometry(targetPID, coldPosition, coldSize, "split restore")
 
-    set appearanceControl to my toolbarElementByAccessibleName(appName, "Preview Appearance")
+    set appearanceControl to my toolbarElementByAccessibleName(targetPID, "Preview Appearance")
     if (role of appearanceControl) is not "AXMenuButton" then
       error "Preview Appearance must be a native menu button, got " & (role of appearanceControl)
     end if
@@ -1408,7 +1939,7 @@ tell application "System Events"
     -- Dismissing a native menu invalidates its AXUIElement; reacquiring the
     -- toolbar control mirrors a later user click instead of testing a stale
     -- Accessibility handle.
-    set appearanceControl to my toolbarElementByAccessibleName(appName, "Preview Appearance")
+    set appearanceControl to my toolbarElementByAccessibleName(targetPID, "Preview Appearance")
     click appearanceControl
     delay 0.3
     if (count of menus of appearanceControl) is 0 then
@@ -1426,7 +1957,7 @@ tell application "System Events"
     -- cannot see that at all: AXIdentifier survives the move untouched, so a
     -- census-only check would have stayed green on a control no assistive tool
     -- can name. Keep this lookup name-based.
-    set rewriteControl to my toolbarElementByAccessibleName(appName, "Rewrite with AI")
+    set rewriteControl to my toolbarElementByAccessibleName(targetPID, "Rewrite with AI")
     if (role of rewriteControl) is not "AXMenuButton" then
       error "Rewrite with AI must be a native menu button, got " & (role of rewriteControl)
     end if
@@ -1454,8 +1985,8 @@ tell application "System Events"
       end tell
     end tell
     delay 0.5
-    set untitledCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
-    my assertWindowGeometry(appName, coldPosition, coldSize, "file-backed to untitled transition")
+    set untitledCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+    my assertWindowGeometry(targetPID, coldPosition, coldSize, "file-backed to untitled transition")
     log "AX_CENSUS_UNTITLED=" & my joined(untitledCensus, ",")
 
     -- A toolbar census can prove the editing chrome exists while missing the
@@ -1464,7 +1995,7 @@ tell application "System Events"
     -- first-responder handoff promised by New File/New Tab. Check product-owned
     -- focus BEFORE the smoke mutates anything; setting AXFocused here would
     -- manufacture the state under test and mask the regression.
-    set editorElement to my windowElementByIdentifier(appName, "pensieve.editor", 50)
+    set editorElement to my windowElementByIdentifier(targetPID, "pensieve.editor", 50)
     if focused of editorElement is not true then
       error "New File did not move first-responder focus to the Untitled editor"
     end if
@@ -1485,7 +2016,7 @@ tell application "System Events"
     end if
     log "NEW_UNTITLED_EDITABLE=PASS"
 
-    if (count of windows) is 0 then error appName & " has no windows after menu probing"
+    if (count of windows) is 0 then error "pid=" & targetPID & " has no windows after menu probing"
   end tell
 end tell
 
@@ -1494,20 +2025,27 @@ tell application "Finder" to activate
 delay 0.3
 -- Reactivate the exact resolved PID (see targetPID above), not the app name,
 -- so this regain step re-focuses the process under test unambiguously.
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+if appProcess is missing value then error "exact smoke pid disappeared before focus regain: " & targetPID
 tell application "System Events"
-  set frontmost of (first process whose unix id is targetPID) to true
-  tell process appName
+  set frontmost of appProcess to true
+  tell appProcess
     perform action "AXRaise" of window 1
   end tell
 end tell
 delay 0.5
-set regainCensus to my settledToolbarCensus(appName, baseExpectedIdentifiers, {}, 40)
-my assertWindowGeometry(appName, coldPosition, coldSize, "key-window regain/redraw")
+set regainCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+my assertWindowGeometry(targetPID, coldPosition, coldSize, "key-window regain/redraw")
 log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
 
-ax_census_output=$(run_ax_osascript 60 "$ax_census_script" "$APP_NAME" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+AX_VERIFIED_PID="$(isolated_app_verify_running_identity \
+  "$APP_ID" "$APP_PATH" "$EXECUTABLE_PATH")" \
+  || die "runtime identity drifted before the toolbar AX census"
+[[ "$AX_VERIFIED_PID" == "$OWNED_PID" ]] \
+  || die "runtime pid changed before the toolbar AX census ($OWNED_PID -> $AX_VERIFIED_PID)"
+ax_census_output=$(run_ax_osascript 60 "$ax_census_script" "$OWNED_PID" "$APP_ID" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
   "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1) || ax_census_status=$?
 rm -f "$ax_census_script"
 printf '%s\n' "$ax_census_output"
@@ -1540,10 +2078,13 @@ ok "native UI smoke passed"
 # the probe manages its own launch/quit/relaunch cycle, starting with
 # terminate_app.
 if [[ $COLD_ONLY -eq 0 ]]; then
+  prepare_next_smoke_scenario "toolbar scenario"
   run_saved_state_isolation_probe
   ok "Saved Application State isolation probe passed"
+  prepare_next_smoke_scenario "saved-state scenario"
   run_zero_window_external_open_probe
   ok "Zero-window external-open probe passed"
+  prepare_next_smoke_scenario "zero-window external-open scenario"
   run_restore_on_external_open_probe
   ok "Restore-ON external-open probe passed"
 fi

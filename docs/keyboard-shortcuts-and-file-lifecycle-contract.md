@@ -1,6 +1,6 @@
 # Pensieve — Keyboard Shortcuts, File & Recovery Contract v0.1
 
-> **Owner: Monika. Established 2026-08-03; current through 2026-08-10.**
+> **Owner: Monika. Established 2026-08-03; current through 2026-08-11.**
 > Settled decisions carry their dates inline. Items marked **[OPEN]** await a
 > product decision; **[IMPLEMENTATION GAP]** means the decision is settled but
 > the current code does not yet satisfy it.
@@ -537,7 +537,12 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
 - **No test writes production Application Support.** Tests inject isolated
   stores; XCTest's shared fallback for Recovery, workspace metadata, index and
   document AI state is process-scoped under one temporary directory. Runtime
-  smoke uses its own staged identity and support directory.
+  smoke uses a unique per-run staged identity across every stateful macOS
+  surface, not only its support directory. `dist/Pensieve.app` and
+  `make run-release` retain production identity; unbundled `make run` retains
+  non-isolated support and Keychain fallbacks. None is fresh-smoke evidence.
+  The preparation, reopen, verification and cleanup rules are
+  canonical in [`runtime-testing.md`](runtime-testing.md).
 
 The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
 source metadata across store reload, non-overwriting recovery open, explicit
@@ -794,6 +799,15 @@ Close All must never cause silent data loss.
   ("file disappears from Open Files, stays in Recents").
 
 ## Minimal smoke check
+
+Run this behavioral checklist only in a repository-owned runtime lane described
+by [`runtime-testing.md`](runtime-testing.md). `make manual-smoke` creates a new
+clean interactive experiment; `make manual-smoke-reopen` intentionally retains
+that experiment for relaunch assertions; `make ui-smoke` is automated and
+ephemeral. Opening `dist/Pensieve.app` or using `make run-release` exercises
+production identity and production state and must not be reported as a fresh
+smoke. Before any witness is seeded, the smoke lane proves one empty launcher,
+zero workspaces, zero Open Files, zero recovery rows and zero Recents.
 
 An agent implementing or refactoring menu/commands must verify:
 

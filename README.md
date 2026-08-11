@@ -98,6 +98,37 @@ make lint
 make gates
 ```
 
+## Runtime testing
+
+`dist/Pensieve.app` and `make run-release` use Pensieve's production bundle
+identity and the operator's existing state. `make run` is also non-isolated: its
+unbundled executable uses the normal support and Keychain fallbacks. These lanes
+are appropriate only when that state is intentionally under test; they are not
+fresh smoke environments.
+
+Use a repository-owned isolated lane for runtime checks:
+
+```bash
+make manual-smoke          # new clean interactive experiment
+make manual-smoke-reopen   # reopen that same experiment with its state intact
+make manual-smoke-verify   # read-only identity and scope verification
+make manual-smoke-clean    # retire only that experiment
+make ui-smoke              # automated ephemeral smoke with a unique identity
+```
+
+Every new manual or automated smoke receives its own process/executable,
+bundle/defaults, Application Support, Keychain, Open Recent, Saved State,
+cache/WebKit, and LaunchServices identity. The harness also requires a source
+bundle signed by the trusted Team ID whose sealed build-provenance manifest
+matches the current runtime inputs and the exact executable/FFI payloads.
+Historical or dirty-source experiments have separate, lane-scoped escape
+hatches documented in the runtime canon; those switches never bypass the
+signature, Team ID, manifest, or payload checks, and such a run is not
+fresh-current-head or release evidence. Smoke commands never reset or delete
+production Pensieve state. See the canonical
+[`docs/runtime-testing.md`](docs/runtime-testing.md) contract before adding or
+changing a runtime test.
+
 The Mac App Store packaging lane exists as `make release-appstore`, but App Store Connect submission, signing identities, and the final MAS truth-clicks stay with the human operator.
 
 ## Product contract

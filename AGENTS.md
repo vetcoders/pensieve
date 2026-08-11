@@ -41,7 +41,7 @@ Pensieve/Sources/Pensieve/
   Search/      index-backed workspace search
   Workspace/   substrate, cache, scanning
 scripts/       build-release.sh, ui-smoke.sh, semgrep-with-policy.sh
-docs/          landing page (index.html) + architecture notes
+docs/          runtime-testing canon, product contract, architecture notes
 ```
 
 ## Traps worth knowing before you edit
@@ -56,12 +56,23 @@ that area — it is the single largest source of click-to-reproduce bugs here.
 lifecycle surface evolves; run `loct impact` on it before changing a signature
 instead of relying on a historical count.
 
-**`make ui-smoke` runs against an isolated smoke identity, not the operator's
-app.** It stages a renamed, re-signed copy of the built app under
-`$SMOKE_ROOT` as `PensieveSmoke` (bundle id `io.vetcoders.pensieve.smoke`) and
-drives that — a separate process name, defaults domain, and support directory
-from the operator's production instance in `/Applications`. See
-`scripts/ui-smoke.sh` for the identity-isolation rationale.
+**`dist/Pensieve.app` and `make run-release` use production identity and
+production state; `make run` is also non-isolated.** These are not clean smoke
+lanes: they may restore or write the operator's real support, Keychain,
+workspaces, files, drafts, recents, and window state. Use
+`make manual-smoke` for a fresh interactive identity, its `-reopen`, `-verify`,
+and `-clean` companions for the same experiment, or `make ui-smoke` for an
+automated ephemeral run. Every newly minted manual experiment and every
+independent automated scenario owns a unique per-run identity across
+process/executable, bundle/defaults, Application Support, Keychain, Open Recent,
+Saved State, caches/WebKit/HTTPStorages, and LaunchServices. The
+source bundle must be signed by the trusted Team ID and carry sealed build
+provenance matching the current runtime inputs plus the exact executable/FFI
+payloads. Historical and dirty-source experiments require separate explicit
+lane-scoped overrides; neither can bypass signature, Team, manifest, or payload
+verification, and neither is release evidence. The canonical contract is
+`docs/runtime-testing.md`; smoke tooling must never touch
+`io.vetcoders.pensieve` or production state.
 
 **`ui-smoke.sh` runs under whatever `bash` is first on PATH.** The shebang is
 `#!/usr/bin/env bash`, so a clean environment picks the system bash 3.2. Empty

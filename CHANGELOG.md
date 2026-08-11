@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A “fresh” smoke can no longer inherit another Pensieve's state or silently
+  test old code.** Manual, automated UI, BUGMAP and search-memory runs now stage
+  a UUID-namespaced bundle whose process/executable, defaults, Application
+  Support, Keychain, Open Recent, Saved State, caches and LaunchServices entry
+  belong to that run alone. Before any witness is seeded, the harness verifies
+  the exact runtime identity and manifest, verifies trusted signed build
+  provenance down to the current runtime inputs and normalized executable/FFI
+  payloads, and requires one empty launcher to remain empty across a
+  three-second census. Process control retains the exact
+  `NSRunningApplication` instead of trusting a reusable PID. Cleanup is
+  manifest-scoped, waits out late Recent Documents writes, verifies the final
+  LaunchServices state, and fails closed rather than guessing or touching
+  production Pensieve state; every newly minted experiment or independent
+  automated scenario receives a different identity, while an explicit manual
+  reopen retains only that experiment's identity for persistence testing.
 - **The File menu no longer disappears with your last window.** Closing every
   window keeps Pensieve running, but the menu bar went with them: New, Open,
   Open Recent and Open Folder all vanished, ⌘N, ⌘O and ⌘T did nothing, and the
@@ -198,7 +213,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed before `caffeinate` or staging begins so an early error cannot leave
   a process keeping the operator's display awake. The staged identity also uses
   its own Keychain service, so smoke cannot read the operator's production AI
-  provider key.
+  provider key. Every runtime smoke now mints a complete per-run identity across
+  executable/PID, bundle/defaults, Application Support, Keychain, Open Recent,
+  Saved State, caches and LaunchServices, pins it in a manifest, and proves one
+  empty launcher before creating a witness. Independent UI-smoke scenarios
+  retire and re-prove that capsule between probes. Cleanup re-authenticates the
+  exact process before every signal and preserves the bundle, manifest and
+  owner root when any step fails, rather than deleting the only safe retry
+  handle or letting a survivor become the next run's ghost.
 - **A large document no longer pins the app at full CPU for as long as it stays open.** Once a multi-megabyte note was on screen, the editor kept asking whether its text had changed by reading the entire document and comparing it character by character — twice for every pass the interface made, and it makes them continuously. On a 17 MB file that answer took longer to produce than the interval between the questions, so the app sat at 100% CPU indefinitely, ignoring the keyboard and the mouse, with nothing on screen to explain why. The editor now recognises unchanged text without reading it, so the question costs the same whether the document is a paragraph or a novel. A side effect of the old comparison is fixed with it: text that differed from what was on screen only in how its accents were composed counted as "unchanged" and never reached the editor.
 - **Opening a large document no longer freezes the window.** Reading a multi-megabyte note, colouring it, and rendering its preview all happened in the instant the click was handled, so the app stopped answering for as long as all three took together — no spinner, no title, nothing to say the click had even landed. A document over a megabyte now opens in stages: the window or tab takes the file's name and place immediately and shows an "Opening …" spinner for it, while the file is read in the background and the colouring and preview arrive as they are ready. Documents under that size open exactly as before, in one go. Whatever you do next wins — opening another file, or closing the window, drops the read instead of letting it arrive on top of you — and the document stays read-only until its text is really there, so a ⌘S during the open cannot write an empty file over the one being read.
 - **A very large note no longer freezes a second time, moments after it has opened.** Staging the open put the file on screen quickly, and then — a fraction of a second later — the window locked up again for minutes, with the spinner already gone and the text already showing. Colouring a document happens in pieces small enough to fit between frames, but one pass never went through that: the one that runs after an edit touches a code fence. Opening a file counts as such an edit, so the pass that had just been carefully spread out was queued up again right behind it, whole. On a 17 MB note that is the entire file re-coloured in one go, and the same freeze came back on every restart that restored it, and on every keystroke on a fence line afterwards. That pass is now cut into the same small pieces as the rest: what is on screen is coloured at once and the remainder follows in the background, for code blocks and ordinary prose alike. Notes below a megabyte are coloured in one pass exactly as before.
