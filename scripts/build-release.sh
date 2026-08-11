@@ -56,7 +56,8 @@ DMG_STABLE_PATH="$DIST_DIR/$APP_NAME.dmg"
 DMG_VOLNAME="Pensieve"
 VERSION_FILE="$REPO_ROOT/VERSION"
 INFO_PLIST_SRC="$PKG_DIR/Resources/Info.plist"
-ENTITLEMENTS="$PKG_DIR/Resources/Pensieve.entitlements"
+ENTITLEMENTS_RELATIVE="Pensieve/Resources/Pensieve.entitlements"
+ENTITLEMENTS="$REPO_ROOT/$ENTITLEMENTS_RELATIVE"
 ICON_SRC="$PKG_DIR/Resources/$APP_NAME.icns"
 ICON_RESOURCE="$APP_NAME.icns"
 KEYS_DIR="${HOME}/.keys"
@@ -67,6 +68,12 @@ SIGNING_IDENTITY_FILE="$KEYS_DIR/signing-identity.txt"
 # SwiftPM manifest links the same profile that is later embedded in the app.
 FFI_PROFILE="${FFI_PROFILE:-release}"
 export FFI_PROFILE
+BUILD_CONFIGURATION="release"
+BUILD_ARCHITECTURE="arm64"
+TRUSTED_DEVELOPER_TEAM_ID="MW223P3NPX"
+RELEASE_SNAPSHOT_ROOT=""
+RELEASE_SNAPSHOT_PKG=""
+PROVENANCE_VERIFICATION_INPUT_DIGEST=""
 
 # ─── Args ─────────────────────────────────────────────────────────────────
 DO_NOTARIZE=1
@@ -101,7 +108,13 @@ if (( APPSTORE )); then
     DIST_DIR="$REPO_ROOT/dist/mas"
     APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
     PKG_PATH="$DIST_DIR/$APP_NAME.pkg"
-    ENTITLEMENTS="$PKG_DIR/Resources/Pensieve.mas.entitlements"
+    ENTITLEMENTS_RELATIVE="Pensieve/Resources/Pensieve.mas.entitlements"
+    ENTITLEMENTS="$REPO_ROOT/$ENTITLEMENTS_RELATIVE"
+    EXPECTED_HARDENED_RUNTIME="false"
+    EXPECTED_SIGNATURE_POLICY="team-only"
+else
+    EXPECTED_HARDENED_RUNTIME="true"
+    EXPECTED_SIGNATURE_POLICY="developer-id"
 fi
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -114,8 +127,11 @@ case "$FFI_PROFILE" in
     debug|release) ;;
     *) die "FFI_PROFILE must be debug or release, got: $FFI_PROFILE" ;;
 esac
+if (( DMG_ONLY )) && [[ "$FFI_PROFILE" != "release" ]]; then
+    die "--dmg-only only packages a release-profile app; unset FFI_PROFILE or set it to release."
+fi
 if (( ! DMG_ONLY )) && [[ "$FFI_PROFILE" != "release" ]]; then
-    if (( DO_NOTARIZE || APPSTORE )); then
+    if (( DO_DMG || DO_NOTARIZE || APPSTORE )); then
         die "Distributable releases require FFI_PROFILE=release; debug FFI is local-only."
     fi
     warn "FFI_PROFILE=debug — local signed app will contain the debug qube-ffi runtime."
@@ -156,6 +172,77 @@ source "$SCRIPT_DIR/lib/bundle-identity.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/rpath-hygiene.sh"
 
+# Runtime-input and normalized-payload provenance. The manifest written by
+# these helpers is sealed by the final bundle signature and later consumed by
+# isolated smoke staging as proof that an artifact actually came from the
+# current runtime-producing source inputs.
+# shellcheck source=scripts/lib/build-provenance.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/build-provenance.sh"
+
+cleanup_release_snapshot() {
+    local original_status="$?"
+    trap - EXIT INT TERM
+    if [[ -n "$RELEASE_SNAPSHOT_ROOT" && -d "$RELEASE_SNAPSHOT_ROOT" ]]; then
+        /bin/chmod -R u+w "$RELEASE_SNAPSHOT_ROOT" >/dev/null 2>&1 || true
+        /bin/rm -R -- "$RELEASE_SNAPSHOT_ROOT" >/dev/null 2>&1 || true
+    fi
+    exit "$original_status"
+}
+trap cleanup_release_snapshot EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+assert_release_head_unchanged() {
+    local phase="$1"
+
+    build_provenance_assert_head "$REPO_ROOT" "$COMMIT_FULL" \
+        || die "Repository HEAD changed $phase; refusing to relabel a commit-$COMMIT_FULL artifact."
+}
+
+verify_release_bundle_provenance() {
+    local phase="$1"
+
+    assert_release_head_unchanged "before $phase"
+    if [[ -n "$PROVENANCE_VERIFICATION_INPUT_DIGEST" ]]; then
+        build_provenance_verify_bundle_against_commit_digest \
+            "$APP_BUNDLE" \
+            "$REPO_ROOT" \
+            "$COMMIT_FULL" \
+            "$PROVENANCE_VERIFICATION_INPUT_DIGEST" \
+            "$BUILD_CONFIGURATION" \
+            "$BUILD_ARCHITECTURE" \
+            "$FFI_PROFILE" \
+            "$TRUSTED_DEVELOPER_TEAM_ID" \
+            "git:$ENTITLEMENTS_RELATIVE" \
+            "$EXPECTED_HARDENED_RUNTIME" \
+            "io.vetcoders.pensieve" \
+            "$APP_NAME" \
+            "$APP_NAME" \
+            "$EXPECTED_SIGNATURE_POLICY" \
+            || return 1
+    else
+        build_provenance_assert_runtime_inputs_clean "$REPO_ROOT" "$FFI_PROFILE" \
+            || die "Release runtime inputs are dirty before $phase."
+        build_provenance_verify_bundle_against_source \
+            "$APP_BUNDLE" \
+            "$REPO_ROOT" \
+            "$COMMIT_FULL" \
+            "$BUILD_CONFIGURATION" \
+            "$BUILD_ARCHITECTURE" \
+            "$FFI_PROFILE" \
+            "$TRUSTED_DEVELOPER_TEAM_ID" \
+            "git:$ENTITLEMENTS_RELATIVE" \
+            "$EXPECTED_HARDENED_RUNTIME" \
+            "io.vetcoders.pensieve" \
+            "$APP_NAME" \
+            "$APP_NAME" \
+            "$EXPECTED_SIGNATURE_POLICY" \
+            || return 1
+    fi
+    assert_release_head_unchanged "after $phase"
+}
+
 # Fail the build if anything inside the .app still carries an absolute LC_RPATH.
 # Verification only — it never mutates, so it is safe to call after signing and
 # in the lanes that reuse an already-signed bundle.
@@ -173,6 +260,81 @@ assert_app_rpath_hygiene() {
     # through @rpath lives inside the bundle. Check it rather than trust it.
     rpath_assert_resolvable "$APP_BUNDLE/Contents/MacOS/$APP_NAME" "$APP_BUNDLE/Contents/Frameworks" \
         || die "$hint"
+}
+
+create_release_snapshot() {
+    local source_digest_before source_digest_after snapshot_digest resolve_log
+
+    assert_release_head_unchanged "before source snapshot"
+    source_digest_before="$(build_provenance_runtime_input_digest \
+        "$REPO_ROOT" "$FFI_PROFILE")" \
+        || die "Could not fingerprint the resolved source inputs before snapshotting."
+
+    RELEASE_SNAPSHOT_ROOT="$(/usr/bin/mktemp -d \
+        "${TMPDIR:-/tmp}/pensieve-release-snapshot.XXXXXX")" \
+        || die "Could not create the release source snapshot."
+    RELEASE_SNAPSHOT_PKG="$RELEASE_SNAPSHOT_ROOT/Pensieve"
+    # Never snapshot mutable worktree bytes. Git archive materializes the exact
+    # COMMIT_FULL tree and therefore defeats status/index bypasses such as
+    # assume-unchanged or skip-worktree. The later source/snapshot digest
+    # equality check still proves that compiler-visible source bytes agree with
+    # that commit. Dependency checkouts are freshly resolved below.
+    if ! /usr/bin/git -C "$REPO_ROOT" archive --format=tar "$COMMIT_FULL" -- \
+        VERSION \
+        Pensieve/Package.swift \
+        Pensieve/Package.resolved \
+        Pensieve/Sources \
+        Pensieve/Resources \
+        Pensieve/scripts \
+        "Pensieve/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib" \
+        scripts/build-release.sh \
+        scripts/lib/bundle-identity.sh \
+        scripts/lib/build-provenance.sh \
+        scripts/lib/rpath-hygiene.sh \
+        | /usr/bin/tar -xf - -C "$RELEASE_SNAPSHOT_ROOT"; then
+        die "Could not materialize the exact release commit into the source snapshot."
+    fi
+    assert_release_head_unchanged "after source snapshot extraction"
+
+    resolve_log="$DIST_DIR/swift-resolve-snapshot.log"
+    if ! swift package resolve --package-path "$RELEASE_SNAPSHOT_PKG" \
+        >"$resolve_log" 2>&1; then
+        /usr/bin/tail -25 "$resolve_log" >&2 || true
+        die "Could not resolve the snapshot's pinned SwiftPM graph — log: $resolve_log"
+    fi
+    # Build outputs remain writable under .build, but every package input and
+    # resolved checkout becomes read-only BEFORE the snapshot is fingerprinted.
+    # A later source mutation cannot affect this build, and the fingerprint can
+    # never describe bytes changed between hashing and swift build.
+    /bin/chmod -R a-w \
+        "$RELEASE_SNAPSHOT_ROOT/VERSION" \
+        "$RELEASE_SNAPSHOT_ROOT/scripts" \
+        "$RELEASE_SNAPSHOT_PKG/Package.swift" \
+        "$RELEASE_SNAPSHOT_PKG/Package.resolved" \
+        "$RELEASE_SNAPSHOT_PKG/Sources" \
+        "$RELEASE_SNAPSHOT_PKG/Resources" \
+        "$RELEASE_SNAPSHOT_PKG/scripts" \
+        "$RELEASE_SNAPSHOT_PKG/Vendor/qube-ffi/$FFI_PROFILE" \
+        "$RELEASE_SNAPSHOT_PKG/.build/checkouts" \
+        || die "Could not make the release snapshot inputs read-only."
+
+    snapshot_digest="$(build_provenance_runtime_input_digest \
+        "$RELEASE_SNAPSHOT_ROOT" "$FFI_PROFILE")" \
+        || die "Could not fingerprint the resolved release snapshot."
+    source_digest_after="$(build_provenance_runtime_input_digest \
+        "$REPO_ROOT" "$FFI_PROFILE")" \
+        || die "Could not re-fingerprint the source inputs after snapshotting."
+    assert_release_head_unchanged "after source snapshot verification"
+    if [[ "$source_digest_before" != "$snapshot_digest" \
+        || "$source_digest_after" != "$snapshot_digest" ]]; then
+        die "The release snapshot is not byte-identical to the clean source inputs.
+       Source before: $source_digest_before
+       Snapshot:      $snapshot_digest
+       Source after:  $source_digest_after"
+    fi
+
+    PROVENANCE_INPUT_DIGEST_BEFORE="$snapshot_digest"
+    ok "Immutable release snapshot: $snapshot_digest"
 }
 
 # ─── Pre-flight ───────────────────────────────────────────────────────────
@@ -238,25 +400,61 @@ if ! security find-identity -v -p codesigning | grep -q "$SIGNING_IDENTITY"; the
 fi
 ok "Signing identity present in Keychain"
 
-APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+assert_release_head_unchanged "while capturing release identity"
+APP_VERSION="$(git -C "$REPO_ROOT" show "$COMMIT_FULL:VERSION" \
+    | tr -d '[:space:]')"
 [[ "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]] \
     || die "VERSION must be semver-like, got '$APP_VERSION'"
-BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD)"
-COMMIT_FULL="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
+BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count "$COMMIT_FULL")"
+COMMIT_SLUG="$(git -C "$REPO_ROOT" rev-parse --short=8 "$COMMIT_FULL")"
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 BUILD_LABEL="$APP_VERSION+$COMMIT_SLUG"
 DMG_PATH="$DIST_DIR/$APP_NAME-$BUILD_LABEL.dmg"
+PROVENANCE_MANIFEST="$APP_BUNDLE/Contents/Resources/$PENSIEVE_BUILD_PROVENANCE_RESOURCE"
+PROVENANCE_INPUT_DIGEST_BEFORE=""
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
 log "FFI profile: $FFI_PROFILE"
+
+if (( ! DMG_ONLY )); then
+    if (( DO_CLEAN )); then
+        log "Cleaning $DIST_DIR + Pensieve/.build"
+        [[ ! -e "$DIST_DIR" ]] || /bin/rm -R -- "$DIST_DIR"
+        [[ ! -e "$PKG_DIR/.build" ]] || /bin/rm -R -- "$PKG_DIR/.build"
+    fi
+    /bin/mkdir -p "$DIST_DIR"
+
+    log "Resolving the source Package.resolved graph"
+    SOURCE_RESOLVE_LOG="$DIST_DIR/swift-resolve-source.log"
+    if ! swift package resolve --package-path "$PKG_DIR" >"$SOURCE_RESOLVE_LOG" 2>&1; then
+        /usr/bin/tail -25 "$SOURCE_RESOLVE_LOG" >&2 || true
+        die "Could not resolve the source SwiftPM graph — log: $SOURCE_RESOLVE_LOG"
+    fi
+    build_provenance_assert_runtime_inputs_clean "$REPO_ROOT" "$FFI_PROFILE" \
+        || die "Release provenance requires clean runtime inputs at HEAD."
+    create_release_snapshot
+
+    BUILD_PKG_DIR="$RELEASE_SNAPSHOT_PKG"
+    BUILD_INFO_PLIST_SRC="$BUILD_PKG_DIR/Resources/Info.plist"
+    BUILD_ICON_SRC="$BUILD_PKG_DIR/Resources/$APP_NAME.icns"
+    BUILD_QUBE_DYLIB_SRC="$BUILD_PKG_DIR/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib"
+    BUILD_ENTITLEMENTS="$RELEASE_SNAPSHOT_ROOT/$ENTITLEMENTS_RELATIVE"
+fi
 
 if (( DMG_ONLY )); then
     # Reuse an already-built, signed, notarized + stapled .app and only
     # (re)build/sign/notarize/staple the DMG around it. Lets a disk-full or
     # transient DMG failure be retried without re-running swift build and a
     # second Apple notarization of the .app.
+    assert_release_head_unchanged "before --dmg-only source verification"
     [[ -d "$APP_BUNDLE" ]] || die "--dmg-only: $APP_BUNDLE not found — run a full build first."
-    if ! codesign --verify --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+    log "Materializing exact commit runtime inputs for --dmg-only"
+    PROVENANCE_VERIFICATION_INPUT_DIGEST="$(
+        build_provenance_commit_runtime_input_digest \
+            "$REPO_ROOT" "$COMMIT_FULL" release
+    )" || die "Could not derive --dmg-only provenance from the exact commit tree."
+    ok "DMG-only commit runtime input: $PROVENANCE_VERIFICATION_INPUT_DIGEST"
+    if ! codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
         die "--dmg-only: $APP_BUNDLE signature is invalid — rebuild it before packaging a DMG."
     fi
     # A valid signature proves the bundle was not modified after signing. It is
@@ -279,21 +477,20 @@ if (( DMG_ONLY )); then
        They cannot be stripped from an already-signed bundle without invalidating
        its signature and notarization ticket. Rebuild it: make release-clean
        (or ./scripts/build-release.sh --clean)."
+    if ! verify_release_bundle_provenance "--dmg-only provenance verification"; then
+        die "--dmg-only: $APP_BUNDLE has missing, stale, or invalid build provenance.
+       A valid signature and Info.plist commit are not enough to prove which
+       runtime inputs and Mach-O payloads are inside it. Run a full build first:
+       make release-clean (or ./scripts/build-release.sh --clean)."
+    fi
     ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, LC_RPATH clean, skipping build/sign/notarize-app)"
 fi
 
 if (( ! DMG_ONLY )); then
 
-# ─── Clean ────────────────────────────────────────────────────────────────
-if (( DO_CLEAN )); then
-    log "Cleaning $DIST_DIR + Pensieve/.build"
-    rm -rf "$DIST_DIR" "$PKG_DIR/.build"
-fi
-mkdir -p "$DIST_DIR"
-
 # ─── Build ────────────────────────────────────────────────────────────────
 log "swift build -c release (arm64)"
-cd "$PKG_DIR"
+cd "$BUILD_PKG_DIR"
 # Same failure class as the `make test | tail` fix: a `| tail -8` on a red
 # parallel build routinely shows 8 progress lines from OTHER modules while the
 # actual `error:` lines scrolled away — the release/MAS lane died with no names.
@@ -303,26 +500,26 @@ if ! swift build -c release --arch arm64 >"$BUILD_LOG" 2>&1; then
     die "swift build failed — full log: $BUILD_LOG"
 fi
 tail -8 "$BUILD_LOG"
-EXECUTABLE="$PKG_DIR/.build/arm64-apple-macosx/release/$APP_NAME"
+EXECUTABLE="$BUILD_PKG_DIR/.build/arm64-apple-macosx/release/$APP_NAME"
 [[ -x "$EXECUTABLE" ]] || die "Executable not built at $EXECUTABLE"
 ok "Executable: $EXECUTABLE ($(du -h "$EXECUTABLE" | cut -f1))"
 
 # Bundle resources from SwiftPM (Bundle.module)
-SPM_BUNDLE_DIR="$(find "$PKG_DIR/.build/arm64-apple-macosx/release" -maxdepth 1 -name "${APP_NAME}_${APP_NAME}.bundle" -type d | head -1)"
+SPM_BUNDLE_DIR="$(find "$BUILD_PKG_DIR/.build/arm64-apple-macosx/release" -maxdepth 1 -name "${APP_NAME}_${APP_NAME}.bundle" -type d | head -1)"
 [[ -d "$SPM_BUNDLE_DIR" ]] || die "SwiftPM resource bundle not found"
 ok "SwiftPM resources: $SPM_BUNDLE_DIR"
 
 # ─── Bundle into .app ─────────────────────────────────────────────────────
 log "Building $APP_NAME.app structure"
-rm -rf "$APP_BUNDLE"
+[[ ! -e "$APP_BUNDLE" ]] || /bin/rm -R -- "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$EXECUTABLE" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-cp "$INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
-cp "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/$ICON_RESOURCE"
+cp "$BUILD_INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
+cp "$BUILD_ICON_SRC" "$APP_BUNDLE/Contents/Resources/$ICON_RESOURCE"
 plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleIconFile" "$APP_NAME"
 plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleShortVersionString" "$APP_VERSION"
 plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleVersion" "$BUILD_NUMBER"
@@ -337,7 +534,7 @@ for component in Editor MarkdownRenderer Preview Search Storage Workspace; do
 done
 # The vendored runtime's banner (line 1) is the ONLY producer of the Mermaid
 # version claim — a hand-copied literal here silently outlives upgrades.
-MERMAID_JS="$PKG_DIR/Sources/Pensieve/Resources/mermaid.min.js"
+MERMAID_JS="$BUILD_PKG_DIR/Sources/Pensieve/Resources/mermaid.min.js"
 MERMAID_VERSION="$(sed -n '1s/.*Mermaid v\([0-9][0-9.]*[0-9]\).*/\1/p' "$MERMAID_JS")"
 [[ -n "$MERMAID_VERSION" ]] || die "Cannot extract Mermaid version from banner of $MERMAID_JS"
 /usr/libexec/PlistBuddy -c "Add :PensieveComponentVersions:Mermaid string $MERMAID_VERSION" "$APP_BUNDLE/Contents/Info.plist" >/dev/null
@@ -355,12 +552,11 @@ find "$APP_BUNDLE" -maxdepth 3 -print | head -20 | sed 's|'"$APP_BUNDLE"'|  ./|'
 # the dev path is gone and the Team IDs differ — so dyld aborts at launch (build 133
 # crashed exactly here). Embed it in Contents/Frameworks, repoint to @rpath, and
 # re-sign with our identity so it loads from inside the bundle.
-QUBE_DYLIB_SRC="$PKG_DIR/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib"
-if [[ -f "$QUBE_DYLIB_SRC" ]]; then
+if [[ -f "$BUILD_QUBE_DYLIB_SRC" ]]; then
     log "Embedding qube-ffi dylib (repoint to @rpath + re-sign)"
     FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
     mkdir -p "$FRAMEWORKS_DIR"
-    cp "$QUBE_DYLIB_SRC" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
+    cp "$BUILD_QUBE_DYLIB_SRC" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
     chmod u+w "$FRAMEWORKS_DIR/libqube_ffi.dylib"
     QUBE_OLD_REF="$(otool -L "$APP_BUNDLE/Contents/MacOS/$APP_NAME" | awk '/libqube_ffi\.dylib/{print $1; exit}')"
     install_name_tool -id "@rpath/libqube_ffi.dylib" "$FRAMEWORKS_DIR/libqube_ffi.dylib"
@@ -398,7 +594,7 @@ if [[ -f "$QUBE_DYLIB_SRC" ]]; then
     sign_code "$FRAMEWORKS_DIR/libqube_ffi.dylib"
     ok "qube-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
 else
-    die "qube-ffi dylib not found at $QUBE_DYLIB_SRC — the app binary links libqube_ffi.dylib unconditionally, so a bundle without it aborts in dyld at launch. Run Pensieve/scripts/build-ffi.sh to produce it, then re-run this script."
+    die "qube-ffi dylib not found at $BUILD_QUBE_DYLIB_SRC — the app binary links libqube_ffi.dylib unconditionally, so a bundle without it aborts in dyld at launch. Run Pensieve/scripts/build-ffi.sh to produce it, then re-run this script."
 fi
 
 # ─── Sign ─────────────────────────────────────────────────────────────────
@@ -417,12 +613,73 @@ else
     log "Signing with Hardened Runtime"
 fi
 # Sign nested first if any (none yet, but template safe)
-sign_code --entitlements "$ENTITLEMENTS" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+sign_code --entitlements "$BUILD_ENTITLEMENTS" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-sign_code --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
+# Re-fingerprint the read-only snapshot that actually produced the binary, then
+# compare it with the current clean checkout. swift build never reads the live
+# checkout: mutation/revert activity there cannot alter this artifact. The
+# before/snapshot/after equality checks around snapshot creation additionally
+# reject a mixed copy, and this final comparison rejects source drift before we
+# stamp the bundle. Nested Mach-Os are already in their final signed form here;
+# normalization removes those signatures from copies without touching payloads.
+PROVENANCE_INPUT_DIGEST_AFTER="$(
+    build_provenance_runtime_input_digest "$RELEASE_SNAPSHOT_ROOT" "$FFI_PROFILE"
+)" || die "Could not re-fingerprint the immutable release snapshot after the build."
+if [[ "$PROVENANCE_INPUT_DIGEST_AFTER" != "$PROVENANCE_INPUT_DIGEST_BEFORE" ]]; then
+    die "The supposedly immutable release snapshot changed during swift build.
+       Before: $PROVENANCE_INPUT_DIGEST_BEFORE
+       After:  $PROVENANCE_INPUT_DIGEST_AFTER
+       Refusing to stamp or sign an artifact assembled from moving inputs."
+fi
+build_provenance_assert_runtime_inputs_clean "$REPO_ROOT" "$FFI_PROFILE" \
+    || die "The source runtime inputs no longer match clean HEAD after swift build."
+SOURCE_INPUT_DIGEST_AFTER="$(
+    build_provenance_runtime_input_digest "$REPO_ROOT" "$FFI_PROFILE"
+)" || die "Could not re-fingerprint the source checkout after the snapshot build."
+if [[ "$SOURCE_INPUT_DIGEST_AFTER" != "$PROVENANCE_INPUT_DIGEST_AFTER" ]]; then
+    die "The source checkout drifted away from the immutable build snapshot.
+       Snapshot: $PROVENANCE_INPUT_DIGEST_AFTER
+       Source:   $SOURCE_INPUT_DIGEST_AFTER"
+fi
+assert_release_head_unchanged "before provenance manifest creation"
+
+MAIN_PAYLOAD_DIGEST="$(
+    build_provenance_normalized_macho_digest "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+)" || die "Could not fingerprint the normalized $APP_NAME executable payload."
+FFI_PAYLOAD_DIGEST="$(
+    build_provenance_normalized_macho_digest "$APP_BUNDLE/Contents/Frameworks/libqube_ffi.dylib"
+)" || die "Could not fingerprint the normalized qube-ffi payload."
+
+build_provenance_write_manifest \
+    "$PROVENANCE_MANIFEST" \
+    "$COMMIT_FULL" \
+    "$PROVENANCE_INPUT_DIGEST_AFTER" \
+    "$FFI_PROFILE" \
+    "$BUILD_CONFIGURATION" \
+    "$BUILD_ARCHITECTURE" \
+    "$MAIN_PAYLOAD_DIGEST" \
+    "$FFI_PAYLOAD_DIGEST" \
+    "$BUILD_DATE" \
+    || die "Could not write $PENSIEVE_BUILD_PROVENANCE_RESOURCE."
+
+build_provenance_verify_manifest \
+    "$PROVENANCE_MANIFEST" \
+    "$COMMIT_FULL" \
+    "$PROVENANCE_INPUT_DIGEST_AFTER" \
+    "$FFI_PROFILE" \
+    "$BUILD_CONFIGURATION" \
+    "$BUILD_ARCHITECTURE" \
+    "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+    "$APP_BUNDLE/Contents/Frameworks/libqube_ffi.dylib" \
+    || die "The just-written build provenance manifest does not verify."
+ok "Build provenance sealed input + normalized payload identities"
+
+sign_code --entitlements "$BUILD_ENTITLEMENTS" "$APP_BUNDLE"
 
 log "Verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE" 2>&1 | tail -5
+verify_release_bundle_provenance "final signed-bundle verification" \
+    || die "Signed bundle identity, payloads, resources, TeamIdentifier, or entitlements do not match provenance."
 ok "Signed"
 
 # ─── Notarize .app ────────────────────────────────────────────────────────
@@ -471,6 +728,8 @@ fi  # end: skip build/sign/notarize-app in --dmg-only mode
 
 # ─── Mac App Store pkg ────────────────────────────────────────────────────
 if (( APPSTORE )); then
+    verify_release_bundle_provenance "Mac App Store package creation" \
+        || die "Source or signed app drifted before Mac App Store packaging."
     log "Building installer pkg (productbuild)"
     rm -f "$PKG_PATH"
     if [[ -n "$MAS_INSTALLER_IDENTITY" ]]; then
@@ -492,6 +751,9 @@ if (( APPSTORE )); then
     log "Entitlements on signed app (verify sandbox):"
     codesign -d --entitlements - "$APP_BUNDLE" 2>/dev/null | head -30
 
+    verify_release_bundle_provenance "Mac App Store package publication" \
+        || die "Source or signed app drifted during Mac App Store packaging."
+
     ok "App Store lane complete"
     echo ""
     echo "  App: $APP_BUNDLE"
@@ -505,8 +767,12 @@ fi
 
 # ─── DMG ──────────────────────────────────────────────────────────────────
 if (( ! DO_DMG )); then
+    verify_release_bundle_provenance "local app completion" \
+        || die "Source or signed app drifted before local app completion."
     ok "Skipping DMG (--no-dmg): signed .app is ready at $APP_BUNDLE"
 else
+verify_release_bundle_provenance "DMG creation" \
+    || die "Source or signed app drifted before DMG creation."
 log "Building DMG"
 rm -f "$DMG_PATH"
 # Stage a drag-install layout: the app plus an /Applications symlink, so the
@@ -563,6 +829,8 @@ fi
 # Refresh the stable-named copy AFTER sign/notarize/staple: the staple ticket
 # lives inside the DMG, so the copy stays validated, and the fixed name keeps
 # the releases/latest/download/Pensieve.dmg funnel alive.
+verify_release_bundle_provenance "DMG publication" \
+    || die "Source or signed app drifted during DMG creation/notarization."
 cp -f "$DMG_PATH" "$DMG_STABLE_PATH"
 ok "Stable alias: $DMG_STABLE_PATH"
 
@@ -584,6 +852,7 @@ fi
 fi  # end: skip DMG build/sign/notarize in --no-dmg mode
 
 # ─── Final Gatekeeper check ───────────────────────────────────────────────
+assert_release_head_unchanged "before release completion"
 log "Gatekeeper assessment"
 spctl --assess --type execute --verbose "$APP_BUNDLE" 2>&1 | tail -3 || warn "spctl assessment failed (may be OK before stapler)"
 if (( DO_DMG )); then
@@ -595,7 +864,7 @@ echo ""
 echo "  App: $APP_BUNDLE"
 (( DO_DMG )) && echo "  DMG: $DMG_PATH"
 echo ""
-echo "  Open: open '$APP_BUNDLE'"
+echo "  Open production identity/state: open '$APP_BUNDLE'  # fresh test: make manual-smoke"
 if (( DO_DMG )); then
     echo "  Verify staple: xcrun stapler validate '$APP_BUNDLE'"
     echo "  Open DMG: open '$DMG_PATH'"
