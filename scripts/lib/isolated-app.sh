@@ -738,6 +738,11 @@ isolated_app_remove_exact_path() {
   if [[ -L "$path" || -f "$path" ]]; then
     /bin/rm -f -- "$path" || return 1
   elif [[ -d "$path" ]]; then
+    # `ditto` preserves the read-only modes carried by immutable release
+    # snapshots. Plain `rm -R` then fails, or prompts when the harness owns a
+    # TTY. This exact directory is already bounded by the caller; walk it
+    # physically and unlock only non-symlink entries before removing it.
+    /usr/bin/find -P "$path" ! -type l -exec /bin/chmod u+w {} + || return 1
     /bin/rm -R -- "$path" || return 1
   elif [[ -e "$path" ]]; then
     /bin/rm -f -- "$path" || return 1

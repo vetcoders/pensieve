@@ -48,6 +48,7 @@ DEFAULTS_RACE_ID=""
 NAMESPACE_RACE_ID=""
 NAMESPACE_RACE_SUPPORT=""
 NAMESPACE_RACE_KEYCHAIN_SERVICE=""
+NAMESPACE_RACE_HOME=""
 RECENTS_WRITER_PID=""
 DEFAULTS_WRITER_PID=""
 NAMESPACE_WRITER_PID=""
@@ -83,8 +84,9 @@ cleanup() {
     isolated_app_reset_defaults_domain "$DEFAULTS_RACE_ID" >/dev/null 2>&1 || true
   fi
   if [[ -n "$NAMESPACE_RACE_ID" && -n "$NAMESPACE_RACE_SUPPORT" \
-    && -n "$NAMESPACE_RACE_KEYCHAIN_SERVICE" ]]; then
-    isolated_app_remove_known_profile_state_once \
+    && -n "$NAMESPACE_RACE_KEYCHAIN_SERVICE" && -n "$NAMESPACE_RACE_HOME" ]]; then
+    HOME="$NAMESPACE_RACE_HOME" \
+      isolated_app_remove_known_profile_state_once \
       "$NAMESPACE_RACE_ID" "$NAMESPACE_RACE_SUPPORT" \
       "$NAMESPACE_RACE_KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
   fi
@@ -105,6 +107,40 @@ fail() {
 pass() {
   printf '[isolated-app test PASS] %s\n' "$*"
 }
+
+READONLY_DMG_STAGING="$FIXTURE_ROOT/release/dist/dmg-staging"
+/bin/mkdir -p "$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle"
+printf '%s\n' 'immutable snapshot resource' \
+  >"$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle/Fixture.txt"
+/bin/chmod -R a-w "$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle"
+build_provenance_cleanup_dmg_staging "$READONLY_DMG_STAGING" \
+  || fail "read-only DMG staging cleanup failed"
+[[ ! -e "$READONLY_DMG_STAGING" ]] \
+  || fail "read-only DMG staging cleanup left copied bundle bytes behind"
+
+UNOWNED_CLEANUP_ROOT="$FIXTURE_ROOT/not-dmg-staging"
+/bin/mkdir -p "$UNOWNED_CLEANUP_ROOT"
+if build_provenance_cleanup_dmg_staging "$UNOWNED_CLEANUP_ROOT" \
+  >/dev/null 2>&1; then
+  fail "DMG staging cleanup accepted a path outside dist/dmg-staging"
+fi
+[[ -d "$UNOWNED_CLEANUP_ROOT" ]] \
+  || fail "rejected DMG staging cleanup mutated the unrelated directory"
+/bin/rm -R -- "$UNOWNED_CLEANUP_ROOT"
+
+SYMLINK_CLEANUP_PARENT="$FIXTURE_ROOT/symlink-release/dist"
+SYMLINK_CLEANUP_TARGET="$FIXTURE_ROOT/symlink-target"
+/bin/mkdir -p "$SYMLINK_CLEANUP_PARENT" "$SYMLINK_CLEANUP_TARGET"
+/bin/ln -s "$SYMLINK_CLEANUP_TARGET" "$SYMLINK_CLEANUP_PARENT/dmg-staging"
+if build_provenance_cleanup_dmg_staging "$SYMLINK_CLEANUP_PARENT/dmg-staging" \
+  >/dev/null 2>&1; then
+  fail "DMG staging cleanup followed a symlinked staging root"
+fi
+[[ -d "$SYMLINK_CLEANUP_TARGET" ]] \
+  || fail "rejected symlink cleanup mutated its referent"
+/bin/rm "$SYMLINK_CLEANUP_PARENT/dmg-staging"
+/bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_CLEANUP_TARGET"
+pass "read-only DMG staging cleanup is exact, bounded and symlink-safe"
 
 assert_plist_value() {
   local plist="$1"
@@ -139,6 +175,7 @@ make_source_fixture() {
   /usr/bin/plutil -insert CFBundleShortVersionString -string 0.0.0 -- "$plist"
   /usr/bin/plutil -insert CFBundleVersion -string 1 -- "$plist"
   /usr/bin/plutil -insert PensieveBuildCommit -string "$SOURCE_COMMIT" -- "$plist"
+  printf '%s\n' 'sealed app resource' >"$SOURCE_APP/Contents/Resources/Fixture.txt"
   /usr/bin/plutil -create xml1 -- "$SOURCE_ENTITLEMENTS"
   /usr/libexec/PlistBuddy \
     -c 'Add :com.apple.security.device.audio-input bool true' "$SOURCE_ENTITLEMENTS" \
@@ -213,7 +250,18 @@ run_certless_cleanup_tests() {
   local reservation_owner reservation_app reservation_support reservation_manifest
   local reservation_id reservation_service reservation_preferences
   local reservation_partial final_partial interrupted_owner interrupted_manifest
-  local interrupted_partial orphan_owner orphan_manifest orphan_partial
+  local interrupted_partial orphan_owner orphan_manifest orphan_partial readonly_tree
+  local recents_race_home
+
+  readonly_tree="$FIXTURE_ROOT/read-only-isolated-tree"
+  /bin/mkdir -p "$readonly_tree/nested"
+  printf 'immutable staged resource\n' >"$readonly_tree/nested/resource.txt"
+  /bin/chmod -R a-w "$readonly_tree"
+  isolated_app_remove_exact_path "$readonly_tree" "read-only isolated fixture" \
+    || fail "isolated cleanup could not retire a read-only staged tree"
+  [[ ! -e "$readonly_tree" ]] \
+    || fail "isolated cleanup left read-only staged bytes behind"
+  pass "isolated cleanup retires immutable staged resources without prompting"
 
   owner_real="$FIXTURE_ROOT/path-guards-owner"
   owner_alias="$FIXTURE_ROOT/path-guards-owner-alias"
@@ -262,7 +310,16 @@ run_certless_cleanup_tests() {
 
   RECENTS_RACE_ID="$(isolated_app_generate_bundle_id smoke)" \
     || fail "could not generate a recent-documents race identity"
-  RECENTS_RACE_PATH="$(isolated_app_recent_documents_path "$RECENTS_RACE_ID")" \
+  # This is a synthetic daemon race, not a LaunchServices integration test.
+  # Keep its fake SharedFileList inside the fixture HOME so the script neither
+  # mutates the operator's real Recent Documents nor depends on terminal/TCC
+  # access to that protected Library subtree. A command-scoped HOME preserves
+  # the production path derivation without leaking the fixture into later
+  # defaults, Keychain or LaunchServices checks.
+  recents_race_home="$FIXTURE_ROOT/recents-race-home"
+  /bin/mkdir -p "$recents_race_home"
+  RECENTS_RACE_PATH="$(HOME="$recents_race_home" \
+    isolated_app_recent_documents_path "$RECENTS_RACE_ID")" \
     || fail "could not derive the recent-documents race path"
   /bin/mkdir -p "$(/usr/bin/dirname "$RECENTS_RACE_PATH")"
   printf 'initial daemon write\n' >"$RECENTS_RACE_PATH"
@@ -271,7 +328,8 @@ run_certless_cleanup_tests() {
     printf 'late daemon write\n' >"$RECENTS_RACE_PATH"
   ) &
   RECENTS_WRITER_PID=$!
-  isolated_app_retire_recent_documents "$RECENTS_RACE_ID" \
+  HOME="$recents_race_home" \
+    isolated_app_retire_recent_documents "$RECENTS_RACE_ID" \
     || fail "recent-documents retirement did not survive a late daemon write"
   wait "$RECENTS_WRITER_PID"
   RECENTS_WRITER_PID=""
@@ -299,10 +357,19 @@ run_certless_cleanup_tests() {
     || fail "could not generate a namespace race identity"
   NAMESPACE_RACE_KEYCHAIN_SERVICE="$NAMESPACE_RACE_ID.completion-provider"
   NAMESPACE_RACE_SUPPORT="$FIXTURE_ROOT/namespace-race-support"
-  byhost_dir="$(isolated_app_byhost_preferences_directory "$NAMESPACE_RACE_ID")"
+  # As above, these are synthetic filesystem payloads. Exercise the complete
+  # ByHost/Containers/Application Scripts coordinate set under a fixture HOME;
+  # the dedicated defaults, Keychain and LaunchServices tests keep using their
+  # real system APIs with UUID-owned identities.
+  NAMESPACE_RACE_HOME="$FIXTURE_ROOT/namespace-race-home"
+  /bin/mkdir -p "$NAMESPACE_RACE_HOME"
+  byhost_dir="$(HOME="$NAMESPACE_RACE_HOME" \
+    isolated_app_byhost_preferences_directory "$NAMESPACE_RACE_ID")"
   byhost_path="$byhost_dir/$NAMESPACE_RACE_ID.fixture.plist"
-  container_path="$(isolated_app_container_path "$NAMESPACE_RACE_ID")"
-  scripts_path="$(isolated_app_application_scripts_path "$NAMESPACE_RACE_ID")"
+  container_path="$(HOME="$NAMESPACE_RACE_HOME" \
+    isolated_app_container_path "$NAMESPACE_RACE_ID")"
+  scripts_path="$(HOME="$NAMESPACE_RACE_HOME" \
+    isolated_app_application_scripts_path "$NAMESPACE_RACE_ID")"
   /bin/mkdir -p "$NAMESPACE_RACE_SUPPORT" "$byhost_dir" "$container_path" "$scripts_path"
   printf 'state\n' >"$NAMESPACE_RACE_SUPPORT/state"
   printf 'state\n' >"$byhost_path"
@@ -314,13 +381,15 @@ run_certless_cleanup_tests() {
     printf 'late state\n' >"$container_path/late-state"
   ) &
   NAMESPACE_WRITER_PID=$!
-  isolated_app_retire_known_profile_namespace \
+  HOME="$NAMESPACE_RACE_HOME" \
+    isolated_app_retire_known_profile_namespace \
     "$NAMESPACE_RACE_ID" "$NAMESPACE_RACE_SUPPORT" \
     "$NAMESPACE_RACE_KEYCHAIN_SERVICE" \
     || fail "bounded namespace retirement did not survive a late helper write"
   wait "$NAMESPACE_WRITER_PID"
   NAMESPACE_WRITER_PID=""
-  isolated_app_known_profile_namespace_is_empty \
+  HOME="$NAMESPACE_RACE_HOME" \
+    isolated_app_known_profile_namespace_is_empty \
     "$NAMESPACE_RACE_ID" "$NAMESPACE_RACE_SUPPORT" \
     "$NAMESPACE_RACE_KEYCHAIN_SERVICE" \
     || fail "known UUID namespace was not empty after its quiet-period census"
@@ -550,6 +619,42 @@ pass "source staging accepts only canonical non-sandboxed Pensieve product bundl
 # access to the operator's Developer ID key.
 isolated_app_verify_embedded_provenance "$SOURCE_APP" \
   || fail "self-consistent embedded provenance was rejected"
+
+# A mounted DMG under mktemp is commonly named through `/var`, while `pwd -P`
+# resolves that same path through `/private/var`. Auxiliary provenance must be
+# a property of the bundle bytes, not of the spelling used to reach them.
+SOURCE_ALIAS_PARENT="$FIXTURE_ROOT/source-alias"
+/bin/ln -s "$FIXTURE_ROOT/source" "$SOURCE_ALIAS_PARENT"
+SOURCE_AUXILIARY_DIGEST="$(build_provenance_bundle_auxiliary_digest \
+  "$SOURCE_APP" \
+  "$SOURCE_APP/Contents/MacOS/Pensieve" \
+  "$SOURCE_APP/Contents/Frameworks/libqube_ffi.dylib")" \
+  || fail "could not hash the canonical source-bundle spelling"
+ALIAS_AUXILIARY_DIGEST="$(build_provenance_bundle_auxiliary_digest \
+  "$SOURCE_ALIAS_PARENT/Pensieve.app" \
+  "$SOURCE_ALIAS_PARENT/Pensieve.app/Contents/MacOS/Pensieve" \
+  "$SOURCE_ALIAS_PARENT/Pensieve.app/Contents/Frameworks/libqube_ffi.dylib")" \
+  || fail "could not hash the aliased source-bundle spelling"
+[[ "$ALIAS_AUXILIARY_DIGEST" == "$SOURCE_AUXILIARY_DIGEST" ]] \
+  || fail "filesystem aliases changed the sealed auxiliary bundle digest"
+pass "bundle provenance is invariant across canonical and aliased paths"
+
+# `xcrun stapler` adds one exact Apple-owned ticket at Contents/CodeResources
+# after signing. It must not look like product drift, while the similarly named
+# resources directory and every other app-owned payload remain sealed.
+STAPLED_SHAPE_APP="$FIXTURE_ROOT/stapled-shape.app"
+/usr/bin/ditto "$SOURCE_APP" "$STAPLED_SHAPE_APP"
+printf '%s\n' 'opaque synthetic stapler ticket' \
+  >"$STAPLED_SHAPE_APP/Contents/CodeResources"
+isolated_app_verify_embedded_provenance "$STAPLED_SHAPE_APP" \
+  || fail "the exact Apple stapler-ticket path invalidated embedded provenance"
+printf '%s\n' 'tampered app resource' \
+  >"$STAPLED_SHAPE_APP/Contents/Resources/Fixture.txt"
+if isolated_app_verify_embedded_provenance "$STAPLED_SHAPE_APP" >/dev/null 2>&1; then
+  fail "stapler-ticket normalization also excluded an app-owned resource"
+fi
+pass "provenance normalizes only the exact Apple stapler ticket"
+
 if isolated_app_assert_source_provenance \
   "$PROVENANCE_REPO" "$SOURCE_APP" 1 1 >/dev/null 2>&1; then
   fail "an ad-hoc source passed the fixed TeamIdentifier gate"

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release provenance verification is now invariant to macOS `/var` ↔
+  `/private/var` path aliases, and isolated smoke cleanup can retire read-only
+  staged resources without an interactive terminal prompt. Toolbar smoke also
+  resolves its exact PID again before each menu action, so WebKit process churn
+  cannot stale a positional Accessibility process reference mid-scenario.
+  Native toolbar-menu checks now issue exactly one semantic press, then poll
+  freshly resolved Accessibility elements for the menu instead of treating one
+  stale 300 ms sample as a swallowed first click. The enclosing toolbar
+  watchdog now sits above the cumulative worst-case duration of those bounded
+  waits, and stage-level focus-regain breadcrumbs identify the exact blocked
+  Accessibility operation instead of misreporting a loaded WindowServer as a
+  product hang. Synthetic Recent Documents and profile-namespace cleanup races
+  now live under the test fixture's temporary home instead of mutating or
+  requiring TCC access to the operator's protected Library state.
+- Release builds made from an immutable exact-commit snapshot now preserve the
+  package's declared test-target layout. SwiftPM plans every declared target
+  even for a product-only `swift build`; omitting `Tests/PensieveTests` made it
+  misclassify production sources as test sources and abort with an overlapping-
+  sources error before signing or notarization. Read-only snapshot templates
+  are also materialized as writable bundle outputs before release metadata is
+  stamped, without weakening the immutable source snapshot. Post-staple
+  provenance verification now recognizes only Apple's exact
+  `Contents/CodeResources` notarization ticket as platform-owned material;
+  app-owned resources remain sealed, and notarized DMG-only retries now require
+  a locally valid stapled app ticket before packaging. DMG staging cleanup now
+  unlocks only the disposable copied directory tree, so resources inherited
+  from the immutable snapshot cannot abort an otherwise valid notarized release
+  while the signed and stapled source app remains untouched.
+
 ### Added
 
 - The source panel is now set in each theme's own monospace family — Sometype Mono (Parchment), JetBrains Mono (Graphite, Ink), IBM Plex Mono (Porcelain), Spline Sans Mono (Typewriter) — across body text, bold/semibold spans, inline code, the caret's typing attributes, the autocomplete ghost, and the line-number gutter. `Default` and `Raw` keep the system monospaced face.

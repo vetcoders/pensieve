@@ -147,6 +147,72 @@ final class BuildIdentityTests: XCTestCase {
         "Distributable releases require FFI_PROFILE=release; debug FFI is local-only."))
   }
 
+  /// SwiftPM enumerates every declared target while planning `swift build`, even
+  /// though the release product does not compile its test target. If the exact-
+  /// commit snapshot drops Tests/PensieveTests, SwiftPM falls back to the package
+  /// root and reports every production source as overlapping with PensieveTests.
+  func testReleaseSnapshotPreservesTheDeclaredTestTargetLayout() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let releaseScript = try String(
+      contentsOf: packageRoot.deletingLastPathComponent()
+        .appendingPathComponent("scripts/build-release.sh"),
+      encoding: .utf8)
+
+    XCTAssertTrue(
+      releaseScript.contains(#"        Pensieve/Tests \"#),
+      "the immutable release snapshot must contain the test target declared by Package.swift")
+    XCTAssertTrue(
+      releaseScript.contains(#"        "$RELEASE_SNAPSHOT_PKG/Tests" \"#),
+      "the snapshot's declared target layout must be frozen before SwiftPM plans the build")
+    XCTAssertTrue(
+      releaseScript.contains(
+        #"/usr/bin/install -m 0644 "$BUILD_INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist""#
+      ),
+      "a read-only source template must become a writable output before version stamping")
+  }
+
+  func testNotarizedDMGRetryRequiresAStapledSourceApp() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let releaseScript = try String(
+      contentsOf: packageRoot.deletingLastPathComponent()
+        .appendingPathComponent("scripts/build-release.sh"),
+      encoding: .utf8)
+
+    XCTAssertTrue(
+      releaseScript.contains(#"xcrun stapler validate "$APP_BUNDLE""#),
+      "a notarized --dmg-only retry must prove the reused app still carries a valid ticket")
+    XCTAssertTrue(
+      releaseScript.contains(
+        "The notarized DMG lane only reuses a signed, notarized, and stapled app."),
+      "a missing ticket must fail with an actionable rebuild instruction")
+  }
+
+  func testDMGStagingCleanupUsesTheBoundedReadOnlyTreeHelper() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let releaseScript = try String(
+      contentsOf: packageRoot.deletingLastPathComponent()
+        .appendingPathComponent("scripts/build-release.sh"),
+      encoding: .utf8)
+
+    let cleanupCall = #"build_provenance_cleanup_dmg_staging "$DMG_STAGING""#
+    XCTAssertGreaterThanOrEqual(
+      releaseScript.components(separatedBy: cleanupCall).count - 1,
+      2,
+      "DMG staging must be unlocked before both pre-clean and EXIT cleanup")
+    XCTAssertFalse(
+      releaseScript.contains(#"trap 'rm -rf "$DMG_STAGING"' EXIT"#),
+      "a plain recursive removal cannot descend through immutable snapshot directories")
+  }
+
   /// scripts/build-release.sh stamps the Mermaid component version by
   /// extracting it from the vendored runtime's banner (line 1) — the file
   /// itself is the only producer of that claim. Guard the extraction

@@ -108,6 +108,7 @@ test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
 	@$(SCRIPTS)/test-rpath-hygiene.sh
 	@$(SCRIPTS)/test-isolated-app.sh
+	@$(SCRIPTS)/test-ui-smoke-contract.sh
 
 .PHONY: ui-smoke
 ui-smoke:  ## Ephemeral automated UI smoke under a new isolated identity

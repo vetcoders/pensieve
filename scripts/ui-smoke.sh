@@ -31,6 +31,21 @@ IDENTITY_MANIFEST=""
 OWNED_PID=""
 EXECUTABLE_PATH=""
 
+# This watchdog encloses the complete toolbar scenario: process/window waits,
+# three mode transitions, native-menu publication, editable-New, and the final
+# focus-regain census. Its job is to stop a truly wedged osascript, not to race
+# the scenario's bounded per-step assertions. Their declared worst-case delays
+# already exceed 100 seconds before Accessibility traversal cost, so keep this
+# outer budget comfortably above that cumulative ceiling.
+TOOLBAR_AX_DECLARED_WAIT_CEILING_SECONDS=101
+TOOLBAR_AX_OUTER_TIMEOUT_SECONDS=180
+if (( TOOLBAR_AX_OUTER_TIMEOUT_SECONDS <= TOOLBAR_AX_DECLARED_WAIT_CEILING_SECONDS )); then
+  printf '[ui-smoke] toolbar AX outer watchdog (%ss) must exceed its declared wait ceiling (%ss)\n' \
+    "$TOOLBAR_AX_OUTER_TIMEOUT_SECONDS" \
+    "$TOOLBAR_AX_DECLARED_WAIT_CEILING_SECONDS" >&2
+  exit 2
+fi
+
 # Saved-state isolation probe state. The probe deliberately asks AppKit to keep
 # windows while telling Pensieve NOT to restore its working set. A relaunch must
 # still produce one empty launcher: if a document returns, Saved Application
@@ -1750,41 +1765,198 @@ on assertMenuItem(targetPID, menuName, itemName)
   end tell
 end assertMenuItem
 
-on toolbarElementByAccessibleName(targetPID, targetName)
+on exactProcessDiagnostics(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then return "process=missing"
+  try
+    tell application "System Events" to tell appProcess
+      set observedBundle to bundle identifier as text
+      set observedFrontmost to frontmost as text
+      set observedWindowCount to (count of windows) as text
+      set observedMenus to name of every menu bar item of menu bar 1
+    end tell
+    return "bundle=" & observedBundle & "; frontmost=" & observedFrontmost & ¬
+      "; windows=" & observedWindowCount & "; menus=" & my joined(observedMenus, ",")
+  on error errorMessage number errorNumber
+    return "diagnostics-error=" & errorNumber & ":" & errorMessage
+  end try
+end exactProcessDiagnostics
+
+on clickExactMenuItem(targetPID, menuName, itemName)
+  set latestError to "process unavailable"
+  repeat with attemptNumber from 1 to 10
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is not missing value then
+      try
+        tell application "System Events" to tell appProcess
+          tell menu bar 1 to tell menu bar item menuName
+            click
+            delay 0.2
+            if not (exists menu item itemName of menu 1) then
+              error "missing menu item " & itemName
+            end if
+            click menu item itemName of menu 1
+          end tell
+        end tell
+        return true
+      on error errorMessage number errorNumber
+        set latestError to errorNumber & ":" & errorMessage
+      end try
+    end if
+    delay 0.2
+  end repeat
+  error "Could not choose " & menuName & " > " & itemName & ¬
+    " for pid=" & targetPID & "; last=" & latestError & "; " & ¬
+    my exactProcessDiagnostics(targetPID)
+end clickExactMenuItem
+
+on exactWindowGeometry(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before geometry read: " & targetPID
+  tell application "System Events" to tell appProcess
+    return {position of window 1, size of window 1}
+  end tell
+end exactWindowGeometry
+
+on activateExactProcess(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before activation: " & targetPID
+  tell application "System Events" to set frontmost of appProcess to true
+end activateExactProcess
+
+on raiseExactProcessWindow(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before raise: " & targetPID
+  tell application "System Events" to tell appProcess
+    perform action "AXRaise" of window 1
+  end tell
+end raiseExactProcessWindow
+
+on exactWindowCount(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before window count: " & targetPID
+  tell application "System Events" to tell appProcess
+    return count of windows
+  end tell
+end exactWindowCount
+
+on namedToolbarElementIn(elementsToSearch, targetName, targetIdentifier)
+  repeat with elementRef in elementsToSearch
+    set elementDescription to ""
+    set elementTitle to ""
+    set elementIdentifier to ""
+    tell application "System Events"
+      try
+        set elementDescription to get description of elementRef
+      end try
+      try
+        set elementTitle to get title of elementRef
+      end try
+      try
+        set elementIdentifier to (value of attribute "AXIdentifier" of elementRef) as text
+      end try
+    end tell
+    -- macOS 27 exposes native SwiftUI toolbar menu names through AXTitle while
+    -- AXDescription remains the generic "menu button". Older bridges used
+    -- AXDescription. Require the exact authored name in either standard
+    -- accessible-name slot so a raw symbol name or an anonymous menu still
+    -- fails this assertion.
+    if elementIdentifier is targetIdentifier and ¬
+      (elementDescription is targetName or elementTitle is targetName) then
+      return contents of elementRef
+    end if
+  end repeat
+  return missing value
+end namedToolbarElementIn
+
+on toolbarElementByAccessibleNameOnce(targetPID, targetName, targetIdentifier)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then return missing value
+  tell application "System Events"
+    tell appProcess
+      -- Keep this lookup bounded to the native toolbar. Walking the entire
+      -- document window traverses the editor and WebKit preview trees and can
+      -- exceed the outer AX timeout while a SwiftUI toolbar is rehosting. A
+      -- transiently empty toolbar is handled by the caller's bounded retry.
+      try
+        return my namedToolbarElementIn(¬
+          entire contents of toolbar 1 of window 1, targetName, targetIdentifier)
+      end try
+    end tell
+  end tell
+  return missing value
+end toolbarElementByAccessibleNameOnce
+
+on toolbarElementByAccessibleName(targetPID, targetName, targetIdentifier)
   -- AX attribute propagation can lag behind the identifier-based toolbar
   -- census: a control can exist (and already show up by identifier) before
   -- its localized accessible name is queryable. Retry with a bounded backoff
   -- instead of failing on the first miss.
   repeat with attemptNumber from 1 to 5
-    set appProcess to my processForPID(targetPID, expectedBundleID)
-    if appProcess is missing value then error "exact smoke pid disappeared before toolbar lookup: " & targetPID
-    tell application "System Events"
-      tell appProcess
-        set toolbarElements to entire contents of toolbar 1 of window 1
-        repeat with elementRef in toolbarElements
-          set elementDescription to ""
-          set elementTitle to ""
-          try
-            set elementDescription to get description of elementRef
-          end try
-          try
-            set elementTitle to get title of elementRef
-          end try
-          -- macOS 27 exposes native SwiftUI toolbar menu names through
-          -- AXTitle while AXDescription remains the generic "menu button".
-          -- Older bridges used AXDescription. Require the exact authored name
-          -- in either standard accessible-name slot so a raw symbol name or an
-          -- anonymous menu still fails this assertion.
-          if elementDescription is targetName or elementTitle is targetName then
-            return contents of elementRef
-          end if
-        end repeat
-      end tell
-    end tell
+    set elementRef to my toolbarElementByAccessibleNameOnce(targetPID, targetName, targetIdentifier)
+    if elementRef is not missing value then return elementRef
     if attemptNumber < 5 then delay 1
   end repeat
-  error "Missing toolbar control with accessible name: " & targetName
+  error "Missing toolbar control with accessible name/identifier: " & ¬
+    targetName & "/" & targetIdentifier
 end toolbarElementByAccessibleName
+
+on toolbarMenuItemsAfterSinglePress(targetPID, targetName, targetIdentifier, expectedMenuItems, allowDisabled, timeoutTenths)
+  set controlRef to my toolbarElementByAccessibleName(targetPID, targetName, targetIdentifier)
+  tell application "System Events"
+    set observedRole to role of controlRef
+    if observedRole is not "AXMenuButton" then
+      error targetName & " must be a native menu button, got " & observedRole
+    end if
+    if not (enabled of controlRef) then
+      if allowDisabled then return {{}, 0, false}
+      error targetName & " is disabled"
+    end if
+    set observedActions to name of every action of controlRef
+    if observedActions does not contain "AXPress" then
+      error targetName & " does not expose AXPress; actions={" & my joined(observedActions, ",") & "}"
+    end if
+
+    -- Exactly ONE semantic press. Repeating the action would hide a real
+    -- product defect where the first click is swallowed. Only the subsequent
+    -- AX publication is allowed to settle below.
+    perform action "AXPress" of controlRef
+  end tell
+
+  set latestMenuItems to {}
+  repeat with sampleNumber from 1 to timeoutTenths
+    delay 0.1
+    -- Native SwiftUI menus may rehost their toolbar item while opening. Read
+    -- the menu from a freshly resolved exact-PID control instead of retaining
+    -- the positional System Events ref used for the press.
+    set freshControl to my toolbarElementByAccessibleNameOnce(¬
+      targetPID, targetName, targetIdentifier)
+    if freshControl is not missing value then
+      tell application "System Events"
+        try
+          if (count of menus of freshControl) > 0 then
+            set latestMenuItems to name of every menu item of menu 1 of freshControl
+            set hasAllExpectedItems to true
+            repeat with expectedItem in expectedMenuItems
+              if latestMenuItems does not contain (expectedItem as text) then
+                set hasAllExpectedItems to false
+                exit repeat
+              end if
+            end repeat
+            if hasAllExpectedItems then
+              return {latestMenuItems, sampleNumber * 100, true}
+            end if
+          end if
+        end try
+      end tell
+    end if
+  end repeat
+
+  error targetName & " menu did not publish expected items={" & ¬
+    my joined(expectedMenuItems, ",") & "} after one AXPress and " & ¬
+    (timeoutTenths * 100) & "ms of fresh-ref polling; observed={" & ¬
+    my joined(latestMenuItems, ",") & "}; " & my exactProcessDiagnostics(targetPID)
+end toolbarMenuItemsAfterSinglePress
 
 on windowElementByIdentifier(targetPID, targetIdentifier, timeoutTenths)
   repeat with attemptNumber from 1 to timeoutTenths
@@ -1830,10 +2002,9 @@ if (count of missingItems) > 0 then
   error "Cold toolbar census missing identifiers: " & my joined(missingItems, ", ") & ¬
     "; observed: " & my joined(coldCensus, ", ")
 end if
-tell application "System Events" to tell appProcess
-  set coldPosition to position of window 1
-  set coldSize to size of window 1
-end tell
+set coldGeometry to my exactWindowGeometry(targetPID)
+set coldPosition to item 1 of coldGeometry
+set coldSize to item 2 of coldGeometry
 log "NO_STIMULUS_BOUNDARY=process/window wait + AX reads only"
 log "WINDOW_GEOMETRY=" & (item 1 of coldPosition) & "," & (item 2 of coldPosition) & "," & (item 1 of coldSize) & "," & (item 2 of coldSize)
 log "AX_CENSUS=" & my joined(coldCensus, ",")
@@ -1845,9 +2016,7 @@ if coldOnly then return "cold toolbar AX census passed"
 -- Activate the resolved PID directly rather than "tell application ... to
 -- activate", which resolves the app by name through LaunchServices and can
 -- target a different installed bundle than the one under test.
-tell application "System Events"
-  set frontmost of appProcess to true
-end tell
+my activateExactProcess(targetPID)
 delay 0.5
 
 assertMenuItem(targetPID, "File", "New File")
@@ -1873,60 +2042,32 @@ set editingIdentifiers to {¬
   "pensieve.toolbar.format.numberedList"}
 set previewExpectedIdentifiers to my identifiersExcluding(baseExpectedIdentifiers, editingIdentifiers)
 
+-- Resolve the exact PID afresh for every menu action. System Events returns
+-- application-process refs as positional `item N` specifiers; retaining one
+-- across WebKit process churn can silently retarget the next menu click.
+my clickExactMenuItem(targetPID, "Mode", "Split Mode")
+delay 0.5
+set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+my assertWindowGeometry(targetPID, coldPosition, coldSize, "split transition")
+log "AX_CENSUS_SPLIT=" & my joined(splitCensus, ",")
+
+my clickExactMenuItem(targetPID, "Mode", "Preview Mode")
+delay 0.5
+set previewCensus to my settledToolbarCensus(targetPID, previewExpectedIdentifiers, editingIdentifiers, 40)
+my assertWindowGeometry(targetPID, coldPosition, coldSize, "preview transition")
+log "AX_CENSUS_PREVIEW=" & my joined(previewCensus, ",")
+
+my clickExactMenuItem(targetPID, "Mode", "Split Mode")
+delay 0.5
+set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+my assertWindowGeometry(targetPID, coldPosition, coldSize, "split restore")
+
+set appearanceOpenResult to my toolbarMenuItemsAfterSinglePress(¬
+  targetPID, "Preview Appearance", "pensieve.toolbar.appearance", ¬
+  {"Flavor", "Theme"}, false, 30)
+set appearanceItems to item 1 of appearanceOpenResult
+log "APPEARANCE_MENU_OPEN_MS=" & (item 2 of appearanceOpenResult)
 tell application "System Events"
-  tell appProcess
-    -- Put the preview surface on screen so the appearance control is part of
-    -- the live toolbar, then prove it is a native menu that actually opens.
-    -- A plain button backed by transient SwiftUI popover state can still pass
-    -- static identifier tests while swallowing the first click and flickering
-    -- closed on the second.
-    tell menu bar 1
-      tell menu bar item "Mode"
-        click
-        delay 0.2
-        click menu item "Split Mode" of menu 1
-      end tell
-    end tell
-    delay 0.5
-
-    set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
-    my assertWindowGeometry(targetPID, coldPosition, coldSize, "split transition")
-    log "AX_CENSUS_SPLIT=" & my joined(splitCensus, ",")
-
-    tell menu bar 1
-      tell menu bar item "Mode"
-        click
-        delay 0.2
-        click menu item "Preview Mode" of menu 1
-      end tell
-    end tell
-    delay 0.5
-    set previewCensus to my settledToolbarCensus(targetPID, previewExpectedIdentifiers, editingIdentifiers, 40)
-    my assertWindowGeometry(targetPID, coldPosition, coldSize, "preview transition")
-    log "AX_CENSUS_PREVIEW=" & my joined(previewCensus, ",")
-
-    tell menu bar 1
-      tell menu bar item "Mode"
-        click
-        delay 0.2
-        click menu item "Split Mode" of menu 1
-      end tell
-    end tell
-    delay 0.5
-    set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
-    my assertWindowGeometry(targetPID, coldPosition, coldSize, "split restore")
-
-    set appearanceControl to my toolbarElementByAccessibleName(targetPID, "Preview Appearance")
-    if (role of appearanceControl) is not "AXMenuButton" then
-      error "Preview Appearance must be a native menu button, got " & (role of appearanceControl)
-    end if
-
-    click appearanceControl
-    delay 0.3
-    if (count of menus of appearanceControl) is 0 then
-      error "Preview Appearance menu did not open after click"
-    end if
-    set appearanceItems to get name of every menu item of menu 1 of appearanceControl
     if appearanceItems does not contain "Flavor" then
       error "Preview Appearance menu is missing the Flavor picker"
     end if
@@ -1939,12 +2080,10 @@ tell application "System Events"
     -- Dismissing a native menu invalidates its AXUIElement; reacquiring the
     -- toolbar control mirrors a later user click instead of testing a stale
     -- Accessibility handle.
-    set appearanceControl to my toolbarElementByAccessibleName(targetPID, "Preview Appearance")
-    click appearanceControl
-    delay 0.3
-    if (count of menus of appearanceControl) is 0 then
-      error "Preview Appearance menu did not reopen after dismissal"
-    end if
+    set appearanceReopenResult to my toolbarMenuItemsAfterSinglePress(¬
+      targetPID, "Preview Appearance", "pensieve.toolbar.appearance", ¬
+      {"Flavor", "Theme"}, false, 30)
+    log "APPEARANCE_MENU_REOPEN_MS=" & (item 2 of appearanceReopenResult)
     key code 53
 
     -- Looking this control up BY NAME, not by identifier, is the assertion and
@@ -1957,17 +2096,12 @@ tell application "System Events"
     -- cannot see that at all: AXIdentifier survives the move untouched, so a
     -- census-only check would have stayed green on a control no assistive tool
     -- can name. Keep this lookup name-based.
-    set rewriteControl to my toolbarElementByAccessibleName(targetPID, "Rewrite with AI")
-    if (role of rewriteControl) is not "AXMenuButton" then
-      error "Rewrite with AI must be a native menu button, got " & (role of rewriteControl)
-    end if
-    if enabled of rewriteControl then
-      click rewriteControl
-      delay 0.3
-      if (count of menus of rewriteControl) is 0 then
-        error "Rewrite with AI menu did not open after click"
-      end if
-      set rewriteItems to get name of every menu item of menu 1 of rewriteControl
+    set rewriteOpenResult to my toolbarMenuItemsAfterSinglePress(¬
+      targetPID, "Rewrite with AI", "pensieve.toolbar.aiRewrite", ¬
+      {"Improve Writing", "Fix Grammar"}, true, 30)
+    if item 3 of rewriteOpenResult then
+      set rewriteItems to item 1 of rewriteOpenResult
+      log "REWRITE_MENU_OPEN_MS=" & (item 2 of rewriteOpenResult)
       if rewriteItems does not contain "Improve Writing" then
         error "Rewrite with AI menu is missing Improve Writing"
       end if
@@ -1977,13 +2111,7 @@ tell application "System Events"
       key code 53
     end if
 
-    tell menu bar 1
-      tell menu bar item "File"
-        click
-        delay 0.2
-        click menu item "New File" of menu 1
-      end tell
-    end tell
+    my clickExactMenuItem(targetPID, "File", "New File")
     delay 0.5
     set untitledCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
     my assertWindowGeometry(targetPID, coldPosition, coldSize, "file-backed to untitled transition")
@@ -2016,26 +2144,32 @@ tell application "System Events"
     end if
     log "NEW_UNTITLED_EDITABLE=PASS"
 
-    if (count of windows) is 0 then error "pid=" & targetPID & " has no windows after menu probing"
-  end tell
+    log "AX_REGAIN_EXACT_WINDOW_COUNT_BEGIN"
+    set postMenuWindowCount to my exactWindowCount(targetPID)
+    log "AX_REGAIN_EXACT_WINDOW_COUNT_END=" & postMenuWindowCount
+    if postMenuWindowCount is 0 then error "pid=" & targetPID & " has no windows after menu probing"
 end tell
 
 
+log "AX_REGAIN_FINDER_ACTIVATE_BEGIN"
 tell application "Finder" to activate
+log "AX_REGAIN_FINDER_ACTIVATE_END"
 delay 0.3
 -- Reactivate the exact resolved PID (see targetPID above), not the app name,
 -- so this regain step re-focuses the process under test unambiguously.
-    set appProcess to my processForPID(targetPID, expectedBundleID)
-if appProcess is missing value then error "exact smoke pid disappeared before focus regain: " & targetPID
-tell application "System Events"
-  set frontmost of appProcess to true
-  tell appProcess
-    perform action "AXRaise" of window 1
-  end tell
-end tell
+log "AX_REGAIN_EXACT_ACTIVATE_BEGIN"
+my activateExactProcess(targetPID)
+log "AX_REGAIN_EXACT_ACTIVATE_END"
+log "AX_REGAIN_RAISE_BEGIN"
+my raiseExactProcessWindow(targetPID)
+log "AX_REGAIN_RAISE_END"
 delay 0.5
+log "AX_REGAIN_CENSUS_BEGIN"
 set regainCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
+log "AX_REGAIN_CENSUS_END"
+log "AX_REGAIN_GEOMETRY_BEGIN"
 my assertWindowGeometry(targetPID, coldPosition, coldSize, "key-window regain/redraw")
+log "AX_REGAIN_GEOMETRY_END"
 log "AX_CENSUS_REGAIN_REDRAW=" & my joined(regainCensus, ",")
 end run
 APPLESCRIPT
@@ -2045,7 +2179,11 @@ AX_VERIFIED_PID="$(isolated_app_verify_running_identity \
   || die "runtime identity drifted before the toolbar AX census"
 [[ "$AX_VERIFIED_PID" == "$OWNED_PID" ]] \
   || die "runtime pid changed before the toolbar AX census ($OWNED_PID -> $AX_VERIFIED_PID)"
-ax_census_output=$(run_ax_osascript 60 "$ax_census_script" "$OWNED_PID" "$APP_ID" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
+# This one process covers every toolbar mode, two native-menu opens, optional
+# Rewrite, editable-New, and focus regain. Each transition keeps its own tight
+# settlement budget; the outer timeout exceeds their cumulative worst-case
+# cost on a loaded WindowServer and must not become the first limit to fire.
+ax_census_output=$(run_ax_osascript "$TOOLBAR_AX_OUTER_TIMEOUT_SECONDS" "$ax_census_script" "$OWNED_PID" "$APP_ID" "$COLD_ONLY" "$BASE_EXPECTED_IDENTIFIER_COUNT" \
   "${EXPECTED_TOOLBAR_IDENTIFIERS[@]}" 2>&1) || ax_census_status=$?
 rm -f "$ax_census_script"
 printf '%s\n' "$ax_census_output"

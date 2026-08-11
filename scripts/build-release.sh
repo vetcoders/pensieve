@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pensieve release pipeline:
-#   swift build (release) → bundle .app → sign → DMG → notarize → staple.
+#   swift build (release) → bundle/sign/notarize/staple .app →
+#   build/sign/notarize/staple DMG.
 #
 # Reads credentials from ~/.keys/.notary.env:
 #   NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD (app-specific)
@@ -279,11 +280,15 @@ create_release_snapshot() {
     # assume-unchanged or skip-worktree. The later source/snapshot digest
     # equality check still proves that compiler-visible source bytes agree with
     # that commit. Dependency checkouts are freshly resolved below.
+    # SwiftPM also enumerates every declared target while planning a product
+    # build, so the exact test-target layout must be present even though release
+    # compilation does not build the tests.
     if ! /usr/bin/git -C "$REPO_ROOT" archive --format=tar "$COMMIT_FULL" -- \
         VERSION \
         Pensieve/Package.swift \
         Pensieve/Package.resolved \
         Pensieve/Sources \
+        Pensieve/Tests \
         Pensieve/Resources \
         Pensieve/scripts \
         "Pensieve/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib" \
@@ -312,6 +317,7 @@ create_release_snapshot() {
         "$RELEASE_SNAPSHOT_PKG/Package.swift" \
         "$RELEASE_SNAPSHOT_PKG/Package.resolved" \
         "$RELEASE_SNAPSHOT_PKG/Sources" \
+        "$RELEASE_SNAPSHOT_PKG/Tests" \
         "$RELEASE_SNAPSHOT_PKG/Resources" \
         "$RELEASE_SNAPSHOT_PKG/scripts" \
         "$RELEASE_SNAPSHOT_PKG/Vendor/qube-ffi/$FFI_PROFILE" \
@@ -483,6 +489,12 @@ if (( DMG_ONLY )); then
        runtime inputs and Mach-O payloads are inside it. Run a full build first:
        make release-clean (or ./scripts/build-release.sh --clean)."
     fi
+    if (( DO_NOTARIZE )) \
+        && ! xcrun stapler validate "$APP_BUNDLE" >/dev/null 2>&1; then
+        die "--dmg-only: $APP_BUNDLE has no valid stapled notarization ticket.
+       The notarized DMG lane only reuses a signed, notarized, and stapled app.
+       Run a full build first: make release-clean (or ./scripts/build-release.sh --clean)."
+    fi
     ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, LC_RPATH clean, skipping build/sign/notarize-app)"
 fi
 
@@ -518,7 +530,7 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$EXECUTABLE" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-cp "$BUILD_INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
+/usr/bin/install -m 0644 "$BUILD_INFO_PLIST_SRC" "$APP_BUNDLE/Contents/Info.plist"
 cp "$BUILD_ICON_SRC" "$APP_BUNDLE/Contents/Resources/$ICON_RESOURCE"
 plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleIconFile" "$APP_NAME"
 plist_set_string "$APP_BUNDLE/Contents/Info.plist" "CFBundleShortVersionString" "$APP_VERSION"
@@ -778,9 +790,23 @@ rm -f "$DMG_PATH"
 # Stage a drag-install layout: the app plus an /Applications symlink, so the
 # mounted image offers the drop target instead of a lone .app.
 DMG_STAGING="$DIST_DIR/dmg-staging"
-rm -rf "$DMG_STAGING"
+build_provenance_cleanup_dmg_staging "$DMG_STAGING" \
+    || die "Could not retire the previous DMG staging tree safely."
 (
-    trap 'rm -rf "$DMG_STAGING"' EXIT
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2329
+    cleanup_dmg_staging_on_exit() {
+        local original_status="$?"
+        trap - EXIT INT TERM
+        if ! build_provenance_cleanup_dmg_staging "$DMG_STAGING"; then
+            warn "Could not retire the read-only DMG staging tree: $DMG_STAGING"
+            (( original_status != 0 )) || original_status=1
+        fi
+        exit "$original_status"
+    }
+    trap cleanup_dmg_staging_on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     mkdir -p "$DMG_STAGING"
     cp -R "$APP_BUNDLE" "$DMG_STAGING/"
     ln -s /Applications "$DMG_STAGING/Applications"

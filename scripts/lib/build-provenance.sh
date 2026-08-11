@@ -15,6 +15,38 @@ build_provenance_error() {
     printf 'build provenance: %s\n' "$*" >&2
 }
 
+# build_provenance_cleanup_dmg_staging PATH
+#
+# Release snapshots deliberately make compiler-visible inputs read-only. The
+# resource modes survive into the signed app and then into the disposable DMG
+# staging copy, so a plain recursive removal cannot descend through those
+# copied directories. Unlock directories in that one derived staging tree,
+# never the signed source app, before removing it. The exact path-shape and
+# symlink guards keep this cleanup from becoming a generic recursive-delete
+# primitive.
+build_provenance_cleanup_dmg_staging() {
+    local staging_path="${1:-}"
+
+    case "$staging_path" in
+        /*/dist/dmg-staging) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact dist/dmg-staging path: $staging_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$staging_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked DMG staging root: $staging_path"
+        return 1
+    fi
+    [[ -e "$staging_path" ]] || return 0
+
+    /usr/bin/find -P "$staging_path" -type d -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$staging_path"
+}
+
 build_provenance_is_sha256() {
     [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }
@@ -1152,8 +1184,11 @@ build_provenance_canonical_info_digest() {
 
 # Hash every sealed runtime payload in the bundle except the two Mach-Os that
 # have their own normalized digests, the provenance plist itself (to avoid a
-# circular hash), and the outer signature material (which is intentionally
-# signing-time dependent). Info.plist is canonicalized only across the four
+# circular hash), and Apple-owned outer signature/notarization material (which
+# is intentionally signing-time dependent). `_CodeSignature` is produced by
+# codesign; the exact top-level `Contents/CodeResources` file is the stapled
+# notarization ticket. Neither is a Pensieve resource, and both are verified by
+# their platform authorities. Info.plist is canonicalized only across the four
 # isolated-smoke identity rewrites documented above.
 build_provenance_bundle_auxiliary_digest() {
     local app_bundle="$1"
@@ -1163,6 +1198,18 @@ build_provenance_bundle_auxiliary_digest() {
 
     app_bundle="$(cd "$app_bundle" 2>/dev/null && pwd -P)" || {
         build_provenance_error "bundle is not readable: $app_bundle"
+        return 1
+    }
+    # A mounted bundle can be reached through aliases such as `/var` and
+    # `/private/var`. `find` below emits physical paths, so canonicalize the
+    # separately hashed Mach-Os as well. Otherwise their alias-spelled paths
+    # miss the exclusions and are counted again as auxiliary resources.
+    main_macho="$(/bin/realpath "$main_macho" 2>/dev/null)" || {
+        build_provenance_error "main executable is not readable: $main_macho"
+        return 1
+    }
+    ffi_macho="$(/bin/realpath "$ffi_macho" 2>/dev/null)" || {
+        build_provenance_error "embedded qube-ffi is not readable: $ffi_macho"
         return 1
     }
     contents="$app_bundle/Contents"
@@ -1192,6 +1239,7 @@ build_provenance_bundle_auxiliary_digest() {
         [[ "$path" != "$main_macho" ]] || continue
         [[ "$path" != "$ffi_macho" ]] || continue
         [[ "$path" != "$manifest" ]] || continue
+        [[ "$path" != "$contents/CodeResources" ]] || continue
         relative="${path#"$app_bundle"/}"
         if ! build_provenance_append_path_record \
             "$path" "$relative" "$app_bundle" "$records_file"; then
