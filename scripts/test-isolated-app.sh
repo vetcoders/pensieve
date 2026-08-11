@@ -2,6 +2,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd -P)"
+
+# Git exports repository-local variables such as GIT_DIR to hooks. Without
+# scrubbing them, `git -C "$FIXTURE_ROOT/..." init` still targets the caller's
+# real repository and a pre-push test can commit fixture files onto the branch
+# it is supposed to validate. Clear every local-repository override before any
+# helper or fixture Git command runs; `-C` can then provide the only repository
+# context.
+while IFS= read -r git_local_environment_name; do
+  [[ -n "$git_local_environment_name" ]] \
+    && unset "$git_local_environment_name"
+done < <(/usr/bin/git rev-parse --local-env-vars 2>/dev/null)
+unset git_local_environment_name
+
+HOST_REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
+HOST_HEAD_BEFORE="$(/usr/bin/git -C "$HOST_REPO_ROOT" rev-parse HEAD)"
+HOST_STATUS_BEFORE="$(
+  /usr/bin/git -C "$HOST_REPO_ROOT" status --porcelain=v1 --untracked-files=all
+)"
+
 # shellcheck source=scripts/lib/isolated-app.sh
 source "$SCRIPT_DIR/lib/isolated-app.sh"
 
@@ -862,5 +881,15 @@ isolated_app_cleanup_manifest "$MANIFEST" "$OWNER_ROOT" \
   && ! -e "$(isolated_app_manifest_partial_path "$MANIFEST" final)" ]] \
   || fail "manifested cleanup left owned bundle/profile artifacts"
 pass "manifested cleanup retires its exact owned capsule and partial staging path"
+
+HOST_HEAD_AFTER="$(/usr/bin/git -C "$HOST_REPO_ROOT" rev-parse HEAD)"
+HOST_STATUS_AFTER="$(
+  /usr/bin/git -C "$HOST_REPO_ROOT" status --porcelain=v1 --untracked-files=all
+)"
+[[ "$HOST_HEAD_AFTER" == "$HOST_HEAD_BEFORE" ]] \
+  || fail "fixture Git commands moved the host repository HEAD"
+[[ "$HOST_STATUS_AFTER" == "$HOST_STATUS_BEFORE" ]] \
+  || fail "fixture Git commands changed the host repository worktree or index"
+pass "fixture Git repositories cannot mutate the host repository"
 
 printf '[isolated-app test] all synthetic checks passed\n'

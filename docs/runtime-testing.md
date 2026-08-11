@@ -264,6 +264,13 @@ An interrupted cleanup may leave the experiment available for inspection and a
 later retry. It must not silently broaden its scope to make the cleanup appear
 successful.
 
+The isolation test is itself repository-safe when invoked from a Git hook.
+`scripts/test-isolated-app.sh` clears inherited repository-local `GIT_*`
+variables before creating its temporary Git fixtures, because `git -C` does not
+override an exported `GIT_DIR`. It also pins the host repository's `HEAD`, index,
+and worktree before and after the run. A synthetic fixture must never create a
+commit on, switch, stage, or otherwise mutate the branch being validated.
+
 ## Choosing the right lane
 
 - Use `make gates` for source-level confidence.
