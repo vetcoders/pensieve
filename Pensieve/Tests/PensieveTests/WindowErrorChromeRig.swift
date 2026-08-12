@@ -22,10 +22,8 @@ final class WindowErrorChromeRig {
   let window: NSWindow
   let hosting: NSHostingView<AnyView>
 
-  /// Keeps the frame the rig asks for, exactly as the toolbar rig does: AppKit
-  /// otherwise shrinks an ordered-in window to the screen it lands on, and a
-  /// window narrower than the layout expects hides chrome for reasons that have
-  /// nothing to do with the code under test.
+  /// Keeps the frame the rig asks for, exactly as the toolbar rig does, while
+  /// the native window remains un-ordered and therefore unpublished.
   final class UnconstrainedWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
       frameRect
@@ -45,7 +43,7 @@ final class WindowErrorChromeRig {
       contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
 
     hosting = NSHostingView(
@@ -64,24 +62,41 @@ final class WindowErrorChromeRig {
         .environmentObject(themeManager)))
     window.contentView = hosting
 
-    // Parked far offscreen and fully transparent: it lays out and it publishes
-    // accessibility, and it never flashes across an operator's screen.
-    window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    window.alphaValue = 0
-    window.makeKeyAndOrderFront(nil)
+    // `contentView` is enough to attach the real SwiftUI graph and build the
+    // responder hierarchy. Keep the window deferred and never order it: even
+    // an eagerly allocated fixture owns a WindowServer surface even while
+    // invisible, whereas this deferred host remains an in-process AppKit
+    // object with no CGWindowID.
     window.layoutIfNeeded()
     settle(0.4)
   }
 
   func tearDown() {
-    window.orderOut(nil)
+    assertUnpublished()
     window.contentView = nil
     window.close()
+    assertUnpublished()
   }
 
   func settle(_ seconds: TimeInterval = 0.2) {
+    assertUnpublished()
     window.layoutIfNeeded()
     RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    assertUnpublished()
+  }
+
+  /// Keep this a real AppKit/SwiftUI host but not a native screen surface. A
+  /// deferred NSWindow reports `-1` until AppKit allocates a window device, so
+  /// this catches both explicit ordering and less obvious future publication.
+  private func assertUnpublished(
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    XCTAssertFalse(
+      window.isVisible,
+      "the error-chrome unit rig became a visible native window", file: file, line: line)
+    XCTAssertEqual(
+      window.windowNumber, -1,
+      "the error-chrome unit rig allocated a WindowServer surface", file: file, line: line)
   }
 
   // MARK: - Reading the live chrome

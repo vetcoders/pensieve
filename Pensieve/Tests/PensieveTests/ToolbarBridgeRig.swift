@@ -18,20 +18,14 @@ final class ToolbarBridgeRig {
   let themeManager: ThemeManager
   let window: NSWindow
 
-  /// A rig window that keeps the width it asks for.
+  /// A rig window that keeps the width it asks for without ever being ordered.
   ///
-  /// AppKit constrains an ordered-in window to the screen it lands on, and it
-  /// constrains the WIDTH too: measured on this rig, a requested 1600pt comes
-  /// back as 1512pt on a 1512pt display. That silent shrink is what makes an
-  /// unguarded rig machine-dependent — below the toolbar's clipping threshold a
-  /// family goes into the "»" overflow, and a clipped control is detached from
-  /// the window (`control.window == nil`), so a synthesized click lands nowhere
-  /// while every structural assertion still passes. That is precisely the shape
-  /// of the CI failure ("clicking the mode picker changed nothing") on a runner
-  /// whose virtual display is far smaller than an operator's: the toolbar was
-  /// never given the width the rig declared. The window is still parked
-  /// offscreen at zero alpha, so a frame no screen can hold costs the operator
-  /// nothing.
+  /// An ordered-in test window is a real WindowServer surface even when it is
+  /// transparent and parked offscreen. Besides leaking into Mission Control,
+  /// AppKit can constrain that surface to the runner's display and make toolbar
+  /// clipping machine-dependent. Keeping the window un-ordered preserves the
+  /// requested geometry and lets the hosting/view hierarchy lay out entirely in
+  /// process.
   final class UnconstrainedWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
       frameRect
@@ -65,7 +59,7 @@ final class ToolbarBridgeRig {
       contentRect: NSRect(x: 0, y: 0, width: width, height: 800),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.toolbarStyle = WindowChromeRecipe.toolbarStyle
     var rootView = AnyView(
@@ -88,13 +82,11 @@ final class ToolbarBridgeRig {
     // from a SwiftUI root into an AppKit window.
     hosting.sceneBridgingOptions = [.toolbars, .title]
     window.contentView = hosting
-    // The bridge only builds the toolbar for a window that is ordered in, but
-    // a test must never flash chrome across an operator's screen: the window
-    // is parked far offscreen and fully transparent, which still lays out and
-    // still tracks synthesized mouse events.
-    window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    window.alphaValue = 0
-    window.makeKeyAndOrderFront(nil)
+    // Assigning the hosting view attaches the real SwiftUI graph to a deferred
+    // AppKit host. The rig deliberately never asks AppKit for a backing window:
+    // even an un-ordered, eagerly allocated NSWindow has a CGWindowID and
+    // therefore exists in WindowServer; invisible geometry is not isolation
+    // either.
     window.layoutIfNeeded()
     settle(0.6)
   }
@@ -103,14 +95,31 @@ final class ToolbarBridgeRig {
   /// closed window keeps the SwiftUI graph (and its window reference) alive,
   /// and a live graph can still draw into a later test's assertions.
   func tearDown() {
-    window.orderOut(nil)
+    assertUnpublished()
     window.contentView = nil
     window.close()
+    assertUnpublished()
   }
 
   func settle(_ seconds: TimeInterval = 0.3) {
+    assertUnpublished()
     window.layoutIfNeeded()
     RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    assertUnpublished()
+  }
+
+  /// A deferred fixture has no native backing surface until some operation
+  /// asks AppKit to publish it. Pin that boundary on every settle: a future
+  /// helper can neither order the window nor allocate a CGWindowID unnoticed.
+  private func assertUnpublished(
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    XCTAssertFalse(
+      window.isVisible,
+      "the toolbar unit rig became a visible native window", file: file, line: line)
+    XCTAssertEqual(
+      window.windowNumber, -1,
+      "the toolbar unit rig allocated a WindowServer surface", file: file, line: line)
   }
 
   func resize(to width: CGFloat) {

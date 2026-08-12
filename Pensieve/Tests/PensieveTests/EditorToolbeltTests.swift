@@ -470,7 +470,7 @@ final class FormattingAccessoryChromeTruthTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
       styleMask: [.titled, .fullSizeContentView],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer { window.close() }
     window.contentView = surface.scrollView
@@ -515,7 +515,7 @@ final class MarkdownTextViewUndoDetachTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer { window.close() }
     window.contentView = surface.scrollView
@@ -615,7 +615,7 @@ final class MarkdownTextViewUndoDetachTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer { window.close() }
     let windowUndoManager = try XCTUnwrap(window.undoManager)
@@ -675,7 +675,7 @@ final class MarkdownTextViewUndoDetachTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = surface.scrollView
     surface.scrollView.frame = window.contentView?.bounds ?? .zero

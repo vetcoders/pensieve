@@ -305,7 +305,7 @@ final class NewDocumentTabIntegrationTests: XCTestCase {
       contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.alphaValue = 0
     window.contentView = NSView(frame: .zero)
@@ -334,7 +334,7 @@ private final class FullScreenLikeWindow: NSWindow {
       contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.alphaValue = 0
     window.contentView = NSView(frame: .zero)

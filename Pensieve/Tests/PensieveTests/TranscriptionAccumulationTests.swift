@@ -563,7 +563,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false
+      defer: true
     )
     window.contentView = surface.scrollView
     surface.textView.allowsUndo = true

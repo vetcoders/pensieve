@@ -157,7 +157,7 @@ final class SkinWindowAppearanceTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     let hosting = NSHostingView(rootView: AnyView(Text("body").pensieveSkinAppearance(manager)))
     window.contentView = hosting

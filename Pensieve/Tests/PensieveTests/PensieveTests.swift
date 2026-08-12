@@ -5718,7 +5718,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     return window
@@ -6483,7 +6483,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -6556,7 +6556,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -6641,7 +6641,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -6734,12 +6734,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let untitledWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [documentWindow, untitledWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -7000,7 +7000,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -7057,7 +7057,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     // A window from this initializer defaults to `isReleasedWhenClosed = true`: `close()` would then
     // release it, and ARC releases the local reference again at scope exit → double free (objc_release
     // EXC_BAD_ACCESS, SIGSEGV). Let ARC own the single reference so teardown is balanced.
@@ -7104,7 +7104,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer {
       window.close()
@@ -7134,7 +7134,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         window.contentView = NSView(frame: .zero)
         createdWindows.append(window)
@@ -7180,7 +7180,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         window.contentView = NSView(frame: .zero)
         createdWindows.append(window)
@@ -7213,7 +7213,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     zombie.isReleasedWhenClosed = false
     zombie.contentView = NSView(frame: .zero)
 
@@ -7232,7 +7232,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         return window
       }
@@ -7256,12 +7256,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -7323,7 +7323,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -7360,12 +7360,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let spawnedWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for tracked in [window, spawnedWindow] {
       tracked.isReleasedWhenClosed = false
     }
@@ -7410,12 +7410,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -7461,12 +7461,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let untitledWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [sourceWindow, untitledWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -7534,12 +7534,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -7611,22 +7611,22 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let launcherB = NSWindow(
       contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let strayWindow = NSWindow(
       contentRect: NSRect(x: 30, y: 30, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherA, launcherB, documentWindow, strayWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
@@ -7704,17 +7704,17 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let untitledWindow = NSWindow(
       contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherWindow, untitledWindow, documentWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
@@ -7774,12 +7774,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let restoredContentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     launcherWindow.isReleasedWhenClosed = false
     restoredContentWindow.isReleasedWhenClosed = false
     launcherWindow.title = "Pensieve"

@@ -117,7 +117,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 390, height: 210),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     transientKeyWindow.isReleasedWhenClosed = false
     addTeardownBlock { await MainActor.run { transientKeyWindow.close() } }
     probe.windows.append(launchWindow)
@@ -284,11 +284,10 @@ final class StartupRestoreTabCostTests: XCTestCase {
   func testAdoptedSurvivorWithASheetParksInsteadOfFanningOutAStandaloneWindow() {
     let probe = RestoreCostProbe()
     let launchWindow = makeWindow(frame: NSRect(x: -9000, y: -9000, width: 700, height: 500))
-    let sheetWindow = makeWindow(frame: NSRect(x: -9000, y: -9000, width: 390, height: 210))
     launchWindow.alphaValue = 0
-    sheetWindow.alphaValue = 0
-    probe.windows.append(contentsOf: [launchWindow, sheetWindow])
+    probe.windows.append(launchWindow)
     var currentTarget: NSWindow? = launchWindow
+    var blockedHost: NSWindow?
     var gateTransitions: [Bool] = []
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
@@ -305,6 +304,9 @@ final class StartupRestoreTabCostTests: XCTestCase {
       isApplicationActive: { true },
       currentMergeTarget: { currentTarget },
       setStartupRestoreInProgress: { gateTransitions.append($0) },
+      isTabMutationHost: { window in
+        DocumentWindowOwnership.isDocumentHost(window) && window !== blockedHost
+      },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
         let window = self.makeWindow(frame: NSRect(x: -9000, y: -9000, width: 480, height: 360))
@@ -321,10 +323,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let survivor = probe.createdWindows[0]
     registry.handleWindowClosed(launchWindow, tombstonePolicy: .reusableWindow)
     currentTarget = launchWindow  // AppKit can report the closing window for one more turn.
-    survivor.beginSheet(sheetWindow)
-    defer {
-      if sheetWindow.sheetParent === survivor { survivor.endSheet(sheetWindow) }
-    }
+    blockedHost = survivor
 
     // The adoption turn. The transaction has no host, the survivor is the only
     // candidate, and it cannot mutate its group this turn.
@@ -339,7 +338,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       "a parked ref must book the next turn, or the rest of the working set never opens")
     XCTAssertEqual(gateTransitions, [true], "the onboarding gate opened while refs were pending")
 
-    survivor.endSheet(sheetWindow)
+    blockedHost = nil
     while !probe.restoreSteps.isEmpty {
       probe.restoreSteps.removeFirst()()
     }
@@ -776,7 +775,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       contentRect: frame,
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     XCTAssertTrue(

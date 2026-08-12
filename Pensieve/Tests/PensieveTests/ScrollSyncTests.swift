@@ -99,7 +99,7 @@ final class ScrollSyncTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.contentView = nil }
 

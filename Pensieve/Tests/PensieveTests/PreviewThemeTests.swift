@@ -501,7 +501,7 @@ final class PreviewThemeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Glass KVO Probe")

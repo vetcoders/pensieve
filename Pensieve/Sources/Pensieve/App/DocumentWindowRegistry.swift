@@ -65,12 +65,34 @@ enum DocumentCloseScope {
 /// must also carry Pensieve's explicit document ownership token (or be the
 /// factory's `DocumentWindow` subclass).
 enum DocumentWindowOwnership {
+  /// Pure structural input used by ownership tests and by the AppKit adapter
+  /// below. Unit tests must not manufacture real parent/child or sheet
+  /// relationships: `addChildWindow` and `beginSheet` may order their operands
+  /// on the operator's active desktop even when every fixture starts hidden.
+  struct SurfaceRelationship: Equatable {
+    let isPanel: Bool
+    let hasSheetParent: Bool
+    let hasParent: Bool
+    let level: NSWindow.Level
+    let styleMask: NSWindow.StyleMask
+  }
+
+  static func isRootSurface(_ relationship: SurfaceRelationship) -> Bool {
+    !relationship.isPanel
+      && !relationship.hasSheetParent
+      && !relationship.hasParent
+      && relationship.level == .normal
+      && relationship.styleMask.contains(.titled)
+  }
+
   static func isRootSurface(_ window: NSWindow) -> Bool {
-    !(window is NSPanel)
-      && window.sheetParent == nil
-      && window.parent == nil
-      && window.level == .normal
-      && window.styleMask.contains(.titled)
+    isRootSurface(
+      SurfaceRelationship(
+        isPanel: window is NSPanel,
+        hasSheetParent: window.sheetParent != nil,
+        hasParent: window.parent != nil,
+        level: window.level,
+        styleMask: window.styleMask))
   }
 
   @MainActor
@@ -104,11 +126,16 @@ enum DocumentWindowOwnership {
   @MainActor
   static func isTabMutationHost(_ window: NSWindow) -> Bool {
     guard isDocumentHost(window) else { return false }
-    let isClear = (window.tabbedWindows ?? [window]).allSatisfy { $0.attachedSheet == nil }
+    let isClear = tabGroupAllowsMutation(
+      attachedSheetStates: (window.tabbedWindows ?? [window]).map { $0.attachedSheet != nil })
     if !isClear {
       DebugTrace.logWindowEvent("document-host.tab-mutation-blocked-by-sheet", window: window)
     }
     return isClear
+  }
+
+  static func tabGroupAllowsMutation(attachedSheetStates: [Bool]) -> Bool {
+    attachedSheetStates.allSatisfy { !$0 }
   }
 }
 
@@ -268,6 +295,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
   /// and the tab-vs-window close scope is decided from exactly this list.
   private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
+  /// Structural tab-mutation eligibility. Production delegates to
+  /// `DocumentWindowOwnership`; unit tests can inject a relationship snapshot
+  /// instead of publishing a native sheet merely to make this answer false.
+  private let isTabMutationHost: @MainActor (NSWindow) -> Bool
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
     scheduleDeferredMainWork: @escaping (@escaping DeferredMainWork) -> Void = { work in
@@ -323,6 +354,9 @@ final class DocumentWindowRegistry: ObservableObject {
     tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
       window.tabbedWindows ?? [window]
     },
+    isTabMutationHost: @escaping @MainActor (NSWindow) -> Bool = {
+      DocumentWindowOwnership.isTabMutationHost($0)
+    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
@@ -338,6 +372,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
+    self.isTabMutationHost = isTabMutationHost
     self.closeWindow = closeWindow
     self.setStartupRestoreInProgress = setStartupRestoreInProgress
     self.makeDocumentWindow = makeDocumentWindow
@@ -435,7 +470,7 @@ final class DocumentWindowRegistry: ObservableObject {
           restoreFrontmostWindow = nil
         }
       } else if !canMutateWindowTabs()
-        || !DocumentWindowOwnership.isTabMutationHost(pinned)
+        || !isTabMutationHost(pinned)
       {
         scheduleNextRestoreStep()
         return
@@ -455,7 +490,7 @@ final class DocumentWindowRegistry: ObservableObject {
       // window — the split restore the pinned and candidate paths already park
       // for.
       guard canMutateWindowTabs(),
-        DocumentWindowOwnership.isTabMutationHost(transactionSurvivor)
+        isTabMutationHost(transactionSurvivor)
       else {
         scheduleNextRestoreStep()
         return
@@ -467,7 +502,7 @@ final class DocumentWindowRegistry: ObservableObject {
     {
       restoreMergeTarget = WeakWindow(candidate)
       noteRestoreParticipant(candidate)
-      guard canMutateWindowTabs(), DocumentWindowOwnership.isTabMutationHost(candidate) else {
+      guard canMutateWindowTabs(), isTabMutationHost(candidate) else {
         scheduleNextRestoreStep()
         return
       }
@@ -784,7 +819,7 @@ final class DocumentWindowRegistry: ObservableObject {
   /// run loop blocks native tab mutation.
   @discardableResult
   func newUntitledTab(from window: NSWindow) -> Bool {
-    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+    guard isTabMutationHost(window) else {
       DebugTrace.log("newUntitledTab rejected ineligible source '\(window.title)'")
       return false
     }
@@ -800,7 +835,7 @@ final class DocumentWindowRegistry: ObservableObject {
       return true
     }
     guard let newWindow = makeUntitledWindow() else { return false }
-    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+    guard isTabMutationHost(window) else {
       DebugTrace.log("newUntitledTab source became ineligible during factory creation")
       closeWindow(newWindow)
       return false
@@ -1282,7 +1317,7 @@ final class DocumentWindowRegistry: ObservableObject {
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
     guard let target = currentDocumentMergeTarget(),
       target !== window,
-      DocumentWindowOwnership.isTabMutationHost(window),
+      isTabMutationHost(window),
       !areWindowsInSameTabGroup(target, window)
     else {
       return
@@ -1306,7 +1341,7 @@ final class DocumentWindowRegistry: ObservableObject {
 
   private func validatedDocumentMergeTarget(_ candidate: NSWindow) -> NSWindow? {
     guard restoreEligibleDocumentHost(candidate) != nil,
-      DocumentWindowOwnership.isTabMutationHost(candidate)
+      isTabMutationHost(candidate)
     else {
       DebugTrace.log("registry.merge rejected non-document target '\(candidate.title)'")
       DebugTrace.logWindowEvent("registry.merge.rejected-target", window: candidate)

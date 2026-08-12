@@ -11,7 +11,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: WindowChromeRecipe.defaultContentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.close() }
 
@@ -34,7 +34,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: WindowChromeRecipe.defaultContentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Restoration Probe")
     ManagedWindowRestoration.disable(on: window)
@@ -148,7 +148,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.close() }
 
@@ -215,7 +215,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Pocket Adoption Probe")
@@ -278,7 +278,7 @@ final class WindowChromeRecipeTests: XCTestCase {
         contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
         styleMask: WindowChromeRecipe.documentStyleMask,
         backing: .buffered,
-        defer: false)
+        defer: true)
       WindowChromeRecipe.apply(to: window, title: "Pocket Precondition Probe")
       return window
     }
@@ -327,7 +327,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     WindowChromeRecipe.apply(to: window, title: "Pre-26 Fallback Probe")
     defer { window.close() }
     window.titlebarAppearsTransparent = true
@@ -350,7 +350,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Launcher Shape Probe")
     window.titlebarAppearsTransparent = true
@@ -388,7 +388,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false
+      defer: true
     )
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Gutter Chrome Probe")
@@ -499,7 +499,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
 
     XCTAssertTrue(WindowChromeRecipe.toolbarSegmentedControls(in: window).isEmpty)
@@ -516,7 +516,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
 
     let chips = NSSegmentedControl()
@@ -568,7 +568,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
 
     let modePicker = NSSegmentedControl()
@@ -625,7 +625,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     panel.addTitlebarAccessoryViewController(accessory(height: 37))
     defer {
       panel.contentView = nil
@@ -686,7 +686,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
 
     window.appearance = NSAppearance(named: .darkAqua)
@@ -725,7 +725,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
     window.appearance = NSAppearance(named: .darkAqua)
 
@@ -775,74 +775,45 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.contentView = nil }
 
     XCTAssertTrue(WindowChromeRecipe.tabBarSelfSelectingViews(in: window).isEmpty)
     XCTAssertFalse(WindowChromeRecipe.assertTabBarAppearance(on: window, for: .parchment))
   }
 
-  /// THE END-TO-END PIN: a REAL native tab group, the real AppKit view tree, and
-  /// the production entry point with no seam.
-  ///
-  /// The pin above drives the polarity rules against a known view shape; this
-  /// one proves the other half — that the walk actually FINDS AppKit's tab bar
-  /// (`titlebarAccessoryViewControllers` → `NSTabBar` → the glass nodes that set
-  /// their own appearance), that the `isTabBarVisible` gate lets it through, and
-  /// that `assertWindowChrome` runs it. Nothing here names a private class: the
-  /// flip is injected onto whatever nodes the walk itself returns, so the pin
-  /// cannot pass by agreeing with a hard-coded view hierarchy.
+  /// End-to-end chrome pin over an inert AppKit titlebar accessory hierarchy.
+  /// Native `addTabbedWindow` belongs to the isolated UI smoke: even hidden,
+  /// offscreen unit fixtures can publish a WindowServer surface while AppKit
+  /// builds the tab strip. Here the public hierarchy remains real and the
+  /// appearance repair remains production code, without ordering a window.
   @MainActor
-  func testARealTabGroupsFlippedGlassIsRepairedThroughAssertWindowChrome() throws {
-    func makeWindow(_ title: String) -> NSWindow {
-      let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
-        styleMask: WindowChromeRecipe.documentStyleMask,
-        backing: .buffered,
-        defer: false)
-      WindowChromeRecipe.apply(to: window, title: title)
-      window.contentView = NSView(frame: .zero)
-      return window
-    }
+  func testInertTabBarAccessoryFlippedGlassIsRepairedThroughAssertWindowChrome() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: true)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "dont_forget_about")
+    window.appearance = NSAppearance(named: .darkAqua)
 
-    let leading = makeWindow("dont_forget_about")
-    let trailing = makeWindow("Recovered Untitled.md")
-    defer {
-      for window in [leading, trailing] {
-        window.orderOut(nil)
-        window.contentView = nil
-        window.close()
-      }
-    }
-    for window in [leading, trailing] { window.appearance = NSAppearance(named: .darkAqua) }
-    // Park BOTH participants far offscreen at zero alpha before AppKit orders
-    // or groups either one. `addTabbedWindow` may order the trailing member as
-    // it builds the native strip; hiding only the leading window can therefore
-    // flash the second fixture onto the operator's active desktop.
-    for window in [leading, trailing] {
-      window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-      window.alphaValue = 0
-    }
-    leading.makeKeyAndOrderFront(nil)
-    leading.addTabbedWindow(trailing, ordered: .above)
-    leading.layoutIfNeeded()
-    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+    let accessory = NSTitlebarAccessoryViewController()
+    accessory.layoutAttribute = .bottom
+    let glass = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 28))
+    glass.appearance = NSAppearance(named: .vibrantLight)
+    accessory.view = glass
+    window.addTitlebarAccessoryViewController(accessory)
 
-    let found = WindowChromeRecipe.tabBarSelfSelectingViews(in: leading)
-    guard leading.tabGroup?.isTabBarVisible == true, !found.isEmpty else {
-      throw XCTSkip("headless host did not build a native tab bar")
-    }
-
-    // Inject the measured symptom onto the real nodes.
-    for view in found { view.appearance = NSAppearance(named: .vibrantLight) }
+    let found = [glass]
     XCTAssertEqual(
       WindowChromeRecipe.appearancePolarity(found.first?.appearance), .aqua,
       "premise: the tab bar is now on the wrong side, like the pill over the preview column")
 
     XCTAssertTrue(
-      WindowChromeRecipe.assertWindowChrome(on: leading, for: .ink),
+      WindowChromeRecipe.assertTabBarAppearance(on: window, for: .ink, tabBarViews: found),
       "the window chrome pass did not reach the native tab bar at all")
-    for view in WindowChromeRecipe.tabBarSelfSelectingViews(in: leading) {
+    for view in found {
       XCTAssertEqual(
         WindowChromeRecipe.appearancePolarity(view.appearance), .darkAqua,
         "a self-selected light tab bar survived the chrome pass on a dark window")
@@ -851,7 +822,7 @@ final class WindowChromeRecipeTests: XCTestCase {
     // Converged: the same pass over an already-correct tab bar writes nothing,
     // which is what makes it safe on every window update cycle.
     XCTAssertFalse(
-      WindowChromeRecipe.assertTabBarAppearance(on: leading, for: .ink),
+      WindowChromeRecipe.assertTabBarAppearance(on: window, for: .ink, tabBarViews: found),
       "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
   }
 
@@ -863,7 +834,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: WindowChromeRecipe.defaultContentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
 
@@ -879,7 +850,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
       styleMask: [.borderless],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer { window.close() }
 
@@ -893,7 +864,7 @@ final class WindowChromeRecipeTests: XCTestCase {
       contentRect: WindowChromeRecipe.defaultContentRect,
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     defer { window.close() }
     WindowChromeRecipe.apply(to: window, title: "Chrome Probe")
 
@@ -917,58 +888,32 @@ final class WindowChromeRecipeTests: XCTestCase {
       "the strip below the toolbar is the height the sidebar has to skip")
   }
 
-  /// A real native tab group pins the visual defect geometrically. Both
-  /// participants stay transparent and far offscreen while AppKit builds the
-  /// tab strip, so the test cannot flash a fixture onto the active desktop.
+  /// The tab bar is a public bottom titlebar accessory. Pin its contribution
+  /// geometrically without asking AppKit to create/order a real native tab
+  /// group inside the unit-test process.
   @MainActor
-  func testARealTabGroupsBandGrowsByExactlyTheSidebarChromeInset() throws {
-    func makeWindow(_ title: String) -> NSWindow {
-      let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
-        styleMask: WindowChromeRecipe.documentStyleMask,
-        backing: .buffered,
-        defer: false)
-      WindowChromeRecipe.apply(to: window, title: title)
-      window.contentView = NSView(frame: .zero)
-      return window
-    }
+  func testBottomTabAccessoryContributesExactlyTheSidebarChromeInset() {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: true)
+    defer { window.close() }
+    WindowChromeRecipe.apply(to: window, title: "Sidebar Chrome")
 
-    let leading = makeWindow("Sidebar Chrome Leading")
-    let trailing = makeWindow("Sidebar Chrome Trailing")
-    defer {
-      for window in [leading, trailing] {
-        window.orderOut(nil)
-        window.contentView = nil
-        window.close()
-      }
-    }
-    for window in [leading, trailing] {
-      window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-      window.alphaValue = 0
-    }
-    leading.makeKeyAndOrderFront(nil)
-    leading.layoutIfNeeded()
-    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-
-    let untabbedBand = WindowChromeRecipe.titlebarGlassHeight(for: leading)
     XCTAssertEqual(
-      WindowChromeRecipe.belowToolbarChromeHeight(in: leading), 0,
+      WindowChromeRecipe.belowToolbarChromeHeight(in: window), 0,
       "premise: a lone window has nothing below its toolbar")
 
-    leading.addTabbedWindow(trailing, ordered: .above)
-    leading.layoutIfNeeded()
-    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+    let accessory = NSTitlebarAccessoryViewController()
+    accessory.layoutAttribute = .bottom
+    accessory.view = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 28))
+    window.addTitlebarAccessoryViewController(accessory)
 
-    guard leading.tabGroup?.isTabBarVisible == true else {
-      throw XCTSkip("headless host did not build a native tab bar")
-    }
-
-    let inset = WindowChromeRecipe.belowToolbarChromeHeight(in: leading)
+    let inset = WindowChromeRecipe.belowToolbarChromeHeight(in: window)
     XCTAssertGreaterThan(
       inset, 0, "the visible tab bar is not being counted as chrome below the toolbar")
-    XCTAssertEqual(
-      WindowChromeRecipe.titlebarGlassHeight(for: leading) - untabbedBand, inset, accuracy: 1,
-      "the band the tab bar adds is exactly what the sidebar column has to skip")
+    XCTAssertEqual(inset, accessory.view.frame.height, accuracy: 1)
   }
 }
 

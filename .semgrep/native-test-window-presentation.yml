@@ -1,0 +1,63 @@
+rules:
+  - id: pensieve.tests.native-window-presentation
+    languages:
+      - swift
+    severity: ERROR
+    message: >-
+      Unit tests must not publish, present, order, attach, or activate native
+      windows. Construct AppKit fixtures with defer: true and keep them
+      unshown; move real WindowServer scenarios to an announced isolated
+      runtime smoke.
+    paths:
+      include:
+        - Pensieve/Tests/**/*.swift
+      exclude:
+        - scripts/**
+    patterns:
+      - pattern-either:
+          - pattern: $OBJECT.makeKeyAndOrderFront(...)
+          - pattern: $OBJECT.orderFront(...)
+          - pattern: $OBJECT.orderFrontRegardless(...)
+          - pattern: $OBJECT.order(...)
+          - pattern: $OBJECT.showWindow(...)
+          - pattern: $OBJECT.beginSheet(...)
+          - pattern: $OBJECT.beginCriticalSheet(...)
+          - pattern: $OBJECT.beginSheetModal(...)
+          - pattern: $OBJECT.presentAsSheet(...)
+          - pattern: $OBJECT.presentAsModalWindow(...)
+          - pattern: $OBJECT.presentViewControllerAsSheet(...)
+          - pattern: $OBJECT.presentViewControllerAsModalWindow(...)
+          - pattern: $OBJECT.presentViewControllerAsPopover(...)
+          - pattern: $OBJECT.presentAsPopover(...)
+          - pattern: $OBJECT.addChildWindow(...)
+          - pattern: $OBJECT.addTabbedWindow(...)
+          - pattern: $OBJECT.setIsVisible(true)
+          - pattern: $OBJECT.isVisible = true
+          - pattern: $OBJECT.runModal(...)
+          - pattern: NSApplication.shared.activate(...)
+          - pattern: NSApp.activate(...)
+          - pattern: '$OBJECT.perform(NSSelectorFromString("makeKeyAndOrderFront:"), ...)'
+          - pattern: '$OBJECT.perform(Selector("makeKeyAndOrderFront:"), ...)'
+          - pattern: NSWindow()
+          - pattern: NSPanel()
+          - pattern: "NSWindow(..., defer: false, ...)"
+          - pattern: "NSPanel(..., defer: false, ...)"
+  - id: pensieve.tests.tafla-panel-requires-injected-factory
+    languages:
+      - swift
+    severity: ERROR
+    message: >-
+      Tafla panel tests must inject an explicit deferred panel factory plus
+      non-publishing presentation and dismissal seams. The production defaults
+      intentionally construct and order a native panel and must never be
+      reached from a unit test.
+    paths:
+      include:
+        - Pensieve/Tests/**/*.swift
+      exclude:
+        - scripts/**
+    patterns:
+      - pattern: "TranscriptionTaflaPanelController(...)"
+      - pattern-not: >-
+          TranscriptionTaflaPanelController(..., panelFactory: ...,
+          presentPanel: ..., dismissPanel: ..., ...)
