@@ -20,10 +20,10 @@ build_provenance_error() {
 # Release snapshots deliberately make compiler-visible inputs read-only. The
 # resource modes survive into the signed app and then into the disposable DMG
 # staging copy, so a plain recursive removal cannot descend through those
-# copied directories. Unlock directories in that one derived staging tree,
-# never the signed source app, before removing it. The exact path-shape and
-# symlink guards keep this cleanup from becoming a generic recursive-delete
-# primitive.
+# copied directories. Unlock only non-symlink entries in that one derived
+# staging tree, never the signed source app, before removing it. The exact
+# path-shape and symlink guards keep this cleanup from becoming a generic
+# recursive-delete primitive.
 build_provenance_cleanup_dmg_staging() {
     local staging_path="${1:-}"
 
@@ -42,7 +42,11 @@ build_provenance_cleanup_dmg_staging() {
     fi
     [[ -e "$staging_path" ]] || return 0
 
-    /usr/bin/find -P "$staging_path" -type d -exec /bin/chmod u+w {} + \
+    # A terminal-attached `rm -R` prompts for a read-only file even when its
+    # parent directory is writable. Do not follow symlinks: staging is a
+    # copied release artifact and this function may mutate only that exact
+    # derived tree.
+    /usr/bin/find -P "$staging_path" ! -type l -exec /bin/chmod u+w {} + \
         || return 1
     /bin/rm -R -- "$staging_path"
 }

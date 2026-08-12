@@ -252,6 +252,9 @@ READONLY_DMG_STAGING="$FIXTURE_ROOT/release/dist/dmg-staging"
 /bin/mkdir -p "$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle"
 printf '%s\n' 'immutable snapshot resource' \
   >"$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle/Fixture.txt"
+# Keep both the copied resource and its parent directory read-only. A cleanup
+# that unlocks directories but not files succeeds non-interactively only when
+# stdin is not a terminal; this contract remains valid when run from a TTY.
 /bin/chmod -R a-w "$READONLY_DMG_STAGING/Pensieve.app/Contents/Resources/Fixture.bundle"
 build_provenance_cleanup_dmg_staging "$READONLY_DMG_STAGING" \
   || fail "read-only DMG staging cleanup failed"
