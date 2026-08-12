@@ -473,7 +473,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     if LaunchIntentCoordinator.shared.isComposerWaitMode {
       return true
     }
-    MainActor.assumeIsolated {
+    return MainActor.assumeIsolated {
       let registry = reopenWindowRegistryOverride ?? .shared
       guard !registry.hasLiveDocumentCapableWindow() else {
         // AppKit may perform its ordinary activation/order work. No custom host
