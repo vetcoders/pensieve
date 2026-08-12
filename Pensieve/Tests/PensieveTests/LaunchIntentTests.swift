@@ -400,14 +400,13 @@ final class LaunchIntentTests: XCTestCase {
       contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     settingsWindow.isReleasedWhenClosed = false
     settingsWindow.alphaValue = 0
     settingsWindow.contentView = NSView(frame: .zero)
     settingsWindow.title = "Settings"
     addTeardownBlock {
       await MainActor.run {
-        settingsWindow.orderOut(nil)
         settingsWindow.close()
       }
     }
@@ -1009,6 +1008,94 @@ final class LaunchIntentTests: XCTestCase {
     XCTAssertEqual(hostRequests, 0)
     XCTAssertEqual(live.appState.selectedDocumentID, requested)
     XCTAssertEqual(live.appState.documentSession.url, requested)
+  }
+
+  /// Settings owns the menu while the document remains a background surface.
+  /// Its application-level New lane must resolve that controller at action time
+  /// and fail closed in a headless test rather than replacing occupied work.
+  @MainActor
+  func testSettingsNewPreservesAnOccupiedBackgroundDocumentWithoutANativeWindow() throws {
+    let live = try makeRestoreHarness(documentNames: ["alpha.md"])
+    let originalURL = live.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    live.controller.openFileInCurrentWindow(url: originalURL)
+    live.appState.documentSession.text = "edited background buffer"
+    live.appState.documentSession.isDirty = true
+    let originalIdentity = live.appState.documentSession.identity
+    var newResults: [Bool] = []
+    var targetedControllers: [AppController] = []
+    let coordinator = LaunchIntentCoordinator(
+      focusedControllerProvider: { live.controller },
+      hasLiveDocumentCapableWindow: { true },
+      openUntitledDocumentHost: {
+        XCTFail("Settings New must not request another root while a document root is alive")
+        return true
+      },
+      createUntitledDocument: { controller in
+        targetedControllers.append(controller)
+        let result = controller.createUntitledDocument()
+        newResults.append(result)
+        return result
+      })
+    let lane = ZeroWindowCommandLane(
+      openExternalURLs: { _ in XCTFail("Settings New must not travel the Open lane") },
+      requestNewDocument: { coordinator.requestNewDocument() })
+
+    XCTAssertEqual(
+      PensieveCommandSurfaceRoute.resolve(
+        settingsOwnsSurface: true,
+        hasDocumentTarget: true),
+      .settings)
+    lane.newDocument()
+
+    XCTAssertEqual(newResults, [false], "headless occupied New must fail closed")
+    XCTAssertEqual(targetedControllers.count, 1)
+    XCTAssertTrue(targetedControllers.first === live.controller)
+    XCTAssertEqual(live.appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(live.appState.selectedDocumentID, originalURL)
+    XCTAssertEqual(live.appState.documentSession.url, originalURL)
+    XCTAssertEqual(live.appState.documentSession.text, "edited background buffer")
+    XCTAssertTrue(live.appState.documentSession.isDirty)
+  }
+
+  /// The Settings File menu uses the same external-open lane. With background
+  /// work already present, Open must request a separate document tab through
+  /// the registry seam and leave the source session byte-for-byte untouched.
+  @MainActor
+  func testSettingsOpenPreservesAnOccupiedBackgroundDocumentWithoutANativeWindow() throws {
+    let live = try makeRestoreHarness(documentNames: ["alpha.md", "beta.md"])
+    let originalURL = live.folder.appendingPathComponent("alpha.md").standardizedFileURL
+    let requestedURL = live.folder.appendingPathComponent("beta.md").standardizedFileURL
+    live.controller.openFileInCurrentWindow(url: originalURL)
+    live.appState.documentSession.text = "edited background buffer"
+    live.appState.documentSession.isDirty = true
+    let originalIdentity = live.appState.documentSession.identity
+    var routedDocuments: [DocumentRef] = []
+    live.controller.requestOpenDocumentWindow = { routedDocuments.append($0) }
+    let coordinator = LaunchIntentCoordinator(
+      settleDelayNanoseconds: 0,
+      focusedControllerProvider: { live.controller },
+      hasLiveDocumentCapableWindow: { true },
+      openExternalDocumentHost: {
+        XCTFail("Settings Open must not request another root while a document root is alive")
+        return true
+      })
+    let lane = ZeroWindowCommandLane(
+      openExternalURLs: { coordinator.handle(urls: $0) },
+      requestNewDocument: { XCTFail("Settings Open must not travel the New lane") })
+
+    XCTAssertEqual(
+      PensieveCommandSurfaceRoute.resolve(
+        settingsOwnsSurface: true,
+        hasDocumentTarget: true),
+      .settings)
+    lane.open(urls: [requestedURL])
+
+    XCTAssertEqual(routedDocuments.map(\.id), [requestedURL])
+    XCTAssertEqual(live.appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(live.appState.selectedDocumentID, originalURL)
+    XCTAssertEqual(live.appState.documentSession.url, originalURL)
+    XCTAssertEqual(live.appState.documentSession.text, "edited background buffer")
+    XCTAssertTrue(live.appState.documentSession.isDirty)
   }
 
   // MARK: - Restore session on launch (S2-A)

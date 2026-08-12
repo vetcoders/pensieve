@@ -11,13 +11,6 @@ struct PensieveApp: App {
   @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
-  private let providerSettings: ProviderSettings
-  /// The auto-save preference the Settings window edits. The SAME instance the
-  /// document store consults, so a flip reaches every open document immediately.
-  private let savingSettings: DocumentSavingSettings
-  /// The restore-on-launch preference the Settings window edits. The SAME
-  /// instance `AppController.start(intent:)` consults on the next cold launch.
-  private let launchSettings: LaunchSettings
 
   init() {
     // Register the bundled OFL theme fonts into this process's font environment
@@ -28,9 +21,6 @@ struct PensieveApp: App {
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
-    providerSettings = ProviderSettings.shared
-    savingSettings = DocumentSavingSettings.shared
-    launchSettings = LaunchSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -79,14 +69,6 @@ struct PensieveApp: App {
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
-    }
-
-    Settings {
-      PensieveSettingsView(
-        providerSettings: providerSettings,
-        savingSettings: savingSettings,
-        launchSettings: launchSettings
-      )
     }
   }
 }
@@ -169,6 +151,14 @@ struct DocumentWindowRootView: View {
           // Publish this window's owning controller so a cross-window "Close
           // from Open Files" routes its dirty guard through this session.
           DocumentWindowRegistry.shared.registerController(controller, for: window)
+          // Keep the non-modal error surface tied to its exact native owner.
+          // Settings presentation can be blocked by a sheet on a different
+          // document than the command fallback; modal errors must return to
+          // the window that actually owns that sheet.
+          CommandSurfaceContext.shared.register(
+            appState: appState,
+            controller: controller,
+            for: window)
           // Give the red close button / tab "×" the same conscious Save / Don't
           // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
           // flush. EVERY window this app can build gets it, not just the

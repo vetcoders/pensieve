@@ -9,17 +9,46 @@ struct PensieveSettingsView: View {
   let providerSettings: ProviderSettings
   let savingSettings: DocumentSavingSettings
   let launchSettings: LaunchSettings
+  @ObservedObject var selection: PensieveSettingsSelection
 
   var body: some View {
-    TabView {
-      GeneralSettingsView(settings: savingSettings, launchSettings: launchSettings)
-        .tabItem {
-          Label("General", systemImage: "gearshape")
+    ZStack(alignment: .bottom) {
+      TabView(selection: $selection.selectedSection) {
+        GeneralSettingsView(settings: savingSettings, launchSettings: launchSettings)
+          .tabItem {
+            Label("General", systemImage: "gearshape")
+          }
+          .tag(PensieveSettingsSection.general)
+        ProviderSettingsView(settings: providerSettings)
+          .tabItem {
+            Label("AI", systemImage: "sparkles")
+          }
+          .tag(PensieveSettingsSection.ai)
+      }
+
+      if let message = selection.presentationError {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .foregroundStyle(.orange)
+          Text(message)
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+          Spacer(minLength: 8)
+          Button {
+            selection.dismissPresentationError()
+          } label: {
+            Image(systemName: "xmark.circle.fill")
+              .foregroundStyle(.secondary)
+          }
+          .buttonStyle(.plain)
+          .accessibilityLabel("Dismiss")
         }
-      ProviderSettingsView(settings: providerSettings)
-        .tabItem {
-          Label("AI", systemImage: "sparkles")
-        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .padding(14)
+        .accessibilityIdentifier("pensieve.settings.presentationError")
+      }
     }
     .accessibilityIdentifier("pensieve.settings")
   }

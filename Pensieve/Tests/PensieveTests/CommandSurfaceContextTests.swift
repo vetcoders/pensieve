@@ -106,6 +106,126 @@ final class CommandSurfaceContextTests: XCTestCase {
     XCTAssertTrue(context.controller === keyController)
   }
 
+  /// A modal block belongs to the window that owns it, not to whichever
+  /// document happened to be the last command fallback. This is the concrete
+  /// two-window regression behind Settings errors appearing in the wrong tab.
+  @MainActor
+  func testModalReportingResolvesTheExactNativeOwnerInsteadOfTheFallback() {
+    let context = CommandSurfaceContext()
+    let fallbackState = AppState()
+    let fallbackController = AppController(appState: fallbackState)
+    let ownerState = AppState()
+    let ownerController = AppController(appState: ownerState)
+    let fallbackWindow = Self.makeParkedWindow()
+    let ownerWindow = Self.makeParkedWindow()
+    defer {
+      fallbackWindow.close()
+      ownerWindow.close()
+    }
+
+    context.register(
+      appState: fallbackState,
+      controller: fallbackController,
+      for: fallbackWindow)
+    context.register(appState: ownerState, controller: ownerController, for: ownerWindow)
+    context.adopt(appState: fallbackState, controller: fallbackController)
+
+    let resolved = context.reportingAppState(
+      blockingOwner: ownerWindow,
+      keyWindow: fallbackWindow,
+      mainWindow: fallbackWindow)
+
+    XCTAssertTrue(resolved === ownerState)
+    XCTAssertFalse(resolved === fallbackState)
+    XCTAssertEqual(fallbackWindow.windowNumber, -1)
+    XCTAssertEqual(ownerWindow.windowNumber, -1)
+  }
+
+  /// If the application-modal surface itself is not a document host, the key
+  /// or main document is the bounded app-global visible reporting surface. A
+  /// historical adopted fallback remains deliberately ineligible.
+  @MainActor
+  func testModalReportingUsesVisibleWindowBeforeHistoricalFallback() {
+    let context = CommandSurfaceContext()
+    let historicalState = AppState()
+    let historicalController = AppController(appState: historicalState)
+    let visibleState = AppState()
+    let visibleController = AppController(appState: visibleState)
+    let historicalWindow = Self.makeParkedWindow()
+    let visibleWindow = Self.makeParkedWindow()
+    let applicationModal = Self.makeParkedWindow()
+    defer {
+      historicalWindow.close()
+      visibleWindow.close()
+      applicationModal.close()
+    }
+
+    context.register(
+      appState: historicalState,
+      controller: historicalController,
+      for: historicalWindow)
+    context.register(appState: visibleState, controller: visibleController, for: visibleWindow)
+    context.adopt(appState: historicalState, controller: historicalController)
+
+    let resolved = context.reportingAppState(
+      blockingOwner: applicationModal,
+      keyWindow: visibleWindow,
+      mainWindow: historicalWindow)
+
+    XCTAssertTrue(resolved === visibleState)
+    XCTAssertFalse(resolved === historicalState)
+    XCTAssertEqual(applicationModal.windowNumber, -1)
+  }
+
+  /// A retained historical command pair is not a reporting owner. Returning
+  /// nil here is the explicit handoff to Settings' own non-modal error surface.
+  @MainActor
+  func testModalReportingReturnsNilWhenOnlyAHistoricalDocumentExists() {
+    let context = CommandSurfaceContext()
+    let historicalState = AppState()
+    let historicalController = AppController(appState: historicalState)
+    let historicalWindow = Self.makeParkedWindow()
+    let auxiliaryModal = Self.makeParkedWindow()
+    defer {
+      historicalWindow.close()
+      auxiliaryModal.close()
+    }
+
+    context.register(
+      appState: historicalState,
+      controller: historicalController,
+      for: historicalWindow)
+    context.adopt(appState: historicalState, controller: historicalController)
+
+    XCTAssertNil(
+      context.reportingAppState(
+        blockingOwner: auxiliaryModal,
+        keyWindow: auxiliaryModal,
+        mainWindow: nil))
+    XCTAssertEqual(historicalWindow.windowNumber, -1)
+    XCTAssertEqual(auxiliaryModal.windowNumber, -1)
+  }
+
+  @MainActor
+  func testReleasingAControllerRetiresItsWindowOwnershipMapping() {
+    let context = CommandSurfaceContext()
+    let appState = AppState()
+    let controller = AppController(appState: appState)
+    let window = Self.makeParkedWindow()
+    defer { window.close() }
+    context.register(appState: appState, controller: controller, for: window)
+    context.adopt(appState: appState, controller: controller)
+
+    context.release(controller: controller)
+
+    XCTAssertNil(
+      context.reportingAppState(
+        blockingOwner: window,
+        keyWindow: nil,
+        mainWindow: nil))
+    XCTAssertEqual(window.windowNumber, -1)
+  }
+
   func testFocusedPairWinsOverTheFallback() {
     let focusedState = NSObject()
     let focusedController = NSObject()

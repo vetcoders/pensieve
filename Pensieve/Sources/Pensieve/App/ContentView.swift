@@ -7,6 +7,7 @@ struct ContentView: View {
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
+  @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
 
@@ -20,6 +21,8 @@ struct ContentView: View {
     self.providerSettings = providerSettings
     _providerOnboardingCoordinator = ObservedObject(
       wrappedValue: providerOnboardingCoordinator ?? .shared)
+    _providerSettingsTransition = StateObject(
+      wrappedValue: ProviderOnboardingSettingsTransition())
   }
 
   var body: some View {
@@ -82,7 +85,18 @@ struct ContentView: View {
       )
     }
     .sheet(isPresented: onboardingSheetBinding) {
-      ProviderOnboardingView(isPresented: onboardingSheetBinding)
+      ProviderOnboardingView(
+        isPresented: onboardingSheetBinding,
+        hostWindow: hostWindow,
+        settingsTransition: providerSettingsTransition,
+        onSettingsTransitionFailure: { failure in
+          appState.lastError = failure.userMessage
+        },
+        onSettingsPresentationFailure: { result in
+          if let message = result.userMessage {
+            appState.lastError = message
+          }
+        })
     }
     .onAppear {
       evaluateProviderOnboarding()
