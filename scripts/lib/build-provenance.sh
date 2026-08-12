@@ -51,6 +51,43 @@ build_provenance_cleanup_dmg_staging() {
     /bin/rm -R -- "$staging_path"
 }
 
+# build_provenance_cleanup_swiftpm_build_cache PATH
+#
+# A release run can leave the source package's resolved dependency checkout
+# read-only after it has been sealed into an immutable snapshot. `--clean`
+# must retire that exact SwiftPM cache before resolving the graph again, but a
+# terminal-attached plain `rm -R` prompts once for every read-only leaf. This
+# helper owns only the source package's literal Pensieve/.build directory. It
+# never accepts a symlink or an arbitrary derived tree, and it never follows
+# symlinks while restoring owner write access.
+build_provenance_cleanup_swiftpm_build_cache() {
+    local build_path="${1:-}"
+
+    case "$build_path" in
+        /*/Pensieve/.build) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact Pensieve/.build path: $build_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$build_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked SwiftPM build root: $build_path"
+        return 1
+    fi
+    [[ -e "$build_path" ]] || return 0
+    if [[ ! -d "$build_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup of a non-directory SwiftPM build root: $build_path"
+        return 1
+    fi
+
+    /usr/bin/find -P "$build_path" ! -type l -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$build_path"
+}
+
 build_provenance_is_sha256() {
     [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }

@@ -392,6 +392,15 @@ run-owned fixture root through the same physical, symlink-safe cleanup
 primitive used by the isolation contract. A terminal-attached test must never
 block on an `rm` `override …?` prompt.
 
+Release cleanup follows the same rule for the source package's exact
+`Pensieve/.build` cache. A prior immutable release snapshot can leave resolved
+SwiftPM checkouts read-only; `make release-clean` restores owner write access
+only on non-symlink entries below that literal cache path before removing it.
+It refuses a symlink, a non-directory, or any other path shape rather than
+turning release cleanup into a generic recursive-delete mechanism. A
+terminal-attached release must therefore never pause on an `rm` `override …?`
+prompt for a dependency checkout.
+
 ## Choosing the right lane
 
 - Use `make gates` for source-level confidence.

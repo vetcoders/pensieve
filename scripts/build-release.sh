@@ -426,7 +426,8 @@ if (( ! DMG_ONLY )); then
     if (( DO_CLEAN )); then
         log "Cleaning $DIST_DIR + Pensieve/.build"
         [[ ! -e "$DIST_DIR" ]] || /bin/rm -R -- "$DIST_DIR"
-        [[ ! -e "$PKG_DIR/.build" ]] || /bin/rm -R -- "$PKG_DIR/.build"
+        build_provenance_cleanup_swiftpm_build_cache "$PKG_DIR/.build" \
+            || die "Could not retire the previous SwiftPM build cache safely."
     fi
     /bin/mkdir -p "$DIST_DIR"
 

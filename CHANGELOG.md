@@ -86,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlocks only the disposable copied directory tree, so resources inherited
   from the immutable snapshot cannot abort an otherwise valid notarized release
   while the signed and stapled source app remains untouched.
+- `make release-clean` now also retires an exact read-only `Pensieve/.build`
+  cache non-interactively before resolving SwiftPM dependencies. That cleanup
+  is bounded to the literal package cache, rejects symlinks and non-directories,
+  and cannot turn a terminal-attached release into a series of `rm`
+  confirmation prompts for immutable dependency checkout files.
 
 ### Added
 

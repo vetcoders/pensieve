@@ -285,6 +285,40 @@ fi
 /bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_CLEANUP_TARGET"
 pass "read-only DMG staging cleanup is exact, bounded and symlink-safe"
 
+READONLY_SWIFTPM_BUILD="$FIXTURE_ROOT/release/Pensieve/.build"
+/bin/mkdir -p "$READONLY_SWIFTPM_BUILD/checkouts/GRDB.swift"
+printf '%s\n' 'immutable dependency checkout resource' \
+  >"$READONLY_SWIFTPM_BUILD/checkouts/GRDB.swift/CODE_OF_CONDUCT.md"
+/bin/chmod -R a-w "$READONLY_SWIFTPM_BUILD/checkouts"
+build_provenance_cleanup_swiftpm_build_cache "$READONLY_SWIFTPM_BUILD" \
+  || fail "read-only SwiftPM build cache cleanup failed"
+[[ ! -e "$READONLY_SWIFTPM_BUILD" ]] \
+  || fail "read-only SwiftPM build cache cleanup left dependency bytes behind"
+
+UNOWNED_BUILD_ROOT="$FIXTURE_ROOT/not-swiftpm-build"
+/bin/mkdir -p "$UNOWNED_BUILD_ROOT"
+if build_provenance_cleanup_swiftpm_build_cache "$UNOWNED_BUILD_ROOT" \
+  >/dev/null 2>&1; then
+  fail "SwiftPM build cache cleanup accepted a path outside Pensieve/.build"
+fi
+[[ -d "$UNOWNED_BUILD_ROOT" ]] \
+  || fail "rejected SwiftPM build cache cleanup mutated the unrelated directory"
+/bin/rm -R -- "$UNOWNED_BUILD_ROOT"
+
+SYMLINK_BUILD_PARENT="$FIXTURE_ROOT/symlink-release/Pensieve"
+SYMLINK_BUILD_TARGET="$FIXTURE_ROOT/symlink-build-target"
+/bin/mkdir -p "$SYMLINK_BUILD_PARENT" "$SYMLINK_BUILD_TARGET"
+/bin/ln -s "$SYMLINK_BUILD_TARGET" "$SYMLINK_BUILD_PARENT/.build"
+if build_provenance_cleanup_swiftpm_build_cache "$SYMLINK_BUILD_PARENT/.build" \
+  >/dev/null 2>&1; then
+  fail "SwiftPM build cache cleanup followed a symlinked build root"
+fi
+[[ -d "$SYMLINK_BUILD_TARGET" ]] \
+  || fail "rejected symlink cleanup mutated its referent"
+/bin/rm "$SYMLINK_BUILD_PARENT/.build"
+/bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_BUILD_TARGET"
+pass "read-only SwiftPM build cache cleanup is exact, bounded and symlink-safe"
+
 assert_plist_value() {
   local plist="$1"
   local key="$2"
