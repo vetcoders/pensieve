@@ -171,7 +171,10 @@ cleanup() {
     fi
   fi
   if [[ -d "$FIXTURE_ROOT" ]]; then
-    /bin/rm -R -- "$FIXTURE_ROOT"
+    # Fixtures intentionally include read-only snapshots and Git objects.
+    # Reuse the bounded cleanup primitive so an attached terminal never turns
+    # their removal into an interactive `override …?` prompt.
+    isolated_app_remove_exact_path "$FIXTURE_ROOT" "isolated-app test fixture root"
     step_status=$?
     if [[ "$cleanup_status" -eq 0 && "$step_status" -ne 0 ]]; then
       cleanup_status="$step_status"
@@ -415,8 +418,9 @@ run_certless_cleanup_tests() {
   local legacy_temp_root legacy_temp_gpu legacy_notice legacy_cleanup_status
 
   readonly_tree="$FIXTURE_ROOT/read-only-isolated-tree"
-  /bin/mkdir -p "$readonly_tree/nested"
+  /bin/mkdir -p "$readonly_tree/nested/.git/objects/aa"
   printf 'immutable staged resource\n' >"$readonly_tree/nested/resource.txt"
+  printf 'immutable Git object\n' >"$readonly_tree/nested/.git/objects/aa/fixture"
   /bin/chmod -R a-w "$readonly_tree"
   isolated_app_remove_exact_path "$readonly_tree" "read-only isolated fixture" \
     || fail "isolated cleanup could not retire a read-only staged tree"

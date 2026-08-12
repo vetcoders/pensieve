@@ -386,6 +386,12 @@ LaunchServices integration seams. It still runs the manifest, filesystem,
 Darwin WebKit, late-writer and cleanup-authority contracts, but it is not
 evidence for LaunchServices registration retirement.
 
+Fixture cleanup is also non-interactive. The harness may intentionally create
+read-only release snapshots and Git object trees; it removes only its exact
+run-owned fixture root through the same physical, symlink-safe cleanup
+primitive used by the isolation contract. A terminal-attached test must never
+block on an `rm` `override …?` prompt.
+
 ## Choosing the right lane
 
 - Use `make gates` for source-level confidence.
