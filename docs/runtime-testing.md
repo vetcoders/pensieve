@@ -220,6 +220,16 @@ Only after that baseline passes may an automated smoke seed its witness files or
 an operator begin an interactive manual scenario. A reset command that ignores
 errors without a read-back is not evidence of a clean state.
 
+Before either lane stages or launches an application, the terminal process
+driving the harness performs a bounded `System Events` Automation and
+Accessibility preflight. TCC authority belongs to that process, not to the
+Pensieve bundle. A denial such as Apple event error `-1743` is therefore an
+environment-inconclusive result (exit 3): automated smoke creates no capsule,
+and manual smoke neither retires the previous experiment nor creates a new one.
+Run the manual command from the terminal whose Automation and Accessibility
+permissions the operator intends to use; granting those permissions to another
+terminal or agent does not satisfy this preflight.
+
 The empty-launcher baseline is itself a throwaway scenario. After it passes,
 the harness retires that complete capsule and mints another fresh identity for
 the first product scenario, just as it does at every later scenario boundary.

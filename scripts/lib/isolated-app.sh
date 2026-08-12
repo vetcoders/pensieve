@@ -19,11 +19,91 @@ ISOLATED_APP_REQUIRED_ENTITLEMENTS="Pensieve/Resources/Pensieve.entitlements"
 ISOLATED_APP_SIGNING_MODE=""
 
 ISOLATED_APP_LIB_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
+ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT="$ISOLATED_APP_LIB_DIR/system-events-preflight.applescript"
 # shellcheck source=scripts/lib/build-provenance.sh
 source "$ISOLATED_APP_LIB_DIR/build-provenance.sh"
 
 isolated_app_error() {
   printf 'isolated-app: %s\n' "$*" >&2
+}
+
+# Run a command behind a watchdog available on a stock macOS installation.
+# Callers use this before any UI-owned state exists, so an unavailable watchdog
+# is an environment result instead of permission to run an unbounded probe.
+isolated_app_run_bounded_command() {
+  local timeout_seconds="${1:-}"
+  shift || return 2
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 ]] || return 2
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout --signal=TERM "$timeout_seconds" "$@"
+    return $?
+  fi
+  if [[ -x /usr/bin/perl ]]; then
+    /usr/bin/perl -e '
+      use strict;
+      use warnings;
+      my $seconds = shift @ARGV;
+      die "invalid timeout\n" unless defined($seconds) && $seconds =~ /\A[1-9][0-9]*\z/;
+      alarm($seconds);
+      exec @ARGV;
+      die "could not exec bounded command: $!\n";
+    ' "$timeout_seconds" "$@"
+    return $?
+  fi
+  isolated_app_error \
+    "no bounded command watchdog is available (need gtimeout or /usr/bin/perl)"
+  return 3
+}
+
+# Prove that the current *calling process* can drive the same System Events
+# Automation + Accessibility route used by the smoke harness. This must run
+# before staging, cleaning a previous manual experiment, minting a capsule, or
+# launching Pensieve. A TCC denial is therefore environment-inconclusive and
+# cannot leave behind an app, defaults domain, Open Recent row, or support tree.
+#
+isolated_app_assert_system_events_automation() {
+  local output="" status=0
+  [[ -f "$ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT" ]] || {
+    isolated_app_error \
+      "tracked System Events preflight is missing: $ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT"
+    return 1
+  }
+  output="$(isolated_app_run_bounded_command \
+    10 /usr/bin/osascript "$ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT" 2>&1)" \
+    || status=$?
+
+  if [[ "$status" -ne 0 ]]; then
+    case "$output" in
+      *-1743* | *"Not authorized"* | *"not authorized"* | *"assistive access"* \
+        | *"Accessibility UI scripting is disabled"* \
+        | *"No frontmost application process is available"*)
+        isolated_app_error \
+          "System Events Automation/Accessibility is unavailable for the host running this command; allow that host in System Settings > Privacy & Security > Automation and Accessibility; no smoke identity was created"
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        return 3
+        ;;
+    esac
+    case "$status" in
+      3 | 124 | 142)
+        isolated_app_error \
+          "System Events preflight failed before smoke staging; no smoke identity was created"
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        return 3
+        ;;
+    esac
+    isolated_app_error \
+      "System Events preflight script failed before smoke staging"
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return 1
+  fi
+  [[ "$output" == "SYSTEM_EVENTS_AUTOMATION=PASS" ]] || {
+    isolated_app_error \
+      "System Events preflight returned an unexpected witness before smoke staging"
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return 1
+  }
+  printf '%s\n' "$output"
 }
 
 isolated_app_signing_mode() {

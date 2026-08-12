@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Automated and manual isolated smoke now prove the calling terminal's bounded
+  `System Events` Automation and Accessibility route before staging, retiring,
+  or launching any test identity. A TCC denial is reported as an
+  environment-inconclusive result and cannot leave another application,
+  profile, Open Recent row, or support tree behind; manual smoke also keeps an
+  existing experiment intact when that preflight is unavailable.
 - Isolated manual and automated smoke cleanup now accounts for WebKit's Darwin
   per-user state explicitly. Schema-5 manifests pin the canonical `C` and `T`
   roots plus the exact GPU, Networking and WebContent paths; cleanup removes

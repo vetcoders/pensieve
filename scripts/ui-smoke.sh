@@ -2304,9 +2304,9 @@ if [[ $# -gt 0 && "$1" != --* ]]; then
 fi
 
 # Exit codes: 0 = pass; 1 = real FAIL (product/harness); 3 = environment
-# inconclusive -- the witness window exists but is offscreen (e.g. active
-# Space unavailable) rather than a genuine census FAIL. Never treat 3 as a
-# PASS; re-run once a normal desktop Space is active.
+# inconclusive -- required TCC/desktop/watchdog evidence is unavailable rather
+# than a genuine product census FAIL. Never treat 3 as a PASS; repair the named
+# host precondition and rerun.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --toolbar-cold-only)
@@ -2447,6 +2447,17 @@ SOURCE_COMMIT="$(isolated_app_assert_source_provenance \
   "${PENSIEVE_UI_SMOKE_ALLOW_STALE_SOURCE:-0}" \
   "${PENSIEVE_UI_SMOKE_ALLOW_DIRTY_SOURCE:-0}")" \
   || die "source provenance check failed (rebuild from the current clean product sources)"
+
+# TCC authority belongs to the terminal/process running this script. Prove the
+# exact System Events route before compiling helpers, waking the display,
+# minting a capsule, cleaning profile state, or launching Pensieve. A denied
+# host is environment-inconclusive (3), with no smoke identity to clean up.
+SYSTEM_EVENTS_PREFLIGHT_STATUS=0
+isolated_app_assert_system_events_automation \
+  || SYSTEM_EVENTS_PREFLIGHT_STATUS=$?
+if [[ "$SYSTEM_EVENTS_PREFLIGHT_STATUS" -ne 0 ]]; then
+  exit "$SYSTEM_EVENTS_PREFLIGHT_STATUS"
+fi
 
 if [[ $COLD_ONLY -eq 0 && $MENU_RESTORED_ONLY -eq 0 ]]; then
   NATIVE_TAB_AX_PROBE="$(native_tab_ax_probe_path)" \

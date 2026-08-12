@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd -P)"
 UI_SMOKE_SCRIPT="$SCRIPT_DIR/ui-smoke.sh"
+MANUAL_SMOKE_SCRIPT="$SCRIPT_DIR/stage-manual-smoke.sh"
+ISOLATED_APP_LIBRARY="$SCRIPT_DIR/lib/isolated-app.sh"
+SYSTEM_EVENTS_PREFLIGHT_SCRIPT="$SCRIPT_DIR/lib/system-events-preflight.applescript"
 NATIVE_TAB_AX_PROBE_SOURCE="$SCRIPT_DIR/lib/native-tab-ax-probe.swift"
 FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-ui-smoke-contract.XXXXXX")"
 AX_SCRIPT_FIXTURE="$FIXTURE_ROOT/toolbar-census.applescript"
@@ -111,6 +114,11 @@ assert_marker_pair() {
 # Keep this contract runnable on the same system Bash 3.2 lane as ui-smoke.
 /bin/bash -n "$UI_SMOKE_SCRIPT" \
   || fail "ui-smoke.sh does not parse under the system Bash"
+[[ -f "$SYSTEM_EVENTS_PREFLIGHT_SCRIPT" ]] \
+  || fail "tracked System Events preflight script is missing"
+/usr/bin/osacompile -o "$FIXTURE_ROOT/system-events-preflight.scpt" \
+  "$SYSTEM_EVENTS_PREFLIGHT_SCRIPT" \
+  || fail "System Events preflight AppleScript does not compile"
 
 [[ -f "$NATIVE_TAB_AX_PROBE_SOURCE" ]] \
   || fail "tracked native-tab AX probe source is missing"
@@ -207,6 +215,97 @@ assert_fixed_count "run_bounded_command \"\$timeout_seconds\" /usr/bin/osascript
 [[ "$(regex_count_in "$UI_SMOKE_SCRIPT" '^[[:space:]]*osascript "\$@"')" == "0" ]] \
   || fail "ui-smoke still contains an unbounded direct osascript fallback"
 pass "Accessibility commands remain bounded without Homebrew gtimeout"
+
+# Automation authority belongs to the process driving System Events, not the
+# staged application. Both smoke lanes must prove that authority before they
+# create, retire or launch an identity. Exercise the shared decision with fake
+# runners so this contract never prompts TCC or touches the operator's desktop.
+preflight_success_output="$(/bin/bash -c '
+  source "$1"
+  isolated_app_run_bounded_command() {
+    local timeout_seconds="$1"
+    shift
+    [[ "$timeout_seconds" == "10" && "$1" == "/usr/bin/osascript" \
+      && "$2" == "$ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT" ]] || return 9
+    printf "SYSTEM_EVENTS_AUTOMATION=PASS\n"
+  }
+  isolated_app_assert_system_events_automation
+' _ "$ISOLATED_APP_LIBRARY")" \
+  || fail "shared System Events preflight rejected an authorized fake runner"
+[[ "$preflight_success_output" == "SYSTEM_EVENTS_AUTOMATION=PASS" ]] \
+  || fail "shared System Events preflight changed its success witness"
+set +e
+/bin/bash -c '
+  source "$1"
+  isolated_app_run_bounded_command() {
+    printf "execution error: Not authorized to send Apple events to System Events. (-1743)\n" >&2
+    return 1
+  }
+  isolated_app_assert_system_events_automation
+' _ "$ISOLATED_APP_LIBRARY" >/dev/null 2>&1
+preflight_denied_status=$?
+set -e
+[[ "$preflight_denied_status" == "3" ]] \
+  || fail "a denied System Events preflight did not return environment status 3"
+
+set +e
+/bin/bash -c '
+  source "$1"
+  isolated_app_run_bounded_command() {
+    printf "unexpected-success-marker\n"
+  }
+  isolated_app_assert_system_events_automation
+' _ "$ISOLATED_APP_LIBRARY" >/dev/null 2>&1
+preflight_bad_marker_status=$?
+set -e
+[[ "$preflight_bad_marker_status" == "1" ]] \
+  || fail "a malformed System Events witness was not classified as a harness failure"
+
+set +e
+/bin/bash -c '
+  source "$1"
+  isolated_app_run_bounded_command() {
+    return 124
+  }
+  isolated_app_assert_system_events_automation
+' _ "$ISOLATED_APP_LIBRARY" >/dev/null 2>&1
+preflight_timeout_status=$?
+set -e
+[[ "$preflight_timeout_status" == "3" ]] \
+  || fail "a timed-out System Events preflight did not return environment status 3"
+
+assert_fixed_count 'isolated_app_assert_system_events_automation \' 1
+ui_preflight_line="$(/usr/bin/grep -n -F -- \
+  'isolated_app_assert_system_events_automation \' \
+  "$UI_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+ui_capsule_line="$(/usr/bin/grep -n -F -- 'SMOKE_ROOT="$(mktemp -d' \
+  "$UI_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+ui_probe_compile_line="$(/usr/bin/grep -n -F -- \
+  'NATIVE_TAB_AX_PROBE="$(native_tab_ax_probe_path)' \
+  "$UI_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+(( ui_preflight_line < ui_probe_compile_line && ui_preflight_line < ui_capsule_line )) \
+  || fail "automated smoke checks System Events only after helper/capsule work"
+
+[[ "$(fixed_count_in "$MANUAL_SMOKE_SCRIPT" \
+  'isolated_app_assert_system_events_automation \')" == "1" ]] \
+  || fail "manual smoke lost its single shared System Events preflight"
+manual_preflight_line="$(/usr/bin/grep -n -F -- \
+  'isolated_app_assert_system_events_automation \' \
+  "$MANUAL_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+manual_cleanup_line="$(/usr/bin/grep -n -F -- \
+  '  cleanup_previous_manifested_identity' \
+  "$MANUAL_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+manual_manifest_line="$(/usr/bin/grep -n -F -- \
+  '  isolated_app_reserve_manifest \' \
+  "$MANUAL_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+manual_open_line="$(/usr/bin/grep -n -F -- \
+  '  isolated_app_open_new ' \
+  "$MANUAL_SMOKE_SCRIPT" | /usr/bin/cut -d: -f1)"
+(( manual_preflight_line < manual_cleanup_line \
+  && manual_preflight_line < manual_manifest_line \
+  && manual_preflight_line < manual_open_line )) \
+  || fail "manual smoke mutates an experiment before proving System Events authority"
+pass "both smoke lanes fail before identity mutation when System Events is unavailable"
 
 # The contract test itself must preserve the original failure, but a successful
 # assertion run must still fail if its cleanup fails.
