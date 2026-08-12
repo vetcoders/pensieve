@@ -116,17 +116,13 @@ make manual-smoke-clean    # retire only that experiment
 make ui-smoke              # automated ephemeral smoke with a unique identity
 ```
 
-Every new manual or automated smoke receives its own process/executable,
-bundle/defaults, Application Support, Keychain, Open Recent, Saved State,
-cache/WebKit, and LaunchServices identity. The harness also requires a source
-bundle signed by the trusted Team ID whose sealed build-provenance manifest
-matches the current runtime inputs and the exact executable/FFI payloads.
-Historical or dirty-source experiments have separate, lane-scoped escape
-hatches documented in the runtime canon; those switches never bypass the
-signature, Team ID, manifest, or payload checks, and such a run is not
-fresh-current-head or release evidence. Smoke commands never reset or delete
-production Pensieve state. See the canonical
-[`docs/runtime-testing.md`](docs/runtime-testing.md) contract before adding or
+Every new manual or automated smoke receives a unique, manifest-scoped runtime
+identity and must fail closed rather than read, reset, or delete production
+Pensieve state. Trusted build provenance and exact executable/FFI payloads are
+verified before launch; historical or dirty-source experiments are explicitly
+labelled and are not release evidence. The complete identity, cleanup,
+compatibility and evidence contract has one canonical home:
+[`docs/runtime-testing.md`](docs/runtime-testing.md). Read it before adding or
 changing a runtime test.
 
 The Mac App Store packaging lane exists as `make release-appstore`, but App Store Connect submission, signing identities, and the final MAS truth-clicks stay with the human operator.

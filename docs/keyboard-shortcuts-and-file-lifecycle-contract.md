@@ -1,6 +1,6 @@
 # Pensieve — Keyboard Shortcuts, File & Recovery Contract v0.1
 
-> **Owner: Monika. Established 2026-08-03; current through 2026-08-11.**
+> **Owner: Monika. Established 2026-08-03; current through 2026-08-12.**
 > Settled decisions carry their dates inline. Items marked **[OPEN]** await a
 > product decision; **[IMPLEMENTATION GAP]** means the decision is settled but
 > the current code does not yet satisfy it.
@@ -316,7 +316,47 @@ Runs a search across the workspace via the index / FTS / fallback. Does not repl
 
 ### `Cmd+,` — Settings
 
-Opens Settings/Preferences, if available.
+Opens Pensieve's one application-owned **Settings** window on **General**.
+Repeated `Cmd+,` gestures raise and reuse that same native window; closing and
+opening it again must not create another surface. While any Pensieve window
+owns an application-modal surface, attached sheet, or sheet parent, every
+Settings entry point fails closed: it performs no activation or ordering,
+reports **Close the current dialog before opening Settings**, and waits for an
+explicit retry after the dialog closes. It never queues a delayed Settings
+presentation behind an arbitrary modal lifecycle.
+
+When Settings is the key window, it owns the command surface. `Cmd+W` closes
+only that retained Settings window; it must not close or mutate a document in
+the background. Document-scoped Save, Mode, Format and Agents commands are not
+published in that state. Application-scoped New and Open commands remain
+available and create or reuse a document-capable host through the same
+zero-window lane described above.
+
+The AI onboarding action
+**Configure…** first captures and dismisses its document sheet, then waits for
+both native host/sheet ownership edges to disappear before opening this same
+Settings window directly on **AI**. `didEndSheet` is diagnostic evidence, not a
+second ownership requirement. If the native pair does not detach within the
+bounded handoff, Pensieve reports a non-modal error and does not attach another
+onboarding sheet over the unresolved pair; **Pensieve > Settings** remains the
+explicit retry. The message is routed to the AppState registered for the exact
+document window that owns the blocking modal relationship (or the current
+registered key/main document surface), never to a historical command fallback.
+If no document owns that relationship — for example, the blocked surface
+belongs to the already-visible Settings window itself — the retained Settings
+model owns and renders the same non-modal message until the user dismisses it
+or a later presentation succeeds. Pensieve does not invent a document owner
+merely to display it. A hidden auxiliary surface cannot gain a new visible
+textual surface without violating the same no-ordering/no-new-window gate; that
+edge remains a beep plus a debug trace, not a promise of immediate on-screen
+text.
+
+Settings is an auxiliary window, never a document host. It has one stable
+AppKit owner for the life of the process, is excluded from native tabbing and
+Saved Application State, and is not eligible for startup restore. `General`
+and `AI` are panes inside the window — neither may appear as a separate
+top-level window, detached tab strip, blank Mission Control participant or
+surviving WindowServer shell after Settings closes.
 
 ### `Cmd+Q` — Quit Pensieve
 
@@ -354,6 +394,13 @@ host. In particular, a sheet, `NSPanel`, child window, elevated helper surface,
 Settings window, or another unknown root must never be assigned the document
 tabbing identifier and must never receive a document through
 `addTabbedWindow`.
+
+Settings has an even narrower ownership contract: Pensieve retains one AppKit
+window controller, seals its window with `tabbingMode = .disallowed`, an empty
+document tabbing identifier and `isRestorable = false`, and reuses that window
+for both General and AI. It is not a SwiftUI scene and is never inferred from
+the key window. Closing it removes the auxiliary surface without creating,
+closing, selecting or reparenting a document window.
 
 While any tab in a native group has an attached sheet, Pensieve does not mutate
 that tab group. A file opened during that interval may appear in a separate
@@ -838,7 +885,26 @@ An agent implementing or refactoring menu/commands must verify:
       exactly one empty launcher.
 - [ ] With zero document windows, About shows Pensieve's `BuildIdentity` panel
       and `Cmd+Q` still runs the protected application quit flow.
-- [ ] `Cmd+M` minimizes the window, `Cmd+,` opens Settings, and `Cmd+Q` quits the application.
+- [ ] `Cmd+M` minimizes the window; `Cmd+,` opens exactly one window titled
+      Settings on General; repeated `Cmd+,` reuses it; close → reopen still
+      yields exactly one Settings window; and `Cmd+Q` quits the application.
+- [ ] With Settings key, `Cmd+W` closes Settings only. Background document
+      commands are unavailable, while application-scoped New/Open remain usable
+      through a document-capable host.
+- [ ] Settings is never a native document tab. Mission Control, Accessibility
+      and WindowServer show no top-level `General` or `AI` surface, no detached
+      Settings tab strip, and no Settings shell after its window closes.
+- [ ] AI onboarding **Configure…** closes the onboarding sheet before the one
+      Settings window appears, with the AI pane selected; a forced native
+      detach timeout reports an error and creates neither Settings nor a second
+      onboarding sheet.
+- [ ] With the onboarding sheet still attached, `Cmd+,` reports that the
+      current dialog must close. The status witness must be absent before the
+      shortcut and present with the exact message afterwards; for a bounded
+      one-second AX interval and concurrent exact-PID CoreGraphics sampling,
+      the native sheet remains attached and the full runtime-derived layer-0
+      surface set remains unchanged. After native detachment, an explicit retry
+      opens one Settings window.
 - [ ] `Cmd+F` searches in the document, and `Shift+Cmd+F` in the workspace.
 - [ ] Close All protects unsaved files and recovery items.
 - [ ] `Cmd+Z` after a tab close is a safe no-op (not a crash);
@@ -869,10 +935,22 @@ An agent implementing or refactoring menu/commands must verify:
       restores one dedicated seed, then proves a zero-window external open does
       not replay that session. A window-title census is not used as proof of
       background native-tab membership.
-- [ ] Window-lifecycle fixtures that call `beginSheet`, `addChildWindow`,
-      `addTabbedWindow`, or `makeKeyAndOrderFront` are parked offscreen and set
-      to zero alpha before AppKit can order them; test chrome must never flash
+- [ ] Source-level window-lifecycle tests never call `beginSheet`,
+      `addChildWindow`, `addTabbedWindow`, `makeKeyAndOrderFront`, or another
+      native presentation API. They model ownership through inert relationship
+      seams and synthetic notifications. Real tab-group, sheet-ordering,
+      Mission Control and WindowServer geometry is exercised only by an
+      announced, uniquely isolated runtime smoke; test chrome must never flash
       on the operator's desktop.
+- [ ] The isolated native-tab probe observes the exact staged PID through public
+      Accessibility and CoreGraphics APIs: one presented AX window, one
+      on-screen layer-0 surface, one two-item AX tab group with one selected
+      child, and a real press-to-switch content round trip back to the original
+      tab. All descendant AX calls inherit a process-global bounded timeout;
+      `kAXErrorCannotComplete` from a press is accepted only as uncertainty and
+      the subsequent selected-state/content poll remains the proof. The probe
+      does not infer grouping from titles and does not claim that AppKit uses
+      only one underlying `NSWindow` object.
 
 ---
 
