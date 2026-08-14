@@ -20,10 +20,12 @@ final class DocumentWindow: NSWindow {
   var onNewWindowForTab: ((NSWindow) -> Void)?
   var onClose: ((NSWindow) -> Void)?
   /// Consulted before the red close button or a tab's "×" tears this window
-  /// down. Returns true to let AppKit proceed, false to keep the window — the
-  /// handler may then run its own async Save / Don't Save / Cancel sheet and
-  /// close the window later once the answer lands.
-  var onShouldClose: ((NSWindow) -> Bool)?
+  /// down, with WHICH of the two is asking. Returns true to let AppKit proceed,
+  /// false to keep the window — the handler may then run its own async Save /
+  /// Don't Save / Cancel sheet and close the window later once the answer
+  /// lands, or (for a tab "×" on the last tab) retire the document and leave
+  /// the window on its empty state.
+  var onShouldClose: ((NSWindow, WindowCloseGesture) -> Bool)?
   private var bypassNextCloseCheck = false
 
   override func newWindowForTab(_ sender: Any?) {
@@ -33,12 +35,20 @@ final class DocumentWindow: NSWindow {
 
   /// The red close button and a tab's "×" both route through `performClose`.
   /// Give this window's controller the same conscious close lifecycle ⌘W has:
-  /// `onShouldClose` returns false to keep the window (a sheet is now up, or the
-  /// user cancelled) and true to let AppKit tear it down. ⌘W does NOT arrive
-  /// here — the File ▸ Close menu item owns that key and runs
-  /// `closeActiveDocument` directly — so there is no double prompt.
+  /// `onShouldClose` returns false to keep the window (a sheet is now up, the
+  /// user cancelled, or the "×" retired the document into the window's empty
+  /// state) and true to let AppKit tear it down. ⌘W does NOT arrive here — the
+  /// File ▸ Close menu item owns that key and runs `closeActiveDocument`
+  /// directly — so there is no double prompt.
+  ///
+  /// Measured on macOS 27.0 (two-window probe, native tab group): NEITHER
+  /// affordance actually lands here any more — the native tab chrome drives the
+  /// terminal `close()` primitive directly for both the "×" and the red button.
+  /// The override stays because it is still the documented route (and the one
+  /// `Shift+Cmd+W` and older systems take), which is why the gesture is
+  /// classified in BOTH entry points rather than in this one.
   override func performClose(_ sender: Any?) {
-    if let onShouldClose, !onShouldClose(self) { return }
+    if let onShouldClose, !onShouldClose(self, currentCloseGesture()) { return }
     // `super.performClose` reaches our `close()` synchronously. The decision
     // above already consented, so the terminal primitive must consume this
     // one-shot pass instead of asking twice.
@@ -47,10 +57,17 @@ final class DocumentWindow: NSWindow {
     bypassNextCloseCheck = false
   }
 
+  /// Which affordance is asking, read from the event AppKit is dispatching at
+  /// this instant. Both close entry points are reached SYNCHRONOUSLY from that
+  /// dispatch, so `NSApp.currentEvent` is still the click that caused them.
+  private func currentCloseGesture() -> WindowCloseGesture {
+    WindowChromeRecipe.closeGesture(closing: self, event: NSApp.currentEvent)
+  }
+
   override func close() {
     if bypassNextCloseCheck {
       bypassNextCloseCheck = false
-    } else if let onShouldClose, !onShouldClose(self) {
+    } else if let onShouldClose, !onShouldClose(self, currentCloseGesture()) {
       return
     }
     DebugTrace.log("DocumentWindow.close '\(title)'")

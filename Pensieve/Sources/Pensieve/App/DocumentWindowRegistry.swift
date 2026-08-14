@@ -51,6 +51,28 @@ enum DocumentCloseScope {
   case window
 }
 
+/// WHICH AFFORDANCE asked a window to close, as opposed to how much the close
+/// turned out to take with it (`DocumentCloseScope`).
+///
+/// This distinction is the operator's 2026-08-14 decision: a control must have
+/// stable semantics independent of the current UI layout. A tab's "×" means
+/// "retire this document" whether the window holds five tabs or one, and the red
+/// traffic-light button means "this window goes away" just as invariantly.
+/// Inferring the meaning from the surviving sibling count made the SAME control
+/// mean two different things depending on how many tabs happened to be open.
+///
+/// Only `.tab` is a positive claim. Everything else — the red button,
+/// `Shift+Cmd+W`, a programmatic close, a close arriving with no event to read —
+/// is `.unreadable` and is served by the scope resolution that was here before,
+/// so a gesture this app cannot recognise never changes behaviour.
+enum WindowCloseGesture {
+  /// A click landed inside the window's native tab bar. The only affordance
+  /// there that can close anything is a tab's "×".
+  case tab
+  /// Nothing about the close identifies it as a tab gesture.
+  case unreadable
+}
+
 /// The native-window boundary for document tabs.
 ///
 /// AppKit exposes sheets, panels, settings windows and document windows through
@@ -1232,28 +1254,53 @@ final class DocumentWindowRegistry: ObservableObject {
     controllersByWindow[ObjectIdentifier(window)]?.controller != nil
   }
 
+  /// Whether `window` is the ONLY window in its tab group — a close arriving
+  /// through it leaves no sibling tab behind.
+  ///
+  /// Always false while the app is terminating: quit is not a per-tab gesture,
+  /// and every window looks lone once the group has been torn down around it.
+  func isLoneTab(_ window: NSWindow) -> Bool {
+    guard !isTerminating else { return false }
+    return tabGroupWindows(window).allSatisfy { $0 === window }
+  }
+
   /// Answers what a close that arrived through `window` actually took with it.
   ///
-  /// AppKit routes the tab's "×" and the window's red button through the SAME
-  /// `performClose`, so the gesture cannot be read at the moment it fires. The
-  /// scope can: a tab leaving a window that stays open leaves its SIBLING tabs
-  /// registered, while a window close takes the whole group down in the same
-  /// pass. So the sibling list is captured now and read back once the close has
-  /// settled — if any sibling is still a live document window, one tab left a
-  /// live window (`.tab`); otherwise the window itself went away (`.window`).
+  /// The GESTURE is authoritative when it can be read at all. AppKit hands the
+  /// tab's "×" and the window's red button to the same close primitive, but the
+  /// two affordances occupy disjoint regions of the window — the "×" lives
+  /// inside the native tab bar's titlebar accessory, the red button in the
+  /// standard window-button area (measured; see
+  /// `WindowChromeRecipe.tabBarAccessoryFrames`) — so the event AppKit is
+  /// dispatching identifies which one fired. A `.tab` gesture is a decision
+  /// about the DOCUMENT and answers `.tab` immediately, whatever the tab group
+  /// looks like.
   ///
-  /// A window with no tab siblings is `.window` by construction, answered
-  /// synchronously: closing the only document window IS closing a window, and
-  /// there is nothing to wait for. So is EVERY close once the app is
-  /// terminating: quit tears every window down at the same time, and reading
-  /// that as the user closing documents would empty the working set the next
-  /// launch restores from.
+  /// An `.unreadable` gesture falls back to the scope heuristic this method
+  /// carried before, which infers from what survives: a tab leaving a window
+  /// that stays open leaves its SIBLING tabs registered, while a window close
+  /// takes the whole group down in the same pass. So the sibling list is
+  /// captured now and read back once the close has settled — if any sibling is
+  /// still a live document window, one tab left a live window (`.tab`);
+  /// otherwise the window itself went away (`.window`). With no siblings the
+  /// heuristic has no resolution left and answers `.window` synchronously,
+  /// which is why an unrecognised gesture can never retire a lone window's
+  /// file.
+  ///
+  /// EVERY close is `.window` once the app is terminating: quit tears every
+  /// window down at the same time, and reading that as the user closing
+  /// documents would empty the working set the next launch restores from.
   func resolveCloseScope(
     for window: NSWindow,
+    gesture: WindowCloseGesture = .unreadable,
     then report: @escaping @MainActor (DocumentCloseScope) -> Void
   ) {
     guard !isTerminating else {
       report(.window)
+      return
+    }
+    guard gesture != .tab else {
+      report(.tab)
       return
     }
     let siblings = tabGroupWindows(window).filter { $0 !== window }

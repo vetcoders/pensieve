@@ -1285,6 +1285,7 @@ final class AppController: ObservableObject {
       // optional chaining never evaluates the argument of a nil call.
       let didClose = documentStore.finishClose(
         decision: decision, response: nil, appState: appState, retiring: .now)
+      if didClose { cancelPendingImport() }
       refreshRecoveredDrafts()
       completion?(didClose)
       return
@@ -1305,9 +1306,32 @@ final class AppController: ObservableObject {
       self.isConfirmingClose = false
       let didClose = self.documentStore.finishClose(
         decision: decision, response: response, appState: self.appState, retiring: .now)
+      if didClose { self.cancelPendingImport() }
       self.refreshRecoveredDrafts()
       completion?(didClose)
     }
+  }
+
+  /// A conscious close is also an answer to "is that conversion still wanted?"
+  /// — no, exactly as `finishClose` answers it for a staged read. The read is
+  /// cancelled in the store because the claim lives in `AppState`; the import
+  /// task is owned by THIS controller and reachable from nowhere else, so its
+  /// half of the same decision has to ride the close here.
+  ///
+  /// Left alone, a conversion started in this window published into the session
+  /// AFTER the close cleared it — the user closed a converting tab and the
+  /// document appeared in the launcher they were left looking at.
+  ///
+  /// Cancelling before publication loses only a temporary string owned by
+  /// nobody (`quiesceForTermination` documents that boundary in full). After
+  /// publication the task re-checks `Task.isCancelled` between the conversion
+  /// and the publication, and that check and this call are both on the main
+  /// actor, so there is no interleaving in which a cancelled import still
+  /// lands. Called only on a close that WENT THROUGH: Cancel, or a failed save,
+  /// leaves the window and its conversion exactly as they were.
+  private func cancelPendingImport() {
+    documentImportTask?.cancel()
+    documentImportTask = nil
   }
 
   /// Whether THIS window may close on the red close button or a tab's "×".
@@ -1320,8 +1344,52 @@ final class AppController: ObservableObject {
   /// window is closed programmatically once the answer lands; on Cancel — or a
   /// failed save — it stays exactly as it was, so no unsaved work is lost to a
   /// close the user did not confirm.
+  ///
+  /// `gesture` says which affordance is asking. It defaults to `.unreadable`,
+  /// which is the behaviour every caller had before the gesture could be read at
+  /// all, so a close that arrives without one is never treated as a document
+  /// decision.
   @discardableResult
-  func windowShouldClose(_ window: NSWindow) -> Bool {
+  func windowShouldClose(
+    _ window: NSWindow,
+    gesture: WindowCloseGesture = .unreadable
+  ) -> Bool {
+    // A tab's "×" means "retire this document" whatever the window's current
+    // layout is — operator decision 2026-08-14, and the reason the gesture is
+    // read at all. On the LAST tab there is no window left to leave the
+    // document behind in, so the gesture is served by the ⌘W path itself:
+    // `closeActiveDocument` runs the identical close-decision matrix (Save /
+    // Don't Save / Cancel, recovery stash), retires the file from Open Files
+    // and the session on a close that goes through, and leaves the window alive
+    // on its empty state. The window teardown is therefore VETOED here — the
+    // "×" closed the document, not the window.
+    //
+    // Windows that still have tab siblings keep the old route: the tab really
+    // does go away there, and the retirement rides the settled close exactly as
+    // before. A window with no document showing keeps it too — a launcher tab's
+    // "×" has nothing to retire, so it must still mean "this window goes away".
+    //
+    // A tab STAGING a large open — or CONVERTING a Word/PDF — counts as showing
+    // its document, which is why the question is `holdsLiveDocumentWork` rather
+    // than the buffer alone: `hasEditableBuffer` is false for both BY DESIGN
+    // (`DocumentSession.hasEditableBuffer` — an empty placeholder must never be
+    // writable over work still in flight), yet the click turn already committed
+    // this tab to that file. Reading either as a launcher would make the "×"
+    // tear the window down mid-read, which is the one layout-dependent answer
+    // this whole cut exists to remove — and for the import it would also
+    // deallocate the controller that OWNS the conversion.
+    //
+    // Asked through the composed predicate on purpose: the registry's launcher
+    // sweep and the open router already decide "is this window spoken for?"
+    // through it, and a fourth hand-spelled copy of the trio is exactly how the
+    // import flag went missing from this guard in the first place.
+    if gesture == .tab, holdsLiveDocumentWork,
+      documentWindowRegistry.isLoneTab(window)
+    {
+      closeActiveDocument()
+      return false
+    }
+
     let decision = documentStore.closeDecision(appState: appState)
     guard let prompt = decision.prompt else {
       if decision == .saveWithoutPrompting {
@@ -1334,7 +1402,8 @@ final class AppController: ObservableObject {
           appState: appState,
           retiring: .deferred { [weak self, weak window] closedURL in
             guard let self, let window else { return }
-            self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+            self.retireDocumentIfThisIsATabClose(
+              url: closedURL, window: window, gesture: gesture)
           })
         refreshRecoveredDrafts()
         return didClose
@@ -1343,7 +1412,7 @@ final class AppController: ObservableObject {
       // A clean session has nothing to persist. The document this close settles
       // is read now and retired only if the close turns out to be a TAB close.
       if let closingURL = appState.documentSession.url {
-        retireDocumentIfOnlyThisTabCloses(url: closingURL, window: window)
+        retireDocumentIfThisIsATabClose(url: closingURL, window: window, gesture: gesture)
       }
       return true
     }
@@ -1365,7 +1434,7 @@ final class AppController: ObservableObject {
         // under that new location, exactly like the ⌘W route.
         retiring: .deferred { [weak self, weak window] closedURL in
           guard let self, let window else { return }
-          self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+          self.retireDocumentIfThisIsATabClose(url: closedURL, window: window, gesture: gesture)
         })
       self.refreshRecoveredDrafts()
       // Only a settled close (saved or discarded) tears the window down; its
@@ -1380,18 +1449,20 @@ final class AppController: ObservableObject {
   }
 
   /// Retires the document from the Open Files working set, but ONLY when this
-  /// close is one tab leaving a window that stays open.
+  /// close was a TAB close.
   ///
   /// The operator's 2026-08-03 rule is about closing a DOCUMENT: ⌘W and a tab's
   /// "×" take the file out of the session for good. Closing a WINDOW is not
   /// that decision — it takes every tab in it down at once, and the files it
   /// held must still be there on the next launch (the same reason termination
-  /// never retires). AppKit hands both gestures to `windowShouldClose`
-  /// identically, so the registry resolves the SCOPE — see
-  /// `DocumentWindowRegistry.resolveCloseScope`, which answers once the close
-  /// has settled and the surviving tabs can be counted.
-  private func retireDocumentIfOnlyThisTabCloses(url: URL, window: NSWindow) {
-    documentWindowRegistry.resolveCloseScope(for: window) { [weak self] scope in
+  /// never retires). AppKit hands both gestures to the same close primitive, so
+  /// the registry settles the question: the READ GESTURE first, and the
+  /// surviving-sibling heuristic when there is no gesture to read — see
+  /// `DocumentWindowRegistry.resolveCloseScope`.
+  private func retireDocumentIfThisIsATabClose(
+    url: URL, window: NSWindow, gesture: WindowCloseGesture
+  ) {
+    documentWindowRegistry.resolveCloseScope(for: window, gesture: gesture) { [weak self] scope in
       guard let self, scope == .tab else { return }
       self.documentStore.forgetOpenFile(url, into: self.appState)
     }

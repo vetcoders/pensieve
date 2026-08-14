@@ -270,6 +270,81 @@ enum WindowChromeRecipe {
     return view.subviews.contains(where: hostsTabBar)
   }
 
+  // MARK: - Which affordance asked for a close
+
+  /// Window-space rects of the titlebar accessories that host the native tab
+  /// bar — the region every tab affordance lives in.
+  ///
+  /// Measured on a two-tab probe (macOS 27.0, 900×500 content window, native
+  /// tab group): ONE accessory, `layoutAttribute == .bottom`, occupying
+  /// `(0, 432, 900, 36)` — full width, directly under the toolbar — with each
+  /// tab's "×" a 16×16 `NSButton` at the LEADING edge of its `NSTabButton`,
+  /// at `(15, 446)` and `(455, 446)`. The same window's red close button
+  /// measures `(9, 477, 14, 14)`. The two affordances occupy DISJOINT bands
+  /// (tab bar y 432…468, traffic lights y 477…491) and cannot be confused by a
+  /// hit test — which is what lets `closeGesture` tell them apart at all.
+  ///
+  /// Untitled helper windows are guarded because asking them for titlebar
+  /// accessories raises an AppKit exception — the same guard
+  /// `belowToolbarChromeHeight` wears. A hidden accessory is skipped: a tab bar
+  /// that is not on screen cannot have been clicked.
+  static func tabBarAccessoryFrames(in window: NSWindow) -> [NSRect] {
+    guard window.styleMask.contains(.titled) else { return [] }
+    return window.titlebarAccessoryViewControllers
+      .filter { !$0.view.isHidden && hostsTabBar($0.view) }
+      .map { $0.view.convert($0.view.bounds, to: nil) }
+  }
+
+  /// The decision itself, over plain geometry so it can be driven from a test
+  /// without a live tab bar or a synthesized `NSEvent`.
+  ///
+  /// Only a CLICK inside the tab bar answers `.tab`. Everything else is
+  /// `.unreadable`, including a click just outside it and a close with no click
+  /// behind it at all — the fail-safe direction, since `.unreadable` keeps the
+  /// behaviour this app had before the gesture was readable.
+  static func closeGesture(
+    clickLocationInWindow point: NSPoint?,
+    tabBarFrames: [NSRect]
+  ) -> WindowCloseGesture {
+    guard let point else { return .unreadable }
+    return tabBarFrames.contains { $0.contains(point) } ? .tab : .unreadable
+  }
+
+  /// Which affordance is asking `window` to close, read from the event AppKit
+  /// is dispatching right now.
+  ///
+  /// Measured on the probe (macOS 27.0): a click injected through the app's own
+  /// event queue is exactly what `NSApp.currentEvent` reports from inside the
+  /// close primitive — a red-button click at `(16, 484)` arrives as
+  /// `leftMouseUp locationInWindow=(16, 484) window=<the clicked window>`. The
+  /// tab "×" fires on `leftMouseDown` and the red button on `leftMouseUp`, so
+  /// both phases count; a keyboard `Shift+Cmd+W`, a programmatic close and a
+  /// close during teardown all arrive with a non-mouse event or none, and stay
+  /// `.unreadable`.
+  ///
+  /// `event.window === window` is deliberately strict. Measured on the same
+  /// probe: closing a NON-SELECTED tab is driven from the tab bar hosted by the
+  /// tab group's selected window, so the event's window is that HOST and not
+  /// the window being closed. Accepting a group sibling's tab bar would widen
+  /// the claim for no benefit — a window with siblings already resolves to
+  /// `.tab` through the surviving-sibling heuristic — while a LONE tab, the
+  /// case the gesture exists to settle, always hosts its own tab bar and passes
+  /// this test.
+  @MainActor
+  static func closeGesture(closing window: NSWindow, event: NSEvent?) -> WindowCloseGesture {
+    closeGesture(
+      clickLocationInWindow: clickLocationInWindow(of: event, closing: window),
+      tabBarFrames: tabBarAccessoryFrames(in: window))
+  }
+
+  static func clickLocationInWindow(of event: NSEvent?, closing window: NSWindow) -> NSPoint? {
+    guard let event, event.window === window else { return nil }
+    switch event.type {
+    case .leftMouseDown, .leftMouseUp, .leftMouseDragged: return event.locationInWindow
+    default: return nil
+    }
+  }
+
   /// Puts any tab-bar glass that has self-selected the WRONG SIDE back on the
   /// window's. Returns `true` when something had to be corrected.
   ///

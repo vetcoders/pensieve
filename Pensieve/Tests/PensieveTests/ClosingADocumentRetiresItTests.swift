@@ -18,6 +18,13 @@ import XCTest
 /// - termination (quit, logout) tears every window down the same way, and the
 ///   working set is exactly what the next launch restores from — see
 ///   `ClosedFileStaysClosedTests` for the relaunch half.
+///
+/// Amended by the operator's 14.08.2026 decision: which of the two a close is
+/// comes from the GESTURE, not from how many tabs happened to survive it. The
+/// tab's "×" retires the document even when it is the last tab (the window then
+/// reverts to the launcher, exactly as ⌘W leaves it); the red button still
+/// retires nothing. A gesture this app cannot read keeps the older
+/// surviving-sibling answer, so nothing it fails to recognise can retire a file.
 @MainActor
 final class ClosingADocumentRetiresItTests: XCTestCase {
 
@@ -170,19 +177,242 @@ final class ClosingADocumentRetiresItTests: XCTestCase {
     }
   }
 
-  /// A window with no tab siblings IS the window: closing it is a window close,
-  /// answered without waiting for anything, and its file stays.
-  func testClosingALoneDocumentWindowKeepsItsFile() throws {
+  /// The RED BUTTON on a window with no tab siblings is still a window close:
+  /// answered without waiting for anything, and its file stays. This half of
+  /// the old scope-based pin survives the 14.08 decision unchanged — the red
+  /// button never stopped meaning "this window goes away".
+  func testClosingALoneDocumentWindowWithTheRedButtonKeepsItsFile() throws {
     let harness = try makeHarness()
     let noteURL = try harness.openInWindow(named: "note.md", contents: "body")
 
     let window = harness.makeRegisteredWindow()
     harness.tabGroup.windows = [window]
 
-    XCTAssertTrue(harness.controller.windowShouldClose(window))
+    XCTAssertTrue(harness.controller.windowShouldClose(window, gesture: .unreadable))
     XCTAssertTrue(
       harness.hasNothingPending,
-      "a window with no siblings needs no settling turn — it cannot be a tab close")
+      "a window with no siblings needs no settling turn — an unread gesture cannot be a tab close")
+    harness.tearDown(window)
+    harness.settleCloses()
+
+    XCTAssertEqual(harness.appState.openFiles.map(\.url), [noteURL])
+    XCTAssertTrue(harness.restoredFilePaths().contains(noteURL.path))
+  }
+
+  /// THE 14.08 REVERSAL. The other half of that pin used to read "a window with
+  /// no tab siblings IS the window", so the tab's "×" silently became a window
+  /// close on the last tab: the file stayed in Open Files and — with the tab bar
+  /// kept permanently visible — the window vanished with no launcher behind it.
+  ///
+  /// Operator decision (Monika, 14.08.2026): a control must have stable
+  /// semantics independent of the current UI layout. The "×" retires the
+  /// DOCUMENT whatever the sibling count is, so on the last tab the outcome is
+  /// ⌘W's: the file leaves Open Files and the bookmarks, the window is NOT torn
+  /// down, and it reverts to the launcher.
+  func testClosingTheLastTabWithItsCloseButtonRetiresTheFile() throws {
+    let harness = try makeHarness()
+    let noteURL = try harness.openInWindow(named: "note.md", contents: "body")
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertFalse(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "the × closed the DOCUMENT, so the window must survive to show the launcher")
+
+    XCTAssertTrue(
+      harness.appState.openFiles.isEmpty,
+      "the last tab's × is the same decision ⌘W is — the row goes with it")
+    XCTAssertFalse(
+      harness.restoredFilePaths().contains(noteURL.path),
+      "and the bookmark goes too, or the next launch undoes the close")
+    XCTAssertFalse(
+      harness.controller.hasEditableBuffer,
+      "the window is left on its empty state, which is the launcher surface")
+  }
+
+  /// The full close-decision matrix runs on that route unchanged, because it IS
+  /// the ⌘W route: a dirty buffer with auto-save off still asks, and Don't Save
+  /// still retires without writing.
+  func testClosingTheLastTabAfterDontSaveRetiresWithoutWriting() throws {
+    let harness = try makeHarness(autoSaveEnabled: false)
+    let noteURL = try harness.openInWindow(named: "note.md", contents: "original")
+    harness.recorder.answer = .discard
+    harness.appState.activeDocumentText = "dropped on purpose"
+    harness.appState.activeDocumentDirty = true
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertFalse(harness.controller.windowShouldClose(window, gesture: .tab))
+
+    XCTAssertEqual(harness.recorder.prompts, [.savePathed], "the matrix still asks")
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "original")
+    XCTAssertTrue(harness.appState.openFiles.isEmpty)
+  }
+
+  /// And Cancel still costs nothing: no retirement, no teardown, buffer intact.
+  func testCancellingTheLastTabsCloseRetiresNothing() throws {
+    let harness = try makeHarness(autoSaveEnabled: false)
+    let noteURL = try harness.openInWindow(named: "note.md", contents: "original")
+    harness.recorder.answer = .cancel
+    harness.appState.activeDocumentText = "still being written"
+    harness.appState.activeDocumentDirty = true
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertFalse(harness.controller.windowShouldClose(window, gesture: .tab))
+
+    XCTAssertEqual(harness.appState.openFiles.map(\.url), [noteURL])
+    XCTAssertTrue(harness.restoredFilePaths().contains(noteURL.path))
+    XCTAssertTrue(harness.appState.documentSession.isDirty)
+  }
+
+  /// THE CARVE-OUT INSIDE THE REVERSAL. A LAUNCHER tab's "×" has no document to
+  /// retire, so it keeps meaning exactly what it meant before: this window goes
+  /// away. Reading it as a document decision would turn the gesture into a
+  /// no-op the operator cannot get out of.
+  func testClosingALoneLauncherTabStillClosesTheWindow() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.registerOpenFileWithoutAWindow(named: "kept.md")
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertFalse(harness.controller.hasEditableBuffer, "this window shows the launcher")
+    XCTAssertTrue(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "with nothing to retire the × is still a window close")
+    harness.tearDown(window)
+    harness.settleCloses()
+
+    XCTAssertEqual(harness.appState.openFiles.map(\.url), [keptURL])
+  }
+
+  /// NOT the carve-out, even though it looks like one for a moment. A tab
+  /// STAGING a large open is SHOWING its document: the click turn already
+  /// published the file's title, URL and identity into it, and only the bytes
+  /// are late. Its "×" is therefore the same document decision every other
+  /// tab's is — the file retires and the window survives on the launcher —
+  /// even though `hasEditableBuffer` is false throughout, which it is BY DESIGN
+  /// (the placeholder buffer must never be writable over the file being read).
+  /// Judging this tab by that predicate alone tore the window down mid-read,
+  /// which is exactly the layout-dependent answer this cut exists to remove.
+  func testClosingALoneLoadingTabRetiresTheFileAndKeepsTheWindow() throws {
+    let harness = try makeHarness()
+    let stagedURL = try harness.openStagedInWindow(named: "huge.md")
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertTrue(harness.appState.documentSession.isLoading, "the open must still be staged")
+    XCTAssertFalse(
+      harness.controller.hasEditableBuffer,
+      "…with no editable buffer behind it, which is what made this case look like a launcher")
+
+    XCTAssertFalse(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "the × closed the DOCUMENT, so the window must survive to show the launcher")
+
+    XCTAssertTrue(
+      harness.appState.openFiles.isEmpty,
+      "a staged file's row is retired by its × exactly like a loaded one's")
+    XCTAssertFalse(
+      harness.restoredFilePaths().contains(stagedURL.path),
+      "and its bookmark goes too, or the next launch undoes the close")
+    XCTAssertFalse(
+      harness.appState.documentIsLoading,
+      "the close is also an answer to 'is that read still wanted?' — no")
+  }
+
+  /// The THIRD kind of live work, and the one the guard above was still
+  /// missing. A tab converting a Word/PDF has an intentionally empty session —
+  /// the conversion runs off the main actor and publishes only when it lands —
+  /// so `hasEditableBuffer` is false AND nothing is marked loading. The "×"
+  /// therefore read a busy tab as a launcher and tore the whole window down,
+  /// which deallocates the controller that OWNS `documentImportTask`: the
+  /// conversion the user was waiting for went with the window, silently.
+  ///
+  /// `DocumentWindowRegistry`'s launcher sweep and the open router had asked
+  /// about all three flags since the import flag existed; only this guard
+  /// carried a hand-spelled two-thirds of the trio, which is why it now asks
+  /// through `holdsLiveDocumentWork` like they do.
+  func testClosingALoneImportingTabVetoesTheWindowAndCancelsTheConversion() throws {
+    let harness = try makeHarness()
+    let source = harness.root.appendingPathComponent("umowa.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Umowa</h1>", baseURL: nil)
+      .write(to: source, options: .atomic)
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    // The conversion is held mid-flight by construction, not by timing: it can
+    // only publish back on the main actor, and this synchronous test body never
+    // gives it up.
+    harness.controller.importDocument(url: source)
+    XCTAssertTrue(
+      harness.controller.hasPendingImportWork, "the conversion has to still be in flight")
+    XCTAssertFalse(
+      harness.controller.hasEditableBuffer,
+      "…with no buffer behind it, which is what made this tab look like a launcher")
+    XCTAssertFalse(
+      harness.appState.documentIsLoading,
+      "…and no staged read either, so the two flags the guard used to ask about both say 'empty'")
+
+    XCTAssertFalse(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "the × closed the DOCUMENT — the window that owns the conversion must survive it")
+
+    XCTAssertFalse(
+      harness.controller.hasPendingImportWork,
+      "and the close answers the conversion too: a cancelled import must not publish into the"
+        + " session the user just cleared")
+  }
+
+  /// A tab gesture on a window that still has siblings is unchanged: the tab
+  /// really does go away, and only its file retires. The gesture short-circuits
+  /// the settling turn the sibling heuristic needed, so the answer no longer
+  /// depends on teardown ordering.
+  func testATabGestureWithSiblingsRetiresOnlyThatTabsFile() throws {
+    let harness = try makeHarness()
+    let keptURL = try harness.registerOpenFileWithoutAWindow(named: "kept.md")
+    let closedURL = try harness.openInWindow(named: "closed.md", contents: "body")
+
+    let closingWindow = harness.makeRegisteredWindow()
+    let survivingTab = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [closingWindow, survivingTab]
+
+    XCTAssertTrue(harness.controller.windowShouldClose(closingWindow, gesture: .tab))
+
+    XCTAssertEqual(
+      harness.appState.openFiles.map(\.url), [keptURL],
+      "a read gesture is the answer — it does not wait for the surviving tabs to be counted")
+    XCTAssertTrue(
+      harness.hasNothingPending,
+      "and it parks no settling turn, so the outcome cannot depend on teardown ordering")
+
+    harness.tearDown(closingWindow)
+    harness.settleCloses()
+
+    XCTAssertEqual(harness.appState.openFiles.map(\.url), [keptURL])
+    XCTAssertFalse(harness.restoredFilePaths().contains(closedURL.path))
+  }
+
+  /// The termination trap survives the new mechanism. Quit is not a gesture:
+  /// even if the pointer happened to be over a tab bar, a close arriving while
+  /// the app is shutting down may never retire anything.
+  func testATabGestureWhileTerminatingRetiresNothing() throws {
+    let harness = try makeHarness()
+    let noteURL = try harness.openInWindow(named: "note.md", contents: "body")
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    harness.registry.beginTermination()
+    XCTAssertTrue(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "termination is not a per-tab decision, so the window tears down as usual")
     harness.tearDown(window)
     harness.settleCloses()
 
@@ -354,6 +584,22 @@ private struct RetirementHarness {
   @discardableResult
   func openInWindow(named name: String, contents: String) throws -> URL {
     let url = try write(named: name, contents: contents)
+    controller.openFile(url: url)
+    return url
+  }
+
+  /// A file past `LargeDocument.sizeBudget`, so its open STAGES: the window
+  /// claims the document in this turn and the bytes arrive from a background
+  /// read, leaving the session `.loading`. These pins never yield the main
+  /// actor, so that read cannot land mid-test — the session is still staged at
+  /// every assertion below.
+  @discardableResult
+  func openStagedInWindow(named name: String) throws -> URL {
+    let url = try write(
+      named: name,
+      contents: String(repeating: "large document line for the size gate\n", count: 30_000))
+    XCTAssertTrue(
+      LargeDocument.isLargeFile(at: url), "fixture must be past the gate or the open is synchronous")
     controller.openFile(url: url)
     return url
   }

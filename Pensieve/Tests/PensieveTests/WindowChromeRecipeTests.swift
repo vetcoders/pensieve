@@ -28,6 +28,105 @@ final class WindowChromeRecipeTests: XCTestCase {
     XCTAssertEqual(window.contentMinSize.height, WindowChromeRecipe.minimumContentSize.height)
   }
 
+  // MARK: - Close gesture: which affordance asked
+
+  /// The geometry the probe measured on macOS 27.0 for a 900×500 content
+  /// window: the native tab bar's titlebar accessory at `(0, 432, 900, 36)`,
+  /// each tab's "×" inside it at `(15, 446, 16, 16)` / `(455, 446, 16, 16)`,
+  /// and the red close button at `(9, 477, 14, 14)` — a band the tab bar never
+  /// reaches.
+  private static let measuredTabBarFrame = NSRect(x: 0, y: 432, width: 900, height: 36)
+  private static let measuredFirstTabCloseButton = NSRect(x: 15, y: 446, width: 16, height: 16)
+  private static let measuredRedButton = NSRect(x: 9, y: 477, width: 14, height: 14)
+
+  func testAClickOnATabsCloseButtonReadsAsTheTabGesture() {
+    let target = NSPoint(
+      x: Self.measuredFirstTabCloseButton.midX, y: Self.measuredFirstTabCloseButton.midY)
+
+    XCTAssertEqual(
+      WindowChromeRecipe.closeGesture(
+        clickLocationInWindow: target, tabBarFrames: [Self.measuredTabBarFrame]),
+      .tab,
+      "the only affordance in the tab bar that closes anything is a tab's ×")
+  }
+
+  func testAClickOnTheRedButtonIsNotReadAsATabGesture() {
+    let target = NSPoint(x: Self.measuredRedButton.midX, y: Self.measuredRedButton.midY)
+
+    XCTAssertFalse(
+      Self.measuredTabBarFrame.contains(target),
+      "the measurement this whole classification rests on: the two affordances are disjoint")
+    XCTAssertEqual(
+      WindowChromeRecipe.closeGesture(
+        clickLocationInWindow: target, tabBarFrames: [Self.measuredTabBarFrame]),
+      .unreadable)
+  }
+
+  /// The fail-safe direction. `Shift+Cmd+W`, a programmatic close and a close
+  /// arriving during teardown all reach the classifier with nothing to read,
+  /// and none of them may be promoted into a document decision.
+  func testACloseWithNoClickBehindItIsUnreadable() {
+    XCTAssertEqual(
+      WindowChromeRecipe.closeGesture(
+        clickLocationInWindow: nil, tabBarFrames: [Self.measuredTabBarFrame]),
+      .unreadable)
+  }
+
+  /// A window with no tab bar at all cannot produce a tab gesture, wherever the
+  /// click landed.
+  func testAWindowWithNoTabBarNeverReadsAsATabGesture() {
+    let target = NSPoint(
+      x: Self.measuredFirstTabCloseButton.midX, y: Self.measuredFirstTabCloseButton.midY)
+
+    XCTAssertEqual(
+      WindowChromeRecipe.closeGesture(clickLocationInWindow: target, tabBarFrames: []),
+      .unreadable)
+  }
+
+  @MainActor
+  func testAnUntabbedWindowReportsNoTabBarAccessory() {
+    let window = NSWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: true)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+
+    XCTAssertTrue(
+      WindowChromeRecipe.tabBarAccessoryFrames(in: window).isEmpty,
+      "no tab bar means no region a tab gesture could have come from")
+    XCTAssertNil(WindowChromeRecipe.clickLocationInWindow(of: nil, closing: window))
+  }
+
+  /// The production entry points, end to end on the fail-safe side: a close
+  /// with no event behind it hands the handler `.unreadable`, never `.tab`.
+  /// Both `performClose` and the terminal `close()` are covered — the probe
+  /// measured macOS 27 driving BOTH affordances through the latter.
+  @MainActor
+  func testDocumentWindowClassifiesAnEventlessCloseAsUnreadable() {
+    let window = DocumentWindow(
+      contentRect: WindowChromeRecipe.defaultContentRect,
+      styleMask: WindowChromeRecipe.documentStyleMask,
+      backing: .buffered,
+      defer: true)
+    window.isReleasedWhenClosed = false
+    var seen: [WindowCloseGesture] = []
+    window.onShouldClose = { _, gesture in
+      seen.append(gesture)
+      return false
+    }
+    defer {
+      window.onShouldClose = nil
+      window.close()
+    }
+
+    window.performClose(nil)
+    window.close()
+
+    XCTAssertEqual(seen, [.unreadable, .unreadable])
+  }
+
   @MainActor
   func testManagedDocumentWindowsOptOutOfAppKitSavedApplicationState() {
     let window = NSWindow(

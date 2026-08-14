@@ -3840,6 +3840,12 @@ final class DocumentStore {
     // launcher may offer it again. (Discard/Save already removed the file
     // outright; this only releases the claim when one survived.)
     recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    // A conscious close is also an answer to "is that staged open still wanted?"
+    // — no, exactly as it is in `select(ref: nil)`. Without this the background
+    // read would land after the clear below, still holding the current claim,
+    // and reopen the document the user just closed. Reached only by a close that
+    // went through: every cancelled or failed branch returned above.
+    appState.cancelPendingDocumentLoad()
     appState.selectedDocumentID = nil
     appState.documentSession.clear()
     // The window is now empty BECAUSE the user asked for it. Any workspace
