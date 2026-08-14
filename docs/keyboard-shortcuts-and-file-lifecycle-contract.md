@@ -225,11 +225,14 @@ decided by the GESTURE the user made, never by how many tabs happen to be open:
 - **The red traffic-light button always closes the window lifecycle.** The
   files it held stay in Open Files and come back on restart. Unchanged.
 - A tab "×" on a window that shows **no document** (the launcher) has nothing
-  to retire and still means "this window goes away". A window part-way through
-  opening a large file does NOT count as one: the click turn already gave that
-  tab its title, its URL and its identity, so it is showing its document and
-  its "×" retires the file and cancels the read in flight, exactly as `Cmd+W`
-  does.
+  to retire and still means "this window goes away". A window with work already
+  in flight does NOT count as one, whether it is part-way through opening a
+  large file or converting a Word/PDF: the click turn has already committed
+  that tab to the file, so it is showing its document and its "×" retires the
+  file and cancels the read or conversion in flight, exactly as `Cmd+W` does.
+  Neither kind of in-flight work has an editable buffer to be judged by — the
+  window is "busy" by the same three-part test the launcher sweep and the open
+  router use.
 
 Rationale — **a control must have stable semantics independent of the current
 UI layout.** Before this decision the same "×" meant "retire the document" with

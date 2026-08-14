@@ -1285,6 +1285,7 @@ final class AppController: ObservableObject {
       // optional chaining never evaluates the argument of a nil call.
       let didClose = documentStore.finishClose(
         decision: decision, response: nil, appState: appState, retiring: .now)
+      if didClose { cancelPendingImport() }
       refreshRecoveredDrafts()
       completion?(didClose)
       return
@@ -1305,9 +1306,32 @@ final class AppController: ObservableObject {
       self.isConfirmingClose = false
       let didClose = self.documentStore.finishClose(
         decision: decision, response: response, appState: self.appState, retiring: .now)
+      if didClose { self.cancelPendingImport() }
       self.refreshRecoveredDrafts()
       completion?(didClose)
     }
+  }
+
+  /// A conscious close is also an answer to "is that conversion still wanted?"
+  /// — no, exactly as `finishClose` answers it for a staged read. The read is
+  /// cancelled in the store because the claim lives in `AppState`; the import
+  /// task is owned by THIS controller and reachable from nowhere else, so its
+  /// half of the same decision has to ride the close here.
+  ///
+  /// Left alone, a conversion started in this window published into the session
+  /// AFTER the close cleared it — the user closed a converting tab and the
+  /// document appeared in the launcher they were left looking at.
+  ///
+  /// Cancelling before publication loses only a temporary string owned by
+  /// nobody (`quiesceForTermination` documents that boundary in full). After
+  /// publication the task re-checks `Task.isCancelled` between the conversion
+  /// and the publication, and that check and this call are both on the main
+  /// actor, so there is no interleaving in which a cancelled import still
+  /// lands. Called only on a close that WENT THROUGH: Cancel, or a failed save,
+  /// leaves the window and its conversion exactly as they were.
+  private func cancelPendingImport() {
+    documentImportTask?.cancel()
+    documentImportTask = nil
   }
 
   /// Whether THIS window may close on the red close button or a tab's "×".
@@ -1345,14 +1369,21 @@ final class AppController: ObservableObject {
     // before. A window with no document showing keeps it too — a launcher tab's
     // "×" has nothing to retire, so it must still mean "this window goes away".
     //
-    // A tab STAGING a large open counts as showing its document, which is why
-    // the loading half is asked for separately: `hasEditableBuffer` is false for
-    // `.loading` BY DESIGN (`DocumentSession.hasEditableBuffer` — an empty
-    // placeholder must never be writable), yet the click turn already published
-    // the file's title, URL and identity into this tab. Reading that as a
-    // launcher would make the "×" tear the window down mid-read, which is the
-    // one layout-dependent answer this whole cut exists to remove.
-    if gesture == .tab, hasEditableBuffer || hasPendingDocumentLoad,
+    // A tab STAGING a large open — or CONVERTING a Word/PDF — counts as showing
+    // its document, which is why the question is `holdsLiveDocumentWork` rather
+    // than the buffer alone: `hasEditableBuffer` is false for both BY DESIGN
+    // (`DocumentSession.hasEditableBuffer` — an empty placeholder must never be
+    // writable over work still in flight), yet the click turn already committed
+    // this tab to that file. Reading either as a launcher would make the "×"
+    // tear the window down mid-read, which is the one layout-dependent answer
+    // this whole cut exists to remove — and for the import it would also
+    // deallocate the controller that OWNS the conversion.
+    //
+    // Asked through the composed predicate on purpose: the registry's launcher
+    // sweep and the open router already decide "is this window spoken for?"
+    // through it, and a fourth hand-spelled copy of the trio is exactly how the
+    // import flag went missing from this guard in the first place.
+    if gesture == .tab, holdsLiveDocumentWork,
       documentWindowRegistry.isLoneTab(window)
     {
       closeActiveDocument()

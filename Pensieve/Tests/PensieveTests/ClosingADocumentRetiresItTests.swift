@@ -326,6 +326,50 @@ final class ClosingADocumentRetiresItTests: XCTestCase {
       "the close is also an answer to 'is that read still wanted?' — no")
   }
 
+  /// The THIRD kind of live work, and the one the guard above was still
+  /// missing. A tab converting a Word/PDF has an intentionally empty session —
+  /// the conversion runs off the main actor and publishes only when it lands —
+  /// so `hasEditableBuffer` is false AND nothing is marked loading. The "×"
+  /// therefore read a busy tab as a launcher and tore the whole window down,
+  /// which deallocates the controller that OWNS `documentImportTask`: the
+  /// conversion the user was waiting for went with the window, silently.
+  ///
+  /// `DocumentWindowRegistry`'s launcher sweep and the open router had asked
+  /// about all three flags since the import flag existed; only this guard
+  /// carried a hand-spelled two-thirds of the trio, which is why it now asks
+  /// through `holdsLiveDocumentWork` like they do.
+  func testClosingALoneImportingTabVetoesTheWindowAndCancelsTheConversion() throws {
+    let harness = try makeHarness()
+    let source = harness.root.appendingPathComponent("umowa.docx")
+    try DocumentTransfer.docxData(fromHTML: "<h1>Umowa</h1>", baseURL: nil)
+      .write(to: source, options: .atomic)
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    // The conversion is held mid-flight by construction, not by timing: it can
+    // only publish back on the main actor, and this synchronous test body never
+    // gives it up.
+    harness.controller.importDocument(url: source)
+    XCTAssertTrue(
+      harness.controller.hasPendingImportWork, "the conversion has to still be in flight")
+    XCTAssertFalse(
+      harness.controller.hasEditableBuffer,
+      "…with no buffer behind it, which is what made this tab look like a launcher")
+    XCTAssertFalse(
+      harness.appState.documentIsLoading,
+      "…and no staged read either, so the two flags the guard used to ask about both say 'empty'")
+
+    XCTAssertFalse(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "the × closed the DOCUMENT — the window that owns the conversion must survive it")
+
+    XCTAssertFalse(
+      harness.controller.hasPendingImportWork,
+      "and the close answers the conversion too: a cancelled import must not publish into the"
+        + " session the user just cleared")
+  }
+
   /// A tab gesture on a window that still has siblings is unchanged: the tab
   /// really does go away, and only its file retires. The gesture short-circuits
   /// the settling turn the sibling heuristic needed, so the answer no longer
