@@ -43,6 +43,7 @@ enum ConsciousCloseHook {
   /// free to re-assign `window.delegate` during a scene update, and re-running
   /// this re-wraps whatever is there now instead of leaving the window
   /// unguarded.
+  ///
   /// `shouldClose` is handed the window AND which affordance is asking. The
   /// scene-owned `AppKitWindow` gets the SAME classification the factory's
   /// `DocumentWindow` gets, and deliberately so: it is not "the launcher" in
