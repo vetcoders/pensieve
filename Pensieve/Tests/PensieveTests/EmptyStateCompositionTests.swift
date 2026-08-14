@@ -109,6 +109,77 @@ final class EmptyStateCompositionTests: XCTestCase {
       "the key column must grow with its widest cluster, not sit in a magic width")
   }
 
+  // MARK: - KT-3, the two rows the fixed frame was hiding
+
+  /// The label cannot wrap at the narrowest sidebar the app allows.
+  ///
+  /// `ContentView` declares that column's minimum at 180 pt and `SidebarView`
+  /// spends 28 of them on padding, so the widest row gets 152 — less than the
+  /// three-cap cluster plus "Open Folder" asks for. The caps cannot compress
+  /// (each is sized to its glyph), so an unconstrained `Text` takes the only
+  /// escape it has and breaks after "Open": the same two-line row KT-3 removed,
+  /// one view further along. Pinned at the composition like everything else
+  /// here — the wrap itself is a rendering outcome.
+  func testTheShortcutLabelCannotWrapInTheNarrowestSidebar() throws {
+    let chrome = try Self.source(of: "App/EmptyStateChrome.swift")
+    let shortcutRow = try XCTUnwrap(
+      Self.declarationBody(
+        named: "private func shortcutRow(_ shortcut: Shortcut) -> some View {", in: chrome),
+      "the shortcut row has moved; re-point this pin before trusting it")
+
+    XCTAssertTrue(
+      shortcutRow.contains(".lineLimit(1)"),
+      "one line per row: wrapping is the exact bug this block was rebuilt to remove")
+    XCTAssertTrue(
+      shortcutRow.contains(".minimumScaleFactor("),
+      "…and it shrinks to fit rather than truncating, so the whole word survives 180 pt")
+  }
+
+  /// One VoiceOver stop per row, not one per cap.
+  ///
+  /// The measuring copies are hidden from accessibility already, but that only
+  /// silences the copies: the VISIBLE caps are still separate `Text`s, and a row
+  /// that lets them compose themselves is announced as "⌘", "⇧", "O" and the
+  /// label in four separate stops, each read as a bare symbol.
+  func testEachShortcutRowIsAnnouncedAsASingleElement() throws {
+    let chrome = try Self.source(of: "App/EmptyStateChrome.swift")
+    let shortcutRow = try XCTUnwrap(
+      Self.declarationBody(
+        named: "private func shortcutRow(_ shortcut: Shortcut) -> some View {", in: chrome),
+      "the shortcut row has moved; re-point this pin before trusting it")
+
+    XCTAssertTrue(
+      shortcutRow.contains(".accessibilityElement(children: .ignore)"),
+      "the row publishes itself, or every cap becomes its own focus stop")
+    XCTAssertTrue(
+      shortcutRow.contains(".accessibilityLabel(Self.spokenLabel(for: shortcut))"),
+      "…carrying the spoken sentence, since ignoring the children drops their text")
+  }
+
+  /// And that sentence names the modifiers instead of handing over their glyphs.
+  func testTheSpokenLabelNamesEveryModifierAndKeepsTheAction() {
+    XCTAssertEqual(
+      EmptyStateShortcuts.spokenLabel(
+        for: EmptyStateShortcuts.Shortcut(
+          symbols: "⌘⇧O", label: "Open Folder", isAction: false)),
+      "Command Shift O, Open Folder")
+
+    for shortcut in EmptyStateShortcuts.shortcuts {
+      let spoken = EmptyStateShortcuts.spokenLabel(for: shortcut)
+
+      XCTAssertTrue(
+        spoken.hasSuffix(shortcut.label),
+        "\(shortcut.label): the row still says what the shortcut DOES, last")
+
+      for glyph in EmptyStateShortcuts.keyGlyphs(in: shortcut.symbols)
+      where !glyph.isLetter && !glyph.isNumber {
+        XCTAssertFalse(
+          spoken.contains(glyph),
+          "\(shortcut.label): \(glyph) reaches a screen reader as a word, never as the glyph")
+      }
+    }
+  }
+
   // MARK: - Source access
 
   private static func packageRoot() -> URL {

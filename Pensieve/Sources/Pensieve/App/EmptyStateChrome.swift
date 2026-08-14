@@ -224,6 +224,29 @@ struct EmptyStateShortcuts: View {
     Array(symbols)
   }
 
+  /// How this row is ANNOUNCED, as one sentence. The caps are glyphs, and a row
+  /// left to compose itself hands VoiceOver one element per cap: "⌘", "⇧", "O"
+  /// and the label become four separate stops, each spoken as a bare symbol
+  /// name. The row is published as a single element carrying this string
+  /// instead. Static for the same reason `keyGlyphs` is — the pins can state
+  /// the contract without rendering SwiftUI.
+  static func spokenLabel(for shortcut: Shortcut) -> String {
+    let keys = keyGlyphs(in: shortcut.symbols).map(spokenKeyName).joined(separator: " ")
+    return "\(keys), \(shortcut.label)"
+  }
+
+  /// Modifier glyphs carry no readable name of their own, so they are given
+  /// theirs. Anything else is already a letter and is spoken as one.
+  private static func spokenKeyName(_ glyph: Character) -> String {
+    switch glyph {
+    case "⌘": return "Command"
+    case "⇧": return "Shift"
+    case "⌥": return "Option"
+    case "⌃": return "Control"
+    default: return String(glyph)
+    }
+  }
+
   @EnvironmentObject private var controller: AppController
   /// Accessibility id for the clickable New File row — lets the sidebar keep the
   /// identifier its empty state exposed before this cut.
@@ -268,10 +291,22 @@ struct EmptyStateShortcuts: View {
         }
         keyCapCluster(for: shortcut.symbols)
       }
+      // The key column is incompressible — caps size to their glyphs — so at the
+      // sidebar's declared 180pt minimum (`ContentView`) the 152pt left after
+      // its padding is not enough for the three-cap cluster AND "Open Folder".
+      // Without these two the label takes the only escape a Text has and wraps
+      // after "Open", which is the two-line row this cut set out to remove,
+      // moved one view along. It shrinks to fit instead, and only in the last
+      // few points before the minimum.
       Text(shortcut.label)
         .font(.callout)
         .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
     }
+    // One stop per row, not one per cap. See `spokenLabel(for:)`.
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(Self.spokenLabel(for: shortcut))
   }
 
   private func keyCapCluster(for symbols: String) -> some View {
