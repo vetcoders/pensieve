@@ -39,6 +39,16 @@ Clarifications (decisions 26.07/31.07, canon item 2):
 - an untitled buffer lives only in memory until an explicit save — zero 0 B files on disk;
 - the app **never creates an untitled tab on its own** (startup, restore, or any automation must never produce a new untitled/recovery buffer without a user action).
 
+Settled behaviour — **no launcher surface between tabs.** The tab is presented
+and selected synchronously, so its draft is created on the same clock: the
+window's construction seeds it, and the later startup pass only confirms it.
+A `newUntitledTab` window therefore renders an editor titled `Untitled.md` from
+its FIRST frame and may never show the launcher branch (New File / Open File /
+RECENT) or the launcher's `Pensieve` window title, no matter how long its
+SwiftUI root takes to cold-start. The seed is idempotent: whichever of the two
+callers gets there first owns the draft, so the late pass can neither renumber
+the tab nor discard what the user has already typed into it.
+
 ### `Cmd+N` — New
 
 In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab with an
@@ -56,6 +66,16 @@ behavior piecemeal.
 Rebuilding the workspace around that tab is configuration hydration only. Its
 asynchronous completion must not clear or replace the new untitled buffer, even
 while the buffer is still empty and therefore not dirty.
+
+Settled behaviour — **one truth for a pending tab.** The native tab group
+mutates at the click, so the sidebar's Open Files list must too: the registry
+publishes the new tab's descriptor when the window is CREATED, before it is
+merged and ordered front, under an untitled identity minted at that moment.
+Open Files may never trail the tab bar by the number of tabs still waiting for
+their SwiftUI root. That row is reconciled, never duplicated — the accessor's
+later attach replaces it in place rather than appending a second row — and it is
+retired with its window, so an abandoned or closed pending tab leaves no phantom
+entry behind.
 
 When no stable document controller is attached yet, New requests are counted,
 not collapsed into a Boolean. The first request may create the single

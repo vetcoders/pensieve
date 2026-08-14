@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A new tab from the tab bar's "+", `Cmd+T` or `Cmd+N` is an editor titled
+  `Untitled.md` from its first frame. Its draft used to be created several
+  run-loop turns after the tab was already presented and selected, so under load
+  the tab spent seconds as a fully interactive launcher — New File / Open File /
+  RECENT, window title **Pensieve** — wedged between the user's documents. The
+  draft is now seeded where the window is constructed, on the same clock as the
+  presentation; the later startup pass is idempotent, so it can neither renumber
+  the tab nor discard what was typed into it in the meantime.
+- The sidebar's **Open Files** list no longer trails the tab bar. A new tab is
+  published into the open-document list when its window is created — before it
+  joins the tab group and is ordered front — instead of only when its SwiftUI
+  root attaches, so a burst of new-tab requests shows one row per tab
+  immediately. The pending row is reconciled rather than duplicated when the
+  attach lands, and is retired with its window, so a closed or abandoned pending
+  tab leaves no phantom entry.
+
 - Automated and manual isolated smoke now prove the calling terminal's bounded
   `System Events` Automation and Accessibility route before staging, retiring,
   or launching any test identity. A TCC denial is reported as an
