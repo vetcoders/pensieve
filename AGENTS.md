@@ -93,11 +93,9 @@ finding, add it there with a reason — do not sprinkle inline ignores.
 
 ## What the gates do not cover
 
-- **CI only triggers on `main`, `fix/**` and `feat/**` base branches.**
-  `.github/workflows/ci.yml` has `pull_request: branches: ["main", "fix/**",
-"feat/**"]`, so a stacked PR based on a `fix/*` or `feat/*` branch still gets
-  checks; a PR based on any other branch prefix gets none. Run `make gates`
-  locally and say so in the PR when the base branch is outside that list.
+- **CI only triggers on `main`.** `.github/workflows/ci.yml` has
+  `pull_request: branches: ["main"]`, so a PR based on another branch (stacked
+  PRs) gets no checks at all. Run `make gates` locally and say so in the PR.
 - **`ui-smoke` is not part of `make ci`.** It is operator-side and ad hoc.
 - **Semgrep does not parse every file.** The gate passes with parser warnings;
   a Swift construct it cannot parse silently drops that whole file from the
