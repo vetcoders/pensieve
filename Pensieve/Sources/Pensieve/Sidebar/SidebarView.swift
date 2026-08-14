@@ -127,13 +127,16 @@ struct SidebarView: View {
     .padding(.vertical, 10)
   }
 
+  /// Deliberately WITHOUT `EmptyStateRecents`. The empty launcher shows the
+  /// sidebar and the detail pane at the same time, and each was drawing its own
+  /// Recent list — the same history, twice, a column apart. The detail pane owns
+  /// that list now; the sidebar keeps the wordmark and the shortcuts.
   private var emptyState: some View {
     VStack(alignment: .leading, spacing: 16) {
       Spacer()
       EmptyStateWordmark(size: 22)
       EmptyStateShortcuts(
         newFileAccessibilityIdentifier: "pensieve.sidebar.emptyState.newFile")
-      EmptyStateRecents(store: controller.recentDocuments, limit: 5)
       Spacer()
     }
     .frame(maxWidth: .infinity, alignment: .leading)
