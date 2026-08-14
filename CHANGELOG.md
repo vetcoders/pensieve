@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Flipping your Mac between light and dark no longer leaves a Typewriter
+  window in two halves.** The native tab bar and the toolbar's toggles jumped to
+  the incoming half immediately while the titlebar, toolbar, sidebar and traffic
+  lights stayed in the outgoing one — the seam landing on the split divider —
+  and an open tab you were not looking at could keep the old half for the rest
+  of the session. The window's half now has a single owner: the chrome pass
+  writes it, the repairs that run between screen updates may only ever paint the
+  half a window already has, and the setting change itself re-dresses every open
+  document window instead of only the ones that happen to be redrawn. Cold
+  starts, skin switches and the white preview page are unchanged.
 - A release without `--clean` no longer stalls or dies while retiring the
   previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
   read-only, so the stale bundle carried unwritable `Assets.xcassets`
