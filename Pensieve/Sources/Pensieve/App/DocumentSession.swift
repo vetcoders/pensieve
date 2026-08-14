@@ -65,6 +65,19 @@ struct DocumentSession: Equatable {
   /// buffer remains untitled until the user explicitly chooses Save to Original
   /// or Save As, so merely opening recovery can never overwrite this URL.
   private var storedRecoverySourceURL: URL?
+  /// Drafts this buffer has already OUTLIVED but whose files are still on disk,
+  /// because the delete that should have retired them failed.
+  ///
+  /// Kept apart from `storedRecoveryID` because the two answer different
+  /// questions. `storedRecoveryID` says "this buffer's durable copy is a draft",
+  /// which stops being true the moment the bytes reach their real destination —
+  /// so a save retires it whether or not the cleanup succeeded, and everything
+  /// that routes on the session's MODE (`recoverySourceURL`, autosave's
+  /// dispatch, ⌘S's destination) keeps agreeing with what is actually on disk.
+  /// This set is the leftover FILE, which nothing else routes on: the next
+  /// durable save retries it, and until then the draft simply stays where the
+  /// user can find it in Recovered Drafts.
+  private var storedPendingRecoveryRetirementIDs: Set<UUID> = []
   /// The last failed write to this buffer's original file, kept separately from
   /// the visible data-loss message.
   ///
@@ -179,6 +192,13 @@ struct DocumentSession: Equatable {
     storedRecoverySourceURL?.standardizedFileURL
   }
 
+  /// Draft files this buffer no longer owns and could not delete. Read by the
+  /// next durable save, which retries them.
+  var pendingRecoveryRetirementIDs: Set<UUID> {
+    get { storedPendingRecoveryRetirementIDs }
+    set { storedPendingRecoveryRetirementIDs = newValue }
+  }
+
   var pendingOriginalSaveFailure: String? {
     storedOriginalSaveFailure
   }
@@ -223,6 +243,7 @@ struct DocumentSession: Equatable {
     self.kind = .fileBacked(document)
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
     self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = false
@@ -235,6 +256,7 @@ struct DocumentSession: Equatable {
     self.kind = .loading(document)
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
     self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
@@ -242,6 +264,11 @@ struct DocumentSession: Equatable {
 
   /// The current buffer reached its intended durable destination, so its
   /// emergency recovery record no longer belongs to it.
+  ///
+  /// Deliberately says nothing about `storedPendingRecoveryRetirementIDs`: what
+  /// this buffer IS is settled by the write, while a draft FILE that could not
+  /// be deleted is a leftover the next save retries. Clearing the leftovers here
+  /// would make a failed cleanup indistinguishable from a successful one.
   mutating func retireRecoveryAssociation() {
     storedRecoveryID = nil
     storedRecoverySourceURL = nil
@@ -261,6 +288,7 @@ struct DocumentSession: Equatable {
     // and the draft the replaced buffer wrote stays where the user can find it.
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
     self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
@@ -275,6 +303,7 @@ struct DocumentSession: Equatable {
     self.kind = .untitled(title: title, identity: .recovered(recoveryID))
     self.storedRecoveryID = recoveryID
     self.storedRecoverySourceURL = sourceURL?.standardizedFileURL
+    self.storedPendingRecoveryRetirementIDs = []
     self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = true

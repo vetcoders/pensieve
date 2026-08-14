@@ -619,11 +619,32 @@ Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10:
   The preparation, reopen, verification and cleanup rules are
   canonical in [`runtime-testing.md`](runtime-testing.md).
 
+Clarification (14.08 — a save's own failures may not be swallowed):
+
+- **The durable destination decides the session's mode, never the cleanup
+  result.** Once a save's bytes reach the file, the buffer is file-backed and
+  carries no recovery source, whether or not the recovery payload could be
+  deleted. A draft that refused to be retired is parked on that buffer and
+  retried by the next durable save; until it goes it simply stays in Recovered
+  Drafts, and the user still sees the "could not retire its recovery copy"
+  status. This is what keeps two invariants true: auto-save after such a save
+  keeps advancing the FILE instead of writing recovery snapshots only, and a
+  Cmd+S after Save As… to a different path writes the NEW destination rather
+  than the original the recovery record came from.
+- **A bookmark that could not be persisted is reported.** The working-set
+  bookmark is what puts a saved document back in Open Files after relaunch, so a
+  save that wrote the bytes but could not mint it leaves a visible warning. That
+  warning outranks the recovery-retirement status and survives the rest of the
+  save — neither the successful retirement of the recovery copy nor the
+  resolution of the data-loss latch may clear it.
+
 The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
 source metadata across store reload, non-overwriting recovery open, explicit
 Save to Original success and failure, same-ID refresh with the latest recovered
-bytes, one-buffer/one-record identity, and red-X/global-quit veto until the
-original destination accepts the recovered buffer.
+bytes, one-buffer/one-record identity, red-X/global-quit veto until the original
+destination accepts the recovered buffer, a failed retirement leaving the saved
+file (not a snapshot) as auto-save's target and Cmd+S's destination, and a
+bookmark failure surviving both Save As… paths.
 
 ### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
 

@@ -53,6 +53,12 @@ final class BookmarkStore {
   /// to leak, and no fixture can mint a real bookmark that fails this read.
   private let bookmarkedOrigin: (Data) -> URL?
 
+  /// How a working-set entry's persisted blob is minted. Injectable for the same
+  /// reason as `bookmarkedOrigin`: a `persistFile` that FAILS is the case whose
+  /// warning used to be swallowed by the save paths downstream of it, and no
+  /// fixture can make a real file on a real volume refuse to produce a bookmark.
+  private let mintFileBookmark: (URL) throws -> Data
+
   init(
     defaults: UserDefaults = .standard,
     trashMembership: @escaping (URL) -> Bool = TrashLocation.contains,
@@ -62,13 +68,23 @@ final class BookmarkStore {
     stopSecurityScopedAccess: @escaping (URL) -> Void = {
       $0.stopAccessingSecurityScopedResource()
     },
-    bookmarkedOrigin: @escaping (Data) -> URL? = BookmarkStore.bookmarkedOriginURL
+    bookmarkedOrigin: @escaping (Data) -> URL? = BookmarkStore.bookmarkedOriginURL,
+    mintFileBookmark: @escaping (URL) throws -> Data = BookmarkStore.securityScopedBookmark
   ) {
     self.defaults = defaults
     self.trashMembership = trashMembership
     self.startSecurityScopedAccess = startSecurityScopedAccess
     self.stopSecurityScopedAccess = stopSecurityScopedAccess
     self.bookmarkedOrigin = bookmarkedOrigin
+    self.mintFileBookmark = mintFileBookmark
+  }
+
+  nonisolated static func securityScopedBookmark(for url: URL) throws -> Data {
+    try url.bookmarkData(
+      options: [.withSecurityScope],
+      includingResourceValuesForKeys: nil,
+      relativeTo: nil
+    )
   }
 
   /// Whether `url` names a document that has been thrown away.
@@ -143,11 +159,7 @@ final class BookmarkStore {
   /// onto that first position, so a key can heal through an ordinary open
   /// instead of waiting for the next launch.
   func persistFile(url: URL, into appState: AppState) throws {
-    let data = try url.bookmarkData(
-      options: [.withSecurityScope],
-      includingResourceValuesForKeys: nil,
-      relativeTo: nil
-    )
+    let data = try mintFileBookmark(url)
     let targetPath = url.standardizedFileURL.path
     var bookmarks = fileBookmarkData
     let matches = bookmarks.indices.filter { resolvedPath(for: bookmarks[$0]) == targetPath }
