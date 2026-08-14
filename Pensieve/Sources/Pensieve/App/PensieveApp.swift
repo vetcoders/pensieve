@@ -183,8 +183,8 @@ struct DocumentWindowRootView: View {
           // restored session, a cold-start Finder open and ⌘N all land in. See
           // `ConsciousCloseHook` for how a window whose class and delegate
           // belong to SwiftUI is reached.
-          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow in
-            controller?.windowShouldClose(closingWindow) ?? true
+          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow, gesture in
+            controller?.windowShouldClose(closingWindow, gesture: gesture) ?? true
           }
         }
       )
