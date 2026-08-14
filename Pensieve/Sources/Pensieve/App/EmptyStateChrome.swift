@@ -258,7 +258,13 @@ struct EmptyStateShortcuts: View {
       // same bug with a bigger constant.
       ZStack(alignment: .leading) {
         ForEach(Self.shortcuts, id: \.self) { sizer in
-          keyCapCluster(for: sizer.symbols).hidden()
+          // `.hidden()` already keeps these out of the picture and out of hit
+          // testing; the explicit accessibility hide is the one that matters —
+          // a measuring copy that reached VoiceOver would read every shortcut
+          // in the block on every row.
+          keyCapCluster(for: sizer.symbols)
+            .hidden()
+            .accessibilityHidden(true)
         }
         keyCapCluster(for: shortcut.symbols)
       }
