@@ -933,6 +933,13 @@ Close All must never cause silent data loss.
 - Recent Files (File → Open Recent, D5 from 26.07) is a list independent of
   Open Files and the working set; during ⌘W-retire it acts as a safety net
   ("file disappears from Open Files, stays in Recents").
+- Exactly ONE Recent list on the empty launcher — the detail pane's. The
+  sidebar's empty state carries the wordmark and the shortcut hints only
+  (decision 14.08); the copy it used to draw was the same history one column
+  away.
+- Shortcut hints render one key cap per key (`⌘` `⇧` `O`), and the key column
+  sizes itself to the widest shortcut in the block — a hint may never wrap onto
+  a second row (decision 14.08).
 
 ## Minimal smoke check
 

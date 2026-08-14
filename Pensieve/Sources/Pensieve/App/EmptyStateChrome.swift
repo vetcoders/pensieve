@@ -8,6 +8,11 @@ import SwiftUI
 /// authority — no second persisted list). Both host surfaces observe
 /// `ThemeManager`, so the accent wordmark and the key-cap hairlines repaint on
 /// a live theme switch.
+///
+/// The RECENTS list is shared code with a single host: the detail pane. The
+/// sidebar drew its own copy until the empty launcher was click-tested and both
+/// lists turned out to be the same six rows side by side, so the sidebar's copy
+/// went and the launcher keeps the one anybody reads.
 
 /// The colours the DETAIL-PANE empty state paints with.
 ///
@@ -78,18 +83,26 @@ struct EmptyStateWordmark: View {
   }
 }
 
-/// A keyboard shortcut rendered as a small key cap (⌘N, ⌘⇧O …), outlined in the
-/// theme border tint.
+/// ONE key of a keyboard shortcut, rendered as a small key cap and outlined in
+/// the theme border tint. A shortcut is a ROW of these — `⌘` `⇧` `O` — the way
+/// macOS draws a shortcut hint.
+///
+/// `glyph` is a `Character` on purpose. The cap used to take the whole symbol
+/// string, which meant its width depended on how many keys the shortcut had —
+/// and the fixed frame it was pinned into fit two glyphs, so "⌘⇧O" wrapped into
+/// a second visual row. A cap that cannot hold more than one key cannot overflow
+/// its own intrinsic width, so the failure is unrepresentable rather than
+/// re-measured.
 struct ShortcutKeyCap: View {
   @EnvironmentObject private var themeManager: ThemeManager
-  let symbols: String
+  let glyph: Character
   /// See `EmptyStateWordmark.palette`. The cap's label inherits the host's
   /// primary foreground, so its fill has to come from the same place: a system
   /// chip under themed text reads as a light patch on a dark skin's pane.
   var palette: EmptyStatePalette?
 
   var body: some View {
-    Text(symbols)
+    Text(String(glyph))
       .font(.system(size: 12, weight: .medium, design: .rounded))
       .padding(.horizontal, 7)
       .padding(.vertical, 3)
@@ -183,11 +196,57 @@ struct EmptyStateRowButtonStyle: ButtonStyle {
   }
 }
 
-/// The primary shortcuts, each a key cap + label. New File is the always-safe
-/// action, so its row is a live button; Open File / Open Folder are hints (their
-/// global menu shortcuts still fire). Replaces the single caption sentence the
-/// old empty states carried, which nobody read.
+/// The primary shortcuts, each a row of key caps + a label. New File is the
+/// always-safe action, so its row is a live button; Open File / Open Folder are
+/// hints (their global menu shortcuts still fire). Replaces the single caption
+/// sentence the old empty states carried, which nobody read.
 struct EmptyStateShortcuts: View {
+  /// One rendered row: the shortcut's keys and what they do.
+  struct Shortcut: Hashable {
+    let symbols: String
+    let label: String
+    /// New File is the always-safe action, so its row is a live button; the
+    /// others are hints whose global menu shortcuts still fire.
+    let isAction: Bool
+  }
+
+  /// Every row this block renders, in display order. Static so the key-cap
+  /// column can size itself to the WIDEST cluster in the block and so the pins
+  /// can state the cap contract without rendering SwiftUI.
+  static let shortcuts: [Shortcut] = [
+    Shortcut(symbols: "⌘N", label: "New File", isAction: true),
+    Shortcut(symbols: "⌘O", label: "Open File", isAction: false),
+    Shortcut(symbols: "⌘⇧O", label: "Open Folder", isAction: false),
+  ]
+
+  /// The individual keys a shortcut is drawn from — one cap each.
+  static func keyGlyphs(in symbols: String) -> [Character] {
+    Array(symbols)
+  }
+
+  /// How this row is ANNOUNCED, as one sentence. The caps are glyphs, and a row
+  /// left to compose itself hands VoiceOver one element per cap: "⌘", "⇧", "O"
+  /// and the label become four separate stops, each spoken as a bare symbol
+  /// name. The row is published as a single element carrying this string
+  /// instead. Static for the same reason `keyGlyphs` is — the pins can state
+  /// the contract without rendering SwiftUI.
+  static func spokenLabel(for shortcut: Shortcut) -> String {
+    let keys = keyGlyphs(in: shortcut.symbols).map(spokenKeyName).joined(separator: " ")
+    return "\(keys), \(shortcut.label)"
+  }
+
+  /// Modifier glyphs carry no readable name of their own, so they are given
+  /// theirs. Anything else is already a letter and is spoken as one.
+  private static func spokenKeyName(_ glyph: Character) -> String {
+    switch glyph {
+    case "⌘": return "Command"
+    case "⇧": return "Shift"
+    case "⌥": return "Option"
+    case "⌃": return "Control"
+    default: return String(glyph)
+    }
+  }
+
   @EnvironmentObject private var controller: AppController
   /// Accessibility id for the clickable New File row — lets the sidebar keep the
   /// identifier its empty state exposed before this cut.
@@ -197,26 +256,64 @@ struct EmptyStateShortcuts: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      Button {
-        controller.createUntitledDocument()
-      } label: {
-        shortcutRow("⌘N", "New File")
+      ForEach(Self.shortcuts, id: \.self) { shortcut in
+        if shortcut.isAction {
+          Button {
+            controller.createUntitledDocument()
+          } label: {
+            shortcutRow(shortcut)
+          }
+          .buttonStyle(EmptyStateRowButtonStyle())
+          .accessibilityIdentifier(newFileAccessibilityIdentifier)
+        } else {
+          shortcutRow(shortcut)
+        }
       }
-      .buttonStyle(EmptyStateRowButtonStyle())
-      .accessibilityIdentifier(newFileAccessibilityIdentifier)
-
-      shortcutRow("⌘O", "Open File")
-      shortcutRow("⌘⇧O", "Open Folder")
     }
   }
 
-  private func shortcutRow(_ symbols: String, _ label: String) -> some View {
+  private func shortcutRow(_ shortcut: Shortcut) -> some View {
     HStack(spacing: 8) {
-      ShortcutKeyCap(symbols: symbols, palette: palette)
-        .frame(width: 44, alignment: .leading)
-      Text(label)
+      // The key column takes its width from the widest cluster in the block —
+      // hidden copies of every cluster participate in layout and nothing else —
+      // so a three-key shortcut WIDENS the column instead of wrapping inside a
+      // hardcoded frame. That frame was the bug; a new magic number would be the
+      // same bug with a bigger constant.
+      ZStack(alignment: .leading) {
+        ForEach(Self.shortcuts, id: \.self) { sizer in
+          // `.hidden()` already keeps these out of the picture and out of hit
+          // testing; the explicit accessibility hide is the one that matters —
+          // a measuring copy that reached VoiceOver would read every shortcut
+          // in the block on every row.
+          keyCapCluster(for: sizer.symbols)
+            .hidden()
+            .accessibilityHidden(true)
+        }
+        keyCapCluster(for: shortcut.symbols)
+      }
+      // The key column is incompressible — caps size to their glyphs — so at the
+      // sidebar's declared 180pt minimum (`ContentView`) the 152pt left after
+      // its padding is not enough for the three-cap cluster AND "Open Folder".
+      // Without these two the label takes the only escape a Text has and wraps
+      // after "Open", which is the two-line row this cut set out to remove,
+      // moved one view along. It shrinks to fit instead, and only in the last
+      // few points before the minimum.
+      Text(shortcut.label)
         .font(.callout)
         .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+    }
+    // One stop per row, not one per cap. See `spokenLabel(for:)`.
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(Self.spokenLabel(for: shortcut))
+  }
+
+  private func keyCapCluster(for symbols: String) -> some View {
+    HStack(spacing: 3) {
+      ForEach(Array(Self.keyGlyphs(in: symbols).enumerated()), id: \.offset) { _, glyph in
+        ShortcutKeyCap(glyph: glyph, palette: palette)
+      }
     }
   }
 }
