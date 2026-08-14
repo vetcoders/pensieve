@@ -1,10 +1,15 @@
 import AppKit
 import SwiftUI
 
-/// The two panes hosted by Pensieve's single application-owned Settings window.
+/// The panes hosted by Pensieve's single application-owned Settings window.
 enum PensieveSettingsSection: Hashable {
   case general
   case ai
+  /// Theme and flavor. Added when the titlebar's appearance menu was removed:
+  /// the status-bar chip is the primary home, but it only exists in a window
+  /// showing a document, so the axes needed one route reachable with ⌘, from
+  /// anywhere — including the launcher.
+  case appearance
 }
 
 enum PensieveSettingsPresentationResult: Equatable {
@@ -89,13 +94,15 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
   convenience init(
     providerSettings: ProviderSettings,
     savingSettings: DocumentSavingSettings,
-    launchSettings: LaunchSettings
+    launchSettings: LaunchSettings,
+    themeManager: ThemeManager = .shared
   ) {
     let selection = PensieveSettingsSelection()
     let rootView = PensieveSettingsView(
       providerSettings: providerSettings,
       savingSettings: savingSettings,
       launchSettings: launchSettings,
+      themeManager: themeManager,
       selection: selection)
     let hostingView = NSHostingView(rootView: rootView)
     let window = NSWindow(

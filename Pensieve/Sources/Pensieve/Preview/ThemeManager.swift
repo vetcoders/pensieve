@@ -21,6 +21,22 @@ import Foundation
 /// Keeping the two axes separate is deliberate: a reader can want GitHub
 /// Flavored tables *and* a paper-like serif body at the same time.
 final class ThemeManager: ObservableObject {
+  /// The app's one appearance state, reachable from surfaces AppKit owns.
+  ///
+  /// Both axes are app-wide, and until Settings gained an Appearance pane every
+  /// writer lived inside the SwiftUI scene, where this object travels as an
+  /// `@EnvironmentObject`. The Settings window is an ordinary `NSWindow`
+  /// retained by `PensieveSettingsWindowController.shared` — no scene, no
+  /// environment — so a pane there could only reach the state by constructing a
+  /// SECOND manager, and two managers mean two copies of the skin that disagree
+  /// the moment either is written. Same reason `ProviderSettings` and
+  /// `DocumentSavingSettings` are shared: the settings window is a singleton, so
+  /// the state it edits has to be one too.
+  ///
+  /// `init` stays available on purpose — tests build isolated managers over
+  /// their own `UserDefaults` and must never touch the process-wide one.
+  static let shared = ThemeManager()
+
   /// Markdown dialect stylesheet (the heavy base CSS bundle).
   enum Theme: String, CaseIterable, Identifiable {
     case markdown

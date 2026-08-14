@@ -35,8 +35,8 @@ import SwiftUI
 ///     labelling the `ControlGroup` does not add one (measured). A family whose
 ///     ENTIRE content sits in a `ControlGroup` therefore vanishes silently once
 ///     the window is too narrow. Controls declared directly in the
-///     `ToolbarItemGroup` (the mode picker, the appearance menu, reload,
-///     rewrite) do carry menu forms.
+///     `ToolbarItemGroup` (the mode picker, reload, rewrite) do carry menu
+///     forms.
 ///
 /// Toggle-only `ControlGroup`s stay: their on-state chip is what
 /// `WindowChromeRecipe.assertToolbarChipTint` paints from the active skin, and
@@ -53,15 +53,22 @@ import SwiftUI
 /// "»" menu. `EditorToolbarWidthBudgetTests` holds the total to a budget derived
 /// from the operator's working window.
 ///
-/// All controls bind into `AppState` / `AppController` / `ThemeManager`, which
-/// is owned by `PensieveApp` and shared as an `EnvironmentObject` so the
-/// toolbar's theme picker and `PreviewView` see the same selection.
+/// The appearance axes (markdown flavor, reading theme) are NOT here. The
+/// toolbar ran out of room, so the pickers live in exactly one place — the
+/// status bar's `appearanceChip` (`EditorStatusBar`). Re-adding them to the
+/// titlebar means paying for them out of the width budget above.
+///
+/// All controls bind into `AppState` / `AppController`. `ThemeManager` is no
+/// longer among them: with the appearance axes moved to the status bar, no
+/// toolbar control reads the skin, so the toolbelt does not observe it either.
+/// `ContentView` still does — it holds the manager as an `EnvironmentObject` —
+/// so a skin switch keeps re-evaluating this declaration through its owner,
+/// which is what the chip-tint and overflow re-derive pins describe.
 struct EditorToolbelt: ToolbarContent {
   // AppState is @Observable: a plain `var` is observed when its properties are
-  // read in this toolbar body. controller/themeManager stay ObservableObject.
+  // read in this toolbar body. controller stays ObservableObject.
   var appState: AppState
   @ObservedObject var controller: AppController
-  @ObservedObject var themeManager: ThemeManager
   let onDispatchToAgent: () -> Void
   let isDispatchDisabled: Bool
   let dispatchHelp: String
@@ -71,7 +78,6 @@ struct EditorToolbelt: ToolbarContent {
   static let shareIdentifier = "pensieve.toolbar.share"
   static let dispatchIdentifier = "pensieve.toolbar.dispatchToAgent"
   static let modePickerIdentifier = "pensieve.toolbar.modePicker"
-  static let appearanceIdentifier = "pensieve.toolbar.appearance"
   static let reloadIdentifier = "pensieve.toolbar.reload"
   static let autoReloadIdentifier = "pensieve.toolbar.autoReload"
   static let scrollSyncIdentifier = "pensieve.toolbar.scrollSync"
@@ -150,11 +156,6 @@ struct EditorToolbelt: ToolbarContent {
     ToolbarItemGroup {
       modePicker
         .controlSize(.regular)
-
-      if Self.showsAppearanceControls(for: appState.mode) {
-        AppearanceToolbarMenu(themeManager: themeManager)
-          .controlSize(.regular)
-      }
     } label: {
       Label("View", systemImage: "rectangle.split.2x1")
     }
@@ -182,14 +183,6 @@ struct EditorToolbelt: ToolbarContent {
     } label: {
       Label("Assistants", systemImage: "sparkles")
     }
-  }
-
-  /// Appearance controls describe only the rendered preview surface, so they
-  /// earn toolbar space only while a preview pane is actually on screen.
-  /// `.split` counts even when a narrow window collapses it to one pane —
-  /// the mode, not the momentary geometry, is the source of truth.
-  static func showsAppearanceControls(for mode: EditorMode) -> Bool {
-    mode == .preview || mode == .split
   }
 
   static func showsEditToolbelt(for mode: EditorMode, hasEditableBuffer: Bool) -> Bool {
@@ -249,11 +242,6 @@ struct EditorToolbelt: ToolbarContent {
     }
 
     identifiers.append(modePickerIdentifier)
-
-    if showsAppearanceControls(for: mode) {
-      identifiers.append(appearanceIdentifier)
-    }
-
     identifiers.append(reloadIdentifier)
     identifiers.append(autoReloadIdentifier)
     identifiers.append(scrollSyncIdentifier)
@@ -287,10 +275,9 @@ struct EditorToolbelt: ToolbarContent {
   /// here, and they are described because the bridge gives that group NO menu
   /// form: a clipped toggle family is otherwise unreachable, which is what put
   /// scroll sync, auto reload, dictation and AI autocomplete out of the
-  /// operator's reach at 1450pt. The view family is deliberately absent — its
-  /// mode picker and appearance menu are declared directly in the toolbar group
-  /// and already carry working menu forms, and an empty command list is the
-  /// recipe's "leave AppKit's own form alone".
+  /// operator's reach at 1450pt. The view family is described for a different
+  /// reason, spelled out at `case .view` below: its mode picker DOES carry a
+  /// menu form, but an icon-segment picker's derived form comes back unnamed.
   ///
   /// This list pairs with the control declarations below rather than generating
   /// them. `EditorToolbarOverflowTests` pins the pairing against the LIVE
@@ -366,11 +353,15 @@ struct EditorToolbelt: ToolbarContent {
     case .view:
       // Authored like the rest, and for a reason the width fix created: with
       // ICON segments the picker's bridged menu form comes back UNNAMED
-      // (measured — the derived group form reads "" with two blank children,
+      // (measured while this family still carried the appearance menu too — the
+      // derived group form read "" with one blank child per formed subitem,
       // where titled segments used to derive "Mode / Graphite"). An unnamed
       // entry in the "»" menu is as unreachable as a missing one.
-      let themeManager = self.themeManager
-      var commands = [
+      //
+      // The appearance axes are NOT described here: they left the toolbar
+      // entirely and live in the status bar's chip, which no titlebar overflow
+      // can clip.
+      return [
         ToolbarOverflowCommand(
           id: Self.modePickerIdentifier, title: "Mode", systemImage: "rectangle.split.2x1",
           children: EditorMode.allCases.map { mode in
@@ -381,29 +372,6 @@ struct EditorToolbelt: ToolbarContent {
               perform: { controller.setMode(mode) })
           })
       ]
-      guard Self.showsAppearanceControls(for: appState.mode) else { return commands }
-      commands.append(
-        ToolbarOverflowCommand(
-          id: "\(Self.appearanceIdentifier).flavor", title: "Markdown Flavor",
-          systemImage: "text.badge.checkmark",
-          children: ThemeManager.Theme.allCases.map { flavor in
-            ToolbarOverflowCommand(
-              id: "\(Self.appearanceIdentifier).flavor.\(flavor.rawValue)",
-              title: flavor.displayName, systemImage: "text.badge.checkmark",
-              isOn: { themeManager.current == flavor },
-              perform: { themeManager.current = flavor })
-          }))
-      commands.append(
-        ToolbarOverflowCommand(
-          id: "\(Self.appearanceIdentifier).skin", title: "Theme", systemImage: "diamond.fill",
-          children: PensieveTheme.allCases.map { skin in
-            ToolbarOverflowCommand(
-              id: "\(Self.appearanceIdentifier).skin.\(skin.rawValue)", title: skin.displayName,
-              systemImage: skin.systemImage,
-              isOn: { themeManager.skin == skin },
-              perform: { themeManager.skin = skin })
-          }))
-      return commands
 
     case .previewRuntime:
       return [
@@ -633,10 +601,9 @@ struct EditorToolbelt: ToolbarContent {
     }
     .help("Rewrite the selection or current paragraph with AI")
     .disabled(!hasEditableBuffer || appState.mode == .preview)
-    // Spelled out for the same reason `AppearanceToolbarMenu` spells its own
-    // out: this menu is declared DIRECTLY in the toolbar group, so it is
-    // bridged to an `NSMenuToolbarItem` of its own and does not inherit the
-    // `Label`'s text the way a `ControlGroup` segment did. Measured on the
+    // Spelled out because this menu is declared DIRECTLY in the toolbar group,
+    // so it is bridged to an `NSMenuToolbarItem` of its own and does not inherit
+    // the `Label`'s text the way a `ControlGroup` segment did. Measured on the
     // built app after the move: `AXDescription "menu button"`, `AXTitle
     // "wand.and.stars"` — the raw symbol name is what VoiceOver announced.
     // `AXIdentifier` survives the move untouched, so nothing but a name-based
@@ -770,52 +737,6 @@ private struct ToolbarHistoryControls: View {
         .accessibilityIdentifier(action.accessibilityIdentifier)
       }
     }
-  }
-}
-
-/// Native menu for the two preview appearance axes. Keeping presentation under
-/// AppKit's menu-button contract avoids transient SwiftUI popover state being
-/// recreated by the toolbar host between mouse-down and mouse-up.
-private struct AppearanceToolbarMenu: View {
-  @ObservedObject var themeManager: ThemeManager
-
-  var body: some View {
-    Menu {
-      Picker("Flavor", selection: $themeManager.current) {
-        ForEach(ThemeManager.Theme.allCases) { theme in
-          Text(theme.displayName).tag(theme)
-        }
-      }
-      .pickerStyle(.menu)
-      .help("Markdown flavor — plain Markdown or GitHub Flavored")
-      .accessibilityIdentifier("pensieve.toolbar.themePicker")
-
-      // Reading-surface skin, orthogonal to the flavor: it re-dresses BOTH the
-      // rendered preview and the source editor — surface, typography and syntax
-      // tokens — without changing the markdown dialect. Seven first-party
-      // themes: Default, Raw, Parchment, Graphite, Ink, Porcelain, Typewriter.
-      Picker("Theme", selection: $themeManager.skin) {
-        ForEach(PensieveTheme.allCases) { skin in
-          Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
-        }
-      }
-      .pickerStyle(.menu)
-      .help("Preview theme — the reading surface for the rendered markdown")
-      .accessibilityIdentifier("pensieve.toolbar.skinPicker")
-    } label: {
-      // 5.2: the active theme is named in the label, marked by an accent-tinted
-      // diamond, instead of an anonymous paintpalette. Flavor stays inside the
-      // menu (and the status-bar chip).
-      Label {
-        Text(themeManager.skin.displayName)
-      } icon: {
-        Image(systemName: "diamond.fill")
-          .foregroundStyle(Color(themeManager.skin.tokens.accent.nsColor))
-      }
-    }
-    .help("Preview appearance — markdown flavor and reading theme")
-    .accessibilityLabel("Preview Appearance")
-    .accessibilityIdentifier(EditorToolbelt.appearanceIdentifier)
   }
 }
 
