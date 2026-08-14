@@ -629,7 +629,7 @@ struct EditorToolbelt: ToolbarContent {
       .disabled(
         customRewriteInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     } message: {
-      Text("Opisz jednorazową zmianę dla zaznaczenia lub bieżącego akapitu.")
+      Text("Describe a one-off change for the selection or the current paragraph.")
     }
   }
 }
