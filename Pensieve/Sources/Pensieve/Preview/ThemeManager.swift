@@ -199,6 +199,22 @@ final class ThemeManager: ObservableObject {
   ///
   /// Unpaired skins read no system setting, so they are filtered out before the
   /// bump rather than being re-rendered for a change that cannot affect them.
+  ///
+  /// The bump alone is not enough, and that is the third lesson on this surface.
+  /// A SwiftUI pass re-dresses the windows it reaches; a background native tab
+  /// that nobody focuses gets no pass, so it kept the half it was last dressed
+  /// in for the rest of the session — and the windows that DID get a pass got it
+  /// at least one run-loop turn after the surfaces AppKit re-dresses on its own
+  /// (the tab bar, the toolbar chips) had already moved. Both halves of that are
+  /// the same missing step: nothing walked the windows when the setting moved.
+  /// So the bump is followed by ONE sweep over the document windows, which is
+  /// where `WindowChromeRecipe.assertWindowChrome` — the single writer of a
+  /// window's half — is driven from for a change no view declared.
+  ///
+  /// The sweep is edge-triggered by the flip, not by a pass, so it does not
+  /// recreate `7908bfd`'s per-pass appearance loop; and it writes only the
+  /// WINDOW, never `NSApp.appearance`, so it cannot re-enter the observation
+  /// that started it.
   private func observeSystemAppearance() {
     appearanceObservation = NSApplication.shared.observe(
       \.effectiveAppearance, options: [.new]
@@ -206,6 +222,10 @@ final class ThemeManager: ObservableObject {
       DispatchQueue.main.async {
         guard let self, self.skin.isPaired else { return }
         self.systemAppearanceGeneration &+= 1
+        MainActor.assumeIsolated {
+          WindowChromeRecipe.assertDocumentWindowChrome(
+            among: NSApplication.shared.windows, for: self.skin)
+        }
       }
     }
   }
