@@ -319,6 +319,63 @@ fi
 /bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_BUILD_TARGET"
 pass "read-only SwiftPM build cache cleanup is exact, bounded and symlink-safe"
 
+# The .app layout stage runs on top of whatever a previous release left in
+# dist/. SwiftPM ships Bundle.module resources read-only, so the stale bundle
+# carries r--r--r-- files inside r-xr-xr-x directories: deleting those children
+# needs write permission on the PARENT, which a plain `rm -R` never restores.
+# Model both modes and prove the retire step needs no terminal.
+READONLY_STALE_APP="$FIXTURE_ROOT/release/dist/Pensieve.app"
+STALE_APP_ASSETS="$READONLY_STALE_APP/Contents/Resources/Pensieve_Pensieve.bundle"
+/bin/mkdir -p "$STALE_APP_ASSETS/Assets.xcassets/ic_format_italic_18pt.imageset"
+printf '%s\n' 'stale bundled sample' >"$STALE_APP_ASSETS/sample.md"
+printf '%s\n' 'stale imageset payload' \
+  >"$STALE_APP_ASSETS/Assets.xcassets/ic_format_italic_18pt.imageset/ic.png"
+/bin/chmod -R a-w "$STALE_APP_ASSETS"
+build_provenance_cleanup_app_bundle "$READONLY_STALE_APP" </dev/null \
+  || fail "read-only stale app bundle cleanup failed"
+[[ ! -e "$READONLY_STALE_APP" ]] \
+  || fail "read-only stale app bundle cleanup left bundle bytes behind"
+# The layout stage must be able to proceed straight into a fresh bundle.
+/bin/mkdir -p "$READONLY_STALE_APP/Contents/MacOS" \
+  || fail "retired app bundle path did not accept a fresh layout"
+/bin/rm -R -- "$FIXTURE_ROOT/release/dist"
+
+# The MAS lane owns dist/mas/Pensieve.app; refusing it would break
+# `make release-appstore` at exactly the same stage.
+MAS_STALE_APP="$FIXTURE_ROOT/release/dist/mas/Pensieve.app"
+/bin/mkdir -p "$MAS_STALE_APP/Contents/Resources"
+printf '%s\n' 'stale MAS resource' >"$MAS_STALE_APP/Contents/Resources/sample.md"
+/bin/chmod -R a-w "$MAS_STALE_APP/Contents/Resources"
+build_provenance_cleanup_app_bundle "$MAS_STALE_APP" </dev/null \
+  || fail "read-only stale MAS app bundle cleanup failed"
+[[ ! -e "$MAS_STALE_APP" ]] \
+  || fail "read-only stale MAS app bundle cleanup left bundle bytes behind"
+/bin/rm -R -- "$FIXTURE_ROOT/release/dist"
+
+UNOWNED_APP_BUNDLE="$FIXTURE_ROOT/Applications/Pensieve.app"
+/bin/mkdir -p "$UNOWNED_APP_BUNDLE/Contents"
+if build_provenance_cleanup_app_bundle "$UNOWNED_APP_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "app bundle cleanup accepted a path outside a dist app bundle"
+fi
+[[ -d "$UNOWNED_APP_BUNDLE/Contents" ]] \
+  || fail "rejected app bundle cleanup mutated the unrelated bundle"
+/bin/rm -R -- "$FIXTURE_ROOT/Applications"
+
+SYMLINK_APP_PARENT="$FIXTURE_ROOT/symlink-release/dist"
+SYMLINK_APP_TARGET="$FIXTURE_ROOT/symlink-app-target"
+/bin/mkdir -p "$SYMLINK_APP_PARENT" "$SYMLINK_APP_TARGET"
+/bin/ln -s "$SYMLINK_APP_TARGET" "$SYMLINK_APP_PARENT/Pensieve.app"
+if build_provenance_cleanup_app_bundle "$SYMLINK_APP_PARENT/Pensieve.app" \
+  >/dev/null 2>&1; then
+  fail "app bundle cleanup followed a symlinked bundle root"
+fi
+[[ -d "$SYMLINK_APP_TARGET" ]] \
+  || fail "rejected symlink cleanup mutated its referent"
+/bin/rm "$SYMLINK_APP_PARENT/Pensieve.app"
+/bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_APP_TARGET"
+pass "read-only stale app bundle cleanup is exact, bounded and symlink-safe"
+
 assert_plist_value() {
   local plist="$1"
   local key="$2"

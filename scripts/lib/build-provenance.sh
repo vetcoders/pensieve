@@ -88,6 +88,50 @@ build_provenance_cleanup_swiftpm_build_cache() {
     /bin/rm -R -- "$build_path"
 }
 
+# build_provenance_cleanup_app_bundle PATH
+#
+# SwiftPM copies `Bundle.module` resources read-only (`r--r--r--` files inside
+# `r-xr-xr-x` directories such as `Assets.xcassets`), and those modes survive
+# into `dist/Pensieve.app`. A release that skips `--clean` lays the bundle out
+# on top of that stale tree, so the plain `rm -R` that used to open the layout
+# stage prompts once per read-only leaf on a terminal and then still fails with
+# `Permission denied` on entries whose parent directory is unwritable —
+# `set -e` turns that into a dead release or, if partially answered, a mixed
+# stale/new bundle. Unlock only non-symlink entries below that one derived app
+# bundle before removing it.
+#
+# Both release lanes own a literal bundle path: `dist/Pensieve.app` for the
+# Developer ID lane and `dist/mas/Pensieve.app` for the App Store lane. Nothing
+# else is accepted, and the symlink guard keeps this from becoming a generic
+# recursive-delete primitive pointed at an installed app.
+build_provenance_cleanup_app_bundle() {
+    local bundle_path="${1:-}"
+
+    case "$bundle_path" in
+        /*/dist/Pensieve.app|/*/dist/mas/Pensieve.app) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact dist app-bundle path: $bundle_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$bundle_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked app bundle: $bundle_path"
+        return 1
+    fi
+    [[ -e "$bundle_path" ]] || return 0
+    if [[ ! -d "$bundle_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup of a non-directory app bundle: $bundle_path"
+        return 1
+    fi
+
+    /usr/bin/find -P "$bundle_path" ! -type l -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$bundle_path"
+}
+
 build_provenance_is_sha256() {
     [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }

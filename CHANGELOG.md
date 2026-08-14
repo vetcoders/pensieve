@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A release without `--clean` no longer stalls or dies while retiring the
+  previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
+  read-only, so the stale bundle carried unwritable `Assets.xcassets`
+  directories: the layout stage's plain `rm -R` prompted per file on a terminal
+  and then failed with `Permission denied` on their children. The stage now
+  restores owner write access on non-symlink entries below that exact bundle
+  before removing it, for both the Developer ID and Mac App Store lanes, and
+  refuses any other path shape or a symlinked bundle root.
 - A new tab from the tab bar's "+", `Cmd+T` or `Cmd+N` is an editor titled
   `Untitled.md` from its first frame. Its draft used to be created several
   run-loop turns after the tab was already presented and selected, so under load

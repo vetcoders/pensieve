@@ -401,6 +401,19 @@ turning release cleanup into a generic recursive-delete mechanism. A
 terminal-attached release must therefore never pause on an `rm` `override …?`
 prompt for a dependency checkout.
 
+The same rule covers the `.app` layout stage, which runs on every release —
+not only on the `--clean` path. SwiftPM copies `Bundle.module` resources
+read-only, so a previously built bundle carries `r--r--r--` files inside
+`r-xr-xr-x` directories such as `Assets.xcassets`. Deleting those children
+needs write permission on their parent, which a plain recursive removal never
+restores: it prompts per read-only file on a terminal and then fails outright
+with `Permission denied`, leaving a mixed stale/new bundle behind. The stage
+now retires the previous bundle through the same primitive, unlocking only
+non-symlink entries below the lane's literal bundle path —
+`dist/Pensieve.app` for Developer ID, `dist/mas/Pensieve.app` for the App
+Store lane. Any other path shape, a symlink, or a non-directory is refused
+rather than deleted, so this never becomes a way to retire an installed app.
+
 ## Choosing the right lane
 
 - Use `make gates` for source-level confidence.

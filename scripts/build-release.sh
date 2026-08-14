@@ -524,7 +524,8 @@ ok "SwiftPM resources: $SPM_BUNDLE_DIR"
 
 # ─── Bundle into .app ─────────────────────────────────────────────────────
 log "Building $APP_NAME.app structure"
-[[ ! -e "$APP_BUNDLE" ]] || /bin/rm -R -- "$APP_BUNDLE"
+build_provenance_cleanup_app_bundle "$APP_BUNDLE" \
+    || die "Could not retire the previous $APP_NAME.app bundle safely."
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
