@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The theme and flavor pickers now live in one place: the status bar.** The
+  diamond that carried them in the toolbar is gone, and with it the "Markdown
+  Flavor" and "Theme" entries the toolbar put in its "»" menu. The titlebar was
+  out of room — every control there decides how narrow a window has to get
+  before whole families disappear behind the chevron — and the status bar's
+  chip at the bottom right already offered exactly the same two pickers. It
+  still does: click `Graphite / Markdown` to change either the reading theme or
+  the markdown flavor, from any mode. Nothing about the themes themselves
+  changed.
+
 ### Fixed
 
 - A release without `--clean` no longer stalls or dies while retiring the
