@@ -9,15 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The theme and flavor pickers now live in one place: the status bar.** The
-  diamond that carried them in the toolbar is gone, and with it the "Markdown
-  Flavor" and "Theme" entries the toolbar put in its "»" menu. The titlebar was
-  out of room — every control there decides how narrow a window has to get
-  before whole families disappear behind the chevron — and the status bar's
-  chip at the bottom right already offered exactly the same two pickers. It
-  still does: click `Graphite / Markdown` to change either the reading theme or
-  the markdown flavor, from any mode. Nothing about the themes themselves
-  changed.
+- **The theme and flavor pickers moved out of the toolbar.** The diamond that
+  carried them is gone, and with it the "Markdown Flavor" and "Theme" entries
+  the toolbar put in its "»" menu. The titlebar was out of room — every control
+  there decides how narrow a window has to get before whole families disappear
+  behind the chevron — and the status bar's chip at the bottom right already
+  offered exactly the same two pickers. It still does: click
+  `Graphite / Markdown` to change either the reading theme or the markdown
+  flavor, from any mode. Nothing about the themes themselves changed.
+- **Settings has a third tab, Appearance**, carrying those same two pickers.
+  The status-bar chip only exists in a window that is showing a document, so on
+  a freshly launched window — the launcher, with nothing open yet — there was no
+  way left to change the reading theme, even though the launcher is painted in
+  it. `Cmd+,` now reaches both axes from anywhere, and doubles as the way in
+  when a very narrow window squeezes the chip. It is a plain mirror: the same
+  two pickers writing the same setting, so the two places cannot fall out of
+  step with each other.
 
 ### Fixed
 

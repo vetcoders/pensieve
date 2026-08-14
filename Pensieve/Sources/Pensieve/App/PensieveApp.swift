@@ -32,7 +32,9 @@ struct PensieveApp: App {
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     launchIntentCoordinator.applyComposerLaunchArguments(composerArgs)
-    let themeManager = ThemeManager()
+    // The shared one, not a fresh instance: Settings ▸ Appearance edits the same
+    // two axes from a window AppKit owns, outside this scene's environment.
+    let themeManager = ThemeManager.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)

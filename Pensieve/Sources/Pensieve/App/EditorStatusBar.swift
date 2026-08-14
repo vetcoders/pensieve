@@ -103,12 +103,14 @@ struct EditorStatusBar: View {
   }
 
   /// The reading-surface chip: `Theme / Flavor` in a hairline capsule that opens
-  /// both appearance pickers. THE ONLY mouse-reachable place either axis can be
-  /// changed — the titlebar's appearance menu was removed when the toolbar ran
-  /// out of width, and no menu-bar command carries these axes — so neither
-  /// picker may leave this chip without another home being built first. Bound
-  /// straight into the shared `ThemeManager`, so a change here re-dresses both
-  /// panels live.
+  /// both appearance pickers. The PRIMARY home for either axis — the one in
+  /// reach of the document being read — but since 14.08.2026 no longer the only
+  /// one. The titlebar's appearance menu was removed when the toolbar ran out of
+  /// width, and `Settings ▸ Appearance` now mirrors these two pickers for the
+  /// windows this chip does not exist in (a launcher has no status bar) and for
+  /// the narrow widths that can clip it. Both surfaces bind straight into the
+  /// shared `ThemeManager`, so a change on either re-dresses every panel live
+  /// and the two cannot drift apart.
   private var appearanceChip: some View {
     Menu {
       Picker("Flavor", selection: $themeManager.current) {

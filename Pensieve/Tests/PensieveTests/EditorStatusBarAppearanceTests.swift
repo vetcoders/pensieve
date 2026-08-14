@@ -3,10 +3,12 @@ import XCTest
 
 @testable import Pensieve
 
-/// The status bar's appearance chip is now the ONLY mouse-reachable home for
-/// the two appearance axes: the titlebar's diamond was removed when the toolbar
-/// ran out of width, and no menu-bar command carries flavor or theme. So the
-/// chip is pinned as a surface, not as a declaration.
+/// The status bar's appearance chip is the PRIMARY home for the two appearance
+/// axes: the titlebar's diamond was removed when the toolbar ran out of width,
+/// and no menu-bar command carries flavor or theme. Since 14.08.2026 it is not
+/// the only home — `Settings ▸ Appearance` mirrors both pickers for the windows
+/// the chip does not exist in, and `AppearanceSettingsPaneTests` holds that
+/// half. So the chip is pinned as a surface, not as a declaration.
 ///
 /// What a headless `swift test` can and cannot see here was measured, and the
 /// split is deliberate:
