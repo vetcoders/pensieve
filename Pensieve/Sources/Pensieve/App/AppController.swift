@@ -1344,7 +1344,17 @@ final class AppController: ObservableObject {
     // does go away there, and the retirement rides the settled close exactly as
     // before. A window with no document showing keeps it too — a launcher tab's
     // "×" has nothing to retire, so it must still mean "this window goes away".
-    if gesture == .tab, hasEditableBuffer, documentWindowRegistry.isLoneTab(window) {
+    //
+    // A tab STAGING a large open counts as showing its document, which is why
+    // the loading half is asked for separately: `hasEditableBuffer` is false for
+    // `.loading` BY DESIGN (`DocumentSession.hasEditableBuffer` — an empty
+    // placeholder must never be writable), yet the click turn already published
+    // the file's title, URL and identity into this tab. Reading that as a
+    // launcher would make the "×" tear the window down mid-read, which is the
+    // one layout-dependent answer this whole cut exists to remove.
+    if gesture == .tab, hasEditableBuffer || hasPendingDocumentLoad,
+      documentWindowRegistry.isLoneTab(window)
+    {
       closeActiveDocument()
       return false
     }

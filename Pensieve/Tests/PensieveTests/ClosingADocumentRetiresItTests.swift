@@ -290,6 +290,42 @@ final class ClosingADocumentRetiresItTests: XCTestCase {
     XCTAssertEqual(harness.appState.openFiles.map(\.url), [keptURL])
   }
 
+  /// NOT the carve-out, even though it looks like one for a moment. A tab
+  /// STAGING a large open is SHOWING its document: the click turn already
+  /// published the file's title, URL and identity into it, and only the bytes
+  /// are late. Its "×" is therefore the same document decision every other
+  /// tab's is — the file retires and the window survives on the launcher —
+  /// even though `hasEditableBuffer` is false throughout, which it is BY DESIGN
+  /// (the placeholder buffer must never be writable over the file being read).
+  /// Judging this tab by that predicate alone tore the window down mid-read,
+  /// which is exactly the layout-dependent answer this cut exists to remove.
+  func testClosingALoneLoadingTabRetiresTheFileAndKeepsTheWindow() throws {
+    let harness = try makeHarness()
+    let stagedURL = try harness.openStagedInWindow(named: "huge.md")
+
+    let window = harness.makeRegisteredWindow()
+    harness.tabGroup.windows = [window]
+
+    XCTAssertTrue(harness.appState.documentSession.isLoading, "the open must still be staged")
+    XCTAssertFalse(
+      harness.controller.hasEditableBuffer,
+      "…with no editable buffer behind it, which is what made this case look like a launcher")
+
+    XCTAssertFalse(
+      harness.controller.windowShouldClose(window, gesture: .tab),
+      "the × closed the DOCUMENT, so the window must survive to show the launcher")
+
+    XCTAssertTrue(
+      harness.appState.openFiles.isEmpty,
+      "a staged file's row is retired by its × exactly like a loaded one's")
+    XCTAssertFalse(
+      harness.restoredFilePaths().contains(stagedURL.path),
+      "and its bookmark goes too, or the next launch undoes the close")
+    XCTAssertFalse(
+      harness.appState.documentIsLoading,
+      "the close is also an answer to 'is that read still wanted?' — no")
+  }
+
   /// A tab gesture on a window that still has siblings is unchanged: the tab
   /// really does go away, and only its file retires. The gesture short-circuits
   /// the settling turn the sibling heuristic needed, so the answer no longer
@@ -504,6 +540,22 @@ private struct RetirementHarness {
   @discardableResult
   func openInWindow(named name: String, contents: String) throws -> URL {
     let url = try write(named: name, contents: contents)
+    controller.openFile(url: url)
+    return url
+  }
+
+  /// A file past `LargeDocument.sizeBudget`, so its open STAGES: the window
+  /// claims the document in this turn and the bytes arrive from a background
+  /// read, leaving the session `.loading`. These pins never yield the main
+  /// actor, so that read cannot land mid-test — the session is still staged at
+  /// every assertion below.
+  @discardableResult
+  func openStagedInWindow(named name: String) throws -> URL {
+    let url = try write(
+      named: name,
+      contents: String(repeating: "large document line for the size gate\n", count: 30_000))
+    XCTAssertTrue(
+      LargeDocument.isLargeFile(at: url), "fixture must be past the gate or the open is synchronous")
     controller.openFile(url: url)
     return url
   }
