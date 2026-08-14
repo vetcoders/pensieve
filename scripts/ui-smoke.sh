@@ -2992,6 +2992,12 @@ end windowElementByIdentifier
 -- its label, which is a failure mode a status-bar control declared inline does
 -- not have.
 on statusBarMenuItemsAfterSinglePress(targetPID, targetName, targetIdentifier, expectedMenuItems, timeoutTenths)
+  -- `timeoutTenths` governs the POST-PRESS menu polling only, never this
+  -- lookup: "does the control exist" and "has SwiftUI published its menu yet"
+  -- are different waits with different failure meanings. The fixed 50 mirrors
+  -- the 5x1s in `toolbarElementByAccessibleName` that the toolbar twin uses, so
+  -- both helpers give a missing control the same budget; spending the caller's
+  -- shorter menu timeout here would quietly cut it to 3s and desynchronise them.
   set controlRef to my windowElementByIdentifier(targetPID, targetIdentifier, 50)
   tell application "System Events"
     -- SwiftUI's borderless `Menu` bridges to an AppKit pop-up button, which AX

@@ -148,6 +148,17 @@ struct EditorStatusBar: View {
     .fixedSize()
     .help("Preview appearance — markdown flavor and reading theme")
     .accessibilityLabel("Preview Appearance")
+    // The static label names the ACTION; without a value beside it the control
+    // announces only that, and the current pair — which the sighted user reads
+    // straight off the chip — reaches nobody else. Since this chip is the only
+    // appearance entry point, that left the active skin and flavor discoverable
+    // solely by opening both pickers and inspecting their checkmarks. Not
+    // pinned in `EditorStatusBarAppearanceTests` on purpose: `NSHostingView`
+    // publishes no accessibility tree in a test process (measured, see that
+    // file's header), so a pin keyed on this would skip itself into a
+    // permanent green. `scripts/ui-smoke.sh` is where it is observable.
+    .accessibilityValue(
+      "\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
     .accessibilityIdentifier(Self.appearanceIdentifier)
   }
 }
