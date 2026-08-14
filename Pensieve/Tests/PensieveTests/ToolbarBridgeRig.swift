@@ -135,7 +135,6 @@ final class ToolbarBridgeRig {
     EditorToolbelt(
       appState: appState,
       controller: controller,
-      themeManager: themeManager,
       onDispatchToAgent: {},
       isDispatchDisabled: false,
       dispatchHelp: "Dispatch to Agent")
@@ -234,8 +233,9 @@ final class ToolbarBridgeRig {
   /// production has already finished by the time the rig's initializer returns.
   /// It has not, necessarily — SwiftUI can re-derive a group's menu form after
   /// the sink ran, and it re-derives exactly the family whose CONTENT it
-  /// rewrites, which is why the view family (its appearance control is labelled
-  /// with the live skin name) was the only one a CI runner ever caught derived.
+  /// rewrites, which is why the view family — labelled with the live skin name
+  /// back when it still carried the appearance menu — was the only one a CI
+  /// runner ever caught derived.
   @discardableResult
   func awaitOverflowConvergence(attempts: Int = 40) -> Bool {
     for _ in 0..<attempts {
@@ -417,7 +417,6 @@ private struct ToolbarBridgeHost: View {
     EditorToolbelt(
       appState: appState,
       controller: controller,
-      themeManager: themeManager,
       onDispatchToAgent: {},
       isDispatchDisabled: false,
       dispatchHelp: "Dispatch to Agent")

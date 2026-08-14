@@ -242,8 +242,8 @@ final class EditorToolbarBridgeTests: XCTestCase {
   /// THE SKIN-SWITCH PIN, on a window that DOES host an editor.
   ///
   /// The editor asserts the chrome on every update pass, and that was still not
-  /// enough: switching skins rebuilds the toolbar (the appearance picker's label
-  /// carries the skin name), the re-bridge lands AFTER the editor's pass, and it
+  /// enough: switching skins rebuilds the toolbar (the view hosting it observes
+  /// the theme manager), the re-bridge lands AFTER the editor's pass, and it
   /// takes `selectedSegmentBezelColor` back to `nil`. Measured on this rig before
   /// the sink existed: the bezel reads `nil` at +50 ms, +350 ms and +1.35 s after
   /// the switch, and only an UNRELATED later SwiftUI pass ever repaints it. So

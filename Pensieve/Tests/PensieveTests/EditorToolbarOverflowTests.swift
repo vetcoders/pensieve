@@ -173,8 +173,9 @@ final class EditorToolbarOverflowTests: XCTestCase {
   /// The view family is authored too, because icon segments cost the bridged
   /// picker its menu-form TITLE (measured: the derived entry comes back blank).
   /// An unnamed entry is as unreachable as a missing one, so the family's own
-  /// entries have to carry the mode names, the flavor and the skin — and have to
-  /// actually switch them.
+  /// entry has to carry the mode names — and has to actually switch them. The
+  /// appearance axes it used to carry beside them are gone from the toolbar
+  /// entirely; their home is the status bar's chip, which nothing clips.
   ///
   /// Run at TWO widths this test chooses itself, and asserts it got: 1600pt,
   /// where the rig proves nothing is clipped, and 900pt, where it proves the
@@ -186,7 +187,7 @@ final class EditorToolbarOverflowTests: XCTestCase {
   /// family or hiding it. The earlier single-width version asserted only
   /// whichever state the host machine happened to produce.
   @MainActor
-  func testOverflowViewFamilyStillSwitchesModeAndSkinWhetherClippedOrNot() throws {
+  func testOverflowViewFamilyStillSwitchesModeWhetherClippedOrNot() throws {
     for width in [1600, 900] as [CGFloat] {
       try runViewFamilyScenario(width: width)
     }
@@ -215,47 +216,31 @@ final class EditorToolbarOverflowTests: XCTestCase {
       "the toolbar never reached agreement with its overflow menus at \(Int(width))pt — "
         + rig.overflowDiagnostics)
 
-    let theme = try XCTUnwrap(
-      Self.authoredItem(named: "Theme", in: rig),
-      "no authored Theme entry at \(Int(width))pt — " + rig.overflowDiagnostics)
-    XCTAssertEqual(theme.submenu?.items.map(\.title), PensieveTheme.allCases.map(\.displayName))
-    let wantedSkin = try XCTUnwrap(PensieveTheme.allCases.last { $0 != rig.themeManager.skin })
-    let skinItem = try XCTUnwrap(theme.submenu?.items.first { $0.title == wantedSkin.displayName })
-    let validator = try XCTUnwrap(skinItem.target as? ToolbarOverflowController)
-    XCTAssertEqual(validator.validateMenuItem(skinItem), true)
-    XCTAssertEqual(skinItem.state, .off, "an unselected skin must not read as the active one")
-    Self.fire(skinItem)
-    XCTAssertEqual(
-      rig.themeManager.skin, wantedSkin, "the » menu's theme entry did not change the skin")
-    _ = validator.validateMenuItem(skinItem)
-    XCTAssertEqual(skinItem.state, .on, "the active skin is not marked in the » menu")
-
-    // A skin switch re-bridges the toolbar (the appearance control's label
-    // carries the skin name), so the menu is re-read only after the toolbar and
-    // its authored forms are back in agreement — never after a bare sleep.
-    XCTAssertTrue(
-      rig.syncOverflowMenus(),
-      "the overflow menus never came back into agreement with the toolbar at \(Int(width))pt — "
-        + rig.overflowDiagnostics)
-
-    // Switching to focus mode takes the appearance control off the toolbar
-    // (`showsAppearanceControls`), so the authored menu has to follow the
-    // toolbar rather than describe a control that is no longer there.
     let mode = try XCTUnwrap(
       Self.authoredItem(named: "Mode", in: rig),
       "no authored Mode entry at \(Int(width))pt — " + rig.overflowDiagnostics)
     XCTAssertEqual(mode.submenu?.items.map(\.title), EditorMode.allCases.map(\.label))
+
     let modeItem = try XCTUnwrap(mode.submenu?.items.first { $0.title == EditorMode.focus.label })
+    let validator = try XCTUnwrap(modeItem.target as? ToolbarOverflowController)
+    XCTAssertEqual(validator.validateMenuItem(modeItem), true)
+    XCTAssertEqual(modeItem.state, .off, "an unselected mode must not read as the active one")
     Self.fire(modeItem)
     XCTAssertEqual(
       rig.appState.mode, .focus, "the » menu's mode entry did not change the editor layout")
+    _ = validator.validateMenuItem(modeItem)
+    XCTAssertEqual(modeItem.state, .on, "the active mode is not marked in the » menu")
 
+    // The mode change re-evaluates the whole toolbar declaration, so the menu
+    // is re-read only after the toolbar and its authored forms are back in
+    // agreement — never after a bare sleep.
     XCTAssertTrue(
       rig.syncOverflowMenus(),
       "the overflow menus did not follow the mode switch — " + rig.overflowDiagnostics)
-    XCTAssertNil(
-      Self.authoredItem(named: "Theme", in: rig),
-      "focus mode has no preview surface to dress, but the » menu still offers its theme picker")
+    XCTAssertEqual(
+      Self.authoredItem(named: "Mode", in: rig)?.submenu?.items.map(\.title),
+      EditorMode.allCases.map(\.label),
+      "the view family lost its mode axis across the rebuild — " + rig.overflowDiagnostics)
   }
 
   /// The ordering that made CI red while this machine stayed green.
@@ -297,11 +282,13 @@ final class EditorToolbarOverflowTests: XCTestCase {
   }
 
   /// The CI shape, reproduced exactly: at 900pt the view family is behind the
-  /// chevron AND is the only group SwiftUI re-derives, because its appearance
-  /// control is labelled with the live skin name. The runner caught five of six
-  /// families authored and that one back on SwiftUI's derived form — which for
-  /// an icon-segment picker is a blank title over blank children, i.e. an
-  /// overflow entry the operator cannot read or reach.
+  /// chevron and SwiftUI hands it back its own derived form — which for an
+  /// icon-segment picker is a blank title over blank children, i.e. an overflow
+  /// entry the operator cannot read or reach. The runner caught five of six
+  /// families authored and that one derived. (On the runner the trigger was the
+  /// live skin name in the family's appearance control; that control has since
+  /// moved to the status bar, so the re-derive is staged here rather than
+  /// waited for — the recovery under test is the same either way.)
   ///
   /// Clipping is not what breaks it and this pins that too: the other two
   /// clipped families must stay authored throughout, exactly as they did on the
@@ -322,12 +309,11 @@ final class EditorToolbarOverflowTests: XCTestCase {
     let derived = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let submenu = NSMenu(title: "")
     submenu.addItem(withTitle: "", action: nil, keyEquivalent: "")
-    submenu.addItem(withTitle: "", action: nil, keyEquivalent: "")
     derived.submenu = submenu
     viewGroup.menuFormRepresentation = derived
 
     XCTAssertNil(
-      Self.authoredItem(named: "Theme", in: rig), "the re-derive did not take the view family")
+      Self.authoredItem(named: "Mode", in: rig), "the re-derive did not take the view family")
     XCTAssertNotNil(
       Self.authoredItem(named: "Reload Preview", in: rig),
       "a clipped family that SwiftUI did NOT rewrite must keep its authored form — "
@@ -337,10 +323,10 @@ final class EditorToolbarOverflowTests: XCTestCase {
       rig.awaitOverflowConvergence(),
       "production never took the view family back from SwiftUI's derived form — "
         + rig.overflowDiagnostics)
-    XCTAssertNotNil(
-      Self.authoredItem(named: "Theme", in: rig),
-      "the view family converged without its theme picker — " + rig.overflowDiagnostics)
-    XCTAssertNotNil(Self.authoredItem(named: "Mode", in: rig), rig.overflowDiagnostics)
+    XCTAssertEqual(
+      Self.authoredItem(named: "Mode", in: rig)?.submenu?.items.map(\.title),
+      EditorMode.allCases.map(\.label),
+      "the view family converged without its mode axis — " + rig.overflowDiagnostics)
   }
 
   /// The repair trigger itself, driven by the cycle the app really uses.
@@ -375,10 +361,9 @@ final class EditorToolbarOverflowTests: XCTestCase {
 
   // MARK: - Re-assertion
 
-  /// SwiftUI hands a rebuilt toolbar group a freshly derived form — a skin
-  /// switch rebuilds the toolbar every time, because the appearance menu's label
-  /// carries the skin name. The pass has to win that back, and has to stay quiet
-  /// when there is nothing to win.
+  /// SwiftUI hands a rebuilt toolbar group a freshly derived form — every mode
+  /// change and every window rebuild is an opportunity. The pass has to win that
+  /// back, and has to stay quiet when there is nothing to win.
   @MainActor
   func testOverflowMenusAreReassertedAfterAClobberAndSilentOtherwise() throws {
     let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")

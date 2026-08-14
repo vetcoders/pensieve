@@ -12,6 +12,16 @@ struct EditorStatusBar: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var themeManager: ThemeManager
 
+  /// The chip and its two axes, named once so the AX contract has a single
+  /// source. `scripts/ui-smoke.sh` looks the chip up by `appearanceIdentifier`
+  /// on the live app and asserts both pickers are in the menu it opens — the
+  /// only place that reachability can be proven, since `NSHostingView`
+  /// publishes no accessibility tree in a headless test process (see
+  /// `WindowErrorChromeRig`).
+  static let appearanceIdentifier = "pensieve.statusbar.appearance"
+  static let flavorPickerIdentifier = "pensieve.statusbar.flavorPicker"
+  static let skinPickerIdentifier = "pensieve.statusbar.skinPicker"
+
   private var text: String { appState.activeDocumentText }
 
   private var metrics: DocumentMetrics { DocumentMetrics.measure(text) }
@@ -93,10 +103,12 @@ struct EditorStatusBar: View {
   }
 
   /// The reading-surface chip: `Theme / Flavor` in a hairline capsule that opens
-  /// the SAME two appearance pickers as the toolbar's menu. Previously Flavor and
-  /// Theme were two inert text cells — the user could read the active theme but
-  /// had to travel to the toolbar to change it. Bound straight into the shared
-  /// `ThemeManager`, so a change here re-dresses both panels live.
+  /// both appearance pickers. THE ONLY mouse-reachable place either axis can be
+  /// changed — the titlebar's appearance menu was removed when the toolbar ran
+  /// out of width, and no menu-bar command carries these axes — so neither
+  /// picker may leave this chip without another home being built first. Bound
+  /// straight into the shared `ThemeManager`, so a change here re-dresses both
+  /// panels live.
   private var appearanceChip: some View {
     Menu {
       Picker("Flavor", selection: $themeManager.current) {
@@ -105,14 +117,24 @@ struct EditorStatusBar: View {
         }
       }
       .pickerStyle(.menu)
+      .help("Markdown flavor — plain Markdown or GitHub Flavored")
+      .accessibilityIdentifier(Self.flavorPickerIdentifier)
 
+      // Reading-surface skin, orthogonal to the flavor: it re-dresses BOTH the
+      // rendered preview and the source editor — surface, typography and syntax
+      // tokens — without changing the markdown dialect.
       Picker("Theme", selection: $themeManager.skin) {
         ForEach(PensieveTheme.allCases) { skin in
           Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
         }
       }
       .pickerStyle(.menu)
+      .help("Preview theme — the reading surface for the rendered markdown")
+      .accessibilityIdentifier(Self.skinPickerIdentifier)
     } label: {
+      // Both axes, always, in this order: `EditorStatusBarAppearanceTests`
+      // spells this format out rather than calling back into it, so a chip that
+      // quietly drops an axis fails a test instead of shipping.
       Text("\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
         .foregroundStyle(.primary)
         .padding(.horizontal, 6)
@@ -125,6 +147,7 @@ struct EditorStatusBar: View {
     .menuStyle(.borderlessButton)
     .fixedSize()
     .help("Preview appearance — markdown flavor and reading theme")
-    .accessibilityIdentifier("pensieve.statusbar.appearance")
+    .accessibilityLabel("Preview Appearance")
+    .accessibilityIdentifier(Self.appearanceIdentifier)
   }
 }

@@ -147,7 +147,6 @@ struct ContentView: View {
     EditorToolbelt(
       appState: appState,
       controller: controller,
-      themeManager: themeManager,
       onDispatchToAgent: {
         controller.requestCurrentDocumentDispatch(workflow: "implement", source: .toolbar)
       },
