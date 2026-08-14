@@ -106,7 +106,23 @@ struct DocumentWindowRootView: View {
     let appState = AppState(workspaceStore: workspaceStore)
     _appState = State(wrappedValue: appState)
     _controller = StateObject(
-      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+      wrappedValue: {
+        let controller = AppController(appState: appState, importsFoldersInBackground: true)
+        // The FIRST render of a "+" / ⌘T / ⌘N tab must already be an editor.
+        // `.task` below (and the coordinator hop behind it) runs run-loop turns
+        // after the tab is on screen and selected, so a draft created there
+        // leaves a fully interactive launcher tab titled "Pensieve" sitting
+        // between the user's documents in the meantime. This autoclosure is
+        // evaluated exactly once, by the SwiftUI storage that actually backs
+        // this window, and before its body first reads the session — which is
+        // the only place on this path that is on the presentation's own clock.
+        // See `NewTabSessionSeed`; `start(intent:)` still asks, idempotently.
+        NewTabSessionSeed.seedIfNeeded(
+          controller: controller,
+          intent: launchIntent,
+          initialDocument: initialDocument)
+        return controller
+      }())
   }
 
   var body: some View {

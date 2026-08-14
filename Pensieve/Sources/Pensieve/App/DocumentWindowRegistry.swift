@@ -837,12 +837,12 @@ final class DocumentWindowRegistry: ObservableObject {
     guard let newWindow = makeUntitledWindow() else { return false }
     guard isTabMutationHost(window) else {
       DebugTrace.log("newUntitledTab source became ineligible during factory creation")
-      closeWindow(newWindow)
+      retireUnplacedUntitledWindow(newWindow)
       return false
     }
     guard prepareTabbedWindow(window) else {
       DebugTrace.log("newUntitledTab source lost document ownership during factory creation")
-      closeWindow(newWindow)
+      retireUnplacedUntitledWindow(newWindow)
       return false
     }
     DebugTrace.log("newUntitledTab from '\(window.title)'")
@@ -865,7 +865,42 @@ final class DocumentWindowRegistry: ObservableObject {
     }
     untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
     markContentWindow(newWindow)
+    publishPendingUntitledTab(newWindow)
     return newWindow
+  }
+
+  /// Publishes the new tab into Open Files at the moment it is CREATED, before
+  /// it is merged and ordered front.
+  ///
+  /// The native tab group mutates synchronously at the click, while the accessor
+  /// that used to be the descriptor's only source attaches several run-loop
+  /// turns later. Open Files therefore trailed the tab bar by exactly the number
+  /// of tabs still waiting for their SwiftUI root — a sidebar that disagreed
+  /// with the tabs above it for as long as that took.
+  ///
+  /// The identity is minted here and PARKED in `fallbackUntitledIdentities`, so
+  /// the accessor's own attach reconciles this row instead of appending a second
+  /// one: an attach carrying the session's identity replaces this descriptor in
+  /// place (`publish` matches on the window first), and an attach that has no
+  /// identity of its own reuses the parked one.
+  private func publishPendingUntitledTab(_ window: NSWindow) {
+    let windowID = ObjectIdentifier(window)
+    let identity = fallbackUntitledIdentities[windowID] ?? .untitled(UUID())
+    fallbackUntitledIdentities[windowID] = identity
+    _ = publish(
+      identity: identity,
+      displayTitle: normalizedTitle(window.title, fallback: "Untitled"),
+      fileURL: nil,
+      isDirty: false,
+      window: window)
+  }
+
+  /// A factory window that never became a tab. It was already published, so it
+  /// has to be retired through the same reconcile a close runs — otherwise the
+  /// abandoned window survives as a phantom Open Files row.
+  private func retireUnplacedUntitledWindow(_ window: NSWindow) {
+    reconcileClosedWindowState(window)
+    closeWindow(window)
   }
 
   @discardableResult
@@ -921,8 +956,15 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     guard let resolvedIdentity else {
+      // A "+" tab whose session has not reached the accessor yet still owns the
+      // pending descriptor minted for it at creation. That row IS the Open Files
+      // truth for this tab, so an identity-less pass must not sweep it away and
+      // reopen the very gap `publishPendingUntitledTab` closes.
+      let isPendingUntitledTab = untitledTabWindows[windowID]?.window === window
       releaseStaleDocumentMappings(for: window, keeping: nil)
-      removeDescriptors(for: window, keeping: nil)
+      if !isPendingUntitledTab {
+        removeDescriptors(for: window, keeping: nil)
+      }
       if hasEditableBuffer {
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
