@@ -10,6 +10,7 @@ set -euo pipefail
 # io.vetcoders.pensieve or the operator's production data.
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
+NATIVE_TAB_AX_PROBE_SOURCE="$SCRIPT_DIR/lib/native-tab-ax-probe.swift"
 # shellcheck source=scripts/lib/isolated-app.sh
 source "$SCRIPT_DIR/lib/isolated-app.sh"
 
@@ -30,6 +31,17 @@ SMOKE_SUPPORT=""
 IDENTITY_MANIFEST=""
 OWNED_PID=""
 EXECUTABLE_PATH=""
+SETTINGS_LIFECYCLE_SCRIPT=""
+SETTINGS_CG_GUARD_PID=""
+SETTINGS_CG_GUARD_ROOT=""
+SETTINGS_CG_GUARD_READY=""
+SETTINGS_CG_GUARD_DONE=""
+SETTINGS_CG_GUARD_OUTPUT=""
+SETTINGS_CG_GUARD_NATURAL_EXIT_POLLS=200
+SETTINGS_CG_GUARD_TERM_EXIT_POLLS=80
+SETTINGS_CG_GUARD_KILL_EXIT_POLLS=80
+SETTINGS_CG_GUARD_REAP_POLL_SECONDS=0.025
+NATIVE_TAB_AX_PROBE=""
 
 # This watchdog encloses the complete toolbar scenario: process/window waits,
 # three mode transitions, native-menu publication, editable-New, and the final
@@ -137,10 +149,367 @@ for w in wl where (w["kCGWindowOwnerPID"] as? Int) == ownerPID
   && (w["kCGWindowLayer"] as? Int) == 0 {
   total += 1
   if (w["kCGWindowIsOnscreen"] as? Bool) == true { onscreen += 1 }
-  print("CGWINDOW num=\(w["kCGWindowNumber"] ?? "?") name=\(w["kCGWindowName"] ?? "-") onscreen=\(w["kCGWindowIsOnscreen"] ?? false)")
+  let bounds = w["kCGWindowBounds"] as? [String: Any] ?? [:]
+  let x = (bounds["X"] as? NSNumber)?.intValue ?? Int.min
+  let y = (bounds["Y"] as? NSNumber)?.intValue ?? Int.min
+  let width = (bounds["Width"] as? NSNumber)?.intValue ?? Int.min
+  let height = (bounds["Height"] as? NSNumber)?.intValue ?? Int.min
+  print("CGWINDOW num=\(w["kCGWindowNumber"] ?? "?") onscreen=\(w["kCGWindowIsOnscreen"] ?? false) x=\(x) y=\(y) width=\(width) height=\(height) name=\(w["kCGWindowName"] ?? "-")")
 }
 print("CGWINDOW_SUMMARY total=\(total) onscreen=\(onscreen)")
 EOF
+}
+
+# Settings failures have historically survived one UI layer: AX could look
+# clean while WindowServer still owned a real layer-0 shell. Poll CoreGraphics
+# inside one Swift invocation until the complete exact-PID census holds steady,
+# rather than sampling one frame or repeatedly recompiling the probe.
+settled_window_server_state() {
+  local expected_total="$1" expected_onscreen="$2"
+  [[ -n "${OWNED_PID:-}" ]] || return 1
+  SMOKE_OWNER_PID="$OWNED_PID" \
+    SMOKE_EXPECTED_CG_TOTAL="$expected_total" \
+    SMOKE_EXPECTED_CG_ONSCREEN="$expected_onscreen" \
+    swift - <<'EOF'
+import CoreGraphics
+import Foundation
+
+struct Entry: Equatable {
+  let number: Int
+  let onscreen: Bool
+  let x: Int
+  let y: Int
+  let width: Int
+  let height: Int
+  let name: String
+}
+
+let environment = ProcessInfo.processInfo.environment
+let ownerPID = Int(environment["SMOKE_OWNER_PID"] ?? "") ?? -1
+let expectedTotal = Int(environment["SMOKE_EXPECTED_CG_TOTAL"] ?? "") ?? -1
+let expectedOnscreen = Int(environment["SMOKE_EXPECTED_CG_ONSCREEN"] ?? "") ?? -1
+
+func census() -> [Entry] {
+  let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)
+    as? [[String: Any]] ?? []
+  return windows.compactMap { window -> Entry? in
+    guard (window["kCGWindowOwnerPID"] as? Int) == ownerPID,
+      (window["kCGWindowLayer"] as? Int) == 0
+    else { return nil }
+    let bounds = window["kCGWindowBounds"] as? [String: Any] ?? [:]
+    return Entry(
+      number: (window["kCGWindowNumber"] as? NSNumber)?.intValue ?? -1,
+      onscreen: (window["kCGWindowIsOnscreen"] as? Bool) == true,
+      x: (bounds["X"] as? NSNumber)?.intValue ?? Int.min,
+      y: (bounds["Y"] as? NSNumber)?.intValue ?? Int.min,
+      width: (bounds["Width"] as? NSNumber)?.intValue ?? Int.min,
+      height: (bounds["Height"] as? NSNumber)?.intValue ?? Int.min,
+      name: window["kCGWindowName"] as? String ?? "-")
+  }.sorted { $0.number < $1.number }
+}
+
+var previous: [Entry] = []
+var stableReads = 0
+var latest: [Entry] = []
+for _ in 0..<60 {
+  latest = census()
+  let onscreen = latest.filter(\.onscreen).count
+  if latest.count == expectedTotal && onscreen == expectedOnscreen {
+    stableReads = latest == previous ? stableReads + 1 : 1
+    if stableReads >= 3 { break }
+  } else {
+    stableReads = 0
+  }
+  previous = latest
+  Thread.sleep(forTimeInterval: 0.1)
+}
+
+for window in latest {
+  print(
+    "CGWINDOW num=\(window.number) onscreen=\(window.onscreen) "
+      + "x=\(window.x) y=\(window.y) width=\(window.width) height=\(window.height) "
+      + "name=\(window.name)")
+}
+let onscreen = latest.filter(\.onscreen).count
+print("CGWINDOW_SUMMARY total=\(latest.count) onscreen=\(onscreen)")
+if stableReads < 3 { exit(4) }
+EOF
+}
+
+# The blocked Cmd+, onboarding probe needs stronger evidence than two bracketed
+# screenshots. One Swift process derives the exact layer-0 baseline for the
+# authenticated smoke PID, signals readiness, and then samples the complete
+# (number, visibility, bounds) tuple set while Accessibility drives the real
+# shortcut. Any transient surface observed by that ~25 ms census is a failure.
+start_settings_onboarding_cg_guard() {
+  local guard_root probe_pid
+  [[ -n "${SMOKE_CAPSULE_ROOT:-}" && -d "$SMOKE_CAPSULE_ROOT" ]] || return 2
+  [[ -z "${SETTINGS_CG_GUARD_PID:-}" ]] || return 2
+  probe_pid="$(authenticated_owned_pid)" || return $?
+  guard_root="$SMOKE_CAPSULE_ROOT/settings-onboarding-command-cg"
+  /bin/mkdir "$guard_root" || return $?
+  SETTINGS_CG_GUARD_ROOT="$guard_root"
+  SETTINGS_CG_GUARD_READY="$guard_root/ready"
+  SETTINGS_CG_GUARD_DONE="$guard_root/done"
+  SETTINGS_CG_GUARD_OUTPUT="$guard_root/output.log"
+
+  SMOKE_OWNER_PID="$probe_pid" \
+    SMOKE_CG_READY="$SETTINGS_CG_GUARD_READY" \
+    SMOKE_CG_DONE="$SETTINGS_CG_GUARD_DONE" \
+    swift - >"$SETTINGS_CG_GUARD_OUTPUT" 2>&1 <<'EOF' &
+import CoreGraphics
+import Foundation
+
+struct Entry: Equatable, CustomStringConvertible {
+  let number: Int
+  let onscreen: Bool
+  let x: Double
+  let y: Double
+  let width: Double
+  let height: Double
+
+  var description: String {
+    "number=\(number) onscreen=\(onscreen) x=\(x) y=\(y) width=\(width) height=\(height)"
+  }
+}
+
+let environment = ProcessInfo.processInfo.environment
+guard let ownerPID = Int(environment["SMOKE_OWNER_PID"] ?? ""), ownerPID > 0,
+  let readyPath = environment["SMOKE_CG_READY"], !readyPath.isEmpty,
+  let donePath = environment["SMOKE_CG_DONE"], !donePath.isEmpty
+else {
+  fputs("invalid Settings CG guard environment\n", stderr)
+  exit(2)
+}
+
+func census() -> [Entry] {
+  let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)
+    as? [[String: Any]] ?? []
+  return windows.compactMap { window -> Entry? in
+    guard (window["kCGWindowOwnerPID"] as? NSNumber)?.intValue == ownerPID,
+      (window["kCGWindowLayer"] as? NSNumber)?.intValue == 0
+    else { return nil }
+    let bounds = window["kCGWindowBounds"] as? [String: Any] ?? [:]
+    return Entry(
+      number: (window["kCGWindowNumber"] as? NSNumber)?.intValue ?? -1,
+      onscreen: (window["kCGWindowIsOnscreen"] as? Bool) == true,
+      x: (bounds["X"] as? NSNumber)?.doubleValue ?? -.infinity,
+      y: (bounds["Y"] as? NSNumber)?.doubleValue ?? -.infinity,
+      width: (bounds["Width"] as? NSNumber)?.doubleValue ?? -.infinity,
+      height: (bounds["Height"] as? NSNumber)?.doubleValue ?? -.infinity)
+  }.sorted { $0.number < $1.number }
+}
+
+func describe(_ entries: [Entry]) -> String {
+  entries.map(\.description).joined(separator: " | ")
+}
+
+func failMismatch(_ phase: String, baseline: [Entry], observed: [Entry]) -> Never {
+  fputs("Settings CG census changed during \(phase)\n", stderr)
+  fputs("baseline: \(describe(baseline))\n", stderr)
+  fputs("observed: \(describe(observed))\n", stderr)
+  exit(5)
+}
+
+var previous: [Entry]?
+var stableReads = 0
+var baseline: [Entry]?
+for _ in 0..<400 {
+  let observed = census()
+  if !observed.isEmpty && observed.allSatisfy(\.onscreen) {
+    stableReads = observed == previous ? stableReads + 1 : 1
+    if stableReads >= 3 {
+      baseline = observed
+      break
+    }
+  } else {
+    stableReads = 0
+  }
+  previous = observed
+  Thread.sleep(forTimeInterval: 0.025)
+}
+
+guard let baseline else {
+  fputs("Settings CG baseline did not reach three identical, nonempty, entirely-onscreen reads\n", stderr)
+  exit(4)
+}
+
+do {
+  try Data("ready\n".utf8).write(to: URL(fileURLWithPath: readyPath), options: .atomic)
+} catch {
+  fputs("could not publish Settings CG ready signal: \(error)\n", stderr)
+  exit(3)
+}
+print("SETTINGS_ONBOARDING_COMMAND_BLOCK_CG_BASELINE \(describe(baseline))")
+
+let deadline = Date().addingTimeInterval(60)
+while !FileManager.default.fileExists(atPath: donePath) {
+  let observed = census()
+  if observed != baseline {
+    failMismatch("concurrent sampling", baseline: baseline, observed: observed)
+  }
+  if Date() >= deadline {
+    fputs("Settings CG guard timed out waiting for the done signal\n", stderr)
+    exit(6)
+  }
+  Thread.sleep(forTimeInterval: 0.025)
+}
+
+let final = census()
+if final != baseline {
+  failMismatch("post-done final census", baseline: baseline, observed: final)
+}
+print("SETTINGS_ONBOARDING_COMMAND_BLOCK_CG=PASS")
+EOF
+  SETTINGS_CG_GUARD_PID=$!
+}
+
+wait_for_settings_onboarding_cg_ready() {
+  local sample_number=0
+  [[ -n "${SETTINGS_CG_GUARD_PID:-}" ]] || return 2
+  while (( sample_number < 400 )); do
+    [[ -f "$SETTINGS_CG_GUARD_READY" ]] && return 0
+    kill -0 "$SETTINGS_CG_GUARD_PID" 2>/dev/null || return 1
+    sleep 0.025
+    sample_number=$((sample_number + 1))
+  done
+  return 1
+}
+
+# Reap one exact background child without relying on Bash 4's `wait -n` or an
+# unbounded blocking wait. The child first gets a bounded natural-exit window,
+# then TERM and KILL grace windows. A process that crossed the natural deadline
+# always returns 124, even if TERM let it run a signal handler and choose its
+# own exit code. `wait` is used only after kill -0 proves the PID is gone, so it
+# merely collects Bash's cached status and cannot block.
+reap_exact_child_bounded() {
+  local pid="${1:-}"
+  local natural_exit_polls="${2:-}"
+  local term_exit_polls="${3:-}"
+  local kill_exit_polls="${4:-}"
+  local poll_seconds="${5:-}"
+  local sample_number=0 child_status=0
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != "$$" ]] || return 2
+  [[ "$natural_exit_polls" =~ ^[0-9]+$ ]] || return 2
+  [[ "$term_exit_polls" =~ ^[0-9]+$ ]] || return 2
+  [[ "$kill_exit_polls" =~ ^[0-9]+$ ]] || return 2
+  [[ "$poll_seconds" =~ ^0\.[0-9]+$ ]] || return 2
+
+  while (( sample_number < natural_exit_polls )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      if wait "$pid"; then child_status=0; else child_status=$?; fi
+      return "$child_status"
+    fi
+    /bin/sleep "$poll_seconds"
+    sample_number=$((sample_number + 1))
+  done
+  if ! kill -0 "$pid" 2>/dev/null; then
+    if wait "$pid"; then child_status=0; else child_status=$?; fi
+    return "$child_status"
+  fi
+
+  kill -TERM "$pid" 2>/dev/null || true
+  sample_number=0
+  while (( sample_number < term_exit_polls )); do
+    kill -0 "$pid" 2>/dev/null || break
+    /bin/sleep "$poll_seconds"
+    sample_number=$((sample_number + 1))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    sample_number=0
+    while (( sample_number < kill_exit_polls )); do
+      kill -0 "$pid" 2>/dev/null || break
+      /bin/sleep "$poll_seconds"
+      sample_number=$((sample_number + 1))
+    done
+  fi
+
+  # Collect a terminated child, but never turn its signal-derived status into
+  # success: crossing the natural-exit deadline is a timeout by definition.
+  if ! kill -0 "$pid" 2>/dev/null; then
+    if wait "$pid"; then child_status=0; else child_status=$?; fi
+  fi
+  return 124
+}
+
+finish_settings_onboarding_cg_guard() {
+  local guard_status=0 wait_status=0 cleanup_status=0
+  [[ -n "${SETTINGS_CG_GUARD_PID:-}" ]] || return 2
+  if : >"$SETTINGS_CG_GUARD_DONE"; then
+    :
+  else
+    guard_status=$?
+    # Without the done signal the watcher would wait for its full 60-second
+    # deadline. Stop the exact child now; the caller already has a hard
+    # failure to report and cleanup must not strand a Swift process.
+    kill "$SETTINGS_CG_GUARD_PID" 2>/dev/null || true
+  fi
+  if reap_exact_child_bounded \
+    "$SETTINGS_CG_GUARD_PID" \
+    "$SETTINGS_CG_GUARD_NATURAL_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_TERM_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_KILL_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_REAP_POLL_SECONDS"; then
+    :
+  else
+    wait_status=$?
+    [[ "$guard_status" -ne 0 ]] || guard_status="$wait_status"
+  fi
+  [[ -f "$SETTINGS_CG_GUARD_OUTPUT" ]] && /bin/cat "$SETTINGS_CG_GUARD_OUTPUT"
+  /bin/rm -f -- \
+    "$SETTINGS_CG_GUARD_READY" \
+    "$SETTINGS_CG_GUARD_DONE" \
+    "$SETTINGS_CG_GUARD_OUTPUT" \
+    || cleanup_status=$?
+  /bin/rmdir -- "$SETTINGS_CG_GUARD_ROOT" 2>/dev/null || cleanup_status=$?
+  [[ "$guard_status" -ne 0 || "$cleanup_status" -eq 0 ]] || guard_status="$cleanup_status"
+  SETTINGS_CG_GUARD_PID=""
+  SETTINGS_CG_GUARD_ROOT=""
+  SETTINGS_CG_GUARD_READY=""
+  SETTINGS_CG_GUARD_DONE=""
+  SETTINGS_CG_GUARD_OUTPUT=""
+  return "$guard_status"
+}
+
+stop_settings_onboarding_cg_guard() {
+  local guard_status=0 cleanup_status=0
+  [[ -n "${SETTINGS_CG_GUARD_PID:-}" ]] || return 0
+  [[ -n "${SETTINGS_CG_GUARD_DONE:-}" ]] && : >"$SETTINGS_CG_GUARD_DONE" 2>/dev/null || true
+  if reap_exact_child_bounded \
+    "$SETTINGS_CG_GUARD_PID" \
+    "$SETTINGS_CG_GUARD_NATURAL_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_TERM_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_KILL_EXIT_POLLS" \
+    "$SETTINGS_CG_GUARD_REAP_POLL_SECONDS"; then
+    :
+  else
+    guard_status=$?
+  fi
+  [[ -f "${SETTINGS_CG_GUARD_OUTPUT:-}" ]] \
+    && /bin/cat "$SETTINGS_CG_GUARD_OUTPUT" >&2 \
+    || true
+  if [[ -n "${SETTINGS_CG_GUARD_READY:-}" ]]; then
+    /bin/rm -f -- "$SETTINGS_CG_GUARD_READY" 2>/dev/null || cleanup_status=$?
+  fi
+  if [[ -n "${SETTINGS_CG_GUARD_DONE:-}" ]]; then
+    /bin/rm -f -- "$SETTINGS_CG_GUARD_DONE" 2>/dev/null || cleanup_status=$?
+  fi
+  if [[ -n "${SETTINGS_CG_GUARD_OUTPUT:-}" ]]; then
+    /bin/rm -f -- "$SETTINGS_CG_GUARD_OUTPUT" 2>/dev/null || cleanup_status=$?
+  fi
+  if [[ -n "${SETTINGS_CG_GUARD_ROOT:-}" ]]; then
+    /bin/rmdir -- "$SETTINGS_CG_GUARD_ROOT" 2>/dev/null || cleanup_status=$?
+  fi
+  [[ "$guard_status" -ne 0 || "$cleanup_status" -eq 0 ]] || guard_status="$cleanup_status"
+  SETTINGS_CG_GUARD_PID=""
+  SETTINGS_CG_GUARD_ROOT=""
+  SETTINGS_CG_GUARD_READY=""
+  SETTINGS_CG_GUARD_DONE=""
+  SETTINGS_CG_GUARD_OUTPUT=""
+  return "$guard_status"
 }
 
 # Re-resolve the complete runtime identity immediately before any destructive
@@ -209,17 +578,88 @@ terminate_app() {
   return 1
 }
 
-# Run an Accessibility AppleScript with GNU timeout when available. A function
-# keeps the no-timeout path explicit; expanding an empty command-prefix array is
-# an `unbound variable` error under macOS' Bash 3.2 when `set -u` is active.
-run_ax_osascript() {
+# Run every Accessibility AppleScript behind an outer watchdog. Homebrew's GNU
+# timeout is optional; stock macOS still ships /usr/bin/perl, whose alarm
+# survives exec and terminates a wedged osascript with SIGALRM. There is no
+# unbounded fallback: if neither watchdog is available, the smoke is
+# environment-inconclusive rather than silently able to hang forever.
+run_bounded_command() {
   local timeout_seconds="$1"
   shift
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout --signal=TERM "$timeout_seconds" osascript "$@"
-  else
-    osascript "$@"
+    gtimeout --signal=TERM "$timeout_seconds" "$@"
+    return $?
   fi
+  if [[ -x /usr/bin/perl ]]; then
+    /usr/bin/perl -e '
+      use strict;
+      use warnings;
+      my $seconds = shift @ARGV;
+      die "invalid timeout\n" unless defined($seconds) && $seconds =~ /\A[1-9][0-9]*\z/;
+      alarm($seconds);
+      exec @ARGV;
+      die "could not exec bounded command: $!\n";
+    ' "$timeout_seconds" "$@"
+    return $?
+  fi
+  printf '\033[33m[ui]\033[0m no bounded command watchdog is available (need gtimeout or /usr/bin/perl)\n' >&2
+  return 3
+}
+
+run_ax_osascript() {
+  local timeout_seconds="$1"
+  shift
+  run_bounded_command "$timeout_seconds" /usr/bin/osascript "$@"
+}
+
+# Compile the tracked public-API AX/WindowServer probe into the same
+# repository-local runtime-tools cache as the exact-identity process helper.
+# The cache key binds both source bytes and the active Swift SDK/toolchain; an
+# interrupted build can publish only its PID-scoped partial, never the final
+# executable. Compile before launching the smoke app so build work cannot
+# perturb the native-tab state that the helper later observes.
+native_tab_ax_probe_path() {
+  local source="$NATIVE_TAB_AX_PROBE_SOURCE"
+  local cache_root="$REPO_ROOT/Pensieve/.build/pensieve-runtime-tools"
+  local toolchain_fingerprint cache_key helper partial
+
+  [[ -f "$source" ]] || {
+    printf '\033[33m[fail]\033[0m tracked native-tab AX probe is missing: %s\n' "$source" >&2
+    return 1
+  }
+  toolchain_fingerprint="$(
+    /usr/bin/shasum -a 256 "$source"
+    /usr/bin/xcrun --sdk macosx swiftc --version
+    /usr/bin/xcrun --sdk macosx --show-sdk-path
+  )" || return 1
+  cache_key="$(printf '%s' "$toolchain_fingerprint" | /usr/bin/shasum -a 256 \
+    | /usr/bin/awk '{ print $1 }')" || return 1
+  [[ "$cache_key" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  helper="$cache_root/native-tab-ax-probe-$cache_key"
+  if [[ ! -x "$helper" ]]; then
+    /bin/mkdir -p "$cache_root" || return 1
+    partial="$helper.partial.$$"
+    if ! /usr/bin/xcrun --sdk macosx swiftc \
+      -warnings-as-errors -O \
+      "$source" \
+      -framework ApplicationServices \
+      -framework CoreGraphics \
+      -o "$partial"; then
+      /bin/rm -f -- "$partial"
+      printf '\033[33m[fail]\033[0m could not compile native-tab AX probe\n' >&2
+      return 1
+    fi
+    /bin/chmod 700 "$partial" || {
+      /bin/rm -f -- "$partial"
+      return 1
+    }
+    /bin/mv -f "$partial" "$helper" || {
+      /bin/rm -f -- "$partial"
+      return 1
+    }
+  fi
+  printf '%s\n' "$helper"
 }
 
 # Force macOS/AppKit state restoration to fire on the next launch regardless of
@@ -302,6 +742,12 @@ open_smoke_app() {
   if open \
     --env "PENSIEVE_SUPPORT_DIR=$SMOKE_SUPPORT" \
     --env "PENSIEVE_KEYCHAIN_SERVICE=$SMOKE_KEYCHAIN_SERVICE" \
+    --env "LLM_ASSISTIVE_ENDPOINT=" \
+    --env "LLM_FORMATTING_ENDPOINT=" \
+    --env "LLM_ENDPOINT=" \
+    --env "LLM_ASSISTIVE_MODEL=" \
+    --env "LLM_FORMATTING_MODEL=" \
+    --env "LLM_MODEL=" \
     "$@"; then
     open_status=0
   else
@@ -516,6 +962,517 @@ APPLESCRIPT
     || die "fresh-profile baseline process survived its termination barrier"
 }
 
+# One compiled source drives every Settings phase. Bash deliberately returns
+# between phases so CoreGraphics can sample the same stable native surfaces AX
+# just proved, including the zero-document state and the onboarding sheet.
+stage_settings_lifecycle_script() {
+  SETTINGS_LIFECYCLE_SCRIPT="$SMOKE_ROOT/settings-window-lifecycle.applescript"
+  cat >"$SETTINGS_LIFECYCLE_SCRIPT" <<'APPLESCRIPT'
+property expectedBundleID : ""
+property settingsWindowIdentifier : "pensieve.settings.window"
+property generalPaneIdentifier : "pensieve.saving.settings"
+property aiPaneIdentifier : "pensieve.provider.settings"
+property onboardingIdentifier : "pensieve.provider.onboarding"
+property configureIdentifier : "pensieve.provider.onboarding.configure"
+property errorBannerIdentifier : "pensieve.errorbanner.status"
+property expectedBlockedMessage : "Close the current dialog before opening Settings."
+
+on run argv
+  set targetPID to (item 1 of argv) as integer
+  set my expectedBundleID to item 2 of argv as text
+  set stageName to item 3 of argv as text
+  set stageResult to "SETTINGS_STAGE_PASS=" & stageName
+  my waitForProcess(targetPID, 15)
+
+  if stageName is "open-general" then
+    my waitForState(targetPID, 1, false, "none", false, 15)
+    my invokeSettingsShortcut(targetPID)
+    set settingsWindow to my waitForState(targetPID, 2, true, "general", false, 15)
+    set stageResult to my settingsBounds(settingsWindow)
+  else if stageName is "repeat-general" then
+    set settingsWindow to my waitForState(targetPID, 2, true, "general", false, 15)
+    my invokeSettingsShortcut(targetPID)
+    set settingsWindow to my waitForState(targetPID, 2, true, "general", false, 15)
+    set stageResult to my settingsBounds(settingsWindow)
+  else if stageName is "close-settings-with-launcher" then
+    set settingsWindow to my waitForState(targetPID, 2, true, "general", false, 15)
+    my closeWindow(settingsWindow)
+    my waitForState(targetPID, 1, false, "none", false, 15)
+  else if stageName is "reopen-general" then
+    my waitForState(targetPID, 1, false, "none", false, 15)
+    my invokeSettingsShortcut(targetPID)
+    set settingsWindow to my waitForState(targetPID, 2, true, "general", false, 15)
+    set stageResult to my settingsBounds(settingsWindow)
+  else if stageName is "close-launcher" then
+    set launcherWindow to my onlyNonSettingsWindow(targetPID)
+    my closeWindow(launcherWindow)
+    my waitForState(targetPID, 0, false, "none", false, 15)
+  else if stageName is "open-general-zero" then
+    my waitForState(targetPID, 0, false, "none", false, 15)
+    my invokeSettingsShortcut(targetPID)
+    set settingsWindow to my waitForState(targetPID, 1, true, "general", false, 15)
+    set stageResult to my settingsBounds(settingsWindow)
+  else if stageName is "close-settings-zero" then
+    set settingsWindow to my waitForState(targetPID, 1, true, "general", false, 15)
+    my closeWindow(settingsWindow)
+    my waitForState(targetPID, 0, false, "none", false, 15)
+  else if stageName is "onboarding-before" then
+    set launcherWindow to my waitForOnboarding(targetPID, 15)
+    set stageResult to "SETTINGS_ONBOARDING_BEFORE=PASS"
+  else if stageName is "onboarding-block-command-settings" then
+    set launcherWindow to my waitForOnboarding(targetPID, 15)
+    if my elementWithIdentifier(launcherWindow, errorBannerIdentifier) is not missing value then
+      error "blocked-Settings witness already existed before Cmd+,"
+    end if
+    my invokeSettingsShortcut(targetPID)
+    my holdBlockedOnboardingState(targetPID, 1)
+    set stageResult to "SETTINGS_ONBOARDING_COMMAND_BLOCK_AX=PASS"
+  else if stageName is "onboarding-configure" then
+    set launcherWindow to my waitForOnboarding(targetPID, 15)
+    set configureButton to my elementWithIdentifier(launcherWindow, configureIdentifier)
+    if configureButton is missing value then error "onboarding Configure control is missing"
+    tell application "System Events" to perform action "AXPress" of configureButton
+    set settingsWindow to my waitForOnboardingTransition(targetPID, 15)
+    set stageResult to my settingsBounds(settingsWindow)
+  else if stageName is "onboarding-close-settings" then
+    set settingsWindow to my waitForState(targetPID, 2, true, "ai", false, 15)
+    my closeWindow(settingsWindow)
+    my waitForState(targetPID, 1, false, "none", false, 15)
+  else
+    error "unknown Settings smoke stage: " & stageName
+  end if
+  return stageResult
+end run
+
+on invokeSettingsShortcut(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared before Cmd+,"
+  tell application "System Events" to tell appProcess
+    set frontmost to true
+    keystroke "," using command down
+  end tell
+end invokeSettingsShortcut
+
+on waitForState(targetPID, expectedCount, expectsSettings, paneName, expectsOnboarding, timeoutSeconds)
+  set lastProblem to "no census"
+  repeat with i from 1 to (timeoutSeconds * 20)
+    try
+      set stateResult to my assertState(targetPID, expectedCount, expectsSettings, paneName, expectsOnboarding)
+      return stateResult
+    on error errorMessage
+      set lastProblem to errorMessage
+    end try
+    delay 0.05
+  end repeat
+  error "Timed out waiting for exact AX state; last=" & lastProblem
+end waitForState
+
+on assertState(targetPID, expectedCount, expectsSettings, paneName, expectsOnboarding)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared during AX census"
+  tell application "System Events" to tell appProcess
+    set topWindows to every window
+  end tell
+  if (count of topWindows) is not expectedCount then
+    error "top-level AXWindows=" & (count of topWindows) & ", expected=" & expectedCount
+  end if
+
+  set settingsWindows to {}
+  repeat with windowRef in topWindows
+    set subroleValue to my attributeText(windowRef, "AXSubrole")
+    if subroleValue is not "AXStandardWindow" then
+      error "top-level surface is not AXStandardWindow: " & subroleValue
+    end if
+    if my attributeText(windowRef, "AXIdentifier") is settingsWindowIdentifier then
+      set end of settingsWindows to contents of windowRef
+    end if
+  end repeat
+
+  if expectsSettings then
+    if (count of settingsWindows) is not 1 then
+      error "expected exactly one identified Settings window, got " & (count of settingsWindows)
+    end if
+    set settingsWindow to item 1 of settingsWindows
+    set identifiers to my identifiersIn(settingsWindow)
+    if paneName is "general" then
+      if identifiers does not contain generalPaneIdentifier then error "General pane identifier is absent"
+      if identifiers contains aiPaneIdentifier then error "AI pane overlaps General"
+    else if paneName is "ai" then
+      if identifiers does not contain aiPaneIdentifier then error "AI pane identifier is absent"
+      if identifiers contains generalPaneIdentifier then error "General pane overlaps AI"
+    end if
+    if expectsOnboarding is false and identifiers contains onboardingIdentifier then
+      error "onboarding content exists inside Settings"
+    end if
+    return settingsWindow
+  end if
+
+  if (count of settingsWindows) is not 0 then error "unexpected Settings window exists"
+  return missing value
+end assertState
+
+on waitForOnboarding(targetPID, timeoutSeconds)
+  set lastProblem to "no census"
+  repeat with i from 1 to (timeoutSeconds * 20)
+    try
+      return my assertOnboardingWithoutSettings(targetPID)
+    on error errorMessage
+      set lastProblem to errorMessage
+    end try
+    delay 0.05
+  end repeat
+  error "Timed out waiting for native onboarding sheet; last=" & lastProblem
+end waitForOnboarding
+
+on holdBlockedOnboardingState(targetPID, durationSeconds)
+  repeat with sampleNumber from 1 to (durationSeconds * 20)
+    try
+      my assertBlockedOnboardingState(targetPID)
+    on error errorMessage
+      error "Cmd+, escaped the native-modal Settings gate at sample " & sampleNumber & ": " & errorMessage
+    end try
+    delay 0.05
+  end repeat
+  return true
+end holdBlockedOnboardingState
+
+on assertBlockedOnboardingState(targetPID)
+  set launcherWindow to my assertOnboardingWithoutSettings(targetPID)
+  set errorBanner to my elementWithIdentifier(launcherWindow, errorBannerIdentifier)
+  if errorBanner is missing value then error "blocked Settings command did not publish its status banner"
+  set expectedLabel to "Message: " & expectedBlockedMessage
+  set observedLabel to my attributeText(errorBanner, "AXLabel")
+  if observedLabel is not expectedLabel then
+    error "blocked Settings status label=[" & observedLabel & "], expected=[" & expectedLabel & "]"
+  end if
+  return launcherWindow
+end assertBlockedOnboardingState
+
+on assertOnboardingWithoutSettings(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then error "exact smoke pid disappeared during onboarding census"
+  tell application "System Events" to tell appProcess
+    set topWindows to every window
+    if (count of topWindows) is not 1 then error "onboarding top-level AXWindows=" & (count of topWindows)
+    set launcherWindow to item 1 of topWindows
+    if (count of sheets of launcherWindow) is not 1 then error "launcher native sheet count is not one"
+    set onboardingSheet to sheet 1 of launcherWindow
+  end tell
+  set sheetIdentifiers to my identifiersIn(onboardingSheet)
+  if sheetIdentifiers does not contain onboardingIdentifier then error "onboarding identifier is absent from native sheet"
+  if sheetIdentifiers does not contain configureIdentifier then error "Configure identifier is absent from native sheet"
+  if my allWindowIdentifiers(targetPID) contains settingsWindowIdentifier then error "Settings exists while onboarding owns a native sheet"
+  return launcherWindow
+end assertOnboardingWithoutSettings
+
+on waitForOnboardingTransition(targetPID, timeoutSeconds)
+  set lastProblem to "transition did not start"
+  repeat with i from 1 to (timeoutSeconds * 40)
+    set appProcess to my processForPID(targetPID, expectedBundleID)
+    if appProcess is missing value then error "exact smoke pid disappeared during onboarding transition"
+    tell application "System Events" to tell appProcess
+      set topWindows to every window
+      set nativeSheetCount to 0
+      repeat with windowRef in topWindows
+        set nativeSheetCount to nativeSheetCount + (count of sheets of windowRef)
+      end repeat
+    end tell
+    set identifiers to my allWindowIdentifiers(targetPID)
+    set hasOnboarding to identifiers contains onboardingIdentifier
+    set hasSettings to identifiers contains settingsWindowIdentifier
+
+    -- Any overlap observed by this loop is a regression. Each pass includes a
+    -- minimum 25 ms delay plus Accessibility traversal; this is deliberately
+    -- stronger than a final-state-only check, but neither fixed-rate sampling
+    -- nor a claim that Accessibility exposes every compositor frame.
+    if hasSettings and (nativeSheetCount > 0 or hasOnboarding) then
+      error "Settings overlapped the native onboarding sheet"
+    end if
+    if hasSettings and nativeSheetCount is 0 and hasOnboarding is false then
+      try
+        return my assertState(targetPID, 2, true, "ai", false)
+      on error errorMessage
+        set lastProblem to errorMessage
+      end try
+    else
+      set lastProblem to "settings=" & hasSettings & ", sheets=" & nativeSheetCount & ", onboarding=" & hasOnboarding
+    end if
+    delay 0.025
+  end repeat
+  error "Timed out waiting for detached onboarding -> Settings transition; last=" & lastProblem
+end waitForOnboardingTransition
+
+on onlyNonSettingsWindow(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  tell application "System Events" to tell appProcess to set topWindows to every window
+  set candidates to {}
+  repeat with windowRef in topWindows
+    if my attributeText(windowRef, "AXIdentifier") is not settingsWindowIdentifier then
+      set end of candidates to contents of windowRef
+    end if
+  end repeat
+  if (count of candidates) is not 1 then error "expected one non-Settings launcher"
+  return item 1 of candidates
+end onlyNonSettingsWindow
+
+on closeWindow(windowRef)
+  tell application "System Events" to tell windowRef
+    set closeButton to first button whose value of attribute "AXSubrole" is "AXCloseButton"
+    perform action "AXPress" of closeButton
+  end tell
+end closeWindow
+
+on allWindowIdentifiers(targetPID)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  tell application "System Events" to tell appProcess to set topWindows to every window
+  set result to {}
+  repeat with windowRef in topWindows
+    set result to result & my identifiersIn(windowRef)
+  end repeat
+  return result
+end allWindowIdentifiers
+
+on identifiersIn(containerRef)
+  set identifiers to {}
+  set ownIdentifier to my attributeText(containerRef, "AXIdentifier")
+  if ownIdentifier is not "" then set end of identifiers to ownIdentifier
+  tell application "System Events" to set descendants to entire contents of containerRef
+  repeat with elementRef in descendants
+    set identifierValue to my attributeText(elementRef, "AXIdentifier")
+    if identifierValue is not "" then set end of identifiers to identifierValue
+  end repeat
+  return identifiers
+end identifiersIn
+
+on elementWithIdentifier(containerRef, wantedIdentifier)
+  tell application "System Events" to set descendants to entire contents of containerRef
+  repeat with elementRef in descendants
+    if my attributeText(elementRef, "AXIdentifier") is wantedIdentifier then return contents of elementRef
+  end repeat
+  return missing value
+end elementWithIdentifier
+
+on attributeText(elementRef, attributeName)
+  try
+    tell application "System Events" to set attributeValue to value of attribute attributeName of elementRef
+    if attributeValue is missing value then return ""
+    return attributeValue as text
+  end try
+  return ""
+end attributeText
+
+on settingsBounds(settingsWindow)
+  tell application "System Events" to tell settingsWindow
+    set {windowX, windowY} to position
+    set {windowWidth, windowHeight} to size
+  end tell
+  return "SETTINGS_AX_BOUNDS x=" & windowX & " y=" & windowY & " width=" & windowWidth & " height=" & windowHeight
+end settingsBounds
+
+on processForPID(targetPID, expectedBundleID)
+  tell application "System Events"
+    repeat with processRef in application processes
+      set observedPID to missing value
+      try
+        set observedPID to unix id of processRef
+      end try
+      if observedPID is targetPID then
+        try
+          set observedBundleID to bundle identifier of processRef
+        on error errorMessage
+          error "could not read bundle identifier for pid=" & targetPID & ": " & errorMessage
+        end try
+        if observedBundleID is not expectedBundleID then
+          error "pid=" & targetPID & " belongs to unexpected bundle=" & observedBundleID
+        end if
+        return processRef
+      end if
+    end repeat
+  end tell
+  return missing value
+end processForPID
+
+on waitForProcess(targetPID, timeoutSeconds)
+  repeat with i from 1 to (timeoutSeconds * 10)
+    if my processForPID(targetPID, expectedBundleID) is not missing value then return true
+    delay 0.1
+  end repeat
+  error "Timed out waiting for pid=" & targetPID
+end waitForProcess
+APPLESCRIPT
+}
+
+run_settings_stage() {
+  local stage_name="$1" probe_pid
+  probe_pid="$(authenticated_owned_pid)"
+  run_ax_osascript 45 "$SETTINGS_LIFECYCLE_SCRIPT" "$probe_pid" "$APP_ID" "$stage_name"
+}
+
+settings_cg_number_for_ax_bounds() {
+  local ax_state="$1" cg_state="$2" x y width height
+  x="$(printf '%s\n' "$ax_state" | /usr/bin/sed -n 's/^SETTINGS_AX_BOUNDS x=\([-0-9][0-9]*\) y=.*/\1/p')"
+  y="$(printf '%s\n' "$ax_state" | /usr/bin/sed -n 's/^SETTINGS_AX_BOUNDS x=[-0-9][0-9]* y=\([-0-9][0-9]*\) width=.*/\1/p')"
+  width="$(printf '%s\n' "$ax_state" | /usr/bin/sed -n 's/^SETTINGS_AX_BOUNDS .* width=\([0-9][0-9]*\) height=.*/\1/p')"
+  height="$(printf '%s\n' "$ax_state" | /usr/bin/sed -n 's/^SETTINGS_AX_BOUNDS .* height=\([0-9][0-9]*\)$/\1/p')"
+  [[ -n "$x" && -n "$y" && -n "$width" && -n "$height" ]] || return 1
+  printf '%s\n' "$cg_state" | /usr/bin/awk \
+    -v wanted_x="$x" -v wanted_y="$y" -v wanted_width="$width" -v wanted_height="$height" '
+      /^CGWINDOW / {
+        delete fields
+        for (index = 1; index <= NF; index += 1) {
+          split($index, pair, "=")
+          fields[pair[1]] = pair[2]
+        }
+        # Accessibility reports logical points while CoreGraphics can round
+        # a window edge by one point. Accept only the smallest platform
+        # rounding tolerance, and still require one unique layer-0 match.
+        dx = fields["x"] - wanted_x; if (dx < 0) dx = -dx
+        dy = fields["y"] - wanted_y; if (dy < 0) dy = -dy
+        dw = fields["width"] - wanted_width; if (dw < 0) dw = -dw
+        dh = fields["height"] - wanted_height; if (dh < 0) dh = -dh
+        if (dx <= 1 && dy <= 1 && dw <= 1 && dh <= 1) {
+          matches += 1
+          number = fields["num"]
+        }
+      }
+      END {
+        if (matches != 1) exit 1
+        print number
+      }
+    '
+}
+
+assert_settings_window_server_state() {
+  local expected_total="$1" expected_onscreen="$2" ax_state="${3:-}"
+  local cg_state settings_number
+  cg_state="$(settled_window_server_state "$expected_total" "$expected_onscreen")" \
+    || die "Settings WindowServer census did not settle at total=$expected_total onscreen=$expected_onscreen"
+  if [[ -n "$ax_state" ]]; then
+    settings_number="$(settings_cg_number_for_ax_bounds "$ax_state" "$cg_state")" \
+      || die "could not correlate exactly one Settings CGWindowNumber with its AX bounds"
+    printf '%s\n' "$settings_number"
+    return 0
+  fi
+  printf '%s\n' "$cg_state"
+}
+
+# Settings used to be owned by SwiftUI's `Settings` scene. Exercise the real
+# shortcut with and without a document window and prove every intermediate AX
+# and WindowServer state, not merely the final absence.
+run_settings_window_lifecycle_probe() {
+  local ax_state first_settings_number repeated_settings_number
+  local reopened_settings_number zero_document_settings_number
+  log "Settings window lifecycle probe (exact AX and WindowServer census)"
+  terminate_app
+  arm_pensieve_restore_off
+  open_smoke_app -n "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -n "$APP_PATH"
+  }
+
+  assert_settings_window_server_state 1 1 >/dev/null
+  ax_state="$(run_settings_stage open-general)"
+  printf '%s\n' "$ax_state"
+  first_settings_number="$(assert_settings_window_server_state 2 2 "$ax_state" | /usr/bin/tail -n 1)"
+
+  ax_state="$(run_settings_stage repeat-general)"
+  printf '%s\n' "$ax_state"
+  repeated_settings_number="$(assert_settings_window_server_state 2 2 "$ax_state" | /usr/bin/tail -n 1)"
+  [[ "$repeated_settings_number" == "$first_settings_number" ]] \
+    || die "repeated Cmd+, replaced native Settings surface ($first_settings_number -> $repeated_settings_number)"
+
+  run_settings_stage close-settings-with-launcher
+  assert_settings_window_server_state 1 1 >/dev/null
+  ax_state="$(run_settings_stage reopen-general)"
+  printf '%s\n' "$ax_state"
+  reopened_settings_number="$(assert_settings_window_server_state 2 2 "$ax_state" | /usr/bin/tail -n 1)"
+  run_settings_stage close-settings-with-launcher
+  assert_settings_window_server_state 1 1 >/dev/null
+  run_settings_stage close-launcher
+  assert_settings_window_server_state 0 0 >/dev/null
+
+  ax_state="$(run_settings_stage open-general-zero)"
+  printf '%s\n' "$ax_state"
+  zero_document_settings_number="$(assert_settings_window_server_state 1 1 "$ax_state" | /usr/bin/tail -n 1)"
+  run_settings_stage close-settings-zero
+  assert_settings_window_server_state 0 0 >/dev/null
+  # CGWindowNumber is a WindowServer presentation identifier, not an AppKit
+  # object-identity token: closing and reopening one retained NSWindow may
+  # legitimately allocate a new number. Compare it only while the surface is
+  # continuously visible (the repeated Cmd+, assertion above), and record the
+  # reopen numbers as bounded presentation evidence rather than equating them
+  # with controller identity. Source-level tests prove retained NSWindow
+  # identity; this runtime lane proves one surface and no post-close shell.
+  log "SETTINGS_WINDOW_CG visible=$first_settings_number repeated=$repeated_settings_number reopened=$reopened_settings_number zeroDocument=$zero_document_settings_number"
+  log "SETTINGS_WINDOW_RESULT=PASS (exact AX/CG states 1-2-2-1-2-1-0-1-0; same visible surface on repeated Cmd+,; clean close/reopen)"
+
+  terminate_app 60 \
+    || die "Settings lifecycle probe process survived its termination barrier"
+}
+
+run_settings_onboarding_transition_probe() {
+  local ax_state ax_status=0 cg_status=0 guard_ready=0
+  log "Settings onboarding transition probe (fresh capsule; native sheet detach gate)"
+  terminate_app
+  arm_pensieve_restore_off
+  defaults write "$APP_ID" Pensieve.aiAutocompleteEnabled -bool true
+  [[ "$(defaults read "$APP_ID" Pensieve.aiAutocompleteEnabled 2>/dev/null)" == "1" ]] \
+    || die "could not arm AI onboarding in the fresh smoke domain"
+  open_smoke_app -n "$APP_PATH" || {
+    sleep 0.5
+    open_smoke_app -n "$APP_PATH"
+  }
+
+  ax_state="$(run_settings_stage onboarding-before)"
+  [[ "$ax_state" == "SETTINGS_ONBOARDING_BEFORE=PASS" ]] \
+    || die "native onboarding precondition returned unexpected evidence: $ax_state"
+
+  start_settings_onboarding_cg_guard \
+    || die "could not start the exact-PID Settings onboarding CG guard"
+  if wait_for_settings_onboarding_cg_ready; then
+    guard_ready=1
+  else
+    local ready_status=$? reaper_status=0
+    if stop_settings_onboarding_cg_guard; then
+      :
+    else
+      reaper_status=$?
+    fi
+    die "Settings onboarding CG guard did not establish a stable runtime-derived baseline (status=$ready_status; reaper_status=$reaper_status)"
+  fi
+
+  if ax_state="$(run_settings_stage onboarding-block-command-settings)"; then
+    [[ "$ax_state" == "SETTINGS_ONBOARDING_COMMAND_BLOCK_AX=PASS" ]] || ax_status=1
+  else
+    ax_status=$?
+  fi
+  if [[ "$guard_ready" -eq 1 ]]; then
+    if finish_settings_onboarding_cg_guard; then
+      cg_status=0
+    else
+      cg_status=$?
+    fi
+  fi
+  if [[ "$ax_status" -ne 0 ]]; then
+    [[ "$cg_status" -eq 0 ]] \
+      || printf '\033[33m[ui]\033[0m secondary Settings CG guard failure status=%s\n' "$cg_status" >&2
+    die "Cmd+, native-modal AX block failed (status=$ax_status; evidence=[$ax_state])"
+  fi
+  [[ "$cg_status" -eq 0 ]] \
+    || die "Cmd+, changed the exact-PID layer-0 WindowServer surface set during concurrent sampling (status=$cg_status)"
+  log "SETTINGS_ONBOARDING_COMMAND_BLOCK_RESULT=PASS (Cmd+, handled; exact status banner; stable 1s AX sheet; unchanged exact-PID CG tuple set sampled concurrently at ~25ms)"
+
+  ax_state="$(run_settings_stage onboarding-configure)"
+  printf '%s\n' "$ax_state"
+  assert_settings_window_server_state 2 2 "$ax_state" >/dev/null
+  run_settings_stage onboarding-close-settings
+  assert_settings_window_server_state 1 1 >/dev/null
+  log "SETTINGS_ONBOARDING_RESULT=PASS (blocked Cmd+, preserved native sheet and exact CG surface set; Configure detached the sheet before one AI Settings surface; no overlap observed during bounded AX polling)"
+
+  terminate_app 60 \
+    || die "Settings onboarding probe process survived its termination barrier"
+}
+
 clear_smoke_capsule_variables() {
   APP_ID=""
   RUN_TOKEN=""
@@ -613,6 +1570,16 @@ prepare_next_smoke_scenario() {
   rotate_smoke_capsule "retiring $previous_scenario"
   run_fresh_launcher_baseline_probe
   rotate_smoke_capsule "retiring the $previous_scenario boundary baseline"
+}
+
+prepare_first_smoke_scenario() {
+  # The invocation begins with a freshly minted capsule. Use it only for the
+  # boundary baseline, then retire it exactly like prepare_next_smoke_scenario
+  # does. The first product scenario must never reuse a profile that the
+  # baseline process has already opened or allowed background services to
+  # write.
+  run_fresh_launcher_baseline_probe
+  rotate_smoke_capsule "retiring the initial fresh-profile boundary baseline"
 }
 
 # Decision 7A (Monika + Maciej, 2026-08-10): Pensieve is the sole
@@ -1337,9 +2304,9 @@ if [[ $# -gt 0 && "$1" != --* ]]; then
 fi
 
 # Exit codes: 0 = pass; 1 = real FAIL (product/harness); 3 = environment
-# inconclusive -- the witness window exists but is offscreen (e.g. active
-# Space unavailable) rather than a genuine census FAIL. Never treat 3 as a
-# PASS; re-run once a normal desktop Space is active.
+# inconclusive -- required TCC/desktop/watchdog evidence is unavailable rather
+# than a genuine product census FAIL. Never treat 3 as a PASS; repair the named
+# host precondition and rerun.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --toolbar-cold-only)
@@ -1371,6 +2338,15 @@ cleanup() {
   local step_status=0
   local process_stopped=0
   local identity_cleaned=0
+  # Stop the concurrent WindowServer watcher before terminating the app. App
+  # termination necessarily changes the census and must not be misreported as
+  # a product regression or leave a Swift process behind after an AX failure.
+  if stop_settings_onboarding_cg_guard; then
+    :
+  else
+    step_status=$?
+    cleanup_status="$step_status"
+  fi
   if [[ -n "${CAFFEINATE_PID:-}" ]]; then
     kill "$CAFFEINATE_PID" 2>/dev/null || true
   fi
@@ -1472,6 +2448,22 @@ SOURCE_COMMIT="$(isolated_app_assert_source_provenance \
   "${PENSIEVE_UI_SMOKE_ALLOW_DIRTY_SOURCE:-0}")" \
   || die "source provenance check failed (rebuild from the current clean product sources)"
 
+# TCC authority belongs to the terminal/process running this script. Prove the
+# exact System Events route before compiling helpers, waking the display,
+# minting a capsule, cleaning profile state, or launching Pensieve. A denied
+# host is environment-inconclusive (3), with no smoke identity to clean up.
+SYSTEM_EVENTS_PREFLIGHT_STATUS=0
+isolated_app_assert_system_events_automation \
+  || SYSTEM_EVENTS_PREFLIGHT_STATUS=$?
+if [[ "$SYSTEM_EVENTS_PREFLIGHT_STATUS" -ne 0 ]]; then
+  exit "$SYSTEM_EVENTS_PREFLIGHT_STATUS"
+fi
+
+if [[ $COLD_ONLY -eq 0 && $MENU_RESTORED_ONLY -eq 0 ]]; then
+  NATIVE_TAB_AX_PROBE="$(native_tab_ax_probe_path)" \
+    || die "native-tab AX probe could not be prepared"
+fi
+
 # Real AX clicks require the display to be awake; a sleeping display
 # (displaysleep) makes popover clicks land randomly, so wake it now and
 # hold it awake for the duration of the smoke to keep this deterministic
@@ -1531,8 +2523,14 @@ log "staged bundle=$APP_PATH executable=$EXECUTABLE_PATH id=$APP_ID signature=$S
 log "isolated support dir=$SMOKE_SUPPORT keychain=$SMOKE_KEYCHAIN_SERVICE"
 log "identity manifest=$IDENTITY_MANIFEST"
 
-run_fresh_launcher_baseline_probe
-rotate_smoke_capsule "retiring initial fresh-profile baseline"
+prepare_first_smoke_scenario
+stage_settings_lifecycle_script
+run_settings_window_lifecycle_probe
+ok "Settings window lifecycle probe passed"
+prepare_next_smoke_scenario "Settings lifecycle scenario"
+run_settings_onboarding_transition_probe
+ok "Settings onboarding transition probe passed"
+prepare_next_smoke_scenario "Settings onboarding transition scenario"
 
 # Witnesses are created only after the clean UI baseline has passed and its
 # capsule has been completely retired. Files that belong to a product scenario
@@ -2206,6 +3204,23 @@ if [[ $ax_census_status -ne 0 ]]; then
     fi
   fi
   exit "$ax_census_status"
+fi
+
+if [[ $COLD_ONLY -eq 0 ]]; then
+  native_tab_probe_status=0
+  NATIVE_TAB_VERIFIED_PID="$(isolated_app_verify_running_identity \
+    "$APP_ID" "$APP_PATH" "$EXECUTABLE_PATH")" \
+    || die "runtime identity drifted before the native-tab AX proof"
+  [[ "$NATIVE_TAB_VERIFIED_PID" == "$OWNED_PID" ]] \
+    || die "runtime pid changed before the native-tab AX proof ($OWNED_PID -> $NATIVE_TAB_VERIFIED_PID)"
+  native_tab_probe_output="$(run_bounded_command 30 \
+    "$NATIVE_TAB_AX_PROBE" \
+    "$OWNED_PID" \
+    "Toolbar cold-frame witness" \
+    "pensieve-new-tab-smoke-witness" \
+    8 2>&1)" || native_tab_probe_status=$?
+  printf '%s\n' "$native_tab_probe_output"
+  [[ $native_tab_probe_status -eq 0 ]] || exit "$native_tab_probe_status"
 fi
 
 ok "native UI smoke passed"

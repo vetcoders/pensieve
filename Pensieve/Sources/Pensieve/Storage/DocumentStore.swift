@@ -1184,7 +1184,18 @@ final class FolderManager {
       into: appState
     )
 
-    persistExcludedPaths(Set(retainedExclusions), into: appState)
+    // Exclusions are pruned only when the bookmark rewrite actually landed. The
+    // rewrite now carries forward the blob of a working-set file it cannot mint,
+    // so the remaining way to fail is a URL with no persisted blob at all (a
+    // surviving ROOT that vanished, say) — and that failure leaves the removed
+    // root persisted. Dropping its exclusions anyway is how the zombie root came
+    // back with its excluded subtrees re-armed for indexing. Keeping both halves
+    // of the persisted state on the same side of the failure keeps what a relaunch
+    // reads consistent; the live workspace still loses the root, and the error
+    // below says the persisted half did not follow.
+    if bookmarkError == nil {
+      persistExcludedPaths(Set(retainedExclusions), into: appState)
+    }
     appState.workspaceRoots = survivingRoots
     appState.folderURL = survivingRootURLs.first?.standardizedFileURL
     appState.workspaceSearchResults.removeAll {
@@ -1218,9 +1229,13 @@ final class FolderManager {
   /// - documents already covered by a SURVIVING root bookmark. They keep their
   ///   access through the root, and persisting them as file bookmarks would come
   ///   back as spurious ad-hoc working-set rows on the next launch.
-  /// - documents whose file no longer exists. `replaceWorkspace` is all-or-
-  ///   nothing, so one unbookmarkable URL would throw the entire rewrite away
-  ///   and leave the just-removed root persisted.
+  /// - documents whose file no longer exists. A vanished file cannot be minted a
+  ///   bookmark, and a tab the working set never named has no persisted blob for
+  ///   `replaceWorkspace` to carry forward either — so it is the one URL that
+  ///   could still throw the whole rewrite away and leave the just-removed root
+  ///   persisted. (The working-set half of the seed is deliberately NOT filtered
+  ///   this way: dropping a missing ad-hoc row here would silently discard its
+  ///   only bookmark. Those rows are covered by the carry-forward instead.)
   /// - documents whose file sits in the TRASH. A thrown-away file still exists,
   ///   so the check above says yes about it, and a tab that has not been retired
   ///   yet would have handed this rewrite a fresh bookmark for a dead document —
@@ -3474,10 +3489,17 @@ final class DocumentStore {
       // the same working-set membership and bookmark as ordinary Save As….
       // It must NOT adopt or select that document: the user chose "save this
       // recovery copy", not "open it in this launcher".
-      registerSavedDocument(ref, previousID: nil, appState: appState, select: false)
+      let bookmarkFailure = registerSavedDocument(
+        ref, previousID: nil, appState: appState, select: false)
       indexDocument(ref, draft.text, appState)
       let retired = recoveryStore.deleteDraft(id: draft.id)
-      appState.lastError = retired ? nil : recoveryRetirementFailureMessage(for: draft.title)
+      // The bookmark warning WINS the status line. Retirement is bookkeeping the
+      // user can redo from Recovered Drafts; a working-set row with no persisted
+      // bookmark is a document that quietly will not be there next launch, and
+      // the `nil` this used to write on the ordinary (retired) path erased the
+      // only notice of it.
+      appState.lastError =
+        bookmarkFailure ?? (retired ? nil : recoveryRetirementFailureMessage(for: draft.title))
       return targetURL
     } catch {
       let message = "Could not save \(targetURL.lastPathComponent): \(error.localizedDescription)"
@@ -3867,17 +3889,19 @@ final class DocumentStore {
       try writeDocument(appState.documentSession.text, targetURL)
       selfWriteObserver(targetURL)
       let ref = documentRef(for: targetURL, appState: appState)
-      registerSavedDocument(ref, previousID: previousID, appState: appState)
+      let bookmarkFailure = registerSavedDocument(
+        ref, previousID: previousID, appState: appState)
       appState.documentSession.document = ref
       appState.documentSession.isDirty = false
       appState.documentSession.clearOriginalSaveFailure()
-      let retiredRecovery = recoveryStore.deleteDraft(id: recoveryID)
       appState.resolveError()
-      if retiredRecovery {
-        appState.documentSession.retireRecoveryAssociation()
-      } else {
-        appState.lastError = recoveryRetirementFailureMessage(for: targetURL.lastPathComponent)
-      }
+      let retirementFailure = retireRecoveryAfterDurableSave(
+        recoveryID: recoveryID, appState: appState, savedTitle: targetURL.lastPathComponent)
+      // AFTER `resolveError()`, which clears the whole status surface: the
+      // bookmark warning describes a working-set row this very save has just
+      // left unpersisted, so it has to be re-raised on the far side of that
+      // clear rather than lost to it.
+      appState.lastError = bookmarkFailure ?? retirementFailure
       // Same publication, same exposure: saving AS an existing file makes our bytes that file's
       // content, so a settled window already open on it holds a buffer this write has just made
       // stale. Our own entry is already gone — `cancelOwnDebouncesOnSessionChange` above.
@@ -4710,22 +4734,23 @@ final class DocumentStore {
         try replaceExistingDocument(appState.documentSession.text, url)
       }
       selfWriteObserver(url)
-      registerSavedDocument(ref, previousID: appState.documentSession.id, appState: appState)
+      let bookmarkFailure = registerSavedDocument(
+        ref, previousID: appState.documentSession.id, appState: appState)
+      appState.documentSession.document = ref
+      appState.documentSession.isDirty = false
+      appState.documentSession.clearOriginalSaveFailure()
+      appState.resolveError()
       // A file-backed buffer whose window tore down with auto-save off left a
       // stash behind (`stashClosingBufferAsRecoveryDraft`). Now that the same
       // bytes are on disk that stash is not recoverable work any more, and
       // leaving it would have the launcher offering content the user already
       // saved — forever, since nothing sweeps drafts.
-      let retiredRecovery = recoveryStore.deleteDraft(id: stashedRecoveryID)
-      appState.documentSession.document = ref
-      appState.documentSession.isDirty = false
-      appState.documentSession.clearOriginalSaveFailure()
-      appState.resolveError()
-      if retiredRecovery {
-        appState.documentSession.retireRecoveryAssociation()
-      } else {
-        appState.lastError = recoveryRetirementFailureMessage(for: url.lastPathComponent)
-      }
+      //
+      // Same split as `attemptSaveToURL`, through the same helper: the write
+      // settles the mode, the delete is retryable bookkeeping.
+      let retirementFailure = retireRecoveryAfterDurableSave(
+        recoveryID: stashedRecoveryID, appState: appState, savedTitle: url.lastPathComponent)
+      appState.lastError = bookmarkFailure ?? retirementFailure
       if indexNow {
         // Only THIS session's debounce, and only when it is armed for the document just written: the
         // write below supersedes it, so leaving it would duplicate the same row. A debounce armed for
@@ -4920,11 +4945,23 @@ final class DocumentStore {
     throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
   }
 
+  /// RETURNS the bookmark-persist warning instead of writing it to
+  /// `appState.lastError` itself.
+  ///
+  /// Every caller runs more of the save AFTER this returns — retiring a recovery
+  /// draft, resolving the data-loss latch — and each of those steps ends by
+  /// writing the window's status. Writing the warning here put it in front of
+  /// those writes, so the very next one erased it: the payload was gone, the
+  /// working-set row had no persisted bookmark, the document silently missed the
+  /// next launch's Open Files, and nothing on screen ever said so. Handing it
+  /// back makes the caller that owns the LAST write to the status also own this
+  /// message, which is the only place it can survive.
   private func registerSavedDocument(
     _ ref: DocumentRef, previousID: DocumentRef.ID?, appState: AppState, select: Bool = true
-  ) {
+  ) -> String? {
     let refPath = ref.id.path
     let isNewSessionURL = previousID?.path != refPath
+    var bookmarkFailure: String?
 
     if ref.isAdHoc {
       if !appState.openFiles.contains(where: {
@@ -4938,7 +4975,7 @@ final class DocumentStore {
         do {
           try bookmarkStore.persistFile(url: ref.url, into: appState)
         } catch {
-          appState.lastError =
+          bookmarkFailure =
             "Could not persist bookmark for \(ref.url.lastPathComponent): \(error.localizedDescription)"
         }
       }
@@ -4951,6 +4988,37 @@ final class DocumentStore {
     if select {
       appState.selectedDocumentID = ref.id
     }
+    return bookmarkFailure
+  }
+
+  /// The recovery cleanup a durable write owes, split from what that write
+  /// SETTLES.
+  ///
+  /// The bytes are at their intended destination, so this session is file-backed
+  /// and has no recovery source — unconditionally, by construction. Deleting the
+  /// draft that stood in for it is a separate filesystem operation that may
+  /// fail, and gating the mode on it left a file-backed buffer wearing a
+  /// `recoverySourceURL`: autosave then wrote only recovery snapshots while the
+  /// real file went stale, and the next ⌘S after a Save As… elsewhere wrote the
+  /// buffer back to the OLD original. An undeletable draft is parked on the
+  /// session instead and retried by the next durable save; until then it stays
+  /// on disk where Recovered Drafts can offer it.
+  ///
+  /// Returns the user-visible retirement failure, or `nil` when nothing is owed.
+  private func retireRecoveryAfterDurableSave(
+    recoveryID: UUID?,
+    appState: AppState,
+    savedTitle: String
+  ) -> String? {
+    appState.documentSession.retireRecoveryAssociation()
+
+    var owed = appState.documentSession.pendingRecoveryRetirementIDs
+    if let recoveryID {
+      owed.insert(recoveryID)
+    }
+    let unretired = owed.filter { !recoveryStore.deleteDraft(id: $0) }
+    appState.documentSession.pendingRecoveryRetirementIDs = unretired
+    return unretired.isEmpty ? nil : recoveryRetirementFailureMessage(for: savedTitle)
   }
 
   /// Same contract as `FolderManager`'s: whatever the cap drops out of the list

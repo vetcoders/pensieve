@@ -65,12 +65,34 @@ enum DocumentCloseScope {
 /// must also carry Pensieve's explicit document ownership token (or be the
 /// factory's `DocumentWindow` subclass).
 enum DocumentWindowOwnership {
+  /// Pure structural input used by ownership tests and by the AppKit adapter
+  /// below. Unit tests must not manufacture real parent/child or sheet
+  /// relationships: `addChildWindow` and `beginSheet` may order their operands
+  /// on the operator's active desktop even when every fixture starts hidden.
+  struct SurfaceRelationship: Equatable {
+    let isPanel: Bool
+    let hasSheetParent: Bool
+    let hasParent: Bool
+    let level: NSWindow.Level
+    let styleMask: NSWindow.StyleMask
+  }
+
+  static func isRootSurface(_ relationship: SurfaceRelationship) -> Bool {
+    !relationship.isPanel
+      && !relationship.hasSheetParent
+      && !relationship.hasParent
+      && relationship.level == .normal
+      && relationship.styleMask.contains(.titled)
+  }
+
   static func isRootSurface(_ window: NSWindow) -> Bool {
-    !(window is NSPanel)
-      && window.sheetParent == nil
-      && window.parent == nil
-      && window.level == .normal
-      && window.styleMask.contains(.titled)
+    isRootSurface(
+      SurfaceRelationship(
+        isPanel: window is NSPanel,
+        hasSheetParent: window.sheetParent != nil,
+        hasParent: window.parent != nil,
+        level: window.level,
+        styleMask: window.styleMask))
   }
 
   @MainActor
@@ -104,11 +126,16 @@ enum DocumentWindowOwnership {
   @MainActor
   static func isTabMutationHost(_ window: NSWindow) -> Bool {
     guard isDocumentHost(window) else { return false }
-    let isClear = (window.tabbedWindows ?? [window]).allSatisfy { $0.attachedSheet == nil }
+    let isClear = tabGroupAllowsMutation(
+      attachedSheetStates: (window.tabbedWindows ?? [window]).map { $0.attachedSheet != nil })
     if !isClear {
       DebugTrace.logWindowEvent("document-host.tab-mutation-blocked-by-sheet", window: window)
     }
     return isClear
+  }
+
+  static func tabGroupAllowsMutation(attachedSheetStates: [Bool]) -> Bool {
+    attachedSheetStates.allSatisfy { !$0 }
   }
 }
 
@@ -268,6 +295,10 @@ final class DocumentWindowRegistry: ObservableObject {
   /// because `NSWindowTabGroup` does not materialize in a headless test bundle,
   /// and the tab-vs-window close scope is decided from exactly this list.
   private let tabGroupWindows: @MainActor (NSWindow) -> [NSWindow]
+  /// Structural tab-mutation eligibility. Production delegates to
+  /// `DocumentWindowOwnership`; unit tests can inject a relationship snapshot
+  /// instead of publishing a native sheet merely to make this answer false.
+  private let isTabMutationHost: @MainActor (NSWindow) -> Bool
   init(
     canMutateWindowTabs: @escaping @MainActor () -> Bool = { NSApp.modalWindow == nil },
     scheduleDeferredMainWork: @escaping (@escaping DeferredMainWork) -> Void = { work in
@@ -323,6 +354,9 @@ final class DocumentWindowRegistry: ObservableObject {
     tabGroupWindows: @escaping @MainActor (NSWindow) -> [NSWindow] = { window in
       window.tabbedWindows ?? [window]
     },
+    isTabMutationHost: @escaping @MainActor (NSWindow) -> Bool = {
+      DocumentWindowOwnership.isTabMutationHost($0)
+    },
     makeDocumentWindow: DocumentWindowFactoryClosure? = nil
   ) {
     self.canMutateWindowTabs = canMutateWindowTabs
@@ -338,6 +372,7 @@ final class DocumentWindowRegistry: ObservableObject {
     self.currentMergeTarget = currentMergeTarget
     self.applicationWindows = applicationWindows
     self.tabGroupWindows = tabGroupWindows
+    self.isTabMutationHost = isTabMutationHost
     self.closeWindow = closeWindow
     self.setStartupRestoreInProgress = setStartupRestoreInProgress
     self.makeDocumentWindow = makeDocumentWindow
@@ -435,7 +470,7 @@ final class DocumentWindowRegistry: ObservableObject {
           restoreFrontmostWindow = nil
         }
       } else if !canMutateWindowTabs()
-        || !DocumentWindowOwnership.isTabMutationHost(pinned)
+        || !isTabMutationHost(pinned)
       {
         scheduleNextRestoreStep()
         return
@@ -455,7 +490,7 @@ final class DocumentWindowRegistry: ObservableObject {
       // window — the split restore the pinned and candidate paths already park
       // for.
       guard canMutateWindowTabs(),
-        DocumentWindowOwnership.isTabMutationHost(transactionSurvivor)
+        isTabMutationHost(transactionSurvivor)
       else {
         scheduleNextRestoreStep()
         return
@@ -467,7 +502,7 @@ final class DocumentWindowRegistry: ObservableObject {
     {
       restoreMergeTarget = WeakWindow(candidate)
       noteRestoreParticipant(candidate)
-      guard canMutateWindowTabs(), DocumentWindowOwnership.isTabMutationHost(candidate) else {
+      guard canMutateWindowTabs(), isTabMutationHost(candidate) else {
         scheduleNextRestoreStep()
         return
       }
@@ -477,11 +512,21 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     let ref = pendingRestoreRefs.removeFirst()
+    // `open` ACTIVATES an already-open identity instead of creating one, and the
+    // most likely thing a user does during a slow restore is click a file the
+    // pass has not reached yet. That window is theirs — it was built by their
+    // interactive open and fronted for them — so the pass must not adopt it:
+    // claiming it as a participant makes `finishRestorePass` read the user's own
+    // selection as its own and yank focus onto the pass's last tab, and adopting
+    // it as `restoreMergeTarget` would silently make it this transaction's host.
+    // Only a window this step actually created belongs to the transaction.
+    let refIdentity = DocumentIdentity.file(ref.id.standardizedFileURL).standardized
+    let windowBeforeOpen = windowsByIdentity[refIdentity]?.window
     if let window = open(
       ref,
       presentation: .joinTabGroupInBackground,
       mergeTargetSelection: .fixed(restoreMergeTarget?.window)
-    ) {
+    ), window !== windowBeforeOpen {
       // If the original host disappeared, the first successfully created
       // replacement becomes the host for the rest of THIS transaction. Never
       // follow a later arbitrary key window between restore turns.
@@ -784,7 +829,7 @@ final class DocumentWindowRegistry: ObservableObject {
   /// run loop blocks native tab mutation.
   @discardableResult
   func newUntitledTab(from window: NSWindow) -> Bool {
-    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+    guard isTabMutationHost(window) else {
       DebugTrace.log("newUntitledTab rejected ineligible source '\(window.title)'")
       return false
     }
@@ -800,14 +845,14 @@ final class DocumentWindowRegistry: ObservableObject {
       return true
     }
     guard let newWindow = makeUntitledWindow() else { return false }
-    guard DocumentWindowOwnership.isTabMutationHost(window) else {
+    guard isTabMutationHost(window) else {
       DebugTrace.log("newUntitledTab source became ineligible during factory creation")
-      closeWindow(newWindow)
+      retireUnplacedUntitledWindow(newWindow)
       return false
     }
     guard prepareTabbedWindow(window) else {
       DebugTrace.log("newUntitledTab source lost document ownership during factory creation")
-      closeWindow(newWindow)
+      retireUnplacedUntitledWindow(newWindow)
       return false
     }
     DebugTrace.log("newUntitledTab from '\(window.title)'")
@@ -830,7 +875,42 @@ final class DocumentWindowRegistry: ObservableObject {
     }
     untitledTabWindows[ObjectIdentifier(newWindow)] = WeakWindow(newWindow)
     markContentWindow(newWindow)
+    publishPendingUntitledTab(newWindow)
     return newWindow
+  }
+
+  /// Publishes the new tab into Open Files at the moment it is CREATED, before
+  /// it is merged and ordered front.
+  ///
+  /// The native tab group mutates synchronously at the click, while the accessor
+  /// that used to be the descriptor's only source attaches several run-loop
+  /// turns later. Open Files therefore trailed the tab bar by exactly the number
+  /// of tabs still waiting for their SwiftUI root — a sidebar that disagreed
+  /// with the tabs above it for as long as that took.
+  ///
+  /// The identity is minted here and PARKED in `fallbackUntitledIdentities`, so
+  /// the accessor's own attach reconciles this row instead of appending a second
+  /// one: an attach carrying the session's identity replaces this descriptor in
+  /// place (`publish` matches on the window first), and an attach that has no
+  /// identity of its own reuses the parked one.
+  private func publishPendingUntitledTab(_ window: NSWindow) {
+    let windowID = ObjectIdentifier(window)
+    let identity = fallbackUntitledIdentities[windowID] ?? .untitled(UUID())
+    fallbackUntitledIdentities[windowID] = identity
+    _ = publish(
+      identity: identity,
+      displayTitle: normalizedTitle(window.title, fallback: "Untitled"),
+      fileURL: nil,
+      isDirty: false,
+      window: window)
+  }
+
+  /// A factory window that never became a tab. It was already published, so it
+  /// has to be retired through the same reconcile a close runs — otherwise the
+  /// abandoned window survives as a phantom Open Files row.
+  private func retireUnplacedUntitledWindow(_ window: NSWindow) {
+    reconcileClosedWindowState(window)
+    closeWindow(window)
   }
 
   @discardableResult
@@ -886,8 +966,15 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     guard let resolvedIdentity else {
+      // A "+" tab whose session has not reached the accessor yet still owns the
+      // pending descriptor minted for it at creation. That row IS the Open Files
+      // truth for this tab, so an identity-less pass must not sweep it away and
+      // reopen the very gap `publishPendingUntitledTab` closes.
+      let isPendingUntitledTab = untitledTabWindows[windowID]?.window === window
       releaseStaleDocumentMappings(for: window, keeping: nil)
-      removeDescriptors(for: window, keeping: nil)
+      if !isPendingUntitledTab {
+        removeDescriptors(for: window, keeping: nil)
+      }
       if hasEditableBuffer {
         markContentWindow(window)
         window.title = normalizedTitle(title, fallback: "Untitled")
@@ -1282,7 +1369,7 @@ final class DocumentWindowRegistry: ObservableObject {
   private func mergeExistingWindowIntoCurrentTabsIfNeeded(_ window: NSWindow) {
     guard let target = currentDocumentMergeTarget(),
       target !== window,
-      DocumentWindowOwnership.isTabMutationHost(window),
+      isTabMutationHost(window),
       !areWindowsInSameTabGroup(target, window)
     else {
       return
@@ -1306,7 +1393,7 @@ final class DocumentWindowRegistry: ObservableObject {
 
   private func validatedDocumentMergeTarget(_ candidate: NSWindow) -> NSWindow? {
     guard restoreEligibleDocumentHost(candidate) != nil,
-      DocumentWindowOwnership.isTabMutationHost(candidate)
+      isTabMutationHost(candidate)
     else {
       DebugTrace.log("registry.merge rejected non-document target '\(candidate.title)'")
       DebugTrace.logWindowEvent("registry.merge.rejected-target", window: candidate)

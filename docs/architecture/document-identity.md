@@ -169,6 +169,18 @@ table above and decide explicitly for each one. In particular:
   an unrelated `/foo`, and with them their security-scoped grants.
   `FileWatcher.canonicalPath` folds the same three aliases for FSEvents paths;
   the two must stay in step.
+- **Rewriting the whole persisted workspace?** `BookmarkStore.replaceWorkspace`
+  is all-or-nothing on purpose, and its caller (`removeRoot`) has already changed
+  the LIVE workspace by the time it hears about a failure — so a refused write
+  leaves the removed root persisted and it comes back on the next launch. A
+  working-set file that can no longer be minted a bookmark therefore does not
+  abort the rewrite: its already-persisted blob is carried forward, matched by
+  `identityPath` against the path the blob was minted for (`.pathKey` read out of
+  the blob — resolution cannot answer for an unreachable file). A URL with no
+  persisted blob still throws, because carrying nothing forward would mean
+  inventing an entry. Anything else that a root removal persists — the exclusions
+  in `workspace.json` — must move on the same side of that outcome, or a relaunch
+  reads two halves of one workspace that disagree about which roots exist.
 - **Adding persistence?** Key it by `persistentID`, not by URL. Every new
   URL-keyed store makes the eventual consolidation more expensive.
 - **Touching `DocumentStore.swift`?** It is a high-fan-out hub and its consumer

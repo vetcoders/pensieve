@@ -29,7 +29,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.appearance = NSAppearance(named: windowAppearance)
     window.contentView = surface.scrollView
     surface.scrollView.frame = NSRect(x: 0, y: 0, width: 600, height: 400)
@@ -43,29 +43,20 @@ final class EditorThemeChromeTests: XCTestCase {
 
   @MainActor
   func testDocumentThemeNeverRepaintsAnAttachedSheetAsWindowChrome() {
-    let parent = NSWindow(
-      contentRect: NSRect(x: -9000, y: -9000, width: 600, height: 400),
-      styleMask: WindowChromeRecipe.documentStyleMask,
-      backing: .buffered,
-      defer: false)
     let sheet = NSWindow(
       contentRect: NSRect(x: -9000, y: -9000, width: 360, height: 220),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
-    parent.isReleasedWhenClosed = false
+      defer: true)
     sheet.isReleasedWhenClosed = false
-    parent.alphaValue = 0
     sheet.alphaValue = 0
-    parent.beginSheet(sheet)
+    sheet.level = .popUpMenu
     defer {
-      if sheet.sheetParent === parent { parent.endSheet(sheet) }
-      sheet.orderOut(nil)
-      parent.orderOut(nil)
       sheet.close()
-      parent.close()
     }
-    XCTAssertTrue(sheet.sheetParent === parent, "fixture must be a real AppKit sheet")
+    XCTAssertFalse(
+      DocumentWindowOwnership.isRootSurface(sheet),
+      "fixture must be structurally transient without publishing a real sheet")
     sheet.appearance = NSAppearance(named: .darkAqua)
     sheet.backgroundColor = .systemPink
     let originalAppearance = sheet.appearance?.name
@@ -209,7 +200,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.appearance = NSAppearance(named: .darkAqua)
     window.contentView = surface.scrollView
     defer { window.contentView = nil }
@@ -259,7 +250,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.appearance = NSAppearance(named: .darkAqua)
     window.contentView = preview
     defer { window.contentView = nil }
@@ -286,7 +277,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.contentView = preview
     defer { window.contentView = nil }
 
@@ -320,7 +311,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     first.contentView = preview
     preview.applyThemeChrome(for: .ink)
     XCTAssertEqual(first.appearance?.name, .darkAqua)
@@ -330,7 +321,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     second.appearance = NSAppearance(named: .aqua)
     second.backgroundColor = .windowBackgroundColor
     second.contentView = preview
@@ -455,7 +446,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
 
     // First pass: nothing asserted for this window yet, so the chrome is written.
     XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
@@ -487,7 +478,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
 
     XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
     XCTAssertEqual(window.appearanceWrites, 1)
@@ -516,7 +507,7 @@ final class EditorThemeChromeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
 
     XCTAssertTrue(WindowChromeRecipe.assertWindowChrome(on: window, for: .parchment))
     XCTAssertEqual(window.lastAppearanceWritten??.name, .aqua)

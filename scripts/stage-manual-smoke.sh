@@ -122,11 +122,9 @@ verify_source_bundle() {
 }
 
 run_osascript() {
-  if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout --signal=TERM 90 /usr/bin/osascript "$@"
-  else
-    /usr/bin/osascript "$@"
-  fi
+  local timeout_seconds="$1"
+  shift
+  isolated_app_run_bounded_command "$timeout_seconds" /usr/bin/osascript "$@"
 }
 
 # This is intentionally a UI assertion, not an inference from empty folders.
@@ -136,7 +134,7 @@ run_osascript() {
 run_fresh_ui_baseline() {
   local verified_pid="$1"
   local expected_bundle_id="$2"
-  run_osascript - "$verified_pid" "$expected_bundle_id" <<'APPLESCRIPT'
+  run_osascript 90 - "$verified_pid" "$expected_bundle_id" <<'APPLESCRIPT'
 on run argv
   set targetPID to (item 1 of argv) as integer
   set expectedBundleID to item 2 of argv as text
@@ -298,7 +296,7 @@ stage_failure_cleanup() {
 stage_command() {
   local source="${1:-$DEFAULT_SOURCE}"
   local source_commit source_version source_build bundle_id keychain_service display_name short_commit run_token
-  local verified_pid
+  local verified_pid system_events_preflight_status=0
   source="$(canonical_existing_path "$source")" || die "source app not found: $source"
   source_commit="$(verify_source_bundle "$source")"
   source_version="$(isolated_app_plist_value \
@@ -306,6 +304,15 @@ stage_command() {
   source_build="$(isolated_app_plist_value "$source/Contents/Info.plist" CFBundleVersion)" \
     || source_build="unknown"
   log "source=$source commit=$source_commit version=$source_version build=$source_build"
+
+  # Do not retire a previous manual experiment or create a new owner directory
+  # until the current terminal proves the exact Automation + Accessibility
+  # route needed for the fresh-profile witness.
+  isolated_app_assert_system_events_automation \
+    || system_events_preflight_status=$?
+  if [[ "$system_events_preflight_status" -ne 0 ]]; then
+    exit "$system_events_preflight_status"
+  fi
 
   cleanup_previous_manifested_identity
   /bin/mkdir -p "$MANUAL_ROOT"

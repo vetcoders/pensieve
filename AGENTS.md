@@ -62,23 +62,30 @@ lanes: they may restore or write the operator's real support, Keychain,
 workspaces, files, drafts, recents, and window state. Use
 `make manual-smoke` for a fresh interactive identity, its `-reopen`, `-verify`,
 and `-clean` companions for the same experiment, or `make ui-smoke` for an
-automated ephemeral run. Every newly minted manual experiment and every
-independent automated scenario owns a unique per-run identity across
-process/executable, bundle/defaults, Application Support, Keychain, Open Recent,
-Saved State, caches/WebKit/HTTPStorages, and LaunchServices. The
-source bundle must be signed by the trusted Team ID and carry sealed build
-provenance matching the current runtime inputs plus the exact executable/FFI
-payloads. Historical and dirty-source experiments require separate explicit
-lane-scoped overrides; neither can bypass signature, Team, manifest, or payload
-verification, and neither is release evidence. The canonical contract is
-`docs/runtime-testing.md`; smoke tooling must never touch
-`io.vetcoders.pensieve` or production state.
+automated ephemeral run. Each independent scenario owns a unique,
+manifest-scoped runtime identity, verifies trusted build provenance and exact
+executable/FFI payloads before launch, and fails closed rather than touching
+`io.vetcoders.pensieve` or production state. Historical or dirty-source runs
+are explicitly labelled and are not release evidence. Low-level identity,
+cleanup, compatibility and evidence rules live only in the canonical
+`docs/runtime-testing.md` contract.
 
 **`ui-smoke.sh` runs under whatever `bash` is first on PATH.** The shebang is
 `#!/usr/bin/env bash`, so a clean environment picks the system bash 3.2. Empty
 arrays under `set -u`, and heredocs nested inside `$(...)`, are fatal there and
 fine under Homebrew's bash 5. Verify with `/bin/bash -n scripts/ui-smoke.sh`,
 not just `bash -n`.
+
+**Unit tests must not present native window fixtures on the operator's
+desktop.** An AppKit test may allocate only an unshown `NSWindow` or `NSPanel`
+constructed with the literal argument `defer: true` to pin inert window
+properties. The default `NSWindow()`/`NSPanel()` constructors, `defer: false`,
+and merely parking a fixture offscreen are not isolation: they allocate a real
+WindowServer object. A unit test must not call `beginSheet`, `addChildWindow`,
+`orderFront`, `makeKeyAndOrderFront`, or otherwise attach/order that fixture.
+Inject relationship seams and synthetic notifications instead. A scenario that
+must exercise real ordering belongs in a uniquely isolated runtime smoke and
+must be announced before it can take focus.
 
 **Suppressions carry rationale.** `.semgrep-policy.json` records accepted
 findings with a `decision` and a `rationale` field. If you need to silence a
@@ -107,5 +114,12 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
-If `make release-clean` dies with `Directory not empty`, a live SourceKit
-indexer is racing the delete; use `make clean && make release` instead.
+`Permission denied` or `Directory not empty` while a release retires `dist/` or
+`Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
+`Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,
+and unlinking a read-only child needs write permission on its parent. The
+cleanup helpers in `scripts/lib/build-provenance.sh` unlock those exact derived
+trees first, so `make release-clean` retires them without prompting. A live
+SourceKit indexer repopulating `.build/index-build` mid-delete can raise the
+same `Directory not empty` — that secondary race is what the rename-aside in the
+`clean` target covers.

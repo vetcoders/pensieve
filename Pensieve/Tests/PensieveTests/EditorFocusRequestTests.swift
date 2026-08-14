@@ -109,7 +109,7 @@ final class EditorFocusRequestTests: XCTestCase {
       contentRect: container.bounds,
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.contentView = container
     container.addSubview(surface.scrollView)
     container.addSubview(sentinel)
@@ -163,7 +163,7 @@ final class EditorFocusRequestTests: XCTestCase {
       contentRect: container.bounds,
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
 
     window.contentView = container
     container.addSubview(surface.scrollView)

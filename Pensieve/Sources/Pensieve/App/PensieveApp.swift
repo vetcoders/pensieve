@@ -12,13 +12,6 @@ struct PensieveApp: App {
   @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
-  private let providerSettings: ProviderSettings
-  /// The auto-save preference the Settings window edits. The SAME instance the
-  /// document store consults, so a flip reaches every open document immediately.
-  private let savingSettings: DocumentSavingSettings
-  /// The restore-on-launch preference the Settings window edits. The SAME
-  /// instance `AppController.start(intent:)` consults on the next cold launch.
-  private let launchSettings: LaunchSettings
 
   init() {
     // Composer v2 Tor B: parse CLI before any window settles so `--wait` and
@@ -40,9 +33,6 @@ struct PensieveApp: App {
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     launchIntentCoordinator.applyComposerLaunchArguments(composerArgs)
     let themeManager = ThemeManager()
-    providerSettings = ProviderSettings.shared
-    savingSettings = DocumentSavingSettings.shared
-    launchSettings = LaunchSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -92,14 +82,6 @@ struct PensieveApp: App {
     .commands {
       PensieveCommands(themeManager: themeManager)
     }
-
-    Settings {
-      PensieveSettingsView(
-        providerSettings: providerSettings,
-        savingSettings: savingSettings,
-        launchSettings: launchSettings
-      )
-    }
   }
 }
 
@@ -136,7 +118,23 @@ struct DocumentWindowRootView: View {
     let appState = AppState(workspaceStore: workspaceStore)
     _appState = State(wrappedValue: appState)
     _controller = StateObject(
-      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+      wrappedValue: {
+        let controller = AppController(appState: appState, importsFoldersInBackground: true)
+        // The FIRST render of a "+" / ⌘T / ⌘N tab must already be an editor.
+        // `.task` below (and the coordinator hop behind it) runs run-loop turns
+        // after the tab is on screen and selected, so a draft created there
+        // leaves a fully interactive launcher tab titled "Pensieve" sitting
+        // between the user's documents in the meantime. This autoclosure is
+        // evaluated exactly once, by the SwiftUI storage that actually backs
+        // this window, and before its body first reads the session — which is
+        // the only place on this path that is on the presentation's own clock.
+        // See `NewTabSessionSeed`; `start(intent:)` still asks, idempotently.
+        NewTabSessionSeed.seedIfNeeded(
+          controller: controller,
+          intent: launchIntent,
+          initialDocument: initialDocument)
+        return controller
+      }())
   }
 
   var body: some View {
@@ -181,6 +179,14 @@ struct DocumentWindowRootView: View {
           // Publish this window's owning controller so a cross-window "Close
           // from Open Files" routes its dirty guard through this session.
           DocumentWindowRegistry.shared.registerController(controller, for: window)
+          // Keep the non-modal error surface tied to its exact native owner.
+          // Settings presentation can be blocked by a sheet on a different
+          // document than the command fallback; modal errors must return to
+          // the window that actually owns that sheet.
+          CommandSurfaceContext.shared.register(
+            appState: appState,
+            controller: controller,
+            for: window)
           // Give the red close button / tab "×" the same conscious Save / Don't
           // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
           // flush. EVERY window this app can build gets it, not just the

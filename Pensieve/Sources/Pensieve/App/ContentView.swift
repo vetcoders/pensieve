@@ -7,6 +7,7 @@ struct ContentView: View {
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
+  @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
 
@@ -20,6 +21,8 @@ struct ContentView: View {
     self.providerSettings = providerSettings
     _providerOnboardingCoordinator = ObservedObject(
       wrappedValue: providerOnboardingCoordinator ?? .shared)
+    _providerSettingsTransition = StateObject(
+      wrappedValue: ProviderOnboardingSettingsTransition())
   }
 
   var body: some View {
@@ -50,8 +53,9 @@ struct ContentView: View {
       }
     }
     .navigationTitle(
-      appState.documentHasEditableBuffer
-        ? appState.documentTitle : "Pensieve"
+      DocumentWindowSurface.navigationTitle(
+        hasEditableBuffer: appState.documentHasEditableBuffer,
+        documentTitle: appState.documentTitle)
     )
     // 5.2: the subtitle carries the document's breadcrumb path; the dirty
     // "Edited" state it used to hold now lives in the status bar's marker.
@@ -82,7 +86,18 @@ struct ContentView: View {
       )
     }
     .sheet(isPresented: onboardingSheetBinding) {
-      ProviderOnboardingView(isPresented: onboardingSheetBinding)
+      ProviderOnboardingView(
+        isPresented: onboardingSheetBinding,
+        hostWindow: hostWindow,
+        settingsTransition: providerSettingsTransition,
+        onSettingsTransitionFailure: { failure in
+          appState.lastError = failure.userMessage
+        },
+        onSettingsPresentationFailure: { result in
+          if let message = result.userMessage {
+            appState.lastError = message
+          }
+        })
     }
     .onAppear {
       evaluateProviderOnboarding()
@@ -247,14 +262,18 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    // Ahead of the empty state, because a staged open is bufferless too and the
-    // two must not look the same: one window is idle, the other is working on a
-    // file the user just asked for.
-    if appState.documentIsLoading {
+    // The launcher-vs-editor split lives in `DocumentWindowSurface` so the
+    // new-tab lifecycle can pin it without building a view tree — a staged open
+    // is bufferless too, and must not look like the idle empty state.
+    switch DocumentWindowSurface.resolve(
+      isLoading: appState.documentIsLoading,
+      hasEditableBuffer: appState.documentHasEditableBuffer)
+    {
+    case .opening:
       DocumentOpeningView(title: appState.documentTitle)
-    } else if !appState.documentHasEditableBuffer {
+    case .launcher:
       DocumentEmptyStateView()
-    } else {
+    case .editor:
       switch appState.mode {
       case .source:
         EditorView()

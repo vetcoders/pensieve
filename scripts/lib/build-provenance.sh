@@ -20,10 +20,10 @@ build_provenance_error() {
 # Release snapshots deliberately make compiler-visible inputs read-only. The
 # resource modes survive into the signed app and then into the disposable DMG
 # staging copy, so a plain recursive removal cannot descend through those
-# copied directories. Unlock directories in that one derived staging tree,
-# never the signed source app, before removing it. The exact path-shape and
-# symlink guards keep this cleanup from becoming a generic recursive-delete
-# primitive.
+# copied directories. Unlock only non-symlink entries in that one derived
+# staging tree, never the signed source app, before removing it. The exact
+# path-shape and symlink guards keep this cleanup from becoming a generic
+# recursive-delete primitive.
 build_provenance_cleanup_dmg_staging() {
     local staging_path="${1:-}"
 
@@ -42,9 +42,137 @@ build_provenance_cleanup_dmg_staging() {
     fi
     [[ -e "$staging_path" ]] || return 0
 
-    /usr/bin/find -P "$staging_path" -type d -exec /bin/chmod u+w {} + \
+    # A terminal-attached `rm -R` prompts for a read-only file even when its
+    # parent directory is writable. Do not follow symlinks: staging is a
+    # copied release artifact and this function may mutate only that exact
+    # derived tree.
+    /usr/bin/find -P "$staging_path" ! -type l -exec /bin/chmod u+w {} + \
         || return 1
     /bin/rm -R -- "$staging_path"
+}
+
+# build_provenance_cleanup_swiftpm_build_cache PATH
+#
+# A release run can leave the source package's resolved dependency checkout
+# read-only after it has been sealed into an immutable snapshot. `--clean`
+# must retire that exact SwiftPM cache before resolving the graph again, but a
+# terminal-attached plain `rm -R` prompts once for every read-only leaf. This
+# helper owns only the source package's literal Pensieve/.build directory. It
+# never accepts a symlink or an arbitrary derived tree, and it never follows
+# symlinks while restoring owner write access.
+build_provenance_cleanup_swiftpm_build_cache() {
+    local build_path="${1:-}"
+
+    case "$build_path" in
+        /*/Pensieve/.build) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact Pensieve/.build path: $build_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$build_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked SwiftPM build root: $build_path"
+        return 1
+    fi
+    [[ -e "$build_path" ]] || return 0
+    if [[ ! -d "$build_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup of a non-directory SwiftPM build root: $build_path"
+        return 1
+    fi
+
+    /usr/bin/find -P "$build_path" ! -type l -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$build_path"
+}
+
+# build_provenance_cleanup_app_bundle PATH
+#
+# SwiftPM copies `Bundle.module` resources read-only (`r--r--r--` files inside
+# `r-xr-xr-x` directories such as `Assets.xcassets`), and those modes survive
+# into `dist/Pensieve.app`. A release that skips `--clean` lays the bundle out
+# on top of that stale tree, so the plain `rm -R` that used to open the layout
+# stage prompts once per read-only leaf on a terminal and then still fails with
+# `Permission denied` on entries whose parent directory is unwritable —
+# `set -e` turns that into a dead release or, if partially answered, a mixed
+# stale/new bundle. Unlock only non-symlink entries below that one derived app
+# bundle before removing it.
+#
+# Both release lanes own a literal bundle path: `dist/Pensieve.app` for the
+# Developer ID lane and `dist/mas/Pensieve.app` for the App Store lane. Nothing
+# else is accepted, and the symlink guard keeps this from becoming a generic
+# recursive-delete primitive pointed at an installed app.
+build_provenance_cleanup_app_bundle() {
+    local bundle_path="${1:-}"
+
+    case "$bundle_path" in
+        /*/dist/Pensieve.app|/*/dist/mas/Pensieve.app) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact dist app-bundle path: $bundle_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$bundle_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked app bundle: $bundle_path"
+        return 1
+    fi
+    [[ -e "$bundle_path" ]] || return 0
+    if [[ ! -d "$bundle_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup of a non-directory app bundle: $bundle_path"
+        return 1
+    fi
+
+    /usr/bin/find -P "$bundle_path" ! -type l -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$bundle_path"
+}
+
+# build_provenance_cleanup_dist_directory PATH
+#
+# `--clean` retires the whole release output directory before laying a fresh
+# build into it, and that directory holds the previous `Pensieve.app`. Its
+# SwiftPM `Bundle.module` resources are read-only, so the plain `rm -R` that
+# used to open the clean stage hit the same wall as the bundle-level cleanup:
+# unlinking a read-only child needs write permission on its PARENT directory,
+# which a recursive delete never restores. The result is a prompt per leaf on a
+# terminal and then `Permission denied` followed by `Directory not empty` —
+# under `set -e` a dead `make release-clean`.
+#
+# Each lane owns one literal output root: `dist` for the Developer ID lane and
+# `dist/mas` for the App Store lane. Nothing else is accepted, and the symlink
+# guard keeps this from becoming a generic recursive-delete primitive aimed at
+# an operator directory.
+build_provenance_cleanup_dist_directory() {
+    local dist_path="${1:-}"
+
+    case "$dist_path" in
+        /*/dist|/*/dist/mas) ;;
+        *)
+            build_provenance_error \
+                "refusing cleanup outside an exact dist output path: $dist_path"
+            return 1
+            ;;
+    esac
+    if [[ -L "$dist_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup through a symlinked dist root: $dist_path"
+        return 1
+    fi
+    [[ -e "$dist_path" ]] || return 0
+    if [[ ! -d "$dist_path" ]]; then
+        build_provenance_error \
+            "refusing cleanup of a non-directory dist root: $dist_path"
+        return 1
+    fi
+
+    /usr/bin/find -P "$dist_path" ! -type l -exec /bin/chmod u+w {} + \
+        || return 1
+    /bin/rm -R -- "$dist_path"
 }
 
 build_provenance_is_sha256() {

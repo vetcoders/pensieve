@@ -19,11 +19,91 @@ ISOLATED_APP_REQUIRED_ENTITLEMENTS="Pensieve/Resources/Pensieve.entitlements"
 ISOLATED_APP_SIGNING_MODE=""
 
 ISOLATED_APP_LIB_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
+ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT="$ISOLATED_APP_LIB_DIR/system-events-preflight.applescript"
 # shellcheck source=scripts/lib/build-provenance.sh
 source "$ISOLATED_APP_LIB_DIR/build-provenance.sh"
 
 isolated_app_error() {
   printf 'isolated-app: %s\n' "$*" >&2
+}
+
+# Run a command behind a watchdog available on a stock macOS installation.
+# Callers use this before any UI-owned state exists, so an unavailable watchdog
+# is an environment result instead of permission to run an unbounded probe.
+isolated_app_run_bounded_command() {
+  local timeout_seconds="${1:-}"
+  shift || return 2
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 ]] || return 2
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout --signal=TERM "$timeout_seconds" "$@"
+    return $?
+  fi
+  if [[ -x /usr/bin/perl ]]; then
+    /usr/bin/perl -e '
+      use strict;
+      use warnings;
+      my $seconds = shift @ARGV;
+      die "invalid timeout\n" unless defined($seconds) && $seconds =~ /\A[1-9][0-9]*\z/;
+      alarm($seconds);
+      exec @ARGV;
+      die "could not exec bounded command: $!\n";
+    ' "$timeout_seconds" "$@"
+    return $?
+  fi
+  isolated_app_error \
+    "no bounded command watchdog is available (need gtimeout or /usr/bin/perl)"
+  return 3
+}
+
+# Prove that the current *calling process* can drive the same System Events
+# Automation + Accessibility route used by the smoke harness. This must run
+# before staging, cleaning a previous manual experiment, minting a capsule, or
+# launching Pensieve. A TCC denial is therefore environment-inconclusive and
+# cannot leave behind an app, defaults domain, Open Recent row, or support tree.
+#
+isolated_app_assert_system_events_automation() {
+  local output="" status=0
+  [[ -f "$ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT" ]] || {
+    isolated_app_error \
+      "tracked System Events preflight is missing: $ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT"
+    return 1
+  }
+  output="$(isolated_app_run_bounded_command \
+    10 /usr/bin/osascript "$ISOLATED_APP_SYSTEM_EVENTS_PREFLIGHT_SCRIPT" 2>&1)" \
+    || status=$?
+
+  if [[ "$status" -ne 0 ]]; then
+    case "$output" in
+      *-1743* | *"Not authorized"* | *"not authorized"* | *"assistive access"* \
+        | *"Accessibility UI scripting is disabled"* \
+        | *"No frontmost application process is available"*)
+        isolated_app_error \
+          "System Events Automation/Accessibility is unavailable for the host running this command; allow that host in System Settings > Privacy & Security > Automation and Accessibility; no smoke identity was created"
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        return 3
+        ;;
+    esac
+    case "$status" in
+      3 | 124 | 142)
+        isolated_app_error \
+          "System Events preflight failed before smoke staging; no smoke identity was created"
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        return 3
+        ;;
+    esac
+    isolated_app_error \
+      "System Events preflight script failed before smoke staging"
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return 1
+  fi
+  [[ "$output" == "SYSTEM_EVENTS_AUTOMATION=PASS" ]] || {
+    isolated_app_error \
+      "System Events preflight returned an unexpected witness before smoke staging"
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return 1
+  }
+  printf '%s\n' "$output"
 }
 
 isolated_app_signing_mode() {
@@ -658,6 +738,185 @@ isolated_app_webkit_path() {
   printf '%s/Library/WebKit/%s\n' "$HOME" "$bundle_id"
 }
 
+# WebKit's auxiliary processes use two per-user Darwin directories outside
+# ~/Library. `getconf` is the only source of truth for these roots; canonicalize
+# its /var spelling before recording or comparing coordinates so a manifest
+# cannot redirect cleanup through an alias or a caller-controlled TMPDIR.
+isolated_app_darwin_user_directory() {
+  local kind="${1:-}"
+  local key path canonical expected_leaf
+  case "$kind" in
+    cache)
+      key="DARWIN_USER_CACHE_DIR"
+      expected_leaf="C"
+      ;;
+    temp)
+      key="DARWIN_USER_TEMP_DIR"
+      expected_leaf="T"
+      ;;
+    *) return 1 ;;
+  esac
+  path="$(/usr/bin/getconf "$key" 2>/dev/null)" || return 1
+  path="${path%/}"
+  isolated_app_assert_absolute_path "$path" "$key" || return 1
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  canonical="$(cd -P -- "$path" 2>/dev/null && pwd -P)" || return 1
+  isolated_app_assert_canonical_directory "$canonical" "$key" || return 1
+  [[ "$(/usr/bin/basename "$canonical")" == "$expected_leaf" ]] || {
+    isolated_app_error "$key did not resolve to the expected $expected_leaf directory"
+    return 1
+  }
+  printf '%s\n' "$canonical"
+}
+
+isolated_app_darwin_webkit_path() {
+  local bundle_id="${1:-}"
+  local root="${2:-}"
+  local role="${3:-}"
+  isolated_app_assert_owned_id "$bundle_id" || return 1
+  isolated_app_assert_canonical_directory "$root" "Darwin WebKit root" || return 1
+  case "$role" in GPU | Networking | WebContent) ;; *) return 1 ;; esac
+  printf '%s/com.apple.WebKit.%s+%s\n' "$root" "$role" "$bundle_id"
+}
+
+isolated_app_darwin_webkit_cache_is_empty() {
+  local bundle_id="${1:-}"
+  local root="${2:-}"
+  local role path
+  isolated_app_assert_owned_id "$bundle_id" || return 2
+  isolated_app_assert_canonical_directory "$root" "Darwin WebKit cache root" || return 2
+  for role in GPU Networking WebContent; do
+    path="$(isolated_app_darwin_webkit_path "$bundle_id" "$root" "$role")" || return 2
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+  return 0
+}
+
+isolated_app_darwin_webkit_temp_metadata_is_protected() {
+  local mode="${1:-}"
+  local flags_decimal="${2:-}"
+  local rootless_value="${3:-}"
+  [[ "$flags_decimal" =~ ^[0-9]+$ ]] || return 1
+  [[ "$mode" == "700" \
+    && "$((flags_decimal & 1048576))" -ne 0 \
+    && "$rootless_value" == "folders" ]]
+}
+
+isolated_app_darwin_webkit_temp_shell_metadata() {
+  local path="${1:-}"
+  local actual_uid mode flags_decimal rootless_value
+  isolated_app_assert_absolute_path "$path" "Darwin WebKit temp shell" || return 2
+  actual_uid="$(/usr/bin/stat -f '%u' -- "$path" 2>/dev/null)" || return 2
+  mode="$(/usr/bin/stat -f '%Lp' -- "$path" 2>/dev/null)" || return 2
+  flags_decimal="$(/usr/bin/stat -f '%f' -- "$path" 2>/dev/null)" || return 2
+  rootless_value="$(
+    /usr/bin/xattr -p com.apple.rootless "$path" 2>/dev/null
+  )" || return 2
+  printf '%s|%s|%s|%s\n' \
+    "$actual_uid" "$mode" "$flags_decimal" "$rootless_value"
+}
+
+# DARWIN_USER_TEMP_DIR entries are OS-managed shells. They can carry rootless /
+# nounlink metadata and therefore are not application-owned residue. Never
+# delete them. Accept only the exact direct-child names WebKit owns for this
+# UUID, and only while each object is an empty, current-user-owned directory.
+# Require the exact protection shape observed on WebKit-created shells: mode
+# 0700, the SF_NOUNLINK bit (0x00100000), and rootless=folders. This applies to
+# every caller-supplied root; a synthetic ordinary directory must never be
+# misclassified as an OS-managed shell merely because it is empty.
+isolated_app_darwin_webkit_temp_shell_snapshot() {
+  local bundle_id="${1:-}"
+  local root="${2:-}"
+  local role path expected_uid first_entry metadata remainder
+  local actual_uid mode flags_decimal rootless_value count=0 roles=""
+  isolated_app_assert_owned_id "$bundle_id" || return 2
+  isolated_app_assert_canonical_directory "$root" "Darwin WebKit temp root" || return 2
+  expected_uid="$(/usr/bin/id -u)" || return 2
+  for role in GPU Networking WebContent; do
+    path="$(isolated_app_darwin_webkit_path "$bundle_id" "$root" "$role")" || return 2
+    if [[ -L "$path" ]]; then
+      isolated_app_error "Darwin WebKit temp shell is a symlink: $path"
+      return 1
+    fi
+    if [[ -e "$path" ]]; then
+      [[ -d "$path" ]] || {
+        isolated_app_error "Darwin WebKit temp shell is not a directory: $path"
+        return 1
+      }
+      if ! metadata="$(
+        isolated_app_darwin_webkit_temp_shell_metadata "$path"
+      )"; then
+        isolated_app_error \
+          "Darwin WebKit temp shell metadata is unreadable or missing: $path"
+        return 2
+      fi
+      actual_uid="${metadata%%|*}"
+      remainder="${metadata#*|}"
+      mode="${remainder%%|*}"
+      remainder="${remainder#*|}"
+      flags_decimal="${remainder%%|*}"
+      rootless_value="${remainder#*|}"
+      [[ "$actual_uid" == "$expected_uid" ]] || {
+        isolated_app_error "Darwin WebKit temp shell has an unexpected owner: $path"
+        return 1
+      }
+      if ! isolated_app_darwin_webkit_temp_metadata_is_protected \
+        "$mode" "$flags_decimal" "$rootless_value"; then
+        isolated_app_error \
+          "Darwin WebKit temp shell lacks the expected OS protection metadata: $path"
+        return 1
+      fi
+      first_entry="$(/usr/bin/find -P "$path" -mindepth 1 -maxdepth 1 \
+        -print -quit 2>/dev/null)" || return 2
+      [[ -z "$first_entry" ]] || {
+        isolated_app_error "Darwin WebKit temp shell is not empty: $path"
+        return 1
+      }
+      count=$((count + 1))
+      if [[ -n "$roles" ]]; then roles="$roles,"; fi
+      roles="$roles$role"
+    fi
+  done
+  printf '%s|%s\n' "$count" "$roles"
+}
+
+isolated_app_darwin_webkit_temp_shells_are_valid() {
+  isolated_app_darwin_webkit_temp_shell_snapshot \
+    "${1:-}" "${2:-}" >/dev/null
+}
+
+isolated_app_darwin_webkit_temp_shell_count() {
+  local snapshot
+  snapshot="$(isolated_app_darwin_webkit_temp_shell_snapshot \
+    "${1:-}" "${2:-}")" || return 1
+  printf '%s\n' "${snapshot%%|*}"
+}
+
+isolated_app_darwin_webkit_temp_shell_roles() {
+  local snapshot
+  snapshot="$(isolated_app_darwin_webkit_temp_shell_snapshot \
+    "${1:-}" "${2:-}")" || return 1
+  printf '%s\n' "${snapshot#*|}"
+}
+
+isolated_app_report_retained_darwin_webkit_temp_shells() {
+  local bundle_id="${1:-}"
+  local root="${2:-}"
+  local count="${3:-}"
+  local roles="${4:-}"
+  isolated_app_assert_owned_id "$bundle_id" || return 1
+  isolated_app_assert_canonical_directory "$root" "Darwin WebKit temp root" || return 1
+  [[ "$count" =~ ^[1-3]$ && -n "$roles" ]] || return 1
+  # Cleanup authority is retired only after the facts above have already been
+  # validated. This final notice is operator information, not another mutable
+  # state transition: a closed/broken stderr must not turn completed cleanup
+  # into an unretryable failure after its manifest has gone away.
+  isolated_app_error \
+    "retired all removable state for $bundle_id; retained $count empty OS-managed WebKit temp shell(s) ($roles) under $root" \
+    || true
+  return 0
+}
+
 isolated_app_http_storages_path() {
   local bundle_id="${1:-}"
   isolated_app_assert_owned_id "$bundle_id" || return 1
@@ -752,6 +1011,39 @@ isolated_app_remove_exact_path() {
     return 1
   fi
   return 0
+}
+
+# Verify that an isolated owner capsule contains no direct child outside the
+# exact paths named by its cleanup authority. This check deliberately runs
+# before authority retirement: an unexpected child keeps the manifest intact
+# so the operator can inspect the capsule and retry safely.
+isolated_app_owner_contains_only_direct_paths() {
+  local owner_root="${1:-}"
+  shift || return 1
+  isolated_app_assert_canonical_directory \
+    "$owner_root" "isolated owner root" || return 1
+  (
+    local observed allowed is_allowed
+    local children
+    /bin/test -r "$owner_root" -a -x "$owner_root" || return 1
+    shopt -s dotglob nullglob
+    children=("$owner_root"/*)
+    for observed in "${children[@]}"; do
+      is_allowed=0
+      for allowed in "$@"; do
+        if [[ "$observed" == "$allowed" ]]; then
+          is_allowed=1
+          break
+        fi
+      done
+      if [[ "$is_allowed" -ne 1 ]]; then
+        isolated_app_error \
+          "isolated owner capsule contains an unknown child: $observed"
+        return 1
+      fi
+    done
+    return 0
+  )
 }
 
 isolated_app_sign_bundle() {
@@ -1022,6 +1314,7 @@ isolated_app_known_profile_namespace_is_empty() {
   local keychain_service="${3:-}"
   local account="${4:-$ISOLATED_APP_KEYCHAIN_ACCOUNT}"
   local allow_empty_support="${5:-0}"
+  local darwin_cache_root="${6:-}"
   local preferences recent saved container application_scripts cache webkit
   local http_storages http_cookies cookies path status
 
@@ -1029,6 +1322,10 @@ isolated_app_known_profile_namespace_is_empty() {
   isolated_app_assert_support_path "$support_dir" || return 2
   isolated_app_assert_keychain_service "$bundle_id" "$keychain_service" || return 2
   [[ "$allow_empty_support" == "0" || "$allow_empty_support" == "1" ]] || return 2
+  [[ -n "$darwin_cache_root" ]] \
+    || darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 2
+  isolated_app_assert_canonical_directory \
+    "$darwin_cache_root" "Darwin WebKit cache root" || return 2
 
   isolated_app_defaults_domain_is_empty "$bundle_id" || return 1
   if isolated_app_keychain_item_exists "$keychain_service" "$account"; then
@@ -1054,6 +1351,8 @@ isolated_app_known_profile_namespace_is_empty() {
   do
     [[ ! -e "$path" && ! -L "$path" ]] || return 1
   done
+  isolated_app_darwin_webkit_cache_is_empty \
+    "$bundle_id" "$darwin_cache_root" || return $?
   if [[ "$allow_empty_support" == "1" && -d "$support_dir" && ! -L "$support_dir" ]]; then
     [[ -z "$(/usr/bin/find "$support_dir" -mindepth 1 -print -quit 2>/dev/null)" ]] \
       || return 1
@@ -1074,12 +1373,24 @@ isolated_app_remove_known_profile_state_once() {
   local support_dir="${2:-}"
   local keychain_service="${3:-}"
   local account="${4:-$ISOLATED_APP_KEYCHAIN_ACCOUNT}"
+  local darwin_cache_root="${5:-}"
+  local darwin_temp_root="${6:-}"
   local preferences recent saved container application_scripts cache webkit
-  local http_storages http_cookies cookies path cleanup_status=0
+  local http_storages http_cookies cookies path role cleanup_status=0
 
   isolated_app_assert_owned_id "$bundle_id" || return 1
   isolated_app_assert_support_path "$support_dir" || return 1
   isolated_app_assert_keychain_service "$bundle_id" "$keychain_service" || return 1
+  [[ -n "$darwin_cache_root" ]] \
+    || darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+  [[ -n "$darwin_temp_root" ]] \
+    || darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
+  isolated_app_assert_canonical_directory \
+    "$darwin_cache_root" "Darwin WebKit cache root" || return 1
+  isolated_app_assert_canonical_directory \
+    "$darwin_temp_root" "Darwin WebKit temp root" || return 1
+  isolated_app_darwin_webkit_temp_shells_are_valid \
+    "$bundle_id" "$darwin_temp_root" || return 1
 
   /usr/bin/defaults delete "$bundle_id" >/dev/null 2>&1 || true
   if ! isolated_app_reset_keychain_item \
@@ -1104,6 +1415,13 @@ isolated_app_remove_known_profile_state_once() {
       cleanup_status=1
     fi
   done
+  for role in GPU Networking WebContent; do
+    path="$(isolated_app_darwin_webkit_path \
+      "$bundle_id" "$darwin_cache_root" "$role")" || return 1
+    if ! isolated_app_remove_exact_path "$path" "isolated Darwin WebKit cache"; then
+      cleanup_status=1
+    fi
+  done
   return "$cleanup_status"
 }
 
@@ -1117,16 +1435,27 @@ isolated_app_retire_known_profile_namespace() {
   local support_dir="${2:-}"
   local keychain_service="${3:-}"
   local account="${4:-$ISOLATED_APP_KEYCHAIN_ACCOUNT}"
+  local darwin_cache_root="${5:-}"
+  local darwin_temp_root="${6:-}"
   local attempt=0 quiet_checks=0 status
   local required_quiet_checks=30
   local maximum_checks=100
 
+  [[ -n "$darwin_cache_root" ]] \
+    || darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+  [[ -n "$darwin_temp_root" ]] \
+    || darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
+
   while [[ "$attempt" -lt "$maximum_checks" ]]; do
     isolated_app_remove_known_profile_state_once \
-      "$bundle_id" "$support_dir" "$keychain_service" "$account" || return 1
+      "$bundle_id" "$support_dir" "$keychain_service" "$account" \
+      "$darwin_cache_root" "$darwin_temp_root" || return 1
     /bin/sleep 0.1
     if isolated_app_known_profile_namespace_is_empty \
-      "$bundle_id" "$support_dir" "$keychain_service" "$account"; then
+      "$bundle_id" "$support_dir" "$keychain_service" "$account" 0 \
+      "$darwin_cache_root" \
+      && isolated_app_darwin_webkit_temp_shells_are_valid \
+        "$bundle_id" "$darwin_temp_root"; then
       quiet_checks=$((quiet_checks + 1))
       if [[ "$quiet_checks" -ge "$required_quiet_checks" ]]; then
         return 0
@@ -1408,7 +1737,12 @@ isolated_app_assert_profile_fresh() {
   isolated_app_assert_not_running "$bundle_id" || return 1
   if isolated_app_known_profile_namespace_is_empty \
     "$bundle_id" "$support_dir" "$keychain_service" "$account" 1; then
-    :
+    if ! isolated_app_darwin_webkit_temp_shells_are_valid \
+      "$bundle_id" "$(isolated_app_darwin_user_directory temp)"; then
+      isolated_app_error \
+        "fresh profile has an unexpected Darwin WebKit temp-shell shape: $bundle_id"
+      return 1
+    fi
   else
     namespace_status=$?
     isolated_app_error \
@@ -1428,6 +1762,7 @@ isolated_app_assert_profile_fresh() {
 
 # isolated_app_cleanup_identity <bundle-id> <bundle-path> <support-dir>
 #   <keychain-service> <expected-owner-root> [keychain-account]
+#   [darwin-cache-root] [darwin-temp-root]
 isolated_app_cleanup_identity() {
   local bundle_id="${1:-}"
   local bundle_path="${2:-}"
@@ -1435,6 +1770,8 @@ isolated_app_cleanup_identity() {
   local keychain_service="${4:-}"
   local expected_owner_root="${5:-}"
   local account="${6:-$ISOLATED_APP_KEYCHAIN_ACCOUNT}"
+  local darwin_cache_root="${7:-}"
+  local darwin_temp_root="${8:-}"
   local bundle_parent support_parent partial_bundle_path
   local cleanup_status=0
   local registration_status
@@ -1458,6 +1795,14 @@ isolated_app_cleanup_identity() {
     return 1
   fi
   isolated_app_assert_keychain_service "$bundle_id" "$keychain_service" || return 1
+  [[ -n "$darwin_cache_root" ]] \
+    || darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+  [[ -n "$darwin_temp_root" ]] \
+    || darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
+  isolated_app_assert_canonical_directory \
+    "$darwin_cache_root" "Darwin WebKit cache root" || return 1
+  isolated_app_assert_canonical_directory \
+    "$darwin_temp_root" "Darwin WebKit temp root" || return 1
   isolated_app_assert_not_running "$bundle_id" || return 1
   partial_bundle_path="${bundle_path%.app}.partial.app"
   if ! isolated_app_remove_exact_path "$partial_bundle_path" "partial staged bundle"; then
@@ -1486,7 +1831,8 @@ isolated_app_cleanup_identity() {
     cleanup_status=1
   fi
   if ! isolated_app_retire_known_profile_namespace \
-    "$bundle_id" "$support_dir" "$keychain_service" "$account"; then
+    "$bundle_id" "$support_dir" "$keychain_service" "$account" \
+    "$darwin_cache_root" "$darwin_temp_root"; then
     cleanup_status=1
   fi
   if isolated_app_launchservices_registration_exists "$bundle_id"; then
@@ -1532,6 +1878,7 @@ isolated_app_insert_manifest_coordinates() {
   local executable_path partial_bundle_path
   local preferences recent saved sandbox_saved cache webkit http_storages http_cookies cookies
   local container application_scripts byhost_directory byhost_stem
+  local darwin_cache_root darwin_temp_root role darwin_path manifest_role
 
   [[ -f "$plist" && ! -L "$plist" ]] || return 1
   executable_path="$bundle_path/Contents/MacOS/$executable_name"
@@ -1549,6 +1896,8 @@ isolated_app_insert_manifest_coordinates() {
   application_scripts="$(isolated_app_application_scripts_path "$bundle_id")" || return 1
   byhost_directory="$(isolated_app_byhost_preferences_directory "$bundle_id")" || return 1
   byhost_stem="$(isolated_app_byhost_preferences_stem "$bundle_id")" || return 1
+  darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+  darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
 
   isolated_app_plist_insert_string "$plist" reservationNonce "$nonce" || return 1
   isolated_app_plist_insert_string "$plist" ownerRoot "$owner_root" || return 1
@@ -1580,6 +1929,21 @@ isolated_app_insert_manifest_coordinates() {
   isolated_app_plist_insert_string "$plist" byHostPreferencesDirectory "$byhost_directory" \
     || return 1
   isolated_app_plist_insert_string "$plist" byHostPreferencesStem "$byhost_stem" || return 1
+  isolated_app_plist_insert_string \
+    "$plist" darwinUserCacheDirectory "$darwin_cache_root" || return 1
+  isolated_app_plist_insert_string \
+    "$plist" darwinUserTempDirectory "$darwin_temp_root" || return 1
+  for role in GPU Networking WebContent; do
+    manifest_role="$role"
+    darwin_path="$(isolated_app_darwin_webkit_path \
+      "$bundle_id" "$darwin_cache_root" "$role")" || return 1
+    isolated_app_plist_insert_string \
+      "$plist" "darwinWebKitCache${manifest_role}Path" "$darwin_path" || return 1
+    darwin_path="$(isolated_app_darwin_webkit_path \
+      "$bundle_id" "$darwin_temp_root" "$role")" || return 1
+    isolated_app_plist_insert_string \
+      "$plist" "darwinWebKitTemp${manifest_role}Path" "$darwin_path" || return 1
+  done
 }
 
 isolated_app_assert_manifest_request() {
@@ -1654,7 +2018,7 @@ isolated_app_reserve_manifest() {
 
   while :; do
     /usr/bin/plutil -create xml1 -- "$partial" >/dev/null 2>&1 || break
-    /usr/bin/plutil -insert schemaVersion -integer 4 -- "$partial" >/dev/null 2>&1 || break
+    /usr/bin/plutil -insert schemaVersion -integer 5 -- "$partial" >/dev/null 2>&1 || break
     isolated_app_plist_insert_string "$partial" manifestState reservation || break
     isolated_app_insert_manifest_coordinates \
       "$partial" "$owner_root" "$source_bundle" "$source_commit" "$bundle_path" \
@@ -1793,11 +2157,13 @@ isolated_app_validate_manifest_coordinates() {
   local manifest="${1:-}"
   local expected_owner_root="${2:-}"
   local expected_state="${3:-}"
+  local expected_schema="${4:-5}"
   local schema state owner source_bundle source_commit nonce
   local bundle_path partial_bundle_path executable_name executable_path bundle_id
   local bundle_name display_name support_dir service account
   local preferences recent saved sandbox_saved cache webkit http_storages http_cookies cookies
   local container application_scripts byhost_directory byhost_stem
+  local darwin_cache_root darwin_temp_root role darwin_path manifest_role
 
   [[ -f "$manifest" && ! -L "$manifest" ]] || {
     isolated_app_error "identity manifest is missing: $manifest"
@@ -1809,7 +2175,8 @@ isolated_app_validate_manifest_coordinates() {
     "$expected_owner_root" "$manifest" "identity manifest" || return 1
   schema="$(isolated_app_manifest_value "$manifest" schemaVersion)" || return 1
   state="$(isolated_app_manifest_value "$manifest" manifestState 2>/dev/null)" || state=""
-  [[ "$schema" == "4" && "$state" == "$expected_state" ]] \
+  [[ "$expected_schema" == "4" || "$expected_schema" == "5" ]] || return 1
+  [[ "$schema" == "$expected_schema" && "$state" == "$expected_state" ]] \
     || {
       isolated_app_error "identity manifest schema or state does not match $expected_state"
       return 1
@@ -1873,7 +2240,34 @@ isolated_app_validate_manifest_coordinates() {
       == "$application_scripts" \
     && "$(isolated_app_manifest_value "$manifest" byHostPreferencesDirectory)" \
       == "$byhost_directory" \
-    && "$(isolated_app_manifest_value "$manifest" byHostPreferencesStem)" == "$byhost_stem" ]]
+    && "$(isolated_app_manifest_value "$manifest" byHostPreferencesStem)" == "$byhost_stem" ]] \
+    || return 1
+
+  # Schema 4 already had authenticated two-phase cleanup authority, but it
+  # predates the Darwin C/T coordinates. Keep it usable for cleanup only. New
+  # reservation, finalization, launch, and verification remain schema 5.
+  if [[ "$expected_schema" == "5" ]]; then
+    darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+    darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
+    [[ "$(isolated_app_manifest_value "$manifest" darwinUserCacheDirectory)" \
+      == "$darwin_cache_root" \
+      && "$(isolated_app_manifest_value "$manifest" darwinUserTempDirectory)" \
+        == "$darwin_temp_root" ]] || return 1
+    for role in GPU Networking WebContent; do
+      manifest_role="$role"
+      darwin_path="$(isolated_app_darwin_webkit_path \
+        "$bundle_id" "$darwin_cache_root" "$role")" || return 1
+      [[ "$(isolated_app_manifest_value \
+        "$manifest" "darwinWebKitCache${manifest_role}Path")" == "$darwin_path" ]] \
+        || return 1
+      darwin_path="$(isolated_app_darwin_webkit_path \
+        "$bundle_id" "$darwin_temp_root" "$role")" || return 1
+      [[ "$(isolated_app_manifest_value \
+        "$manifest" "darwinWebKitTemp${manifest_role}Path")" == "$darwin_path" ]] \
+        || return 1
+    done
+  fi
+  return 0
 }
 
 isolated_app_validate_reservation() {
@@ -1886,20 +2280,33 @@ isolated_app_validate_cleanup_manifest() {
   local state schema
   schema="$(isolated_app_manifest_value "$manifest" schemaVersion)" || return 1
   state="$(isolated_app_manifest_value "$manifest" manifestState 2>/dev/null)" || state=""
-  if [[ "$schema" == "4" && "$state" == "reservation" ]]; then
-    isolated_app_validate_reservation "$manifest" "$expected_owner_root"
-  else
-    isolated_app_validate_manifest "$manifest" "$expected_owner_root"
-  fi
+  case "$schema/$state" in
+    5/reservation)
+      isolated_app_validate_reservation "$manifest" "$expected_owner_root"
+      ;;
+    5/finalized)
+      isolated_app_validate_manifest "$manifest" "$expected_owner_root"
+      ;;
+    4/reservation)
+      isolated_app_validate_manifest_coordinates \
+        "$manifest" "$expected_owner_root" reservation 4
+      ;;
+    4/finalized)
+      isolated_app_validate_manifest_coordinates \
+        "$manifest" "$expected_owner_root" finalized 4 \
+        && isolated_app_validate_manifest_payload "$manifest"
+      ;;
+    *)
+      isolated_app_error \
+        "identity manifest schema or state cannot authorize cleanup: $schema/$state"
+      return 1
+      ;;
+  esac
 }
 
-isolated_app_validate_manifest() {
+isolated_app_validate_manifest_payload() {
   local manifest="${1:-}"
-  local expected_owner_root="${2:-}"
   local source_input source_main source_ffi source_team digest
-  isolated_app_validate_manifest_coordinates \
-    "$manifest" "$expected_owner_root" finalized || return 1
-
   source_input="$(isolated_app_manifest_value "$manifest" sourceRuntimeInputSHA256)" || return 1
   source_main="$(isolated_app_manifest_value \
     "$manifest" sourceMainExecutableNormalizedSHA256)" || return 1
@@ -1913,6 +2320,14 @@ isolated_app_validate_manifest() {
     isolated_app_error "identity manifest does not name the trusted source TeamIdentifier"
     return 1
   }
+}
+
+isolated_app_validate_manifest() {
+  local manifest="${1:-}"
+  local expected_owner_root="${2:-}"
+  isolated_app_validate_manifest_coordinates \
+    "$manifest" "$expected_owner_root" finalized 5 || return 1
+  isolated_app_validate_manifest_payload "$manifest"
 }
 
 isolated_app_verify_bundle_from_manifest() {
@@ -1967,6 +2382,7 @@ isolated_app_cleanup_manifest() {
   local manifest="${1:-}"
   local expected_owner_root="${2:-}"
   local bundle_id bundle_path support_dir service account reservation_partial final_partial
+  local schema darwin_cache_root darwin_temp_root retained_snapshot retained_count retained_roles
   isolated_app_assert_canonical_directory \
     "$expected_owner_root" "expected owner root" || return 1
   isolated_app_assert_direct_owned_path \
@@ -1982,33 +2398,69 @@ isolated_app_cleanup_manifest() {
   # bundle mutation is permitted before reservation publication, so remove the
   # two exact manifest temporaries only when they are the owner's sole children.
   if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+    isolated_app_owner_contains_only_direct_paths \
+      "$expected_owner_root" "$reservation_partial" "$final_partial" || return 1
     isolated_app_remove_exact_path \
       "$reservation_partial" "reservation manifest partial" || return 1
     isolated_app_remove_exact_path "$final_partial" "final manifest partial" || return 1
-    if [[ -n "$(/usr/bin/find "$expected_owner_root" -mindepth 1 -maxdepth 1 \
-      -print -quit 2>/dev/null)" ]]; then
-      isolated_app_error \
-        "cleanup authority is missing while owner artifacts remain: $expected_owner_root"
+    if ! /bin/rmdir "$expected_owner_root"; then
+      isolated_app_error "could not retire empty isolated owner root: $expected_owner_root"
       return 1
     fi
-    /bin/rmdir "$expected_owner_root" >/dev/null 2>&1 || true
     return 0
   fi
 
   isolated_app_validate_cleanup_manifest "$manifest" "$expected_owner_root" || return 1
+  schema="$(isolated_app_manifest_value "$manifest" schemaVersion)" || return 1
   bundle_id="$(isolated_app_manifest_value "$manifest" bundleID)" || return 1
   bundle_path="$(isolated_app_manifest_value "$manifest" bundlePath)" || return 1
   support_dir="$(isolated_app_manifest_value "$manifest" supportPath)" || return 1
   service="$(isolated_app_manifest_value "$manifest" keychainService)" || return 1
   account="$(isolated_app_manifest_value "$manifest" keychainAccount)" || return 1
+  if [[ "$schema" == "5" ]]; then
+    darwin_cache_root="$(isolated_app_manifest_value \
+      "$manifest" darwinUserCacheDirectory)" || return 1
+    darwin_temp_root="$(isolated_app_manifest_value \
+      "$manifest" darwinUserTempDirectory)" || return 1
+  else
+    # Schema 4 could not pin Darwin coordinates. Its already-authenticated
+    # bundle ID bounds the exact role names; getconf supplies today's canonical
+    # per-user roots without trusting data added to the legacy plist.
+    darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
+    darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
+  fi
   isolated_app_cleanup_identity \
     "$bundle_id" "$bundle_path" "$support_dir" "$service" "$expected_owner_root" "$account" \
+    "$darwin_cache_root" "$darwin_temp_root" \
+    || return 1
+  # Re-census the explicit manifest coordinates immediately before retiring
+  # cleanup authority. A recreated C payload or malformed T shell keeps the
+  # manifest intact for a safe retry.
+  isolated_app_known_profile_namespace_is_empty \
+    "$bundle_id" "$support_dir" "$service" "$account" 0 \
+    "$darwin_cache_root" || return 1
+  retained_snapshot="$(isolated_app_darwin_webkit_temp_shell_snapshot \
+    "$bundle_id" "$darwin_temp_root")" || return 1
+  retained_count="${retained_snapshot%%|*}"
+  retained_roles="${retained_snapshot#*|}"
+  isolated_app_owner_contains_only_direct_paths \
+    "$expected_owner_root" "$manifest" "$reservation_partial" "$final_partial" \
     || return 1
   isolated_app_remove_exact_path \
     "$reservation_partial" "reservation manifest partial" || return 1
   isolated_app_remove_exact_path "$final_partial" "final manifest partial" || return 1
   isolated_app_remove_exact_path "$manifest" "isolated identity manifest" || return 1
-  /bin/rmdir "$expected_owner_root" >/dev/null 2>&1 || true
+  if ! /bin/rmdir "$expected_owner_root"; then
+    isolated_app_error "could not retire empty isolated owner root: $expected_owner_root"
+    return 1
+  fi
+  if [[ "$retained_count" -gt 0 ]]; then
+    # Informational only. All authoritative cleanup and manifest retirement is
+    # already complete; reporting cannot retroactively make it fail.
+    isolated_app_report_retained_darwin_webkit_temp_shells \
+      "$bundle_id" "$darwin_temp_root" "$retained_count" "$retained_roles" \
+      || true
+  fi
   return 0
 }
 

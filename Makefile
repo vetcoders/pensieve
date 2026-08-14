@@ -77,10 +77,17 @@ clean:  ## Remove .build/ + dist/
 	@# so rmdir hits ENOTEMPTY). An atomic rename detaches the tree from the path
 	@# the indexer holds, so the delete can't lose that race. Best-effort: never
 	@# abort the gated release if a stray file lingers.
+	@# Unlock before deleting, for the same reason the release cleanup helpers in
+	@# scripts/lib/build-provenance.sh do: dist/ holds SwiftPM Bundle.module
+	@# resources copied r--r--r-- inside r-xr-xr-x directories, and unlinking a
+	@# read-only child needs write permission on its PARENT. Without this the
+	@# -f delete fails on those leaves, and because it is best-effort the failure
+	@# is silent — leaving a *.trash.<pid> tree parked in the repo.
 	@for d in $(BUILD_DIR) $(DIST); do \
 		[ -e "$$d" ] || continue; \
 		trash="$$d.trash.$$$$"; \
 		mv "$$d" "$$trash" 2>/dev/null || trash="$$d"; \
+		chmod -R u+w "$$trash" 2>/dev/null || true; \
 		rm -rf "$$trash" 2>/dev/null || rm -rf "$$trash" 2>/dev/null || true; \
 	done
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) cleaned\n"
@@ -108,7 +115,12 @@ test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
 	@$(SCRIPTS)/test-rpath-hygiene.sh
 	@$(SCRIPTS)/test-isolated-app.sh
+	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 	@$(SCRIPTS)/test-ui-smoke-contract.sh
+
+.PHONY: test-semgrep-contract
+test-semgrep-contract:  ## Verify the Tests-only native-window presentation Semgrep rule
+	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 
 .PHONY: ui-smoke
 ui-smoke:  ## Ephemeral automated UI smoke under a new isolated identity

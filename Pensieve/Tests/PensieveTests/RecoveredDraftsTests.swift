@@ -913,6 +913,166 @@ final class RecoveredDraftsTests: XCTestCase {
     XCTAssertFalse(fileExists(draft.url))
   }
 
+  // MARK: - A save reports what it could not make durable
+
+  /// The working-set bookmark is what puts a saved document back in Open Files
+  /// on the next launch. When minting it fails the bytes are safe but the row is
+  /// not persisted, so the document silently misses that launch — and the ONLY
+  /// notice of it is the warning `registerSavedDocument` produces.
+  ///
+  /// The launcher's Save As… used to erase that warning one line later: the
+  /// draft retired successfully, and the `retired ? nil : …` fold wrote the
+  /// `nil`. This drives the whole save and reads the status the user is left
+  /// with, not an intermediate one.
+  @MainActor
+  func testALauncherSaveAsKeepsTheBookmarkWarningItsRetirementUsedToErase() throws {
+    let folder = try makeTemporaryFolder()
+    let targetURL = folder.appendingPathComponent("unbookmarkable.md")
+    let store = try makeRecoveryStore(in: folder)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveRecoveredDraftBookmarkFailure"),
+      mintFileBookmark: { _ in throw CocoaError(.fileWriteNoPermission) })
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      recoveryStore: store,
+      savePanelURLProvider: { _ in targetURL })
+    let draft = try seedDraft(in: store, text: "recovered body", ageInDays: 0)
+    let appState = AppState()
+
+    XCTAssertNotNil(documentStore.saveRecoveredDraftAs(draft, into: appState))
+
+    // The retirement SUCCEEDS here on purpose: the erasing branch is the happy
+    // one, so a failing draft delete would hide the defect behind its own
+    // message instead of pinning it.
+    XCTAssertFalse(fileExists(draft.url))
+    let message = try XCTUnwrap(
+      appState.lastError,
+      "the save left no persisted bookmark and said nothing about it")
+    XCTAssertTrue(message.contains("Could not persist bookmark"), message)
+    XCTAssertTrue(message.contains("unbookmarkable.md"), message)
+  }
+
+  /// The same warning on the ordinary Save As… path, where `resolveError()` —
+  /// which clears the entire status surface once the bytes are durable — used to
+  /// take it down instead.
+  @MainActor
+  func testSaveAsKeepsTheBookmarkWarningResolveErrorUsedToClear() throws {
+    let folder = try makeTemporaryFolder()
+    let targetURL = folder.appendingPathComponent("unbookmarkable-save-as.md")
+    let store = try makeRecoveryStore(in: folder)
+    let bookmarkStore = BookmarkStore(
+      defaults: makeEphemeralDefaults(prefix: "PensieveSaveAsBookmarkFailure"),
+      mintFileBookmark: { _ in throw CocoaError(.fileWriteNoPermission) })
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: bookmarkStore,
+      recoveryStore: store)
+    let appState = AppState()
+    appState.documentSession.createUntitled(title: "Untitled.md")
+    appState.activeDocumentText = "unsaved body"
+    appState.documentSession.isDirty = true
+
+    XCTAssertTrue(documentStore.saveAs(appState: appState, to: targetURL))
+
+    XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), "unsaved body")
+    let message = try XCTUnwrap(
+      appState.lastError,
+      "the save left no persisted bookmark and said nothing about it")
+    XCTAssertTrue(message.contains("Could not persist bookmark"), message)
+    XCTAssertTrue(message.contains("unbookmarkable-save-as.md"), message)
+  }
+
+  // MARK: - A durable save settles the session's mode, cleanup or not
+
+  /// Save to Original on an adopted recovery buffer, with the draft delete
+  /// failing. The bytes reached the user's file, so the session is file-backed —
+  /// and the autosave that follows the NEXT edit has to keep that file current.
+  ///
+  /// It used to keep its `recoverySourceURL` whenever the delete failed, and
+  /// autosave tests that flag FIRST: every later edit went to a recovery
+  /// snapshot only, and the file the user is looking at silently stopped
+  /// advancing.
+  @MainActor
+  func testAFailedRetirementStillLetsAutosaveKeepTheSavedFileCurrent() async throws {
+    let folder = try makeTemporaryFolder()
+    let originalURL = folder.appendingPathComponent("protected.md")
+    try Data("original bytes".utf8).write(to: originalURL, options: .atomic)
+    let store = makeUndeletableDraftStore(in: folder)
+    let draft = try store.saveDraft(
+      id: nil, title: "protected.md", text: "recovered edit", sourceURL: originalURL)
+    store.markDraftClosed(id: draft.id)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveFailedRetirementAutosave")),
+      recoveryStore: store)
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+
+    documentStore.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: originalURL, encoding: .utf8), "recovered edit")
+    XCTAssertNil(
+      appState.documentSession.recoverySourceURL,
+      "a file-backed buffer kept a recovery source because its draft could not be deleted")
+    XCTAssertEqual(
+      appState.documentSession.url?.standardizedFileURL, originalURL.standardizedFileURL)
+    XCTAssertEqual(
+      appState.documentSession.pendingRecoveryRetirementIDs, [draft.id],
+      "the undeletable draft was forgotten instead of parked for a retry")
+    XCTAssertTrue(fileExists(draft.url), "the draft was reported retired but is still on disk")
+    let message = try XCTUnwrap(appState.lastError)
+    XCTAssertTrue(message.contains("could not retire its recovery copy"), message)
+
+    appState.activeDocumentText = "second edit"
+    documentStore.documentDidChange(appState: appState)
+
+    try await waitUntilFile(originalURL, contains: "second edit")
+    XCTAssertEqual(
+      appState.documentSession.pendingRecoveryRetirementIDs, [draft.id],
+      "the parked retirement was dropped by the retry that could not complete it")
+  }
+
+  /// Save As… to a DIFFERENT path with the draft delete failing, then ⌘S.
+  ///
+  /// The second save used to route on the stale `recoverySourceURL` and write
+  /// the buffer back to the ORIGINAL file the draft came from — a silent write
+  /// to a target the user had just navigated away from, with the file they
+  /// actually saved to left stale.
+  @MainActor
+  func testAFailedRetirementDoesNotSendTheNextSaveBackToTheOldOriginal() throws {
+    let folder = try makeTemporaryFolder()
+    let originalURL = folder.appendingPathComponent("original.md")
+    try Data("original bytes".utf8).write(to: originalURL, options: .atomic)
+    let elsewhereURL = folder.appendingPathComponent("elsewhere.md")
+    let store = makeUndeletableDraftStore(in: folder)
+    let draft = try store.saveDraft(
+      id: nil, title: "original.md", text: "recovered edit", sourceURL: originalURL)
+    store.markDraftClosed(id: draft.id)
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveFailedRetirementSaveAs")),
+      recoveryStore: store)
+    XCTAssertTrue(documentStore.openRecoveredDraft(draft, into: appState))
+
+    XCTAssertTrue(documentStore.saveAs(appState: appState, to: elsewhereURL))
+    XCTAssertNil(appState.documentSession.recoverySourceURL)
+
+    appState.activeDocumentText = "typed after save as"
+    documentStore.save(appState: appState)
+
+    XCTAssertEqual(
+      try String(contentsOf: elsewhereURL, encoding: .utf8), "typed after save as",
+      "⌘S left the file the user saved to stale")
+    XCTAssertEqual(
+      try String(contentsOf: originalURL, encoding: .utf8), "original bytes",
+      "⌘S wrote the buffer back to the original the user had saved away from")
+  }
+
   // MARK: - Discard
 
   /// Discard is now one of only three things that may retire a draft, so it is
@@ -1565,6 +1725,41 @@ final class RecoveredDraftsTests: XCTestCase {
       try await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("no recovery draft holding \(text.debugDescription)", file: file, line: line)
+  }
+
+  /// Waits for a debounced write to land `text` in a FILE on disk. The file is
+  /// what the recovery-mode defect makes stale, so the pin has to read the disk
+  /// rather than the session's opinion of it.
+  private func waitUntilFile(
+    _ url: URL,
+    contains text: String,
+    timeout: TimeInterval = 5,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if (try? String(contentsOf: url, encoding: .utf8)) == text { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail(
+      "\(url.lastPathComponent) never reached \(text.debugDescription)"
+        + " — it holds \((try? String(contentsOf: url, encoding: .utf8)).debugDescription)",
+      file: file, line: line)
+  }
+
+  /// A `RecoveryStore` whose draft PAYLOAD can never be deleted, so
+  /// `deleteDraft` always fails while every other operation behaves normally.
+  /// Same shape as `testDeleteDraftFailureKeepsTheVisiblePayloadClaimAndSidecars`.
+  private func makeUndeletableDraftStore(in folder: URL) -> RecoveryStore {
+    RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
   }
 
   /// Waits for the ONE draft an asynchronous path is expected to persist. Polls

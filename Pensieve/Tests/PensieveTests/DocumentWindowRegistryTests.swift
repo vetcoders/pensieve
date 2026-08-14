@@ -79,7 +79,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
     var didMoveCallbackRan = false
     observingView.onWindowChanged = { didMoveCallbackRan = true }
     defer {
-      window.orderOut(nil)
       window.close()
     }
 
@@ -135,7 +134,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
       })
     let coordinator = accessor.makeCoordinator()
     defer {
-      window.orderOut(nil)
       window.close()
     }
 
@@ -184,7 +182,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
       onWindow: { publishedWindows.append($0) })
     let coordinator = accessor.makeCoordinator()
     defer {
-      window.orderOut(nil)
       window.close()
     }
 
@@ -206,71 +203,47 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
   @MainActor
   func testDocumentOwnershipRejectsEveryTransientWindowShape() {
-    let root = Self.makeWindow(title: "[PensieveTests] Document Root")
-    let sheet = Self.makeWindow(title: "[PensieveTests] Sheet")
-    let child = Self.makeWindow(title: "[PensieveTests] Child")
-    let elevated = Self.makeWindow(title: "[PensieveTests] Elevated")
-    let panel = NSPanel(
-      contentRect: NSRect(x: -9000, y: -9000, width: 260, height: 160),
-      styleMask: [.titled],
-      backing: .buffered,
-      defer: false)
-    panel.isReleasedWhenClosed = false
-    panel.alphaValue = 0
-    elevated.level = .popUpMenu
-    // `addChildWindow` and `beginSheet` can order their operands even when the
-    // root was never shown. Every participant is parked and transparent before
-    // either AppKit ownership transition, so a test run cannot flash native
-    // chrome onto the operator's active desktop.
-    root.addChildWindow(child, ordered: .above)
-    root.beginSheet(sheet)
-    defer {
-      if sheet.sheetParent === root { root.endSheet(sheet) }
-      if child.parent === root { root.removeChildWindow(child) }
-      for window in [sheet, child, elevated, panel, root] {
-        window.orderOut(nil)
-        window.close()
-      }
+    func relationship(
+      isPanel: Bool = false,
+      hasSheetParent: Bool = false,
+      hasParent: Bool = false,
+      level: NSWindow.Level = .normal,
+      styleMask: NSWindow.StyleMask = [.titled]
+    ) -> DocumentWindowOwnership.SurfaceRelationship {
+      .init(
+        isPanel: isPanel,
+        hasSheetParent: hasSheetParent,
+        hasParent: hasParent,
+        level: level,
+        styleMask: styleMask)
     }
 
-    XCTAssertTrue(DocumentWindowOwnership.isRootSurface(root))
-    XCTAssertFalse(DocumentWindowOwnership.isRootSurface(sheet))
-    XCTAssertFalse(DocumentWindowOwnership.isRootSurface(child))
-    XCTAssertFalse(DocumentWindowOwnership.isRootSurface(elevated))
-    XCTAssertFalse(DocumentWindowOwnership.isRootSurface(panel))
-    XCTAssertFalse(DocumentWindowOwnership.claimDocumentHost(sheet))
-    XCTAssertFalse(DocumentWindowOwnership.claimDocumentHost(child))
-    XCTAssertFalse(DocumentWindowOwnership.claimDocumentHost(panel))
+    XCTAssertTrue(DocumentWindowOwnership.isRootSurface(relationship()))
+    XCTAssertFalse(
+      DocumentWindowOwnership.isRootSurface(relationship(hasSheetParent: true)),
+      "a sheet is presentation chrome owned by its document host")
+    XCTAssertFalse(
+      DocumentWindowOwnership.isRootSurface(relationship(hasParent: true)),
+      "a child window cannot own a document tab group")
+    XCTAssertFalse(
+      DocumentWindowOwnership.isRootSurface(relationship(level: .popUpMenu)),
+      "an elevated helper is not a document root")
+    XCTAssertFalse(
+      DocumentWindowOwnership.isRootSurface(relationship(isPanel: true)),
+      "a panel is transient even when it otherwise resembles a titled root")
   }
 
   @MainActor
   func testDocumentHostWithAttachedSheetCannotMutateItsTabGroup() {
     let documentWindow = Self.makeWindow(title: "Document Root")
-    let sheetWindow = Self.makeWindow(title: "Provider Onboarding")
-    documentWindow.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    documentWindow.alphaValue = 0
-    defer {
-      if sheetWindow.sheetParent === documentWindow {
-        documentWindow.endSheet(sheetWindow)
-      }
-      for window in [sheetWindow, documentWindow] {
-        window.orderOut(nil)
-        window.close()
-      }
-    }
+    defer { documentWindow.close() }
 
     XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(documentWindow))
     XCTAssertTrue(DocumentWindowOwnership.isTabMutationHost(documentWindow))
-
-    documentWindow.beginSheet(sheetWindow)
-
     XCTAssertFalse(
-      DocumentWindowOwnership.isTabMutationHost(documentWindow),
+      DocumentWindowOwnership.tabGroupAllowsMutation(attachedSheetStates: [false, true]),
       "a document-modal sheet freezes only its owning native tab group")
-
-    documentWindow.endSheet(sheetWindow)
-
-    XCTAssertTrue(DocumentWindowOwnership.isTabMutationHost(documentWindow))
+    XCTAssertTrue(DocumentWindowOwnership.tabGroupAllowsMutation(attachedSheetStates: [false]))
   }
 
   @MainActor
@@ -281,7 +254,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
     let documentWindow = Self.makeWindow(title: "Opened Document")
     defer {
       for window in [settingsWindow, documentWindow] {
-        window.orderOut(nil)
         window.close()
       }
     }
@@ -310,7 +282,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
       .standardizedFileURL
     let panel = Self.makePanel(title: "Transient Factory Surface")
     defer {
-      panel.orderOut(nil)
       panel.close()
     }
     var closedWindows: [NSWindow] = []
@@ -338,8 +309,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
     let documentRoot = Self.makeWindow(title: "Document Root")
     let panel = Self.makePanel(title: "Transient New Tab Surface")
     defer {
-      panel.orderOut(nil)
-      documentRoot.orderOut(nil)
       panel.close()
       documentRoot.close()
     }
@@ -366,7 +335,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
   func testContentPromotionRejectsATransientWindow() {
     let panel = Self.makePanel(title: "Transient Draft Surface")
     defer {
-      panel.orderOut(nil)
       panel.close()
     }
     let registry = DocumentWindowRegistry(
@@ -389,7 +357,6 @@ final class DocumentWindowRegistryTests: XCTestCase {
     documentWindow.setFrame(NSRect(x: 0, y: 0, width: 320, height: 240), display: false)
     defer {
       for window in [targetWindow, documentWindow] {
-        window.orderOut(nil)
         window.close()
       }
     }
@@ -417,24 +384,16 @@ final class DocumentWindowRegistryTests: XCTestCase {
   func testOpenNeverTreatsAnAttachedSheetAsADocumentTabTarget() throws {
     let documentID = URL(fileURLWithPath: "/tmp/pensieve-sheet-tab-target.md")
       .standardizedFileURL
-    let parentWindow = Self.makeWindow(title: "Document Host")
-    let sheetWindow = Self.makeWindow(title: "Provider Onboarding")
+    let transientWindow = Self.makeWindow(title: "Provider Onboarding")
     let documentWindow = Self.makeWindow(title: "Opened Document")
-    parentWindow.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    parentWindow.alphaValue = 0
-    parentWindow.beginSheet(sheetWindow)
     defer {
-      if sheetWindow.sheetParent === parentWindow {
-        parentWindow.endSheet(sheetWindow)
-      }
-      for window in [sheetWindow, documentWindow, parentWindow] {
-        window.orderOut(nil)
+      for window in [transientWindow, documentWindow] {
         window.close()
       }
     }
-    XCTAssertTrue(sheetWindow.sheetParent === parentWindow, "fixture must be a real AppKit sheet")
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(transientWindow))
 
-    let originalSheetTabbingIdentifier = sheetWindow.tabbingIdentifier
+    let originalSheetTabbingIdentifier = transientWindow.tabbingIdentifier
     let originalDocumentFrame = documentWindow.frame
     var mergedTargets: [NSWindow] = []
     var activatedWindows: [NSWindow] = []
@@ -444,7 +403,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { target, _ in mergedTargets.append(target) },
       orderAndActivateWindow: { activatedWindows.append($0) },
-      currentMergeTarget: { sheetWindow },
+      currentMergeTarget: { transientWindow },
+      isTabMutationHost: { $0 !== transientWindow },
       makeDocumentWindow: { _, _ in documentWindow })
 
     registry.open(DocumentRef(id: documentID))
@@ -453,7 +413,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       mergedTargets.isEmpty,
       "a sheet is presentation chrome owned by its parent, never a document tab group")
     XCTAssertEqual(
-      sheetWindow.tabbingIdentifier,
+      transientWindow.tabbingIdentifier,
       originalSheetTabbingIdentifier,
       "opening a document must not reclassify the active sheet as a document window")
     XCTAssertEqual(
@@ -1271,7 +1231,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
     XCTAssertEqual(
       registry.openDocuments.first?.isDirty,
       true,
-      "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state")
+      "the deferred attach must preserve the dirty metadata, not overwrite it with the default clean state"
+    )
   }
 
   /// The launcher sweep is a DEFERRED `asyncAfter`: once armed it cannot be cancelled, so a sweep
@@ -1304,7 +1265,8 @@ final class DocumentWindowRegistryTests: XCTestCase {
     XCTAssertTrue(
       terminating.closedIDs.isEmpty,
       "a sweep that fires during the quit must close nothing: every close posts willCloseNotification, "
-        + "and that save would land after the termination sequence already drained and checkpointed")
+        + "and that save would land after the termination sequence already drained and checkpointed"
+    )
   }
 
   /// A registry with one redundant empty launcher beside a presented document window, plus captured
@@ -1450,7 +1412,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     WindowChromeRecipe.apply(to: documentWindow, title: "Untitled")
     let previousHandler = DocumentWindowTabBridge.handleNewWindowForTab
     defer {
@@ -1503,7 +1465,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.alphaValue = 0
     window.contentView = NSView(frame: .zero)
@@ -1532,7 +1494,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       contentRect: NSRect(x: -9000, y: -9000, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     panel.isReleasedWhenClosed = false
     panel.alphaValue = 0
     panel.contentView = NSView(frame: .zero)
@@ -1575,7 +1537,7 @@ private final class SceneOwnedLikeWindow: NSWindow {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     return window
@@ -1598,7 +1560,7 @@ private final class SceneOwnedAnsweringWindow: NSWindow {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     return window

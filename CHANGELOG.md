@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A release without `--clean` no longer stalls or dies while retiring the
+  previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
+  read-only, so the stale bundle carried unwritable `Assets.xcassets`
+  directories: the layout stage's plain `rm -R` prompted per file on a terminal
+  and then failed with `Permission denied` on their children. The stage now
+  restores owner write access on non-symlink entries below that exact bundle
+  before removing it, for both the Developer ID and Mac App Store lanes, and
+  refuses any other path shape or a symlinked bundle root.
+- A new tab from the tab bar's "+", `Cmd+T` or `Cmd+N` is an editor titled
+  `Untitled.md` from its first frame. Its draft used to be created several
+  run-loop turns after the tab was already presented and selected, so under load
+  the tab spent seconds as a fully interactive launcher — New File / Open File /
+  RECENT, window title **Pensieve** — wedged between the user's documents. The
+  draft is now seeded where the window is constructed, on the same clock as the
+  presentation; the later startup pass is idempotent, so it can neither renumber
+  the tab nor discard what was typed into it in the meantime.
+- The sidebar's **Open Files** list no longer trails the tab bar. A new tab is
+  published into the open-document list when its window is created — before it
+  joins the tab group and is ordered front — instead of only when its SwiftUI
+  root attaches, so a burst of new-tab requests shows one row per tab
+  immediately. The pending row is reconciled rather than duplicated when the
+  attach lands, and is retired with its window, so a closed or abandoned pending
+  tab leaves no phantom entry.
+
+- Automated and manual isolated smoke now prove the calling terminal's bounded
+  `System Events` Automation and Accessibility route before staging, retiring,
+  or launching any test identity. A TCC denial is reported as an
+  environment-inconclusive result and cannot leave another application,
+  profile, Open Recent row, or support tree behind; manual smoke also keeps an
+  existing experiment intact when that preflight is unavailable.
+- Isolated manual and automated smoke cleanup now accounts for WebKit's Darwin
+  per-user state explicitly. Schema-5 manifests pin the canonical `C` and `T`
+  roots plus the exact GPU, Networking and WebContent paths; cleanup removes
+  late-written run-owned `C` cache, strictly validates protected empty
+  per-identity filesystem entries under the OS-managed `T` root without trying
+  to delete them, and reports that payload-free residue honestly. Legacy
+  two-phase schema-4 coordinates remain cleanup-only after current bounded
+  validation so an interrupted older smoke does not become an undeletable
+  zombie; that validation is not authenticated provenance, and no legacy
+  manifest can authorize a new launch.
+- Settings no longer participates in SwiftUI scene restoration or the native
+  document tab graph. Pensieve now owns one retained AppKit window titled
+  **Settings**, excludes it from tabbing and Saved Application State, and
+  reuses it across repeated `Cmd+,` and close/reopen cycles. **General** and
+  **AI** remain panes inside that window instead of becoming detached top-level
+  or blank Mission Control surfaces; AI onboarding captures and dismisses its
+  document sheet, waits for the native ownership edges to detach, then opens
+  the same window on the AI pane. Every Settings entry point shares one final
+  native-modal gate: while a modal window, attached sheet, or sheet parent
+  remains, Pensieve leaves the window graph untouched, reports that the current
+  dialog must close, and requires an explicit retry. If the already-visible
+  Settings window owns that relationship and no exact document error surface
+  does, its retained model owns the same non-modal message instead of assigning
+  it to an unrelated historical document. An already-visible Settings window
+  renders that message; a hidden auxiliary window stays hidden and reports the
+  blocked retry with a beep plus trace rather than violating the no-ordering
+  gate. A bounded teardown failure reports through the originating
+  document's non-modal error surface and cannot queue a second onboarding sheet
+  over the unresolved pair. When Settings is key, `Cmd+W` closes Settings
+  itself and document-scoped commands cannot mutate the window behind it;
+  application-level New/Open remain available. The isolated UI smoke
+  independently vetoes both Accessibility duplicates and a surviving
+  WindowServer shell after Settings closes. Source-level lifecycle coverage
+  injects sheet relationships and notifications instead of attaching or
+  ordering real test windows onto the operator's active desktop.
 - Release provenance verification is now invariant to macOS `/var` ↔
   `/private/var` path aliases, and isolated smoke cleanup can retire read-only
   staged resources without an interactive terminal prompt. Toolbar smoke also
@@ -20,7 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   watchdog now sits above the cumulative worst-case duration of those bounded
   waits, and stage-level focus-regain breadcrumbs identify the exact blocked
   Accessibility operation instead of misreporting a loaded WindowServer as a
-  product hang. Synthetic Recent Documents and profile-namespace cleanup races
+  product hang. A public-API AX/CoreGraphics probe now proves that the file and
+  untitled buffers share one presented native tab surface by switching tabs,
+  observing the editor content change and returning to the original tab. Its
+  process-global AX timeout also bounds descendant tab/window reads and failure
+  inventory; an action-timeout result is accepted only after the selected state
+  and document content prove that the requested switch happened.
+  Background WindowServer watchers are reaped by exact child PID through
+  bounded natural, TERM and KILL phases, so a failed smoke cannot hang cleanup
+  or signal an unrelated process. Synthetic Recent Documents and profile-namespace cleanup races
   now live under the test fixture's temporary home instead of mutating or
   requiring TCC access to the operator's protected Library state.
 - Release builds made from an immutable exact-commit snapshot now preserve the
@@ -37,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlocks only the disposable copied directory tree, so resources inherited
   from the immutable snapshot cannot abort an otherwise valid notarized release
   while the signed and stapled source app remains untouched.
+- `make release-clean` now also retires an exact read-only `Pensieve/.build`
+  cache non-interactively before resolving SwiftPM dependencies. That cleanup
+  is bounded to the literal package cache, rejects symlinks and non-directories,
+  and cannot turn a terminal-attached release into a series of `rm`
+  confirmation prompts for immutable dependency checkout files.
 
 ### Added
 

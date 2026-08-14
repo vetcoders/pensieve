@@ -193,6 +193,10 @@ final class AppController: ObservableObject {
   private var documentImportTask: Task<Void, Never>?
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
+  /// One-way, per window: this session's new-tab draft has been created. Set by
+  /// `seedUntitledDraftForNewTab`, which both the window's construction and
+  /// `start(.newUntitledTab)` call.
+  private var didSeedUntitledDraftForNewTab = false
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
   /// The launch restore's bulk route. One call for the WHOLE working set, so
   /// the registry can join every tab to the group and bring exactly one window
@@ -392,7 +396,12 @@ final class AppController: ObservableObject {
     // reopen the previous working set.
     if intent == .newUntitledTab {
       folderManager.restoreLastFolderInBackground(into: appState)
-      _ = beginUntitledSession()
+      // Idempotent: the window's construction already seeded this draft (see
+      // `NewTabSessionSeed`), so this is the fallback for a controller that
+      // never went through a factory window — and, just as importantly, the
+      // guarantee that the late workspace hydration above cannot replace a
+      // buffer the user has been typing into since the tab appeared.
+      seedUntitledDraftForNewTab()
       return
     }
 
@@ -2107,6 +2116,20 @@ final class AppController: ObservableObject {
     }
     nextUntitledIndex = index + 1
     return untitledTitle(for: index)
+  }
+
+  /// The empty draft a "+" / ⌘T / ⌘N tab owes its FIRST render — see
+  /// `NewTabSessionSeed` for why it cannot wait for `start(intent:)`.
+  ///
+  /// One draft per window, whichever caller gets here first. A second call is a
+  /// no-op rather than a second `beginUntitledSession`: repeating it would
+  /// renumber the tab ("Untitled 2.md") and, worse, throw away whatever the user
+  /// had already typed into the tab that was on screen the whole time.
+  @discardableResult
+  func seedUntitledDraftForNewTab() -> Bool {
+    guard !didSeedUntitledDraftForNewTab else { return false }
+    didSeedUntitledDraftForNewTab = true
+    return beginUntitledSession()
   }
 
   @discardableResult
