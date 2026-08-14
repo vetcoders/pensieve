@@ -188,6 +188,26 @@ final class StartupRestoreWorkingSetHygieneTests: XCTestCase {
       "a file that is missing today is not a file the user closed")
   }
 
+  // MARK: - Status
+
+  /// THE WRITER DOES NOT SPEAK FOR THE WINDOW. `persistFile` used to clear
+  /// `lastError` when it succeeded, so recording a bookmark erased a failure the
+  /// user had not read yet — and a save records one mid-flight, which is exactly
+  /// where the message that mattered was coming from. Succeeding at persisting a
+  /// bookmark is not evidence that anything else went well.
+  func testASuccessfulPersistLeavesAnUnreadFailureOnScreen() throws {
+    let harness = try makeHarness()
+    let note = try harness.writeNote(named: "kept.md")
+    let appState = AppState()
+    appState.lastError = "Could not save notes.md: the volume is out of space."
+
+    try harness.makeBookmarkStore().persistFile(url: note, into: appState)
+
+    XCTAssertEqual(
+      appState.lastError, "Could not save notes.md: the volume is out of space.",
+      "a bookmark write erased an unrelated failure the user had not seen")
+  }
+
   // MARK: - Harness
 
   private func makeHarness() throws -> WorkingSetHarness {

@@ -23,11 +23,16 @@ final class BookmarkStore {
     var bookmark: Data?
   }
 
-  /// A freshly minted persisted blob together with the URL that carries the
-  /// security-scope extension obtained by resolving that exact blob.
+  /// A persisted blob together with the URL that carries the security-scope
+  /// extension obtained by resolving that exact blob.
+  ///
+  /// `resolvedURL` is NIL for a blob carried forward from the previous workspace
+  /// because its file cannot be reached today (see `replaceWorkspace`): there is
+  /// nothing live to take a grant on, and the entry is kept precisely so the
+  /// grant can be taken again once the file comes back.
   private struct WorkspaceBookmark {
     let data: Data
-    let resolvedURL: URL
+    let resolvedURL: URL?
   }
 
   private var activeAccess: [String: ActiveAccess] = [:]
@@ -158,6 +163,14 @@ final class BookmarkStore {
   /// from the front of it. Entries a previous build already duplicated collapse
   /// onto that first position, so a key can heal through an ordinary open
   /// instead of waiting for the next launch.
+  ///
+  /// Succeeding here says nothing about the caller's status line, so this writes
+  /// NOTHING to `appState.lastError`. It used to clear it, which made an ordinary
+  /// bookmark persist erase an earlier, unrelated failure the user had not read
+  /// yet — a save's own warning among them, since a save persists a bookmark
+  /// mid-flight. `appState` stays in the signature because a future failure of
+  /// this write may still need the state it names; deciding what the user sees
+  /// belongs to the caller that owns the last write to the status.
   func persistFile(url: URL, into appState: AppState) throws {
     let data = try mintFileBookmark(url)
     let targetPath = url.standardizedFileURL.path
@@ -173,7 +186,6 @@ final class BookmarkStore {
     }
     defaults.set(bookmarks, forKey: fileBookmarksKey)
     activate(url, bookmark: data)
-    appState.lastError = nil
   }
 
   /// Replaces the complete persisted workspace only after every new bookmark has been created.
@@ -186,16 +198,30 @@ final class BookmarkStore {
   /// handed it twice. Its only caller passes the live Open Files list, which is
   /// de-duplicated upstream — the guard below is what keeps that a fact about
   /// this key rather than a fact about today's callers.
+  ///
+  /// A working-set file that can no longer be bookmarked does NOT abort the
+  /// rewrite: its already-persisted blob is carried forward instead. All-or-
+  /// nothing protects the previous workspace from a partial write, but the caller
+  /// that removes a root has already changed the live workspace by the time it
+  /// hears about the failure — so refusing to write left the removed root
+  /// persisted and it came back on the next launch, durably. One file on an
+  /// unplugged volume was enough to trigger it, and that file is guaranteed to
+  /// still be in the working set: a merely-missing row is deliberately kept
+  /// (unplugged ≠ trashed). Carrying the old blob keeps that file's access for
+  /// when the volume returns AND lets the rewrite complete, which is what
+  /// actually retires the removed root's blob.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
     let roots = try rootURLs.map { url in
       try makeWorkspaceBookmark(for: url)
     }
+    // Read before anything is written: this is the key the fallback carries from.
+    let persistedFileBookmarks = fileBookmarksByMintedIdentity()
     var seenFilePaths: Set<String> = []
     let files =
       try fileURLs
       .filter { seenFilePaths.insert($0.standardizedFileURL.path).inserted }
       .map { url in
-        try makeWorkspaceBookmark(for: url)
+        try makeWorkspaceBookmark(for: url, carryingForward: persistedFileBookmarks)
       }
 
     // Resolve every freshly minted bookmark BEFORE dropping the old grants.
@@ -212,8 +238,13 @@ final class BookmarkStore {
       defaults.removeObject(forKey: legacyFolderBookmarkKey)
     }
     appState.bookmarkData = roots.first?.data
-    for root in roots { activate(root.resolvedURL) }
-    for file in files { activate(file.resolvedURL, bookmark: file.data) }
+    for root in roots { if let resolvedURL = root.resolvedURL { activate(resolvedURL) } }
+    for file in files {
+      // A carried-forward blob has no reachable URL, so there is no grant to take
+      // for it now. Launch restore activates it again the moment it resolves.
+      guard let resolvedURL = file.resolvedURL else { continue }
+      activate(resolvedURL, bookmark: file.data)
+    }
     appState.lastError = nil
   }
 
@@ -472,6 +503,61 @@ final class BookmarkStore {
       bookmarkDataIsStale: &bookmarkIsStale
     )
     return WorkspaceBookmark(data: data, resolvedURL: resolvedURL)
+  }
+
+  /// Mints `url`'s blob, or — when this machine cannot produce one today — hands
+  /// back the blob the working set already holds for the same file.
+  ///
+  /// Minting needs a live file: a deleted document or an unplugged volume makes
+  /// `bookmarkData` throw `NSFileReadNoSuchFile`, and inside an all-or-nothing
+  /// rewrite that one URL used to discard the whole write (see
+  /// `replaceWorkspace`). The carried blob is matched on the path it was MINTED
+  /// for, read out of the blob itself — resolving cannot answer for a file that
+  /// is not reachable, which is exactly the case this exists for — and folded
+  /// through `identityPath`, because neither spelling can be canonicalized
+  /// against a missing target.
+  ///
+  /// A failure with no previously persisted blob still throws: there is nothing
+  /// to carry, and inventing an entry for a file the working set never recorded
+  /// would be a resurrection rather than a rescue.
+  private func makeWorkspaceBookmark(
+    for url: URL,
+    carryingForward persistedFileBookmarks: [String: Data]
+  ) throws -> WorkspaceBookmark {
+    do {
+      return try makeWorkspaceBookmark(for: url)
+    } catch {
+      guard let carried = persistedFileBookmarks[Self.identityPath(url)] else { throw error }
+      DebugTrace.log("bookmark carried forward for unreachable file path=\(url.path)")
+      return WorkspaceBookmark(data: carried, resolvedURL: resolvedWorkspaceURL(for: carried))
+    }
+  }
+
+  /// The persisted working set keyed by the path each blob was minted for, which
+  /// is the only identity a file that cannot be resolved still answers to.
+  /// A blob carrying no cached path is skipped: it can name no file, so nothing
+  /// could ever match it.
+  private func fileBookmarksByMintedIdentity() -> [String: Data] {
+    var byIdentity: [String: Data] = [:]
+    for data in fileBookmarkData {
+      guard let origin = bookmarkedOrigin(data) else { continue }
+      byIdentity[Self.identityPath(origin)] = data
+    }
+    return byIdentity
+  }
+
+  /// Resolves a blob for its security-scope extension, or nil when its file
+  /// cannot be reached. `.withoutMounting` for the reason `pruneTrashedFiles`
+  /// gives: this runs on the main actor during a rewrite the operator is
+  /// watching, and a carried blob names a volume that may well be gone.
+  private func resolvedWorkspaceURL(for bookmark: Data) -> URL? {
+    var bookmarkIsStale = false
+    return try? URL(
+      resolvingBookmarkData: bookmark,
+      options: [.withSecurityScope, .withoutMounting],
+      relativeTo: nil,
+      bookmarkDataIsStale: &bookmarkIsStale
+    )
   }
 
   func clear(into appState: AppState, error: String? = nil) {

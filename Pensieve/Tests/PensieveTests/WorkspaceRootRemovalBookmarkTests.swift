@@ -144,6 +144,88 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     )
   }
 
+  /// THE ZOMBIE ROOT. The rewrite is all-or-nothing and its working-set half is
+  /// seeded unfiltered — by design, because filtering a missing ad-hoc row out
+  /// would silently drop the only bookmark that file has left. So one working-set
+  /// file that can no longer be bookmarked (deleted, or on an unplugged volume)
+  /// used to throw the ENTIRE rewrite away: the sidebar dropped the root, the
+  /// persisted key kept it, and the next launch brought the removed root back —
+  /// durably, and with its exclusions already dropped.
+  ///
+  /// A merely-missing row is guaranteed to still be there when this runs:
+  /// `reconcileTrashedOpenFiles` keeps it on purpose (unplugged ≠ trashed).
+  @MainActor
+  func testRemovingRootStillRetiresItWhenAWorkingSetFileCannotBeBookmarked() async throws {
+    let scenario = try await makeScenario()
+    let exclusion = try await excludeSubfolder(of: scenario.rootA, in: scenario)
+    try FileManager.default.removeItem(at: scenario.adHocFile)
+    XCTAssertTrue(
+      scenario.appState.openFiles.contains { $0.url.standardizedFileURL == scenario.adHocFile },
+      "Precondition: the vanished file is still a working-set row, which is what seeds the rewrite")
+
+    scenario.harness.manager.removeRoot(scenario.rootA, into: scenario.appState)
+    await settle(scenario.harness)
+
+    XCTAssertEqual(
+      persistedRootBookmarkURLs(scenario.harness).map(\.standardizedFileURL),
+      [scenario.rootB.standardizedFileURL],
+      """
+      The removed root is still in the persisted root key, so the next launch brings it back: \
+      persisted roots were \(persistedRootBookmarkURLs(scenario.harness).map(\.lastPathComponent))
+      """
+    )
+    XCTAssertTrue(
+      persistedFileBookmarkIdentities(scenario.harness)
+        .contains(BookmarkStore.identityPath(scenario.adHocFile)),
+      """
+      The vanished ad-hoc file lost its bookmark — the only thing that can give it access back \
+      when it returns: persisted file bookmarks named \
+      \(persistedFileBookmarkIdentities(scenario.harness))
+      """
+    )
+    XCTAssertFalse(
+      scenario.harness.metadataStore.load().excludedPaths.contains(exclusion),
+      "a rewrite that completed retires the removed root's exclusions along with it")
+    XCTAssertNil(
+      scenario.appState.lastError,
+      "carrying a blob forward is not a failure the user has to be told about")
+  }
+
+  /// THE RESIDUAL FAILURE, and what the exclusions must do about it. Carrying a
+  /// blob forward needs a blob: a surviving ROOT that vanished has none — root
+  /// bookmarks are not the working set — so the rewrite still fails, and the
+  /// removed root stays persisted.
+  ///
+  /// The exclusions then have to fail WITH it. Persisting them unconditionally is
+  /// what made the zombie root come back with its excluded subtrees re-armed for
+  /// indexing: two halves of one persisted workspace disagreeing about which
+  /// roots exist.
+  @MainActor
+  func testRemovingRootKeepsExclusionsWhenTheBookmarkRewriteCannotComplete() async throws {
+    let scenario = try await makeScenario()
+    let exclusion = try await excludeSubfolder(of: scenario.rootA, in: scenario)
+    try FileManager.default.removeItem(at: scenario.rootB)
+
+    scenario.harness.manager.removeRoot(scenario.rootA, into: scenario.appState)
+    await settle(scenario.harness)
+
+    XCTAssertNotNil(
+      scenario.appState.lastError,
+      "Precondition: this scenario is the rewrite FAILING — without the failure it proves nothing")
+    XCTAssertTrue(
+      persistedRootBookmarkURLs(scenario.harness).map(\.standardizedFileURL)
+        .contains(scenario.rootA.standardizedFileURL),
+      "Precondition: the failed rewrite left the removed root persisted")
+    XCTAssertTrue(
+      scenario.harness.metadataStore.load().excludedPaths.contains(exclusion),
+      """
+      The root is coming back on the next launch, but its exclusions were dropped anyway — the \
+      excluded subtrees would be indexed again: persisted exclusions were \
+      \(scenario.harness.metadataStore.load().excludedPaths)
+      """
+    )
+  }
+
   // MARK: - Scenario
 
   @MainActor
@@ -253,6 +335,10 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
     let documentWindowRegistry: DocumentWindowRegistry
     let defaults: UserDefaults
     let securityScopeProbe: SecurityScopeProbe
+    /// The exclusions' durable home. Root removal decides what a RELAUNCH sees,
+    /// so the exclusion half has to be read where a relaunch reads it, not off
+    /// the live `AppState` mirror.
+    let metadataStore: WorkspaceMetadataStore
   }
 
   private func makeSandbox() throws -> Sandbox {
@@ -294,10 +380,11 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       currentMergeTarget: { nil },
       applicationWindows: { [] },
       closeWindow: { _ in })
+    let metadataStore = WorkspaceMetadataStore(
+      metadataURL: support.appendingPathComponent("workspace.json")
+    )
     let manager = FolderManager(
-      metadataStore: WorkspaceMetadataStore(
-        metadataURL: support.appendingPathComponent("workspace.json")
-      ),
+      metadataStore: metadataStore,
       indexDatabase: indexDatabase,
       bookmarkStore: bookmarkStore,
       documentWindowRegistry: documentWindowRegistry,
@@ -313,7 +400,8 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
       bookmarkStore: bookmarkStore,
       documentWindowRegistry: documentWindowRegistry,
       defaults: defaults,
-      securityScopeProbe: securityScopeProbe
+      securityScopeProbe: securityScopeProbe,
+      metadataStore: metadataStore
     )
   }
 
@@ -334,6 +422,38 @@ final class WorkspaceRootRemovalBookmarkTests: XCTestCase {
   private func persistedFileBookmarkURLs(_ harness: Harness) -> [URL] {
     persistedBookmarkURLs(key: "Pensieve.workspace.fileBookmarks", in: harness)
       .map(\.standardizedFileURL)
+  }
+
+  /// Every file the persisted working set NAMES, read from the path each blob was
+  /// MINTED for. `persistedFileBookmarkURLs` cannot answer for the file this cut
+  /// is about: resolving its bookmark fails by definition, so a blob carried
+  /// forward for a file that is gone would read as no entry at all.
+  @MainActor
+  private func persistedFileBookmarkIdentities(_ harness: Harness) -> [String] {
+    let blobs = harness.defaults.array(forKey: "Pensieve.workspace.fileBookmarks") as? [Data] ?? []
+    return blobs.compactMap { data in
+      guard let path = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: data)?.path
+      else { return nil }
+      return BookmarkStore.identityPath(URL(fileURLWithPath: path))
+    }
+  }
+
+  /// Excludes a subfolder of `root` and returns the persisted exclusion key, so a
+  /// test can ask what the removal did to the OTHER half of the persisted
+  /// workspace.
+  @MainActor
+  private func excludeSubfolder(of root: URL, in scenario: Scenario) async throws -> String {
+    let folder = root.appendingPathComponent("excluded", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    scenario.harness.manager.addExcludedURLs([folder], into: scenario.appState)
+    await settle(scenario.harness)
+    let key = try XCTUnwrap(
+      WorkspaceExclusion.scopedKey(
+        for: folder, roots: scenario.appState.workspaceRoots.map(\.url)))
+    XCTAssertTrue(
+      scenario.harness.metadataStore.load().excludedPaths.contains(key),
+      "Precondition: the exclusion has to be durable before the removal can be asked about it")
+    return key
   }
 
   @MainActor

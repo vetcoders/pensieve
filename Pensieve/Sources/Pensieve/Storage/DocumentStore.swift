@@ -1181,7 +1181,18 @@ final class FolderManager {
       into: appState
     )
 
-    persistExcludedPaths(Set(retainedExclusions), into: appState)
+    // Exclusions are pruned only when the bookmark rewrite actually landed. The
+    // rewrite now carries forward the blob of a working-set file it cannot mint,
+    // so the remaining way to fail is a URL with no persisted blob at all (a
+    // surviving ROOT that vanished, say) — and that failure leaves the removed
+    // root persisted. Dropping its exclusions anyway is how the zombie root came
+    // back with its excluded subtrees re-armed for indexing. Keeping both halves
+    // of the persisted state on the same side of the failure keeps what a relaunch
+    // reads consistent; the live workspace still loses the root, and the error
+    // below says the persisted half did not follow.
+    if bookmarkError == nil {
+      persistExcludedPaths(Set(retainedExclusions), into: appState)
+    }
     appState.workspaceRoots = survivingRoots
     appState.folderURL = survivingRootURLs.first?.standardizedFileURL
     appState.workspaceSearchResults.removeAll {
@@ -1215,9 +1226,13 @@ final class FolderManager {
   /// - documents already covered by a SURVIVING root bookmark. They keep their
   ///   access through the root, and persisting them as file bookmarks would come
   ///   back as spurious ad-hoc working-set rows on the next launch.
-  /// - documents whose file no longer exists. `replaceWorkspace` is all-or-
-  ///   nothing, so one unbookmarkable URL would throw the entire rewrite away
-  ///   and leave the just-removed root persisted.
+  /// - documents whose file no longer exists. A vanished file cannot be minted a
+  ///   bookmark, and a tab the working set never named has no persisted blob for
+  ///   `replaceWorkspace` to carry forward either — so it is the one URL that
+  ///   could still throw the whole rewrite away and leave the just-removed root
+  ///   persisted. (The working-set half of the seed is deliberately NOT filtered
+  ///   this way: dropping a missing ad-hoc row here would silently discard its
+  ///   only bookmark. Those rows are covered by the carry-forward instead.)
   /// - documents whose file sits in the TRASH. A thrown-away file still exists,
   ///   so the check above says yes about it, and a tab that has not been retired
   ///   yet would have handed this rewrite a fresh bookmark for a dead document —
