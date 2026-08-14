@@ -888,6 +888,13 @@ if (( DO_DMG )); then
     spctl --assess --type open --context context:primary-signature "$DMG_PATH" 2>&1 | tail -3 || warn "DMG spctl check failed (may be OK)"
 fi
 
+# ─── Landing page checksum gate ────────────────────────────────────────────
+# docs/index.html ships a placeholder SHA-256 that a human fills in by hand
+# at publish time. Nothing else in the repo replaces or checks it, so catch
+# an unfilled placeholder here instead of shipping a broken download page.
+grep -q 'DO-NOT-SHIP' "$REPO_ROOT/docs/index.html" \
+    && die "docs/index.html still carries the placeholder checksum (DO-NOT-SHIP marker) — fill in the real SHA-256 before publishing."
+
 ok "Release pipeline complete"
 echo ""
 echo "  App: $APP_BUNDLE"
