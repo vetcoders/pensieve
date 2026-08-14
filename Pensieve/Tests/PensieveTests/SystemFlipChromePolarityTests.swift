@@ -6,7 +6,7 @@ import XCTest
 /// One window is on ONE half, always — including during the run-loop turn a live
 /// system flip takes to reach it.
 ///
-/// The defect these pin was photographed on the shipping app (KT-4): with
+/// The defect these tests pin was photographed on the shipping app (KT-4): with
 /// Typewriter active, flipping the Mac's light/dark setting mid-session left the
 /// window two-toned — the native tab bar and the toolbar chips in the NEW half
 /// while the titlebar, toolbar, sidebar and traffic lights stayed in the OLD
