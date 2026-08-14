@@ -425,7 +425,8 @@ log "FFI profile: $FFI_PROFILE"
 if (( ! DMG_ONLY )); then
     if (( DO_CLEAN )); then
         log "Cleaning $DIST_DIR + Pensieve/.build"
-        [[ ! -e "$DIST_DIR" ]] || /bin/rm -R -- "$DIST_DIR"
+        build_provenance_cleanup_dist_directory "$DIST_DIR" \
+            || die "Could not retire the previous release output safely."
         build_provenance_cleanup_swiftpm_build_cache "$PKG_DIR/.build" \
             || die "Could not retire the previous SwiftPM build cache safely."
     fi

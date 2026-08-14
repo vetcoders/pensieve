@@ -376,6 +376,64 @@ fi
 /bin/rm -R -- "$FIXTURE_ROOT/symlink-release" "$SYMLINK_APP_TARGET"
 pass "read-only stale app bundle cleanup is exact, bounded and symlink-safe"
 
+# `--clean` retires the whole lane output directory, and that directory holds
+# the same read-only .app. Model a stale release output — read-only files inside
+# read-only directories, plus the loose logs a previous run leaves — and prove
+# the clean path retires it with no terminal available.
+READONLY_DIST="$FIXTURE_ROOT/release/dist"
+STALE_DIST_BUNDLE="$READONLY_DIST/Pensieve.app/Contents/Resources/Pensieve_Pensieve.bundle"
+/bin/mkdir -p "$STALE_DIST_BUNDLE/Assets.xcassets/ic_format_italic_18pt.imageset"
+printf '%s\n' 'stale bundled sample' >"$STALE_DIST_BUNDLE/sample.md"
+printf '%s\n' 'stale imageset payload' \
+  >"$STALE_DIST_BUNDLE/Assets.xcassets/ic_format_italic_18pt.imageset/ic.png"
+printf '%s\n' 'stale build log' >"$READONLY_DIST/swift-build.log"
+/bin/chmod -R a-w "$STALE_DIST_BUNDLE"
+build_provenance_cleanup_dist_directory "$READONLY_DIST" </dev/null \
+  || fail "read-only dist cleanup failed"
+[[ ! -e "$READONLY_DIST" ]] \
+  || fail "read-only dist cleanup left release output bytes behind"
+# --clean proceeds straight into `mkdir -p "$DIST_DIR"`.
+/bin/mkdir -p "$READONLY_DIST" \
+  || fail "retired dist path did not accept a fresh release output directory"
+/bin/rm -R -- "$READONLY_DIST"
+
+# `--clean --appstore` computes dist/mas as its output root; refusing it would
+# break `make release-appstore` at exactly the same stage.
+MAS_DIST="$FIXTURE_ROOT/release/dist/mas"
+/bin/mkdir -p "$MAS_DIST/Pensieve.app/Contents/Resources"
+printf '%s\n' 'stale MAS resource' \
+  >"$MAS_DIST/Pensieve.app/Contents/Resources/sample.md"
+/bin/chmod -R a-w "$MAS_DIST/Pensieve.app/Contents/Resources"
+build_provenance_cleanup_dist_directory "$MAS_DIST" </dev/null \
+  || fail "read-only MAS dist cleanup failed"
+[[ ! -e "$MAS_DIST" ]] \
+  || fail "read-only MAS dist cleanup left release output bytes behind"
+/bin/rm -R -- "$READONLY_DIST"
+
+UNOWNED_DIST_ROOT="$FIXTURE_ROOT/not-dist"
+/bin/mkdir -p "$UNOWNED_DIST_ROOT"
+if build_provenance_cleanup_dist_directory "$UNOWNED_DIST_ROOT" \
+  >/dev/null 2>&1; then
+  fail "dist cleanup accepted a path outside an exact dist output root"
+fi
+[[ -d "$UNOWNED_DIST_ROOT" ]] \
+  || fail "rejected dist cleanup mutated the unrelated directory"
+/bin/rm -R -- "$UNOWNED_DIST_ROOT"
+
+SYMLINK_DIST_PARENT="$FIXTURE_ROOT/symlink-release"
+SYMLINK_DIST_TARGET="$FIXTURE_ROOT/symlink-dist-target"
+/bin/mkdir -p "$SYMLINK_DIST_PARENT" "$SYMLINK_DIST_TARGET"
+/bin/ln -s "$SYMLINK_DIST_TARGET" "$SYMLINK_DIST_PARENT/dist"
+if build_provenance_cleanup_dist_directory "$SYMLINK_DIST_PARENT/dist" \
+  >/dev/null 2>&1; then
+  fail "dist cleanup followed a symlinked release output root"
+fi
+[[ -d "$SYMLINK_DIST_TARGET" ]] \
+  || fail "rejected symlink cleanup mutated its referent"
+/bin/rm "$SYMLINK_DIST_PARENT/dist"
+/bin/rm -R -- "$SYMLINK_DIST_PARENT" "$SYMLINK_DIST_TARGET"
+pass "read-only dist cleanup is exact, bounded and symlink-safe"
+
 assert_plist_value() {
   local plist="$1"
   local key="$2"

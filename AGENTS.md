@@ -116,5 +116,12 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
-If `make release-clean` dies with `Directory not empty`, a live SourceKit
-indexer is racing the delete; use `make clean && make release` instead.
+`Permission denied` or `Directory not empty` while a release retires `dist/` or
+`Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
+`Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,
+and unlinking a read-only child needs write permission on its parent. The
+cleanup helpers in `scripts/lib/build-provenance.sh` unlock those exact derived
+trees first, so `make release-clean` retires them without prompting. A live
+SourceKit indexer repopulating `.build/index-build` mid-delete can raise the
+same `Directory not empty` — that secondary race is what the rename-aside in the
+`clean` target covers.
