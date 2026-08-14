@@ -8,8 +8,9 @@ import SwiftUI
 /// actions) raises an intent; this sheet shows the explicit subject, the
 /// preselected workflow, the agent picker, the remembered run root, and a
 /// summary — nothing runs until the user presses Dispatch. Dispatch is headless
-/// via the canonical uv-core entry (parseable run_id) and confirms IN the sheet
-/// ("Dispatched ✓ run: …") so the user always knows whether it fired. Presented
+/// via the canonical uv-core entry (parseable run_id) and reports IN the sheet
+/// whether worker spawn was recorded or the launch remains unconfirmed, without
+/// mistaking either state for completion. Presented
 /// as a `.sheet` (not a transient popover) so the "Choose…" NSOpenPanel can run
 /// as a sheet-on-sheet without dismissing it and losing the chosen folder.
 struct DispatchPopover: View {
@@ -27,15 +28,31 @@ struct DispatchPopover: View {
   /// which launches with NO positional agent). Only offered when the
   /// descriptor declares the positional-synthesizer policy.
   @State private var synthesizer: String = ""
-  /// Agent token to observe after a launch; nil for a default swarm run,
-  /// which has no single agent to observe.
-  @State private var observeAgent: String?
 
   enum Phase: Equatable {
     case configuring
     case dispatching
-    case dispatched(runID: String?, reportPath: String?)
-    case failed(String)
+    case dispatched(runID: String?, reportPath: String?, observeAgent: String?)
+    case acceptedUnconfirmed(runID: String, reportPath: String?, observeAgent: String?)
+    case failed(String, runID: String?, reportPath: String?, observeAgent: String?)
+  }
+
+  /// Pure outcome-to-view-state seam. Receipt identifiers and the canonical
+  /// observe agent must survive success, uncertainty, and rejection alike.
+  static func resolvedPhase(for outcome: AppController.DocumentDispatchOutcome) -> Phase {
+    switch outcome {
+    case .success(let runID, let reportPath, let observeAgent, _):
+      return .dispatched(
+        runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+    case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _):
+      return .acceptedUnconfirmed(
+        runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+    case .rejected(let message, let runID, let reportPath, let observeAgent):
+      return .failed(
+        message, runID: runID, reportPath: reportPath, observeAgent: observeAgent)
+    case .failure(let message):
+      return .failed(message, runID: nil, reportPath: nil, observeAgent: nil)
+    }
   }
 
   init(
@@ -65,7 +82,7 @@ struct DispatchPopover: View {
   private var isConfiguring: Bool {
     switch phase {
     case .configuring, .failed: return true
-    case .dispatching, .dispatched: return false
+    case .dispatching, .dispatched, .acceptedUnconfirmed: return false
     }
   }
 
@@ -231,10 +248,15 @@ struct DispatchPopover: View {
   @ViewBuilder private var actionRow: some View {
     switch phase {
     case .configuring, .failed:
-      if case .failed(let message) = phase {
+      if case .failed(let message, let runID, let reportPath, let observeAgent) = phase {
         Text(message)
           .font(.system(size: 11)).foregroundStyle(.red).lineLimit(3)
           .frame(maxWidth: .infinity, alignment: .leading)
+        // A rejected or failed launch never started a run: only the report
+        // file, if the launcher already wrote one, is real.
+        dispatchReceiptActions(
+          runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+          runIsLaunched: false)
       }
       if intent.subjectIsEmpty {
         Text("This document is empty. Write something before dispatching.")
@@ -265,33 +287,117 @@ struct DispatchPopover: View {
         Text("Dispatching…").font(.system(size: 12))
         Spacer()
       }
-    case .dispatched(let runID, let reportPath):
+    case .dispatched(let runID, let reportPath, let observeAgent):
       VStack(alignment: .leading, spacing: 8) {
         Label(
-          runID.map { "Dispatched ✓  run: \($0)" } ?? "Dispatched ✓",
+          runID.map { "Run started  ·  \($0)" } ?? "Run started",
           systemImage: "checkmark.seal.fill"
         )
         .foregroundStyle(.green)
         .font(.system(size: 12, weight: .semibold))
         .textSelection(.enabled)
         .accessibilityIdentifier("pensieve.dispatch.confirmed")
+        Text(
+          "This confirms launch, not completion. The agent keeps running in the background "
+            + "if you close this sheet or Terminal."
+        )
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
         HStack(spacing: 8) {
-          if let reportPath {
-            Button("Reveal report") {
-              NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: reportPath)])
-            }
-          }
-          if let runID, let observeAgent {
-            Button("Observe in Terminal") {
-              controller.observeRunInTerminal(agent: observeAgent, runID: runID)
-            }
-          }
+          dispatchReceiptActions(
+            runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+            runIsLaunched: true)
           Spacer()
-          Button("Done") { onClose() }
+          Button("Close") { onClose() }
+            .keyboardShortcut(.defaultAction)
+        }
+      }
+    case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent):
+      VStack(alignment: .leading, spacing: 8) {
+        Label(
+          "Run accepted · launch unconfirmed  ·  \(runID)",
+          systemImage: "exclamationmark.triangle.fill"
+        )
+        .foregroundStyle(.orange)
+        .font(.system(size: 12, weight: .semibold))
+        .textSelection(.enabled)
+        .accessibilityIdentifier("pensieve.dispatch.unconfirmed")
+        Text(AgentDispatchMetadata.unconfirmedLaunchExplanation)
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("pensieve.dispatch.lifecycleNote")
+        HStack(spacing: 8) {
+          dispatchReceiptActions(
+            runID: runID, reportPath: reportPath, observeAgent: observeAgent,
+            runIsLaunched: true)
+          Spacer()
+          Button("Close") { onClose() }
             .keyboardShortcut(.defaultAction)
         }
       }
     }
+  }
+
+  /// What a receipt may offer, for every phase that shows one. The rules live
+  /// in the pure resolver below; this is only their rendering.
+  @ViewBuilder private func dispatchReceiptActions(
+    runID: String?, reportPath: String?, observeAgent: String?, runIsLaunched: Bool
+  ) -> some View {
+    let actions = Self.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      runIsLaunched: runIsLaunched)
+    if let reportPath = actions.revealReportPath {
+      Button("Reveal report") {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: reportPath)])
+      }
+    }
+    if let observe = actions.observe {
+      Button("Check status in Terminal") {
+        controller.observeRunInTerminal(agent: observe.agent, runID: observe.runID)
+      }
+    }
+  }
+
+  /// The affordances a launch receipt earns.
+  struct ReceiptActions: Equatable {
+    /// The report file is real as soon as the launcher wrote it — a rejected
+    /// run may still have one, so revealing it never depends on the launch.
+    let revealReportPath: String?
+    /// Present only for a run that actually started.
+    let observe: Observe?
+
+    struct Observe: Equatable {
+      let agent: String
+      let runID: String
+    }
+  }
+
+  /// The single seam deciding what a receipt offers. Pure, so both rules are
+  /// pinnable without a hosted view:
+  ///
+  /// - the resolved `observeAgent` is the authority for
+  ///   `vibecrafted <agent> observe`. `AppController` may derive it from the
+  ///   one explicitly dispatched positional agent when an older receipt omits
+  ///   `agent:`; this view never guesses from the configured-agent list;
+  /// - a run that never started has no status to check, whatever identifiers
+  ///   its rejection receipt carries.
+  static func receiptActions(
+    runID: String?,
+    reportPath: String?,
+    observeAgent: String?,
+    runIsLaunched: Bool
+  ) -> ReceiptActions {
+    guard runIsLaunched, let runID, let observeAgent, !observeAgent.isEmpty else {
+      return ReceiptActions(revealReportPath: reportPath, observe: nil)
+    }
+    return ReceiptActions(
+      revealReportPath: reportPath,
+      observe: ReceiptActions.Observe(agent: observeAgent, runID: runID))
   }
 
   private func runDispatch() async {
@@ -306,18 +412,16 @@ struct DispatchPopover: View {
     case .loading, .unavailable:
       // The Dispatch button is disabled for these plans; if a race lands here
       // anyway, refuse in the UI — confirmDispatch would refuse too.
-      phase = .failed("This workflow can't be dispatched right now.")
+      phase = .failed(
+        "This workflow can't be dispatched right now.",
+        runID: nil,
+        reportPath: nil,
+        observeAgent: nil)
       return
     }
-    observeAgent = agents.first
     let outcome = await controller.confirmDispatch(
       intent: intent, workflow: workflow, agents: agents, rootURL: rootURL)
-    switch outcome {
-    case .success(let runID, let reportPath, _):
-      phase = .dispatched(runID: runID, reportPath: reportPath)
-    case .failure(let message):
-      phase = .failed(message)
-    }
+    phase = Self.resolvedPhase(for: outcome)
   }
 
   private func chooseRoot() {

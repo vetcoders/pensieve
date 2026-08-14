@@ -11,6 +11,7 @@ extension XCTestCase {
     recoveryStore: RecoveryStore? = nil,
     savingSettings: DocumentSavingSettings? = nil,
     writeDocument: ((String, URL) throws -> Void)? = nil,
+    replaceExistingDocument: ((String, URL) throws -> Void)? = nil,
     indexDocument: (@MainActor (DocumentRef, String, AppState?) -> Void)? = nil,
     dirtySessionPrompt: (@MainActor (DocumentSession) -> SaveChangesResponse)? = nil,
     savePanelURLProvider: (@MainActor (AppState) -> URL?)? = nil,
@@ -31,6 +32,7 @@ extension XCTestCase {
       // toggled in the real app must not decide how these tests behave.
       savingSettings: savingSettings ?? makeAutoSaveSettings(enabled: true),
       writeDocument: writeDocument,
+      replaceExistingDocument: replaceExistingDocument,
       indexDocument: indexDocument,
       dirtySessionPrompt: dirtySessionPrompt,
       savePanelURLProvider: savePanelURLProvider,

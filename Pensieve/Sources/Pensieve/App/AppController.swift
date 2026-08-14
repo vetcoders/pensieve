@@ -11,14 +11,12 @@ private enum DocumentImportOutcome: Sendable {
 /// The application's ONE startup restore, as a process-wide fact.
 ///
 /// Bringing the working set back is something the APPLICATION does once, when
-/// it starts — not something every window that runs
-/// `start(intent:)` does. Every launcher takes that same path: the
-/// one the registry re-opens after the last document window closes, and the one
-/// a Dock reopen makes. And closing a WINDOW deliberately leaves its files in
-/// the working set — retiring a file is what closing the DOCUMENT does (⌘W, a
-/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — so a
-/// per-controller gate meant closing the last document window immediately
-/// reopened it: the user could not close it at all.
+/// it starts — not something every window that runs `start(intent:)` does.
+/// Launchers created later by an explicit Dock reopen must not repeat that
+/// startup restore. Closing a WINDOW deliberately leaves its files in the
+/// working set — retiring a file is what closing the DOCUMENT does (⌘W, a
+/// tab's "×", "Close from Open Files"; operator decision 2026-08-03) — while
+/// closing the last window leaves the running app windowless until Dock reopen.
 ///
 /// Production shares `.shared`; a test that simulates a launch holds its own
 /// instance, because "once per process" is otherwise once per test BUNDLE.
@@ -32,6 +30,62 @@ final class ApplicationStartupRestore {
   func claimStartupRestore() -> Bool {
     defer { isUnclaimed = false }
     return isUnclaimed
+  }
+}
+
+/// Becoming active is an APPLICATION event, so the working-set reconcile it
+/// triggers is subscribed ONCE per process — not once per window.
+///
+/// It used to be armed in every `AppController.init`: with N windows open, one
+/// activation ran N identical passes over the SAME shared working set (each a
+/// `stat` plus a Trash `getRelationship` per open file, all on the main actor).
+/// The subscription now lives here and fans out to one live controller per
+/// distinct working set.
+@MainActor
+final class AppActivationReconciler {
+  static let shared = AppActivationReconciler()
+
+  /// Which working set a controller's reconcile would touch. Two windows of the
+  /// same app share the process's one `WorkspaceStore` (`PensieveApp` builds it
+  /// and hands it to every window's `AppState`), so they collapse to a single
+  /// pass; a test harness with its own store still gets its own.
+  struct WorkingSetKey: Hashable {
+    let folderManager: ObjectIdentifier
+    let workingSet: ObjectIdentifier
+  }
+
+  /// Weak by construction: a closed window's controller drops out on dealloc,
+  /// so the process-wide subscription can outlive every window without holding
+  /// one alive and without dangling. Last window closed ⇒ the pass is a no-op;
+  /// a controller that appears later is served again.
+  private let controllers = NSHashTable<AppController>.weakObjects()
+  private var cancellable: AnyCancellable?
+
+  private init() {}
+
+  /// Registers a window's controller and arms the one subscription on first
+  /// use. Nothing is ever unregistered by hand.
+  func register(_ controller: AppController) {
+    controllers.add(controller)
+    guard cancellable == nil else { return }
+    cancellable = NotificationCenter.default.publisher(
+      for: NSApplication.didBecomeActiveNotification
+    ).sink { _ in
+      Task { @MainActor in AppActivationReconciler.shared.reconcile() }
+    }
+  }
+
+  func reconcile() {
+    for controller in Self.reconcilePass(over: controllers.allObjects) {
+      controller.reconcileWorkingSetForAppActivation()
+    }
+  }
+
+  /// One controller per distinct working set, in registration order. Pure, so
+  /// the fan-out rule is pinnable without posting a notification.
+  static func reconcilePass(over controllers: [AppController]) -> [AppController] {
+    var seen = Set<WorkingSetKey>()
+    return controllers.filter { seen.insert($0.workingSetKey).inserted }
   }
 }
 
@@ -49,6 +103,9 @@ final class AppController: ObservableObject {
       DocumentClosePrompt, DocumentSession, NSWindow?,
       @escaping @MainActor (SaveChangesResponse) -> Void
     ) -> Void
+  /// Asks whether a global quit may continue while leaving a recovery copy on
+  /// disk. The title identifies the document whose cleanup failed.
+  typealias QuitAfterRecoveryRetirementFailureConfirmation = @MainActor (String) -> Bool
 
   private let appState: AppState
   private let folderManager: FolderManager
@@ -65,6 +122,28 @@ final class AppController: ObservableObject {
   private let confirmFolderTrash: FolderTrashConfirmation
   private let confirmSaveChanges: SaveChangesConfirmation
   private let confirmDiscardDraft: DraftDiscardConfirmation
+  private let confirmQuitAfterRecoveryRetirementFailure:
+    QuitAfterRecoveryRetirementFailureConfirmation
+  /// How many app-activation reconcile passes THIS controller ran. Per instance
+  /// on purpose: the fan-out pin reads it instead of a process-wide counter, so
+  /// whatever else is alive in the test bundle cannot move it.
+  private(set) var appActivationReconcilePassCount = 0
+
+  /// Identifies the working set this controller's activation reconcile touches.
+  /// See `AppActivationReconciler.WorkingSetKey`.
+  var workingSetKey: AppActivationReconciler.WorkingSetKey {
+    AppActivationReconciler.WorkingSetKey(
+      folderManager: ObjectIdentifier(folderManager),
+      workingSet: ObjectIdentifier(appState.workspaceStore))
+  }
+
+  /// Finder can move an ad-hoc working-set file to Trash while no watched
+  /// workspace root covers it. Returning to Pensieve is where the live working
+  /// set finds out. Driven by `AppActivationReconciler`, once per activation.
+  func reconcileWorkingSetForAppActivation() {
+    appActivationReconcilePassCount += 1
+    folderManager.reconcileExternalWorkingSetChanges(into: appState)
+  }
   /// Unhandled crash drafts, newest first — the model behind the launcher's
   /// "Recovered Drafts" section. Empty means the section is not shown at all.
   @Published private(set) var recoveredDrafts: [RecoveryDraft] = []
@@ -114,6 +193,10 @@ final class AppController: ObservableObject {
   private var documentImportTask: Task<Void, Never>?
   private var workspaceSearchTask: Task<Void, Never>?
   private var nextUntitledIndex = 1
+  /// One-way, per window: this session's new-tab draft has been created. Set by
+  /// `seedUntitledDraftForNewTab`, which both the window's construction and
+  /// `start(.newUntitledTab)` call.
+  private var didSeedUntitledDraftForNewTab = false
   var requestOpenDocumentWindow: ((DocumentRef) -> Void)?
   /// The launch restore's bulk route. One call for the WHOLE working set, so
   /// the registry can join every tab to the group and bring exactly one window
@@ -188,6 +271,21 @@ final class AppController: ObservableObject {
       alert.addButton(withTitle: "Cancel")
       alert.buttons[1].keyEquivalent = "\u{1b}"
       return alert.runModal() == .alertFirstButtonReturn
+    },
+    confirmQuitAfterRecoveryRetirementFailure:
+      @escaping
+    QuitAfterRecoveryRetirementFailureConfirmation = { title in
+      let alert = NSAlert()
+      alert.messageText = "The recovery copy couldn’t be removed."
+      alert.informativeText =
+        "Pensieve can keep “\(title)” open so you can retry, or quit without removing its recovery copy. If you quit, the discarded copy may appear in Recovered Drafts the next time Pensieve opens."
+      alert.alertStyle = .warning
+      let keepOpenButton = alert.addButton(withTitle: "Keep Pensieve Open")
+      keepOpenButton.keyEquivalent = "\u{1b}"
+      let quitAnywayButton = alert.addButton(withTitle: "Quit Anyway")
+      quitAnywayButton.hasDestructiveAction = true
+      alert.window.defaultButtonCell = keepOpenButton.cell as? NSButtonCell
+      return alert.runModal() == .alertSecondButtonReturn
     }
   ) {
     self.appState = appState
@@ -207,9 +305,12 @@ final class AppController: ObservableObject {
     self.confirmFolderTrash = confirmFolderTrash
     self.confirmSaveChanges = confirmSaveChanges
     self.confirmDiscardDraft = confirmDiscardDraft
+    self.confirmQuitAfterRecoveryRetirementFailure =
+      confirmQuitAfterRecoveryRetirementFailure
     self.documentStore.observeSelfWrites { [weak folderManager] url in
       folderManager?.noteSelfWrite(at: url)
     }
+    AppActivationReconciler.shared.register(self)
   }
 
   /// Whether this window's session holds work the user could lose — an
@@ -244,6 +345,16 @@ final class AppController: ObservableObject {
   /// this window and a new tab, the empty-window close — has to ask this too.
   var hasPendingDocumentLoad: Bool { appState.documentIsLoading }
 
+  /// "Is this window already spoken for?" — the single question every open
+  /// router asks before choosing between loading in place and handing the
+  /// document to the registry. An empty, idle window is the one that may be
+  /// reused; a buffer, a conversion in flight or a staged read all claim it.
+  /// One expression so `openFile` (⌘O, Finder, recents) and
+  /// `openDocumentWindow` (every click) cannot drift apart.
+  var holdsLiveDocumentWork: Bool {
+    appState.documentSession.hasEditableBuffer || hasPendingImportWork || hasPendingDocumentLoad
+  }
+
   /// True until this window's launch-time restore resolves. A window waiting
   /// for its document must not be reaped as an "empty launcher" just because
   /// the document has not reached the accessor yet — the sweep fires on a
@@ -276,6 +387,24 @@ final class AppController: ObservableObject {
     let indexDatabase = indexDatabase
     Task { await indexDatabase.openInBackground(into: appState) }
     guard intent.restoresWorkspace else { return }
+
+    // A factory-built New tab is not a launcher waiting to be restored. Its
+    // root starts bufferless while SwiftUI attaches, so materialize the empty
+    // editable draft here before the launcher sweep can mistake it for idle.
+    // It must also never claim the process-wide cold-start restore: New creates
+    // one document and may rebuild workspace configuration, but it does not
+    // reopen the previous working set.
+    if intent == .newUntitledTab {
+      folderManager.restoreLastFolderInBackground(into: appState)
+      // Idempotent: the window's construction already seeded this draft (see
+      // `NewTabSessionSeed`), so this is the fallback for a controller that
+      // never went through a factory window — and, just as importantly, the
+      // guarantee that the late workspace hydration above cannot replace a
+      // buffer the user has been typing into since the tab appeared.
+      seedUntitledDraftForNewTab()
+      return
+    }
+
     // Claim the application's one startup restore BEFORE anything else in this
     // branch can return early: whichever window gets here first IS the launch,
     // and every launcher after it must be an empty launcher.
@@ -367,6 +496,25 @@ final class AppController: ObservableObject {
     }
   }
 
+  /// Whether an explicit open of `documentID` must go to the window registry
+  /// instead of loading into THIS window.
+  ///
+  /// One predicate, two callers, because there is one policy — and it used to be
+  /// written down twice. `openDocumentWindow` (the sidebar/search click) had both
+  /// terms; `openFile` (⌘O, Finder, Open Recent, the launcher's RECENT list) had
+  /// only the first, so an idle window asked to open a document that already had
+  /// a tab elsewhere loaded it in place and put the same file on screen twice.
+  ///
+  /// - a window holding LIVE WORK is spoken for: an editable buffer, a pending
+  ///   import, or a staged read whose bytes have not landed yet. Loading over any
+  ///   of them throws the user's document away.
+  /// - a document ALREADY IN SOME TAB routes even from an idle window, precisely
+  ///   because the window is free: rendering it here would be the second copy.
+  ///   The registry activates the tab that already shows it.
+  private func routesToOwnTab(_ documentID: URL) -> Bool {
+    holdsLiveDocumentWork || documentWindowRegistry.openTabDocumentIDs.contains(documentID)
+  }
+
   func openFolder(url: URL) {
     if importsFoldersInBackground {
       folderManager.openInBackground(url: url, into: appState)
@@ -376,10 +524,11 @@ final class AppController: ObservableObject {
   }
 
   /// External/explicit file opens (⌘O, Finder, recents): tab per document.
-  /// An empty window (no editable buffer) is reused in place; once this
-  /// window shows a document, further opens route through the window registry
-  /// and appear as native tabs. Falls back to in-window load when no routing
-  /// is wired (tests, headless).
+  /// An empty, idle window is reused in place; a window holding live work — or
+  /// an open request for a document that already has a tab somewhere — routes
+  /// through the window registry and appears as a native tab. Both terms live in
+  /// `routesToOwnTab`, shared with `openDocumentWindow`. Falls back to in-window
+  /// load when no routing is wired (tests, headless).
   func openFile(url: URL) {
     let standardizedURL = url.standardizedFileURL
 
@@ -439,10 +588,7 @@ final class AppController: ObservableObject {
     // URL of a multi-file open would answer "empty, use this window", invalidate
     // the first file's claim, and the file the user clicked first would vanish
     // exactly the way an import used to.
-    if appState.documentSession.hasEditableBuffer || hasPendingImportWork
-      || hasPendingDocumentLoad,
-      let requestOpenDocumentWindow
-    {
+    if routesToOwnTab(standardizedURL), let requestOpenDocumentWindow {
       DebugTrace.log("openFile -> registry: \(standardizedURL.lastPathComponent)")
       requestOpenDocumentWindow(DocumentRef(id: standardizedURL, isAdHoc: true))
       return
@@ -499,6 +645,11 @@ final class AppController: ObservableObject {
   /// Converts a Word/PDF source off the main actor and opens the result as an
   /// unsaved Markdown draft. The source file remains untouched; Save therefore
   /// follows the normal untitled-document Save As path.
+  ///
+  /// The conversion and the recovery write are reported SEPARATELY. A conversion
+  /// that lands but cannot be backed by a draft is not a success: the converted
+  /// text exists only in the buffer, so the error stays on screen rather than
+  /// being cleared, and the buffer stays open and dirty.
   func importDocument(url: URL) {
     let sourceURL = url.standardizedFileURL
     documentImportTask?.cancel()
@@ -522,6 +673,7 @@ final class AppController: ObservableObject {
       switch outcome {
       case .success(let imported):
         guard documentStore.prepareForDocumentSwitch(appState: appState) else { return }
+        documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
         appState.selectedDocumentID = nil
         appState.documentSession.restoreUntitled(
           title: imported.suggestedFileName,
@@ -530,7 +682,38 @@ final class AppController: ObservableObject {
         )
         // The conversion result has no source-backed autosave target. Persist
         // the dirty untitled session immediately so a crash cannot erase the handoff.
-        documentStore.savePendingChangesOnClose(appState: appState)
+        //
+        // `releasesDraftClaim: false` because this window STAYS OPEN holding the
+        // buffer that draft belongs to. The flush's default is a close, where
+        // releasing the claim is the point — the buffer dies and its draft goes
+        // back on the launcher. Here it would publish a LIVE buffer's draft as
+        // unhandled: every other launcher surface would offer it, and adopting it
+        // into a second window would put two buffers on one recovery ID,
+        // autosaving over each other.
+        let persisted = documentStore.savePendingChangesOnClose(
+          appState: appState, releasesDraftClaim: false)
+        guard persisted else {
+          // The conversion succeeded and its ONLY copy is the buffer on screen —
+          // there is no source-backed file to fall back to and no draft on disk.
+          // Clearing `lastError` here (which this path did unconditionally) left
+          // the app unable to tell a completed import from a failed one, so a
+          // crash before Save As… took the conversion with nothing having
+          // recorded the risk. The buffer is left open and dirty, and the stakes
+          // are appended to the recovery-snapshot error already reported.
+          //
+          // Reported through `reportDataLoss`, not a plain `lastError` write:
+          // the assignment lands in the STATUS slot, so it would leave the
+          // sharper sentence sitting behind the unresolved data loss
+          // the snapshot write just latched and never reach the screen. See
+          // the lifecycle contract's Recovery section.
+          appState.reportDataLoss(
+            (appState.lastError ?? "Could not write recovery draft.")
+              + " The text converted from \(sourceURL.lastPathComponent) is open but has no"
+              + " recovery copy — save it with Save As… before quitting.")
+          DebugTrace.log(
+            "importDocument -> Markdown draft NOT persisted: \(sourceURL.lastPathComponent)")
+          return
+        }
         appState.lastError = nil
         DebugTrace.log("importDocument -> Markdown draft: \(sourceURL.lastPathComponent)")
       case .failure(let message):
@@ -576,6 +759,7 @@ final class AppController: ObservableObject {
     let targetURL = availableSiblingURL(
       for: directoryURL.appendingPathComponent("Untitled").appendingPathExtension("md")
     )
+    documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
     appState.documentSession.createUntitled(title: targetURL.lastPathComponent)
     appState.selectedDocumentID = nil
     appState.lastError = nil
@@ -778,9 +962,16 @@ final class AppController: ObservableObject {
 
   /// Phase-2 apply for a deferred multi-window pass: performs the destructive
   /// step phase 1 deferred for this window — dropping an untitled draft the user
-  /// chose to Discard and marking it clean. `.settled` is a no-op.
-  func applyDeferredDirtySessionResolution(_ resolution: DocumentStore.DirtySessionResolution) {
-    documentStore.applyDeferredDirtySessionResolution(resolution, appState: appState)
+  /// chose to Discard and marking it clean. `.settled` is a no-op. Returns false
+  /// if the recovery payload could not be retired, which vetoes the teardown.
+  func applyDeferredDirtySessionResolution(
+    _ resolution: DocumentStore.DirtySessionResolution,
+    onRecoveryRetirementFailure: @MainActor () -> Bool = { false }
+  ) -> Bool {
+    documentStore.applyDeferredDirtySessionResolution(
+      resolution,
+      appState: appState,
+      onRecoveryRetirementFailure: onRecoveryRetirementFailure)
   }
 
   func clearOpenFiles() {
@@ -807,6 +998,10 @@ final class AppController: ObservableObject {
     //   resurrects and no stale `isDirty` trips the teardown save hook, THEN
     //   close the windows. No explicit per-window clear is needed: closing a
     //   window discards its `AppState` (and thus its session) outright.
+    //   Recovery retirement is the remaining fallible apply step. If it fails,
+    //   stop before closing any window; choices already applied earlier in this
+    //   phase remain conscious Discards, while the failed owner stays dirty and
+    //   recoverable rather than disappearing behind a false success.
     //
     // DELIBERATE DIVERGENCE from the conscious-close work landing in this same
     // stack: the Save/Don't Save/Cancel SHEET (`closeActiveDocument`,
@@ -852,7 +1047,12 @@ final class AppController: ObservableObject {
     }
 
     for (owner, resolution) in deferred {
-      owner.applyDeferredDirtySessionResolution(resolution)
+      guard owner.applyDeferredDirtySessionResolution(resolution) else {
+        // A recorded Discard still has one fallible step: retiring its durable
+        // recovery payload. If that fails, keep every window alive rather than
+        // turning a failed cleanup into an apparent successful close.
+        return
+      }
     }
     // Phase 2 also retires the FILES from the working set, for the same reason
     // the single-row close does: this affordance empties the Open Files list,
@@ -865,16 +1065,52 @@ final class AppController: ObservableObject {
     documentWindowRegistry.closeAllDocumentWindows()
   }
 
+  /// ⌘N / "New File".
+  ///
+  /// A window holding LIVE WORK is spoken for — the first term of
+  /// `routesToOwnTab`, and the reason ⌘O on such a window opens a tab instead of
+  /// loading in place. ⌘N never asked, so it replaced the buffer where it fired:
+  /// the file-backed session was overwritten by the new draft, the window's
+  /// registry identity flipped from `.file(url)` to `.untitled(uuid)`, and the
+  /// document's row in the sidebar's Open Files list — which mirrors the tab
+  /// chain — was REPLACED rather than joined. One document open, ⌘N, and the
+  /// document was gone from the list.
+  ///
+  /// An occupied window never enters the save/switch path. New is deterministic
+  /// in Pensieve v1: the factory-built document joins the source window's native
+  /// tab group, regardless of macOS's "Prefer tabs when opening documents"
+  /// setting. Reuse is restricted to a window the registry still classifies as
+  /// the idle launcher. A user-created untitled tab may briefly have no buffer
+  /// while SwiftUI attaches its controller, but its native role already makes a
+  /// second New another tab. Clean headless tests retain their in-place fallback.
   @discardableResult
   func createUntitledDocument() -> Bool {
-    guard documentStore.prepareForDocumentSwitch(appState: appState) else {
-      return false
+    let sourceWindow =
+      documentWindowRegistry.window(hosting: self) ?? hostWindowProvider?()
+    let sourceRequiresNewTab =
+      sourceWindow.map {
+        !documentWindowRegistry.isReusableLauncherWindow($0)
+      } ?? false
+
+    if holdsLiveDocumentWork || sourceRequiresNewTab {
+      if documentWindowRegistry.canOpenUntitledTab {
+        guard let sourceWindow else { return false }
+        return documentWindowRegistry.newUntitledTab(from: sourceWindow)
+      }
+
+      // A headless controller has no factory with which to preserve a dirty or
+      // in-flight session. Fail closed: New must neither ask to save nor replace
+      // work it cannot place elsewhere. Clean editable buffers retain the legacy
+      // in-place renumbering used by focused command tests.
+      guard !appState.documentSession.isDirty,
+        !hasPendingImportWork,
+        !hasPendingDocumentLoad
+      else {
+        return false
+      }
     }
 
-    appState.documentSession.createUntitled(title: nextUntitledTitle())
-    appState.selectedDocumentID = nil
-    appState.lastError = nil
-    return true
+    return beginUntitledSession()
   }
 
   func restoreLastFolder() {
@@ -951,6 +1187,12 @@ final class AppController: ObservableObject {
     //   aborted the quit — leaving a still-rendered buffer that no longer
     //   survives a crash and that the next ⌘Q/close no longer asks about.
     //
+    // Filesystem cleanup in phase 2 is deliberately sequential, not described
+    // as atomic: a recovery draft successfully deleted for an earlier explicit
+    // Discard cannot be rolled back if a later deletion fails. Keeping Pensieve
+    // open preserves the failing and not-yet-applied sessions; earlier conscious
+    // Discards remain applied.
+    //
     // Self is asked LAST so the firing window's own prompt is the final word,
     // exactly as before.
     var deferred: [(controller: AppController, resolution: DocumentStore.DirtySessionResolution)] =
@@ -963,8 +1205,27 @@ final class AppController: ObservableObject {
     guard let ownResolution = confirmDirtySessionForDeferredClose() else { return false }
     deferred.append((self, ownResolution))
 
+    var didAuthorizeRetainedRecoveryForThisQuit = false
     for (controller, resolution) in deferred {
-      controller.applyDeferredDirtySessionResolution(resolution)
+      guard
+        controller.applyDeferredDirtySessionResolution(
+          resolution,
+          onRecoveryRetirementFailure: {
+            if didAuthorizeRetainedRecoveryForThisQuit {
+              return true
+            }
+            guard
+              self.confirmQuitAfterRecoveryRetirementFailure(
+                controller.appState.documentSession.displayTitle)
+            else {
+              return false
+            }
+            didAuthorizeRetainedRecoveryForThisQuit = true
+            return true
+          })
+      else {
+        return false
+      }
     }
     // This pass has SETTLED, so the AppKit terminate hook must not run a second
     // one. ⌘Q reaches that hook through its own `NSApplication.terminate(_:)`
@@ -1063,10 +1324,24 @@ final class AppController: ObservableObject {
   func windowShouldClose(_ window: NSWindow) -> Bool {
     let decision = documentStore.closeDecision(appState: appState)
     guard let prompt = decision.prompt else {
-      // closeWithoutPrompting / saveWithoutPrompting: nothing to ask. Let the
-      // normal teardown run — for an auto-save-owned file it flushes on close.
-      // The session is still intact here, so the document this close settles is
-      // read now and retired only if the close turns out to be a TAB close.
+      if decision == .saveWithoutPrompting {
+        // This is still a VETO point. Persist now instead of trusting the later
+        // willClose notification, where both original and recovery writes could
+        // fail after AppKit had already committed to tearing the window down.
+        let didClose = documentStore.finishClose(
+          decision: decision,
+          response: nil,
+          appState: appState,
+          retiring: .deferred { [weak self, weak window] closedURL in
+            guard let self, let window else { return }
+            self.retireDocumentIfOnlyThisTabCloses(url: closedURL, window: window)
+          })
+        refreshRecoveredDrafts()
+        return didClose
+      }
+
+      // A clean session has nothing to persist. The document this close settles
+      // is read now and retired only if the close turns out to be a TAB close.
       if let closingURL = appState.documentSession.url {
         retireDocumentIfOnlyThisTabCloses(url: closingURL, window: window)
       }
@@ -1097,7 +1372,9 @@ final class AppController: ObservableObject {
       // `willCloseNotification` guard is a no-op on the now-clean session. Cancel
       // or a failed save leaves the window — and its buffer — intact.
       guard didClose else { return }
-      window?.close()
+      if let window {
+        ConsciousCloseHook.closeAfterConsent(window)
+      }
     }
     return false
   }
@@ -1151,9 +1428,17 @@ final class AppController: ObservableObject {
   /// panel leaves everything untouched.
   @discardableResult
   func saveRecoveredDraftAs(_ draft: RecoveryDraft) -> Bool {
-    let didSave = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    let savedURL = documentStore.saveRecoveredDraftAs(draft, into: appState)
+    if let savedURL {
+      recentDocuments.noteOpened(savedURL)
+      if appState.workspaceRoots.contains(where: {
+        WorkspaceScanner.contains(savedURL, in: $0.url)
+      }) {
+        folderManager.refresh(into: appState)
+      }
+    }
     refreshRecoveredDrafts()
-    return didSave
+    return savedURL != nil
   }
 
   /// `Discard`: drop the draft after the user confirms. Returns whether it was
@@ -1161,9 +1446,18 @@ final class AppController: ObservableObject {
   @discardableResult
   func discardRecoveredDraft(_ draft: RecoveryDraft) -> Bool {
     guard confirmDiscardDraft(draft) else { return false }
-    documentStore.discardRecoveredDraft(draft)
+    switch documentStore.discardRecoveredDraft(draft, into: appState) {
+    case .discarded:
+      refreshRecoveredDrafts()
+      return true
+    case .claimedByAnotherWindow:
+      appState.lastError = "This recovered draft is already open in another window."
+    case .storageFailure:
+      appState.lastError =
+        "Could not discard \(draft.displayTitle). The recovery copy is still on disk; resolve the storage error and try again."
+    }
     refreshRecoveredDrafts()
-    return true
+    return false
   }
 
   /// `NSApp` is an implicitly unwrapped global that stays nil until something
@@ -1198,42 +1492,41 @@ final class AppController: ObservableObject {
         ? appState.makeDocumentRef(for: id) : nil)
   }
 
-  /// Default click (Open Files list, workspace tree, search result, context-menu
-  /// "Open"): load the document in the current window, reusing the active editor
-  /// pane. This is the VS Code / Zed model — a single click never spawns a window
-  /// or tab. New tabs come only from the explicit `openDocumentInNewWindow`
-  /// gesture. Clicking the currently displayed document is a no-op.
+  /// Every click that means "open this file" — the workspace tree, a search
+  /// result, the context-menu "Open" — lands exactly where ⌘O and a Finder
+  /// "Open with Pensieve" land: as a native window tab. `click = tab`
+  /// (`docs/keyboard-shortcuts-and-file-lifecycle-contract.md`, decision
+  /// 26.07). A click is an explicit open, so it must not replace the document
+  /// this window is reading: files stay visible in parallel and switching
+  /// between them is switching tabs.
+  ///
+  /// Destination is `openFile`'s policy, not a second one — literally, through
+  /// the shared `routesToOwnTab`: an empty, idle window is reused in place — the
+  /// launcher the user clicked from becomes the file's window instead of
+  /// spawning a tab beside itself and being reaped a moment later — and a window
+  /// holding live work hands the document to the registry. The registry
+  /// activates the tab already showing the document rather than opening a twin,
+  /// which is also why a document open SOMEWHERE ELSE routes even from an idle
+  /// window: loading it in place would leave the same file rendered in two tabs.
+  ///
+  /// Clicking the document this window already shows is a no-op. Falls back to
+  /// in-window selection when no routing is wired (tests, headless).
   func openDocumentWindow(id: DocumentRef.ID?) {
     guard let id, let ref = resolveDocumentRef(for: id) else { return }
 
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
+    let documentID = ref.id.standardizedFileURL
+    if appState.selectedDocumentID?.standardizedFileURL == documentID {
       return
     }
 
-    DebugTrace.log("openDocumentWindow -> select in current window: \(ref.id.lastPathComponent)")
-    selectDocument(id: ref.id)
-  }
-
-  /// Explicit "Open in New Window" context-menu gesture: route through the window
-  /// registry to open the document in a native tab (or activate the window
-  /// already showing it). Clicking the currently displayed document is a no-op.
-  /// Falls back to in-window selection when no routing is wired (tests, headless).
-  func openDocumentInNewWindow(id: DocumentRef.ID?) {
-    guard let id, let ref = resolveDocumentRef(for: id) else { return }
-
-    if appState.selectedDocumentID?.standardizedFileURL == ref.id.standardizedFileURL {
-      return
-    }
-
-    guard let requestOpenDocumentWindow else {
+    guard routesToOwnTab(documentID), let requestOpenDocumentWindow else {
       DebugTrace.log(
-        "openDocumentInNewWindow -> select in current window (no routing): \(ref.id.lastPathComponent)"
-      )
+        "openDocumentWindow -> load in this window: \(ref.id.lastPathComponent)")
       selectDocument(id: ref.id)
       return
     }
 
-    DebugTrace.log("openDocumentInNewWindow -> registry: \(ref.id.lastPathComponent)")
+    DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
   }
 
@@ -1483,13 +1776,28 @@ final class AppController: ObservableObject {
     transcriptionService: TranscriptionService,
     onSuccess: (@MainActor @Sendable () -> Void)?
   ) {
-    if metadata.exitCode == 0 {
+    switch metadata.launchVerification {
+    case .workerSpawnRecorded:
       onSuccess?()
       appState.lastError = nil
-    } else {
+      transcriptionService.updateDispatchStatus(metadata.statusLine)
+
+    case .acceptedUnconfirmed:
+      // The detached run may already be alive. Keep the dictated prompt so a
+      // bounded proof timeout cannot erase the user's only editable copy, but
+      // do not present the accepted receipt as an application error either.
+      appState.lastError = nil
+      // The tafla has no orange receipt chrome to carry the uncertainty the way
+      // the dispatch sheet does, and its status line renders in exactly the same
+      // secondary caption a started run gets. So the line itself has to say what
+      // is unconfirmed — the sheet's own sentence, from the one copy.
+      transcriptionService.updateDispatchStatus(
+        "\(metadata.statusLine) — \(AgentDispatchMetadata.unconfirmedLaunchExplanation)")
+
+    case .rejected:
       appState.lastError = metadata.statusLine
+      transcriptionService.updateDispatchStatus(metadata.statusLine)
     }
-    transcriptionService.updateDispatchStatus(metadata.statusLine)
     isAgentDispatchInFlight = false
   }
 
@@ -1596,17 +1904,25 @@ final class AppController: ObservableObject {
   }
 
   /// Outcome of a document dispatch surfaced to the dispatch sheet for an
-  /// explicit, unmissable in-app confirmation (the user must know it fired).
+  /// explicit, unmissable in-app launch receipt. A spawn record proves that
+  /// the detached launcher created a worker, not that the worker is still
+  /// alive. A successful launcher receipt without that bounded proof remains
+  /// inspectable and must never be rewritten as a failed launch.
   enum DocumentDispatchOutcome: Sendable {
-    case success(runID: String?, reportPath: String?, statusLine: String)
+    case success(
+      runID: String?, reportPath: String?, observeAgent: String?, statusLine: String)
+    case acceptedUnconfirmed(
+      runID: String, reportPath: String?, observeAgent: String?, statusLine: String)
+    case rejected(
+      message: String, runID: String?, reportPath: String?, observeAgent: String?)
     case failure(message: String)
   }
 
-  /// The ONLY UI → launch path: headless dispatch of a confirmed intent via
-  /// the canonical uv-core entry, which prints a parseable launch receipt
-  /// (run_id / report path) and detaches. Called exclusively by the gateway
-  /// sheet's Dispatch button; the sheet shows "Dispatched ✓ run: …" from the
-  /// returned outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
+  /// The canonical document-sheet → launch path: headless dispatch of a
+  /// confirmed intent via the canonical uv-core entry, which prints a parseable
+  /// launch receipt (run_id / agent / report path) and detaches. Called by the gateway
+  /// sheet's Dispatch button; the sheet shows "Run started" from the returned
+  /// outcome. `workflow`/`agent`/`rootURL` are the sheet's edited
   /// values; the payload comes from the intent's subject snapshot. Terminal
   /// observability is a separate, user-triggered affordance
   /// (`observeRunInTerminal`) so a successful run never depends on a terminal.
@@ -1666,18 +1982,55 @@ final class AppController: ObservableObject {
           workflow: workflow, agents: agents,
           payload: payload, workingDirectoryURL: rootURL)
       }.value
-      guard metadata.exitCode == 0 else {
+      // The receipt's `agent:` token is authoritative. Older/trimmed receipts
+      // may omit it; only an explicitly dispatched positional agent is a safe
+      // fallback. A default swarm has no positional authority, so it gets no
+      // guessed Terminal observer action.
+      let observeAgent = metadata.observeAgent ?? agents.first
+      switch metadata.launchVerification {
+      case .rejected:
         appState.lastError = metadata.statusLine
         transcriptionService.updateDispatchStatus(metadata.statusLine)
-        return .failure(message: metadata.statusLine)
+        return .rejected(
+          message: metadata.statusLine,
+          runID: metadata.runID,
+          reportPath: metadata.reportPath,
+          observeAgent: metadata.observeAgent)
+
+      case .acceptedUnconfirmed:
+        guard let runID = metadata.runID else {
+          let message = "Dispatch rejected: Vibecrafted returned no run ID."
+          appState.lastError = message
+          transcriptionService.updateDispatchStatus(message)
+          return .rejected(
+            message: message,
+            runID: nil,
+            reportPath: metadata.reportPath,
+            observeAgent: observeAgent)
+        }
+        appState.lastError = nil
+        let line =
+          "Accepted \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent); "
+          + "worker launch unconfirmed"
+        transcriptionService.updateDispatchStatus("\(line) · run: \(runID)")
+        return .acceptedUnconfirmed(
+          runID: runID,
+          reportPath: metadata.reportPath,
+          observeAgent: observeAgent,
+          statusLine: line)
+
+      case .workerSpawnRecorded:
+        appState.lastError = nil
+        let line =
+          "Started \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
+        transcriptionService.updateDispatchStatus(
+          metadata.runID.map { "\(line) · run: \($0)" } ?? line)
+        return .success(
+          runID: metadata.runID,
+          reportPath: metadata.reportPath,
+          observeAgent: observeAgent,
+          statusLine: line)
       }
-      appState.lastError = nil
-      let line =
-        "Dispatched \(title) → \(workflow) (\(agentLabel)) in \(rootURL.lastPathComponent)"
-      transcriptionService.updateDispatchStatus(
-        metadata.runID.map { "\(line) · run: \($0)" } ?? line)
-      return .success(
-        runID: metadata.runID, reportPath: metadata.reportPath, statusLine: line)
     } catch {
       let message = "Dispatch failed: \(error.localizedDescription)"
       appState.lastError = message
@@ -1763,6 +2116,30 @@ final class AppController: ObservableObject {
     }
     nextUntitledIndex = index + 1
     return untitledTitle(for: index)
+  }
+
+  /// The empty draft a "+" / ⌘T / ⌘N tab owes its FIRST render — see
+  /// `NewTabSessionSeed` for why it cannot wait for `start(intent:)`.
+  ///
+  /// One draft per window, whichever caller gets here first. A second call is a
+  /// no-op rather than a second `beginUntitledSession`: repeating it would
+  /// renumber the tab ("Untitled 2.md") and, worse, throw away whatever the user
+  /// had already typed into the tab that was on screen the whole time.
+  @discardableResult
+  func seedUntitledDraftForNewTab() -> Bool {
+    guard !didSeedUntitledDraftForNewTab else { return false }
+    didSeedUntitledDraftForNewTab = true
+    return beginUntitledSession()
+  }
+
+  @discardableResult
+  private func beginUntitledSession() -> Bool {
+    guard documentStore.prepareForDocumentSwitch(appState: appState) else { return false }
+    documentStore.releaseRecoveryClaimBeforeReplacingSession(appState: appState)
+    appState.documentSession.createUntitled(title: nextUntitledTitle())
+    appState.selectedDocumentID = nil
+    appState.lastError = nil
+    return true
   }
 
   private func untitledTitle(for index: Int) -> String {

@@ -47,10 +47,20 @@ final class WorkspaceMetadataStore {
       .appendingPathComponent("workspace.json", isDirectory: false)
   }
 
-  static func applicationSupportDirectory() -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot() { return overrideRoot }
+  static func applicationSupportDirectory(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fileManager: FileManager = .default,
+    isTestProcess: Bool? = nil
+  ) -> URL {
+    if let isolationRoot = AppSupportLocation.isolationRoot(
+      environment: environment,
+      fileManager: fileManager,
+      isTestProcess: isTestProcess)
+    {
+      return isolationRoot
+    }
     do {
-      return try FileManager.default
+      return try fileManager
         .url(
           for: .applicationSupportDirectory,
           in: .userDomainMask,
@@ -63,7 +73,7 @@ final class WorkspaceMetadataStore {
         "%@",
         "WorkspaceMetadataStore: Application Support unavailable, "
           + "falling back to temporary directory: \(error)")
-      return FileManager.default.temporaryDirectory
+      return fileManager.temporaryDirectory
         .appendingPathComponent("Pensieve", isDirectory: true)
     }
   }

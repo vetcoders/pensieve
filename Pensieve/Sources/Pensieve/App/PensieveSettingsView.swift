@@ -9,17 +9,46 @@ struct PensieveSettingsView: View {
   let providerSettings: ProviderSettings
   let savingSettings: DocumentSavingSettings
   let launchSettings: LaunchSettings
+  @ObservedObject var selection: PensieveSettingsSelection
 
   var body: some View {
-    TabView {
-      GeneralSettingsView(settings: savingSettings, launchSettings: launchSettings)
-        .tabItem {
-          Label("General", systemImage: "gearshape")
+    ZStack(alignment: .bottom) {
+      TabView(selection: $selection.selectedSection) {
+        GeneralSettingsView(settings: savingSettings, launchSettings: launchSettings)
+          .tabItem {
+            Label("General", systemImage: "gearshape")
+          }
+          .tag(PensieveSettingsSection.general)
+        ProviderSettingsView(settings: providerSettings)
+          .tabItem {
+            Label("AI", systemImage: "sparkles")
+          }
+          .tag(PensieveSettingsSection.ai)
+      }
+
+      if let message = selection.presentationError {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .foregroundStyle(.orange)
+          Text(message)
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+          Spacer(minLength: 8)
+          Button {
+            selection.dismissPresentationError()
+          } label: {
+            Image(systemName: "xmark.circle.fill")
+              .foregroundStyle(.secondary)
+          }
+          .buttonStyle(.plain)
+          .accessibilityLabel("Dismiss")
         }
-      ProviderSettingsView(settings: providerSettings)
-        .tabItem {
-          Label("AI", systemImage: "sparkles")
-        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .padding(14)
+        .accessibilityIdentifier("pensieve.settings.presentationError")
+      }
     }
     .accessibilityIdentifier("pensieve.settings")
   }
@@ -55,8 +84,14 @@ struct GeneralSettingsView: View {
           "On, closing such a file saves it and closes. Off, Pensieve asks "
             + "Save / Don't Save / Cancel before anything is lost."
         )
-        Text("A new draft has no location yet, so closing one always asks where to save it.")
-        Text("Recovered drafts protect unsaved work after a crash either way.")
+        Text(
+          "An untouched empty draft closes silently. Once edited, a new draft always asks "
+            + "where to save it."
+        )
+        Text(
+          "Crash recovery protects edited drafts and unsaved changes to existing files in "
+            + "either mode. It never overwrites an original automatically."
+        )
         Text("Changes take effect immediately — no restart needed.")
       }
       .font(.caption)
@@ -80,10 +115,13 @@ struct GeneralSettingsView: View {
       .formStyle(.grouped)
 
       VStack(alignment: .leading, spacing: 5) {
-        Text("When off, Pensieve starts with no files open — nothing is reopened for you.")
+        Text(
+          "When off, Pensieve opens one empty launcher and no documents. "
+            + "When on, Pensieve alone restores the saved working set."
+        )
         Text(
           "Your workspace comes back either way: the folders you work in are "
-            + "configuration, not session."
+            + "always-alive configuration, not session."
         )
       }
       .font(.caption)

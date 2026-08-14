@@ -460,7 +460,7 @@ final class IndexDatabase {
     if let configuredDatabaseURL {
       return configuredDatabaseURL
     }
-    let directory = try applicationSupportDirectory()
+    let directory = try Self.applicationSupportDirectory()
     return directory.appendingPathComponent("index.db", isDirectory: false)
   }
 
@@ -2207,9 +2207,19 @@ final class IndexDatabase {
     }
   }
 
-  private func applicationSupportDirectory() throws -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot() { return overrideRoot }
-    return try FileManager.default
+  nonisolated static func applicationSupportDirectory(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fileManager: FileManager = .default,
+    isTestProcess: Bool? = nil
+  ) throws -> URL {
+    if let isolationRoot = AppSupportLocation.isolationRoot(
+      environment: environment,
+      fileManager: fileManager,
+      isTestProcess: isTestProcess)
+    {
+      return isolationRoot
+    }
+    return try fileManager
       .url(
         for: .applicationSupportDirectory,
         in: .userDomainMask,

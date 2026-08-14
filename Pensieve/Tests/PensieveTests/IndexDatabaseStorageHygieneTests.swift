@@ -598,13 +598,12 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   /// (`AppController.applicationShouldTerminate()`), so Dock quit, logout and
   /// shutdown — everything that goes straight to `terminate:` — skipped it.
   ///
-  /// This drives the REAL delegate entry point AppKit calls, not a helper: the
-  /// bug was never in the terminal checkpoint itself (which had its own passing
-  /// tests), it was in nothing calling it. Note the delegate hook deliberately
-  /// is NOT `applicationShouldTerminate(_:)`: under
-  /// `@NSApplicationDelegateAdaptor` that method is never invoked at all
-  /// (falsified at runtime on 2026-07-29), so a test pinning it would have gone
-  /// green against dead code.
+  /// This drives the REAL final-durability delegate entry point, not a helper:
+  /// the bug was never in the terminal checkpoint itself (which had its own
+  /// passing tests), it was in nothing calling it after the consent/veto pass.
+  /// `applicationShouldTerminate(_:)` now decides whether termination may
+  /// proceed; `applicationWillTerminate(_:)` performs the irreversible final
+  /// flush and checkpoint after that decision.
   func testApplicationWillTerminateCheckpointsTheIndexOnQuitPathsWithoutTheMenuItem() throws {
     let folder = try makeTemporaryFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -1733,7 +1732,7 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     registry.registerController(controller, for: window)
 

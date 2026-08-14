@@ -1,11 +1,14 @@
 # Pensieve — Keyboard Shortcuts, File & Recovery Contract v0.1
 
-> **Author: Monika (2026-08-03). Details filled in from settled product
-> decisions (dates inline).** Items marked **[OPEN]** await a decision — list
-> at the end.
-> Operator's Polish working copy lives outside the repo.
+> **Owner: Monika. Established 2026-08-03; current through 2026-08-12.**
+> Settled decisions carry their dates inline. Items marked **[OPEN]** await a
+> product decision; **[IMPLEMENTATION GAP]** means the decision is settled but
+> the current code does not yet satisfy it.
 
-This document is the source of truth for keyboard shortcuts, menus, and the lifecycle of files, tabs, windows and recovery in Pensieve. Changing a command's semantics requires updating this contract.
+This is the single source of truth for keyboard shortcuts, menus, and the
+lifecycle of files, tabs, windows and recovery in Pensieve. A report, test,
+implementation detail or external mirror cannot override it. Changing a
+command's semantics requires an explicit product decision and an update here.
 
 Pensieve follows macOS conventions but has its own model: **workspace + files + tabs**.
 
@@ -23,18 +26,65 @@ Pensieve follows macOS conventions but has its own model: **workspace + files + 
 
 ### `Cmd+T` — New Empty Tab
 
-Creates an empty, editable untitled/unsaved tab in the current window and moves focus to the editor. Does not create a file on disk. `Cmd+S` triggers the Save As flow for it.
+Creates an empty, editable untitled/unsaved tab in the current window and issues
+one focus request bound to that document session. Pensieve waits until the
+editor is hosted, then attempts `makeFirstResponder` exactly once. If AppKit
+refuses the attempt, the current responder stays in place and no later render or
+remount may replay it. The command does not create a file on disk. `Cmd+S`
+triggers the Save As flow for it. `Cmd+N` invokes this same operation in v1 and
+therefore carries the same editability and one-shot focus contract.
 
 Clarifications (decisions 26.07/31.07, canon item 2):
 
 - an untitled buffer lives only in memory until an explicit save — zero 0 B files on disk;
 - the app **never creates an untitled tab on its own** (startup, restore, or any automation must never produce a new untitled/recovery buffer without a user action).
 
+Settled behaviour — **no launcher surface between tabs.** The tab is presented
+and selected synchronously, so its draft is created on the same clock: the
+window's construction seeds it, and the later startup pass only confirms it.
+A `newUntitledTab` window therefore renders an editor titled `Untitled.md` from
+its FIRST frame and may never show the launcher branch (New File / Open File /
+RECENT) or the launcher's `Pensieve` window title, no matter how long its
+SwiftUI root takes to cold-start. The seed is idempotent: whichever of the two
+callers gets there first owns the draft, so the late pass can neither renumber
+the tab nor discard what the user has already typed into it.
+
 ### `Cmd+N` — New
 
-In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab / untitled buffer. It must not mean sometimes a new file, sometimes a window, and sometimes a workspace.
+In Pensieve v1 this is an alias for `Cmd+T`: it creates a new empty tab with an
+untitled buffer in the current window. An **idle** launcher may take that buffer
+in place; an occupied window must preserve its current session and add a native
+tab. A user-created empty tab is already occupied for placement purposes, even
+before its editable buffer finishes attaching: another `Cmd+N` or `Cmd+T` must
+add another tab, never reuse that tab in place. The macOS "Prefer tabs when
+opening documents" setting does not turn this command into an
+independent-window command. A later mature multi-window feature may consciously
+split `Cmd+N` (New Window) from `Cmd+T` (New Tab), but that is a future contract
+change — not an open ambiguity in v1 and not authority to restore the old
+behavior piecemeal.
 
-Splitting `Cmd+N` (new window/document) from `Cmd+T` (new tab) is only possible after an explicit product decision on the multi-window model.
+Rebuilding the workspace around that tab is configuration hydration only. Its
+asynchronous completion must not clear or replace the new untitled buffer, even
+while the buffer is still empty and therefore not dirty.
+
+Settled behaviour — **one truth for a pending tab.** The native tab group
+mutates at the click, so the sidebar's Open Files list must too: the registry
+publishes the new tab's descriptor when the window is CREATED, before it is
+merged and ordered front, under an untitled identity minted at that moment.
+Open Files may never trail the tab bar by the number of tabs still waiting for
+their SwiftUI root. That row is reconciled, never duplicated — the accessor's
+later attach replaces it in place rather than appending a second row — and it is
+retired with its window, so an abandoned or closed pending tab leaves no phantom
+entry behind.
+
+When no stable document controller is attached yet, New requests are counted,
+not collapsed into a Boolean. The first request may create the single
+`newUntitledTab` host; a second or third request made before that host attaches
+is replayed into a separate editable tab after attachment. If a Finder/open
+request is already creating an explicit-document host, that host keeps the
+document intent and every concurrent New request is replayed afterwards. No New
+gesture may replace the external document, be deduplicated away, or create a
+second host while the first one is in flight.
 
 ### `Cmd+O` — Open File… / `Shift+Cmd+O` — Open Folder…
 
@@ -50,6 +100,28 @@ the contract adopts this split:
   gets immediate feedback (tab/progress), and expensive work must not
   freeze the main thread for minutes (lesson from bugs H/J, 03.08).
 
+### Clicking a file — same route as `Cmd+O`
+
+`click = tab` (decision 26.07) is not only about `Cmd+O`. Every single-open
+gesture — a row in the workspace tree, a search result, the context-menu
+**Open**, a RECENT row on the launcher — lands where a Finder "Open with
+Pensieve" lands: as a native tab in the current window's tab group. A click is
+an explicit open, so it never replaces the document the window is reading;
+files stay visible in parallel and switching between them is switching tabs.
+
+- A file that already has a tab is **activated**, never opened a second time —
+  neither a re-click nor a click from another window may render the same
+  document twice.
+- An **empty, idle window** (launcher / empty state) is reused in place instead
+  of spawning a tab beside itself: no stray launcher tab, no flash. The single
+  exception is the rule above — a file that already has a tab is activated
+  there even when the clicking window is idle.
+- Clicking the document the window already shows is a no-op.
+- Because every open lands as a tab, there is **no separate "Open in New
+  Window"** item: it would be a second button for the same action. A detached
+  (non-tabbed) window is not part of v1 and is tied to the open multi-window
+  decision below.
+
 ### `Cmd+S` — Save
 
 Saves the active tab:
@@ -57,6 +129,64 @@ Saves the active tab:
 - a tab with a path — saves to the existing file;
 - an untitled/unsaved tab — triggers Save As;
 - saving must not trigger a self-write reindex loop or lose the dirty buffer state.
+
+#### Who may CREATE a file (05.08)
+
+A write to a document's own path may **update** the file it names. Only a write
+the user **asked for** may bring one back that is no longer there.
+
+- **Explicit** — `Cmd+S`, `Shift+Cmd+S`, and **Save** answered in a close prompt.
+  If the file has vanished from disk (Trash, `rm`, a sync client), these write it
+  again. Putting the file back is what the user asked for.
+- **Unattended** — the auto-save debounce, the window-teardown flush, and the
+  close paths auto-save answers on the user's behalf. These write **only a file
+  that is still there**. A missing target is refused before any write: nobody
+  asked for it, so a note dragged to the Trash must not reappear where it was,
+  beside the copy still sitting in the Trash.
+
+What a refusal guarantees:
+
+- the file is **not** recreated, and nothing else on disk is touched;
+- the buffer keeps every character and stays **dirty**, so the tab's unsaved
+  marker and the close question stay truthful;
+- a refusal is reported exactly like any other save that did not happen, and
+  every caller already handles that: a close driven by auto-save is **aborted**
+  and the window goes on holding the text, and a window tearing down anyway
+  stashes the buffer as a recovery draft, exactly as an auto-save-OFF close
+  does. A write that was **attempted and failed** (permissions, full disk)
+  behaves identically and is unchanged by this rule — this cut adds a reason to
+  refuse a write, not a new way to close a document.
+
+Where the guarantee lives: in the **write**, not in a check before it. An
+unattended save publishes through a replace-existing-only step
+(`DocumentStore.replaceExistingItem`) that requires its target to exist inside
+the same atomic operation, so there is no window in which the file can go and
+be recreated. The `fileExists` check ahead of it is a fast path that chooses a
+human-readable message; deleting it would change wording, never whether the
+file comes back. Any future rewrite of the write layer must keep this
+property — a plain atomic write reintroduces the bug. Because the atomic swap
+publishes a new inode, Pensieve copies the existing file's filesystem metadata
+(mode, ownership, ACLs, extended attributes/Finder tags and creation metadata)
+onto the replacement before the swap while preserving the new content's
+modification time. On volumes that support and permit those metadata operations,
+the full set is preserved. `ENOTSUP`, `EPERM` and `EACCES` are deliberately
+best-effort so replacement can proceed on SMB, exFAT and restricted volumes;
+unexpected I/O failures and a missing target still abort before publication.
+
+**Integrated error and recovery behavior (10.08).** When the file is gone or an
+original write otherwise fails, the dirty buffer first enters the data-loss
+class because its only current copy may be in memory. Pensieve immediately
+attempts a RecoveryStore snapshot. A successful fallback keeps the original
+untouched, leaves the session dirty, resolves the data-loss latch and shows an
+ordinary persistent status saying that the emergency copy is safe. If recovery
+also fails, data loss remains latched and close/quit is vetoed. The error surface
+and the explicit recovered-file actions are normative below. This applies to a
+direct `Cmd+S` as well as unattended auto-save: a failed explicit original write
+falls back immediately, but only a later successful original write completes the
+Save and retires that recovery copy. The original-write failure and the recovery
+write result remain separate conditions, so a later successful recovery tick
+never repeats a resolved recovery error or implies that the original became
+current.
 
 ### `Shift+Cmd+S` — Save As…
 
@@ -68,12 +198,12 @@ Closes the active tab/file, but **does not quit the application**.
 
 - With multiple tabs, closes only the active one.
 - With the last tab, the window shows the startup screen (launcher), it does not
-  quit the app (decision recorded further below in "Open decisions",
-  item 1 — resolved).
-- For unsaved changes or recovery, displays a native prompt
-  (macOS naming: **Save / Don't Save / Cancel**; for untitled —
-  Monika's 03.08 proposal: a full native sheet with a "Save As" field,
-  tags, and inline location, like TextEdit/Pages — separate UX cut).
+  quit the app.
+- Applies the close-decision matrix below. In particular, a dirty file-backed
+  buffer with auto-save OFF displays the native **Save / Don't Save / Cancel**
+  prompt. For untitled documents, Monika's 03.08 proposal is a full native
+  sheet with a "Save As" field, tags, and inline location, like TextEdit/Pages
+  — a separate UX cut.
 - `Cancel` aborts closing; **Cancel = zero mutation** (no draft or
   buffer may be destroyed before the prompt is resolved).
 - **RESOLVED (Monika, 03.08):** closing a single tab
@@ -81,6 +211,32 @@ Closes the active tab/file, but **does not quit the application**.
   from Open Files and from the session**. Closing the whole window via the red
   button does NOT remove it (a tidying gesture — files come back). Quit, crash,
   and emergency exit NEVER remove it — files come back after restart.
+
+#### Close-decision matrix (canonical, Monika + Maciej, 10.08.2026)
+
+This matrix is the single per-document rule for `Cmd+W`, a tab's `X`, the
+system window `X`, `Shift+Cmd+W`, and quit. Whole-window and quit flows aggregate
+the same decisions across their tabs; they do not invent a second saving policy.
+
+- A clean buffer, or an untouched empty draft, closes without a prompt.
+- A dirty file-backed buffer with **Automatically save… ON** is flushed without
+  a prompt. Closing proceeds only after the current bytes are durable: first in
+  the original file, or — if that write fails — in RecoveryStore. If both
+  destinations fail, close is vetoed and the only in-memory copy remains open.
+- A dirty file-backed buffer with **Automatically save… OFF** always asks
+  **Save / Don't Save / Cancel**. RecoveryStore may protect the buffer from a
+  crash, but it never substitutes for this conscious question.
+- A dirty untitled buffer always asks **Save As… / Don't Save / Cancel**, in
+  either auto-save mode.
+- A recovered file-backed buffer is never written over its original merely by
+  opening or closing it. Its conscious choices are **Save to Original / Save
+  As… / Don't Save / Cancel**.
+- `Cancel`, a dismissed save picker, or failure to make the current bytes
+  durable vetoes the close. There is no implicit discard path.
+- If a conscious Don't Save cannot remove its recovery payload, document/tab
+  close and **Clear Open Files** also veto teardown. The global quit path has the
+  one explicit exception described under `Cmd+Q`; it does not change these
+  document-level close rules.
 
 ### `Cmd+Z` / `Shift+Cmd+Z` — Undo / Redo
 
@@ -93,14 +249,68 @@ be cleared of ALL targets of a dying editor during teardown).
 
 Closes the whole window with all its tabs — the equivalent of the red button.
 A tidying gesture: it does NOT remove files from Open Files (they come back on restore).
-For dirty tabs, the window-close flow applies (batch modal).
+For dirty tabs, the window-close flow applies (batch modal). After the last
+window closes, the Pensieve process remains alive with zero windows; it does
+not create a launcher automatically. Clicking Pensieve in the Dock later
+creates exactly one empty launcher.
 
-### `Shift+Cmd+T` — Reopen Closed Tab (03.08 proposal)
+Opening a supported file from Finder, `open`, or another application while the
+process has zero windows is a different explicit intent: Pensieve creates
+exactly one document host for the queued URL and opens that file there. The
+request must not remain hidden until a later Dock click, and the new host must
+not restore the previous working set around the explicitly opened document.
+
+"Zero windows" means zero DOCUMENT windows. A Settings, About or other auxiliary
+window still standing does not count as a surface that can hold a file: with one
+of those as the only remaining window, a Finder open still creates exactly one
+document host, and a Dock click still creates exactly one empty launcher.
+Treating any visible window as a live surface left the opened file parked
+invisibly and made the Dock icon inert for the rest of the session.
+
+**The menu bar keeps working with zero windows.** A windowless Pensieve is a
+normal macOS document-app state (Finder-launched TextEdit, Xcode), so the File
+menu must stay usable rather than collapse to the system default. In that state
+Pensieve offers exactly:
+
+- **New File** (`Cmd+N`) and **New Tab** (`Cmd+T`) — the first request creates
+  one window carrying the `newUntitledTab` intent, so it comes up with an
+  editable draft, not an empty launcher; further requests made before that
+  host attaches are counted and replayed as additional tabs;
+- **Open File…** (`Cmd+O`) — the same native picker as with a window on screen;
+- **Open Recent** — the same system-backed list, including **Clear Menu**;
+- **Open Folder…** (`Shift+Cmd+O`) — opens the folder as a workspace.
+
+Items that act ON a document (Save, Save As, Export, Share, Close, and the
+Mode/Format/Agents menus) stay absent: they need a session this state has none
+of. Application-global commands do not depend on a document target: **About
+Pensieve** always shows the app's own panel populated from `BuildIdentity`, and
+**Quit Pensieve** always runs the protected all-window quit decision. Both stay
+installed while the app has zero document windows and during command-target
+rebuild gaps.
+
+Every one of those zero-window invocations travels the lanes the app already
+owns: an open is handed to the same coordinator entry a Finder/`open`/Dock drop
+uses (so the one-host guard covers it, and an `Cmd+O` arriving while a host is
+already being built for an external open does not create a second one), and New
+enters the coordinator's counted pending-New lane. One in-flight host consumes
+at most its own creation intent; every remaining New is replayed through the
+attached controller. No shortcut is rebound and no window is created by a path
+of the menu's own. With a window on screen, all of these items behave exactly as
+they always have and act on that window.
+
+### `Shift+Cmd+T` — Reopen Closed Tab (reserved, decision 05.08)
 
 A safety net for ⌘W-retire (Safari convention): restores the last closed
-tab along with returning the file to Open Files. Pending product
-confirmation — together with Recent Files (D5) it forms the full set of
-cushions against accidental closes.
+tab along with returning the file to Open Files. Together with Recent Files
+(D5) it forms the full set of cushions against accidental closes.
+
+**RESOLVED (Monika, 2026-08-05):** `Shift+Cmd+T` is reserved for this
+Reopen Closed Tab behavior, per macOS convention. The feature itself is
+**not yet implemented** — it stays on the backlog. Truthful state of this
+branch today: `Shift+Cmd+T` is actually bound to **Tidy Table** (Format
+menu); no reopen-tab code exists anywhere in the app yet. When Reopen
+Closed Tab ships, Tidy Table loses (or is reassigned) this shortcut — the
+two cannot coexist on the same binding.
 
 ### Tab navigation
 
@@ -126,19 +336,166 @@ Runs a search across the workspace via the index / FTS / fallback. Does not repl
 
 ### `Cmd+,` — Settings
 
-Opens Settings/Preferences, if available.
+Opens Pensieve's one application-owned **Settings** window on **General**.
+Repeated `Cmd+,` gestures raise and reuse that same native window; closing and
+opening it again must not create another surface. While any Pensieve window
+owns an application-modal surface, attached sheet, or sheet parent, every
+Settings entry point fails closed: it performs no activation or ordering,
+reports **Close the current dialog before opening Settings**, and waits for an
+explicit retry after the dialog closes. It never queues a delayed Settings
+presentation behind an arbitrary modal lifecycle.
+
+When Settings is the key window, it owns the command surface. `Cmd+W` closes
+only that retained Settings window; it must not close or mutate a document in
+the background. Document-scoped Save, Mode, Format and Agents commands are not
+published in that state. Application-scoped New and Open commands remain
+available and create or reuse a document-capable host through the same
+zero-window lane described above.
+
+The AI onboarding action
+**Configure…** first captures and dismisses its document sheet, then waits for
+both native host/sheet ownership edges to disappear before opening this same
+Settings window directly on **AI**. `didEndSheet` is diagnostic evidence, not a
+second ownership requirement. If the native pair does not detach within the
+bounded handoff, Pensieve reports a non-modal error and does not attach another
+onboarding sheet over the unresolved pair; **Pensieve > Settings** remains the
+explicit retry. The message is routed to the AppState registered for the exact
+document window that owns the blocking modal relationship (or the current
+registered key/main document surface), never to a historical command fallback.
+If no document owns that relationship — for example, the blocked surface
+belongs to the already-visible Settings window itself — the retained Settings
+model owns and renders the same non-modal message until the user dismisses it
+or a later presentation succeeds. Pensieve does not invent a document owner
+merely to display it. A hidden auxiliary surface cannot gain a new visible
+textual surface without violating the same no-ordering/no-new-window gate; that
+edge remains a beep plus a debug trace, not a promise of immediate on-screen
+text.
+
+Settings is an auxiliary window, never a document host. It has one stable
+AppKit owner for the life of the process, is excluded from native tabbing and
+Saved Application State, and is not eligible for startup restore. `General`
+and `AI` are panes inside the window — neither may appear as a separate
+top-level window, detached tab strip, blank Mission Control participant or
+surviving WindowServer shell after Settings closes.
 
 ### `Cmd+Q` — Quit Pensieve
 
-Quits the whole application per macOS convention. If dirty buffers or recovery items requiring a decision exist, the app must protect the user from data loss.
+Quits the whole application per macOS convention. It first collects the close
+decision for every document; a `Cancel`, dismissed save picker, or true
+original-plus-RecoveryStore write failure remains a hard veto with no override.
+
+If the user already chose Don't Save but Pensieve cannot remove that document's
+recovery payload, global quit presents **Keep Pensieve Open** (safe default and
+Escape) and the destructive **Quit Anyway**. Keep Pensieve Open vetoes the quit
+and leaves the failing session dirty and its payload claimed. Quit Anyway applies
+the Don't Save decision without pretending cleanup succeeded: the session becomes
+clean, the payload and its live claim remain until process exit, and the discarded
+copy may appear in Recovered Drafts on the next launch. One Quit Anyway
+confirmation authorizes the current and any remaining retirement failures in
+that same quit pass; a later quit is a new pass and asks again.
+
+The collect phase is atomic with respect to a later `Cancel`, but phase-two
+filesystem cleanup is sequential and cannot be rolled back. If an earlier
+explicit Don't Save already removed its payload before a later retirement fails,
+choosing Keep Pensieve Open leaves that earlier decision applied. The failing and
+not-yet-applied discard sessions remain dirty, and any existing recovery payloads
+remain claimed. This narrow boundary does not weaken the hard veto for unsaved
+bytes that have no durable original or recovery copy.
 
 ---
 
 ## Closing windows and tabs
 
+### Native window ownership
+
+Only a root document window may own Pensieve's native document tab group. A
+window becoming key or main is a focus event, not proof that it is a document
+host. In particular, a sheet, `NSPanel`, child window, elevated helper surface,
+Settings window, or another unknown root must never be assigned the document
+tabbing identifier and must never receive a document through
+`addTabbedWindow`.
+
+Settings has an even narrower ownership contract: Pensieve retains one AppKit
+window controller, seals its window with `tabbingMode = .disallowed`, an empty
+document tabbing identifier and `isRestorable = false`, and reuses that window
+for both General and AI. It is not a SwiftUI scene and is never inferred from
+the key window. Closing it removes the auxiliary surface without creating,
+closing, selecting or reparenting a document window.
+
+While any tab in a native group has an attached sheet, Pensieve does not mutate
+that tab group. A file opened during that interval may appear in a separate
+document window; it must not be merged through the sheet, its parent, or a
+sibling as a fallback. Once the sheet ends, ordinary document-to-document tab
+grouping may resume.
+
+Startup restore is one indivisible exception to the timing above, not to its
+safety rule. The restore pins the initial document host for its whole multi-turn
+pass, and provider onboarding stays unpresented until every restored tab has
+joined and the transaction has completed its final selection decision,
+including preservation of a newer user selection. A sheet, Settings window or
+helper surface becoming key must never redirect a later restore step or split
+the working set into additional windows. Pensieve still never mutates a tab
+group while it owns an attached sheet; it prevents that overlap instead. That
+rule covers the host the pass ADOPTS after its original host closes mid-pass: a
+survivor carrying a sheet is not merged into, the pending ref waits for the next
+turn, and the pass keeps parking until the group can take it.
+
+The pass ends with at most one closing order. It may activate the restored
+frontmost tab only when Pensieve is still active and the current key window is
+one of that restore transaction's participants. If the user creates or selects
+a non-restore tab while the pass is yielding between turns, restore completion
+must preserve that newer selection and skip its final activation. A restore
+that finishes after the user has switched away may order its final tab into
+place without pulling focus back across the app boundary.
+
+"Participant" means a window the pass itself created. Opening a file the pass
+has queued but not yet reached is an ordinary interactive open: when the pass
+later reaches that ref it activates the window the user already has instead of
+building one, and that window stays outside the transaction — it never becomes
+a participant and never becomes the transaction's merge host. A file the user
+opened by hand mid-restore therefore keeps the front exactly like any other
+newer selection.
+
+Window-following UI bridges (theme chrome, toolbar overflow, command routing,
+close hooks) publish only a proven document root. A queued callback belonging
+to a factory window that has already closed must be dropped rather than
+republishing a half-dead window as the current command target.
+
+The close hook must protect both AppKit entry points: `performClose` /
+`windowShouldClose` and the terminal `NSWindow.close()` used directly by native
+tab chrome on current macOS builds. `willCloseNotification` is too late to ask
+or veto and remains only a final recovery backstop. A programmatic close after
+Save or Don't Save has already settled may bypass the guard exactly once; it
+must not ask twice or leave a reusable bypass armed for a later gesture.
+
 ### System window `X` button
 
-Closes the window, not a single tab. Must not cause a cycle of "window/app closes and immediately reopens." Such behavior is a bug to diagnose.
+Closes the window, not a single tab. Every tab must complete the canonical
+close-decision matrix before AppKit tears the window down; auto-save ON may
+settle a file-backed tab without a question, while auto-save OFF, untitled and
+recovery cases retain their explicit choices. Cancel or a save failure leaves
+the window open. A successful close of the last window leaves the running app
+windowless. It must not create a launcher, restore another document, or cause a
+cycle of "window/app closes and immediately reopens." Such behavior is a bug.
+The only replacement-window path is a later explicit Dock activation, which
+creates exactly one empty launcher.
+
+The close decision is atomic across the window:
+
+- If no tab has unsaved changes and none is a recovery item, the window closes
+  without a prompt.
+- If exactly one tab requires a decision, Pensieve shows **Save / Don't Save /
+  Cancel**.
+- If several tabs require decisions, Pensieve shows the batch-close surface
+  specified below. **Review Changes…** visits the active tab first, then the
+  remaining tabs from left to right.
+- `Cancel` at any stage aborts closing the whole window. Saves already completed
+  remain saved; unresolved tabs remain open and unchanged.
+- A save error stops the sequence, identifies the affected file, and leaves the
+  window open.
+- AppKit may close the window only after every dirty, untitled, and recovery
+  item has been saved successfully or explicitly discarded. No response, a
+  dismissed picker, or an error never means `Discard`.
 
 ### `X` button on a tab
 
@@ -177,15 +534,210 @@ Clarification (04.08, Monika — "they don't disappear without my decision"):
 - If the number of drafts ever needs to be surfaced, it is shown to the user as
   information — never acted on by deleting.
 
+Clarification (10.08, launcher pagination and test isolation):
+
+- **Five drafts per launcher page.** The Recovered Drafts section paginates its
+  presentation in groups of five and shows both the visible item range and the
+  page count. Previous/Next navigation keeps every unhandled draft reachable.
+  This is a UI bound only: it does not reintroduce a storage cap, retention, or
+  automatic deletion. If an action removes the last item on a page, the current
+  page is clamped to the new last page instead of leaving an empty surface.
+- **Tests fail closed outside production Application Support.** A test should
+  inject its own stores; every default fallback that otherwise derives
+  `~/Library/Application Support/Pensieve` — Recovery, workspace metadata, the
+  search index and document AI session state — is nevertheless process-scoped
+  under one temporary directory whenever Pensieve is hosted by XCTest. An
+  explicit `PENSIEVE_SUPPORT_DIR` still takes precedence for canary runs. A
+  forgotten test dependency may therefore contaminate its own test process,
+  never the operator's production support directory.
+
+Final recovery contract (Monika + Maciej, 10.08.2026 — decisions 1–6 and 10: A):
+
+- **Crash recovery is independent of auto-save.** An edited untitled draft is
+  periodically written to RecoveryStore in either auto-save mode. An edited
+  file-backed buffer with auto-save OFF is also periodically written there,
+  while the original file remains byte-for-byte untouched.
+- **Auto-save failure falls back immediately.** With auto-save ON, Pensieve
+  first attempts the original file. If that write fails, the same bytes are
+  written to RecoveryStore immediately. The original failure stays visible,
+  the session stays dirty because the original is stale, and a successful
+  recovery fallback changes the condition from data loss to ordinary status.
+- **One live buffer owns exactly one recovery identity.** Repeated edits,
+  debounce ticks, close flushes and quit flushes update that item in place.
+  A rename/rekey of that same live buffer preserves the identity; replacing the
+  buffer with another document releases its claim so the launcher can offer the
+  emergency copy immediately. Content equality is never used to collapse
+  different buffers. A stale launcher row may not Save As or Discard an item
+  currently claimed by a live buffer.
+- **File-backed recovery is self-describing.** Its record persists the
+  standardized original path in a `.source` sidecar. The launcher labels it
+  **Unsaved changes — <filename>**, shows the full original path and timestamp,
+  and states that this is an emergency copy. A file-backed recovery entry must
+  never masquerade as another ordinary `umowa.md`/`Untitled.md`. Turning a
+  record into an ordinary untitled draft must remove the old source association
+  successfully before publishing its new payload; a stale sidecar must never
+  redirect unrelated text back to the previous file.
+- **Opening recovery never overwrites the original.** It opens a dirty recovered
+  buffer, displays the original path, and waits for an explicit decision:
+  **Save to Original / Save As… / Don't Save / Cancel**. Cmd+S on that buffer
+  means Save to Original; Save As writes only the chosen destination. If Save
+  to Original fails, Pensieve immediately refreshes that buffer's existing
+  recovery item with the latest bytes while preserving the same recovery ID and
+  original-path association. The buffer remains dirty and the original remains
+  stale. Later edits keep updating that same item without clearing the honest
+  stale-original/recovery-safe status. This recovery fallback protects the
+  bytes but does not satisfy a Save decision made during document close or
+  global quit: both operations remain vetoed until the original itself is
+  current.
+- **A successful save retires the recovery item.** Saving to the original or a
+  new destination removes the item only after the destination write succeeds.
+  A launcher-level Save As also registers that destination in Pensieve's
+  working set, persists any required file bookmark and adds it to native
+  Recents, but does not open or select it in the launcher.
+  Don't Save removes it only as a conscious rejection. Cancel and any failed
+  write leave both the buffer and recovery item intact. If the filesystem
+  refuses to retire the recovery payload after Don't Save, document/tab close
+  and Clear Open Files veto teardown: the buffer stays dirty and the item remains
+  claimed for a safe retry. Global quit alone may continue after the explicit
+  **Quit Anyway** confirmation; it then retains the claimed payload through
+  process exit and warns that the copy may return in Recovered Drafts on relaunch.
+- **An untouched empty draft closes silently.** A draft asks where to save only
+  after it contains unsaved changes.
+- **Content durability fails closed.** If an original-file write fails, Pensieve
+  attempts the recovery fallback before allowing teardown. If neither the
+  original nor RecoveryStore accepts the bytes, the window/quit remains open,
+  the buffer remains dirty, and the error explicitly says the only copy is
+  still in memory. A teardown notification is only a final backstop; it is not
+  allowed to be the first place a fallible user-content write is attempted.
+- **No test writes production Application Support.** Tests inject isolated
+  stores; XCTest's shared fallback for Recovery, workspace metadata, index and
+  document AI state is process-scoped under one temporary directory. Runtime
+  smoke uses a unique per-run staged identity across every stateful macOS
+  surface, not only its support directory. `dist/Pensieve.app` and
+  `make run-release` retain production identity; unbundled `make run` retains
+  non-isolated support and Keychain fallbacks. None is fresh-smoke evidence.
+  The preparation, reopen, verification and cleanup rules are
+  canonical in [`runtime-testing.md`](runtime-testing.md).
+
+Clarification (14.08 — a save's own failures may not be swallowed):
+
+- **The durable destination decides the session's mode, never the cleanup
+  result.** Once a save's bytes reach the file, the buffer is file-backed and
+  carries no recovery source, whether or not the recovery payload could be
+  deleted. A draft that refused to be retired is parked on that buffer and
+  retried by the next durable save; until it goes it simply stays in Recovered
+  Drafts, and the user still sees the "could not retire its recovery copy"
+  status. This is what keeps two invariants true: auto-save after such a save
+  keeps advancing the FILE instead of writing recovery snapshots only, and a
+  Cmd+S after Save As… to a different path writes the NEW destination rather
+  than the original the recovery record came from.
+- **A bookmark that could not be persisted is reported.** The working-set
+  bookmark is what puts a saved document back in Open Files after relaunch, so a
+  save that wrote the bytes but could not mint it leaves a visible warning. That
+  warning outranks the recovery-retirement status and survives the rest of the
+  save — neither the successful retirement of the recovery copy nor the
+  resolution of the data-loss latch may clear it.
+
+The durable unit pins cover periodic file-backed snapshots, auto-save fallback,
+source metadata across store reload, non-overwriting recovery open, explicit
+Save to Original success and failure, same-ID refresh with the latest recovered
+bytes, one-buffer/one-record identity, red-X/global-quit veto until the original
+destination accepts the recovered buffer, a failed retirement leaving the saved
+file (not a snapshot) as auto-save's target and Cmd+S's destination, and a
+bookmark failure surviving both Save As… paths.
+
+### Error surface (05.08) — UX SHAPE PENDING RATIFICATION
+
+What an error the app records actually does on screen. The behavior below is
+implemented and pinned; its **visual shape is a recommendation awaiting Monika's
+ratification**, so the wording, colour and placement may still change without
+changing anything in this section's rules.
+
+**Two classes, chosen at the write site.** A failure is classified where it is
+raised, never by matching its message text:
+
+- **Status** (the default). The action was refused, a read failed, or some
+  housekeeping did not land — and nothing the user typed is at risk. Examples:
+  "Open a workspace folder before creating a workspace file", a workspace that
+  will not open, a recovered draft that could not be saved under a new name
+  (the draft file is still on disk, so the work survives), and a failed write
+  to the original file whose RecoveryStore fallback succeeded.
+- **Data loss.** Pensieve failed to put content anywhere durable AND the only
+  remaining copy is the in-memory buffer. A failed original-file write may
+  raise this condition provisionally, but an immediate successful recovery
+  fallback resolves it to status. If the fallback also fails, data loss stays
+  latched and close/quit is vetoed. Status is the default precisely so that the
+  loud class stays opt-in: a new error has to be argued into it and cannot fall
+  into it.
+
+**One surface, and it is passive.** Pensieve has NO modal error path. Both
+classes show the same standing line in the window that recorded the failure and
+in no other (the state is per-window: `AppState.currentError` →
+`DocumentWindowModel`). It sits between the document pane and the status bar,
+and deliberately NOT behind the status bar's `documentHasEditableBuffer` gate —
+the errors that most need saying can land in a window with nothing open. It is
+passive in the strict sense: it never takes first responder, so it may appear
+and disappear under a live editing session without moving the caret or
+interrupting typing. It carries a dismiss button. Nothing times it out. Severity
+changes the dressing — filled accent and a warning icon for data loss, the
+status bar's own material for everything else — never whether the user is
+interrupted.
+
+**Data loss LATCHES; status does not.** The two live in separate state, and the
+separation is the point:
+
+- `DocumentWindowModel.statusError` — the passive message, freely overwritten
+  and freely cleared by whoever wrote it.
+- `DocumentWindowModel.unresolvedDataLoss` — a latch: content that reached no
+  file and exists only in a buffer that dies with the process.
+- `DocumentWindowModel.dataLossBannerDismissed` — visibility only, never safety.
+
+Three rules follow, and each is pinned:
+
+1. **A status message cannot displace an unresolved data loss** — not by being
+   written, and not by being cleared. Around a dozen sites assign
+   `lastError = nil` on their own unrelated success, and none of them know
+   anything about a buffer whose content reached no disk. The banner keeps
+   showing the loss while it is still true.
+2. **Dismissing the banner does not reset the condition.** The latch survives,
+   so an identical failure repeating on the next autosave tick has nothing new
+   to say and the banner the user put away stays away. Without this a full disk
+   would resurrect a dismissed banner every 1.5 seconds. One original-write +
+   recovery-write attempt publishes one final compound failure identity; its
+   two internal errors must not alternate the surface back open.
+3. **A resolved loss that happens again IS news.** The dedupe is scoped to one
+   unresolved condition, not to a message string forever, so the surface re-arms
+   — dismissal included. A genuinely different failure arriving while the first
+   is still unresolved also re-arms.
+
+**What retires the latch.** Only `AppState.resolveError()`, called where a
+durable write for that buffer actually lands: a successful original-file save,
+`saveAs`, or recovery write. When the original stays stale but recovery lands,
+the data-loss latch is retired and replaced by a status that explicitly says
+the original was not overwritten.
+
+Tests. `WindowErrorChromeRenderTests` drives a real window hosting the real
+`ContentView` and measures the live layout, so "the banner is mounted" is read
+from the window and not from a resolver; it holds all three latch rules on that
+live surface plus the focus contract (typing continues, caret unmoved, first
+responder unchanged) across the banner appearing and disappearing.
+`WindowErrorSurfaceTests` pins the classification through real production paths
+(a failing save, an unwritable recovery directory, a refused document creation)
+and the same three rules at the state level.
+`testAnImportWhoseRecoveryWriteFailsSurfacesAsDataLoss` holds the import chain
+end to end.
+
 Creating a new document must not force a recovery decision. A recovery item can only be deleted after:
 
 - being saved as a regular file;
 - being explicitly discarded;
 - being closed with confirmed rejection of changes.
 
-When closing a recovery item, the app shows a native prompt:
-**Save / Don't Save / Cancel** (macOS naming; "Discard" appears
-only in the batch modal as **Discard All**). It must not be removed without asking.
+When closing an ordinary untitled recovery item, the app shows the native
+**Save / Don't Save / Cancel** prompt and Save opens Save As. A recovery item
+that protects an existing file shows **Save to Original / Save As… / Don't
+Save / Cancel**. "Discard" appears only in the batch modal as **Discard All**.
+No recovery item is removed without one of these explicit decisions.
 
 ---
 
@@ -195,8 +747,9 @@ only in the batch modal as **Discard All**). It must not be removed without aski
 2. **Save All** — a convenience shortcut (deliberate extension; the native alert doesn't have it).
 3. **Discard All** — a clear, destructive option.
 4. **Cancel** — always safely aborts the operation.
-5. Every untitled/recovery document gets its own native **Save As** — never
-   an automatic save under a generated name.
+5. Every ordinary untitled recovery document gets its own native **Save As**.
+   File-backed recovery offers **Save to Original** or **Save As…**; neither
+   route writes automatically under a generated name.
 6. Zero rollback for completed saves.
 7. Recovery disappears only after a successful save or explicit rejection.
 
@@ -207,6 +760,27 @@ Discard All requires an extra confirmation (this morning's spec; deliberately
 more cautious than the native Discard Changes — relevant for recovery items).
 Micro-refinement to consider during implementation: narrowing the
 confirmation to only batches that contain recovery items.
+
+The two deliberate extensions over AppKit's native batch alert are normative
+and must not be "corrected" back toward pure nativeness: **Save All** is an
+additional convenience action, and **Discard All** requires the extra
+confirmation described above.
+
+`Save All` runs in this order:
+
+1. Save dirty files that already have paths; they need no picker.
+2. Visit untitled and recovery tabs one at a time, active tab first and then
+   left to right, presenting a separate native **Save As** picker for each.
+3. After a successful Save As, assign the chosen path to the untitled tab. A
+   recovery item may be retired only after the file is confirmed on disk.
+4. Canceling any picker aborts the whole Close All. Completed saves remain;
+   canceled and not-yet-visited tabs retain their content and dirty/recovery
+   state.
+5. A save error stops on that file, keeps the window open, and never retires its
+   recovery item. The user may retry, switch to **Review Changes…**, or cancel.
+
+`Cancel`, dismissing a picker, and a save error are never equivalent to
+`Discard`.
 
 ## Close All Open Files
 
@@ -220,24 +794,94 @@ Close All must never cause silent data loss.
 
 ---
 
-## Session and restore at launch (03.08 addendum)
+## Session and restore at launch (finalized 10.08.2026)
 
 - **Workspace is configuration — it always comes back** (decision 26.07, W9). The
   "Restore session on launch" toggle controls only the files that get opened
-  and the auto-select.
-- Startup restore opens at most **12 most recent** files of the working set
+  and the deterministic auto-select described below. Workspace roots remain
+  indexed and protected in either setting; they are not session entries and do
+  not expire.
+- With restore OFF, a cold launch creates exactly **one empty launcher** and
+  opens zero documents. Workspace roots and the sidebar still return.
+- With restore ON, Pensieve restores the saved working set in its persisted
+  order and, by default, selects the final restored entry. A newer user
+  selection made while the multi-turn restore is still running is preserved
+  instead. The v1 working set records file membership and order, but does
+  **not** persist a separate identity for the tab that was selected at quit.
+  Switching between already-open tabs therefore does not change what a later
+  launch selects unless it also changes the working set. Exact tab membership,
+  order and selection belong to the true session snapshot named below, not to
+  the current bookmark list.
+- Startup restore opens at most the **final 12 entries in persisted working-set
+  order**
   (decision 03.08, interim pending a true session snapshot — target model:
   "tabs from the moment of quit", variant b from 31.07).
 - Restore **must not undo a deliberate Close** by the user.
-- **Trash is dead** (decision 26.07): a file or folder whose bookmark
-  points into `~/.Trash` does not exist for the app — it does not come back on
-  restore and disappears from the store. (Implemented for files in PR #30; for
-  workspace roots **[OPEN]**.)
-- **Single source of truth for the session: the app.** macOS's own window
-  restoration (Saved Application State) must not resurrect documents alongside
-  the app's session model (bug G, 03.08 — pending session-layer audit). The
-  target is for the app to explicitly control the `isRestorable` state of its
-  windows.
+- **Trash is dead** (decision 26.07): a file whose bookmark points into a Trash
+  does not exist for the app. Membership is asked of the filesystem (every volume
+  has its own Trash, a sandboxed build a container-relative one), not matched
+  against a hardcoded `~/.Trash`, so a directory merely NAMED `.Trash` is not one.
+  The fallback for a missing volume accepts only the real mount-root shape
+  `/Volumes/<volume>/.Trashes/<uid>/...`; a nested user folder with the same
+  component names is ordinary content.
+  The rule holds at every point a file can become, or stay, an open document:
+  - launch restore drops such an entry and its bookmark;
+  - a **running** app retires a workspace file on the next watched scan commit.
+    An ad-hoc file outside every workspace root is reconciled when Pensieve
+    becomes active again (for example, after returning from Finder), so its row
+    also leaves Open Files without waiting for a relaunch;
+  - opening one is refused with "<name> is in the Trash. Put it back to open it.",
+    so no route (Recents, drag, a stale sidebar row) can re-add it;
+  - selecting one refuses to put its content in the editor and retires the row;
+  - after Pensieve's own **Move to Trash**, bookmarks are pruned by where they
+    LAND, which also covers every document inside a trashed folder. If the
+    selected buffer had already produced an emergency recovery copy, clearing
+    that buffer releases its live ownership claim but does not delete the copy:
+    the single recovery entry becomes immediately available for an explicit
+    Save / Save As / Don't Save decision instead of staying hidden until the
+    next process launch. It never recreates the trashed original automatically.
+
+  A file that is merely MISSING is not trashed: it keeps its bookmark (it may be
+  mid-replacement, or on an unplugged volume) and only drops out of what a
+  restore opens. The running app retires such a row only when the bookmark that
+  turned up in the Trash is the one MINTED FOR THAT PATH — never because a file
+  of the same NAME was thrown away somewhere else, which would retire a document
+  still open from a disconnected volume.
+
+  **RESOLVED (Monika, 2026-08-05):** a workspace **root** follows the same
+  rule as an individual file above. A root that lands in the Trash
+  disappears from the sidebar live, at the next scan commit — same as a
+  trashed file leaving Open Files without waiting for a relaunch. Its
+  bookmarks (the root's own and every file bookmark it granted) are pruned
+  at the same time. Recovery is manual: put the folder back from the Trash,
+  then re-add it as a workspace root. **[IMPLEMENTATION GAP]**:
+  this PR only implements the individual-file half of "Trash is dead"; the
+  root half described here is decided but not yet built.
+
+- **Removing one workspace root never revokes another tab's access.** The
+  persisted bookmark set is rebuilt from the UNION of the working set and the
+  live tab chain across every window: a document of the removed root that a
+  window still has open gets a file bookmark of its own, a document covered by a
+  surviving root does not (its root already grants access), and a file that is in
+  neither source still loses its bookmark — nothing is resurrected. In the
+  sandboxed lane every freshly minted bookmark is resolved before old grants are
+  released, and the resolved security-scoped URL is the one activated; a plain
+  `DocumentRef` URL is not treated as if it carried a grant.
+- **Quit gives the working set a bounded durability flush.** Quit starts an
+  explicit `cfprefsd` synchronization and waits for it for up to one second
+  before continuing with the remaining drain phases. A normal flush is durable
+  before exit; a stalled system service may finish on its own schedule after the
+  budget expires (measured at up to ~14 s after exit). The bounded wait is a
+  deliberate tradeoff: working-set restoration can be stale in that exceptional
+  case, but quit must not beachball indefinitely and user-content writes retain
+  priority over session metadata.
+- **Single source of truth for the session: Pensieve** (decisions 7–9: A,
+  Monika + Maciej, 10.08). Every managed launcher/document window opts out of
+  AppKit Saved Application State (`isRestorable = false`), and there is no
+  value-based SwiftUI document `WindowGroup` for macOS to revive independently.
+  Existing legacy Saved Application State may remain on disk, but Pensieve
+  ignores its document/window payload: it never deletes user files, bookmarks,
+  workspace configuration or the app's working set while doing so.
 
 ## Launcher (startup screen) — 03.08 addendum
 
@@ -252,16 +896,64 @@ Close All must never cause silent data loss.
 
 ## Minimal smoke check
 
+Run this behavioral checklist only in a repository-owned runtime lane described
+by [`runtime-testing.md`](runtime-testing.md). `make manual-smoke` creates a new
+clean interactive experiment; `make manual-smoke-reopen` intentionally retains
+that experiment for relaunch assertions; `make ui-smoke` is automated and
+ephemeral. Opening `dist/Pensieve.app` or using `make run-release` exercises
+production identity and production state and must not be reported as a fresh
+smoke. Before any witness is seeded, the smoke lane proves one empty launcher,
+zero workspaces, zero Open Files, zero recovery rows and zero Recents.
+
 An agent implementing or refactoring menu/commands must verify:
 
 - [ ] `Cmd+T` creates an empty tab with no file on disk.
-- [ ] `Cmd+N` does the same as `Cmd+T` in v1.
+- [ ] `Cmd+N` does the same as `Cmd+T` in v1: it preserves the current buffer
+      and creates a native tab; an idle launcher may fill in place.
+- [ ] New makes one session-bound editor-focus attempt after the editor is
+      hosted; if AppKit refuses it, a later SwiftUI render/remount cannot replay
+      the request or steal focus from the current responder.
+- [ ] Repeated New commands (`file → Cmd+N → Cmd+T`) add one tab per command;
+      a newly created empty tab is never mistaken for the idle launcher.
+- [ ] From zero document windows, two or three rapid `Cmd+N` / `Cmd+T`
+      gestures create one host and one editable tab per gesture; none is lost.
+- [ ] If a Finder/open host is in flight when New is invoked, exactly one host
+      opens the external file and the New request appears as an additional
+      editable tab after attachment.
 - [ ] `Cmd+O` opens the file picker, `Shift+Cmd+O` the folder picker (workspace).
+- [ ] From zero document windows, `Shift+Cmd+O` creates one host, selects the
+      chosen folder as the workspace root, and does not synthesize a document.
 - [ ] `Cmd+S` saves an existing file, and for untitled it triggers Save As.
 - [ ] `Shift+Cmd+S` triggers Save As.
 - [ ] `Cmd+W` and the tab's `X` close the active tab and protect dirty buffer/recovery.
-- [ ] The system `X` closes the window without an automatic reopen.
-- [ ] `Cmd+M` minimizes the window, `Cmd+,` opens Settings, and `Cmd+Q` quits the application.
+- [ ] The system `X` protects dirty/recovery buffers, then closes the last
+      window without an automatic reopen; the process stays alive with zero
+      windows, and a later Dock click creates exactly one empty launcher.
+- [ ] With Settings (or About) as the only remaining window: a Finder open of a
+      `.md` file opens it in a new document host, and a Dock click creates
+      exactly one empty launcher.
+- [ ] With zero document windows, About shows Pensieve's `BuildIdentity` panel
+      and `Cmd+Q` still runs the protected application quit flow.
+- [ ] `Cmd+M` minimizes the window; `Cmd+,` opens exactly one window titled
+      Settings on General; repeated `Cmd+,` reuses it; close → reopen still
+      yields exactly one Settings window; and `Cmd+Q` quits the application.
+- [ ] With Settings key, `Cmd+W` closes Settings only. Background document
+      commands are unavailable, while application-scoped New/Open remain usable
+      through a document-capable host.
+- [ ] Settings is never a native document tab. Mission Control, Accessibility
+      and WindowServer show no top-level `General` or `AI` surface, no detached
+      Settings tab strip, and no Settings shell after its window closes.
+- [ ] AI onboarding **Configure…** closes the onboarding sheet before the one
+      Settings window appears, with the AI pane selected; a forced native
+      detach timeout reports an error and creates neither Settings nor a second
+      onboarding sheet.
+- [ ] With the onboarding sheet still attached, `Cmd+,` reports that the
+      current dialog must close. The status witness must be absent before the
+      shortcut and present with the exact message afterwards; for a bounded
+      one-second AX interval and concurrent exact-PID CoreGraphics sampling,
+      the native sheet remains attached and the full runtime-derived layer-0
+      surface set remains unchanged. After native detachment, an explicit retry
+      opens one Settings window.
 - [ ] `Cmd+F` searches in the document, and `Shift+Cmd+F` in the workspace.
 - [ ] Close All protects unsaved files and recovery items.
 - [ ] `Cmd+Z` after a tab close is a safe no-op (not a crash);
@@ -276,80 +968,63 @@ An agent implementing or refactoring menu/commands must verify:
       recovery item (zero draft multiplication).
 - [ ] Clicking a RECENT row on the launcher gives immediate feedback,
       and opening a large file does not block the UI silently.
+- [ ] A click in the workspace tree / a search result / context-menu "Open"
+      opens a tab and leaves the current tab's document alone; re-clicking an
+      open file activates its tab instead of opening a duplicate.
 - [ ] Restore after restart: workspace always comes back; open files max 12;
       a file/root from Trash does not come back; a deliberately closed file does not come back.
+- [ ] With a live provider/onboarding sheet, opening or restoring another file
+      never gives the sheet a document tab bar, changes the sheet's frame into
+      a document frame, or moves document navigation outside its root window.
+- [ ] Startup restore keeps one pinned document host across run-loop turns;
+      provider onboarding appears only after all restored tabs have joined and
+      the transaction has completed its final selection decision, including
+      preservation of a newer user selection.
+- [ ] The restore-ON runtime probe starts from a clean smoke-only working set,
+      restores one dedicated seed, then proves a zero-window external open does
+      not replay that session. A window-title census is not used as proof of
+      background native-tab membership.
+- [ ] Source-level window-lifecycle tests never call `beginSheet`,
+      `addChildWindow`, `addTabbedWindow`, `makeKeyAndOrderFront`, or another
+      native presentation API. They model ownership through inert relationship
+      seams and synthetic notifications. Real tab-group, sheet-ordering,
+      Mission Control and WindowServer geometry is exercised only by an
+      announced, uniquely isolated runtime smoke; test chrome must never flash
+      on the operator's desktop.
+- [ ] The isolated native-tab probe observes the exact staged PID through public
+      Accessibility and CoreGraphics APIs: one presented AX window, one
+      on-screen layer-0 surface, one two-item AX tab group with one selected
+      child, and a real press-to-switch content round trip back to the original
+      tab. All descendant AX calls inherit a process-global bounded timeout;
+      `kAXErrorCannotComplete` from a press is accepted only as uncertainty and
+      the subsequent selected-state/content poll remains the proof. The probe
+      does not infer grouping from titles and does not claim that AppKit uses
+      only one underlying `NSWindow` object.
 
 ---
 
-## Open decisions and items to verify
+## Open decisions and implementation gaps
 
-0. **List of currently open items (state as of 03.08, after this morning's decisions):**
-   - **[OPEN]** workspace ROOT in Trash on restore (same rule as
-     files — does it stay);
-   - **[OPEN]** native Save sheet for untitled on close
-     (Monika's 03.08 proposal, separate UX cut);
-   - **[OPEN — pending multi-window decision]** splitting `Cmd+N`/`Cmd+T`;
-   - **[OPEN]** `Shift+Cmd+T` Reopen Closed Tab (proposal — ⌘W-retire
-     safety net).
+**Current list:**
 
-   **To be inventoried in v0.2** (exist in the UI, semantics to be written down):
-   markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
-   bold/italic/link), switching editor/split/preview mode, sidebar toggle,
-   zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing to be assigned to it pending
-   the multi-window decision.
+- **[IMPLEMENTATION GAP]** workspace ROOT in Trash: behavior
+  **RESOLVED (Monika, 2026-08-05)** — same rule as files (see the
+  "Trash is dead" section above); not yet built in this PR;
+- **[IMPLEMENTATION GAP]** `Shift+Cmd+T` Reopen Closed Tab:
+  shortcut **RESOLVED (Monika, 2026-08-05)** — reserved for this feature
+  (see the `Shift+Cmd+T` section above); the feature itself is not yet
+  implemented;
+- **[IMPLEMENTATION GAP]** a true session snapshot that persists exact tab
+  membership, tab order and the selected tab at quit. The current v1 working
+  set restores at most the final 12 bookmarked files in persisted order and
+  selects the final restored entry by default; it must not be described as
+  remembering a later tab switch.
 
-   RESOLVED today: ⌘W and Open Files (see the `Cmd+W` section — closing a
-   tab removes the file from the session; window/quit/crash do not remove it); the
-   last tab (launcher); the shape of the batch modal (the "Batch close modal" section).
+**To be inventoried in v0.2** (exist in the UI, semantics to be written down):
+markdown formatting (`Cmd+B` / `Cmd+I` / `Cmd+K` — the toolbar has
+bold/italic/link), switching editor/split/preview mode, sidebar toggle,
+zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing is assigned to it in v1.
 
-1. **Last tab after `Cmd+W`** — RESOLVED: shows the startup screen
-   (launcher), does not quit the app.
-2. **System `X` and dirty tabs** — SPEC IN FORCE (not an open
-   decision; to be moved into the "Closing windows and tabs" section for v0.2).
-   03.08 implementation delta: the PR #15 line has a two-phase pass (decisions
-   for all windows BEFORE any mutation, Cancel aborts the whole thing) —
-   in the spirit of this flow, but WITHOUT the batch modal
-   (Review Changes… / Save All / Discard All); the batch modal is a separate
-   UX cut after the campaign. The following flow applies when closing a window:
-   - If no tab has unsaved changes and none is a recovery item, the window closes without an additional prompt.
-   - If only one tab requires a decision, the app shows the native prompt: **Save / Don't Save / Cancel**.
-   - If several tabs require a decision, the app first shows the batch modal with the options:
-     - **Review Changes…** — the default option; step through the files in order, with a **Save / Don't Save / Cancel** decision for each;
-     - **Save All** — a quick save of all files; untitled and recovery tabs require subsequent Save As pickers;
-     - **Discard All** — discarding all changes only after an additional, unambiguous confirmation;
-     - **Cancel** — aborts closing and leaves the whole window unchanged.
-   - In **Review Changes…** mode, files are presented in a predictable order: the active tab first, then subsequent tabs from left to right.
-   - `Cancel` at any stage aborts closing the whole window. Saves already performed remain saved, but unresolved tabs are neither closed nor discarded.
-   - A save error stops the process, indicates the specific file, and leaves the window open.
-   - The window closes only once every dirty, untitled, and recovery item has been successfully saved or explicitly discarded. No decision never means `Discard`.
-3. **Save All for untitled/recovery** — SPEC IN FORCE (not an
-   open decision; key rules: paths files first, without pickers;
-   untitled/recovery one at a time via native Save As — NEVER an
-   automatic save under generated names; canceling any picker aborts the
-   entire Close All; completed saves remain; a recovery item disappears only after a
-   confirmed save).
-
-   **Compatibility with the native model (03.08 analysis, Monika + Fable):** the
-   flow is compatible with NSDocument/NSDocumentController on every safety
-   rule (pathed without a picker, untitled via the native Save sheet,
-   Cancel aborts the whole thing, no rollback, error blocks, Review as default).
-   TWO DELIBERATE extensions relative to the native alert — not to be
-   "corrected" back toward pure nativeness:
-   - **Save All** — the native batch alert doesn't have it (only Review /
-     Discard / Cancel); our extension, safe;
-   - **Discard All with an extra confirmation** — the native Discard Changes
-     deletes without a second question; we are deliberately more cautious here
-     (the "zero silent data loss" principle, relevant for recovery items).
-
-   The operation proceeds in the following order:
-   - First the app saves dirty files that already have a path on disk. These saves do not require pickers.
-   - Then it handles untitled and recovery tabs in order: the active tab first, then the rest from left to right.
-   - For each such tab it shows a separate native **Save As** picker. Several independent buffers must not be saved automatically under generated names.
-   - After a successful save, the untitled tab receives the chosen path and becomes a regular saved file. A recovery item can be removed from recovery only after the file has been confirmed saved to disk.
-   - Canceling any picker **aborts the entire Close All**. The window stays open; the canceled and still-unresolved tabs keep their content and dirty/recovery status.
-   - Files saved before the cancellation remain saved — the operation does not try to undo completed saves.
-   - A save error stops the sequence at the specific file, shows a readable message, and leaves the window open. A recovery item cannot be removed after a failed save.
-   - After resolving the error, the user can retry the save, move to **Review Changes…**, or cancel the close.
-   - The window or all tabs close only once every dirty, untitled, and recovery item has been successfully saved or explicitly discarded.
-
-**Safety rule:** `Cancel`, closing a picker, and a save error are never equivalent to `Discard`.
+Settled behavior belongs in the normative sections above, not in this list.
+In particular, `Cmd+W` and Open Files, the last-tab launcher, system-window
+close, and the batch-close/Save All sequence are resolved contracts.

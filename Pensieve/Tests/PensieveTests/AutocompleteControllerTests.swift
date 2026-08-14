@@ -223,7 +223,7 @@ final class AutocompleteControllerTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.contentView = surface.scrollView
     window.makeFirstResponder(surface.textView)
     // The window is the undo authority once the surface is hosted; if this ever
@@ -274,7 +274,7 @@ final class AutocompleteControllerTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.contentView = surface.scrollView
     window.makeFirstResponder(surface.textView)
     let manager = surface.textView.undoManager

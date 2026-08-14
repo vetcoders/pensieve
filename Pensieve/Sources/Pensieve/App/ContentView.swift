@@ -1,11 +1,13 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
+  @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
 
@@ -19,6 +21,8 @@ struct ContentView: View {
     self.providerSettings = providerSettings
     _providerOnboardingCoordinator = ObservedObject(
       wrappedValue: providerOnboardingCoordinator ?? .shared)
+    _providerSettingsTransition = StateObject(
+      wrappedValue: ProviderOnboardingSettingsTransition())
   }
 
   var body: some View {
@@ -27,7 +31,21 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       VStack(spacing: 0) {
+        if let sourceURL = appState.documentSession.recoverySourceURL {
+          RecoveredFileBanner(
+            sourceURL: sourceURL,
+            saveToOriginal: { controller.saveActiveDocument() },
+            saveAs: { saveRecoveredFileAs() }
+          )
+        }
         EditorPreviewSplit()
+        // Deliberately OUTSIDE the buffer gate below: the errors that most need
+        // saying (a workspace that will not open, a file that has moved, a
+        // recovery draft that could not be written) can all land in a window
+        // with nothing open, where the status bar does not exist.
+        if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
+          WindowErrorBanner(error: error) { appState.dismissVisibleError() }
+        }
         if appState.documentHasEditableBuffer {
           EditorStatusBar()
             .opacity(appState.mode == .focus ? 0.45 : 1)
@@ -35,8 +53,9 @@ struct ContentView: View {
       }
     }
     .navigationTitle(
-      appState.documentHasEditableBuffer
-        ? appState.documentTitle : "Pensieve"
+      DocumentWindowSurface.navigationTitle(
+        hasEditableBuffer: appState.documentHasEditableBuffer,
+        documentTitle: appState.documentTitle)
     )
     // 5.2: the subtitle carries the document's breadcrumb path; the dirty
     // "Edited" state it used to hold now lives in the status bar's marker.
@@ -67,7 +86,18 @@ struct ContentView: View {
       )
     }
     .sheet(isPresented: onboardingSheetBinding) {
-      ProviderOnboardingView(isPresented: onboardingSheetBinding)
+      ProviderOnboardingView(
+        isPresented: onboardingSheetBinding,
+        hostWindow: hostWindow,
+        settingsTransition: providerSettingsTransition,
+        onSettingsTransitionFailure: { failure in
+          appState.lastError = failure.userMessage
+        },
+        onSettingsPresentationFailure: { result in
+          if let message = result.userMessage {
+            appState.lastError = message
+          }
+        })
     }
     .onAppear {
       evaluateProviderOnboarding()
@@ -78,6 +108,12 @@ struct ContentView: View {
     .onChange(of: appState.aiAutocompleteEnabled) {
       providerOnboardingCoordinator.setAutocompleteEnabled(appState.aiAutocompleteEnabled)
       evaluateProviderOnboarding()
+    }
+    .onChange(of: providerOnboardingCoordinator.startupRestoreInProgress) {
+      _, restoreInProgress in
+      if !restoreInProgress {
+        evaluateProviderOnboarding()
+      }
     }
     .onReceive(
       NotificationCenter.default.publisher(
@@ -156,6 +192,53 @@ struct ContentView: View {
       windowID: hostWindowID,
       isKeyWindow: hostWindow?.isKeyWindow == true)
   }
+
+  private func saveRecoveredFileAs() {
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+      .plainText,
+    ].compactMap { $0 }
+    panel.canCreateDirectories = true
+    panel.directoryURL = appState.documentSession.recoverySourceURL?.deletingLastPathComponent()
+    panel.nameFieldStringValue =
+      appState.documentSession.recoverySourceURL?.lastPathComponent ?? "Recovered.md"
+    panel.prompt = "Save"
+    if panel.runModal() == .OK, let url = panel.url {
+      controller.saveActiveDocument(as: url)
+    }
+  }
+}
+
+private struct RecoveredFileBanner: View {
+  let sourceURL: URL
+  let saveToOriginal: () -> Void
+  let saveAs: () -> Void
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Image(systemName: "lifepreserver")
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Recovered unsaved changes")
+          .font(.callout.weight(.semibold))
+        Text(sourceURL.path)
+          .font(.caption)
+          .lineLimit(1)
+          .truncationMode(.middle)
+        Text("The original file has not been overwritten.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      Button("Save to Original", action: saveToOriginal)
+      Button("Save As…", action: saveAs)
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .background(.orange.opacity(0.12))
+    .accessibilityIdentifier("pensieve.recoveredFile.banner")
+  }
 }
 
 struct EditorPreviewSplit: View {
@@ -179,14 +262,18 @@ struct EditorPreviewSplit: View {
 
   @ViewBuilder
   private func content(forWidth width: CGFloat) -> some View {
-    // Ahead of the empty state, because a staged open is bufferless too and the
-    // two must not look the same: one window is idle, the other is working on a
-    // file the user just asked for.
-    if appState.documentIsLoading {
+    // The launcher-vs-editor split lives in `DocumentWindowSurface` so the
+    // new-tab lifecycle can pin it without building a view tree — a staged open
+    // is bufferless too, and must not look like the idle empty state.
+    switch DocumentWindowSurface.resolve(
+      isLoading: appState.documentIsLoading,
+      hasEditableBuffer: appState.documentHasEditableBuffer)
+    {
+    case .opening:
       DocumentOpeningView(title: appState.documentTitle)
-    } else if !appState.documentHasEditableBuffer {
+    case .launcher:
       DocumentEmptyStateView()
-    } else {
+    case .editor:
       switch appState.mode {
       case .source:
         EditorView()
@@ -307,8 +394,42 @@ struct DocumentEmptyStateView: View {
 ///
 /// Deliberately quiet — it is a footnote under the empty state, and it renders
 /// nothing at all when there is no unhandled draft, which is the normal case.
+struct RecoveredDraftsPagination: Equatable {
+  static let pageSize = 5
+
+  let itemCount: Int
+  let pageIndex: Int
+
+  init(itemCount: Int, requestedPageIndex: Int) {
+    self.itemCount = max(0, itemCount)
+    let lastPageIndex = max(0, Self.pageCount(for: itemCount) - 1)
+    self.pageIndex = min(max(0, requestedPageIndex), lastPageIndex)
+  }
+
+  var pageCount: Int {
+    Self.pageCount(for: itemCount)
+  }
+
+  var itemRange: Range<Int> {
+    let lowerBound = pageIndex * Self.pageSize
+    let upperBound = min(lowerBound + Self.pageSize, itemCount)
+    return lowerBound..<upperBound
+  }
+
+  var itemRangeLabel: String {
+    guard !itemRange.isEmpty else { return "0 of 0" }
+    return "\(itemRange.lowerBound + 1)–\(itemRange.upperBound) of \(itemCount)"
+  }
+
+  private static func pageCount(for itemCount: Int) -> Int {
+    guard itemCount > 0 else { return 0 }
+    return (itemCount + pageSize - 1) / pageSize
+  }
+}
+
 struct RecoveredDraftsSection: View {
   @EnvironmentObject private var controller: AppController
+  @State private var requestedPageIndex = 0
   /// The launcher pane's own skin tokens. The section sits INSIDE the themed
   /// empty state, so a system colour here would reinstate exactly the grey card
   /// on a cream/ink pane the empty-state palette exists to prevent.
@@ -319,13 +440,50 @@ struct RecoveredDraftsSection: View {
     // "0 drafts" row would turn the ordinary launcher into a permanent crash
     // reminder.
     if !controller.recoveredDrafts.isEmpty {
+      let pagination = RecoveredDraftsPagination(
+        itemCount: controller.recoveredDrafts.count,
+        requestedPageIndex: requestedPageIndex)
       VStack(alignment: .leading, spacing: 8) {
-        Text("Recovered Drafts")
-          .font(.headline)
-          .foregroundStyle(Color(palette.secondaryText))
+        HStack {
+          Text("Recovered Drafts")
+            .font(.headline)
+            .foregroundStyle(Color(palette.secondaryText))
+          Spacer()
+          Text(pagination.itemRangeLabel)
+            .font(.caption)
+            .foregroundStyle(Color(palette.tertiaryText))
+            .accessibilityIdentifier("pensieve.recoveredDrafts.range")
+        }
 
-        ForEach(controller.recoveredDrafts) { draft in
+        ForEach(Array(controller.recoveredDrafts[pagination.itemRange])) { draft in
           RecoveredDraftRow(draft: draft, palette: palette)
+        }
+
+        if pagination.pageCount > 1 {
+          HStack(spacing: 8) {
+            Button("Previous") {
+              requestedPageIndex = max(0, pagination.pageIndex - 1)
+            }
+            .disabled(pagination.pageIndex == 0)
+            .accessibilityIdentifier("pensieve.recoveredDrafts.previousPage")
+
+            Spacer()
+
+            Text("Page \(pagination.pageIndex + 1) of \(pagination.pageCount)")
+              .font(.caption)
+              .foregroundStyle(Color(palette.secondaryText))
+              .accessibilityIdentifier("pensieve.recoveredDrafts.page")
+
+            Spacer()
+
+            Button("Next") {
+              requestedPageIndex = min(
+                pagination.pageCount - 1, pagination.pageIndex + 1)
+            }
+            .disabled(pagination.pageIndex == pagination.pageCount - 1)
+            .accessibilityIdentifier("pensieve.recoveredDrafts.nextPage")
+          }
+          .controlSize(.small)
         }
       }
       .padding(16)
@@ -335,6 +493,12 @@ struct RecoveredDraftsSection: View {
           .fill(Color(palette.keyCapFill))
       )
       .accessibilityIdentifier("pensieve.recoveredDrafts")
+      .onChange(of: controller.recoveredDrafts.count) { _, count in
+        requestedPageIndex =
+          RecoveredDraftsPagination(
+            itemCount: count, requestedPageIndex: requestedPageIndex
+          ).pageIndex
+      }
     }
   }
 }
@@ -347,7 +511,7 @@ private struct RecoveredDraftRow: View {
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 12) {
       VStack(alignment: .leading, spacing: 2) {
-        Text(draft.title)
+        Text(draft.displayTitle)
           .font(.callout)
           .foregroundStyle(Color(palette.primaryText))
           .lineLimit(1)
@@ -358,6 +522,16 @@ private struct RecoveredDraftRow: View {
         Text(draft.updatedAt.formatted(date: .abbreviated, time: .shortened))
           .font(.caption2)
           .foregroundStyle(Color(palette.tertiaryText))
+        if let sourceURL = draft.sourceURL {
+          Text(sourceURL.path)
+            .font(.caption2)
+            .foregroundStyle(Color(palette.tertiaryText))
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Text("Emergency copy — the original file has not been overwritten.")
+            .font(.caption2)
+            .foregroundStyle(Color(palette.tertiaryText))
+        }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 

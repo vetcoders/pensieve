@@ -320,16 +320,208 @@ final class DispatchGatewayTests: XCTestCase {
     XCTAssertEqual(launcher.requests().map(\.workflow), ["research", "research"])
   }
 
+  @MainActor
+  func testDefaultSwarmCarriesReceiptObserveAgentThroughControllerAndPhase() async throws {
+    let provider = FakeWorkflowCapabilitiesProvider(
+      result: .success(try WorkflowCapabilitiesFixtures.decoded()))
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: research-default-swarm
+        agent: swarm
+        report: /tmp/reports/research-default-swarm.md
+        """,
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
+    let (controller, _, launcher) = makeController(
+      capabilities: provider,
+      launcherResult: receipt)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-swarm-receipt.md").standardizedFileURL
+    let rootURL = URL(fileURLWithPath: "/tmp", isDirectory: true).standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .fileURL(fileURL), workflow: "research", source: .sidebar),
+      workflow: "research",
+      agents: [],
+      rootURL: rootURL)
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted default swarm receipt to remain inspectable")
+    }
+    XCTAssertEqual(runID, "research-default-swarm")
+    XCTAssertEqual(reportPath, "/tmp/reports/research-default-swarm.md")
+    XCTAssertEqual(observeAgent, "swarm")
+    XCTAssertEqual(launcher.requests().map(\.agents), [[]])
+    XCTAssertEqual(
+      DispatchPopover.resolvedPhase(for: outcome),
+      .acceptedUnconfirmed(
+        runID: "research-default-swarm",
+        reportPath: "/tmp/reports/research-default-swarm.md",
+        observeAgent: "swarm"))
+  }
+
+  // MARK: - Receipt actions (what a launch receipt earns)
+
+  /// An older/trimmed receipt may omit `agent:`, but a single-agent dispatch
+  /// still has one explicit positional authority. That dispatched token — not
+  /// the first item in the configured-agent list — is what the status action
+  /// must observe.
+  @MainActor
+  func testSingleAgentReceiptWithoutAgentUsesTheExplicitDispatchedAgentForStatus() async {
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: work-no-agent-line
+        report: /tmp/reports/work-no-agent-line.md
+        """,
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
+    XCTAssertNil(receipt.observeAgent, "precondition: the receipt names no observe agent")
+
+    let (controller, _, launcher) = makeController(launcherResult: receipt)
+    XCTAssertEqual(
+      controller.availableAgents.first, "claude",
+      "precondition: production ordering starts with a different agent than the default")
+    XCTAssertEqual(controller.defaultAgent, "codex", "precondition: the explicit default lane")
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-no-agent-line.md").standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(subject: .fileURL(fileURL), workflow: "review", source: .sidebar),
+      workflow: "review",
+      agents: ["codex"],
+      rootURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted single-agent receipt to remain inspectable")
+    }
+    XCTAssertEqual(observeAgent, "codex")
+    XCTAssertEqual(launcher.requests().map(\.agents), [["codex"]])
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      runIsLaunched: true)
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/work-no-agent-line.md")
+    XCTAssertEqual(
+      actions.observe,
+      DispatchPopover.ReceiptActions.Observe(agent: "codex", runID: "work-no-agent-line"))
+  }
+
+  /// A default swarm has no positional agent. If its receipt also omits
+  /// `agent:`, neither the controller nor the view may guess an observer from
+  /// the configured-agent order; the report remains a real, revealable artifact.
+  @MainActor
+  func testDefaultSwarmReceiptWithoutAgentOffersNoStatusButKeepsTheReport() async throws {
+    let provider = FakeWorkflowCapabilitiesProvider(
+      result: .success(try WorkflowCapabilitiesFixtures.decoded()))
+    let receipt = AgentDispatchMetadata.parse(
+      output: """
+        run_id: research-default-no-agent
+        report: /tmp/reports/research-default-no-agent.md
+        """,
+      exitCode: 0
+    ).classified(workerSpawnRecorded: false)
+    XCTAssertNil(receipt.observeAgent, "precondition: the receipt names no observe agent")
+
+    let (controller, _, launcher) = makeController(
+      capabilities: provider,
+      launcherResult: receipt)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-default-no-agent.md").standardizedFileURL
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .fileURL(fileURL), workflow: "research", source: .sidebar),
+      workflow: "research",
+      agents: [],
+      rootURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+
+    guard
+      case .acceptedUnconfirmed(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected the accepted default swarm receipt to remain inspectable")
+    }
+    XCTAssertNil(observeAgent, "a default swarm has no positional observer authority")
+    XCTAssertEqual(launcher.requests().map(\.agents), [[]])
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      runIsLaunched: true)
+    XCTAssertNil(actions.observe, "no receipt or positional agent means no status action")
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/research-default-no-agent.md")
+
+    XCTAssertEqual(
+      DispatchPopover.resolvedPhase(for: outcome),
+      .acceptedUnconfirmed(
+        runID: "research-default-no-agent",
+        reportPath: "/tmp/reports/research-default-no-agent.md",
+        observeAgent: nil))
+  }
+
+  /// A rejected launch never started a run. Its receipt may still carry a run
+  /// ID and a report the launcher wrote — the report is real and stays
+  /// revealable — but "Check status" would point at a run that does not exist.
+  @MainActor
+  func testRejectedReceiptRevealsItsReportButOffersNoStatusCheck() {
+    let rejected = AgentDispatchMetadata.parse(
+      output: """
+        run_id: work-rejected
+        agent: codex
+        report: /tmp/reports/work-rejected.md
+        refused: workflow gate
+        """,
+      exitCode: 2)
+    XCTAssertEqual(rejected.launchVerification, .rejected, "precondition")
+
+    let phase = DispatchPopover.resolvedPhase(
+      for: .rejected(
+        message: rejected.statusLine,
+        runID: rejected.runID,
+        reportPath: rejected.reportPath,
+        observeAgent: rejected.observeAgent))
+    guard case .failed(_, let runID, let reportPath, let observeAgent) = phase else {
+      return XCTFail("Expected a rejected outcome to render as the failed phase")
+    }
+
+    let actions = DispatchPopover.receiptActions(
+      runID: runID,
+      reportPath: reportPath,
+      observeAgent: observeAgent,
+      runIsLaunched: false)
+    XCTAssertEqual(actions.revealReportPath, "/tmp/reports/work-rejected.md")
+    XCTAssertNil(actions.observe, "a run that never started has no status to check")
+
+    // The same identifiers on a launched run DO earn the status action — the
+    // difference is the launch, not the receipt.
+    XCTAssertNotNil(
+      DispatchPopover.receiptActions(
+        runID: runID,
+        reportPath: reportPath,
+        observeAgent: observeAgent,
+        runIsLaunched: true
+      ).observe)
+  }
+
   // MARK: - Helpers
 
   @MainActor
   private func makeController(
-    capabilities: WorkflowCapabilitiesProviding? = nil
+    capabilities: WorkflowCapabilitiesProviding? = nil,
+    launcherResult: AgentDispatchMetadata? = nil
   )
     -> (AppController, AppState, GatewayRecordingLauncher)
   {
     let appState = AppState()
-    let launcher = GatewayRecordingLauncher()
+    let launcher = GatewayRecordingLauncher(result: launcherResult)
     let controller = AppController(
       appState: appState,
       folderManager: .shared,
@@ -381,7 +573,12 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
   }
 
   private let lock = NSLock()
+  private let result: AgentDispatchMetadata?
   private var recordedRequests: [Request] = []
+
+  init(result: AgentDispatchMetadata? = nil) {
+    self.result = result
+  }
 
   func dispatch(
     workflow: String,
@@ -397,8 +594,12 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
         payload: payload,
         workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
     lock.unlock()
-    return AgentDispatchMetadata(
-      runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt")
+    return result
+      ?? AgentDispatchMetadata(
+        runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt",
+        // Explicit: metadata built directly carries no spawn proof, so the
+        // started-run path has to be asked for.
+        launchVerification: .workerSpawnRecorded)
   }
 
   func requests() -> [Request] {
@@ -426,7 +627,8 @@ private final class BlockingLauncher: AgentPromptLaunching, @unchecked Sendable 
     lock.unlock()
     gate.wait()
     return AgentDispatchMetadata(
-      runID: "blocking-test", reportPath: nil, exitCode: 0, output: "receipt")
+      runID: "blocking-test", reportPath: nil, exitCode: 0, output: "receipt",
+      launchVerification: .workerSpawnRecorded)
   }
 
   func startedCount() -> Int {

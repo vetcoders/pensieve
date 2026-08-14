@@ -97,6 +97,21 @@ final class DocumentCloseLifecycleTests: XCTestCase {
       .confirm(.saveAsUntitled))
   }
 
+  @MainActor
+  func testRecoveredFileBufferOffersOriginalSaveSaveAsDiscardAndCancelContract() throws {
+    let sourceURL = URL(fileURLWithPath: "/tmp/recovered-note.md")
+    var session = DocumentSession.untitled()
+    session.restoreUntitled(
+      title: "Unsaved changes — recovered-note.md",
+      text: "recovered body",
+      recoveryID: UUID(),
+      sourceURL: sourceURL)
+
+    XCTAssertEqual(
+      DocumentCloseDecision.resolve(for: session),
+      .confirm(.saveRecoveredFile))
+  }
+
   // MARK: - ⌘W on an untitled draft
 
   @MainActor
@@ -492,6 +507,52 @@ final class DocumentCloseLifecycleTests: XCTestCase {
     XCTAssertEqual(recorder.promptCount, 0)
   }
 
+  /// If neither the original file nor RecoveryStore can accept the current
+  /// bytes, the red close button must be vetoed while the only copy is still in
+  /// memory. This is the last safe point before AppKit destroys the window.
+  @MainActor
+  func testWindowShouldCloseIsVetoedWhenOriginalAndRecoveryWritesBothFail() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("no-durable-destination.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
+    let recoveryStore = RecoveryStore(directoryURL: blockedRecoveryURL)
+
+    let appState = AppState()
+    appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "original")
+    appState.selectedDocumentID = noteURL.standardizedFileURL
+    appState.activeDocumentText = "the only copy is in memory"
+    appState.activeDocumentDirty = true
+    try FileManager.default.removeItem(at: noteURL)
+
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: true))
+    let recorder = SaveChangesRecorder()
+    let controller = makeController(
+      appState: appState,
+      in: folder,
+      documentStore: documentStore,
+      autoSaveEnabled: true,
+      recorder: recorder)
+    let window = Self.makeTestWindow()
+    defer { window.close() }
+
+    XCTAssertFalse(controller.windowShouldClose(window))
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.text, "the only copy is in memory")
+    XCTAssertNotNil(appState.unresolvedDataLoss)
+    XCTAssertEqual(appState.currentError?.severity, .dataLoss)
+    XCTAssertTrue(appState.currentError?.message.contains("window will stay open") == true)
+  }
+
   /// A pristine document's close button never asks — nothing is at stake.
   @MainActor
   func testWindowShouldCloseAllowsImmediateCloseForACleanDocument() throws {
@@ -519,7 +580,7 @@ final class DocumentCloseLifecycleTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     return window

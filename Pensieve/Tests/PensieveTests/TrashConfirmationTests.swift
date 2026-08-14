@@ -206,7 +206,7 @@ final class TrashTestHarness {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false
+      defer: true
     )
     window.isReleasedWhenClosed = false
     return window

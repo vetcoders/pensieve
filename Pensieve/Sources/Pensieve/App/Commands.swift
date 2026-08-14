@@ -37,13 +37,31 @@ extension FocusedValues {
 final class CommandSurfaceContext: ObservableObject {
   static let shared = CommandSurfaceContext()
 
+  private final class WeakWindowSurface {
+    weak var window: NSWindow?
+    weak var appState: AppState?
+    weak var controller: AppController?
+
+    init(window: NSWindow, appState: AppState, controller: AppController) {
+      self.window = window
+      self.appState = appState
+      self.controller = controller
+    }
+  }
+
   @Published private(set) var appState: AppState?
   @Published private(set) var controller: AppController?
+  private var windowSurfaces: [ObjectIdentifier: WeakWindowSurface] = [:]
 
   /// Adopts a document root as the fallback command target. Always adopted as
   /// a PAIR: a mixed state/controller pair would let a menu action mutate one
   /// window's state through another window's controller.
   func adopt(appState: AppState, controller: AppController) {
+    // This signal is intentionally sent even when the pair is unchanged. A
+    // window accessor can resolve after the root's early `.task` already
+    // adopted the same controller; that later turn is precisely when a New
+    // gesture queued during the attach gap becomes safe to replay.
+    LaunchIntentCoordinator.shared.commandTargetDidBecomeAvailable(controller)
     guard self.appState !== appState || self.controller !== controller else { return }
     self.appState = appState
     self.controller = controller
@@ -62,13 +80,62 @@ final class CommandSurfaceContext: ObservableObject {
     adopt(appState: appState, controller: controller)
   }
 
+  /// Records the exact document surface behind a native window. Modal error
+  /// reporting must resolve through this ownership map rather than through the
+  /// most recently adopted fallback: the latter may be a different document
+  /// that merely happened to own the menu before a sheet became key.
+  func register(appState: AppState, controller: AppController, for window: NSWindow) {
+    pruneWindowSurfaces()
+    windowSurfaces = windowSurfaces.filter { _, surface in
+      surface.controller !== controller
+    }
+    windowSurfaces[ObjectIdentifier(window)] = WeakWindowSurface(
+      window: window,
+      appState: appState,
+      controller: controller)
+  }
+
+  /// Resolves the non-modal document error surface that visibly owns a modal
+  /// block. The exact owner wins; key/main are bounded app-global fallbacks for
+  /// a standalone application-modal alert. Deliberately never falls back to
+  /// `appState`, because that pair is historical command focus, not native
+  /// window ownership.
+  func reportingAppState(
+    blockingOwner: NSWindow?,
+    keyWindow: NSWindow?,
+    mainWindow: NSWindow?
+  ) -> AppState? {
+    pruneWindowSurfaces()
+    var seen: Set<ObjectIdentifier> = []
+    for candidate in [blockingOwner, keyWindow, mainWindow].compactMap({ $0 }) {
+      let identifier = ObjectIdentifier(candidate)
+      guard seen.insert(identifier).inserted else { continue }
+      if let state = windowSurfaces[identifier]?.appState {
+        return state
+      }
+    }
+    return nil
+  }
+
   /// Drops the adopted pair when its window closes, so a dead root neither
   /// leaks nor keeps serving menu actions. A no-op when a different root has
   /// already taken over.
   func release(controller: AppController) {
+    windowSurfaces = windowSurfaces.filter { _, surface in
+      guard surface.window != nil, surface.appState != nil, surface.controller != nil else {
+        return false
+      }
+      return surface.controller !== controller
+    }
     guard self.controller === controller else { return }
     appState = nil
     self.controller = nil
+  }
+
+  private func pruneWindowSurfaces() {
+    windowSurfaces = windowSurfaces.filter { _, surface in
+      surface.window != nil && surface.appState != nil && surface.controller != nil
+    }
   }
 }
 
@@ -120,25 +187,306 @@ enum CommandTargetResolution {
   }
 }
 
+/// Which command family owns the menu bar. An auxiliary Settings window has
+/// precedence over a still-live document fallback: otherwise its key window
+/// receives document Save/Mode/Format/Close actions for a background buffer.
+enum PensieveCommandSurfaceRoute: Equatable {
+  case settings
+  case document
+  case zeroWindow
+
+  static func resolve(settingsOwnsSurface: Bool, hasDocumentTarget: Bool) -> Self {
+    if settingsOwnsSurface { return .settings }
+    return hasDocumentTarget ? .document : .zeroWindow
+  }
+}
+
+/// How the File menu acts when it was built with NO command target — the
+/// deliberate zero-window state a Mac document app keeps living in after its
+/// last window closes (`Shift+Cmd+W`).
+///
+/// Every action here funnels into the lanes the app already owns for a window
+/// it does not have yet: an open goes through `LaunchIntentCoordinator.handle`,
+/// the same entry a Finder/`open`/Dock drop uses, so the coordinator's
+/// one-shot host guard covers a menu-driven open too and a launcher already on
+/// its way is never doubled; New goes through the registry's single
+/// `openDocumentHost(intent:)` factory. Nothing here creates a window by
+/// itself.
+///
+struct ZeroWindowCommandLane {
+  var openExternalURLs: @MainActor ([URL]) -> Void = { urls in
+    LaunchIntentCoordinator.shared.handle(urls: urls)
+  }
+  var requestNewDocument: @MainActor () -> Void = {
+    LaunchIntentCoordinator.shared.requestNewDocument()
+  }
+
+  /// ⌘O, ⇧⌘O and Open Recent. Handed to the coordinator whether or not a root
+  /// exists: `handle(urls:)` routes to the focused window when there is one and
+  /// materializes exactly one host when there is not — the same double-open and
+  /// one-shot guards an external open relies on.
+  @MainActor
+  func open(urls: [URL]) {
+    guard !urls.isEmpty else { return }
+    openExternalURLs(urls)
+  }
+
+  /// ⌘N / ⌘T. The coordinator resolves the controller again at action time and
+  /// counts the gesture while a host is attaching. One `.newUntitledTab` host
+  /// consumes the first request; rapid later requests are replayed as native
+  /// tabs rather than being dropped or spawning competing roots.
+  @MainActor
+  func newDocument() {
+    requestNewDocument()
+  }
+}
+
+/// The native pickers the File menu opens. Shared by the live and the
+/// zero-window command surfaces so both offer exactly the same file types and
+/// the same prompts — a second copy is how the two menus drift apart.
+enum DocumentOpenPanel {
+  static var markdownContentTypes: [UTType] {
+    [
+      UTType(filenameExtension: "md"),
+      UTType(filenameExtension: "markdown"),
+      .plainText,
+    ].compactMap { $0 }
+  }
+
+  static var documentImportContentTypes: [UTType] {
+    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
+  }
+
+  static var openableContentTypes: [UTType] {
+    markdownContentTypes + documentImportContentTypes
+  }
+
+  @MainActor
+  static func chooseFileToOpen() -> URL? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = openableContentTypes
+    panel.prompt = "Open"
+    guard panel.runModal() == .OK else { return nil }
+    return panel.url
+  }
+
+  @MainActor
+  static func chooseFolderToOpen() -> URL? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Open"
+    guard panel.runModal() == .OK else { return nil }
+    return panel.url
+  }
+}
+
+/// Commands that belong to the APPLICATION rather than to one document root.
+/// Their lane stays installed while the process has zero windows and during a
+/// focused-value rebuild, so About remains Pensieve's BuildIdentity surface and
+/// ⌘Q can never fall back to SwiftUI's unguarded default termination command.
+struct ApplicationCommandLane {
+  var resolveTermination: @MainActor () -> NSApplication.TerminateReply = {
+    DocumentWindowRegistry.shared.resolveTerminationRequest()
+  }
+  var terminate: @MainActor () -> Void = {
+    NSApplication.shared.terminate(nil)
+  }
+  var showAbout: @MainActor () -> Void = {
+    PensieveAboutPanel.show()
+  }
+  var showSettings:
+    @MainActor (PensieveSettingsSection) -> PensieveSettingsPresentationResult = { section in
+    PensieveSettingsWindowController.shared.show(section: section)
+  }
+
+  @discardableResult
+  @MainActor
+  func openSettings() -> PensieveSettingsPresentationResult {
+    showSettings(.general)
+  }
+
+  @MainActor
+  func quit() {
+    guard resolveTermination() == .terminateNow else { return }
+    terminate()
+  }
+}
+
+@MainActor
+private enum PensieveAboutPanel {
+  static func show() {
+    let identity = BuildIdentity.current
+    let alert = NSAlert()
+    alert.messageText = identity.aboutTitle
+    alert.informativeText = identity.aboutDetails
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
+  }
+}
+
+private struct GlobalPensieveCommands: Commands {
+  var lane = ApplicationCommandLane()
+
+  var body: some Commands {
+    CommandGroup(replacing: .appInfo) {
+      Button("About Pensieve") {
+        lane.showAbout()
+      }
+    }
+
+    CommandGroup(replacing: .appSettings) {
+      Button("Settings…") {
+        lane.openSettings()
+      }
+      .keyboardShortcut(",", modifiers: [.command])
+    }
+
+    CommandGroup(replacing: .appTermination) {
+      Button("Quit Pensieve") {
+        lane.quit()
+      }
+      .keyboardShortcut("q", modifiers: [.command])
+    }
+  }
+}
+
 struct PensieveCommands: Commands {
   @FocusedValue(\.appState) private var focusedAppState: AppState?
   @FocusedObject private var focusedController: AppController?
   @ObservedObject var themeManager: ThemeManager
   @ObservedObject private var surface = CommandSurfaceContext.shared
+  @ObservedObject private var settingsController = PensieveSettingsWindowController.shared
 
   var body: some Commands {
-    if let target = CommandTargetResolution.resolve(
+    GlobalPensieveCommands()
+
+    let target = CommandTargetResolution.resolve(
       focusedState: focusedAppState,
       focusedController: focusedController,
       fallbackState: surface.appState,
       fallbackController: surface.controller
-    ) {
+    )
+    switch PensieveCommandSurfaceRoute.resolve(
+      settingsOwnsSurface: settingsController.ownsCommandSurface,
+      hasDocumentTarget: target != nil)
+    {
+    case .settings:
+      // Settings is auxiliary, but the application-level File/New/Open lane
+      // remains useful. Its own Close command replaces the document close
+      // family, while Mode/Format/Agents stay absent because no document
+      // command collection is installed in this branch.
+      DocumentlessFileCommands(recentDocuments: RecentDocumentsStore.shared)
+      SettingsWindowCommands(controller: settingsController)
+    case .document:
+      if let target {
       ActivePensieveCommands(
         appState: target.state,
         controller: target.controller,
         themeManager: themeManager,
         recentDocuments: target.controller.recentDocuments
       )
+      }
+    case .zeroWindow:
+      // Closing the last window leaves the process alive on purpose, and every
+      // item above needs a document root to act on — so the whole File menu used
+      // to vanish with it: no New, no Open, no Open Recent, and ⌘N/⌘O/⌘T dead.
+      // A Mac document app keeps a working File menu with zero windows; this is
+      // that menu, and it is the ONLY branch that runs without a root.
+      DocumentlessFileCommands(recentDocuments: RecentDocumentsStore.shared)
+    }
+  }
+}
+
+private struct SettingsWindowCommands: Commands {
+  @ObservedObject var controller: PensieveSettingsWindowController
+
+  private var lane: SettingsWindowCommandLane {
+    SettingsWindowCommandLane {
+      controller.close()
+    }
+  }
+
+  var body: some Commands {
+    CommandGroup(replacing: .saveItem) {
+      Button("Close Settings") {
+        lane.close()
+      }
+      .keyboardShortcut("w", modifiers: [.command])
+    }
+  }
+}
+
+/// Action-time target for Settings' ⌘W. Keeping the closure independent of a
+/// document controller makes the critical shortcut directly testable without
+/// ordering a native Settings fixture on screen.
+struct SettingsWindowCommandLane {
+  var closeSettings: @MainActor () -> Void
+
+  @MainActor
+  func close() {
+    closeSettings()
+  }
+}
+
+/// The application-owned File/New/Open lane used whenever the KEY command
+/// surface is not a document — both the true zero-window state and Settings.
+/// Deliberately a subset: every item that acts ON a document (Save, Export,
+/// Close, Format, Mode, Agents) needs a foreground document session.
+/// Application-global About and protected Quit live in
+/// `GlobalPensieveCommands`; Settings adds its own Close family alongside this
+/// lane.
+private struct DocumentlessFileCommands: Commands {
+  @ObservedObject var recentDocuments: RecentDocumentsStore
+  var lane = ZeroWindowCommandLane()
+
+  var body: some Commands {
+    CommandGroup(replacing: .newItem) {
+      Button("New File") {
+        lane.newDocument()
+      }
+      .keyboardShortcut("n", modifiers: [.command])
+
+      Button("New Tab") {
+        lane.newDocument()
+      }
+      .keyboardShortcut("t", modifiers: [.command])
+
+      Divider()
+
+      Button("Open File…") {
+        guard let url = DocumentOpenPanel.chooseFileToOpen() else { return }
+        lane.open(urls: [url])
+      }
+      .keyboardShortcut("o", modifiers: [.command])
+
+      Menu("Open Recent") {
+        ForEach(recentDocuments.recentDocuments, id: \.self) { url in
+          Button(RecentDocumentsStore.menuTitle(for: url)) {
+            lane.open(urls: [url])
+          }
+        }
+
+        if !recentDocuments.recentDocuments.isEmpty {
+          Divider()
+        }
+
+        Button("Clear Menu") {
+          recentDocuments.clear()
+        }
+        .disabled(recentDocuments.recentDocuments.isEmpty)
+      }
+
+      Button("Open Folder…") {
+        guard let url = DocumentOpenPanel.chooseFolderToOpen() else { return }
+        lane.open(urls: [url])
+      }
+      .keyboardShortcut("o", modifiers: [.command, .shift])
     }
   }
 }
@@ -151,18 +499,17 @@ private struct ActivePensieveCommands: Commands {
   @ObservedObject var recentDocuments: RecentDocumentsStore
 
   var body: some Commands {
-    CommandGroup(replacing: .appInfo) {
-      Button("About Pensieve") {
-        showAboutPanel()
-      }
-    }
-
     // File menu
     CommandGroup(replacing: .newItem) {
-      Button("New File…") {
+      Button("New File") {
         controller.createUntitledDocument()
       }
       .keyboardShortcut("n", modifiers: [.command])
+
+      Button("New Tab") {
+        controller.createUntitledDocument()
+      }
+      .keyboardShortcut("t", modifiers: [.command])
 
       Divider()
 
@@ -288,15 +635,6 @@ private struct ActivePensieveCommands: Commands {
       }
       .keyboardShortcut(.delete, modifiers: [.command])
       .disabled(sidebarActionTargetURL == nil)
-    }
-
-    CommandGroup(replacing: .appTermination) {
-      Button("Quit Pensieve") {
-        if controller.applicationShouldTerminate() {
-          NSApplication.shared.terminate(nil)
-        }
-      }
-      .keyboardShortcut("q", modifiers: [.command])
     }
 
     // File menu — replace the default Save/Close group so ⌘W closes the
@@ -569,7 +907,9 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func saveActiveDocument() {
-    if appState.documentSession.isUntitled {
+    if appState.documentSession.isUntitled
+      && appState.documentSession.recoverySourceURL == nil
+    {
       saveActiveDocumentAs()
     } else {
       controller.saveActiveDocument()
@@ -589,15 +929,12 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func openFile() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = false
-    panel.allowsMultipleSelection = false
-    panel.allowedContentTypes = openableContentTypes
-    panel.prompt = "Open"
-    if panel.runModal() == .OK, let url = panel.url {
-      controller.openFileInCurrentWindow(url: url)
-    }
+    guard let url = DocumentOpenPanel.chooseFileToOpen() else { return }
+    // The File menu is an explicit document-open gesture, just like Open
+    // Recent and Finder/Dock opens. Let the controller reuse an idle window
+    // or route to the existing/new native tab; loading in place here would
+    // replace a live document before the tab policy gets a chance to act.
+    controller.openFile(url: url)
   }
 
   private func importDocument() {
@@ -614,14 +951,8 @@ private struct ActivePensieveCommands: Commands {
   }
 
   private func openFolder() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.prompt = "Open"
-    if panel.runModal() == .OK, let url = panel.url {
-      controller.openFolder(url: url)
-    }
+    guard let url = DocumentOpenPanel.chooseFolderToOpen() else { return }
+    controller.openFolder(url: url)
   }
 
   private func createFolder() {
@@ -656,20 +987,10 @@ private struct ActivePensieveCommands: Commands {
     }
   }
 
-  private var markdownContentTypes: [UTType] {
-    [
-      UTType(filenameExtension: "md"),
-      UTType(filenameExtension: "markdown"),
-      .plainText,
-    ].compactMap { $0 }
-  }
+  private var markdownContentTypes: [UTType] { DocumentOpenPanel.markdownContentTypes }
 
   private var documentImportContentTypes: [UTType] {
-    [UTType(filenameExtension: "docx"), .pdf].compactMap { $0 }
-  }
-
-  private var openableContentTypes: [UTType] {
-    markdownContentTypes + documentImportContentTypes
+    DocumentOpenPanel.documentImportContentTypes
   }
 
   private var sidebarActionTargetURL: URL? {
@@ -747,13 +1068,4 @@ private struct ActivePensieveCommands: Commands {
     appState.findFocusToken &+= 1
   }
 
-  private func showAboutPanel() {
-    let identity = BuildIdentity.current
-    let alert = NSAlert()
-    alert.messageText = identity.aboutTitle
-    alert.informativeText = identity.aboutDetails
-    alert.alertStyle = .informational
-    alert.addButton(withTitle: "OK")
-    alert.runModal()
-  }
 }

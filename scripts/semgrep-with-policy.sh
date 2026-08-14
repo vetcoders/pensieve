@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 policy="$repo_root/.semgrep-policy.json"
+native_window_contract="$repo_root/.semgrep/native-test-window-presentation.yml"
 report="$(mktemp -t pensieve-semgrep.XXXXXX)"
 trap 'rm -f "$report"' EXIT
 
@@ -13,7 +14,12 @@ if git grep -n -E 'nosemgrep|nosem' -- Pensieve docs ':!Pensieve/Sources/Pensiev
   exit 1
 fi
 
-semgrep scan --config auto --quiet --json "$@" >"$report"
+semgrep scan \
+  --config auto \
+  --config "$native_window_contract" \
+  --quiet \
+  --json \
+  "$@" >"$report"
 
 allowed="$(jq -c '.accepted_findings' "$policy")"
 invalid_policy="$(jq -r '

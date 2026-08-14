@@ -10,13 +10,26 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   private let onSend: (TranscriptionSendTarget) -> Bool
   private var panel: NSPanel?
   private var sendEventMonitor: Any?
+  private let panelFactory: @MainActor () -> NSPanel
+  private let presentPanel: @MainActor (NSPanel) -> Void
+  private let dismissPanel: @MainActor (NSPanel) -> Void
+  private let panelIsVisible: @MainActor (NSPanel) -> Bool
 
   init(
     service: TranscriptionService,
-    onSend: @escaping (TranscriptionSendTarget) -> Bool = { _ in false }
+    onSend: @escaping (TranscriptionSendTarget) -> Bool = { _ in false },
+    panelFactory: (@MainActor () -> NSPanel)? = nil,
+    presentPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderFront(nil) },
+    dismissPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderOut(nil) },
+    panelIsVisible: @escaping @MainActor (NSPanel) -> Bool = { $0.isVisible }
   ) {
     self.service = service
     self.onSend = onSend
+    self.panelFactory =
+      panelFactory ?? { TranscriptionTaflaPanelController.makeProductionPanelWindow() }
+    self.presentPanel = presentPanel
+    self.dismissPanel = dismissPanel
+    self.panelIsVisible = panelIsVisible
   }
 
   deinit {
@@ -26,7 +39,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 
   var isVisible: Bool {
-    panel?.isVisible == true
+    panel.map(panelIsVisible) == true
   }
 
   func toggle() {
@@ -36,13 +49,13 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   func show() {
     let panel = panel ?? makePanel()
     self.panel = panel
-    panel.orderFront(nil)
+    presentPanel(panel)
     installSendEventMonitor()
     onVisibilityChanged?()
   }
 
   func hide() {
-    panel?.orderOut(nil)
+    if let panel { dismissPanel(panel) }
     removeSendEventMonitor()
     onVisibilityChanged?()
   }
@@ -52,17 +65,25 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     onVisibilityChanged?()
   }
 
-  func makePanelForTesting() -> NSPanel {
-    makePanel()
+  private func makePanel() -> NSPanel {
+    let panel = panelFactory()
+    configure(panel)
+    return panel
   }
 
-  private func makePanel() -> NSPanel {
-    let panel = NonActivatingTaflaPanel(
+  private static func makeProductionPanelWindow() -> NSPanel {
+    // Production intentionally allocates an eager AppKit panel. Tests inject
+    // their own `defer: true` fixture and no-op presentation closures so unit
+    // tests never publish a native WindowServer surface.
+    NonActivatingTaflaPanel(
       contentRect: NSRect(x: 160, y: 160, width: 720, height: 520),
       styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
       backing: .buffered,
       defer: false
     )
+  }
+
+  private func configure(_ panel: NSPanel) {
     panel.title = "Dictation"
     panel.titleVisibility = .hidden
     panel.titlebarAppearsTransparent = true
@@ -83,7 +104,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       routingState: routingState,
       onSend: { [weak self] target in self?.sendComposition(target: target) == true },
       onClose: { [weak panel, weak self] in
-        panel?.orderOut(nil)
+        if let panel { self?.dismissPanel(panel) }
         self?.removeSendEventMonitor()
         self?.onVisibilityChanged?()
       }
@@ -103,7 +124,6 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
       "Record speech, review the transcript, and insert it into the active document."
     )
     panel.contentView = contentContainer
-    return panel
   }
 
   private func sendComposition(target: TranscriptionSendTarget) -> Bool {
@@ -131,7 +151,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 }
 
-private final class NonActivatingTaflaPanel: NSPanel {
+final class NonActivatingTaflaPanel: NSPanel {
   // A non-activating panel can still become key for its own controls. Without
   // this, pickers, selectable transcript text, and buttons present as live but
   // cannot reliably receive keyboard/click interaction.

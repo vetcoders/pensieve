@@ -1,6 +1,17 @@
 import AppKit
 import SwiftUI
 
+/// Pensieve's working set and `LaunchSettings` are the only session restore
+/// authority. Managed windows must never be serialized by AppKit Saved
+/// Application State, otherwise a second owner can resurrect documents that the
+/// user disabled or already closed in Pensieve.
+@MainActor
+enum ManagedWindowRestoration {
+  static func disable(on window: NSWindow) {
+    window.isRestorable = false
+  }
+}
+
 /// NSWindow subclass for document windows. Implementing `newWindowForTab(_:)`
 /// makes the native tab bar show its "+" button; the handler routes through
 /// the registry so the new untitled tab joins this window's tab group instead
@@ -13,6 +24,7 @@ final class DocumentWindow: NSWindow {
   /// handler may then run its own async Save / Don't Save / Cancel sheet and
   /// close the window later once the answer lands.
   var onShouldClose: ((NSWindow) -> Bool)?
+  private var bypassNextCloseCheck = false
 
   override func newWindowForTab(_ sender: Any?) {
     DebugTrace.log("newWindowForTab '\(title)'")
@@ -27,10 +39,20 @@ final class DocumentWindow: NSWindow {
   /// `closeActiveDocument` directly — so there is no double prompt.
   override func performClose(_ sender: Any?) {
     if let onShouldClose, !onShouldClose(self) { return }
+    // `super.performClose` reaches our `close()` synchronously. The decision
+    // above already consented, so the terminal primitive must consume this
+    // one-shot pass instead of asking twice.
+    bypassNextCloseCheck = true
     super.performClose(sender)
+    bypassNextCloseCheck = false
   }
 
   override func close() {
+    if bypassNextCloseCheck {
+      bypassNextCloseCheck = false
+    } else if let onShouldClose, !onShouldClose(self) {
+      return
+    }
     DebugTrace.log("DocumentWindow.close '\(title)'")
     onClose?(self)
     super.close()
@@ -52,6 +74,11 @@ final class DocumentWindow: NSWindow {
       self.onClose = nil
       self.onShouldClose = nil
     }
+  }
+
+  func closeAfterConsent() {
+    bypassNextCloseCheck = true
+    close()
   }
 }
 
@@ -82,8 +109,11 @@ struct DocumentWindowFactory {
       backing: .buffered,
       defer: false)
     WindowChromeRecipe.apply(to: window, title: document?.title ?? "Untitled")
+    ManagedWindowRestoration.disable(on: window)
     window.onNewWindowForTab = { sourceWindow in
-      DocumentWindowRegistry.shared.newUntitledTab(from: sourceWindow)
+      // ONE call, to the ONE deterministic tab-creation path — the same route
+      // scene-owned windows reach through `DocumentWindowTabBridge`.
+      DocumentWindowRegistry.shared.newDocumentForTab(from: sourceWindow)
     }
     window.onClose = { closedWindow in
       DocumentWindowRegistry.shared.handleWindowClosed(

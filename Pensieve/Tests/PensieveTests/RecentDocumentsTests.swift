@@ -80,6 +80,48 @@ final class RecentDocumentsTests: XCTestCase {
 
   // MARK: - Route matrix: every successful open records exactly once
 
+  func testLauncherRecoverySaveAsRecordsTheSavedFileExactlyOnce() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveRecoveryRecentTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let targetURL = root.appendingPathComponent("recovered.md").standardizedFileURL
+    let recoveryStore = RecoveryStore(
+      directoryURL: root.appendingPathComponent("Recovery", isDirectory: true))
+    let draft = try recoveryStore.saveDraft(
+      id: nil, title: "Recovered.md", text: "recovered body")
+    recoveryStore.markDraftClosed(id: draft.id)
+
+    let indexDatabase = IndexDatabase(databaseURL: root.appendingPathComponent("index.db"))
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: indexDatabase,
+      bookmarkStore: BookmarkStore(
+        defaults: makeEphemeralDefaults(prefix: "PensieveRecoveryRecentTests")),
+      recoveryStore: recoveryStore,
+      savePanelURLProvider: { _ in targetURL })
+    let fake = FakeRecentDocumentsController()
+    let recentDocuments = RecentDocumentsStore(controller: fake, fileExists: { _ in true })
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: WorkspaceMetadataStore(
+          metadataURL: root.appendingPathComponent("workspace.json")),
+        indexDatabase: indexDatabase),
+      documentStore: documentStore,
+      indexDatabase: indexDatabase,
+      recentDocuments: recentDocuments)
+
+    XCTAssertTrue(controller.saveRecoveredDraftAs(draft))
+
+    XCTAssertEqual(fake.noteCalls, [targetURL])
+    XCTAssertEqual(recentDocuments.recentDocuments, [targetURL])
+    XCTAssertNil(appState.selectedDocumentID)
+    XCTAssertFalse(appState.documentSession.hasEditableBuffer)
+  }
+
   func testOpenFileInCurrentWindowRecordsExactlyOnce() throws {
     let harness = try makeRouteHarness()
     defer { harness.cleanup() }

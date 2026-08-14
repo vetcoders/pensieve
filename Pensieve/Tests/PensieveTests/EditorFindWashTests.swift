@@ -28,7 +28,7 @@ final class EditorFindWashTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false
+      defer: true
     )
     window.contentView = surface.scrollView
     surface.scrollView.frame = NSRect(x: 0, y: 0, width: 600, height: 400)

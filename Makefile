@@ -42,16 +42,18 @@ build: ffi-check
 	@cd $(PKG_DIR) && swift build
 
 .PHONY: build-release
-build-release:  ## Release build (unsigned, fast smoke)
+build-release:  ## Release-mode SwiftPM build only (not a fresh-profile smoke)
 build-release: ffi-check
 	@cd $(PKG_DIR) && swift build -c release --arch arm64
 
 .PHONY: run
 run: build  ## Build + launch app (debug, no .app bundle)
+	@printf "$(C_YELLOW)[profile]$(C_RESET) swift run uses non-isolated Pensieve support/keychain fallbacks; use make manual-smoke for a clean profile\n"
 	@cd $(PKG_DIR) && swift run Pensieve
 
 .PHONY: run-release
-run-release: release-local  ## Build + launch signed .app (no notarize)
+run-release: release-local  ## Launch signed .app with the production Pensieve profile
+	@printf "$(C_YELLOW)[profile]$(C_RESET) dist/Pensieve.app uses io.vetcoders.pensieve and your production state; use make manual-smoke for a clean profile\n"
 	@open "$(APP_BUNDLE)"
 
 .PHONY: install-app
@@ -75,10 +77,17 @@ clean:  ## Remove .build/ + dist/
 	@# so rmdir hits ENOTEMPTY). An atomic rename detaches the tree from the path
 	@# the indexer holds, so the delete can't lose that race. Best-effort: never
 	@# abort the gated release if a stray file lingers.
+	@# Unlock before deleting, for the same reason the release cleanup helpers in
+	@# scripts/lib/build-provenance.sh do: dist/ holds SwiftPM Bundle.module
+	@# resources copied r--r--r-- inside r-xr-xr-x directories, and unlinking a
+	@# read-only child needs write permission on its PARENT. Without this the
+	@# -f delete fails on those leaves, and because it is best-effort the failure
+	@# is silent — leaving a *.trash.<pid> tree parked in the repo.
 	@for d in $(BUILD_DIR) $(DIST); do \
 		[ -e "$$d" ] || continue; \
 		trash="$$d.trash.$$$$"; \
 		mv "$$d" "$$trash" 2>/dev/null || trash="$$d"; \
+		chmod -R u+w "$$trash" 2>/dev/null || true; \
 		rm -rf "$$trash" 2>/dev/null || rm -rf "$$trash" 2>/dev/null || true; \
 	done
 	@printf "$(C_GREEN)[ ok ]$(C_RESET) cleaned\n"
@@ -105,16 +114,39 @@ test:  ## Run unit + integration tests
 test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
 	@$(SCRIPTS)/test-rpath-hygiene.sh
+	@$(SCRIPTS)/test-isolated-app.sh
+	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
+	@$(SCRIPTS)/test-ui-smoke-contract.sh
+
+.PHONY: test-semgrep-contract
+test-semgrep-contract:  ## Verify the Tests-only native-window presentation Semgrep rule
+	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 
 .PHONY: ui-smoke
-ui-smoke:  ## Accessibility-driven smoke against dist/Pensieve.app
+ui-smoke:  ## Ephemeral automated UI smoke under a new isolated identity
 	@$(SCRIPTS)/ui-smoke.sh "$(APP_BUNDLE)"
+
+.PHONY: manual-smoke
+manual-smoke:  ## Stage + open a new clean manual-smoke identity from dist/Pensieve.app
+	@$(SCRIPTS)/stage-manual-smoke.sh stage "$(APP_BUNDLE)"
+
+.PHONY: manual-smoke-reopen
+manual-smoke-reopen:  ## Reopen the current manual-smoke experiment without resetting it
+	@$(SCRIPTS)/stage-manual-smoke.sh reopen
+
+.PHONY: manual-smoke-verify
+manual-smoke-verify:  ## Verify staged identity and the exact process when running
+	@$(SCRIPTS)/stage-manual-smoke.sh verify
+
+.PHONY: manual-smoke-clean
+manual-smoke-clean:  ## Retire only the manifest-owned manual-smoke app and profile
+	@$(SCRIPTS)/stage-manual-smoke.sh clean
 
 .PHONY: test-ui
 test-ui: ui-smoke  ## Alias for the accessibility UI smoke harness
 
 .PHONY: bugmap-smoke
-bugmap-smoke:  ## BUGMAP P0 runtime matrix against dist/Pensieve.app (EVIDENCE_DIR=…)
+bugmap-smoke:  ## BUGMAP P0 matrix staged from dist/Pensieve.app under isolated identities
 	@$(SCRIPTS)/bugmap-p0-smoke.sh --app "$(APP_BUNDLE)" \
 		--evidence "$(or $(EVIDENCE_DIR),dist/bugmap-evidence)"
 
@@ -179,7 +211,7 @@ release: ffi-check
 	@$(SCRIPTS)/build-release.sh
 
 .PHONY: release-local
-release-local: gates  ## Signed .app only (no dmg, no notarize) — local install/run
+release-local: gates  ## Build signed production-identity .app only (no launch)
 release-local: ffi-check
 	@$(SCRIPTS)/build-release.sh --no-notarize --no-dmg
 
@@ -264,7 +296,7 @@ ci: ffi-check
 # =========================================================================
 
 .PHONY: smoke-search-memory
-smoke-search-memory:  ## Multi-root reindex memory smoke (B-04, audit F-8-R03)
+smoke-search-memory:  ## Isolated multi-root reindex memory smoke (B-04, audit F-8-R03)
 	@$(SCRIPTS)/smoke_search_memory.sh
 
 # =========================================================================
@@ -285,6 +317,7 @@ help:  ## Show this help
 	@printf "\n  $(C_CYAN)Quick start:$(C_RESET)\n"
 	@printf "    make run             # build + launch (debug)\n"
 	@printf "    make test            # unit + integration tests\n"
-	@printf "    make ui-smoke        # launch .app + verify native UI surface\n"
+	@printf "    make ui-smoke        # automated ephemeral isolated UI smoke\n"
+	@printf "    make manual-smoke    # open a new clean manual test identity\n"
 	@printf "    make release         # signed + notarized .app + .dmg\n"
 	@printf "    make info-artifacts  # inspect dist/ contents\n\n"

@@ -24,11 +24,66 @@ final class EditorToolbarBridgeTests: XCTestCase {
     let picker = try XCTUnwrap(
       rig.modePickerControl(),
       "the mode picker must bridge to a segmented control with one segment per mode")
+    XCTAssertEqual(
+      picker.accessibilityIdentifier(), EditorToolbelt.modePickerIdentifier,
+      "the toolbar recipe must stamp the bridged control with its AppKit identity")
     XCTAssertEqual(picker.segmentCount, EditorMode.allCases.count)
     for segment in 0..<picker.segmentCount {
       XCTAssertTrue(
         picker.isEnabled(forSegment: segment),
         "mode segment \(segment) came back disabled — the picker is nested in a ControlGroup again")
+    }
+  }
+
+  /// macOS 27 changed the ambient toolbar control size. The declaration pins
+  /// regular explicitly so a future SDK default cannot silently grow the
+  /// toolbar past its width budget again.
+  @MainActor
+  func testEveryBridgedToolbarControlUsesRegularControlSize() throws {
+    let rig = try makeRig()
+    defer { rig.tearDown() }
+
+    let controls = bridgedControls(in: rig)
+    XCTAssertFalse(controls.isEmpty, "premise: the bridged toolbar must expose controls")
+    for control in controls {
+      XCTAssertEqual(
+        control.controlSize, .regular,
+        "\(type(of: control)) inherited the OS toolbar default instead of the pinned regular size")
+    }
+  }
+
+  /// THE PIN THAT CAN ACTUALLY FAIL HERE. `testEveryBridged…` above reads the
+  /// RESOLVED control size, and on a runner whose ambient toolbar default is
+  /// already regular — every macOS 26 machine, including CI's
+  /// `macos-26-arm64` — deleting every `.controlSize(.regular)` from
+  /// `EditorToolbelt` leaves that assertion perfectly green. The regression it
+  /// was written for is therefore invisible to the only OS the gate runs on,
+  /// and would be caught by macOS 27 alone.
+  ///
+  /// So the ambient default is moved out from under the declaration: the rig
+  /// hosts the same toolbar under an inherited `.mini`, which is what a future
+  /// SDK bump does in spirit. A control that comes back regular is stating its
+  /// size; a control that comes back mini inherited it. That distinction is
+  /// OS-independent, so this pin bites on macOS 26 and macOS 27 alike.
+  @MainActor
+  func testBridgedToolbarControlsDeclareRegularRatherThanInheritingTheAmbientSize() throws {
+    let rig = try makeRig(ambientControlSize: .mini)
+    defer { rig.tearDown() }
+
+    let controls = bridgedControls(in: rig)
+    XCTAssertFalse(controls.isEmpty, "premise: the bridged toolbar must expose controls")
+    // The premise, asserted rather than assumed: if the bridge dropped the
+    // inherited size on the floor, nothing below would be measuring anything.
+    XCTAssertTrue(
+      controls.contains { $0.controlSize == .regular },
+      "premise: an ambient .mini reached this toolbar and NOTHING came back regular — the rig is "
+        + "not exercising the inherited-size path any more")
+    for control in controls {
+      XCTAssertEqual(
+        control.controlSize, .regular,
+        "\(type(of: control)) came back at \(control.controlSize.rawValue) under an ambient "
+          + ".mini: it is inheriting the surrounding control size instead of declaring its own, "
+          + "so the toolbar's width is at the mercy of whatever default the next SDK ships")
     }
   }
 
@@ -66,6 +121,30 @@ final class EditorToolbarBridgeTests: XCTestCase {
     XCTAssertEqual(
       tips, EditorMode.allCases.map(\.label),
       "an icon-only mode segment with no tooltip leaves the operator guessing which layout it is")
+  }
+
+  /// SwiftUI's late toolbar derivation can clear the AppKit-side tooltip after
+  /// the sink authored it. The same window-update repair that restores menu
+  /// forms must restore this accessibility contract without another SwiftUI
+  /// body pass.
+  @MainActor
+  func testAModeTooltipClearedBetweenPassesIsRepairedOnAWindowUpdate() throws {
+    let rig = try makeRig()
+    defer { rig.tearDown() }
+
+    let picker = try XCTUnwrap(rig.modePickerControl())
+    let segment = picker.segmentCount - 1
+    picker.setToolTip(nil, forSegment: segment)
+
+    for _ in 0..<40 {
+      if picker.toolTip(forSegment: segment) == EditorMode.allCases[segment].label { break }
+      rig.window.update()
+      rig.settle(0.02)
+    }
+
+    XCTAssertEqual(
+      picker.toolTip(forSegment: segment), EditorMode.allCases[segment].label,
+      "a late toolbar derivation cleared the mode tooltip and the window-update repair ignored it")
   }
 
   // MARK: - Format actions
@@ -195,7 +274,7 @@ final class EditorToolbarBridgeTests: XCTestCase {
   /// only triggers are a body re-evaluation and the runloop turn after it, and a
   /// clobber that lands later than that would stay on screen until the operator
   /// happened to type. Same shape, same trigger and same measured reason as
-  /// `ToolbarOverflowController.repairClobberedForms`.
+  /// `ToolbarOverflowController.repairClobberedBridge`.
   @MainActor
   func testAChipClearedBetweenPassesIsRepairedOnAWindowUpdate() throws {
     let rig = try makeRig(hostsEditor: false)
@@ -273,7 +352,30 @@ final class EditorToolbarBridgeTests: XCTestCase {
   // MARK: - Rig
 
   @MainActor
-  private func makeRig(hostsEditor: Bool = true) throws -> ToolbarBridgeRig {
-    try makeToolbarRig(prefix: "EditorToolbarBridgeTests", hostsEditor: hostsEditor)
+  private func makeRig(
+    hostsEditor: Bool = true, ambientControlSize: ControlSize? = nil
+  ) throws -> ToolbarBridgeRig {
+    try makeToolbarRig(
+      prefix: "EditorToolbarBridgeTests", hostsEditor: hostsEditor,
+      ambientControlSize: ambientControlSize)
+  }
+
+  /// Every `NSControl` the bridged toolbar put on screen, groups included.
+  @MainActor
+  private func bridgedControls(in rig: ToolbarBridgeRig) -> [NSControl] {
+    var controls: [NSControl] = []
+    func collect(from view: NSView) {
+      if let control = view as? NSControl { controls.append(control) }
+      for subview in view.subviews { collect(from: subview) }
+    }
+    for item in rig.toolbar?.items ?? [] {
+      if let view = item.view { collect(from: view) }
+      if let group = item as? NSToolbarItemGroup {
+        for subitem in group.subitems {
+          if let view = subitem.view { collect(from: view) }
+        }
+      }
+    }
+    return controls
   }
 }

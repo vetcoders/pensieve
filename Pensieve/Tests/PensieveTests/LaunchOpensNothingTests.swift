@@ -168,13 +168,9 @@ final class LaunchOpensNothingTests: XCTestCase {
   /// CLOSING THE LAST DOCUMENT MUST CLOSE IT.
   ///
   /// A native window close deliberately LEAVES the file in the working set —
-  /// only "Close from Open Files" retires it — and the registry re-opens a
-  /// launcher after the last document window goes, so the app is never left
-  /// windowless. That replacement launcher's root runs the very same
-  /// `start(intent: .coldLaunch)` as the launch one did. With the reopen
-  /// gated per controller, the launcher immediately reloaded the file the user
-  /// had just closed: the last document could not be closed at all without
-  /// first removing its Open Files row.
+  /// only "Close from Open Files" retires it — but it must leave the process
+  /// windowless rather than manufacture a replacement. A later Dock reopen
+  /// creates one empty launcher without restoring the file into it.
   func testClosingTheLastDocumentDoesNotImmediatelyReopenIt() throws {
     let harness = try makeHarness()
     let keptURL = try harness.writeLooseNote(named: "kept.md")
@@ -188,12 +184,15 @@ final class LaunchOpensNothingTests: XCTestCase {
       launched.appState.documentSession.url?.standardizedFileURL, keptURL,
       "the launch never opened the document, so closing it would prove nothing")
 
-    let replacement = harness.closeWindowAdoptingTheReplacementLauncher(launched.window)
+    XCTAssertTrue(
+      harness.closeWindowWithoutReplacement(launched.window),
+      "closing the last window manufactured a replacement native window")
+
+    let replacement = harness.openDockReopenLauncher()
 
     XCTAssertNil(
       replacement.appState.documentSession.url,
-      "closing the last document reopened it in the replacement launcher — from the user's"
-        + " side the window simply refuses to close")
+      "Dock reopen restored the document the user had just closed with its window")
     XCTAssertTrue(
       replacement.registry.openDocuments.isEmpty,
       "the document the user just closed came straight back as an open document row")
@@ -283,7 +282,11 @@ final class LaunchOpensNothingTests: XCTestCase {
     }
 
     let defaults = makeEphemeralDefaults(prefix: "PensieveLaunchOpensNothing")
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    // The membership predicate is injected because `.Trash` under `/tmp` is a
+    // directory with a suggestive name, not a Trash the system knows about —
+    // see `SimulatedTrash`.
+    let bookmarkStore = BookmarkStore(
+      defaults: defaults, trashMembership: SimulatedTrash.membership(at: trash))
     let harness = LaunchHarness(
       root: root,
       support: support,
@@ -348,9 +351,8 @@ private final class LaunchHarness {
   let makeStore: (URL, BookmarkStore) -> DocumentStore
   private var windows: [NSWindow] = []
   /// The launched process's registry and its once-per-process startup-restore
-  /// decision, kept so a SECOND window in the same process (the launcher the
-  /// registry re-opens after the last document closes) shares both — which is
-  /// the whole point of the pin that uses them.
+  /// decision, kept so a SECOND window in the same process (created by an
+  /// explicit Dock reopen) shares both.
   private var registry: DocumentWindowRegistry?
   private var startupRestore: ApplicationStartupRestore?
   private var bookmarkStore: BookmarkStore?
@@ -440,7 +442,8 @@ private final class LaunchHarness {
   /// model list and the window registry disagreed for a long time, and only the
   /// registry is what the user sees.
   func relaunch() throws -> RelaunchedSession {
-    let bookmarkStore = BookmarkStore(defaults: defaults)
+    let bookmarkStore = BookmarkStore(
+      defaults: defaults, trashMembership: SimulatedTrash.membership(at: trash))
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { [weak self] work in self?.deferredMainWork.append(work) },
@@ -466,12 +469,9 @@ private final class LaunchHarness {
     return adoptRootView(for: launcherWindow)
   }
 
-  /// The user closing the last document window. AppKit's close reaches the
-  /// registry, which — so the app is never left windowless — re-opens a
-  /// launcher through the factory; that launcher's root then runs the same
-  /// `start(intent: .coldLaunch)` as the launch one. Returns the
-  /// REPLACEMENT launcher's session.
-  func closeWindowAdoptingTheReplacementLauncher(_ window: NSWindow) -> RelaunchedSession {
+  /// The user closing the last document window. Returns true only when the
+  /// registry reconciles the close without constructing another native window.
+  func closeWindowWithoutReplacement(_ window: NSWindow) -> Bool {
     guard let registry else {
       preconditionFailure("relaunch() first: there is no launched process to close a window in")
     }
@@ -479,12 +479,7 @@ private final class LaunchHarness {
     window.close()
     registry.handleWindowClosed(window, tombstonePolicy: .reusableWindow)
     runDeferredMainWork()
-    guard windows.count > windowsBefore, let replacement = windows.last else {
-      preconditionFailure(
-        "closing the last document window left the app windowless — the registry never"
-          + " re-opened a launcher, so this pin is not exercising the reported path")
-    }
-    return adoptRootView(for: replacement)
+    return windows.count == windowsBefore
   }
 
   /// The user clicking the Dock icon later in the SAME process, with the
@@ -492,7 +487,15 @@ private final class LaunchHarness {
   /// back on `.dockReopen`, which is a different intent from the launch — so it
   /// is the window that would inherit an unclaimed startup restore.
   func openDockReopenLauncher() -> RelaunchedSession {
-    adoptRootView(for: makeWindow(), intent: .dockReopen)
+    guard let registry else {
+      preconditionFailure("relaunch() first: there is no launched process to reopen")
+    }
+    let windowsBefore = windows.count
+    registry.openLauncherWindow(intent: .dockReopen)
+    guard windows.count == windowsBefore + 1, let launcher = windows.last else {
+      preconditionFailure("Dock reopen did not construct exactly one launcher window")
+    }
+    return adoptRootView(for: launcher, intent: .dockReopen)
   }
 
   /// Everything `DocumentWindowRootView` does for one window: build the
@@ -550,7 +553,7 @@ private final class LaunchHarness {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     windows.append(window)

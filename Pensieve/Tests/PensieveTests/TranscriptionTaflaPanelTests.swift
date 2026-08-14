@@ -6,10 +6,12 @@ import XCTest
 @MainActor
 final class TranscriptionTaflaPanelTests: XCTestCase {
   func testPanelIsFloatingNonActivatingAndAccessible() {
-    let service = TranscriptionService()
-    let controller = TranscriptionTaflaPanelController(service: service)
-    let panel = controller.makePanelForTesting()
+    let fixture = makeFixture()
+    defer { close(fixture) }
+    fixture.controller.show()
+    let panel = fixture.panel
 
+    assertUnpublished(panel)
     XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
     XCTAssertTrue(panel.canBecomeKey)
     XCTAssertFalse(panel.canBecomeMain)
@@ -33,11 +35,13 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   }
 
   func testPanelOwnsSizingAndKeepsHostedContentPinnedToItsBounds() {
-    let service = TranscriptionService()
-    let controller = TranscriptionTaflaPanelController(service: service)
-    let panel = controller.makePanelForTesting()
+    let fixture = makeFixture()
+    defer { close(fixture) }
+    fixture.controller.show()
+    let panel = fixture.panel
     let contentView = panel.contentView
 
+    assertUnpublished(panel)
     XCTAssertEqual(panel.contentMinSize, NSSize(width: 560, height: 420))
     XCTAssertEqual(contentView?.subviews.count, 1)
     contentView?.setFrameSize(NSSize(width: 640, height: 460))
@@ -46,10 +50,12 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   }
 
   func testPanelUsesMatureDictationIdentityAndAccessiblePurpose() {
-    let service = TranscriptionService()
-    let controller = TranscriptionTaflaPanelController(service: service)
-    let panel = controller.makePanelForTesting()
+    let fixture = makeFixture()
+    defer { close(fixture) }
+    fixture.controller.show()
+    let panel = fixture.panel
 
+    assertUnpublished(panel)
     XCTAssertEqual(panel.title, "Dictation")
     XCTAssertEqual(panel.contentView?.accessibilityLabel(), "Dictation controls")
     XCTAssertEqual(
@@ -80,10 +86,12 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   }
 
   func testPanelStartsAtAStableWorkingSizeAndCannotCollapseIntoACrampedLayout() {
-    let service = TranscriptionService()
-    let controller = TranscriptionTaflaPanelController(service: service)
-    let panel = controller.makePanelForTesting()
+    let fixture = makeFixture()
+    defer { close(fixture) }
+    fixture.controller.show()
+    let panel = fixture.panel
 
+    assertUnpublished(panel)
     XCTAssertGreaterThanOrEqual(panel.frame.width, 680)
     XCTAssertGreaterThanOrEqual(panel.frame.height, 500)
     XCTAssertGreaterThanOrEqual(panel.minSize.width, 520)
@@ -91,13 +99,68 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   }
 
   func testControllerShowsAndHidesDictationWithoutActivatingItAsTheMainWindow() {
-    let service = TranscriptionService()
-    let controller = TranscriptionTaflaPanelController(service: service)
+    var presentedPanel: NSPanel?
+    var dismissedPanel: NSPanel?
+    var visible = false
+    let fixture = makeFixture(
+      presentPanel: {
+        presentedPanel = $0
+        visible = true
+      },
+      dismissPanel: {
+        dismissedPanel = $0
+        visible = false
+      },
+      panelIsVisible: { _ in visible })
+    defer { close(fixture) }
 
-    controller.show()
-    XCTAssertTrue(controller.isVisible)
+    fixture.controller.show()
+    assertUnpublished(fixture.panel)
+    XCTAssertTrue(presentedPanel === fixture.panel)
+    XCTAssertTrue(fixture.controller.isVisible)
 
-    controller.hide()
-    XCTAssertFalse(controller.isVisible)
+    fixture.controller.hide()
+    assertUnpublished(fixture.panel)
+    XCTAssertTrue(dismissedPanel === fixture.panel)
+    XCTAssertFalse(fixture.controller.isVisible)
+  }
+
+  private struct Fixture {
+    let controller: TranscriptionTaflaPanelController
+    let panel: NSPanel
+  }
+
+  private func makeFixture(
+    presentPanel: @escaping @MainActor (NSPanel) -> Void = { _ in },
+    dismissPanel: @escaping @MainActor (NSPanel) -> Void = { _ in },
+    panelIsVisible: @escaping @MainActor (NSPanel) -> Bool = { _ in false }
+  ) -> Fixture {
+    let panel = NonActivatingTaflaPanel(
+      contentRect: NSRect(x: 160, y: 160, width: 720, height: 520),
+      styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+      backing: .buffered,
+      defer: true
+    )
+    assertUnpublished(panel)
+    let controller = TranscriptionTaflaPanelController(
+      service: TranscriptionService(),
+      panelFactory: { panel },
+      presentPanel: presentPanel,
+      dismissPanel: dismissPanel,
+      panelIsVisible: panelIsVisible
+    )
+    return Fixture(controller: controller, panel: panel)
+  }
+
+  private func close(_ fixture: Fixture) {
+    fixture.controller.hide()
+    assertUnpublished(fixture.panel)
+    fixture.panel.close()
+    assertUnpublished(fixture.panel)
+  }
+
+  private func assertUnpublished(_ panel: NSPanel) {
+    XCTAssertFalse(panel.isVisible)
+    XCTAssertEqual(panel.windowNumber, -1)
   }
 }

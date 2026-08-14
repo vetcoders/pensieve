@@ -3,6 +3,7 @@ import Foundation
 /// Answer to a "do you want to save the changes?" confirmation.
 enum SaveChangesResponse: Equatable {
   case save
+  case saveAs
   case discard
   case cancel
 }
@@ -13,16 +14,19 @@ enum SaveChangesResponse: Equatable {
 enum DocumentClosePrompt: Equatable {
   case saveAsUntitled
   case savePathed
+  case saveRecoveredFile
 }
 
 /// What `File > Close` (⌘W) must do with the active session — decided BEFORE
 /// any UI exists, so the whole lifecycle is testable without an alert.
 ///
-/// The governing rule (operator decision, 2026-07-24): a normal close is a
-/// CONSCIOUS lifecycle with a save question. Recovery drafts cover abnormal
-/// endings (crash, forced quit); they are not a substitute for asking. That is
-/// why a dirty buffer never closes silently here, in either direction — no
-/// silent discard, and no silent save either.
+/// The governing rule (operator decisions, 2026-07-24 and 2026-08-10): a
+/// normal close is a CONSCIOUS lifecycle. Recovery drafts cover abnormal
+/// endings (crash, forced quit); they are not a substitute for asking when the
+/// user owns saving. With auto-save OFF, a dirty file-backed buffer therefore
+/// asks before close. With auto-save ON, Pensieve owns that write and may close
+/// without a question only after it has flushed the current bytes somewhere
+/// durable. No mode ever permits a silent discard.
 enum DocumentCloseDecision: Equatable {
   /// Nothing at stake: an empty session, or a buffer with no unsaved edits.
   case closeWithoutPrompting
@@ -49,6 +53,9 @@ enum DocumentCloseDecision: Equatable {
   ) -> DocumentCloseDecision {
     guard session.hasEditableBuffer, session.isDirty else {
       return .closeWithoutPrompting
+    }
+    if session.recoverySourceURL != nil {
+      return .confirm(.saveRecoveredFile)
     }
     if session.isUntitled {
       return .confirm(.saveAsUntitled)

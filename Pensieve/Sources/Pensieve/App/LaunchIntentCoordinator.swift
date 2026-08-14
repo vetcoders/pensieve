@@ -3,7 +3,16 @@ import Foundation
 
 @MainActor
 final class LaunchIntentCoordinator: ObservableObject {
-  static let shared = LaunchIntentCoordinator()
+  static let shared = LaunchIntentCoordinator(
+    hasLiveDocumentCapableWindow: {
+      DocumentWindowRegistry.shared.hasLiveDocumentCapableWindow()
+    },
+    openExternalDocumentHost: {
+      DocumentWindowRegistry.shared.openDocumentHost(intent: .explicitDocument)
+    },
+    openUntitledDocumentHost: {
+      DocumentWindowRegistry.shared.openDocumentHost(intent: .newUntitledTab)
+    })
 
   typealias StartupDecisionHandler = @MainActor () -> Void
 
@@ -20,9 +29,40 @@ final class LaunchIntentCoordinator: ObservableObject {
   /// opened document. Falling back to the focused controller closes that hole
   /// while leaving cold launch (launcher attached, no window key yet) unchanged.
   private let focusedControllerProvider: @MainActor () -> AppController?
+  /// Materializes a document host for an external file-open event when the app
+  /// is deliberately alive with zero windows. The URL stays in `pendingURLs`;
+  /// the new root drains it when its controller attaches, preserving the same
+  /// explicit-document launch path as a cold Finder open.
+  ///
+  /// The question is deliberately "is a DOCUMENT-capable window alive", not "is
+  /// any window alive": a visible Settings or About window cannot take a file,
+  /// so counting it as a live surface left the external open with no target
+  /// controller, no host request, and a URL parked in `pendingURLs` for the rest
+  /// of the session.
+  private let hasLiveDocumentCapableWindow: @MainActor () -> Bool
+  private let openExternalDocumentHost: @MainActor () -> Bool
+  private let openUntitledDocumentHost: @MainActor () -> Bool
+  /// Injection seam for the extra New gestures a just-created host did not
+  /// itself consume. Production routes through the controller's normal native
+  /// tab policy; tests can count the queue without depending on AppKit tab
+  /// materialization in a headless bundle.
+  private let createUntitledDocument: @MainActor (AppController) -> Bool
   private var pendingURLs: [URL] = []
+  /// New is a counted gesture, not a boolean intent. The first request can be
+  /// represented by the host carrying `.newUntitledTab`; every later request
+  /// must still become its own tab once that host's controller attaches.
+  private var pendingNewDocumentCount = 0
+  /// Creating a tab can synchronously publish/adopt its window and re-enter the
+  /// pending queue through `commandTargetDidBecomeAvailable`. One owner drains
+  /// at a time so that callback cannot consume the same counted gesture twice.
+  private var isDrainingPendingNewDocuments = false
   private var startupTask: Task<Void, Never>?
   private var startupDecisionHandler: StartupDecisionHandler?
+  /// A document-capable host exists or has been synchronously requested, but
+  /// its SwiftUI controller may not have attached yet. Shared by Finder/Open
+  /// and New so interleaved gestures cannot create competing roots.
+  private var isDocumentHostRequested = false
+  private var isStartupDecisionPending = false
   /// Set when launch URLs were actually opened into a window and CONSUMED by
   /// the next start decision.
   ///
@@ -49,10 +89,20 @@ final class LaunchIntentCoordinator: ObservableObject {
     settleDelayNanoseconds: UInt64 = 0,
     focusedControllerProvider: @escaping @MainActor () -> AppController? = {
       CommandSurfaceContext.shared.controller
+    },
+    hasLiveDocumentCapableWindow: @escaping @MainActor () -> Bool = { false },
+    openExternalDocumentHost: @escaping @MainActor () -> Bool = { false },
+    openUntitledDocumentHost: @escaping @MainActor () -> Bool = { false },
+    createUntitledDocument: @escaping @MainActor (AppController) -> Bool = {
+      $0.createUntitledDocument()
     }
   ) {
     self.settleDelayNanoseconds = settleDelayNanoseconds
     self.focusedControllerProvider = focusedControllerProvider
+    self.hasLiveDocumentCapableWindow = hasLiveDocumentCapableWindow
+    self.openExternalDocumentHost = openExternalDocumentHost
+    self.openUntitledDocumentHost = openUntitledDocumentHost
+    self.createUntitledDocument = createUntitledDocument
   }
 
   /// The controller an incoming file open should be routed to: the cold-start
@@ -81,6 +131,10 @@ final class LaunchIntentCoordinator: ObservableObject {
     startupTask = nil
     startupDecisionHandler = nil
     pendingURLs.removeAll()
+    pendingNewDocumentCount = 0
+    isDrainingPendingNewDocuments = false
+    isDocumentHostRequested = false
+    isStartupDecisionPending = false
   }
 
   /// Starts `controller` once any launch URLs have settled. `intent` is the one
@@ -93,6 +147,7 @@ final class LaunchIntentCoordinator: ObservableObject {
     onStartupDecision: @escaping StartupDecisionHandler = {}
   ) {
     guard !isQuiescedForTermination else { return }
+    isStartupDecisionPending = true
     attach(controller: controller)
     startupDecisionHandler = onStartupDecision
     startupTask?.cancel()
@@ -109,9 +164,51 @@ final class LaunchIntentCoordinator: ObservableObject {
       guard !self.isQuiescedForTermination else { return }
 
       self.drainPendingURLs()
-      controller.start(intent: self.consumeLaunchDocumentOpen() ? .explicitDocument : intent)
+      let effectiveIntent: LaunchIntent =
+        self.consumeLaunchDocumentOpen() ? .explicitDocument : intent
+      controller.start(intent: effectiveIntent)
+      self.drainPendingNewDocuments(
+        on: controller,
+        hostConsumedOneNewRequest: effectiveIntent == .newUntitledTab)
       self.finishStartupDecision()
     }
+  }
+
+  /// Handles ⌘N/⌘T while no stable document command target exists.
+  ///
+  /// A host factory returns before SwiftUI attaches its controller. Treating
+  /// New as a one-shot host request therefore dropped the second and third key
+  /// presses in that gap. Count every gesture, let one `.newUntitledTab` host
+  /// consume at most one, and replay the rest only after startup made that host
+  /// document-capable. The same queue covers a Finder host already in flight.
+  func requestNewDocument() {
+    guard !isQuiescedForTermination else { return }
+
+    if let target = openTargetController, !isStartupDecisionPending {
+      // A stable target gets a one-shot action. Never retain a failed attempt:
+      // doing so made an unavailable source window turn into a surprise tab on
+      // some unrelated later open. Older requests are the deliberate attach-
+      // gap queue and remain independently retryable.
+      drainPendingNewDocuments(on: target, hostConsumedOneNewRequest: false)
+      _ = createUntitledDocument(target)
+      return
+    }
+
+    pendingNewDocumentCount += 1
+    guard !hasLiveDocumentCapableWindow(), !isDocumentHostRequested else { return }
+    isDocumentHostRequested = openUntitledDocumentHost()
+  }
+
+  /// Replays only gestures accepted while a document host was alive or being
+  /// built but had not published a stable command controller yet.
+  ///
+  /// `CommandSurfaceContext` calls this on every adoption attempt, including
+  /// the later window-accessor turn where the adopted pair itself is unchanged.
+  /// That event-driven handoff avoids an unbounded timer and keeps a failed
+  /// one-shot New on an already-stable controller out of this queue entirely.
+  func commandTargetDidBecomeAvailable(_ controller: AppController) {
+    guard !isQuiescedForTermination, !isStartupDecisionPending else { return }
+    drainPendingNewDocuments(on: controller, hostConsumedOneNewRequest: false)
   }
 
   func handle(urls: [URL]) {
@@ -124,11 +221,20 @@ final class LaunchIntentCoordinator: ObservableObject {
     pendingURLs.append(contentsOf: urls)
     startupTask?.cancel()
     drainPendingURLs()
-    guard let target = openTargetController else { return }
+    guard let target = openTargetController else {
+      // The zero-window process is intentional, but an external open is also
+      // an explicit request for a surface. Keep the URLs queued and create one
+      // host; its root will attach above and drain them exactly once.
+      if !hasLiveDocumentCapableWindow(), !isDocumentHostRequested {
+        isDocumentHostRequested = openExternalDocumentHost()
+      }
+      return
+    }
     // The URLs already landed in this window; spend the launch-document intent
     // here so the NEXT window is judged on its own.
     _ = consumeLaunchDocumentOpen()
     target.start(intent: .explicitDocument)
+    drainPendingNewDocuments(on: target, hostConsumedOneNewRequest: false)
     finishStartupDecision()
   }
 
@@ -142,9 +248,34 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 
   private func finishStartupDecision() {
+    isStartupDecisionPending = false
+    isDocumentHostRequested = false
     let handler = startupDecisionHandler
     startupDecisionHandler = nil
     handler?()
+  }
+
+  private func drainPendingNewDocuments(
+    on controller: AppController,
+    hostConsumedOneNewRequest: Bool
+  ) {
+    guard !isDrainingPendingNewDocuments else { return }
+    isDrainingPendingNewDocuments = true
+    defer { isDrainingPendingNewDocuments = false }
+
+    if hostConsumedOneNewRequest, pendingNewDocumentCount > 0 {
+      pendingNewDocumentCount -= 1
+    }
+    while pendingNewDocumentCount > 0 {
+      // Claim before crossing into AppKit/SwiftUI: window creation may publish
+      // the controller synchronously and re-enter this method. Put the claim
+      // back only when the New operation itself refused the request.
+      pendingNewDocumentCount -= 1
+      guard createUntitledDocument(controller) else {
+        pendingNewDocumentCount += 1
+        return
+      }
+    }
   }
 
   /// Whether launch documents were opened and not yet accounted for, resetting
@@ -170,8 +301,8 @@ final class LaunchIntentCoordinator: ObservableObject {
 
     // `openFile` picks the destination per window state: an empty window is
     // reused in place (cold start), a window already showing a document routes
-    // to the registry so the file lands as a native tab — the system "Prefer
-    // tabs when opening documents" contract. Special-casing the first URL into
+    // to the registry so the file lands as a native tab — Pensieve's
+    // deterministic click/open contract. Special-casing the first URL into
     // `openFileInCurrentWindow` replaced the document the user was reading
     // whenever a Finder/Dock open arrived at a running app.
     for url in supportedFileURLs {
@@ -205,6 +336,9 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   var terminationFolderManagerOverride: FolderManager?
   var terminationAutosaverOverride: Autosaver?
   var terminationLaunchIntentCoordinatorOverride: LaunchIntentCoordinator?
+  /// Dock-reopen injection seam. Production uses the shared registry; tests
+  /// drive the real delegate callback against isolated window graphs.
+  var reopenWindowRegistryOverride: DocumentWindowRegistry?
   /// Launch-pass injection seam, same shape as the termination ones above.
   /// Production leaves it `nil` and reads `RecoveryStore.shared`; a test points
   /// it at a temp directory so the LAUNCH pass can be driven for real without
@@ -237,15 +371,16 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = true
     traceObservers = DebugTrace.installWindowLifecycleObservers()
+    DebugTrace.logWindowGraph("applicationDidFinishLaunching")
 
     surveyRecoveredDraftsOnLaunch()
 
-    // Window-agnostic close lifecycle. Not every document-bearing window
-    // is a DocumentWindow (state-restored WindowGroup scenes / "+"-spawned scene
-    // tabs are not), so they have no onClose hook → their document would linger
+    // Window-agnostic close lifecycle. The scene-owned launcher and any native
+    // tab that AppKit re-hosts are not guaranteed to be a DocumentWindow, so
+    // they have no onClose hook → their document would linger
     // forever in the registry's published open-tab list as a phantom "Open Files"
-    // row. The shared lifecycle is idempotent and also restores one launcher
-    // after the final content window closes.
+    // row. The shared lifecycle is idempotent. It never creates a replacement
+    // window: an explicit Dock reopen is the sole owner of that transition.
     let openTabReconciler = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: nil, queue: .main
     ) { note in
@@ -276,31 +411,36 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
     Task { @MainActor in
       await Task.yield()
       if !DocumentWindowRegistry.shared.applicationHasLiveWindow() {
-        if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-          DocumentWindowRegistry.shared.openLauncherWindow(intent: .coldLaunch)
-        } else {
-          NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
-        }
+        DocumentWindowRegistry.shared.openDocumentHost(intent: .coldLaunch)
       }
     }
   }
 
-  /// Clicking the Dock icon with no windows open reopens an EMPTY launcher.
-  /// Closing every document is a conscious act; reactivating the app is not a
-  /// request to undo it, so nothing is selected back into the new window.
+  /// Clicking the Dock icon with no DOCUMENT window open reopens an EMPTY
+  /// launcher. Closing every document is a conscious act; reactivating the app
+  /// is not a request to undo it, so nothing is selected back into the new
+  /// window.
+  ///
+  /// AppKit's `hasVisibleWindows` counts every surface, Settings and About
+  /// included, so trusting it alone made the Dock icon inert for a session whose
+  /// last remaining window cannot hold a document. The decision is the registry's
+  /// document-capable answer alone, and `flag` is deliberately not consulted.
   func applicationShouldHandleReopen(
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
   ) -> Bool {
-    guard !flag else { return true }
-    Task { @MainActor in
-      if DocumentWindowRegistry.shared.makeDocumentWindow != nil {
-        DocumentWindowRegistry.shared.openLauncherWindow(intent: .dockReopen)
-      } else {
-        NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+    MainActor.assumeIsolated {
+      let registry = reopenWindowRegistryOverride ?? .shared
+      guard !registry.hasLiveDocumentCapableWindow() else {
+        // AppKit may perform its ordinary activation/order work. No custom host
+        // was created, so returning false here would swallow the Dock click.
+        return true
       }
+      // A delegate that creates the host must consume the reopen synchronously.
+      // Returning true after doing so asks AppKit to reopen another scene and
+      // was the source of duplicate windows after one Dock click.
+      return !registry.openDocumentHost(intent: .dockReopen)
     }
-    return true
   }
 
   func application(_ application: NSApplication, open urls: [URL]) {
@@ -322,9 +462,10 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   /// object — but it FORWARDS `applicationShouldTerminate(_:)` to the
   /// `@NSApplicationDelegateAdaptor` instance, and a file probe written from
   /// inside this method landed on an AppleScript quit. ⌘Q keeps its own pass in
-  /// `Commands.swift` (unchanged) because `NSApplication.terminate(_:)` does NOT
-  /// reliably reach this hook — `NSSupportsSuddenTermination` is true in
-  /// `Info.plist`, and a programmatic terminate can exit the process outright.
+  /// the application-global command lane because `NSApplication.terminate(_:)`
+  /// does NOT reliably reach this hook on every programmatic route. The shipped bundle
+  /// explicitly sets `NSSupportsSuddenTermination` to false so AppKit reaches
+  /// the final `applicationWillTerminate` durability phase after consent.
   /// Moving the pass OFF the menu item is therefore a data-loss regression, which
   /// is what the 2026-07-29 attempt hit.
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -335,13 +476,12 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     MainActor.assumeIsolated {
-      // This notification is the one termination hook the app actually receives:
-      // `applicationShouldTerminate(_:)` on THIS delegate is never invoked under
-      // `@NSApplicationDelegateAdaptor` (falsified at runtime on 2026-07-29), so wiring anything
-      // there would have looked right and done nothing. Every quit path — Dock, logout, shutdown,
-      // the custom ⌘Q item — arrives here, which is why the whole termination contract (final
-      // window saves → index drain → truncating checkpoint) has exactly one owner and it hangs off
-      // this call. See `TerminationSequence`.
+      // `applicationShouldTerminate(_:)` is the synchronous consent/veto
+      // phase. Once it returns `.terminateNow`, every quit path arrives here
+      // for the final durability sequence: quiesce producers, flush accepted
+      // user bytes, persist the working set, drain the index and checkpoint.
+      // Keeping those roles separate avoids both an unvetoable quit and a
+      // duplicate final flush. See `TerminationSequence`.
       TerminationSequence(
         registry: terminationWindowRegistryOverride ?? .shared,
         indexDatabase: terminationIndexDatabaseOverride ?? .shared,

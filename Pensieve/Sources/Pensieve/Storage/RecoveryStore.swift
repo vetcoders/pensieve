@@ -6,6 +6,30 @@ struct RecoveryDraft: Equatable, Identifiable {
   let title: String
   let text: String
   let updatedAt: Date
+  /// The file whose unsaved in-memory edits this recovery record protects.
+  /// `nil` means the record belongs to a draft that never had a location.
+  let sourceURL: URL?
+
+  init(
+    id: UUID,
+    url: URL,
+    title: String,
+    text: String,
+    updatedAt: Date,
+    sourceURL: URL? = nil
+  ) {
+    self.id = id
+    self.url = url
+    self.title = title
+    self.text = text
+    self.updatedAt = updatedAt
+    self.sourceURL = sourceURL
+  }
+
+  var displayTitle: String {
+    guard let sourceURL else { return title }
+    return "Unsaved changes — \(sourceURL.lastPathComponent)"
+  }
 
   /// One-line gist for the Recovered Drafts list. The draft file carries no
   /// name of its own, so the first non-empty line is the only thing that tells
@@ -40,28 +64,55 @@ final class RecoveryStore {
   /// draft except `deleteDraft`, which only ever runs off one of those actions.
   private let directoryURL: URL
   private let fileManager: FileManager
+  private let removeItem: (URL) throws -> Void
 
   /// Drafts a window is holding open and editing RIGHT NOW. They are not
   /// "unhandled", so no other launcher surface may offer them: two buffers on
   /// one recovery ID autosave over each other.
   private var openDraftIDs: Set<UUID> = []
 
-  init(directoryURL: URL? = nil, fileManager: FileManager = .default) {
+  init(
+    directoryURL: URL? = nil,
+    fileManager: FileManager = .default,
+    removeItem: ((URL) throws -> Void)? = nil
+  ) {
     self.fileManager = fileManager
+    self.removeItem = removeItem ?? { try fileManager.removeItem(at: $0) }
     self.directoryURL = directoryURL ?? Self.defaultDirectoryURL(fileManager: fileManager)
   }
 
   @discardableResult
-  func saveDraft(id existingID: UUID?, title: String, text: String) throws -> RecoveryDraft {
+  func saveDraft(
+    id existingID: UUID?,
+    title: String,
+    text: String,
+    sourceURL: URL? = nil
+  ) throws -> RecoveryDraft {
     let id = existingID ?? UUID()
     try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
 
     let url = draftURL(for: id)
-    try text.write(to: url, atomically: true, encoding: .utf8)
     let resolvedTitle = title.isEmpty ? Self.fallbackTitle : title
     // The draft's own name lives in a sidecar. Without it the title died at the
     // process boundary and EVERY recovered draft came back called
     // "Recovered Untitled.md", no matter what the user had been working on.
+    // Required identity metadata lands BEFORE the visible `.md` payload. A
+    // failed `.source` write must not leave a newly discoverable file-backed
+    // recovery item that has already forgotten which original it protects.
+    // An orphan sidecar is harmless and invisible to `loadDrafts`; a visible
+    // payload without its source would be another ambiguous ghost.
+    if let sourceURL {
+      try Data(sourceURL.standardizedFileURL.path.utf8).write(
+        to: sourceURLSidecar(for: id), options: .atomic)
+    } else {
+      // Reusing a recovery ID after the buffer became a normal untitled draft
+      // must not retain an older file association. This is required metadata,
+      // not cleanup: if the stale sidecar cannot be removed, publishing new
+      // untitled bytes would later offer "Save to Original" for the WRONG file.
+      // Fail before touching the visible payload instead.
+      try removeItemIfPresent(at: sourceURLSidecar(for: id))
+    }
+    try text.write(to: url, atomically: true, encoding: .utf8)
     try? Data(resolvedTitle.utf8).write(to: titleURL(for: id), options: .atomic)
     // Writing a draft IS the claim: the buffer that produced it is live.
     openDraftIDs.insert(id)
@@ -73,7 +124,8 @@ final class RecoveryStore {
       url: url,
       title: resolvedTitle,
       text: text,
-      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date()
+      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? Date(),
+      sourceURL: sourceURL?.standardizedFileURL
     )
   }
 
@@ -92,19 +144,47 @@ final class RecoveryStore {
       .sorted { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
   }
 
-  func deleteDraft(id: UUID?) {
-    guard let id else { return }
+  /// Retires a recovery record only after its visible payload is confirmed gone.
+  ///
+  /// The `.md` file is the launcher's source of truth. If removing it fails, the
+  /// draft still exists and remains claimed by the live buffer that owns it; the
+  /// title/source sidecars are left untouched so a later retry cannot turn the
+  /// record into an ambiguous ghost. Sidecars become invisible once the payload
+  /// is gone, so their cleanup is best effort and logged rather than allowed to
+  /// turn a completed retirement back into a user-visible failure.
+  @discardableResult
+  func deleteDraft(id: UUID?) -> Bool {
+    guard let id else { return true }
+
+    do {
+      try removeItemIfPresent(at: draftURL(for: id))
+    } catch {
+      NSLog("Could not retire recovery draft %@: %@", id.uuidString, error.localizedDescription)
+      return false
+    }
+
     openDraftIDs.remove(id)
-    removeDraftFiles(id: id)
+    removeSidecarIfPresent(at: titleURL(for: id), draftID: id)
+    removeSidecarIfPresent(at: sourceURLSidecar(for: id), draftID: id)
+    return true
   }
 
-  /// Drops BOTH files a draft is made of. Removing only the `.md` leaves the
-  /// `.title` sidecar behind — invisible (the directory listing only reads
-  /// `.md`) and never collected by anything, so the recovery directory grows a
-  /// permanent orphan per retired draft.
-  private func removeDraftFiles(id: UUID) {
-    try? fileManager.removeItem(at: draftURL(for: id))
-    try? fileManager.removeItem(at: titleURL(for: id))
+  private func removeSidecarIfPresent(at url: URL, draftID: UUID) {
+    do {
+      try removeItemIfPresent(at: url)
+    } catch {
+      NSLog(
+        "Could not remove recovery sidecar %@ for %@: %@", url.lastPathComponent,
+        draftID.uuidString, error.localizedDescription)
+    }
+  }
+
+  private func removeItemIfPresent(at url: URL) throws {
+    do {
+      try removeItem(url)
+    } catch let error as CocoaError where error.code == .fileNoSuchFile {
+      // No old association is the desired state.
+    }
   }
 
   // MARK: - Claim tracking
@@ -153,7 +233,8 @@ final class RecoveryStore {
       // generic fallback still has to hold for them.
       title: loadTitle(for: id) ?? Self.fallbackTitle,
       text: text,
-      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? .distantPast
+      updatedAt: Self.modifiedDate(for: url, fileManager: fileManager) ?? .distantPast,
+      sourceURL: loadSourceURL(for: id)
     )
   }
 
@@ -165,6 +246,16 @@ final class RecoveryStore {
       return nil
     }
     return title
+  }
+
+  private func loadSourceURL(for id: UUID) -> URL? {
+    guard let data = try? Data(contentsOf: sourceURLSidecar(for: id)),
+      let path = String(data: data, encoding: .utf8),
+      !path.isEmpty
+    else {
+      return nil
+    }
+    return URL(fileURLWithPath: path).standardizedFileURL
   }
 
   static let fallbackTitle = "Recovered Untitled.md"
@@ -180,9 +271,25 @@ final class RecoveryStore {
     directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("title")
   }
 
-  private static func defaultDirectoryURL(fileManager: FileManager) -> URL {
-    if let overrideRoot = AppSupportLocation.overrideRoot(fileManager: fileManager) {
-      return overrideRoot.appendingPathComponent("Recovery", isDirectory: true)
+  /// Sidecar holding the original path for a file-backed recovery. It is plain
+  /// UTF-8 rather than a property list so a recovery record stays three small,
+  /// inspectable files and never participates in Saved Application State.
+  private func sourceURLSidecar(for id: UUID) -> URL {
+    directoryURL.appendingPathComponent(id.uuidString).appendingPathExtension("source")
+  }
+
+  static func defaultDirectoryURL(
+    fileManager: FileManager,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    isTestProcess: Bool? = nil
+  ) -> URL {
+    if let isolationRoot = AppSupportLocation.isolationRoot(
+      environment: environment,
+      fileManager: fileManager,
+      isTestProcess: isTestProcess)
+    {
+      return isolationRoot
+        .appendingPathComponent("Recovery", isDirectory: true)
     }
     let appSupport =
       fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first

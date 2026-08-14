@@ -10,6 +10,12 @@ final class ProviderOnboardingCoordinator: ObservableObject {
   static let shared = ProviderOnboardingCoordinator()
 
   @Published private(set) var presentingWindowID: ObjectIdentifier?
+  /// Startup restore mutates one native tab group over several run-loop turns.
+  /// A sheet becoming key between those turns used to replace the document
+  /// host as the registry's merge target and split the restored working set
+  /// into standalone windows. Keep onboarding eligible but unpresented until
+  /// the restore has finished building its tab group.
+  @Published private(set) var startupRestoreInProgress = false
 
   private var autocompleteEnabled: Bool?
   private var providerConfigured: Bool
@@ -52,11 +58,23 @@ final class ProviderOnboardingCoordinator: ObservableObject {
     reconcileEligibility()
   }
 
+  func setStartupRestoreInProgress(_ inProgress: Bool) {
+    guard startupRestoreInProgress != inProgress else { return }
+    startupRestoreInProgress = inProgress
+    if inProgress {
+      // A view may have claimed presentation during its first onAppear while
+      // the controller was still preparing the working set. Withdraw that
+      // pending claim before SwiftUI materializes the sheet.
+      presentingWindowID = nil
+    }
+  }
+
   /// Lets one window context claim presentation only when it is currently key.
   /// Calls from background tabs are harmless and cannot create queued sheets.
   func evaluate(windowID: ObjectIdentifier?, isKeyWindow: Bool) {
     guard autocompleteEnabled == true, !providerConfigured,
       !dismissedForEnableCycle, presentingWindowID == nil,
+      !startupRestoreInProgress,
       isKeyWindow, let windowID
     else {
       return

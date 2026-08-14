@@ -1140,7 +1140,8 @@ final class PensieveSmokeTests: XCTestCase {
     // name after the folders and documents rather than being silently dropped.
     let children = try XCTUnwrap(appState.workspaceTree.first?.children)
     XCTAssertEqual(
-      children.map(\.name), ["Alpha", "Zeta", "2", "10", "index.db", "index.db-shm", "index.db-wal"]
+      children.map(\.name),
+      ["Alpha", "Zeta", "2", "10", "index.db", "index.db-shm", "index.db-wal"]
     )
     XCTAssertEqual(
       children.map(\.kind),
@@ -3299,7 +3300,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testSelectionRefusesWhenDirtySessionCannotBeSaved() throws {
+  func testSelectionUsesRecoveryFallbackWhenDirtyOriginalCannotBeSaved() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveDirtyRefusalTests-\(UUID().uuidString)", isDirectory: true)
     let deletedFolder = folder.appendingPathComponent("Deleted", isDirectory: true)
@@ -3318,10 +3319,14 @@ final class PensieveSmokeTests: XCTestCase {
       DocumentRef(id: alphaURL.standardizedFileURL),
       DocumentRef(id: betaURL.standardizedFileURL),
     ]
+    let recoveryStore = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
-      documentStore: makeTestDocumentStore(indexDatabase: temporaryIndexDatabase(in: folder))
+      documentStore: makeTestDocumentStore(
+        indexDatabase: temporaryIndexDatabase(in: folder),
+        recoveryStore: recoveryStore)
     )
     controller.selectDocument(id: alphaURL.standardizedFileURL)
 
@@ -3331,15 +3336,13 @@ final class PensieveSmokeTests: XCTestCase {
 
     controller.selectDocument(id: betaURL.standardizedFileURL)
 
-    XCTAssertEqual(
-      appState.selectedDocumentID?.resolvingSymlinksInPath(),
-      alphaURL.standardizedFileURL.resolvingSymlinksInPath())
-    XCTAssertEqual(
-      appState.documentSession.url?.resolvingSymlinksInPath(),
-      alphaURL.standardizedFileURL.resolvingSymlinksInPath())
-    XCTAssertEqual(appState.documentSession.text, "alpha unsaved")
-    XCTAssertTrue(appState.documentSession.isDirty)
-    XCTAssertTrue(appState.lastError?.contains("Could not save alpha.md") == true)
+    XCTAssertEqual(appState.selectedDocumentID, betaURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.url, betaURL.standardizedFileURL)
+    XCTAssertEqual(appState.documentSession.text, "beta original")
+    XCTAssertFalse(appState.documentSession.isDirty)
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.text, "alpha unsaved")
+    XCTAssertEqual(recovery.sourceURL, alphaURL.standardizedFileURL)
   }
 
   @MainActor
@@ -3502,7 +3505,7 @@ final class PensieveSmokeTests: XCTestCase {
   }
 
   @MainActor
-  func testCloseActiveDocumentRefusesWhenDirtySaveFails() throws {
+  func testCloseActiveDocumentRefusesWhenOriginalAndRecoveryWritesFail() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveCloseRefusalTests-\(UUID().uuidString)", isDirectory: true)
     let writable = folder.appendingPathComponent("Writable", isDirectory: true)
@@ -3514,10 +3517,14 @@ final class PensieveSmokeTests: XCTestCase {
     let noteURL = writable.appendingPathComponent("doomed.md")
     try "original".write(to: noteURL, atomically: true, encoding: .utf8)
 
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecovery")
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
     let appState = AppState()
     appState.documents = [DocumentRef(id: noteURL.standardizedFileURL)]
     let indexDatabase = temporaryIndexDatabase(in: folder)
-    let documentStore = makeTestDocumentStore(indexDatabase: indexDatabase)
+    let documentStore = makeTestDocumentStore(
+      indexDatabase: indexDatabase,
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL))
     let controller = AppController(
       appState: appState,
       folderManager: FolderManager(
@@ -3547,6 +3554,56 @@ final class PensieveSmokeTests: XCTestCase {
       appState.selectedDocumentID?.resolvingSymlinksInPath(),
       noteURL.standardizedFileURL.resolvingSymlinksInPath())
     XCTAssertTrue(appState.lastError?.contains("Could not save doomed.md") == true)
+  }
+
+  /// Quit Anyway is intentionally unavailable to document-level close. A ⌘W
+  /// Don't Save still fails closed when its recovery payload cannot be retired.
+  @MainActor
+  func testCloseActiveDocumentRetirementFailureHasNoQuitAnywayEscapeHatch() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveCloseRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let recovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let appState = AppState()
+    let documentStore = makeTestDocumentStore(recoveryStore: recovery)
+    var quitConfirmationCount = 0
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore,
+      confirmSaveChanges: { _, _, _, respond in respond(.discard) },
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        quitConfirmationCount += 1
+        return true
+      })
+    XCTAssertTrue(controller.createUntitledDocument())
+    appState.activeDocumentText = "keep this document open"
+    appState.activeDocumentDirty = true
+    XCTAssertTrue(
+      documentStore.savePendingChangesOnClose(
+        appState: appState,
+        releasesDraftClaim: false))
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+
+    var didClose: Bool?
+    controller.closeActiveDocument { didClose = $0 }
+
+    XCTAssertEqual(didClose, false)
+    XCTAssertEqual(quitConfirmationCount, 0)
+    XCTAssertTrue(appState.activeDocumentDirty)
+    XCTAssertEqual(appState.activeDocumentText, "keep this document open")
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id))
+    XCTAssertTrue(appState.lastError?.contains("Could not discard the recovery copy") == true)
   }
 
   @MainActor
@@ -3823,6 +3880,51 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(appState.activeDocumentDirty)
   }
 
+  @MainActor
+  func testQuitIsVetoedWhenOriginalAndRecoveryWritesBothFail() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitDoubleFailure-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let noteURL = folder.appendingPathComponent("only-copy.md")
+    try "original".write(to: noteURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
+
+    let appState = AppState()
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "original")
+    appState.activeDocumentText = "only in memory"
+    appState.activeDocumentDirty = true
+    try FileManager.default.removeItem(at: noteURL)
+
+    let documentStore = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL),
+      savingSettings: makeAutoSaveSettings(enabled: true))
+    var retirementConfirmationCount = 0
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: documentStore,
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        retirementConfirmationCount += 1
+        return true
+      })
+
+    XCTAssertFalse(controller.applicationShouldTerminate())
+    XCTAssertEqual(
+      retirementConfirmationCount, 0,
+      "Quit Anyway never overrides a true original-plus-recovery write failure")
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
+    XCTAssertTrue(appState.documentSession.isDirty)
+    XCTAssertEqual(appState.documentSession.text, "only in memory")
+    XCTAssertEqual(appState.currentError?.severity, .dataLoss)
+    XCTAssertTrue(appState.currentError?.message.contains("window will stay open") == true)
+  }
+
   /// ⌘Q must ask about EVERY window's unsaved work, not just the one it fired
   /// from — otherwise other windows exit through their teardown path, which has
   /// no veto point and can never ask. With every window's guard resolving, the
@@ -3878,6 +3980,263 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertTrue(promptedB, "the OTHER window's dirty session must be asked about too")
     XCTAssertFalse(stateA.documentSession.isDirty)
     XCTAssertFalse(stateB.documentSession.isDirty)
+  }
+
+  /// Keeping Pensieve open after a retirement failure preserves the failing
+  /// session and must not arm the one-shot pass latch over its dirty buffer.
+  @MainActor
+  func testQuitKeepOpenVetoesWhenRecoveryRetirementAfterDiscardFails() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+    let recovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let state = AppState()
+    let store = makeTestDocumentStore(
+      recoveryStore: recovery,
+      dirtySessionPrompt: { _ in .discard })
+    var confirmationTitles: [String] = []
+    let controller = AppController(
+      appState: state,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return false
+      })
+    XCTAssertTrue(controller.createUntitledDocument())
+    state.activeDocumentText = "keep this live when retirement fails"
+    state.activeDocumentDirty = true
+    XCTAssertTrue(store.savePendingChangesOnClose(appState: state, releasesDraftClaim: false))
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+    registry.registerController(controller, for: window)
+
+    XCTAssertEqual(
+      registry.resolveTerminationRequest(), .terminateCancel,
+      "Dock, AppleScript and logout quits use the same safe Keep Open default")
+
+    XCTAssertEqual(confirmationTitles, ["Untitled.md"])
+    XCTAssertTrue(state.activeDocumentDirty)
+    XCTAssertEqual(state.activeDocumentText, "keep this live when retirement fails")
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id))
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(state.lastError?.contains("Could not discard the recovery copy") == true)
+    XCTAssertFalse(
+      registry.consumeTerminationPassLatch(),
+      "Keep Pensieve Open must leave the next global quit guarded")
+  }
+
+  /// One destructive confirmation belongs to the whole global quit pass. Once
+  /// accepted, every later retirement failure in that pass may retain its
+  /// payload; the user's Don't Save decisions are still applied and the quit
+  /// latch is armed exactly as it is for an ordinary settled pass.
+  @MainActor
+  func testQuitAnywayAuthorizesAllRetirementFailuresInTheSamePass() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitAnywayTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let otherWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      otherWindow.close()
+    }
+
+    let makeFailingRecovery: (String) -> RecoveryStore = { name in
+      RecoveryStore(
+        directoryURL: folder.appendingPathComponent(name, isDirectory: true),
+        removeItem: { url in
+          if url.pathExtension == "md" {
+            throw CocoaError(.fileWriteNoPermission)
+          }
+          try FileManager.default.removeItem(at: url)
+        })
+    }
+    var confirmationTitles: [String] = []
+
+    let otherRecovery = makeFailingRecovery("RecoveryOther")
+    let otherURL = folder.appendingPathComponent("other.md")
+    try "other on disk".write(to: otherURL, atomically: true, encoding: .utf8)
+    let otherAutosaver = Autosaver(
+      saveDelayMilliseconds: 60_000,
+      indexDelayMilliseconds: 60_000)
+    let otherState = AppState()
+    let otherStore = makeTestDocumentStore(
+      autosaver: otherAutosaver,
+      bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: otherRecovery,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      dirtySessionPrompt: { _ in .discard })
+    let otherController = AppController(
+      appState: otherState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: otherStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return true
+      })
+    otherStore.load(ref: DocumentRef(id: otherURL.standardizedFileURL), into: otherState)
+    otherState.activeDocumentText = "protected recovery snapshot"
+    otherStore.documentDidChange(appState: otherState)
+    XCTAssertTrue(
+      otherStore.savePendingChangesOnClose(appState: otherState, releasesDraftClaim: false))
+    let otherDraft = try XCTUnwrap(otherRecovery.loadDrafts().first)
+    otherState.activeDocumentText = "other discarded edit"
+    otherStore.documentDidChange(appState: otherState)
+    XCTAssertTrue(otherAutosaver.armedSaveIsOwned(by: otherState))
+
+    let firingRecovery = makeFailingRecovery("RecoveryFiring")
+    let firingState = AppState()
+    let firingStore = makeTestDocumentStore(
+      recoveryStore: firingRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    let firingController = AppController(
+      appState: firingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: firingStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { title in
+        confirmationTitles.append(title)
+        return true
+      })
+    XCTAssertTrue(firingController.createUntitledDocument())
+    firingState.activeDocumentText = "firing retained recovery"
+    firingState.activeDocumentDirty = true
+    XCTAssertTrue(
+      firingStore.savePendingChangesOnClose(appState: firingState, releasesDraftClaim: false))
+    let firingDraft = try XCTUnwrap(firingRecovery.loadDrafts().first)
+
+    registry.registerController(otherController, for: otherWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertTrue(firingController.applicationShouldTerminate())
+
+    XCTAssertEqual(confirmationTitles, ["other"], "the quit pass asks only once")
+    XCTAssertFalse(otherState.activeDocumentDirty)
+    XCTAssertFalse(firingState.activeDocumentDirty)
+    XCTAssertFalse(
+      otherAutosaver.armedSaveIsOwned(by: otherState),
+      "a pathed Don't Save cancels only that session's pending write")
+    XCTAssertEqual(try String(contentsOf: otherURL, encoding: .utf8), "other on disk")
+    XCTAssertEqual(otherRecovery.loadDrafts().map(\.id), [otherDraft.id])
+    XCTAssertEqual(firingRecovery.loadDrafts().map(\.id), [firingDraft.id])
+    XCTAssertTrue(otherRecovery.isDraftOpen(id: otherDraft.id))
+    XCTAssertTrue(firingRecovery.isDraftOpen(id: firingDraft.id))
+    XCTAssertTrue(otherState.lastError?.contains("may appear in Recovered Drafts") == true)
+    XCTAssertTrue(firingState.lastError?.contains("may appear in Recovered Drafts") == true)
+    XCTAssertTrue(
+      registry.consumeTerminationPassLatch(),
+      "Quit Anyway settles the pass and must cover the AppKit terminate hook")
+
+    otherState.activeDocumentDirty = true
+    firingState.activeDocumentDirty = true
+    XCTAssertTrue(firingController.applicationShouldTerminate())
+    XCTAssertEqual(
+      confirmationTitles.count, 2,
+      "authorization is scoped to one pass; a later quit must confirm again")
+    XCTAssertTrue(registry.consumeTerminationPassLatch())
+  }
+
+  /// The collect phase is atomic with respect to a later Cancel, but filesystem
+  /// cleanup in apply cannot be rolled back. If an earlier recovery retirement
+  /// succeeded before a later one failed, Keep Pensieve Open preserves the
+  /// failing session while leaving the earlier conscious Discard applied.
+  @MainActor
+  func testQuitKeepOpenPreservesFailingSessionAfterEarlierDiscardWasApplied() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveQuitPartialApply-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    let registry = DocumentWindowRegistry(canMutateWindowTabs: { true })
+    let firingWindow = Self.makeControllerlessWindow()
+    let earlierWindow = Self.makeControllerlessWindow()
+    defer {
+      firingWindow.close()
+      earlierWindow.close()
+    }
+
+    // Other windows apply before the firing controller, so this successful
+    // retirement is the irreversible earlier step in the pass.
+    let earlierRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryEarlier", isDirectory: true))
+    let earlierState = AppState()
+    let earlierStore = makeTestDocumentStore(
+      recoveryStore: earlierRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    let earlierController = AppController(
+      appState: earlierState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: earlierStore,
+      documentWindowRegistry: registry)
+    XCTAssertTrue(earlierController.createUntitledDocument())
+    earlierState.activeDocumentText = "earlier conscious discard"
+    earlierState.activeDocumentDirty = true
+    XCTAssertTrue(
+      earlierStore.savePendingChangesOnClose(appState: earlierState, releasesDraftClaim: false))
+    let earlierDraft = try XCTUnwrap(earlierRecovery.loadDrafts().first)
+
+    let failingRecovery = RecoveryStore(
+      directoryURL: folder.appendingPathComponent("RecoveryFailing", isDirectory: true),
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let failingState = AppState()
+    let failingStore = makeTestDocumentStore(
+      recoveryStore: failingRecovery,
+      dirtySessionPrompt: { _ in .discard })
+    var confirmationCount = 0
+    let firingController = AppController(
+      appState: failingState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: failingStore,
+      documentWindowRegistry: registry,
+      confirmQuitAfterRecoveryRetirementFailure: { _ in
+        confirmationCount += 1
+        return false
+      })
+    XCTAssertTrue(firingController.createUntitledDocument())
+    failingState.activeDocumentText = "failing recovery stays live"
+    failingState.activeDocumentDirty = true
+    XCTAssertTrue(
+      failingStore.savePendingChangesOnClose(appState: failingState, releasesDraftClaim: false))
+    let failingDraft = try XCTUnwrap(failingRecovery.loadDrafts().first)
+
+    registry.registerController(earlierController, for: earlierWindow)
+    registry.registerController(firingController, for: firingWindow)
+
+    XCTAssertFalse(firingController.applicationShouldTerminate())
+
+    XCTAssertEqual(confirmationCount, 1)
+    XCTAssertFalse(
+      earlierState.activeDocumentDirty,
+      "an earlier explicit Don't Save remains applied after its payload was deleted")
+    XCTAssertTrue(earlierRecovery.loadDrafts().isEmpty)
+    XCTAssertFalse(earlierRecovery.isDraftOpen(id: earlierDraft.id))
+    XCTAssertTrue(failingState.activeDocumentDirty)
+    XCTAssertEqual(failingState.activeDocumentText, "failing recovery stays live")
+    XCTAssertEqual(failingRecovery.loadDrafts().map(\.id), [failingDraft.id])
+    XCTAssertTrue(failingRecovery.isDraftOpen(id: failingDraft.id))
+    XCTAssertFalse(registry.consumeTerminationPassLatch())
   }
 
   /// A Cancel in ANY window aborts the whole quit; every window keeps its work.
@@ -4865,17 +5224,73 @@ final class PensieveSmokeTests: XCTestCase {
       "the deferred Discard must drop the recovery draft on a successful pass")
   }
 
-  /// Case 5 — the test the "keep Save in phase 1" decision rests on. A Discard
-  /// window is confirmed FIRST (its Discard deferred), then a pathed window's
-  /// force-save FAILS with an I/O error. That failure is the only thing left
-  /// that can abort the pass — and it must, WITHOUT the earlier deferred Discard
-  /// leaking to execution. If the abort path (decide's
-  /// `guard !isDirty else { return nil }`) did not fire, phase 2 would run and
-  /// the Discard window's draft would be dropped; asserting the draft survives
-  /// proves the save genuinely failed and aborted rather than silently
-  /// succeeding.
+  /// Phase 2 still has one fallible operation: retiring the durable recovery
+  /// payload after the user chose Discard. A failed retirement must veto the
+  /// teardown just like a failed Save does; otherwise the window disappears
+  /// while its draft remains claimed and invisible until relaunch.
   @MainActor
-  func testClearOpenFilesSaveIOFailureAbortsPassAndSparesDeferredDiscard() throws {
+  func testClearOpenFilesRecoveryRetirementFailureKeepsTheWindowAndClaimAlive() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent("PensieveClearRetireFail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+
+    var closedWindows: [NSWindow] = []
+    let registry = Self.makeCrossWindowRegistry { closedWindows.append($0) }
+    let window = Self.makeControllerlessWindow()
+    defer { window.close() }
+
+    let recoveryDirectory = folder.appendingPathComponent("Recovery", isDirectory: true)
+    let recovery = RecoveryStore(
+      directoryURL: recoveryDirectory,
+      removeItem: { url in
+        if url.pathExtension == "md" {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
+      })
+    let state = AppState()
+    let store = makeTestDocumentStore(
+      recoveryStore: recovery,
+      dirtySessionPrompt: { _ in .discard })
+    let controller = AppController(
+      appState: state,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: store,
+      documentWindowRegistry: registry
+    )
+    XCTAssertTrue(controller.createUntitledDocument())
+    state.activeDocumentText = "recovery bytes that must remain owned"
+    state.activeDocumentDirty = true
+    XCTAssertTrue(
+      store.savePendingChangesOnClose(appState: state, releasesDraftClaim: false),
+      "fixture: the live buffer must keep ownership of the seeded recovery payload")
+    let draft = try XCTUnwrap(recovery.loadDrafts().first)
+    let identity = try XCTUnwrap(state.windowModel.documentIdentity)
+
+    XCTAssertTrue(
+      registry.attach(
+        window, identity: identity, documentID: nil,
+        title: "Untitled.md", isDirty: true, hasEditableBuffer: true))
+    registry.registerController(controller, for: window)
+
+    controller.clearOpenFiles()
+
+    XCTAssertTrue(closedWindows.isEmpty, "failed recovery retirement must veto every close")
+    XCTAssertTrue(state.activeDocumentDirty, "the live buffer must remain guarded as unsaved")
+    XCTAssertEqual(state.activeDocumentText, "recovery bytes that must remain owned")
+    XCTAssertTrue(recovery.isDraftOpen(id: draft.id), "the surviving payload keeps its live claim")
+    XCTAssertEqual(recovery.loadDrafts().map(\.id), [draft.id])
+    XCTAssertTrue(state.lastError?.contains("Could not discard the recovery copy") == true)
+  }
+
+  /// Case 5 — the test the "keep Save in phase 1" decision rests on. A Discard
+  /// window is confirmed FIRST (its Discard deferred), then both durable writes
+  /// for a pathed window fail: the original and RecoveryStore. That double
+  /// failure is the only thing left that can abort the pass — and it must,
+  /// WITHOUT the earlier deferred Discard leaking to execution.
+  @MainActor
+  func testClearOpenFilesDoubleWriteFailureAbortsPassAndSparesDeferredDiscard() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent("PensieveClearSaveFailTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -4911,15 +5326,17 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertFalse(discardRecovery.loadDrafts().isEmpty, "fixture must seed a recovery draft")
     let discardIdentity = try XCTUnwrap(discardState.windowModel.documentIdentity)
 
-    // Window A: a pathed doc, dirtied, whose write throws. saveExisting catches
-    // the throw and returns false, leaving the session dirty — the decide guard
-    // then returns nil (abort). Attached SECOND so the failure trips after B.
+    // Window A: a pathed doc whose original and fallback both throw. Attached
+    // SECOND so the double failure trips after B's deferred decision.
     let fileURL = folder.appendingPathComponent("cannot-write.md")
     try "on disk".write(to: fileURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("BlockedRecoveryA")
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
     let failState = AppState()
     let failStore = makeTestDocumentStore(
       indexDatabase: temporaryIndexDatabase(in: folder),
       bookmarkStore: temporaryBookmarkStore(),
+      recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL),
       writeDocument: { _, _ in throw NSError(domain: "PensieveTestWriteFailure", code: 1) })
     let failController = AppController(
       appState: failState,
@@ -5301,7 +5718,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.contentView = NSView(frame: .zero)
     return window
@@ -5955,8 +6372,12 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(appState.activeDocumentText, "the book")
   }
 
+  /// `click = tab` (keyboard-shortcuts-and-file-lifecycle-contract, decision
+  /// 26.07): every single-open gesture — Open Files' context-menu "Open", the
+  /// workspace tree, a search result — hands the document to the window
+  /// registry, and none of them replaces the document this window is reading.
   @MainActor
-  func testDefaultClickSelectsInPlaceAndExplicitGestureRoutesToRegistry() throws {
+  func testSingleClickRoutesEveryOpenSurfaceToTheWindowRegistry() throws {
     let folder = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "PensieveSidebarOpenReuseTests-\(UUID().uuidString)", isDirectory: true)
@@ -5967,8 +6388,12 @@ final class PensieveSmokeTests: XCTestCase {
 
     let alphaURL = folder.appendingPathComponent("alpha.md")
     let betaURL = folder.appendingPathComponent("beta.md")
+    let gammaURL = folder.appendingPathComponent("gamma.md")
+    let deltaURL = folder.appendingPathComponent("delta.md")
     try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
     try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+    try "gamma".write(to: gammaURL, atomically: true, encoding: .utf8)
+    try "delta".write(to: deltaURL, atomically: true, encoding: .utf8)
 
     let appState = AppState()
     let indexDatabase = temporaryIndexDatabase(in: folder)
@@ -5983,46 +6408,552 @@ final class PensieveSmokeTests: XCTestCase {
     controller.requestOpenDocumentWindow = { requestedRefs.append($0) }
 
     controller.openFolder(url: folder)
+    // This window is reading alpha; every click below targets a document it is
+    // not currently displaying.
+    controller.selectDocument(id: alphaURL.standardizedFileURL)
+    requestedRefs.removeAll()
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL), [betaURL.standardizedFileURL],
+      "a single click opens the document through the registry, as a native tab")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "the clicking window keeps its own document; the clicked one loads in its tab")
+    XCTAssertEqual(
+      appState.activeDocumentText, "alpha",
+      "the current editor pane is never replaced by a click")
+
+    // The workspace tree rides the same route as the context-menu "Open".
+    let root = try XCTUnwrap(appState.workspaceTree.first)
+    let gammaNode = try XCTUnwrap(
+      root.children?.first(where: { $0.documentID == gammaURL.standardizedFileURL }))
+    controller.selectWorkspaceNode(gammaNode)
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL],
+      "a workspace-tree click opens through the registry too")
+
+    // ...and so does a search result.
+    let deltaRef = try XCTUnwrap(
+      appState.allDocuments.first(where: { $0.id == deltaURL.standardizedFileURL }))
+    controller.selectSearchResult(
+      WorkspaceSearchResult(
+        document: deltaRef,
+        displayPath: deltaURL.lastPathComponent,
+        snippet: "delta",
+        matchKind: .body,
+        score: 1,
+        updatedAt: Date()))
+
+    XCTAssertEqual(
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL, deltaURL.standardizedFileURL],
+      "a search-result click opens through the registry too")
+
+    // Clicking the document this window already shows stays a no-op.
     controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
-    XCTAssertTrue(requestedRefs.isEmpty, "a default click never spawns a window")
-    XCTAssertEqual(appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
-    XCTAssertEqual(appState.activeDocumentText, "alpha")
-
-    // VS Code / Zed model: a default click on another document loads it in place,
-    // reusing the current window — it does NOT route to the registry.
-    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
-
-    XCTAssertTrue(
-      requestedRefs.isEmpty,
-      "a default click on another document loads in place, never routing to the registry")
     XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
-      "the current window swaps to the clicked document")
-    XCTAssertEqual(appState.activeDocumentText, "beta")
-
-    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
-
-    XCTAssertEqual(
-      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      requestedRefs.map(\.id.standardizedFileURL),
+      [betaURL.standardizedFileURL, gammaURL.standardizedFileURL, deltaURL.standardizedFileURL],
       "clicking the currently displayed document is a no-op")
+  }
 
-    // Only the explicit "Open in New Window" gesture routes to the registry, and
-    // only for a document the window is not already showing.
-    controller.openDocumentInNewWindow(id: alphaURL.standardizedFileURL)
+  /// The registry dedups by document identity, so a re-click has to find the
+  /// tab that already shows the file instead of building a second one.
+  @MainActor
+  func testClickOnAlreadyOpenDocumentActivatesItsExistingTab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenActivateTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
 
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired click must open synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    controller.selectDocument(id: alphaURL.standardizedFileURL)
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(factoryCalls, 1, "re-clicking an open document must not spawn a second tab")
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
-      "the explicit gesture opens the document in a new window/tab")
+      activations, 2, "the second click activates the tab already showing the document")
     XCTAssertEqual(
+      registry.openDocuments.map(\.identity), [.file(betaURL.standardizedFileURL)],
+      "the document stays registered exactly once")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL,
+      "neither click disturbs the document this window reads")
+  }
+
+  /// The launcher/empty-state window is a window, not a spare tab slot: a click
+  /// from it loads in place rather than spawning a tab beside itself only to be
+  /// reaped. The exception is a file that already has a tab — rendering it here
+  /// too would put the same document on screen twice.
+  @MainActor
+  func testClickFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveSidebarOpenIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired click must open synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    XCTAssertFalse(controller.holdsLiveDocumentWork, "the window under test starts idle")
+
+    // beta already lives in some other tab.
+    registry.open(DocumentRef(id: betaURL.standardizedFileURL, isAdHoc: true))
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+
+    controller.openDocumentWindow(id: betaURL.standardizedFileURL)
+
+    XCTAssertEqual(factoryCalls, 1, "a file that already has a tab never gets a second window")
+    XCTAssertEqual(activations, 2, "the click activates the tab that already shows it")
+    XCTAssertNotEqual(
       appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
-      "the originating window keeps its document while the new window materializes")
+      "an idle window must not render a second copy of a file that already has a tab")
 
-    controller.openDocumentInNewWindow(id: betaURL.standardizedFileURL)
+    // alpha has no tab, so this idle window is the one that takes it.
+    controller.openDocumentWindow(id: alphaURL.standardizedFileURL)
 
     XCTAssertEqual(
-      requestedRefs.map(\.id.standardizedFileURL), [alphaURL.standardizedFileURL],
-      "the explicit gesture on the currently displayed document is a no-op")
+      factoryCalls, 1,
+      "an idle window is reused in place instead of spawning a tab beside itself")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+  }
+
+  /// The same policy, reached through the OTHER door. `openFile` is what ⌘O,
+  /// Finder, Open Recent and the launcher's RECENT list all funnel into, and it
+  /// used to ask only "does this window hold live work?" — so an idle window
+  /// asked to open a document that already had a tab elsewhere loaded it in
+  /// place and put the same file on screen twice. Mirror of
+  /// `testClickFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab`.
+  @MainActor
+  func testOpenFileFromIdleWindowLoadsInPlaceUnlessTheFileAlreadyHasATab() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveOpenFileIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let alphaURL = folder.appendingPathComponent("alpha.md")
+    let betaURL = folder.appendingPathComponent("beta.md")
+    try "alpha".write(to: alphaURL, atomically: true, encoding: .utf8)
+    try "beta".write(to: betaURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true)
+    documentWindow.isReleasedWhenClosed = false
+    defer {
+      documentWindow.close()
+    }
+
+    var factoryCalls = 0
+    var activations = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("a wired open must happen synchronously") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { _, _ in },
+      orderAndActivateWindow: { _ in activations += 1 },
+      currentMergeTarget: { nil },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return documentWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    controller.requestOpenDocumentWindow = { registry.open($0) }
+
+    controller.openFolder(url: folder)
+    XCTAssertFalse(controller.holdsLiveDocumentWork, "the window under test starts idle")
+
+    // beta already lives in some other tab.
+    registry.open(DocumentRef(id: betaURL.standardizedFileURL, isAdHoc: true))
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(activations, 1)
+
+    controller.openFile(url: betaURL)
+
+    XCTAssertEqual(
+      factoryCalls, 1, "⌘O on a file that already has a tab never gets a second window")
+    XCTAssertEqual(activations, 2, "the open activates the tab that already shows it")
+    XCTAssertNotEqual(
+      appState.selectedDocumentID?.standardizedFileURL, betaURL.standardizedFileURL,
+      "an idle window must not render a second copy of a file that already has a tab")
+
+    // alpha has no tab, so this idle window is the one that takes it.
+    controller.openFile(url: alphaURL)
+
+    XCTAssertEqual(
+      factoryCalls, 1,
+      "an idle window is reused in place instead of spawning a tab beside itself")
+    XCTAssertEqual(
+      appState.selectedDocumentID?.standardizedFileURL, alphaURL.standardizedFileURL)
+    XCTAssertEqual(appState.activeDocumentText, "alpha")
+  }
+
+  /// ⌘N over an open document must not EAT that document.
+  ///
+  /// The operator opened one file from Finder and pressed ⌘N: the file's row
+  /// vanished from the sidebar's Open Files list and was replaced by a single
+  /// "Untitled.md", titlebar included. Open Files mirrors the tab chain
+  /// (`SidebarView.openFilesList` reads `windowRegistry.openDocuments`), and
+  /// `createUntitledDocument` overwrote THIS window's session in place — so the
+  /// window's registry identity flipped from `.file(url)` to `.untitled(uuid)`
+  /// and `DocumentWindowRegistry.publish` replaced the descriptor at the same
+  /// index rather than adding one. Nothing was deleted from disk; the document
+  /// simply stopped being open.
+  ///
+  /// ⌘O from the same window already routes to a tab of its own, on the first
+  /// term of `routesToOwnTab` — and the tab bar's "+" button already opens an
+  /// untitled TAB. ⌘N was the one door that clobbered.
+  @MainActor
+  func testNewDocumentOverALiveBufferOpensATabInsteadOfEatingTheOpenFile() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileTabTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let noteURL = folder.appendingPathComponent("transcript.md").standardizedFileURL
+    try "# transcript".write(to: noteURL, atomically: true, encoding: .utf8)
+
+    let documentWindow = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true)
+    let untitledWindow = NSWindow(
+      contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true)
+    for window in [documentWindow, untitledWindow] {
+      window.isReleasedWhenClosed = false
+    }
+    defer {
+      documentWindow.close()
+      untitledWindow.close()
+    }
+
+    var untitledFactoryCalls = 0
+    var tabMerges = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("⌘N must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === documentWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
+      orderAndActivateWindow: { _ in },
+      currentMergeTarget: { documentWindow },
+      applicationWindows: { [documentWindow, untitledWindow] },
+      makeDocumentWindow: { ref, _ in
+        XCTAssertNil(ref, "⌘N asks the factory for an untitled window")
+        untitledFactoryCalls += 1
+        return untitledWindow
+      }
+    )
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+    registry.registerController(controller, for: documentWindow)
+
+    // The window is showing the file the user opened from Finder, and the
+    // sidebar's Open Files list is that registry row.
+    appState.documentSession.load(document: DocumentRef(id: noteURL), text: "# transcript")
+    registry.attach(documentWindow, documentID: noteURL, hasEditableBuffer: true)
+    XCTAssertEqual(registry.openTabDocumentIDs, [noteURL])
+    XCTAssertTrue(controller.holdsLiveDocumentWork)
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(
+      untitledFactoryCalls, 1,
+      "⌘N over a live buffer must open its own tab, like the tab bar's + button")
+    XCTAssertEqual(tabMerges, 1)
+    XCTAssertEqual(
+      registry.openTabDocumentIDs, [noteURL],
+      "the open document lost its row in Open Files to the new untitled draft")
+    XCTAssertEqual(
+      appState.documentSession.url, noteURL,
+      "⌘N overwrote the file-backed buffer of the window it fired from")
+    XCTAssertEqual(appState.activeDocumentText, "# transcript")
+  }
+
+  @MainActor
+  func testControllerCreatesNewTabWithoutPromptingOrMutatingRecoveredDraft() throws {
+    let sourceWindow = Self.makeControllerlessWindow()
+    let untitledWindow = Self.makeControllerlessWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+    XCTAssertTrue(
+      DocumentWindowOwnership.claimDocumentHost(sourceWindow),
+      "the controller fixture must model the document root claimed by its window accessor")
+
+    var factoryCalls = 0
+    var promptCount = 0
+    var tabMerges = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("New must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === sourceWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
+      orderAndActivateWindow: { window in XCTAssertTrue(window === untitledWindow) },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+    let appState = AppState()
+    let recoveryID = UUID()
+    appState.documentSession.restoreUntitled(
+      title: "Recovered.md",
+      text: "contract text that must survive",
+      recoveryID: recoveryID)
+    let originalIdentity = appState.documentSession.identity
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(dirtySessionPrompt: { _ in
+        promptCount += 1
+        return .cancel
+      }),
+      documentWindowRegistry: registry)
+    registry.registerController(controller, for: sourceWindow)
+
+    XCTAssertTrue(registry.window(hosting: controller) === sourceWindow)
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(tabMerges, 1)
+    XCTAssertEqual(promptCount, 0, "New must never enter the dirty-session save prompt")
+    XCTAssertEqual(appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(appState.activeDocumentText, "contract text that must survive")
+    XCTAssertTrue(appState.activeDocumentDirty)
+  }
+
+  @MainActor
+  func testControllerCreatesNewTabWithoutReplacingOccupiedUntitledSession() throws {
+    let sourceWindow = Self.makeControllerlessWindow()
+    let untitledWindow = Self.makeControllerlessWindow()
+    defer {
+      sourceWindow.close()
+      untitledWindow.close()
+    }
+    XCTAssertTrue(
+      DocumentWindowOwnership.claimDocumentHost(sourceWindow),
+      "the controller fixture must model a document host")
+
+    var factoryCalls = 0
+    var tabMerges = 0
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in XCTFail("New must not defer here") },
+      scheduleLauncherWindowSweep: { _ in },
+      mergeWindowIntoTabs: { source, created in
+        XCTAssertTrue(source === sourceWindow)
+        XCTAssertTrue(created === untitledWindow)
+        tabMerges += 1
+      },
+      orderAndActivateWindow: { window in
+        XCTAssertTrue(window === untitledWindow)
+      },
+      applicationWindows: { [sourceWindow, untitledWindow] },
+      makeDocumentWindow: { ref, intent in
+        XCTAssertNil(ref)
+        XCTAssertEqual(intent, .newUntitledTab)
+        factoryCalls += 1
+        return untitledWindow
+      })
+    let appState = AppState()
+    appState.documentSession = .untitled(title: "Original.md")
+    appState.activeDocumentText = "original buffer"
+    let originalIdentity = appState.documentSession.identity
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(metadataStore: temporaryMetadataStore()),
+      documentStore: makeTestDocumentStore(),
+      documentWindowRegistry: registry)
+    registry.registerController(controller, for: sourceWindow)
+
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(factoryCalls, 1)
+    XCTAssertEqual(tabMerges, 1)
+    XCTAssertEqual(appState.documentSession.identity, originalIdentity)
+    XCTAssertEqual(appState.activeDocumentText, "original buffer")
+  }
+
+  /// The other half of the same policy: an IDLE window has nothing to lose, so
+  /// ⌘N is still answered in place instead of spawning a tab beside an empty
+  /// launcher. Without this term the fix would trade one bug for a window leak.
+  @MainActor
+  func testNewDocumentInAnIdleWindowStillFillsThatWindowInPlace() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "PensieveNewFileIdleTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+    }
+
+    let appState = AppState()
+    let indexDatabase = temporaryIndexDatabase(in: folder)
+    let unusedWindow = Self.makeControllerlessWindow()
+    defer { unusedWindow.close() }
+    var factoryCalls = 0
+    let registry = DocumentWindowRegistry(
+      scheduleLauncherWindowSweep: { _ in },
+      makeDocumentWindow: { _, _ in
+        factoryCalls += 1
+        return unusedWindow
+      })
+    let controller = AppController(
+      appState: appState,
+      folderManager: FolderManager(
+        metadataStore: temporaryMetadataStore(), indexDatabase: indexDatabase),
+      documentStore: makeTestDocumentStore(indexDatabase: indexDatabase),
+      indexDatabase: indexDatabase,
+      documentWindowRegistry: registry
+    )
+
+    XCTAssertFalse(controller.holdsLiveDocumentWork)
+    XCTAssertTrue(controller.createUntitledDocument())
+
+    XCTAssertEqual(factoryCalls, 0, "an idle window is the one that takes the new draft")
+    XCTAssertTrue(appState.documentSession.isUntitled)
+    XCTAssertTrue(appState.documentSession.hasEditableBuffer)
   }
 
   @MainActor
@@ -6069,7 +7000,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -6126,7 +7057,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     // A window from this initializer defaults to `isReleasedWhenClosed = true`: `close()` would then
     // release it, and ARC releases the local reference again at scope exit → double free (objc_release
     // EXC_BAD_ACCESS, SIGSEGV). Let ARC own the single reference so teardown is balanced.
@@ -6173,7 +7104,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     defer {
       window.close()
@@ -6203,7 +7134,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         window.contentView = NSView(frame: .zero)
         createdWindows.append(window)
@@ -6249,7 +7180,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled, .closable],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         window.contentView = NSView(frame: .zero)
         createdWindows.append(window)
@@ -6282,7 +7213,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled, .closable],
       backing: .buffered,
-      defer: false)
+      defer: true)
     zombie.isReleasedWhenClosed = false
     zombie.contentView = NSView(frame: .zero)
 
@@ -6301,7 +7232,7 @@ final class PensieveSmokeTests: XCTestCase {
           contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
           styleMask: [.titled],
           backing: .buffered,
-          defer: false)
+          defer: true)
         window.isReleasedWhenClosed = false
         return window
       }
@@ -6325,15 +7256,16 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(targetWindow))
     defer {
       targetWindow.close()
       documentWindow.close()
@@ -6391,7 +7323,7 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     documentWindow.isReleasedWhenClosed = false
     defer {
       documentWindow.close()
@@ -6428,12 +7360,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let spawnedWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for tracked in [window, spawnedWindow] {
       tracked.isReleasedWhenClosed = false
     }
@@ -6478,15 +7410,16 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [targetWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
+    XCTAssertTrue(DocumentWindowOwnership.claimDocumentHost(targetWindow))
     defer {
       targetWindow.close()
       documentWindow.close()
@@ -6528,12 +7461,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let untitledWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [sourceWindow, untitledWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -6601,12 +7534,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherWindow, documentWindow] {
       window.isReleasedWhenClosed = false
     }
@@ -6678,22 +7611,22 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let launcherB = NSWindow(
       contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let strayWindow = NSWindow(
       contentRect: NSRect(x: 30, y: 30, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherA, launcherB, documentWindow, strayWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
@@ -6771,17 +7704,17 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let untitledWindow = NSWindow(
       contentRect: NSRect(x: 10, y: 10, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let documentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     for window in [launcherWindow, untitledWindow, documentWindow] {
       window.isReleasedWhenClosed = false
       window.title = "Pensieve"
@@ -6841,12 +7774,12 @@ final class PensieveSmokeTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     let restoredContentWindow = NSWindow(
       contentRect: NSRect(x: 20, y: 20, width: 320, height: 240),
       styleMask: [.titled],
       backing: .buffered,
-      defer: false)
+      defer: true)
     launcherWindow.isReleasedWhenClosed = false
     restoredContentWindow.isReleasedWhenClosed = false
     launcherWindow.title = "Pensieve"

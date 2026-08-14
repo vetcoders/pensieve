@@ -301,7 +301,7 @@ final class DocumentIdentityCrossWireTests: XCTestCase {
     AppController(
       appState: appState,
       folderManager: FolderManager.shared,
-      documentStore: DocumentStore.shared,
+      documentStore: makeTestDocumentStore(),
       documentWindowRegistry: registry
     )
   }

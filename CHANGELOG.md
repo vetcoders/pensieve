@@ -7,18 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A release without `--clean` no longer stalls or dies while retiring the
+  previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
+  read-only, so the stale bundle carried unwritable `Assets.xcassets`
+  directories: the layout stage's plain `rm -R` prompted per file on a terminal
+  and then failed with `Permission denied` on their children. The stage now
+  restores owner write access on non-symlink entries below that exact bundle
+  before removing it, for both the Developer ID and Mac App Store lanes, and
+  refuses any other path shape or a symlinked bundle root.
+- A new tab from the tab bar's "+", `Cmd+T` or `Cmd+N` is an editor titled
+  `Untitled.md` from its first frame. Its draft used to be created several
+  run-loop turns after the tab was already presented and selected, so under load
+  the tab spent seconds as a fully interactive launcher — New File / Open File /
+  RECENT, window title **Pensieve** — wedged between the user's documents. The
+  draft is now seeded where the window is constructed, on the same clock as the
+  presentation; the later startup pass is idempotent, so it can neither renumber
+  the tab nor discard what was typed into it in the meantime.
+- The sidebar's **Open Files** list no longer trails the tab bar. A new tab is
+  published into the open-document list when its window is created — before it
+  joins the tab group and is ordered front — instead of only when its SwiftUI
+  root attaches, so a burst of new-tab requests shows one row per tab
+  immediately. The pending row is reconciled rather than duplicated when the
+  attach lands, and is retired with its window, so a closed or abandoned pending
+  tab leaves no phantom entry.
+
+- Automated and manual isolated smoke now prove the calling terminal's bounded
+  `System Events` Automation and Accessibility route before staging, retiring,
+  or launching any test identity. A TCC denial is reported as an
+  environment-inconclusive result and cannot leave another application,
+  profile, Open Recent row, or support tree behind; manual smoke also keeps an
+  existing experiment intact when that preflight is unavailable.
+- Isolated manual and automated smoke cleanup now accounts for WebKit's Darwin
+  per-user state explicitly. Schema-5 manifests pin the canonical `C` and `T`
+  roots plus the exact GPU, Networking and WebContent paths; cleanup removes
+  late-written run-owned `C` cache, strictly validates protected empty
+  per-identity filesystem entries under the OS-managed `T` root without trying
+  to delete them, and reports that payload-free residue honestly. Legacy
+  two-phase schema-4 coordinates remain cleanup-only after current bounded
+  validation so an interrupted older smoke does not become an undeletable
+  zombie; that validation is not authenticated provenance, and no legacy
+  manifest can authorize a new launch.
+- Settings no longer participates in SwiftUI scene restoration or the native
+  document tab graph. Pensieve now owns one retained AppKit window titled
+  **Settings**, excludes it from tabbing and Saved Application State, and
+  reuses it across repeated `Cmd+,` and close/reopen cycles. **General** and
+  **AI** remain panes inside that window instead of becoming detached top-level
+  or blank Mission Control surfaces; AI onboarding captures and dismisses its
+  document sheet, waits for the native ownership edges to detach, then opens
+  the same window on the AI pane. Every Settings entry point shares one final
+  native-modal gate: while a modal window, attached sheet, or sheet parent
+  remains, Pensieve leaves the window graph untouched, reports that the current
+  dialog must close, and requires an explicit retry. If the already-visible
+  Settings window owns that relationship and no exact document error surface
+  does, its retained model owns the same non-modal message instead of assigning
+  it to an unrelated historical document. An already-visible Settings window
+  renders that message; a hidden auxiliary window stays hidden and reports the
+  blocked retry with a beep plus trace rather than violating the no-ordering
+  gate. A bounded teardown failure reports through the originating
+  document's non-modal error surface and cannot queue a second onboarding sheet
+  over the unresolved pair. When Settings is key, `Cmd+W` closes Settings
+  itself and document-scoped commands cannot mutate the window behind it;
+  application-level New/Open remain available. The isolated UI smoke
+  independently vetoes both Accessibility duplicates and a surviving
+  WindowServer shell after Settings closes. Source-level lifecycle coverage
+  injects sheet relationships and notifications instead of attaching or
+  ordering real test windows onto the operator's active desktop.
+- Release provenance verification is now invariant to macOS `/var` ↔
+  `/private/var` path aliases, and isolated smoke cleanup can retire read-only
+  staged resources without an interactive terminal prompt. Toolbar smoke also
+  resolves its exact PID again before each menu action, so WebKit process churn
+  cannot stale a positional Accessibility process reference mid-scenario.
+  Native toolbar-menu checks now issue exactly one semantic press, then poll
+  freshly resolved Accessibility elements for the menu instead of treating one
+  stale 300 ms sample as a swallowed first click. The enclosing toolbar
+  watchdog now sits above the cumulative worst-case duration of those bounded
+  waits, and stage-level focus-regain breadcrumbs identify the exact blocked
+  Accessibility operation instead of misreporting a loaded WindowServer as a
+  product hang. A public-API AX/CoreGraphics probe now proves that the file and
+  untitled buffers share one presented native tab surface by switching tabs,
+  observing the editor content change and returning to the original tab. Its
+  process-global AX timeout also bounds descendant tab/window reads and failure
+  inventory; an action-timeout result is accepted only after the selected state
+  and document content prove that the requested switch happened.
+  Background WindowServer watchers are reaped by exact child PID through
+  bounded natural, TERM and KILL phases, so a failed smoke cannot hang cleanup
+  or signal an unrelated process. Synthetic Recent Documents and profile-namespace cleanup races
+  now live under the test fixture's temporary home instead of mutating or
+  requiring TCC access to the operator's protected Library state.
+- Release builds made from an immutable exact-commit snapshot now preserve the
+  package's declared test-target layout. SwiftPM plans every declared target
+  even for a product-only `swift build`; omitting `Tests/PensieveTests` made it
+  misclassify production sources as test sources and abort with an overlapping-
+  sources error before signing or notarization. Read-only snapshot templates
+  are also materialized as writable bundle outputs before release metadata is
+  stamped, without weakening the immutable source snapshot. Post-staple
+  provenance verification now recognizes only Apple's exact
+  `Contents/CodeResources` notarization ticket as platform-owned material;
+  app-owned resources remain sealed, and notarized DMG-only retries now require
+  a locally valid stapled app ticket before packaging. DMG staging cleanup now
+  unlocks only the disposable copied directory tree, so resources inherited
+  from the immutable snapshot cannot abort an otherwise valid notarized release
+  while the signed and stapled source app remains untouched.
+- `make release-clean` now also retires an exact read-only `Pensieve/.build`
+  cache non-interactively before resolving SwiftPM dependencies. That cleanup
+  is bounded to the literal package cache, rejects symlinks and non-directories,
+  and cannot turn a terminal-attached release into a series of `rm`
+  confirmation prompts for immutable dependency checkout files.
+
 ### Added
 
 - The source panel is now set in each theme's own monospace family — Sometype Mono (Parchment), JetBrains Mono (Graphite, Ink), IBM Plex Mono (Porcelain), Spline Sans Mono (Typewriter) — across body text, bold/semibold spans, inline code, the caret's typing attributes, the autocomplete ghost, and the line-number gutter. `Default` and `Raw` keep the system monospaced face.
 - Task lists gained a third checkbox state: `- [~]` ("in progress") is highlighted in the source panel like `- [ ]` / `- [x]` and renders in preview as a diamond inside an accent-coloured frame.
 - Recovered Drafts get their own launcher section, rendered only when it is not empty, with **Open**, **Save As…**, and **Discard** — replacing the old behavior where an unsaved crash draft was claimed automatically by whatever window happened to load next. A draft stays in that section until you decide about it: saving it, discarding it, or answering Don't Save when it closes. Nothing else removes it — not its age, not how many drafts you have, and not restarting Pensieve.
-- A new Settings > General toggle, **"Automatically save changes to files that already have a location,"** is ON by default: a document that already lives on disk saves and closes without a prompt, after a final flush. An untitled document always prompts regardless of the setting. Turning it off restores a save prompt on every close, for every document. Crash recovery is unaffected either way.
+- A new Settings > General toggle, **"Automatically save changes to files that already have a location,"** is ON by default: a document that already lives on disk saves and closes without a prompt, after a final flush. Turning it off restores a save prompt on every close, for every edited document. An untouched empty draft closes silently; an edited untitled draft always asks where to save. Crash recovery protects both drafts and dirty file-backed buffers in either mode without automatically overwriting the original file.
 - Non-markdown files no longer disappear from a workspace's sidebar tree: a file whose extension isn't `.md`/`.markdown`/`.txt` (or has none at all) now shows up greyed-out and inert — no open-on-click — with an "Add .md Extension" repair action in its context menu for extensionless files. These foreign files stay hidden by default; a new View menu **"Show All Files"** toggle reveals or re-hides them instantly, with no rescan.
 - **Every row in Open Files says how to close it.** Putting a file away meant already knowing ⌘W, or finding "Close from Open Files" in the row's context menu — nothing on the row itself showed that it could be closed at all. Hovering a row now reveals an "×" at its trailing edge, and it is the same close as the menu item: a document with unsaved changes still asks Save / Don't Save / Cancel in the window that owns it, and Cancel leaves the row exactly where it was. The "×" holds its place in the row while hidden, so hovering never shifts the file names beside it.
-- **You now choose whether starting Pensieve reopens the files you left open.** A new Settings > General toggle, **"Restore session on launch,"** is ON by default and keeps today's behavior: a cold start rebuilds your workspace and reopens the files you left open. Turn it off and Pensieve starts with nothing open — but still in the workspace you work in: your folders and their sidebar are configuration, not session, so they come back on every start. Only the cold start is affected: clicking the Dock icon with no windows on screen, and the tab bar's "+", still bring the workspace back as they always did. The files you left open are only skipped, never forgotten — turning the toggle back on reopens them on the next launch.
+- **You now choose whether starting Pensieve reopens the files you left open.** A new Settings > General toggle, **"Restore session on launch,"** is ON by default and keeps today's behavior: a cold start rebuilds your workspace and reopens the files you left open. Turn it off and Pensieve opens one empty launcher with zero documents — but still in the workspace you work in: your folders and their sidebar are always-alive configuration, not session, so they come back on every start. Pensieve's working set is the sole restore authority; managed windows opt out of AppKit Saved Application State so legacy system restoration cannot open a second copy behind the toggle.
 
 ### Changed
 
+- **New is deterministic in Pensieve v1.** `Cmd+N`, `Cmd+T`, and the native tab
+  bar's `+` create an editable tab in the current document host regardless of
+  macOS's global "Prefer tabs when opening documents" setting. An idle launcher
+  may take the first draft in place; an occupied host never turns New into an
+  unrelated standalone window. During a zero-window attach gap, rapid New
+  requests are counted rather than collapsed: one host is created and every
+  gesture becomes its own editable tab. If Finder is already opening a file,
+  that same host keeps the requested file and queued New gestures follow as
+  tabs instead of replacing it or spawning another host.
 - **Typewriter now follows your Mac's light/dark setting**, and it does it with two palettes of its own rather than by turning into a system theme. Set your Mac to dark and the window is the dark one — `#171717` titlebar over a dark source panel; set it to light and the same skin turns the window and the source panel white. The **page stays white either way**: the sheet is what you are reading, and it is paper in both halves, so the preview never follows the window into dark. Switching the system setting re-dresses open windows live, and an exported PDF is always the light sheet — exporting from a dark Mac no longer produced a dark document. Both halves stay on Typewriter's one grey ramp with no colour at all. A theme saved as Typewriter stays Typewriter; there is nothing to re-pick.
 - The toolbar's active toggles — Rich Markdown, Auto Reload Preview, Scroll Sync, Dictation, AI Autocomplete — now fill from the active theme instead of the system accent: sienna on Parchment, deep slate-teal on Graphite, iris on Ink, clinical teal on Porcelain, mid grey on Typewriter — which stays achromatic, one step up its own grey ramp. `Default` and `Raw` keep the accent chosen in System Settings.
 - **Closing a document is now a conscious decision, not a silent teardown.** A dirty untitled document asks Save As… / Don't Save / Cancel; a dirty document that already has a location asks Save / Don't Save / Cancel; a clean, untouched document still closes without asking. Cancel, or a save that fails, always leaves the window open with nothing discarded. The same pass now gates the red close button, ⌘W, Dock quit, and Quit Pensieve alike, so none of them can drop unsaved work behind another window's back.
@@ -29,14 +147,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The empty state's Recent files and "New File" now answer the pointer.** The two fastest ways into a document were the two things on screen that looked dead: no highlight under the pointer, no cursor change, and nothing at all on the click — the row simply sat there until the document appeared, which is exactly the moment you click it a second time. Rows now light up on hover, deepen while held, and show the pointing-hand cursor, in the same accent the sidebar's rows already use, on both the detail pane and the sidebar.
 
+- **Clicking a file opens it as a tab instead of taking over the one you are reading.** A click in the workspace tree, on a search result, or on the context menu's "Open" used to swap the document out from under the current window — the VS Code model — so reading two files meant losing your place in the first. A click is an explicit open, so it now lands exactly where ⌘O and a Finder "Open with Pensieve" land: a native tab next to the one you are in, with your current document untouched. A file that is already open is brought forward rather than opened twice, whichever window you click it from, and an empty window still takes the file itself instead of putting a second tab beside itself. "Open in New Window" is gone from the context menu: with every open landing as a tab it was a second button for "Open".
+
 ### Fixed
 
+- **A “fresh” smoke can no longer inherit another Pensieve's state or silently
+  test old code.** Manual, automated UI, BUGMAP and search-memory runs now stage
+  a UUID-namespaced bundle whose process/executable, defaults, Application
+  Support, Keychain, Open Recent, Saved State, caches and LaunchServices entry
+  belong to that run alone. Before any witness is seeded, the harness verifies
+  the exact runtime identity and manifest, verifies trusted signed build
+  provenance down to the current runtime inputs and normalized executable/FFI
+  payloads, and requires one empty launcher to remain empty across a
+  three-second census. Process control retains the exact
+  `NSRunningApplication` instead of trusting a reusable PID. Cleanup is
+  manifest-scoped, waits out late Recent Documents writes, verifies the final
+  LaunchServices state, and fails closed rather than guessing or touching
+  production Pensieve state; every newly minted experiment or independent
+  automated scenario receives a different identity, while an explicit manual
+  reopen retains only that experiment's identity for persistence testing.
+- **The File menu no longer disappears with your last window.** Closing every
+  window keeps Pensieve running, but the menu bar went with them: New, Open,
+  Open Recent and Open Folder all vanished, ⌘N, ⌘O and ⌘T did nothing, and the
+  only way back into the app was clicking the Dock icon. With zero windows the
+  File menu now keeps New File (⌘N), New Tab (⌘T), Open File… (⌘O), Open Recent
+  and Open Folder… (⇧⌘O). The app-global About item also keeps Pensieve's own
+  build-identity panel, and Quit keeps the protected all-window decision even
+  while no document command target exists. New opens a host already holding an
+  empty draft; rapid additional New requests become tabs in that host. Open
+  lands its file in the same guarded host lane a Finder open uses. With a window
+  on screen every one of these behaves exactly as before.
+- **Opening a file no longer disappears into a windowless Pensieve process.**
+  After the last window is closed, Finder/Open With or `open` now creates one
+  explicit-document host and drains the queued URL into it instead of waiting
+  invisibly for a later Dock click to happen to create a launcher.
+- **Startup restore now remains one transaction across modal and close turns.**
+  A modal pause keeps the same ref pending and the onboarding gate closed; if
+  the pinned host closes between turns, later tabs re-pin to a live restore
+  survivor and the final ordering never resurrects the closed window. If the
+  user creates or selects a non-restore tab while that multi-turn pass is still
+  running, completion now preserves the newer selection instead of stealing
+  focus back to the last restored tab.
+- **One live recovery copy now follows the live buffer instead of its latest
+  window label.** Renaming/rekeying a buffer preserves its recovery identity;
+  actually replacing that buffer releases the claim so the launcher can offer
+  the emergency copy immediately. A stale launcher row cannot Save As or
+  Discard a copy currently owned by a live tab; the owning tab itself can still
+  discard after confirmation, and a storage failure is reported honestly
+  instead of being mislabeled as another-window ownership. Converting a
+  file-backed record to an untitled one remains fail-closed if its old
+  source-path sidecar cannot be removed. Moving the selected source file to
+  Trash also releases the live claim before clearing its session, so the one
+  emergency copy is visible now
+  instead of returning only after relaunch. An original-write plus
+  recovery-write failure is reported as one
+  stable condition, so its two internal errors cannot resurrect a dismissed
+  banner on every debounce tick. A failed explicit Cmd+S now uses that same
+  immediate recovery fallback without claiming that the stale original was
+  saved. This also covers a recovered file's Save to Original action: a failed
+  Cmd+S, close, or quit refreshes the same recovery item with the latest edit
+  and preserves its original-path association. Later recovery ticks keep that
+  identity and continue saying that the original is stale instead of silently
+  clearing the status. Close and quit remain vetoed until the original itself
+  accepts the bytes; a later successful original write still retires the
+  emergency copy.
+  When auto-save is off and a later recovery tick succeeds, Pensieve keeps the
+  original-write failure separate from the resolved recovery failure and says
+  the emergency copy is safe instead of publishing a contradictory status. If
+  a conscious Discard cannot retire its recovery payload, document close and
+  Clear Open Files stop with the live buffer still dirty. Global quit now offers
+  a deliberate **Quit Anyway**
+  escape hatch after the safe **Keep Pensieve Open** default: one confirmation
+  settles the remaining Discards in that quit pass while retaining the failed
+  recovery copies and warning that they may reappear after restart. Cancel and
+  original-plus-recovery double-write failures remain hard vetoes.
+- **Unattended saves preserve the file around the Markdown.** The atomic
+  replace-existing write publishes a new inode, so Pensieve now carries across
+  the original mode, ownership, ACLs, extended attributes/Finder tags and
+  creation metadata while keeping the replacement content's new modification
+  time on volumes that support and permit it. `ENOTSUP`, `EPERM` and `EACCES`
+  make metadata preservation best-effort so content replacement can still work
+  on SMB, exFAT and restricted volumes; unexpected I/O failures and a missing
+  target still abort before publication.
+- **Live Trash reconciliation now covers ad-hoc files without mistaking a
+  lookalike folder for macOS Trash.** Workspace files still leave Open Files on
+  their watched scan; files opened outside every workspace are checked when
+  Pensieve becomes active again after Finder. The missing-volume fallback only
+  accepts `/Volumes/<volume>/.Trashes/<uid>/...`, not an arbitrary nested folder
+  with the same component names, and healthy files no longer pay an unnecessary
+  per-volume Trash lookup on every scan. Activation reconciliation is subscribed
+  once per process and runs one pass per distinct shared working set, rather
+  than repeating the same file checks once for every open window.
+- **The sandboxed bookmark rewrite keeps the grants it promises.** Fresh
+  bookmarks are resolved before old security scopes are released, and the
+  resolved security-scoped URLs — not plain document URLs — are activated for
+  the surviving roots and tabs. Failed grants are distinguishable and traced.
+  Under XCTest, Recovery, workspace metadata, the search index and document AI
+  state now share one process-scoped temporary Application Support root unless
+  an explicit smoke root is supplied, so a forgotten singleton cannot write to
+  the operator's production data.
+
+- **Saving a recovered draft from the launcher no longer creates a file that
+  Pensieve immediately forgets.** The file was written and the recovery copy
+  retired, but the destination skipped the normal Save As registration path:
+  it received no Open Files membership or ad-hoc bookmark and never appeared in
+  native Recents. A successful launcher Save As now completes that fan-out while
+  leaving the launcher empty — saving a rescue copy does not silently open it.
+
+- **A native tab bar no longer covers the top of the sidebar.** When a window
+  gained tabs, AppKit added a strip below the toolbar while SwiftUI kept laying
+  out the sidebar from the toolbar edge. The workspace title, creation buttons
+  and search field could therefore sit beneath the full-width titlebar
+  background. Pensieve now measures the public bottom titlebar accessories and
+  applies exactly that height to the sidebar; an untabbed launcher keeps its
+  original layout.
+- **The native tab `X` can no longer bypass the unsaved-work close guard.** On
+  macOS 27 the real tab control reaches `NSWindow.close()` directly, while the
+  existing protection covered `performClose` / `windowShouldClose` and the
+  later teardown notification could only write a recovery copy. A dirty
+  file-backed tab could therefore disappear without Save / Don't Save / Cancel
+  even with auto-save OFF. Both AppKit close routes are now guarded, a settled
+  sheet gets a one-shot non-recursive close, and the scene-window guard is also
+  refreshed when SwiftUI replaces its delegate without changing document
+  metadata.
+- **Recovered edits to an existing file are no longer anonymous ghosts.** With auto-save off, Pensieve now keeps a periodic emergency copy while leaving the original file untouched; with auto-save on, the same recovery path is the immediate fallback when writing the original fails. Each live buffer updates one recovery identity, and a file-backed record carries the original path, appears as **Unsaved changes — <filename>**, and states that it is an emergency copy. Opening it never writes anything by itself: the recovered buffer offers **Save to Original**, **Save As…**, **Don't Save**, and **Cancel**, and retires only after a successful explicit save or a conscious rejection.
+- **Close and quit no longer consent before the last fallible content write.** Pensieve attempts the original file and then RecoveryStore while the window can still veto teardown. If neither destination accepts the bytes, red-X close and quit stay open with the dirty buffer intact and a data-loss message. A successful recovery fallback permits an unattended close or quit because the bytes are durable, but keeps the original-file failure visible and never claims that the stale original was saved.
+- **macOS no longer restores a second document/window graph behind Pensieve.** Managed launcher and document windows opt out of AppKit Saved Application State, and the legacy value-based SwiftUI document scene has been removed. The Restore Session setting and Pensieve's working set are now the one source of truth, so restore OFF cannot be contradicted by an older system-saved window payload.
+- **Pensieve now tells you when something failed, instead of only recording it.** Every failure the app noticed — a folder it could not open, a file it could not save, a crash-recovery copy it could not write — was written into a field that no part of the interface ever read. Nothing appeared, nothing was logged where you would see it, and the operation simply looked like it had worked. A failure now shows up as a line in the window that hit it, and in that window only. It is deliberately quiet: nothing about it is a dialog, it never takes your cursor, and it can appear or disappear while you are typing without dropping a keystroke. One class of failure is dressed more prominently, because it is the one that can cost you your work: when Pensieve could not write your text anywhere on disk and the only copy left is the one on screen. That one also behaves differently — it stays until the work is actually saved, an ordinary message arriving later cannot push it aside, and closing it puts the line away without pretending the problem is solved, so a save that keeps failing every second and a half will not keep reopening the line you just closed. Save the work with Save As… and it goes away on its own; if the same trouble happens again afterwards, you are told again.
+- **Importing a Word or PDF file no longer treats a failed crash-recovery copy as a finished import.** That conversion has no file of its own, so the recovery copy Pensieve writes for it straight away is the only other place the text exists. If that write failed — no room left on the disk, a recovery folder you no longer have permission to write into, or one replaced by something that is not a folder — the import went on to announce itself as finished and cleared the error on the very next line, so nothing anywhere recorded that the conversion had no safe copy. The converted document now keeps its unsaved marker and its text, the failure is reported in that window — a named line that stays up, since the conversion is the only copy — instead of being wiped, and nothing on disk is touched. Save it yourself with Save As… — Pensieve starts no retry of its own, though a further edit can re-arm the automatic save and hit the same failure again.
+- **A note you threw away no longer comes back on its own.** With a document open in Pensieve, deleting its file — dragging it to the Trash in Finder, removing it from a script, letting a sync client take it — left the editor holding the text and still pointing at the path the file used to have. The next automatic save went to that path, and since nothing was there any more it did not update a file, it **created** one: the note reappeared exactly where you had removed it from, beside the copy sitting in your Trash, with nothing on screen to explain it. Closing the window did it too. Automatic saves now write only a file that is still there; when the file is gone the write is refused instead and your text stays exactly as you typed it, still marked unsaved. Nothing is lost by the refusal: closing the document with ⌘W keeps the window open, the same as it already does when a save fails, and a window that goes away regardless keeps your text as a recovered draft. Saving on purpose is untouched — ⌘S, Save As…, and answering **Save** to a close prompt still write the file, including writing it back after it has gone missing, because that is what you asked them to do.
+- **An unsaved document you keep closing leaves ONE recovered draft, not one per close.** A file that already lives on disk is kept as a recovered draft when its window goes away without the text reaching that file — auto-save turned off, or a save that failed — so the work is never lost. Each of those stashes was filed as a brand new draft, though: closing the same document ten times put ten copies of it in Recovered Drafts, and since a draft is only ever removed by your decision, they stayed there forever and the recovery folder grew without bound. A buffer now keeps the draft it already wrote and updates that one in place, so one document is one draft however many times you close it. Saving the file in the window that made the stash retires it — the work is on disk, so there is nothing left to recover. A draft left behind by a window you have already closed still waits for you in Recovered Drafts until you save or discard it.
+- **An onboarding sheet can no longer become the owner of document tabs.** A
+  sheet may temporarily become the key AppKit window without being reported as
+  a global modal window; opening or restoring a file in that moment used to
+  treat the sheet as the current document target, assign it Pensieve's tab
+  identity, copy its compact frame to the new document, and merge the document
+  into it. Native tab mutations now accept only explicitly owned document
+  roots and stop while any member of that tab group has an attached sheet.
+  Panels, child windows, Settings and other transient surfaces remain outside
+  the document navigation graph, and a queued callback cannot republish a
+  factory window after it has closed.
+- **Restoring a session no longer splits its tabs into extra windows when AI
+  onboarding appears.** Session restore arrives over several run-loop turns;
+  the onboarding sheet could become the key window between two of them, so the
+  next document rejected the sheet and fell back to a standalone window. One
+  restore now pins one document host for the whole pass, and onboarding waits
+  until every restored tab has joined and the transaction has completed its
+  final selection decision — including preserving a newer tab the user chose
+  while restore was still running.
+- **Agent dispatch now says what actually happened.** The green confirmation
+  previously read “Dispatched” and ended with a “Done” button even though the
+  receipt was not a completion result. A recorded positive worker PID now says
+  **Run started** without claiming the worker is still alive. A valid run ID
+  whose spawn record misses the bounded wait says **Run accepted · launch
+  unconfirmed**, preserves the run ID and any report path, and warns against a
+  duplicate dispatch instead of fabricating `exit 1`. Reveal appears only when
+  a report path exists; Check Status appears only when the receipt names the
+  observer agent or the dispatch explicitly selected one positional agent. A
+  default swarm gets no guessed Terminal command, and a genuine rejection gets
+  no status action for a run that never started while retaining its real exit
+  code and any run/report identifiers. Dictated dispatches use the same
+  accepted-but-unconfirmed explanation. Closing the sheet or Terminal still
+  does not stop a detached run.
+- **A new draft's focus request cannot arrive late.** New creates one request
+  bound to that document session and waits until its editor has a window before
+  trying to make it first responder. The attempt itself consumes the request:
+  if AppKit refuses it, the current responder remains in place and a later
+  SwiftUI render cannot replay the request and steal focus.
+- **The isolated UI smoke no longer turns an early failure into a successful
+  exit on the system Bash.** Optional timeout prefixes and toolbar expectations
+  are now safe when empty under macOS Bash 3.2, and cleanup preserves the
+  smoke's original exit status instead of replacing or reclassifying it. INT
+  and TERM now exit as 130/143 even when sent only to the script, and cleanup is
+  installed before `caffeinate` or staging begins so an early error cannot leave
+  a process keeping the operator's display awake. The staged identity also uses
+  its own Keychain service, so smoke cannot read the operator's production AI
+  provider key. Every runtime smoke now mints a complete per-run identity across
+  executable/PID, bundle/defaults, Application Support, Keychain, Open Recent,
+  Saved State, caches and LaunchServices, pins it in a manifest, and proves one
+  empty launcher before creating a witness. Independent UI-smoke scenarios
+  retire and re-prove that capsule between probes. Cleanup re-authenticates the
+  exact process before every signal and preserves the bundle, manifest and
+  owner root when any step fails, rather than deleting the only safe retry
+  handle or letting a survivor become the next run's ghost.
 - **A large document no longer pins the app at full CPU for as long as it stays open.** Once a multi-megabyte note was on screen, the editor kept asking whether its text had changed by reading the entire document and comparing it character by character — twice for every pass the interface made, and it makes them continuously. On a 17 MB file that answer took longer to produce than the interval between the questions, so the app sat at 100% CPU indefinitely, ignoring the keyboard and the mouse, with nothing on screen to explain why. The editor now recognises unchanged text without reading it, so the question costs the same whether the document is a paragraph or a novel. A side effect of the old comparison is fixed with it: text that differed from what was on screen only in how its accents were composed counted as "unchanged" and never reached the editor.
 - **Opening a large document no longer freezes the window.** Reading a multi-megabyte note, colouring it, and rendering its preview all happened in the instant the click was handled, so the app stopped answering for as long as all three took together — no spinner, no title, nothing to say the click had even landed. A document over a megabyte now opens in stages: the window or tab takes the file's name and place immediately and shows an "Opening …" spinner for it, while the file is read in the background and the colouring and preview arrive as they are ready. Documents under that size open exactly as before, in one go. Whatever you do next wins — opening another file, or closing the window, drops the read instead of letting it arrive on top of you — and the document stays read-only until its text is really there, so a ⌘S during the open cannot write an empty file over the one being read.
 - **A very large note no longer freezes a second time, moments after it has opened.** Staging the open put the file on screen quickly, and then — a fraction of a second later — the window locked up again for minutes, with the spinner already gone and the text already showing. Colouring a document happens in pieces small enough to fit between frames, but one pass never went through that: the one that runs after an edit touches a code fence. Opening a file counts as such an edit, so the pass that had just been carefully spread out was queued up again right behind it, whole. On a 17 MB note that is the entire file re-coloured in one go, and the same freeze came back on every restart that restored it, and on every keystroke on a fence line afterwards. That pass is now cut into the same small pieces as the rest: what is on screen is coloured at once and the remainder follows in the background, for code blocks and ordinary prose alike. Notes below a megabyte are coloured in one pass exactly as before.
 - **Undoing your writing no longer leaves AI autocomplete continuing from the text you took back.** The editor listened for undo on the history a surface keeps only while it has no window, so once the editor was actually on screen that hook never fired again: ⌘Z rewound your document while the next suggestion was still written as a continuation of the sentence you had just removed. Undo is now heard in the window the editor is hosted in, so a suggestion always continues from what the document really says.
 - **Starting Pensieve with a dozen files open no longer hangs the app.** Reopening the files you left open cost more the more of them there were: each restored tab was brought to the front as it arrived, and macOS answers a new tab by resizing every tab already in the group — which made each of those tabs lay itself out again, all the way down to re-rendering its document's preview. With a large workspace open the launch could sit at full CPU for minutes before drawing anything, and the app grew past a gigabyte of memory doing it. Restored tabs now join the window quietly, so bringing back twelve files no longer costs twelve times more than bringing back one. Each tab still has to draw itself once, and the window used to sit frozen for all of them together — several seconds of a window that is on screen and will not answer. The tabs now arrive one at a time, so the window responds throughout while the rest of your files come back. Same files, same order.
-- **The tab you were last working in is the one you come back to.** The first restored file is loaded into the window the app starts in, and that window announced itself late enough to be treated as freshly opened — so it jumped in front just after the restore had finished, and a launch that should have returned you to the file you left ended on the oldest file in the list instead.
+- **In an uninterrupted startup restore, the final restored working-set entry remains in front.** The first restored file is loaded into the window the app starts in, and that window announced itself late enough to be treated as freshly opened — so it jumped in front just after the restore had finished and replaced the tab the restore transaction had deliberately selected. A newer tab the user chooses while restore is still running still wins. The v1 working set stores file membership and order, not a separate selected-tab snapshot; exact tab order and selection at quit remain part of the planned true session snapshot.
 - **A file you left open comes back once, not twice.** The record a launch restores from identified files by the permission token stored with them, and that token is not stable — reopening a file could add a second entry for it, and a launch turned every entry into a tab. Files are now identified by where they are, so a record that already grew a duplicate is collapsed on the next launch (or the next time you open that file) instead of coming back as two tabs on one document.
 - **A file you threw away stays thrown away.** A document moved to the Trash still exists on disk, so the launch happily reopened it — from your side, a deleted file came back as an open tab on every start. A file whose record leads into the Trash is now treated as gone: it is not reopened, and its record is dropped.
 - **A large document no longer freezes the window for minutes while the line numbers redraw.** The gutter numbered its rows by walking the document from the very first line on every repaint, and that walk typeset each line it passed — so a repaint laid out the whole file, however little of it was on screen. Since a repaint is posted on every scroll and every editor layout pass, and the layout for lines that are not showing is thrown away again, the same whole-file typesetting ran over and over: on the reported file the main thread sat at 100% for around two minutes, and even a 200 KB document cost 1.7–2.7 seconds per repaint once the themed faces landed. The gutter now starts at the first line actually on screen and stops at the last one, reading the row's number from the text instead of counting its way down to it. The numbers, the active-line marker and the rendering are unchanged.
@@ -49,7 +348,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Mermaid diagrams in an exported HTML file follow the theme you exported.** The page's colours were fixed to the skin while the diagram picked its own palette from the reader's system light/dark setting, so a Typewriter export opened on a dark Mac put a dark diagram box on a white page, and Graphite on a light Mac did the reverse. Diagrams now read the same colour tokens as the rest of the page, so `Default` and `Raw` still follow the reader while a fixed skin no longer disagrees with itself.
 - **A task marker has to be literally written to become a checkbox.** Encoding any character inside it — `- [&#126;] wip`, or a marker left unterminated — still produced an in-progress checkbox, because only the opening bracket was checked against the source. All three characters are now verified.
 - **Recent files with the same name AND the same folder name are told apart.** The disambiguating suffix added one folder, so `/a/project/README.md` and `/b/project/README.md` both read `README — project`. The suffix now grows until the rows genuinely differ, one component at a time and only for the names that collide — including when the folders match for several levels, as `/a/shared/project/README.md` and `/b/shared/project/README.md` do.
-- **A launch reopens at most 12 files, not everything you have ever opened.** The list behind Open Files has always been capped at 12, but only in memory: the record a relaunch reads from kept growing with every ad-hoc file and was only ever trimmed by closing a row explicitly. Now that a launch reopens that record for real, a long-running install would have come up with dozens of tabs. The cap now applies to what a launch inherits as well, keeping the 12 most recent, and a file dropped from the list is dropped from the record with it — so nothing lingers invisibly waiting to come back.
+- **A launch reopens at most 12 files, not everything you have ever opened.** The list behind Open Files has always been capped at 12, but only in memory: the record a relaunch reads from kept growing with every ad-hoc file and was only ever trimmed by closing a row explicitly. Now that a launch reopens that record for real, a long-running install would have come up with dozens of tabs. The cap now applies to what a launch inherits as well, keeping the final 12 entries in persisted working-set order, and a file dropped from the list is dropped from the record with it — so nothing lingers invisibly waiting to come back. Switching among existing tabs does not turn this v1 list into a most-recently-used order.
 - **Opening several files at once no longer loses the first one.** When the first file of the batch was a Word or PDF document, its conversion left the window looking empty, so the next file in the batch took the same window: a second Word or PDF file cancelled the first conversion outright, and a Markdown file appeared for a moment before the finished conversion replaced it. A window with a conversion running is now occupied, and every following file opens in its own tab.
 - **A numbered task is a task in the editor too.** `1. [x] done` and `1. [~] wip` render as real checkboxes in the preview, but the source panel styled them as plain text and pressing Return on such a line continued it as a bare `2. ` instead of opening the next task. Both panels now recognise numbered task lines, in either `1.` or `1)` form.
 
@@ -90,7 +389,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The toolbar's Mode picker answers a click again.** It was drawn as a single greyed-out "Mode" chip that opened nothing while the diamond next to it still worked. A segmented picker cannot live inside a segmented control: declaring it inside the family's `ControlGroup` made macOS fold the whole picker into one disabled segment carrying its title. The picker is now declared directly in its toolbar group and comes back as one live segment per mode.
 - **The toolbar's format buttons edit the document again.** Bold, Italic, Strike, Quote, Code, Link and the two list actions shared a control group with the Rich Markdown toggle, which put the whole control into on/off tracking — a click lit the segment like a sticky state instead of running a one-shot action. The format actions now sit in a group of their own and stay momentary, matching the floating selection bar and the Format menu.
-- **The whole toolbar fits an ordinary window again.** The Mode picker was drawn as four titled segments behind a 300 pt width floor — 300 pt of a 1096 pt toolbar for one control — and macOS answered by pushing the three trailing families (Mode, Reload/Auto Reload/Scroll Sync, Dictation/AI Autocomplete/Rewrite) behind the "»" chevron at a 1450 pt window. Mode now shows icon segments, each naming itself on hover, which brings the toolbar to 944 pt and the point where macOS starts hiding families from ~1366 pt down to ~1200 pt.
+- **The whole toolbar fits an ordinary window again.** The Mode picker was drawn as four titled segments behind a 300 pt width floor — 300 pt of a 1096 pt toolbar for one control — and macOS answered by pushing the three trailing families (Mode, Reload/Auto Reload/Scroll Sync, Dictation/AI Autocomplete/Rewrite) behind the "»" chevron at a 1450 pt window. Mode now shows icon segments, each naming itself on hover. The complete declared toolbar measures 944 pt on macOS 26 and 905 pt on macOS 27; the regression test hosts it under an ambient `.mini` control size so it fails unless Pensieve explicitly restores the intended `.regular` geometry.
 - **The "»" overflow menu lists every control it hides, exactly once.** Its entries come only from what each toolbar family can describe about itself, and a family bridged into a segmented control describes nothing — so Auto Reload Preview, Scroll Sync, Dictation and AI Autocomplete simply ceased to exist on a narrow window, while Reload Preview and Rewrite with AI appeared twice each, once as a button and once as a chevroned parent of themselves. Every family now carries a named menu of its own controls, with live check marks for the toggles and the same actions the chips run.
 - A theme carried over from an older build is migrated once instead of on every launch: the retired name (`glass`, `pergament`, `klinika`, `maszynopis`, …) was mapped to its surviving skin in memory only, so the dead value stayed in preferences until you picked a theme by hand. The migrated name is now written back where it is resolved.
 - `==highlight==` stays readable in the source panel on themes whose mark wash sits on top of the body text colour (Typewriter): the marked span falls back to the theme's own pane colour and reads as an inverted stamp instead of vanishing.

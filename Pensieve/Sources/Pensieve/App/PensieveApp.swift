@@ -11,13 +11,6 @@ struct PensieveApp: App {
   @State private var workspaceStore: WorkspaceStore
   @StateObject private var launchIntentCoordinator: LaunchIntentCoordinator
   @StateObject private var themeManager: ThemeManager
-  private let providerSettings: ProviderSettings
-  /// The auto-save preference the Settings window edits. The SAME instance the
-  /// document store consults, so a flip reaches every open document immediately.
-  private let savingSettings: DocumentSavingSettings
-  /// The restore-on-launch preference the Settings window edits. The SAME
-  /// instance `AppController.start(intent:)` consults on the next cold launch.
-  private let launchSettings: LaunchSettings
 
   init() {
     // Register the bundled OFL theme fonts into this process's font environment
@@ -28,14 +21,11 @@ struct PensieveApp: App {
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     let themeManager = ThemeManager()
-    providerSettings = ProviderSettings.shared
-    savingSettings = DocumentSavingSettings.shared
-    launchSettings = LaunchSettings.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
 
-    // External-file launches deliberately bypass the value-based WindowGroup.
+    // External-file launches deliberately bypass SwiftUI scene restoration.
     // Wire the AppKit factory before AppDelegate's launch fallback so it can
     // materialize the root that will attach a controller and drain those URLs.
     let factory = DocumentWindowFactory(
@@ -68,8 +58,8 @@ struct PensieveApp: App {
         launchIntent: .coldLaunch
       )
     }
-    // Opt OUT of external events here too, not just on the value-based group
-    // below. A launcher scene that still claimed Finder/Dock/`open` URL events
+    // Opt OUT of external events here. A launcher scene that still claimed
+    // Finder/Dock/`open` URL events
     // would let SwiftUI materialize a fresh scene-owned launcher window per
     // event — reviving the detached one-window-per-file path the registry's
     // native-tab merge exists to prevent. With neither scene claiming them,
@@ -79,50 +69,6 @@ struct PensieveApp: App {
     .pensieveDocumentWindowChrome()
     .commands {
       PensieveCommands(themeManager: themeManager)
-    }
-
-    // The value-based WindowGroup serves any state-restored legacy document
-    // scenes (`initialDocument`). Document opens do NOT go through
-    // `openWindow(value:)`: DocumentWindowRegistry builds document windows
-    // directly in AppKit (DocumentWindowFactory) and attaches them as native
-    // tabs before first presentation.
-    //
-    // No `.commands` here on purpose. SwiftUI assembles ONE app-wide menu bar
-    // from the whole scene tree at launch; the `.commands` attached to the
-    // primary launcher WindowGroup above already own that single menu bar, so
-    // a window restored into THIS group inherits the full Mode/Format/Agents
-    // surface — its enabled/disabled state and target follow focus through
-    // `CommandSurfaceContext` (Commands.swift), not scene ownership. The
-    // menu structure is built from the declaration, so it never depends on a
-    // launcher window being open. Re-declaring `PensieveCommands` on this
-    // second scene would NOT merge idempotently: `CommandsBuilder` appends
-    // per scene, so every `CommandMenu` (Mode/Format/Agents) — and the
-    // replaced File groups — would appear TWICE. The single declaration above
-    // IS the app-global level that covers both scenes.
-    WindowGroup("Pensieve", for: DocumentRef.self) { document in
-      DocumentWindowRootView(
-        workspaceStore: workspaceStore,
-        launchIntentCoordinator: launchIntentCoordinator,
-        themeManager: themeManager,
-        initialDocument: document.wrappedValue,
-        // A scene in this group exists FOR its document, restored or not.
-        launchIntent: .explicitDocument
-      )
-    }
-    // Never let SwiftUI spawn a fresh WindowGroup scene per external event:
-    // every Finder/Dock/`open` file event was materializing a detached
-    // standalone window (bypassing the registry's native-tab merge), one per
-    // file. With no scene claiming external events they fall through to
-    // `application(_:open:)` → LaunchIntentCoordinator → registry tabs.
-    .handlesExternalEvents(matching: [])
-    .pensieveDocumentWindowChrome()
-
-    Settings {
-      PensieveSettingsView(
-        providerSettings: providerSettings,
-        savingSettings: savingSettings,
-        launchSettings: launchSettings
-      )
     }
   }
 }
@@ -160,14 +106,29 @@ struct DocumentWindowRootView: View {
     let appState = AppState(workspaceStore: workspaceStore)
     _appState = State(wrappedValue: appState)
     _controller = StateObject(
-      wrappedValue: AppController(appState: appState, importsFoldersInBackground: true))
+      wrappedValue: {
+        let controller = AppController(appState: appState, importsFoldersInBackground: true)
+        // The FIRST render of a "+" / ⌘T / ⌘N tab must already be an editor.
+        // `.task` below (and the coordinator hop behind it) runs run-loop turns
+        // after the tab is on screen and selected, so a draft created there
+        // leaves a fully interactive launcher tab titled "Pensieve" sitting
+        // between the user's documents in the meantime. This autoclosure is
+        // evaluated exactly once, by the SwiftUI storage that actually backs
+        // this window, and before its body first reads the session — which is
+        // the only place on this path that is on the presentation's own clock.
+        // See `NewTabSessionSeed`; `start(intent:)` still asks, idempotently.
+        NewTabSessionSeed.seedIfNeeded(
+          controller: controller,
+          intent: launchIntent,
+          initialDocument: initialDocument)
+        return controller
+      }())
   }
 
   var body: some View {
     ContentView(hostWindow: $currentWindow)
-      // Every window this app can build — the scene-owned launcher (which is
-      // where restoration puts the recovered document), a state-restored
-      // WindowGroup scene, and every factory-built native tab — shares THIS
+      // Every window this app can build — the scene-owned launcher and every
+      // factory-built native tab — shares THIS
       // root, so declaring the skin's appearance once here is what makes a
       // light skin light on all of them, chrome included.
       .pensieveSkinAppearance(themeManager)
@@ -202,9 +163,18 @@ struct DocumentWindowRootView: View {
           hasEditableBuffer: appState.documentHasEditableBuffer
         ) { window in
           currentWindow = window
+          ManagedWindowRestoration.disable(on: window)
           // Publish this window's owning controller so a cross-window "Close
           // from Open Files" routes its dirty guard through this session.
           DocumentWindowRegistry.shared.registerController(controller, for: window)
+          // Keep the non-modal error surface tied to its exact native owner.
+          // Settings presentation can be blocked by a sheet on a different
+          // document than the command fallback; modal errors must return to
+          // the window that actually owns that sheet.
+          CommandSurfaceContext.shared.register(
+            appState: appState,
+            controller: controller,
+            for: window)
           // Give the red close button / tab "×" the same conscious Save / Don't
           // Save / Cancel lifecycle ⌘W has, instead of the silent teardown
           // flush. EVERY window this app can build gets it, not just the
@@ -273,8 +243,8 @@ struct DocumentWindowRootView: View {
         else { return }
         CommandSurfaceContext.shared.adopt(appState: appState, controller: controller)
       }
-      // App-wide save-on-close guard. Every window (factory-built document tab AND
-      // state-restored WindowGroup scene) shares this root, and every close
+      // App-wide save-on-close guard. Every managed window (scene-owned launcher
+      // and factory-built document tab) shares this root, and every close
       // trigger — red close button, the tab's "×", the sidebar "Close from Open
       // Files", or ⌘W falling through to a native window close — posts
       // `willCloseNotification` for the closing window. Filtering to THIS window's

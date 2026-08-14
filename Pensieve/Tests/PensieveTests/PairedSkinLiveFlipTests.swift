@@ -36,7 +36,7 @@ final class PairedSkinLiveFlipTests: XCTestCase {
       contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.contentView = surface.scrollView
     surface.scrollView.frame = NSRect(x: 0, y: 0, width: 600, height: 400)
     surface.scrollView.layoutSubtreeIfNeeded()

@@ -44,11 +44,49 @@ struct DocumentSession: Equatable {
     /// preview all go quiet — so no surface can act on, or worse WRITE, the
     /// empty placeholder buffer standing in for a file that is still loading.
     case loading(DocumentRef)
-    case untitled(title: String, identity: DocumentIdentity, recoveryID: UUID?)
+    case untitled(title: String, identity: DocumentIdentity)
     case fileBacked(DocumentRef)
   }
 
   private var kind: Kind
+  /// The recovery draft this buffer already owns, if it wrote one.
+  ///
+  /// Stored ALONGSIDE the kind, not inside `.untitled`, because every buffer
+  /// shape can produce a draft: a file-backed one is stashed by
+  /// `DocumentStore.stashClosingBufferAsRecoveryDraft` whenever its window tears
+  /// down without reaching disk (auto-save off, or a save that failed). While
+  /// this lived in the `.untitled` payload the getter answered `nil` for such a
+  /// buffer and the setter silently dropped the write-back, so EVERY stash of the
+  /// same file minted a fresh UUID — one new draft file per close, forever, with
+  /// nothing on disk ever converging. Keeping it here is what makes "one buffer,
+  /// one draft" true for all of them.
+  private var storedRecoveryID: UUID?
+  /// Original file protected by an adopted file-backed recovery record. The
+  /// buffer remains untitled until the user explicitly chooses Save to Original
+  /// or Save As, so merely opening recovery can never overwrite this URL.
+  private var storedRecoverySourceURL: URL?
+  /// Drafts this buffer has already OUTLIVED but whose files are still on disk,
+  /// because the delete that should have retired them failed.
+  ///
+  /// Kept apart from `storedRecoveryID` because the two answer different
+  /// questions. `storedRecoveryID` says "this buffer's durable copy is a draft",
+  /// which stops being true the moment the bytes reach their real destination —
+  /// so a save retires it whether or not the cleanup succeeded, and everything
+  /// that routes on the session's MODE (`recoverySourceURL`, autosave's
+  /// dispatch, ⌘S's destination) keeps agreeing with what is actually on disk.
+  /// This set is the leftover FILE, which nothing else routes on: the next
+  /// durable save retries it, and until then the draft simply stays where the
+  /// user can find it in Recovered Drafts.
+  private var storedPendingRecoveryRetirementIDs: Set<UUID> = []
+  /// The last failed write to this buffer's original file, kept separately from
+  /// the visible data-loss message.
+  ///
+  /// A failed original write followed by a failed recovery write produces one
+  /// compound error for the window. If a later recovery tick succeeds, it must
+  /// still describe the ORIGINAL as stale — not reuse that compound message and
+  /// claim that the already-resolved recovery failure is current. This value is
+  /// therefore buffer-scoped state, never text parsed back out of the banner.
+  private var storedOriginalSaveFailure: String?
   var text: String
   var isDirty: Bool
 
@@ -59,7 +97,7 @@ struct DocumentSession: Equatable {
     identityID: UUID = UUID()
   ) -> DocumentSession {
     DocumentSession(
-      kind: .untitled(title: title, identity: .untitled(identityID), recoveryID: nil),
+      kind: .untitled(title: title, identity: .untitled(identityID)),
       text: "",
       isDirty: false)
   }
@@ -80,6 +118,13 @@ struct DocumentSession: Equatable {
     }
     set {
       kind = newValue.map(Kind.fileBacked) ?? .empty
+      // Assigning a document does NOT necessarily replace the buffer. Rename
+      // and move re-key the SAME live buffer through this setter; dropping its
+      // recovery ID there strands the old claimed draft and lets the next tick
+      // mint a second one. Real buffer replacements use `load`,
+      // `beginLoading`, `createUntitled`, `restoreUntitled`, or `clear`, all of
+      // which reset the association explicitly. Successful saves retire it via
+      // `retireRecoveryAssociation()` after the recovery file is deleted.
     }
   }
 
@@ -95,7 +140,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return nil
-    case .untitled(_, let identity, _):
+    case .untitled(_, let identity):
       return identity.standardized
     case .fileBacked(let document), .loading(let document):
       return .file(document.url.standardizedFileURL)
@@ -120,22 +165,42 @@ struct DocumentSession: Equatable {
     return true
   }
 
+  /// The draft this buffer owns. Reading it is how every writer — the debounced
+  /// autosave, the teardown stash — upserts INTO the draft it already wrote
+  /// instead of minting a new UUID, so one buffer is one draft file no matter
+  /// how many times it is persisted.
   var recoveryID: UUID? {
-    get {
-      guard case .untitled(_, _, let recoveryID) = kind else { return nil }
-      return recoveryID
-    }
+    get { storedRecoveryID }
     set {
-      guard case .untitled(let title, let identity, _) = kind else { return }
-      // Once a draft is backed by a recovery record its persistent identity must
-      // become `.recovered(recoveryID)` — the SAME key a post-relaunch restore
-      // rebuilds via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)`
-      // key here would derive the AI session store key `untitled:<uuid>` before
-      // close but `recovery:<recoveryID>` after restore, silently dropping the
-      // AI continuation saved for this draft. Nil clears (discard) keep identity.
+      storedRecoveryID = newValue
+      // A FILE-BACKED buffer keeps its file identity: the draft is a stash of an
+      // edit that has not reached that file, not a new document. Only an
+      // UNTITLED one is re-keyed, and it must be: once a draft is backed by a
+      // recovery record its persistent identity has to become
+      // `.recovered(recoveryID)` — the SAME key a post-relaunch restore rebuilds
+      // via `restoreUntitled`. Keeping the ephemeral `.untitled(uuid)` key would
+      // derive the AI session store key `untitled:<uuid>` before close but
+      // `recovery:<recoveryID>` after restore, silently dropping the AI
+      // continuation saved for this draft. Nil clears (discard) keep identity.
+      guard case .untitled(let title, let identity) = kind else { return }
       let resolvedIdentity = newValue.map(DocumentIdentity.recovered) ?? identity
-      kind = .untitled(title: title, identity: resolvedIdentity, recoveryID: newValue)
+      kind = .untitled(title: title, identity: resolvedIdentity)
     }
+  }
+
+  var recoverySourceURL: URL? {
+    storedRecoverySourceURL?.standardizedFileURL
+  }
+
+  /// Draft files this buffer no longer owns and could not delete. Read by the
+  /// next durable save, which retries them.
+  var pendingRecoveryRetirementIDs: Set<UUID> {
+    get { storedPendingRecoveryRetirementIDs }
+    set { storedPendingRecoveryRetirementIDs = newValue }
+  }
+
+  var pendingOriginalSaveFailure: String? {
+    storedOriginalSaveFailure
   }
 
   var hasEditableBuffer: Bool {
@@ -155,7 +220,7 @@ struct DocumentSession: Equatable {
     switch kind {
     case .empty:
       return ""
-    case .untitled(let title, _, _):
+    case .untitled(let title, _):
       return title
     case .fileBacked(let document), .loading(let document):
       return document.title
@@ -176,6 +241,10 @@ struct DocumentSession: Equatable {
 
   mutating func load(document: DocumentRef, text: String) {
     self.kind = .fileBacked(document)
+    self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
+    self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = false
   }
@@ -185,21 +254,57 @@ struct DocumentSession: Equatable {
   /// lands the real text — see `Kind.loading`.
   mutating func beginLoading(document: DocumentRef) {
     self.kind = .loading(document)
+    self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
+    self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
+  }
+
+  /// The current buffer reached its intended durable destination, so its
+  /// emergency recovery record no longer belongs to it.
+  ///
+  /// Deliberately says nothing about `storedPendingRecoveryRetirementIDs`: what
+  /// this buffer IS is settled by the write, while a draft FILE that could not
+  /// be deleted is a leftover the next save retries. Clearing the leftovers here
+  /// would make a failed cleanup indistinguishable from a successful one.
+  mutating func retireRecoveryAssociation() {
+    storedRecoveryID = nil
+    storedRecoverySourceURL = nil
+  }
+
+  mutating func recordOriginalSaveFailure(_ message: String) {
+    storedOriginalSaveFailure = message
+  }
+
+  mutating func clearOriginalSaveFailure() {
+    storedOriginalSaveFailure = nil
   }
 
   mutating func createUntitled(title: String = "Untitled.md") {
-    self.kind = .untitled(title: title, identity: .untitled(UUID()), recoveryID: nil)
+    self.kind = .untitled(title: title, identity: .untitled(UUID()))
+    // A brand new buffer owns no draft. The one it eventually writes is ITS own,
+    // and the draft the replaced buffer wrote stays where the user can find it.
+    self.storedRecoveryID = nil
+    self.storedRecoverySourceURL = nil
+    self.storedPendingRecoveryRetirementIDs = []
+    self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
   }
 
-  mutating func restoreUntitled(title: String, text: String, recoveryID: UUID) {
-    self.kind = .untitled(
-      title: title,
-      identity: .recovered(recoveryID),
-      recoveryID: recoveryID)
+  mutating func restoreUntitled(
+    title: String,
+    text: String,
+    recoveryID: UUID,
+    sourceURL: URL? = nil
+  ) {
+    self.kind = .untitled(title: title, identity: .recovered(recoveryID))
+    self.storedRecoveryID = recoveryID
+    self.storedRecoverySourceURL = sourceURL?.standardizedFileURL
+    self.storedPendingRecoveryRetirementIDs = []
+    self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = true
   }

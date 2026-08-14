@@ -18,20 +18,14 @@ final class ToolbarBridgeRig {
   let themeManager: ThemeManager
   let window: NSWindow
 
-  /// A rig window that keeps the width it asks for.
+  /// A rig window that keeps the width it asks for without ever being ordered.
   ///
-  /// AppKit constrains an ordered-in window to the screen it lands on, and it
-  /// constrains the WIDTH too: measured on this rig, a requested 1600pt comes
-  /// back as 1512pt on a 1512pt display. That silent shrink is what makes an
-  /// unguarded rig machine-dependent — below the toolbar's clipping threshold a
-  /// family goes into the "»" overflow, and a clipped control is detached from
-  /// the window (`control.window == nil`), so a synthesized click lands nowhere
-  /// while every structural assertion still passes. That is precisely the shape
-  /// of the CI failure ("clicking the mode picker changed nothing") on a runner
-  /// whose virtual display is far smaller than an operator's: the toolbar was
-  /// never given the width the rig declared. The window is still parked
-  /// offscreen at zero alpha, so a frame no screen can hold costs the operator
-  /// nothing.
+  /// An ordered-in test window is a real WindowServer surface even when it is
+  /// transparent and parked offscreen. Besides leaking into Mission Control,
+  /// AppKit can constrain that surface to the runner's display and make toolbar
+  /// clipping machine-dependent. Keeping the window un-ordered preserves the
+  /// requested geometry and lets the hosting/view hierarchy lay out entirely in
+  /// process.
   final class UnconstrainedWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
       frameRect
@@ -43,7 +37,17 @@ final class ToolbarBridgeRig {
   /// pane, the same toolbar, and no editor and no preview anywhere in the tree.
   /// Every AppKit-side chrome pass this app had used to hang off one of those
   /// two panes, so that window received none of it.
-  init(defaults: UserDefaults, width: CGFloat = 1600, hostsEditor: Bool = true) {
+  ///
+  /// `ambientControlSize` sets the INHERITED control size the toolbar is built
+  /// under, which is the only way a test can tell a DECLARED size from an
+  /// ambient one. Reading `NSControl.controlSize` back cannot: it reports the
+  /// resolved value, and on an OS whose ambient default already IS the declared
+  /// size the two are indistinguishable — which is exactly the shape that let a
+  /// macOS 27 regression pass a green macOS 26 runner.
+  init(
+    defaults: UserDefaults, width: CGFloat = 1600, hostsEditor: Bool = true,
+    ambientControlSize: ControlSize? = nil
+  ) {
     appState = AppState(defaults: defaults)
     appState.documentSession = .untitled()
     appState.documentSession.text = "hello brave new world"
@@ -55,30 +59,34 @@ final class ToolbarBridgeRig {
       contentRect: NSRect(x: 0, y: 0, width: width, height: 800),
       styleMask: WindowChromeRecipe.documentStyleMask,
       backing: .buffered,
-      defer: false)
+      defer: true)
     window.isReleasedWhenClosed = false
     window.toolbarStyle = WindowChromeRecipe.toolbarStyle
-    let hosting = NSHostingView(
-      rootView: AnyView(
-        ToolbarBridgeHost(
-          appState: appState, controller: controller, themeManager: themeManager,
-          hostsEditor: hostsEditor
-        )
-        // The chrome contract every production window root carries
-        // (`DocumentWindowRootView`). A rig that left it off would be modelling
-        // a window this app never builds.
-        .pensieveSkinAppearance(themeManager)))
+    var rootView = AnyView(
+      ToolbarBridgeHost(
+        appState: appState, controller: controller, themeManager: themeManager,
+        hostsEditor: hostsEditor
+      )
+      // The chrome contract every production window root carries
+      // (`DocumentWindowRootView`). A rig that left it off would be modelling
+      // a window this app never builds.
+      .pensieveSkinAppearance(themeManager))
+    // OUTSIDE the host, so it lands in the environment the toolbar declaration
+    // inherits — the same place a future SDK would raise the toolbar's own
+    // default — rather than overriding anything the declaration states itself.
+    if let ambientControlSize {
+      rootView = AnyView(rootView.controlSize(ambientControlSize))
+    }
+    let hosting = NSHostingView(rootView: rootView)
     // The same bridge the factory tab path uses to carry `.toolbar` content
     // from a SwiftUI root into an AppKit window.
     hosting.sceneBridgingOptions = [.toolbars, .title]
     window.contentView = hosting
-    // The bridge only builds the toolbar for a window that is ordered in, but
-    // a test must never flash chrome across an operator's screen: the window
-    // is parked far offscreen and fully transparent, which still lays out and
-    // still tracks synthesized mouse events.
-    window.setFrameOrigin(NSPoint(x: -9000, y: -9000))
-    window.alphaValue = 0
-    window.makeKeyAndOrderFront(nil)
+    // Assigning the hosting view attaches the real SwiftUI graph to a deferred
+    // AppKit host. The rig deliberately never asks AppKit for a backing window:
+    // even an un-ordered, eagerly allocated NSWindow has a CGWindowID and
+    // therefore exists in WindowServer; invisible geometry is not isolation
+    // either.
     window.layoutIfNeeded()
     settle(0.6)
   }
@@ -87,14 +95,31 @@ final class ToolbarBridgeRig {
   /// closed window keeps the SwiftUI graph (and its window reference) alive,
   /// and a live graph can still draw into a later test's assertions.
   func tearDown() {
-    window.orderOut(nil)
+    assertUnpublished()
     window.contentView = nil
     window.close()
+    assertUnpublished()
   }
 
   func settle(_ seconds: TimeInterval = 0.3) {
+    assertUnpublished()
     window.layoutIfNeeded()
     RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    assertUnpublished()
+  }
+
+  /// A deferred fixture has no native backing surface until some operation
+  /// asks AppKit to publish it. Pin that boundary on every settle: a future
+  /// helper can neither order the window nor allocate a CGWindowID unnoticed.
+  private func assertUnpublished(
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    XCTAssertFalse(
+      window.isVisible,
+      "the toolbar unit rig became a visible native window", file: file, line: line)
+    XCTAssertEqual(
+      window.windowNumber, -1,
+      "the toolbar unit rig allocated a WindowServer surface", file: file, line: line)
   }
 
   func resize(to width: CGFloat) {
@@ -221,6 +246,29 @@ final class ToolbarBridgeRig {
     return overflowMatches(toolbelt.overflowFamilies)
   }
 
+  /// Waits for every AppKit-authored toolbar surface the production sinks own:
+  /// overflow forms and mode-segment tooltips. macOS 27 can re-derive either
+  /// after the first SwiftUI pass, so a rig that returns earlier hands tests a
+  /// transient toolbar the operator never meaningfully interacts with.
+  @discardableResult
+  func awaitBridgeConvergence(attempts: Int = 40) -> Bool {
+    let titles = EditorMode.allCases.map(\.label)
+    func matches() -> Bool {
+      guard let picker = modePickerControl(), picker.segmentCount == titles.count else {
+        return false
+      }
+      let tooltips = (0..<picker.segmentCount).map { picker.toolTip(forSegment: $0) ?? "" }
+      return overflowMatches(toolbelt.overflowFamilies) && tooltips == titles
+    }
+
+    for _ in 0..<attempts {
+      if matches() { return true }
+      window.update()
+      settle(0.02)
+    }
+    return matches()
+  }
+
   /// Everything a failing overflow assertion needs to name its own cause on a
   /// machine nobody can attach a debugger to: the geometry the rig actually got
   /// (not the one it asked for), whether the window is really on screen, how
@@ -322,8 +370,11 @@ final class ToolbarBridgeRig {
       let down = event(.leftMouseDown, pressure: 1),
       let up = event(.leftMouseUp, pressure: 0)
     else { return }
-    NSApp.postEvent(up, atStart: true)
-    window.sendEvent(down)
+    // Posting the terminator before dispatching mouse-down used to be enough,
+    // but macOS 27 can consume that queued event before the segmented cell's
+    // tracking loop starts. Deliver it on the next runloop turn instead.
+    DispatchQueue.main.async { NSApp.postEvent(up, atStart: true) }
+    control.mouseDown(with: down)
   }
 }
 
@@ -332,15 +383,22 @@ extension XCTestCase {
   /// at all: with no `NSToolbar` there is nothing for these suites to read, and
   /// a failure there would be about the environment, not the toolbelt.
   @MainActor
-  func makeToolbarRig(prefix: String, width: CGFloat = 1600, hostsEditor: Bool = true) throws
+  func makeToolbarRig(
+    prefix: String, width: CGFloat = 1600, hostsEditor: Bool = true,
+    ambientControlSize: ControlSize? = nil
+  ) throws
     -> ToolbarBridgeRig
   {
     let rig = ToolbarBridgeRig(
-      defaults: makeEphemeralDefaults(prefix: prefix), width: width, hostsEditor: hostsEditor)
+      defaults: makeEphemeralDefaults(prefix: prefix), width: width, hostsEditor: hostsEditor,
+      ambientControlSize: ambientControlSize)
     guard rig.window.toolbar != nil else {
       rig.tearDown()
       throw XCTSkip("headless window did not bridge a SwiftUI toolbar")
     }
+    XCTAssertTrue(
+      rig.awaitBridgeConvergence(),
+      "the production toolbar sinks never converged — " + rig.overflowDiagnostics)
     return rig
   }
 }

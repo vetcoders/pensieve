@@ -102,8 +102,10 @@ dist/
 !SECURITY.md
 !AGENTS.md
 !docs/keyboard-shortcuts-and-file-lifecycle-contract.md
+!docs/runtime-testing.md
 /tmp
 /dist
+/.runtime/
 /docs/superpowers
 *.backup
 /docs/workforce

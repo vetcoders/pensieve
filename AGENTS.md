@@ -41,7 +41,7 @@ Pensieve/Sources/Pensieve/
   Search/      index-backed workspace search
   Workspace/   substrate, cache, scanning
 scripts/       build-release.sh, ui-smoke.sh, semgrep-with-policy.sh
-docs/          landing page (index.html) + architecture notes
+docs/          runtime-testing canon, product contract, architecture notes
 ```
 
 ## Traps worth knowing before you edit
@@ -52,21 +52,40 @@ Any operation that opens, closes, renames or forgets a document has to reach all
 of them by hand. Read `docs/architecture/document-identity.md` before touching
 that area — it is the single largest source of click-to-reproduce bugs here.
 
-**`DocumentStore.swift` is a hub** with 20 direct and 56 transitive consumers.
-Run `loct impact` on it before changing a signature.
+**`DocumentStore.swift` is a hub.** Its consumer count changes quickly as the
+lifecycle surface evolves; run `loct impact` on it before changing a signature
+instead of relying on a historical count.
 
-**`make ui-smoke` runs against an isolated smoke identity, not the operator's
-app.** It stages a renamed, re-signed copy of the built app under
-`$SMOKE_ROOT` as `PensieveSmoke` (bundle id `io.vetcoders.pensieve.smoke`) and
-drives that — a separate process name, defaults domain, and support directory
-from the operator's production instance in `/Applications`. See
-`scripts/ui-smoke.sh` for the identity-isolation rationale.
+**`dist/Pensieve.app` and `make run-release` use production identity and
+production state; `make run` is also non-isolated.** These are not clean smoke
+lanes: they may restore or write the operator's real support, Keychain,
+workspaces, files, drafts, recents, and window state. Use
+`make manual-smoke` for a fresh interactive identity, its `-reopen`, `-verify`,
+and `-clean` companions for the same experiment, or `make ui-smoke` for an
+automated ephemeral run. Each independent scenario owns a unique,
+manifest-scoped runtime identity, verifies trusted build provenance and exact
+executable/FFI payloads before launch, and fails closed rather than touching
+`io.vetcoders.pensieve` or production state. Historical or dirty-source runs
+are explicitly labelled and are not release evidence. Low-level identity,
+cleanup, compatibility and evidence rules live only in the canonical
+`docs/runtime-testing.md` contract.
 
 **`ui-smoke.sh` runs under whatever `bash` is first on PATH.** The shebang is
 `#!/usr/bin/env bash`, so a clean environment picks the system bash 3.2. Empty
 arrays under `set -u`, and heredocs nested inside `$(...)`, are fatal there and
 fine under Homebrew's bash 5. Verify with `/bin/bash -n scripts/ui-smoke.sh`,
 not just `bash -n`.
+
+**Unit tests must not present native window fixtures on the operator's
+desktop.** An AppKit test may allocate only an unshown `NSWindow` or `NSPanel`
+constructed with the literal argument `defer: true` to pin inert window
+properties. The default `NSWindow()`/`NSPanel()` constructors, `defer: false`,
+and merely parking a fixture offscreen are not isolation: they allocate a real
+WindowServer object. A unit test must not call `beginSheet`, `addChildWindow`,
+`orderFront`, `makeKeyAndOrderFront`, or otherwise attach/order that fixture.
+Inject relationship seams and synthetic notifications instead. A scenario that
+must exercise real ordering belongs in a uniquely isolated runtime smoke and
+must be announced before it can take focus.
 
 **Suppressions carry rationale.** `.semgrep-policy.json` records accepted
 findings with a `decision` and a `rationale` field. If you need to silence a
@@ -97,5 +116,12 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
-If `make release-clean` dies with `Directory not empty`, a live SourceKit
-indexer is racing the delete; use `make clean && make release` instead.
+`Permission denied` or `Directory not empty` while a release retires `dist/` or
+`Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
+`Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,
+and unlinking a read-only child needs write permission on its parent. The
+cleanup helpers in `scripts/lib/build-provenance.sh` unlock those exact derived
+trees first, so `make release-clean` retires them without prompting. A live
+SourceKit indexer repopulating `.build/index-build` mid-delete can raise the
+same `Directory not empty` — that secondary race is what the rename-aside in the
+`clean` target covers.

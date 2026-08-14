@@ -49,18 +49,11 @@ registries, and "forget document X" would be a single call.
 
 ## Where it stopped
 
-`persistentID` has **four occurrences across three files** in the whole
-repository:
-
-| Site                               | Purpose                           |
-| ---------------------------------- | --------------------------------- |
-| `DocumentSession.swift:18`         | the definition                    |
-| `DocumentSession.swift:83`         | `persistentAIDocumentID`          |
-| `DocumentWindowModel.swift:38`     | `aiDocumentID` for the AI session |
-| `DocumentWindowRegistry.swift:382` | a string inside a debug log line  |
-
-No persistence layer uses it. The unifying key currently unifies one thing: the
-AI conversation keyed to a document.
+`DocumentSession` defines `persistentID`. `DocumentWindowModel` consumes it as
+the AI-session identity, while `DocumentWindowRegistry` includes it in identity
+diagnostics. No persistence store uses it: the durable working set, bookmarks
+and RecoveryStore still keep their own keys. The exact call-site count is not an
+architectural invariant and must not be copied into this document.
 
 ---
 
@@ -72,7 +65,7 @@ AI conversation keyed to a document.
 | Window registry           | `DocumentWindowRegistry`     | `DocumentIdentity` + `ObjectIdentifier(NSWindow)` | no                |
 | File bookmarks            | `BookmarkStore`              | path + bookmark `Data` bytes                      | yes               |
 | Workspace roots           | `BookmarkStore`              | separate defaults key                             | yes               |
-| Recovery drafts           | `RecoveryStore`              | draft `UUID`, one file each                       | yes               |
+| Recovery drafts           | `RecoveryStore`              | draft `UUID` + payload/sidecars                    | yes               |
 | Untitled documents        | `DocumentSession`            | in-memory `UUID` + optional `recoveryID`          | only via recovery |
 
 `BookmarkStore` alone holds three defaults keys:
@@ -87,6 +80,12 @@ The first is named `legacy` in the source — a single-folder bookmark supersede
 by multi-root `rootBookmarks`. The migration started and the old path stayed.
 That is the same half-finished pattern as `DocumentIdentity` itself, one layer
 down.
+
+One RecoveryStore record is not one filesystem object. Its UUID names a visible
+Markdown payload (`.md`), a title sidecar (`.title`), and, for a file-backed
+buffer, a required original-path sidecar (`.source`). The ownership claim that
+keeps two live windows from adopting the same record exists only in process; a
+crash drops the claim while leaving the record available at the next launch.
 
 ---
 
@@ -105,14 +104,18 @@ defects:
 - **Open through a symlink** — `forgetFile` compares `standardizedFileURL`, which
   does not resolve symlinks, while bookmark resolution returns the canonical
   path. The entry never matches and the file comes back.
-- **Save a recovered draft** — `saveRecoveredDraftAs` writes and indexes but
-  skips the registration that `saveAs` performs, so the file lands in neither
-  the working set nor recents and gets no security-scoped bookmark.
 - **Close a document from another window** — identity routing exists in the
   registry, but the completion captures the _calling_ window's controller.
 
-Each was found by clicking, not by a test, because no single type forces the
-stores to agree.
+These are historical examples found first through runtime clicking because no
+single type forced the stores to agree. Targeted regression tests now cover the
+repaired paths; the underlying multi-store coordination risk remains.
+
+The launcher-level recovered-draft Save As route now closes one of those fan-out
+gaps explicitly: after the destination write succeeds it registers the file in
+the working set, persists the ad-hoc bookmark when required, indexes it and adds
+it to native Recents. It deliberately does not select or open the saved file in
+the launcher that performed the rescue.
 
 ---
 
@@ -141,19 +144,50 @@ the persistence half.
 When you add or change an operation on a document, walk all six rows of the
 table above and decide explicitly for each one. In particular:
 
-- **Adding a way to close/remove a document?** It must reach `forgetOpenFile`,
-  which is the choke point that clears the bookmark. Bypassing it is what makes
-  files immortal.
+- **Adding a way to close/remove a document?** An ordinary close/remove must
+  reach `forgetOpenFile`, which clears the working-set row and matching
+  bookmark. Trash is intentionally different: a moved bookmark resolves to its
+  Trash landing path, so that lane uses `pruneTrashedFiles()` and releases its
+  security scope through the cached pre-trash origin or, when no origin exists,
+  through the bookmark blob itself.
 - **Adding a way to create/save a document?** Compare against `saveAs` — that is
   the path that registers bookmark, working set and recents together.
 - **Comparing paths?** Use one convention. `standardizedFileURL` does not resolve
   symlinks; `resolvingSymlinksInPath()` does. Mixed conventions across stores
   produce entries that never match.
+- **Comparing a path that may no longer exist?** Use
+  `BookmarkStore.identityPath`. Both `standardizedFileURL` and
+  `resolvingSymlinksInPath()` drop a leading `/private` only while the target
+  still exists, so a trashed file reads as `/var/…` from its live row and
+  `/private/var/…` from its bookmark blob. `identityPath` folds that prefix for
+  the three directories macOS publishes twice — `/private/var`, `/private/tmp`,
+  `/private/etc`, the symlink aliases — and returns every other path untouched.
+  It is an identity key, **not** a general canonicalizer: it resolves no
+  symlinks of its own, it does not fold the alias roots spelled on their own,
+  and it must never be handed back to the filesystem. Folding `/private`
+  unconditionally is the bug this narrowing fixed — it fused `/private/foo` with
+  an unrelated `/foo`, and with them their security-scoped grants.
+  `FileWatcher.canonicalPath` folds the same three aliases for FSEvents paths;
+  the two must stay in step.
+- **Rewriting the whole persisted workspace?** `BookmarkStore.replaceWorkspace`
+  is all-or-nothing on purpose, and its caller (`removeRoot`) has already changed
+  the LIVE workspace by the time it hears about a failure — so a refused write
+  leaves the removed root persisted and it comes back on the next launch. A
+  working-set file that can no longer be minted a bookmark therefore does not
+  abort the rewrite: its already-persisted blob is carried forward, matched by
+  `identityPath` against the path the blob was minted for (`.pathKey` read out of
+  the blob — resolution cannot answer for an unreachable file). A URL with no
+  persisted blob still throws, because carrying nothing forward would mean
+  inventing an entry. Anything else that a root removal persists — the exclusions
+  in `workspace.json` — must move on the same side of that outcome, or a relaunch
+  reads two halves of one workspace that disagree about which roots exist.
 - **Adding persistence?** Key it by `persistentID`, not by URL. Every new
   URL-keyed store makes the eventual consolidation more expensive.
-- **Touching `DocumentStore.swift`?** It has 20 direct and 56 transitive
-  consumers. Run `loct impact Pensieve/Sources/Pensieve/Storage/DocumentStore.swift`
-  before changing a signature.
+- **Touching `DocumentStore.swift`?** It is a high-fan-out hub and its consumer
+  count changes as the app evolves. Run
+  `loct impact Pensieve/Sources/Pensieve/Storage/DocumentStore.swift` against
+  the current tree before changing a signature; do not rely on a historical
+  count copied into documentation.
 
 ---
 

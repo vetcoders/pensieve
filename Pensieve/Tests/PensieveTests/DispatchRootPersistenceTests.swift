@@ -192,7 +192,8 @@ private final class DispatchRootRecordingLauncher: AgentPromptLaunching, @unchec
       runID: "dispatch-root-test",
       reportPath: nil,
       exitCode: 0,
-      output: "receipt")
+      output: "receipt",
+      launchVerification: .workerSpawnRecorded)
   }
 
   func workingDirectories() -> [URL] {

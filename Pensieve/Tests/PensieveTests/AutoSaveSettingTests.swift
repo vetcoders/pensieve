@@ -146,12 +146,14 @@ final class AutoSaveSettingTests: XCTestCase {
     let folder = try makeTemporaryFolder()
     let noteURL = folder.appendingPathComponent("off.md")
     try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
 
     let appState = AppState()
     var writeCount = 0
     let store = makeTestDocumentStore(
       autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
       indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
       savingSettings: makeAutoSaveSettings(enabled: false),
       writeDocument: { text, url in
         writeCount += 1
@@ -162,14 +164,231 @@ final class AutoSaveSettingTests: XCTestCase {
     appState.activeDocumentText = "edited with auto-save off"
     store.documentDidChange(appState: appState)
 
-    // Long enough for the (cancelled) write to betray itself.
-    try await Task.sleep(nanoseconds: 200_000_000)
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "edited with auto-save off"
+    }
 
     XCTAssertEqual(writeCount, 0, "auto-save off must not write the user's file on its own")
     XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "initial")
     XCTAssertTrue(
       appState.documentSession.isDirty,
       "the edit stays unsaved, which is what makes the close question honest")
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.sourceURL, noteURL.standardizedFileURL)
+    XCTAssertEqual(recovery.displayTitle, "Unsaved changes — off.md")
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().count, 1,
+      "one live file-backed buffer must own exactly one recovery record")
+  }
+
+  @MainActor
+  func testExplicitSaveFailureFallsBackToRecoveryAndLaterSuccessRetiresIt() throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("explicit-save.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+    let appState = AppState()
+    var originalWriteShouldFail = true
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 60_000, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      writeDocument: { text, url in
+        if originalWriteShouldFail {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        try text.write(to: url, atomically: true, encoding: .utf8)
+      })
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "protected edit"
+    appState.documentSession.isDirty = true
+
+    store.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "on disk")
+    XCTAssertEqual(recoveryStore.loadDrafts().map(\.text), ["protected edit"])
+    XCTAssertTrue(appState.documentSession.isDirty, "the original is still stale")
+    XCTAssertNil(appState.unresolvedDataLoss, "the recovery copy made the bytes durable")
+    XCTAssertTrue(
+      appState.currentError?.message.contains("Could not save explicit-save.md") == true)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertNotNil(appState.documentSession.pendingOriginalSaveFailure)
+    let recoveryID = try XCTUnwrap(appState.documentSession.recoveryID)
+
+    originalWriteShouldFail = false
+    store.save(appState: appState)
+
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "protected edit")
+    XCTAssertFalse(appState.documentSession.isDirty)
+    XCTAssertTrue(recoveryStore.loadDrafts().isEmpty)
+    XCTAssertFalse(
+      FileManager.default.fileExists(
+        atPath: folder.appendingPathComponent("Recovery/\(recoveryID.uuidString).md").path))
+    XCTAssertNil(appState.documentSession.recoveryID)
+    XCTAssertNil(appState.documentSession.pendingOriginalSaveFailure)
+    XCTAssertNil(appState.currentError)
+  }
+
+  @MainActor
+  func testAutoSaveOffRecoveryTickKeepsTheOriginalFailureSeparateFromRecoveryFailure()
+    async throws
+  {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("stale-original.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("Recovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
+    let recoveryStore = RecoveryStore(directoryURL: blockedRecoveryURL)
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false),
+      writeDocument: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.activeDocumentText = "unsafe edit"
+    appState.documentSession.isDirty = true
+
+    store.save(appState: appState)
+    let compoundFailure = try XCTUnwrap(appState.unresolvedDataLoss?.message)
+    XCTAssertTrue(compoundFailure.contains("Could not save stale-original.md"))
+    XCTAssertTrue(compoundFailure.contains("Could not write recovery copy"))
+    XCTAssertTrue(
+      appState.documentSession.pendingOriginalSaveFailure?.contains(
+        "Could not save stale-original.md") == true)
+    XCTAssertFalse(
+      appState.documentSession.pendingOriginalSaveFailure?.contains(
+        "Could not write recovery copy") == true,
+      "the buffer stored the compound banner as if it were the original failure")
+
+    try FileManager.default.removeItem(at: blockedRecoveryURL)
+
+    appState.activeDocumentText = "unsafe edit, now recovered"
+    store.documentDidChange(appState: appState)
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "unsafe edit, now recovered"
+    }
+
+    XCTAssertNil(
+      appState.unresolvedDataLoss,
+      "durable recovery bytes left the buffer classified as memory-only data loss")
+    XCTAssertEqual(appState.currentError?.severity, .status)
+    XCTAssertTrue(
+      appState.currentError?.message.contains("Could not save stale-original.md") == true)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    XCTAssertTrue(
+      appState.currentError?.message.contains("original file was not overwritten") == true)
+    XCTAssertFalse(
+      appState.currentError?.message.contains("Could not write recovery copy") == true,
+      "a resolved recovery failure was copied into the stale-original status")
+    XCTAssertFalse(
+      appState.currentError?.message.contains("window will stay open") == true,
+      "the success status still claimed the recovery write had failed")
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "on disk")
+
+    appState.documentSession.createUntitled(title: "A different buffer.md")
+    XCTAssertNil(
+      appState.documentSession.pendingOriginalSaveFailure,
+      "a replacement buffer inherited the previous file's failure identity")
+  }
+
+  @MainActor
+  func testAutoSaveOffRecoveryOnlyFailureResolvesToNeutralSafeStatus() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("recovery-only.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let blockedRecoveryURL = folder.appendingPathComponent("Recovery", isDirectory: false)
+    try Data("not a directory".utf8).write(to: blockedRecoveryURL, options: .atomic)
+    let recoveryStore = RecoveryStore(directoryURL: blockedRecoveryURL)
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+
+    appState.activeDocumentText = "first edit"
+    store.documentDidChange(appState: appState)
+    try await waitUntil {
+      appState.unresolvedDataLoss?.message.contains("Could not write recovery copy") == true
+    }
+    XCTAssertNil(appState.documentSession.pendingOriginalSaveFailure)
+
+    try FileManager.default.removeItem(at: blockedRecoveryURL)
+    appState.activeDocumentText = "second edit"
+    store.documentDidChange(appState: appState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "second edit" }
+
+    XCTAssertNil(appState.unresolvedDataLoss)
+    XCTAssertEqual(
+      appState.currentError?.message,
+      "A recovery copy is safe; the original file was not overwritten.")
+    XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "on disk")
+  }
+
+  @MainActor
+  func testAutoSaveOffRecoveryTickDoesNotClearAnUnrelatedStatus() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("status.md")
+    try "on disk".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60_000),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: false))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "on disk")
+    appState.lastError = "A separate workspace warning"
+
+    appState.activeDocumentText = "recovered edit"
+    store.documentDidChange(appState: appState)
+    try await waitUntil { recoveryStore.loadDrafts().first?.text == "recovered edit" }
+
+    XCTAssertEqual(appState.lastError, "A separate workspace warning")
+    XCTAssertNil(appState.unresolvedDataLoss)
+  }
+
+  @MainActor
+  func testFailedAutoSaveFallsBackToARecoveryCopyWithoutOverwritingTheOriginal() async throws {
+    let folder = try makeTemporaryFolder()
+    let noteURL = folder.appendingPathComponent("removed-before-autosave.md")
+    try "initial".write(to: noteURL, atomically: true, encoding: .utf8)
+    let recoveryStore = RecoveryStore(directoryURL: folder.appendingPathComponent("Recovery"))
+
+    let appState = AppState()
+    let store = makeTestDocumentStore(
+      autosaver: Autosaver(saveDelayMilliseconds: 20, indexDelayMilliseconds: 60),
+      indexDatabase: temporaryIndexDatabase(in: folder),
+      recoveryStore: recoveryStore,
+      savingSettings: makeAutoSaveSettings(enabled: true))
+    appState.documentSession.load(
+      document: DocumentRef(id: noteURL.standardizedFileURL), text: "initial")
+    try FileManager.default.removeItem(at: noteURL)
+
+    appState.activeDocumentText = "edit protected by fallback"
+    store.documentDidChange(appState: appState)
+
+    try await waitUntil {
+      recoveryStore.loadDrafts().first?.text == "edit protected by fallback"
+    }
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: noteURL.path))
+    XCTAssertTrue(appState.documentSession.isDirty, "the original file is still stale")
+    XCTAssertNil(
+      appState.unresolvedDataLoss,
+      "a durable recovery copy means the failed original write is status, not data loss")
+    XCTAssertEqual(appState.currentError?.severity, .status)
+    XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertEqual(recovery.sourceURL, noteURL.standardizedFileURL)
   }
 
   /// The setting is read when the debounce FIRES, so switching auto-save off also
@@ -324,6 +543,10 @@ final class AutoSaveSettingTests: XCTestCase {
     XCTAssertEqual(
       recoveryStore.loadDrafts().map(\.text), ["edit that cannot reach disk"],
       "a failed close-save must fall back to a recovery draft, not lose the edit")
+    let recovery = try XCTUnwrap(recoveryStore.loadDrafts().first)
+    XCTAssertFalse(
+      recoveryStore.isDraftOpen(id: recovery.id),
+      "the dying window kept its fallback claimed and hid it from the launcher")
     XCTAssertNotNil(
       appState.lastError, "the save failure must stay surfaced, not be masked by the draft write")
   }

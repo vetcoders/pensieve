@@ -35,6 +35,33 @@ Pensieve keeps Markdown as the source of truth while making exchange with Word-f
 
 The existing HTML and PDF export options remain available in the File menu.
 
+## Agent dispatch lifecycle
+
+Dispatch asks Vibecrafted to start a detached worker and returns a run ID. The
+launch receipt is not a completion result: the run can continue after the
+dispatch sheet closes, and closing the optional Terminal status window does not
+stop it. Pensieve resolves the installed uv-managed Vibecrafted entrypoint by
+absolute path and supplies the standard agent binary directories that a
+Finder/Dock launch omits from `PATH`; custom version-manager layouts can use
+`PENSIEVE_VIBECRAFTED_PATH` to select a wrapper that establishes their required
+environment. The override chooses the Vibecrafted executable; it does not add
+version-manager shim directories to an agent's `PATH` by itself.
+
+A positive worker PID in Vibecrafted metadata is shown as **Run started**. It is
+a spawn record, not a promise that the worker is still alive. If Vibecrafted
+exits successfully with a valid run ID but that spawn record does not arrive
+within the bounded confirmation window, Pensieve shows **Run accepted · launch
+unconfirmed**, preserves the run ID and any report path, and does not call the
+run failed or encourage a duplicate dispatch. **Reveal report** appears only
+when the launcher returned a report path. **Check status in Terminal** appears
+only when the observer agent is authoritative: either the receipt names it or
+the dispatch explicitly selected one positional agent. Pensieve does not guess
+an observer for a default swarm. A genuinely rejected launch keeps its real exit
+code, run ID and report path when available, and shows the final actionable
+launcher error without offering a status check for a run that never started.
+The status action requests one snapshot; the worker itself remains owned by its
+Vibecrafted/vc-frame session.
+
 ## Requirements
 
 - macOS 15 or newer.
@@ -71,7 +98,41 @@ make lint
 make gates
 ```
 
+## Runtime testing
+
+`dist/Pensieve.app` and `make run-release` use Pensieve's production bundle
+identity and the operator's existing state. `make run` is also non-isolated: its
+unbundled executable uses the normal support and Keychain fallbacks. These lanes
+are appropriate only when that state is intentionally under test; they are not
+fresh smoke environments.
+
+Use a repository-owned isolated lane for runtime checks:
+
+```bash
+make manual-smoke          # new clean interactive experiment
+make manual-smoke-reopen   # reopen that same experiment with its state intact
+make manual-smoke-verify   # read-only identity and scope verification
+make manual-smoke-clean    # retire only that experiment
+make ui-smoke              # automated ephemeral smoke with a unique identity
+```
+
+Every new manual or automated smoke receives a unique, manifest-scoped runtime
+identity and must fail closed rather than read, reset, or delete production
+Pensieve state. Trusted build provenance and exact executable/FFI payloads are
+verified before launch; historical or dirty-source experiments are explicitly
+labelled and are not release evidence. The complete identity, cleanup,
+compatibility and evidence contract has one canonical home:
+[`docs/runtime-testing.md`](docs/runtime-testing.md). Read it before adding or
+changing a runtime test.
+
 The Mac App Store packaging lane exists as `make release-appstore`, but App Store Connect submission, signing identities, and the final MAS truth-clicks stay with the human operator.
+
+## Product contract
+
+The canonical definition of keyboard shortcuts and the lifecycle of files,
+tabs, windows, and recovery is
+[`docs/keyboard-shortcuts-and-file-lifecycle-contract.md`](docs/keyboard-shortcuts-and-file-lifecycle-contract.md).
+Implementations, tests, reports, and external mirrors do not override it.
 
 ## Background & Heritage
 
