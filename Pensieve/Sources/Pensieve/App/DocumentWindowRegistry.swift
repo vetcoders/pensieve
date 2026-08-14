@@ -512,11 +512,21 @@ final class DocumentWindowRegistry: ObservableObject {
     }
 
     let ref = pendingRestoreRefs.removeFirst()
+    // `open` ACTIVATES an already-open identity instead of creating one, and the
+    // most likely thing a user does during a slow restore is click a file the
+    // pass has not reached yet. That window is theirs — it was built by their
+    // interactive open and fronted for them — so the pass must not adopt it:
+    // claiming it as a participant makes `finishRestorePass` read the user's own
+    // selection as its own and yank focus onto the pass's last tab, and adopting
+    // it as `restoreMergeTarget` would silently make it this transaction's host.
+    // Only a window this step actually created belongs to the transaction.
+    let refIdentity = DocumentIdentity.file(ref.id.standardizedFileURL).standardized
+    let windowBeforeOpen = windowsByIdentity[refIdentity]?.window
     if let window = open(
       ref,
       presentation: .joinTabGroupInBackground,
       mergeTargetSelection: .fixed(restoreMergeTarget?.window)
-    ) {
+    ), window !== windowBeforeOpen {
       // If the original host disappeared, the first successfully created
       // replacement becomes the host for the rest of THIS transaction. Never
       // follow a later arbitrary key window between restore turns.

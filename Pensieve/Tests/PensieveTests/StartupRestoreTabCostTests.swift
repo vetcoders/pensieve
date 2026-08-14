@@ -450,6 +450,88 @@ final class StartupRestoreTabCostTests: XCTestCase {
     XCTAssertTrue(probe.orderedWithoutActivation.isEmpty)
   }
 
+  /// THE COLLISION the pin above does not reach: its user tab is a bare window
+  /// the registry has never heard of, so the restore could not have mistaken it
+  /// for its own even by accident. The real mid-restore gesture is clicking a
+  /// file in the sidebar — and the most likely file to click is one the pass has
+  /// QUEUED but not reached yet.
+  ///
+  /// That interactive open builds the window, registers the identity and fronts
+  /// it. When the pass later reaches the same ref, `open` hands back THAT window
+  /// instead of creating one, and the pass used to claim it: it became a restore
+  /// participant, so at completion the user's own selection read as the pass's
+  /// own and the restore ordered its last tab over the file the user had just
+  /// asked for. The window the user opened by hand is never this transaction's.
+  func testRestoreDoesNotClaimATabTheUserOpenedWhileThePassWasQueued() {
+    let probe = RestoreCostProbe()
+    let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
+    probe.windows.append(target)
+    var selectedWindow: NSWindow? = target
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { true },
+      scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      scheduleRestoreStep: { [weak probe] work in probe?.restoreSteps.append(work) },
+      mergeWindowIntoTabs: { _, window in probe.foregroundMerges.append(window) },
+      mergeWindowIntoTabsBehind: { _, window in probe.backgroundMerges.append(window) },
+      orderAndActivateWindow: { probe.activations.append($0) },
+      orderWindowWithoutActivating: { probe.orderedWithoutActivation.append($0) },
+      isApplicationActive: { true },
+      currentKeyWindow: { selectedWindow },
+      currentMergeTarget: { target },
+      setStartupRestoreInProgress: { _ in },
+      makeDocumentWindow: { [weak probe] _, _ in
+        guard let probe else { return nil }
+        let window = self.makeWindow(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        probe.windows.append(window)
+        probe.createdWindows.append(window)
+        return window
+      })
+    let refs = (0..<3).map {
+      DocumentRef(
+        id: URL(fileURLWithPath: "/tmp/pensieve-restore-user-open-\($0).md").standardizedFileURL,
+        isAdHoc: true)
+    }
+
+    registry.openRestoredDocuments(refs)
+    XCTAssertEqual(probe.createdWindows.count, 1, "the pass should have opened exactly refs[0]")
+
+    // The user clicks refs[1] in the sidebar while refs[1] and refs[2] are still
+    // queued: the interactive route builds its window, fronts it and leaves it
+    // key. refs[2] is what gives the pass a later tab to steal the front with.
+    registry.open(refs[1])
+    guard let userWindow = probe.createdWindows.last, probe.createdWindows.count == 2 else {
+      return XCTFail("the interactive open did not build its own window")
+    }
+    XCTAssertTrue(
+      probe.activations.last === userWindow,
+      "the interactive open must front the file the user asked for; without that this pin has no"
+        + " user selection to defend")
+    selectedWindow = userWindow
+    let activationsBeforeCompletion = probe.activations.count
+
+    while !probe.restoreSteps.isEmpty {
+      probe.restoreSteps.removeFirst()()
+    }
+
+    XCTAssertEqual(
+      probe.createdWindows.count, 3,
+      "the pass must reuse the user's window for refs[1] and still restore refs[2] after it —"
+        + " otherwise the collision this pin is about never happened")
+    XCTAssertEqual(
+      probe.activations.count, activationsBeforeCompletion,
+      "restore completion claimed the tab the user opened by hand as its own participant, read"
+        + " their selection as the pass's own, and ordered its last restored tab over the file"
+        + " they had just clicked")
+    XCTAssertTrue(
+      probe.activations.last === userWindow,
+      "the window in front at completion must still be the one the user opened")
+    XCTAssertTrue(
+      probe.orderedWithoutActivation.isEmpty,
+      "the app was frontmost the whole time; a silent re-order is the same theft without the"
+        + " activation")
+  }
+
   func testRestoreSuspendsOnboardingForExactlyTheRestorePass() {
     let probe = RestoreCostProbe()
     let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))

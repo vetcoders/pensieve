@@ -448,6 +448,14 @@ must preserve that newer selection and skip its final activation. A restore
 that finishes after the user has switched away may order its final tab into
 place without pulling focus back across the app boundary.
 
+"Participant" means a window the pass itself created. Opening a file the pass
+has queued but not yet reached is an ordinary interactive open: when the pass
+later reaches that ref it activates the window the user already has instead of
+building one, and that window stays outside the transaction — it never becomes
+a participant and never becomes the transaction's merge host. A file the user
+opened by hand mid-restore therefore keeps the front exactly like any other
+newer selection.
+
 Window-following UI bridges (theme chrome, toolbar overflow, command routing,
 close hooks) publish only a proven document root. A queued callback belonging
 to a factory window that has already closed must be dropped rather than
