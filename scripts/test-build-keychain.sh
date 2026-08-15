@@ -48,7 +48,7 @@ cleanup() {
     local original_status="$?"
     trap - EXIT INT TERM
     if [[ -n "${FIXTURE_ROOT:-}" && -d "$FIXTURE_ROOT" ]]; then
-        /bin/rm -R -- "$FIXTURE_ROOT" >/dev/null 2>&1 || true
+        rm -rf "$FIXTURE_ROOT" >/dev/null 2>&1 || true
     fi
     exit "$original_status"
 }
