@@ -41,6 +41,15 @@ LANDING_PAGE_CHECKSUM_SLOT_PATTERN='class="sha"'
 LANDING_PAGE_ALGORITHM_LABEL='<b>SHA-256</b>'
 # A placeholder that must never reach a published page.
 LANDING_PAGE_UNFILLED_MARKER='DO-NOT-SHIP'
+# How many places the published page hands the reader the artifact: the JSON-LD
+# `downloadUrl`, the hero button and the download-panel button. Asserted as an
+# EXACT count rather than "at least one good link", because the checksum is
+# printed once for a page with three download targets: a run that only proved
+# some target somewhere is canonical would publish this build's SHA-256 next to
+# a button repointed at an installer page, a redirector, or another repo's
+# artifact — the remaining links vouching for the swapped one. Growing the page
+# a fourth download target is a deliberate edit here, not a silent widening.
+LANDING_PAGE_ARTIFACT_LINK_COUNT=3
 
 # Every parser below prints one NON-EMPTY record per declaration it finds, using
 # `!empty` / `!unparsable` / `!wronglabel` sentinels for a declaration it cannot
@@ -141,20 +150,30 @@ landing_page_count_records() {
     printf '%s\n' "$records" | /usr/bin/wc -l | /usr/bin/tr -d ' '
 }
 
-# landing_page_artifact_urls <page> — prints every absolute URL on the page
-# that points at a `.dmg`, one per line, in document order.
+# landing_page_artifact_urls <page> — prints one record per DOWNLOAD TARGET the
+# page declares, in document order: the WHOLE, verbatim value of every `href`
+# and every JSON-LD `downloadUrl` that names a `.dmg`, or `!unparsable` for a
+# target declaration whose shape this lib cannot read. No output means the page
+# declares no download target at all.
 #
-# That is the whole artifact surface of this page: the hero button, the
-# download-panel button and the JSON-LD `downloadUrl`. A checksum is only
-# meaningful next to the link the reader will actually click, so the release
-# asserts that all of them are the one artifact it publishes. Out of scope by
-# construction: a button repointed at a URL that does not end in `.dmg` (an
-# installer page, a redirector) — that is a page redesign, not a swap the
-# checksum could be read as covering.
+# Three properties this parser exists to have, each one a way the previous
+# substring scan let a swapped button through:
 #
-# No sentinel record here: a match is a matched URL, so every record this prints
-# is non-empty by construction and none can be swallowed off the end of a
-# listing.
+#   * it reads ATTRIBUTE VALUES, not URLs embedded in a line, so a target is
+#     compared whole. `href="…/Pensieve.dmg.exe"` used to yield the substring
+#     `…/Pensieve.dmg` — exactly the canonical URL — and a page offering a
+#     Windows executable passed the gate advertising the DMG's checksum.
+#   * it is not restricted to ABSOLUTE URLs, so `href="/downloads/Other.dmg"`
+#     is a target that disagrees with this release rather than a target the
+#     scan could not see and therefore silently tolerated.
+#   * a declaration it cannot read is a `!unparsable` record, not a skipped
+#     one: an unquoted `href=Pensieve.dmg` fails the release loudly instead of
+#     hiding a download target from the caller's count.
+#
+# Deliberately still out of scope: a download offered through anything but an
+# `href`/`downloadUrl` attribute (a meta refresh, a script-built link). Those
+# are page redesigns, and the caller's exact-count assertion catches the
+# redesign that removes one of the targets this page has.
 landing_page_artifact_urls() {
     local page="${1:-}"
 
@@ -162,9 +181,26 @@ landing_page_artifact_urls() {
     /usr/bin/awk '
         {
             line = $0
-            while (match(line, /https?:\/\/[^"'"'"'<> ]+\.dmg/)) {
-                print substr(line, RSTART, RLENGTH)
+            # `href="URL"` and the JSON-LD `"downloadUrl": "URL"` in one shape:
+            # the name, an optional closing quote, the separator, the value.
+            while (match(line, /(href|downloadUrl)"?[ \t]*[:=][ \t]*/)) {
                 line = substr(line, RSTART + RLENGTH)
+                quote = substr(line, 1, 1)
+                if (quote != "\"" && quote != "\047") {
+                    print "!unparsable"
+                    continue
+                }
+                line = substr(line, 2)
+                end = index(line, quote)
+                if (end == 0) {
+                    print "!unparsable"
+                    continue
+                }
+                value = substr(line, 1, end - 1)
+                line = substr(line, end + 1)
+                if (index(tolower(value), ".dmg") > 0) {
+                    print value
+                }
             }
         }
     ' "$page" || {
@@ -204,10 +240,12 @@ landing_page_declared_version() {
 
 # landing_page_assert_download_panel <page> <expected_version> <expected_url> [reported_path]
 #
-#   0 — the panel declares exactly this release's version and every artifact
-#       link on the page points at exactly <expected_url>
+#   0 — the panel declares exactly this release's version, and the page carries
+#       exactly $LANDING_PAGE_ARTIFACT_LINK_COUNT download targets, every one of
+#       them equal in full to <expected_url>
 #   1 — unreadable page, no single declared version, a different version, no
-#       artifact link at all, or a link pointing somewhere else
+#       artifact link at all, a different number of download targets, a target
+#       whose shape is unreadable, or a target pointing somewhere else
 #   2 — called wrong
 #
 # Asserted at BOTH ends of the run (preflight and the final gate), because the
@@ -266,8 +304,20 @@ landing_page_assert_download_panel() {
             "$reported" >&2
         return 1
     fi
+    # An exact count, not a floor. A page whose hero button was repointed at
+    # something that is not a DMG at all still leaves two canonical links
+    # behind, and "every target I could see was right" would publish it.
+    if (( url_count != LANDING_PAGE_ARTIFACT_LINK_COUNT )); then
+        printf 'landing-page: %s hands the reader the artifact in %s places but this page is published with %s (the JSON-LD downloadUrl, the hero button and the download-panel button) — a download target that moved is not something the advertised checksum can cover\n' \
+            "$reported" "$url_count" "$LANDING_PAGE_ARTIFACT_LINK_COUNT" >&2
+        return 1
+    fi
     while IFS= read -r url; do
-        [[ -n "$url" ]] || continue
+        if [[ "$url" == '!unparsable' ]]; then
+            printf 'landing-page: %s: a download target is no longer href="URL" or "downloadUrl": "URL" — teach scripts/lib/landing-page.sh the new shape before releasing\n' \
+                "$reported" >&2
+            return 1
+        fi
         if [[ "$url" != "$expected_url" ]]; then
             printf 'landing-page: %s links the artifact %s but this release publishes %s — the advertised checksum would sit next to bytes it does not describe\n' \
                 "$reported" "$url" "$expected_url" >&2

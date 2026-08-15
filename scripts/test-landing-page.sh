@@ -53,12 +53,30 @@ fail() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
+# print_download_targets <artifact-url>… — the download-target shape the real
+# docs/index.html carries: a JSON-LD `downloadUrl`, a hero button and a
+# download-panel button, one target per argument IN ORDER. Fixtures mirror that
+# shape rather than a single link, because the lib asserts an exact target
+# count and a one-link fixture would only ever exercise a page nobody publishes.
+print_download_targets() {
+    if (( $# >= 1 )); then
+        printf '    <script type="application/ld+json">\n      { "downloadUrl": "%s" }\n    </script>\n' "$1"
+    fi
+    if (( $# >= 2 )); then
+        printf '    <a class="btn btn-hero"\n      href="%s"\n      >Download</a\n    >\n' "$2"
+    fi
+    if (( $# >= 3 )); then
+        printf '    <a class="btn btn-primary"\n      href="%s"\n      >Download Pensieve.dmg</a\n    >\n' "$3"
+    fi
+}
+
 # make_labelled_page <name> <version> <artifact-url|-> <algorithm-label>
 #                    <checksum-slot-payload>… → prints the page path.
 # One slot payload per checksum <div>; zero payloads yields a page with none. A
-# `-` URL yields a page that links no artifact at all. The label is a parameter
-# so a page can advertise our checksum under somebody else's algorithm while
-# keeping the slot's shape byte-for-byte.
+# `-` URL yields a page that links no artifact at all; any other value is
+# published in all three download targets. The label is a parameter so a page
+# can advertise our checksum under somebody else's algorithm while keeping the
+# slot's shape byte-for-byte.
 make_labelled_page() {
     local name="$1"
     local version="$2"
@@ -73,7 +91,7 @@ make_labelled_page() {
         printf '    <dl>\n      <div><dt>Version</dt><dd>%s</dd></div>\n' "$version"
         printf '      <div><dt>Platform</dt><dd>macOS 15+</dd></div>\n    </dl>\n'
         if [[ "$url" != "-" ]]; then
-            printf '    <a class="btn btn-primary"\n      href="%s"\n      >Download Pensieve.dmg</a\n    >\n' "$url"
+            print_download_targets "$url" "$url" "$url"
         fi
         for payload in "$@"; do
             printf '    <div class="sha">%s<br />%s</div>\n' "$label" "$payload"
@@ -109,7 +127,7 @@ make_versions_page() {
             printf '      <div><dt>Version</dt><dd>%s</dd></div>\n' "$version"
         done
         printf '    </dl>\n'
-        printf '    <a class="btn" href="%s">Download Pensieve.dmg</a>\n' "$URL_A"
+        print_download_targets "$URL_A" "$URL_A" "$URL_A"
         printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$payload"
         printf '  </body>\n</html>\n'
     } >"$page"
@@ -240,11 +258,95 @@ NO_URL_PAGE="$(make_page no-url "$VERSION_A" "-" "$PLACEHOLDER")"
 assert_status "a page with no artifact link at all is rejected" 1 "no downloadable artifact" \
     landing_page_assert_publishable "$NO_URL_PAGE" "$VERSION_A" "$URL_A"
 
-MIXED_URL_PAGE="$FIXTURE_ROOT/mixed-url.html"
-printf '<div><dt>Version</dt><dd>%s</dd></div>\n<a href="%s">a</a>\n<a href="%s">b</a>\n<div class="sha"><b>SHA-256</b><br />%s</div>\n' \
-    "$VERSION_A" "$URL_A" "$URL_FOREIGN" "$PLACEHOLDER" >"$MIXED_URL_PAGE"
-assert_status "one canonical link does not excuse a second, foreign one" 1 "links the artifact" \
+# make_targets_page <name> <download-target>… → prints the page path. Everything
+# but the download targets is this release's: the point of each fixture below is
+# one target that disagrees while its neighbours vouch for the page.
+make_targets_page() {
+    local name="$1"
+    shift
+    local page="$FIXTURE_ROOT/$name.html"
+
+    {
+        printf '<!doctype html>\n<html>\n  <body>\n'
+        printf '    <dl>\n      <div><dt>Version</dt><dd>%s</dd></div>\n    </dl>\n' "$VERSION_A"
+        print_download_targets "$@"
+        printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER"
+        printf '  </body>\n</html>\n'
+    } >"$page"
+    printf '%s\n' "$page"
+}
+
+MIXED_URL_PAGE="$(make_targets_page mixed-url "$URL_A" "$URL_A" "$URL_FOREIGN")"
+assert_status "two canonical links do not excuse a third, foreign one" 1 "links the artifact" \
     landing_page_assert_publishable "$MIXED_URL_PAGE" "$VERSION_A" "$URL_A"
+
+# The substring scan this parser replaced saw absolute .dmg URLs only, so a
+# relative href was not a target it disagreed with — it was a target it could
+# not see, and the two canonical neighbours carried the page through.
+RELATIVE_URL_PAGE="$(make_targets_page relative-url "$URL_A" "/downloads/Other.dmg" "$URL_A")"
+assert_status "a download target repointed at a relative path is rejected" 1 \
+    "links the artifact" \
+    landing_page_assert_publishable "$RELATIVE_URL_PAGE" "$VERSION_A" "$URL_A"
+
+# …and it matched a PREFIX, so a button offering Pensieve.dmg.exe yielded the
+# canonical URL as a substring and the page shipped this DMG's checksum next to
+# a Windows executable.
+SUFFIXED_URL_PAGE="$(make_targets_page suffixed-url "$URL_A" "$URL_A" "$URL_A.exe")"
+assert_status "a download target that only starts with the artifact URL is rejected" 1 \
+    "links the artifact" \
+    landing_page_assert_publishable "$SUFFIXED_URL_PAGE" "$VERSION_A" "$URL_A"
+
+# A target repointed at something that is not a DMG at all leaves the other two
+# canonical, so only an exact count can notice it.
+MISSING_TARGET_PAGE="$(make_targets_page missing-target \
+    "$URL_A" "https://github.com/vetcoders/pensieve/releases/latest" "$URL_A")"
+assert_status "a page that stopped handing the reader the artifact in one of its three places is rejected" 1 \
+    "hands the reader the artifact in 2 places" \
+    landing_page_assert_publishable "$MISSING_TARGET_PAGE" "$VERSION_A" "$URL_A"
+
+DROPPED_TARGET_PAGE="$(make_targets_page dropped-target "$URL_A" "$URL_A")"
+assert_status "a page that dropped a download target outright is rejected" 1 \
+    "hands the reader the artifact in 2 places" \
+    landing_page_assert_publishable "$DROPPED_TARGET_PAGE" "$VERSION_A" "$URL_A"
+
+EXTRA_TARGET_PAGE="$FIXTURE_ROOT/extra-target.html"
+{
+    printf '<!doctype html>\n<html>\n  <body>\n'
+    printf '    <dl>\n      <div><dt>Version</dt><dd>%s</dd></div>\n    </dl>\n' "$VERSION_A"
+    print_download_targets "$URL_A" "$URL_A" "$URL_A"
+    printf '    <a class="btn" href="%s">one more</a>\n' "$URL_A"
+    printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER"
+    printf '  </body>\n</html>\n'
+} >"$EXTRA_TARGET_PAGE"
+assert_status "a fourth download target is a deliberate edit, not a silent widening" 1 \
+    "hands the reader the artifact in 4 places" \
+    landing_page_assert_publishable "$EXTRA_TARGET_PAGE" "$VERSION_A" "$URL_A"
+
+UNQUOTED_URL_PAGE="$FIXTURE_ROOT/unquoted-url.html"
+{
+    printf '<!doctype html>\n<html>\n  <body>\n'
+    printf '    <dl>\n      <div><dt>Version</dt><dd>%s</dd></div>\n    </dl>\n' "$VERSION_A"
+    print_download_targets "$URL_A" "$URL_A"
+    printf '    <a class="btn" href=%s>Download Pensieve.dmg</a>\n' "$URL_A"
+    printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER"
+    printf '  </body>\n</html>\n'
+} >"$UNQUOTED_URL_PAGE"
+assert_status "a download target whose shape the parser cannot read fails loudly, not silently" 1 \
+    "no longer href=" \
+    landing_page_assert_publishable "$UNQUOTED_URL_PAGE" "$VERSION_A" "$URL_A"
+
+# The parser reads whole attribute values, not URLs found inside a line. Pinned
+# directly, because every assertion above would also pass on a parser that
+# merely counted three matches somewhere on the page.
+TARGET_RECORDS="$(landing_page_artifact_urls "$SUFFIXED_URL_PAGE")"
+if [[ "$TARGET_RECORDS" == "$URL_A
+$URL_A
+$URL_A.exe" ]]; then
+    pass "a download target is read whole, not truncated at the first .dmg"
+else
+    fail "a download target is read whole, not truncated at the first .dmg" \
+        "records: $(printf '%s' "$TARGET_RECORDS" | tr '\n' ' ')"
+fi
 
 assert_status "an expected artifact URL that is not an https .dmg is a usage error" 2 \
     "not an https .dmg URL" \
@@ -530,7 +632,7 @@ landing_page_declared_version() {
 # shellcheck disable=SC2329
 landing_page_artifact_urls() {
     printf '%s\n' "$1" >>"$READS_LOG"
-    printf '%s\n' "$URL_A"
+    printf '%s\n%s\n%s\n' "$URL_A" "$URL_A" "$URL_A"
 }
 ISOLATION_PAGE="$(make_page gate-isolation "$VERSION_A" "$URL_A" "$SHA_A")"
 if landing_page_assert_published "$ISOLATION_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"; then

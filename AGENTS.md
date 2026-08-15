@@ -126,9 +126,13 @@ another version) fails in pre-flight, before anything is built or published.
 
 What is asserted — in pre-flight and again at the end of the run — is the whole
 published claim: the checksum, the version in the panel's `<dt>Version</dt>`,
-and the artifact every `.dmg` link on the page points at (hero button, panel
-button, JSON-LD `downloadUrl`), which must be the
-`releases/latest/download/Pensieve.dmg` funnel this lane publishes. So editing
+and every place the page hands the reader the artifact. That last one is an
+exact census, not a spot check: the page carries three download targets (hero
+button, panel button, JSON-LD `downloadUrl`), each `href`/`downloadUrl` value
+must equal the `releases/latest/download/Pensieve.dmg` funnel this lane
+publishes IN FULL, and there must be exactly three of them
+(`LANDING_PAGE_ARTIFACT_LINK_COUNT`). Giving `docs/index.html` a fourth
+download target therefore means bumping that constant deliberately. So editing
 the version line or a download button of `docs/index.html` while a release is
 in flight fails that release rather than publishing a mismatched page. Stamping
 itself is concurrency-safe for the same reason: the page is rewritten by
