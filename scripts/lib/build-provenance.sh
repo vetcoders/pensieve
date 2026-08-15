@@ -605,6 +605,7 @@ build_provenance_runtime_input_status() {
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-provenance.sh \
+        scripts/lib/landing-page.sh \
         scripts/lib/rpath-hygiene.sh \
         Pensieve/Package.swift \
         Pensieve/Package.resolved \
@@ -638,6 +639,7 @@ build_provenance_assert_runtime_inputs_clean() {
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-provenance.sh \
+        scripts/lib/landing-page.sh \
         scripts/lib/rpath-hygiene.sh \
         Pensieve/Package.swift \
         Pensieve/Package.resolved \
@@ -729,6 +731,7 @@ build_provenance_runtime_input_digest() {
         "$repo_root/scripts/build-release.sh" \
         "$repo_root/scripts/lib/bundle-identity.sh" \
         "$repo_root/scripts/lib/build-provenance.sh" \
+        "$repo_root/scripts/lib/landing-page.sh" \
         "$repo_root/scripts/lib/rpath-hygiene.sh" \
         "$ffi_path"
     do
@@ -757,6 +760,7 @@ build_provenance_runtime_input_digest() {
             "$repo_root/scripts/build-release.sh" \
             "$repo_root/scripts/lib/bundle-identity.sh" \
             "$repo_root/scripts/lib/build-provenance.sh" \
+            "$repo_root/scripts/lib/landing-page.sh" \
             "$repo_root/scripts/lib/rpath-hygiene.sh" \
             "$ffi_path"
         /usr/bin/find "$sources_root" "$resources_root" "$package_scripts_root" \
@@ -946,6 +950,7 @@ build_provenance_commit_runtime_input_digest() (
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-provenance.sh \
+        scripts/lib/landing-page.sh \
         scripts/lib/rpath-hygiene.sh \
         | /usr/bin/tar -xf - -C "$snapshot_root"; then
         build_provenance_error \
