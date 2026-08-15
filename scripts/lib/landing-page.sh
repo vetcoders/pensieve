@@ -18,9 +18,15 @@
 #
 # Usage:
 #   source "$SCRIPT_DIR/lib/landing-page.sh"
-#   landing_page_assert_publishable "$PAGE" "$APP_VERSION" || …   # preflight
-#   landing_page_stamp_checksum "$PAGE" "$DMG_SHA256" || …        # publish
-#   landing_page_assert_checksum "$PAGE" "$DMG_SHA256" || …       # gate
+#   landing_page_assert_publishable "$PAGE" "$VERSION" "$URL" || …  # preflight
+#   landing_page_stamp_checksum "$PAGE" "$DMG_SHA256" || …          # publish
+#   landing_page_assert_published "$PAGE" "$SHA" "$VERSION" "$URL" || …  # gate
+#
+# The gate takes the WHOLE published contract — checksum, declared version and
+# artifact URL — in one call on purpose. A gate that asserts only the checksum
+# passes a page whose <dt>Version</dt> or download href moved underneath the
+# run, and the pipeline then reports success for a page advertising this
+# build's checksum next to another release's version or somebody else's bytes.
 
 # The one line that carries the advertised checksum, e.g.
 #   <div class="sha"><b>SHA-256</b><br />…</div>
@@ -49,8 +55,15 @@ landing_page_readable() {
 }
 
 # landing_page_checksum_values <page> — prints one line per checksum slot with
-# the advertised value (whitespace stripped), or `!unparsable` for a slot whose
-# shape this lib no longer understands. No output means no slot at all.
+# the advertised value (whitespace stripped), `!empty` for a slot that carries
+# no value, or `!unparsable` for a slot whose shape this lib no longer
+# understands. No output means no slot at all.
+#
+# Every record is deliberately NON-EMPTY. Callers read this through `$(…)`,
+# which strips trailing newlines, so an empty trailing record would vanish: a
+# page with a filled slot plus an empty second one used to count as ONE slot,
+# which let a duplicated (and therefore unstampable) page through preflight and
+# let the final gate pass a page carrying a stray extra slot.
 landing_page_checksum_values() {
     local page="${1:-}"
 
@@ -63,9 +76,50 @@ landing_page_checksum_values() {
                 sub(/^<br[^>]*>/, "", payload)
                 sub(/<\/div>$/, "", payload)
                 gsub(/[ \t\r]/, "", payload)
-                print payload
+                print (payload == "" ? "!empty" : payload)
             } else {
                 print "!unparsable"
+            }
+        }
+    ' "$page" || {
+        printf 'landing-page: could not parse %s\n' "$page" >&2
+        return 1
+    }
+}
+
+# landing_page_count_records <records> — how many lines a values listing holds.
+# Empty input means zero; every other listing counts its lines. Split out so
+# the call sites cannot drift apart.
+landing_page_count_records() {
+    local records="${1:-}"
+
+    if [[ -z "$records" ]]; then
+        printf '0\n'
+        return 0
+    fi
+    printf '%s\n' "$records" | /usr/bin/wc -l | /usr/bin/tr -d ' '
+}
+
+# landing_page_artifact_urls <page> — prints every absolute URL on the page
+# that points at a `.dmg`, one per line, in document order.
+#
+# That is the whole artifact surface of this page: the hero button, the
+# download-panel button and the JSON-LD `downloadUrl`. A checksum is only
+# meaningful next to the link the reader will actually click, so the release
+# asserts that all of them are the one artifact it publishes. Out of scope by
+# construction: a button repointed at a URL that does not end in `.dmg` (an
+# installer page, a redirector) — that is a page redesign, not a swap the
+# checksum could be read as covering.
+landing_page_artifact_urls() {
+    local page="${1:-}"
+
+    landing_page_readable "$page" || return $?
+    /usr/bin/awk '
+        {
+            line = $0
+            while (match(line, /https?:\/\/[^"'"'"'<> ]+\.dmg/)) {
+                print substr(line, RSTART, RLENGTH)
+                line = substr(line, RSTART + RLENGTH)
             }
         }
     ' "$page" || {
@@ -95,11 +149,68 @@ landing_page_declared_version() {
     }
 }
 
-# landing_page_assert_publishable <page> <expected_version>
+# landing_page_assert_download_panel <page> <expected_version> <expected_url>
+#
+#   0 — the panel declares exactly this release's version and every artifact
+#       link on the page points at exactly <expected_url>
+#   1 — unreadable page, no single declared version, a different version, no
+#       artifact link at all, or a link pointing somewhere else
+#   2 — called wrong
+#
+# Asserted at BOTH ends of the run (preflight and the final gate), because the
+# checksum is only worth printing next to the version and the download link it
+# describes.
+landing_page_assert_download_panel() {
+    local page="${1:-}"
+    local expected_version="${2:-}"
+    local expected_url="${3:-}"
+    local version_values version_count urls url_count url
+
+    if [[ -z "$page" || -z "$expected_version" || -z "$expected_url" ]]; then
+        printf 'landing-page: usage: landing_page_assert_download_panel <page> <expected_version> <expected_url>\n' >&2
+        return 2
+    fi
+    if [[ ! "$expected_url" =~ ^https://[^[:space:]\"]+\.dmg$ ]]; then
+        printf 'landing-page: expected artifact URL is not an https .dmg URL: %s\n' "$expected_url" >&2
+        return 2
+    fi
+    landing_page_readable "$page" || return $?
+
+    version_values="$(landing_page_declared_version "$page")" || return 1
+    version_count="$(landing_page_count_records "$version_values")"
+    if (( version_count != 1 )); then
+        printf 'landing-page: %s must declare exactly one download version (<dt>Version</dt><dd>…</dd>), found %s\n' \
+            "$page" "$version_count" >&2
+        return 1
+    fi
+    if [[ "$version_values" != "$expected_version" ]]; then
+        printf 'landing-page: %s advertises version %s but this release is %s — update the download panel before publishing\n' \
+            "$page" "$version_values" "$expected_version" >&2
+        return 1
+    fi
+
+    urls="$(landing_page_artifact_urls "$page")" || return 1
+    url_count="$(landing_page_count_records "$urls")"
+    if (( url_count < 1 )); then
+        printf 'landing-page: %s advertises no downloadable artifact — a checksum with no link beside it is not publishable\n' \
+            "$page" >&2
+        return 1
+    fi
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        if [[ "$url" != "$expected_url" ]]; then
+            printf 'landing-page: %s links the artifact %s but this release publishes %s — the advertised checksum would sit next to bytes it does not describe\n' \
+                "$page" "$url" "$expected_url" >&2
+            return 1
+        fi
+    done <<<"$urls"
+}
+
+# landing_page_assert_publishable <page> <expected_version> <expected_url>
 #
 #   0 — the page can be stamped at the end of this run
 #   1 — missing/unreadable/unwritable page, no single stampable checksum slot,
-#       or the panel advertises a different version than this release
+#       or a download panel that does not describe this release
 #   2 — called wrong
 #
 # Runs BEFORE anything is built or published, so a page that cannot carry this
@@ -108,10 +219,11 @@ landing_page_declared_version() {
 landing_page_assert_publishable() {
     local page="${1:-}"
     local expected_version="${2:-}"
-    local values version_values slot_count version_count
+    local expected_url="${3:-}"
+    local values slot_count
 
-    if [[ -z "$page" || -z "$expected_version" ]]; then
-        printf 'landing-page: usage: landing_page_assert_publishable <page> <expected_version>\n' >&2
+    if [[ -z "$page" || -z "$expected_version" || -z "$expected_url" ]]; then
+        printf 'landing-page: usage: landing_page_assert_publishable <page> <expected_version> <expected_url>\n' >&2
         return 2
     fi
 
@@ -122,8 +234,7 @@ landing_page_assert_publishable() {
     fi
 
     values="$(landing_page_checksum_values "$page")" || return 1
-    slot_count=0
-    [[ -z "$values" ]] || slot_count="$(printf '%s\n' "$values" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+    slot_count="$(landing_page_count_records "$values")"
     if (( slot_count != 1 )); then
         printf 'landing-page: %s must carry exactly one %s checksum slot, found %s\n' \
             "$page" "$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" "$slot_count" >&2
@@ -135,33 +246,49 @@ landing_page_assert_publishable() {
         return 1
     fi
 
-    version_values="$(landing_page_declared_version "$page")" || return 1
-    version_count=0
-    [[ -z "$version_values" ]] || version_count="$(printf '%s\n' "$version_values" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-    if (( version_count != 1 )); then
-        printf 'landing-page: %s must declare exactly one download version (<dt>Version</dt><dd>…</dd>), found %s\n' \
-            "$page" "$version_count" >&2
+    landing_page_assert_download_panel "$page" "$expected_version" "$expected_url"
+}
+
+# landing_page_digest <page> — SHA-256 of the page's current bytes.
+# Used to bracket the read→transform→write window with a same-content check.
+landing_page_digest() {
+    local page="${1:-}"
+    local digest
+
+    landing_page_readable "$page" || return $?
+    digest="$(/usr/bin/shasum -a 256 "$page" | /usr/bin/awk '{print $1}')" || {
+        printf 'landing-page: could not digest %s\n' "$page" >&2
         return 1
-    fi
-    if [[ "$version_values" != "$expected_version" ]]; then
-        printf 'landing-page: %s advertises version %s but this release is %s — update the download panel before publishing\n' \
-            "$page" "$version_values" "$expected_version" >&2
+    }
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+        printf 'landing-page: could not digest %s\n' "$page" >&2
         return 1
-    fi
+    }
+    printf '%s\n' "$digest"
 }
 
 # landing_page_stamp_checksum <page> <sha256>
 #
 #   0 — the single checksum slot now carries <sha256>
-#   1 — page unreadable, or not exactly one slot could be rewritten
+#   1 — page unreadable, not exactly one slot could be rewritten, or the page
+#       changed underneath the rewrite
 #   2 — called wrong (missing args, or a value that is not a SHA-256)
 #
-# The file is rewritten in place (same inode, same permissions): everything
-# outside the checksum slot stays byte-identical.
+# Everything outside the checksum slot stays byte-identical, and the write is a
+# same-directory rename: a reader never sees a half-written page.
+#
+# This repo is worked in SHARED worktrees, so the rewrite is bracketed by a
+# digest of the page: read it, transform it, and refuse to publish the
+# transformed snapshot if the page moved in between. Without that, a concurrent
+# edit landing between the read and the write was simply erased — and erased
+# INVISIBLY, because the snapshot still carried the checksum the final gate
+# looks for, so the gate had nothing to notice. The rename closes the tail of
+# the window; what remains is the rename itself, which cannot lose a write it
+# does not overlap.
 landing_page_stamp_checksum() {
     local page="${1:-}"
     local sha="${2:-}"
-    local tmp status=0
+    local tmp before after mode status=0
 
     if [[ -z "$page" || -z "$sha" ]]; then
         printf 'landing-page: usage: landing_page_stamp_checksum <page> <sha256>\n' >&2
@@ -172,12 +299,29 @@ landing_page_stamp_checksum() {
         return 2
     fi
     landing_page_readable "$page" || return $?
+    if [[ -L "$page" ]]; then
+        # A rename would replace the link with a regular file and leave the
+        # real page unstamped, so this is a refusal rather than a silent swap.
+        printf 'landing-page: %s is a symlink — stamp the file it points at\n' "$page" >&2
+        return 1
+    fi
     if [[ ! -w "$page" ]]; then
         printf 'landing-page: %s is not writable\n' "$page" >&2
         return 1
     fi
 
-    tmp="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/pensieve-landing-page.XXXXXX")" || return 1
+    before="$(landing_page_digest "$page")" || return 1
+    mode="$(/usr/bin/stat -f '%Lp' "$page")" || {
+        printf 'landing-page: could not read the permissions of %s\n' "$page" >&2
+        return 1
+    }
+    # Same directory as the page: the final rename must be atomic, which it is
+    # only within one filesystem, and $TMPDIR is routinely another one.
+    tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$page")/.pensieve-landing-page.XXXXXX")" || {
+        printf 'landing-page: could not create a temporary file next to %s — the stamped page is written by renaming one into place\n' \
+            "$page" >&2
+        return 1
+    }
     /usr/bin/awk -v slot="$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" -v sha="$sha" '
         BEGIN { stamped = 0 }
         {
@@ -199,27 +343,52 @@ landing_page_stamp_checksum() {
             "$page" "$status" >&2
         return 1
     fi
-    if ! /bin/cat "$tmp" >"$page"; then
+    after="$(landing_page_digest "$page")" || {
+        /bin/rm -f "$tmp"
+        return 1
+    }
+    if [[ "$before" != "$after" ]]; then
+        /bin/rm -f "$tmp"
+        printf 'landing-page: %s changed while this release was stamping it — refusing to write a snapshot that would drop that edit\n' \
+            "$page" >&2
+        return 1
+    fi
+    if ! /bin/chmod "$mode" "$tmp"; then
+        /bin/rm -f "$tmp"
+        printf 'landing-page: could not carry the permissions of %s onto the stamped page\n' "$page" >&2
+        return 1
+    fi
+    if ! /bin/mv -f "$tmp" "$page"; then
         /bin/rm -f "$tmp"
         printf 'landing-page: could not write %s\n' "$page" >&2
         return 1
     fi
-    /bin/rm -f "$tmp"
 }
 
-# landing_page_assert_checksum <page> <sha256>
+# landing_page_assert_published <page> <sha256> <expected_version> <expected_url>
 #
-#   0 — the page advertises exactly this checksum and carries no placeholder
-#   1 — page unreadable, wrong/absent/duplicated checksum, or a leftover
-#       DO-NOT-SHIP marker anywhere in the file
+#   0 — the page advertises exactly this checksum, for exactly this release's
+#       version, next to exactly this release's artifact link, and carries no
+#       placeholder
+#   1 — page unreadable, wrong/absent/duplicated checksum, wrong or missing
+#       declared version, a foreign artifact link, or a leftover DO-NOT-SHIP
+#       marker anywhere in the file
 #   2 — called wrong
-landing_page_assert_checksum() {
+#
+# All four arguments are required so that no caller can assert half of the
+# published contract. The version matters as much as the checksum: a parallel
+# edit to <dt>Version</dt> during a build or notarization round trip would
+# otherwise leave the run reporting success for a page pairing this release's
+# checksum with a different release's version.
+landing_page_assert_published() {
     local page="${1:-}"
     local sha="${2:-}"
+    local expected_version="${3:-}"
+    local expected_url="${4:-}"
     local values slot_count marker_status
 
-    if [[ -z "$page" || -z "$sha" ]]; then
-        printf 'landing-page: usage: landing_page_assert_checksum <page> <sha256>\n' >&2
+    if [[ -z "$page" || -z "$sha" || -z "$expected_version" || -z "$expected_url" ]]; then
+        printf 'landing-page: usage: landing_page_assert_published <page> <sha256> <expected_version> <expected_url>\n' >&2
         return 2
     fi
     if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
@@ -247,8 +416,7 @@ landing_page_assert_checksum() {
     esac
 
     values="$(landing_page_checksum_values "$page")" || return 1
-    slot_count=0
-    [[ -z "$values" ]] || slot_count="$(printf '%s\n' "$values" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+    slot_count="$(landing_page_count_records "$values")"
     if (( slot_count != 1 )); then
         printf 'landing-page: %s must carry exactly one %s checksum slot, found %s\n' \
             "$page" "$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" "$slot_count" >&2
@@ -259,4 +427,6 @@ landing_page_assert_checksum() {
             "$page" "$values" "$sha" >&2
         return 1
     fi
+
+    landing_page_assert_download_panel "$page" "$expected_version" "$expected_url"
 }

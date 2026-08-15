@@ -131,6 +131,12 @@ if (( DO_DMG && DO_NOTARIZE )); then
     PUBLISHES_DMG=1
 fi
 LANDING_PAGE="$REPO_ROOT/docs/index.html"
+# The one artifact URL the download page may advertise. Derived from the stable
+# DMG name this lane publishes, so renaming the artifact cannot leave the page
+# pointing at an asset the release no longer produces. The funnel is
+# deliberately unversioned: each release replaces what `releases/latest`
+# resolves to, which is exactly why the checksum beside it has to be restamped.
+LANDING_PAGE_ARTIFACT_URL="https://github.com/vetcoders/pensieve/releases/latest/download/$(basename "$DMG_STABLE_PATH")"
 DMG_SHA256=""
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -446,11 +452,11 @@ log "FFI profile: $FFI_PROFILE"
 
 # The public download page is stamped with this run's DMG checksum further
 # down. Prove NOW that it can carry it — a page that is missing, unreadable,
-# unwritable, reshaped or still advertising another version must cost a
-# preflight failure, not a notarization round trip plus an artifact already
-# copied onto the team shelf.
+# unwritable, reshaped, advertising another version or linking another
+# artifact must cost a preflight failure, not a notarization round trip plus an
+# artifact already copied onto the team shelf.
 if (( PUBLISHES_DMG )); then
-    landing_page_assert_publishable "$LANDING_PAGE" "$APP_VERSION" \
+    landing_page_assert_publishable "$LANDING_PAGE" "$APP_VERSION" "$LANDING_PAGE_ARTIFACT_URL" \
         || die "docs/index.html cannot carry this release's checksum (see above) — fix the download page before publishing."
     ok "Landing page ready for stamping: $LANDING_PAGE"
 fi
@@ -909,8 +915,8 @@ if (( PUBLISHES_DMG )); then
     [[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Could not compute the DMG SHA-256 for $DMG_PATH"
     landing_page_stamp_checksum "$LANDING_PAGE" "$DMG_SHA256" \
         || die "Could not stamp the release checksum into docs/index.html."
-    landing_page_assert_checksum "$LANDING_PAGE" "$DMG_SHA256" \
-        || die "docs/index.html does not advertise this build's DMG checksum after stamping."
+    landing_page_assert_published "$LANDING_PAGE" "$DMG_SHA256" "$APP_VERSION" "$LANDING_PAGE_ARTIFACT_URL" \
+        || die "docs/index.html does not describe this build (checksum, version or artifact link) after stamping."
     ok "Landing page checksum: $DMG_SHA256"
 fi
 
@@ -939,14 +945,16 @@ if (( DO_DMG )); then
     spctl --assess --type open --context context:primary-signature "$DMG_PATH" 2>&1 | tail -3 || warn "DMG spctl check failed (may be OK)"
 fi
 
-# ─── Landing page checksum gate ────────────────────────────────────────────
+# ─── Landing page publication gate ─────────────────────────────────────────
 # Re-read the page at the end: this repo is worked in shared worktrees, so the
 # stamp above can be clobbered by a concurrent edit or a checkout between then
-# and now. The check is fail-closed — an unreadable, reshaped or differently
-# filled page fails the run instead of passing for lack of a match.
+# and now. The check is fail-closed and covers the WHOLE published contract —
+# checksum, declared version and artifact link. Re-checking only the checksum
+# would let a run that produced 0.4.3 report success for a page whose version
+# line was moved to 0.4.4 mid-build, publishing a version/checksum mismatch.
 if (( PUBLISHES_DMG )); then
-    landing_page_assert_checksum "$LANDING_PAGE" "$DMG_SHA256" \
-        || die "docs/index.html no longer advertises this build's DMG checksum ($DMG_SHA256)."
+    landing_page_assert_published "$LANDING_PAGE" "$DMG_SHA256" "$APP_VERSION" "$LANDING_PAGE_ARTIFACT_URL" \
+        || die "docs/index.html no longer describes this build (checksum $DMG_SHA256, version $APP_VERSION, artifact $LANDING_PAGE_ARTIFACT_URL)."
 fi
 
 ok "Release pipeline complete"

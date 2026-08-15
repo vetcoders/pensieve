@@ -56,9 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The page is also checked in pre-flight, before anything is built or copied to
   the internal release shelf, and every check is fail-closed: a missing,
   unreadable, read-only, reshaped or wrong-version page fails the release
-  instead of passing for lack of a match. Lanes that publish nothing
-  (`make release-local`, `make release-appstore`, any `--no-notarize` run)
-  neither stamp nor gate on the page.
+  instead of passing for lack of a match. What is asserted is the whole
+  published claim, at both ends of the run — the checksum, the version the
+  panel declares, and the artifact every download link on the page points at —
+  so a release cannot report success for a page pairing this build's checksum
+  with another version's number or with a link serving somebody else's bytes.
+  Because this repo is worked in shared worktrees, stamping is also concurrency
+  safe: the page is rewritten by renaming a fresh copy into place, and an edit
+  that lands while the release is stamping aborts the run instead of being
+  silently overwritten. Lanes that publish nothing (`make release-local`,
+  `make release-appstore`, any `--no-notarize` run) neither stamp nor gate on
+  the page.
 - A release without `--clean` no longer stalls or dies while retiring the
   previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
   read-only, so the stale bundle carried unwritable `Assets.xcassets`

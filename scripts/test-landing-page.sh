@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for scripts/lib/landing-page.sh — the guard that keeps the public
-# download page's SHA-256 tied to the DMG the release actually produced.
+# download page's SHA-256 tied to the DMG the release actually produced, and
+# tied to the version and artifact link it is printed next to.
 #
 # Self-contained: synthetic HTML fixtures in a mktemp dir, no build, no
 # codesign, no network. Runs in well under a second, so it belongs in
@@ -11,8 +12,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LANDING_PAGE_LIB="$SCRIPT_DIR/lib/landing-page.sh"
 # shellcheck source=scripts/lib/landing-page.sh
-source "$SCRIPT_DIR/lib/landing-page.sh"
+source "$LANDING_PAGE_LIB"
 
 C_GREEN='\033[32m'
 C_RED='\033[31m'
@@ -35,6 +37,8 @@ VERSION_B="9.9.2"
 SHA_A="1111111111111111111111111111111111111111111111111111111111111111"
 SHA_B="2222222222222222222222222222222222222222222222222222222222222222"
 PLACEHOLDER="RELEASE-9-9-1-SHA256-FILLED-AT-PUBLISH-DO-NOT-SHIP-THIS-LINE"
+URL_A="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
+URL_FOREIGN="https://github.com/someone-else/pensieve/releases/latest/download/Pensieve.dmg"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -49,12 +53,14 @@ fail() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
-# make_page <name> <version> <checksum-slot-payload>… → prints the page path
-# One slot payload per checksum <div>; zero payloads yields a page with none.
+# make_page <name> <version> <artifact-url|-> <checksum-slot-payload>… → prints
+# the page path. One slot payload per checksum <div>; zero payloads yields a
+# page with none. A `-` URL yields a page that links no artifact at all.
 make_page() {
     local name="$1"
     local version="$2"
-    shift 2
+    local url="$3"
+    shift 3
     local page="$FIXTURE_ROOT/$name.html"
     local payload
 
@@ -62,6 +68,9 @@ make_page() {
         printf '<!doctype html>\n<html>\n  <body>\n'
         printf '    <dl>\n      <div><dt>Version</dt><dd>%s</dd></div>\n' "$version"
         printf '      <div><dt>Platform</dt><dd>macOS 15+</dd></div>\n    </dl>\n'
+        if [[ "$url" != "-" ]]; then
+            printf '    <a class="btn btn-primary"\n      href="%s"\n      >Download Pensieve.dmg</a\n    >\n' "$url"
+        fi
         for payload in "$@"; do
             printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$payload"
         done
@@ -90,14 +99,14 @@ assert_status() {
 
 # ─── Preflight: landing_page_assert_publishable ───────────────────────────
 
-GOOD_PAGE="$(make_page good "$VERSION_A" "$PLACEHOLDER")"
+GOOD_PAGE="$(make_page good "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 assert_status "a placeholder page for this version is stampable" 0 "" \
-    landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A"
+    landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A" "$URL_A"
 
 assert_status "a missing page is a failure, not a silent pass" 1 "no landing page at" \
-    landing_page_assert_publishable "$FIXTURE_ROOT/absent.html" "$VERSION_A"
+    landing_page_assert_publishable "$FIXTURE_ROOT/absent.html" "$VERSION_A" "$URL_A"
 
-UNREADABLE_PAGE="$(make_page unreadable "$VERSION_A" "$PLACEHOLDER")"
+UNREADABLE_PAGE="$(make_page unreadable "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 chmod 000 "$UNREADABLE_PAGE"
 if [[ -r "$UNREADABLE_PAGE" ]]; then
     # root (or an ACL-permissive volume) can read a 000 file; the case is then
@@ -105,46 +114,78 @@ if [[ -r "$UNREADABLE_PAGE" ]]; then
     printf '%b[SKIP]%b unreadable-page case: this user can read a 0000 file\n' "$C_RED" "$C_RESET"
 else
     assert_status "an unreadable page is a failure, not a silent pass" 1 "not readable" \
-        landing_page_assert_publishable "$UNREADABLE_PAGE" "$VERSION_A"
+        landing_page_assert_publishable "$UNREADABLE_PAGE" "$VERSION_A" "$URL_A"
 fi
 chmod 644 "$UNREADABLE_PAGE"
 
-READONLY_PAGE="$(make_page readonly "$VERSION_A" "$PLACEHOLDER")"
+READONLY_PAGE="$(make_page readonly "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 chmod 444 "$READONLY_PAGE"
 if [[ -w "$READONLY_PAGE" ]]; then
     printf '%b[SKIP]%b read-only-page case: this user can write a 0444 file\n' "$C_RED" "$C_RESET"
 else
     assert_status "a page the release cannot stamp is rejected up front" 1 "not writable" \
-        landing_page_assert_publishable "$READONLY_PAGE" "$VERSION_A"
+        landing_page_assert_publishable "$READONLY_PAGE" "$VERSION_A" "$URL_A"
 fi
 chmod 644 "$READONLY_PAGE"
 
-NO_SLOT_PAGE="$(make_page no-slot "$VERSION_A")"
+NO_SLOT_PAGE="$(make_page no-slot "$VERSION_A" "$URL_A")"
 assert_status "a page with no checksum slot is rejected" 1 "exactly one" \
-    landing_page_assert_publishable "$NO_SLOT_PAGE" "$VERSION_A"
+    landing_page_assert_publishable "$NO_SLOT_PAGE" "$VERSION_A" "$URL_A"
 
-TWO_SLOT_PAGE="$(make_page two-slots "$VERSION_A" "$PLACEHOLDER" "$SHA_A")"
+TWO_SLOT_PAGE="$(make_page two-slots "$VERSION_A" "$URL_A" "$PLACEHOLDER" "$SHA_A")"
 assert_status "an ambiguous page with two checksum slots is rejected" 1 "exactly one" \
-    landing_page_assert_publishable "$TWO_SLOT_PAGE" "$VERSION_A"
+    landing_page_assert_publishable "$TWO_SLOT_PAGE" "$VERSION_A" "$URL_A"
+
+# The trailing slot is EMPTY on purpose. Slot listings are read through `$(…)`,
+# which strips trailing newlines, so an empty last record used to disappear:
+# this page counted as one slot, passed preflight, and only blew up at stamping
+# time — after the build, the notarization round trip and the shelf copy.
+EMPTY_TRAILING_SLOT_PAGE="$(make_page empty-trailing-slot "$VERSION_A" "$URL_A" "$PLACEHOLDER" "")"
+assert_status "an empty trailing checksum slot is counted, not swallowed" 1 "found 2" \
+    landing_page_assert_publishable "$EMPTY_TRAILING_SLOT_PAGE" "$VERSION_A" "$URL_A"
 
 RESHAPED_PAGE="$FIXTURE_ROOT/reshaped.html"
 printf '<div><dt>Version</dt><dd>%s</dd></div>\n<div class="sha">%s</div>\n' \
     "$VERSION_A" "$PLACEHOLDER" >"$RESHAPED_PAGE"
 assert_status "a checksum slot in an unknown shape is rejected, not stamped blindly" 1 \
-    "no longer" landing_page_assert_publishable "$RESHAPED_PAGE" "$VERSION_A"
+    "no longer" landing_page_assert_publishable "$RESHAPED_PAGE" "$VERSION_A" "$URL_A"
 
 assert_status "a page advertising another version is rejected before the build" 1 \
-    "advertises version" landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_B"
+    "advertises version" landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_B" "$URL_A"
 
 NO_VERSION_PAGE="$FIXTURE_ROOT/no-version.html"
 printf '<div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER" >"$NO_VERSION_PAGE"
 assert_status "a page that declares no download version is rejected" 1 \
-    "exactly one download version" landing_page_assert_publishable "$NO_VERSION_PAGE" "$VERSION_A"
+    "exactly one download version" \
+    landing_page_assert_publishable "$NO_VERSION_PAGE" "$VERSION_A" "$URL_A"
+
+FOREIGN_URL_PAGE="$(make_page foreign-url "$VERSION_A" "$URL_FOREIGN" "$PLACEHOLDER")"
+assert_status "a download button pointing at another repo's artifact is rejected up front" 1 \
+    "links the artifact" \
+    landing_page_assert_publishable "$FOREIGN_URL_PAGE" "$VERSION_A" "$URL_A"
+
+NO_URL_PAGE="$(make_page no-url "$VERSION_A" "-" "$PLACEHOLDER")"
+assert_status "a page with no artifact link at all is rejected" 1 "no downloadable artifact" \
+    landing_page_assert_publishable "$NO_URL_PAGE" "$VERSION_A" "$URL_A"
+
+MIXED_URL_PAGE="$FIXTURE_ROOT/mixed-url.html"
+printf '<div><dt>Version</dt><dd>%s</dd></div>\n<a href="%s">a</a>\n<a href="%s">b</a>\n<div class="sha"><b>SHA-256</b><br />%s</div>\n' \
+    "$VERSION_A" "$URL_A" "$URL_FOREIGN" "$PLACEHOLDER" >"$MIXED_URL_PAGE"
+assert_status "one canonical link does not excuse a second, foreign one" 1 "links the artifact" \
+    landing_page_assert_publishable "$MIXED_URL_PAGE" "$VERSION_A" "$URL_A"
+
+assert_status "an expected artifact URL that is not an https .dmg is a usage error" 2 \
+    "not an https .dmg URL" \
+    landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A" "https://github.com/vetcoders/pensieve/releases/latest"
+
+assert_status "preflight without an expected artifact URL is a usage error, not a pass" 2 \
+    "usage" landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A"
 
 # ─── Stamping: landing_page_stamp_checksum ────────────────────────────────
 
-STAMP_PAGE="$(make_page stamp "$VERSION_A" "$PLACEHOLDER")"
+STAMP_PAGE="$(make_page stamp "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 BEFORE_LINES="$(wc -l <"$STAMP_PAGE")"
+chmod 640 "$STAMP_PAGE"
 if landing_page_stamp_checksum "$STAMP_PAGE" "$SHA_A"; then
     if grep -q "<div class=\"sha\"><b>SHA-256</b><br />$SHA_A</div>" "$STAMP_PAGE"; then
         pass "stamping replaces the placeholder with the build's checksum"
@@ -163,9 +204,25 @@ if landing_page_stamp_checksum "$STAMP_PAGE" "$SHA_A"; then
     else
         fail "stamping leaves the rest of the page intact" "line count or surrounding markup changed"
     fi
+    # The page is now written by renaming a fresh file into place, so its
+    # permissions have to be carried over explicitly — a published page that
+    # silently becomes 0600 is a broken checkout, not a stamped release.
+    if [[ "$(stat -f '%Lp' "$STAMP_PAGE")" == "640" ]]; then
+        pass "stamping preserves the page's permissions"
+    else
+        fail "stamping preserves the page's permissions" \
+            "mode after stamping: $(stat -f '%Lp' "$STAMP_PAGE")"
+    fi
+    if compgen -G "$FIXTURE_ROOT/.pensieve-landing-page.*" >/dev/null; then
+        fail "stamping leaves no temporary file behind" \
+            "leftovers: $(echo "$FIXTURE_ROOT"/.pensieve-landing-page.*)"
+    else
+        pass "stamping leaves no temporary file behind"
+    fi
 else
     fail "stamping replaces the placeholder with the build's checksum" "stamp call failed"
 fi
+chmod 644 "$STAMP_PAGE"
 
 # Re-stamping an already filled page is the --dmg-only / retry path.
 if landing_page_stamp_checksum "$STAMP_PAGE" "$SHA_B" \
@@ -184,39 +241,129 @@ assert_status "stamping a missing page fails" 1 "no landing page at" \
 
 assert_status "stamping a page with no slot fails instead of writing nothing quietly" 1 \
     "could not rewrite exactly one checksum slot" \
-    landing_page_stamp_checksum "$(make_page stamp-no-slot "$VERSION_A")" "$SHA_A"
+    landing_page_stamp_checksum "$(make_page stamp-no-slot "$VERSION_A" "$URL_A")" "$SHA_A"
 
-# ─── Gate: landing_page_assert_checksum ───────────────────────────────────
+SYMLINK_PAGE="$FIXTURE_ROOT/symlinked.html"
+ln -sf "$(make_page symlink-target "$VERSION_A" "$URL_A" "$PLACEHOLDER")" "$SYMLINK_PAGE"
+assert_status "stamping through a symlink is refused instead of replacing the link" 1 \
+    "is a symlink" landing_page_stamp_checksum "$SYMLINK_PAGE" "$SHA_A"
 
-FILLED_PAGE="$(make_page filled "$VERSION_A" "$SHA_A")"
-assert_status "a page advertising this build's checksum passes the gate" 0 "" \
-    landing_page_assert_checksum "$FILLED_PAGE" "$SHA_A"
+# The stamped page is renamed into place from a temp file in the page's OWN
+# directory, because a rename is atomic only inside one filesystem. Proving it
+# behaviorally: a directory that cannot hold the temp file fails the stamp
+# (a $TMPDIR temp plus an in-place truncating write would have succeeded here).
+SEALED_DIR="$FIXTURE_ROOT/sealed"
+mkdir -p "$SEALED_DIR"
+SEALED_PAGE="$SEALED_DIR/index.html"
+printf '<div><dt>Version</dt><dd>%s</dd></div>\n<a href="%s">d</a>\n<div class="sha"><b>SHA-256</b><br />%s</div>\n' \
+    "$VERSION_A" "$URL_A" "$PLACEHOLDER" >"$SEALED_PAGE"
+chmod 500 "$SEALED_DIR"
+if [[ -w "$SEALED_DIR" ]]; then
+    printf '%b[SKIP]%b sealed-directory case: this user can write a 0500 directory\n' "$C_RED" "$C_RESET"
+else
+    assert_status "the stamped page is written next to the page, not from \$TMPDIR" 1 \
+        "next to" landing_page_stamp_checksum "$SEALED_PAGE" "$SHA_A"
+fi
+chmod 700 "$SEALED_DIR"
+
+# A shared worktree can be edited while the release is stamping. The rewrite is
+# bracketed by a digest of the page for exactly that reason: publishing the
+# pre-edit snapshot would erase the concurrent edit AND leave the final gate
+# nothing to notice, because the snapshot still carries the expected checksum.
+# Simulated deterministically by making the two digest reads disagree, which is
+# what a racing writer produces.
+CONFLICT_PAGE="$(make_page conflict "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
+CONFLICT_MARKER="$FIXTURE_ROOT/conflict-digest-taken"
+# The counter lives in a file: each digest is read through `$(…)`, i.e. in a
+# subshell, so a shell variable would come back to 0 on the second call.
+landing_page_digest() {
+    if [[ -e "$CONFLICT_MARKER" ]]; then
+        printf 'bbbb%060d\n' 0
+    else
+        : >"$CONFLICT_MARKER"
+        printf 'aaaa%060d\n' 0
+    fi
+}
+CONFLICT_OUTPUT="$(landing_page_stamp_checksum "$CONFLICT_PAGE" "$SHA_A" 2>&1 >/dev/null)" \
+    && CONFLICT_STATUS=0 || CONFLICT_STATUS=$?
+# shellcheck source=scripts/lib/landing-page.sh
+source "$LANDING_PAGE_LIB"
+if (( CONFLICT_STATUS == 1 )) && [[ "$CONFLICT_OUTPUT" == *"changed while this release was stamping it"* ]]; then
+    if grep -q "DO-NOT-SHIP" "$CONFLICT_PAGE"; then
+        pass "a page edited mid-stamp is left alone and the stamp fails loudly"
+    else
+        fail "a page edited mid-stamp is left alone and the stamp fails loudly" \
+            "the stamp was published anyway"
+    fi
+else
+    fail "a page edited mid-stamp is left alone and the stamp fails loudly" \
+        "expected exit 1 with a concurrent-edit message, got $CONFLICT_STATUS: ${CONFLICT_OUTPUT:-<no output>}"
+fi
+if compgen -G "$FIXTURE_ROOT/.pensieve-landing-page.*" >/dev/null; then
+    fail "an aborted stamp leaves no temporary file behind" \
+        "leftovers: $(echo "$FIXTURE_ROOT"/.pensieve-landing-page.*)"
+else
+    pass "an aborted stamp leaves no temporary file behind"
+fi
+
+# ─── Gate: landing_page_assert_published ──────────────────────────────────
+
+FILLED_PAGE="$(make_page filled "$VERSION_A" "$URL_A" "$SHA_A")"
+assert_status "a page describing this build passes the gate" 0 "" \
+    landing_page_assert_published "$FILLED_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
 
 assert_status "a page advertising another build's checksum fails the gate" 1 "advertises checksum" \
-    landing_page_assert_checksum "$FILLED_PAGE" "$SHA_B"
+    landing_page_assert_published "$FILLED_PAGE" "$SHA_B" "$VERSION_A" "$URL_A"
 
-PLACEHOLDER_PAGE="$(make_page placeholder "$VERSION_A" "$PLACEHOLDER")"
+# The P1 this gate exists for: a parallel agent bumps <dd>Version</dd> while the
+# build and notarization are in flight. The checksum still matches, so a
+# checksum-only gate reported success for a page pairing 0.4.3's checksum with
+# 0.4.4's version.
+VERSION_DRIFT_PAGE="$(make_page version-drift "$VERSION_B" "$URL_A" "$SHA_A")"
+assert_status "a version changed underneath the build fails the gate" 1 "advertises version" \
+    landing_page_assert_published "$VERSION_DRIFT_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
+
+URL_DRIFT_PAGE="$(make_page url-drift "$VERSION_A" "$URL_FOREIGN" "$SHA_A")"
+assert_status "a download link repointed underneath the build fails the gate" 1 \
+    "links the artifact" \
+    landing_page_assert_published "$URL_DRIFT_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
+
+assert_status "the gate refuses to run on half a contract" 2 "usage" \
+    landing_page_assert_published "$FILLED_PAGE" "$SHA_A"
+
+PLACEHOLDER_PAGE="$(make_page placeholder "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 assert_status "an unfilled placeholder fails the gate" 1 "DO-NOT-SHIP" \
-    landing_page_assert_checksum "$PLACEHOLDER_PAGE" "$SHA_A"
+    landing_page_assert_published "$PLACEHOLDER_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
 
 assert_status "a missing page fails the gate instead of passing for lack of a match" 1 \
-    "no landing page at" landing_page_assert_checksum "$FIXTURE_ROOT/absent.html" "$SHA_A"
+    "no landing page at" \
+    landing_page_assert_published "$FIXTURE_ROOT/absent.html" "$SHA_A" "$VERSION_A" "$URL_A"
 
-UNREADABLE_GATE_PAGE="$(make_page unreadable-gate "$VERSION_A" "$SHA_A")"
+UNREADABLE_GATE_PAGE="$(make_page unreadable-gate "$VERSION_A" "$URL_A" "$SHA_A")"
 chmod 000 "$UNREADABLE_GATE_PAGE"
 if [[ -r "$UNREADABLE_GATE_PAGE" ]]; then
     printf '%b[SKIP]%b unreadable-gate case: this user can read a 0000 file\n' "$C_RED" "$C_RESET"
 else
     assert_status "an unreadable page fails the gate (grep's exit 2 is not 'no match')" 1 \
-        "not readable" landing_page_assert_checksum "$UNREADABLE_GATE_PAGE" "$SHA_A"
+        "not readable" \
+        landing_page_assert_published "$UNREADABLE_GATE_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
 fi
 chmod 644 "$UNREADABLE_GATE_PAGE"
 
 assert_status "a page with two checksum slots fails the gate" 1 "exactly one" \
-    landing_page_assert_checksum "$(make_page gate-two "$VERSION_A" "$SHA_A" "$SHA_A")" "$SHA_A"
+    landing_page_assert_published \
+    "$(make_page gate-two "$VERSION_A" "$URL_A" "$SHA_A" "$SHA_A")" "$SHA_A" "$VERSION_A" "$URL_A"
+
+# Same swallowed-record bug as in preflight, on the far more dangerous side:
+# the page carries this build's checksum AND a stray second slot, and the gate
+# used to report it as a single clean slot.
+assert_status "a stray empty checksum slot cannot slip past the gate" 1 "found 2" \
+    landing_page_assert_published \
+    "$(make_page gate-empty-trailing "$VERSION_A" "$URL_A" "$SHA_A" "")" "$SHA_A" "$VERSION_A" "$URL_A"
 
 assert_status "an expected checksum that is not a SHA-256 is a usage error" 2 \
-    "not a lowercase SHA-256" landing_page_assert_checksum "$FILLED_PAGE" "deadbeef"
+    "not a lowercase SHA-256" \
+    landing_page_assert_published "$FILLED_PAGE" "deadbeef" "$VERSION_A" "$URL_A"
 
 # ─── Lane contract in scripts/build-release.sh ────────────────────────────
 # The page belongs to the lane that publishes a notarized DMG. `make
@@ -246,11 +393,48 @@ else
         "unguarded: $UNGUARDED"
 fi
 
+# Both gates — the one right after stamping and the one at the end of the run —
+# must assert the whole published contract. The final gate asserting only the
+# checksum is what let a mid-build version bump through.
+GATE_CALLS="$(grep -c \
+    'landing_page_assert_published .*LANDING_PAGE.*DMG_SHA256.*APP_VERSION.*LANDING_PAGE_ARTIFACT_URL' \
+    "$RELEASE_SCRIPT" || true)"
+if [[ "$GATE_CALLS" == "2" ]]; then
+    pass "both landing-page gates assert checksum, version and artifact URL together"
+else
+    fail "both landing-page gates assert checksum, version and artifact URL together" \
+        "expected 2 full-contract gate calls in build-release.sh, found $GATE_CALLS"
+fi
+
+if grep -q 'landing_page_assert_publishable .*LANDING_PAGE.*APP_VERSION.*LANDING_PAGE_ARTIFACT_URL' \
+    "$RELEASE_SCRIPT"; then
+    pass "preflight checks the artifact URL before anything is built"
+else
+    fail "preflight checks the artifact URL before anything is built" \
+        "no landing_page_assert_publishable call carrying \$LANDING_PAGE_ARTIFACT_URL"
+fi
+
 if grep -Eq "grep .*(DO-NOT-SHIP|docs/index\.html)" "$RELEASE_SCRIPT"; then
     fail "the release script no longer gates the page with a bare grep" \
         "a bare grep on docs/index.html cannot tell 'no marker' (exit 1) from 'unreadable' (exit 2)"
 else
     pass "the release script no longer gates the page with a bare grep"
+fi
+
+# ─── Provenance contract in scripts/lib/build-provenance.sh ───────────────
+# The stamping helper is sourced by the release script and mutates a published
+# file (docs/index.html), so it is a runtime input like every other release
+# helper: a release must refuse to run with local edits to it, seal it into the
+# input digest, and materialize it from the commit it claims to build.
+
+PROVENANCE_LIB="$SCRIPT_DIR/lib/build-provenance.sh"
+RPATH_LIST_COUNT="$(grep -c 'scripts/lib/rpath-hygiene\.sh' "$PROVENANCE_LIB" || true)"
+LANDING_LIST_COUNT="$(grep -c 'scripts/lib/landing-page\.sh' "$PROVENANCE_LIB" || true)"
+if [[ "$LANDING_LIST_COUNT" == "$RPATH_LIST_COUNT" && "$LANDING_LIST_COUNT" != "0" ]]; then
+    pass "landing-page.sh is a release runtime input everywhere the other helpers are"
+else
+    fail "landing-page.sh is a release runtime input everywhere the other helpers are" \
+        "rpath-hygiene.sh appears in $RPATH_LIST_COUNT provenance lists, landing-page.sh in $LANDING_LIST_COUNT"
 fi
 
 printf '\n'

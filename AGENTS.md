@@ -123,7 +123,22 @@ release. Local lanes (`make release-local`, `make release-appstore`, any
 keeps an unfilled placeholder between releases. A page that cannot carry this
 build's checksum (missing, unreadable, read-only, reshaped, or advertising
 another version) fails in pre-flight, before anything is built or published.
-Helpers: `scripts/lib/landing-page.sh`, tested by `scripts/test-landing-page.sh`.
+
+What is asserted — in pre-flight and again at the end of the run — is the whole
+published claim: the checksum, the version in the panel's `<dt>Version</dt>`,
+and the artifact every `.dmg` link on the page points at (hero button, panel
+button, JSON-LD `downloadUrl`), which must be the
+`releases/latest/download/Pensieve.dmg` funnel this lane publishes. So editing
+the version line or a download button of `docs/index.html` while a release is
+in flight fails that release rather than publishing a mismatched page. Stamping
+itself is concurrency-safe for the same reason: the page is rewritten by
+renaming a fresh copy into place, and an edit that lands mid-stamp aborts the
+run instead of being silently overwritten.
+
+`scripts/lib/landing-page.sh` is a release runtime input like every other
+release helper — it is listed in `scripts/lib/build-provenance.sh`, so a
+release refuses to run with uncommitted edits to it and seals it into the
+provenance digest. Tested by `scripts/test-landing-page.sh`.
 
 `Permission denied` or `Directory not empty` while a release retires `dist/` or
 `Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
