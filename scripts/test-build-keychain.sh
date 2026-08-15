@@ -184,6 +184,7 @@ run_preflight() {
         PENSIEVE_TEST_UNLOCK_RESULT="${UNLOCK_RESULT:-0}" \
         PENSIEVE_TEST_SHOWINFO_RESULT="${SHOWINFO_RESULT:-0}" \
         PENSIEVE_TEST_MANAGERNAME="${MANAGERNAME:-Aqua}" \
+        LANE_SIGNS_FROM_BUILD_KEYCHAIN="${LANE_KEYCHAIN:-1}" \
         SSH_CONNECTION="${FAKE_SSH_CONNECTION:-}" \
         SSH_TTY="" \
             /bin/bash "$DRIVER" "$EXTRACTED" 2>&1
@@ -204,6 +205,7 @@ UNLOCK_RESULT=0
 SHOWINFO_RESULT=0
 MANAGERNAME=Aqua
 FAKE_SSH_CONNECTION=""
+LANE_KEYCHAIN=1
 
 # ─── 1. No dedicated build keychain on this machine ───────────────────────
 # A machine that signs out of the default search list must be left alone
@@ -303,12 +305,66 @@ assert_contains "empty password file: diagnosed as LOCKED, not as a bad password
 assert_absent "empty password file: never calls unlock-keychain" \
     "unlock-keychain" "$RUN_CALLS"
 
+# ─── 8. A lane that does not sign out of this keychain is never gated on it ─
+# The App Store lane signs with the PENSIEVE_MAS_* identities, which need not
+# live in the dedicated build keychain at all. Gating it on that keychain would
+# let a stale password file — or a keychain locked in a headless session —
+# refuse a build that never opens it. Both fatal branches must stay silent, and
+# the keychain must not be touched at all.
+give_keychain
+give_password
+LANE_KEYCHAIN=0
+UNLOCK_RESULT=1
+MANAGERNAME=Aqua
+FAKE_SSH_CONNECTION=""
+run_preflight
+UNLOCK_RESULT=0
+assert_status "foreign lane, wrong password: preflight does not refuse the build" 0 "$RUN_STATUS"
+assert_absent "foreign lane, wrong password: never touches the build keychain" \
+    "security" "$RUN_CALLS"
+
+give_keychain
+drop_password
+MANAGERNAME=Background
+FAKE_SSH_CONNECTION="10.0.0.2 51000 10.0.0.3 22"
+SHOWINFO_RESULT=1
+run_preflight
+assert_status "foreign lane, locked keychain over SSH: preflight succeeds" 0 "$RUN_STATUS"
+assert_absent "foreign lane, locked keychain over SSH: never probes the lock state" \
+    "security" "$RUN_CALLS"
+LANE_KEYCHAIN=1
+
 # Restore defaults before the structural checks.
 SHOWINFO_RESULT=0
 MANAGERNAME=Aqua
 FAKE_SSH_CONNECTION=""
 
-# ─── 8. `security` is only ever used non-interactively ────────────────────
+# ─── 9. The lane flag is decided before the preflight consumes it ─────────
+# Same failure family as PUBLISHES_DMG: a lane flag read before it is assigned
+# silently degrades to the wrong lane. Pinned by line order, and by the default
+# in the preflight itself, which must keep the strict gate when the flag is
+# missing rather than open it.
+LANE_FLAG_LINE="$(/usr/bin/grep -n '^ *LANE_SIGNS_FROM_BUILD_KEYCHAIN=' "$RELEASE_SCRIPT" | /usr/bin/tail -n 1 | /usr/bin/cut -d: -f1)"
+PREFLIGHT_LINE="$(/usr/bin/grep -n '^preflight_build_keychain$' "$RELEASE_SCRIPT" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+if [[ -n "$LANE_FLAG_LINE" && -n "$PREFLIGHT_LINE" && "$LANE_FLAG_LINE" -lt "$PREFLIGHT_LINE" ]]; then
+    pass "the lane flag is assigned before preflight_build_keychain runs"
+else
+    fail "the lane flag is assigned before preflight_build_keychain runs" \
+        "assignment at line [${LANE_FLAG_LINE:-none}], preflight call at line [${PREFLIGHT_LINE:-none}]"
+fi
+
+assert_contains "the missing lane flag defaults to the strict gate" \
+    'LANE_SIGNS_FROM_BUILD_KEYCHAIN:-1' "$(cat "$EXTRACTED")"
+
+# The App Store lane keeps the opportunistic unlock at each signing site: a
+# Developer ID identity is a documented MAS dry-run stand-in and it does live in
+# the build keychain, so skipping the unlock there would resurrect
+# errSecInternalComponent on that path.
+assert_absent "sign_code() unlocks in every lane, gate or no gate" \
+    "LANE_SIGNS_FROM_BUILD_KEYCHAIN" \
+    "$(/usr/bin/awk '/^sign_code\(\) \{/ { inside = 1 } inside { print } inside && /^\}/ { exit }' "$RELEASE_SCRIPT")"
+
+# ─── 10. `security` is only ever used non-interactively ───────────────────
 # Across every case above, the only two subcommands the shim saw must be the
 # unlock (always with -p, so SecurityAgent is never reached) and the fenced
 # lock probe. Anything else — dump-keychain, a bare unlock-keychain, find-key —
@@ -327,7 +383,7 @@ else
     pass "unlock always carries -p (no interactive unlock path)"
 fi
 
-# ─── 9. Every signing site re-asserts the unlock ──────────────────────────
+# ─── 11. Every signing site re-asserts the unlock ─────────────────────────
 # A keychain's inactivity auto-lock can close it again while the release sits
 # in `swift build` or in notarization, so the unlock has to be re-asserted at
 # each signing site rather than only in preflight. Checked structurally,

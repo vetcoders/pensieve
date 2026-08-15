@@ -125,6 +125,13 @@ session that runs codesign, reading the password from
 `PENSIEVE_BUILD_KEYCHAIN` and `PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE`; a machine
 with no such keychain file is left alone entirely.
 
+Only the Developer ID lane is _gated_ on that keychain. The App Store lane signs
+with the `PENSIEVE_MAS_*` identities, which need not live there at all, so a
+stale password file must not refuse a `--appstore` build that never touches it.
+The MAS lane still gets the opportunistic, non-fatal unlock at each signing site,
+because a Developer ID identity is a documented stand-in for a MAS dry run and
+that one does live in the build keychain.
+
 The unlock is re-asserted before every signing site, not just in pre-flight,
 because a keychain's inactivity auto-lock can close it again while the run sits
 in `swift build` or waits on notarization — deliberately, in preference to

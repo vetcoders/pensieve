@@ -115,9 +115,18 @@ if (( APPSTORE )); then
     ENTITLEMENTS="$REPO_ROOT/$ENTITLEMENTS_RELATIVE"
     EXPECTED_HARDENED_RUNTIME="false"
     EXPECTED_SIGNATURE_POLICY="team-only"
+    # The dedicated build keychain is the Developer ID identity's home; the MAS
+    # lane signs with PENSIEVE_MAS_* identities, which need not live there at
+    # all. So the MAS lane must not be *gated* on that keychain: a stale
+    # ~/.keys/.build-keychain-pw would otherwise refuse a build that never
+    # touches it. It still gets the opportunistic, non-fatal unlock at every
+    # signing site, because a Developer ID identity is a documented stand-in
+    # for a MAS dry run (docs/appstore-lane.md) and that one does live there.
+    LANE_SIGNS_FROM_BUILD_KEYCHAIN=0
 else
     EXPECTED_HARDENED_RUNTIME="true"
     EXPECTED_SIGNATURE_POLICY="developer-id"
+    LANE_SIGNS_FROM_BUILD_KEYCHAIN=1
 fi
 
 # A lane "publishes" when it produces the notarized DMG humans actually
@@ -233,9 +242,15 @@ unlock_build_keychain() {
 
 # Fail here, with the keychain named and the remedy spelled out, rather than
 # eight minutes later inside codesign with an errSecInternalComponent.
+#
+# Only the lane whose signing identity lives in this keychain may be *gated* on
+# it. LANE_SIGNS_FROM_BUILD_KEYCHAIN is decided up in the arg block, long before
+# this runs, and defaults to 1 here: an unset flag keeps the strict gate rather
+# than silently opening it, so a future lane cannot lose the check by omission.
 preflight_build_keychain() {
     local status=0
 
+    (( ${LANE_SIGNS_FROM_BUILD_KEYCHAIN:-1} )) || return 0
     [[ -f "$BUILD_KEYCHAIN" ]] || return 0
 
     unlock_build_keychain || status=$?
