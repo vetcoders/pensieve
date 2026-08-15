@@ -125,6 +125,14 @@ session that runs codesign, reading the password from
 `PENSIEVE_BUILD_KEYCHAIN` and `PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE`; a machine
 with no such keychain file is left alone entirely.
 
+That 0600 is enforced, not merely documented. The file holds the keychain
+password in cleartext and `$HOME` is world-executable on macOS, so its own mode
+is the whole of its confidentiality. The pre-flight requires it to be owned by
+the user running the build with no group or other bits set — `0600`, or `0400`
+for a copy kept read-only. Anything wider is refused rather than read, with
+`chmod 600` printed; treat a password that sat in a group- or world-readable
+file as disclosed and rotate it.
+
 Only the Developer ID lane is _gated_ on that keychain. The App Store lane signs
 with the `PENSIEVE_MAS_*` identities, which need not live there at all, so a
 stale password file must not refuse a `--appstore` build that never touches it.

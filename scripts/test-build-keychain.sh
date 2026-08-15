@@ -114,6 +114,7 @@ fi
 for required_function in \
     session_can_prompt \
     build_keychain_is_locked \
+    build_keychain_password_file_is_private \
     unlock_build_keychain \
     preflight_build_keychain
 do
@@ -123,7 +124,7 @@ do
         exit 1
     fi
 done
-pass "fenced preflight block extracts with all four functions"
+pass "fenced preflight block extracts with all five functions"
 
 # ─── PATH shims ───────────────────────────────────────────────────────────
 # Every invocation is recorded, so a test can assert what was NOT run as well
@@ -197,8 +198,14 @@ run_preflight() {
 
 give_keychain()   { : >"$KEYCHAIN"; }
 drop_keychain()   { /bin/rm -f "$KEYCHAIN"; }
-give_password()   { printf '%s\n' "$TEST_PASSWORD" >"$PASSWORD_FILE"; chmod 600 "$PASSWORD_FILE"; }
 drop_password()   { /bin/rm -f "$PASSWORD_FILE"; }
+# Recreated rather than overwritten: a preceding case may have left the file
+# read-only, and every case is entitled to a fixture in a known mode.
+give_password()   { drop_password; printf '%s\n' "$TEST_PASSWORD" >"$PASSWORD_FILE"; chmod 600 "$PASSWORD_FILE"; }
+empty_password()  { drop_password; : >"$PASSWORD_FILE"; chmod 600 "$PASSWORD_FILE"; }
+# Same secret, arbitrary mode — the permission contract is exercised on a real
+# file in the fixture, not through a shim, because it is a real stat(2) fact.
+give_password_mode() { give_password; chmod "$1" "$PASSWORD_FILE"; }
 
 # Defaults for the knobs run_preflight reads; each case overrides what it needs.
 UNLOCK_RESULT=0
@@ -294,7 +301,7 @@ assert_contains "SSH, already unlocked: says so instead of failing" \
 # An empty file must not be handed to `security` as a password: that turns a
 # clear diagnosis into a spurious "wrong password" failure.
 give_keychain
-: >"$PASSWORD_FILE"
+empty_password
 MANAGERNAME=Background
 FAKE_SSH_CONNECTION="10.0.0.2 51000 10.0.0.3 22"
 SHOWINFO_RESULT=1
@@ -305,7 +312,36 @@ assert_contains "empty password file: diagnosed as LOCKED, not as a bad password
 assert_absent "empty password file: never calls unlock-keychain" \
     "unlock-keychain" "$RUN_CALLS"
 
-# ─── 8. A lane that does not sign out of this keychain is never gated on it ─
+# ─── 8. The password file must be a secret, not merely present ────────────
+# It holds the keychain password in cleartext and $HOME is world-executable on
+# macOS, so the file's own mode is the whole of its confidentiality. AGENTS.md
+# documents 0600; until this check the contract was decorative — a group- or
+# world-readable file was read and handed to `security` without a word.
+give_keychain
+MANAGERNAME=Aqua
+FAKE_SSH_CONNECTION=""
+for insecure_mode in 644 640 604; do
+    give_password_mode "$insecure_mode"
+    run_preflight
+    assert_status "password file mode $insecure_mode: preflight refuses the build" 9 "$RUN_STATUS"
+    assert_contains "password file mode $insecure_mode: names the file and prints the chmod remedy" \
+        "chmod 600 \"$PASSWORD_FILE\"" "$RUN_OUTPUT"
+    assert_absent "password file mode $insecure_mode: the secret never reaches security" \
+        "unlock-keychain" "$RUN_CALLS"
+done
+
+# 0600 and 0400 are both owner-only, so both are accepted: a password file kept
+# deliberately read-only must not be rejected for being *stricter* than the
+# documented mode.
+for private_mode in 600 400; do
+    give_password_mode "$private_mode"
+    run_preflight
+    assert_status "password file mode $private_mode: preflight succeeds" 0 "$RUN_STATUS"
+    assert_contains "password file mode $private_mode: unlocks with the stored password" \
+        "security unlock-keychain -p $TEST_PASSWORD $KEYCHAIN" "$RUN_CALLS"
+done
+
+# ─── 9. A lane that does not sign out of this keychain is never gated on it ─
 # The App Store lane signs with the PENSIEVE_MAS_* identities, which need not
 # live in the dedicated build keychain at all. Gating it on that keychain would
 # let a stale password file — or a keychain locked in a headless session —
@@ -339,7 +375,7 @@ SHOWINFO_RESULT=0
 MANAGERNAME=Aqua
 FAKE_SSH_CONNECTION=""
 
-# ─── 9. The lane flag is decided before the preflight consumes it ─────────
+# ─── 10. The lane flag is decided before the preflight consumes it ────────
 # Same failure family as PUBLISHES_DMG: a lane flag read before it is assigned
 # silently degrades to the wrong lane. Pinned by line order, and by the default
 # in the preflight itself, which must keep the strict gate when the flag is
@@ -364,7 +400,7 @@ assert_absent "sign_code() unlocks in every lane, gate or no gate" \
     "LANE_SIGNS_FROM_BUILD_KEYCHAIN" \
     "$(/usr/bin/awk '/^sign_code\(\) \{/ { inside = 1 } inside { print } inside && /^\}/ { exit }' "$RELEASE_SCRIPT")"
 
-# ─── 10. `security` is only ever used non-interactively ───────────────────
+# ─── 11. `security` is only ever used non-interactively ───────────────────
 # Across every case above, the only two subcommands the shim saw must be the
 # unlock (always with -p, so SecurityAgent is never reached) and the fenced
 # lock probe. Anything else — dump-keychain, a bare unlock-keychain, find-key —
@@ -383,7 +419,7 @@ else
     pass "unlock always carries -p (no interactive unlock path)"
 fi
 
-# ─── 11. Every signing site re-asserts the unlock ─────────────────────────
+# ─── 12. Every signing site re-asserts the unlock ─────────────────────────
 # A keychain's inactivity auto-lock can close it again while the release sits
 # in `swift build` or in notarization, so the unlock has to be re-asserted at
 # each signing site rather than only in preflight. Checked structurally,

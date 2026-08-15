@@ -226,14 +226,39 @@ build_keychain_is_locked() {
 # mode, so the only alternative is the interactive prompt this whole preflight
 # exists to avoid. The window is milliseconds on a single-operator build
 # machine, and the source is already a 0600 secret in $HOME.
+
+# build_keychain_password_file_is_private — the "already a 0600 secret" above is
+# a contract (AGENTS.md), and until here nothing checked it. $HOME is
+# world-executable on macOS, so this file's confidentiality rests entirely on
+# its own mode: a stray `chmod 644` hands the keychain password to every local
+# account and, before this check, did so silently. Required: owned by the user
+# running the build, with no group or other bits at all — 0600, or 0400 for a
+# file deliberately kept read-only. Anything wider is refused rather than read,
+# because reading it anyway would make the mode contract decorative.
 #
+# `stat -L` resolves a symlink on purpose: the mode that matters belongs to the
+# file whose bytes we are about to hand to `security`, not to the link.
+build_keychain_password_file_is_private() {
+    local metadata owner mode
+
+    metadata="$(/usr/bin/stat -L -f '%u %Lp' "$BUILD_KEYCHAIN_PASSWORD_FILE" 2>/dev/null)" || return 1
+    owner="${metadata%% *}"
+    mode="${metadata##* }"
+    [[ -n "$owner" && -n "$mode" ]] || return 1
+    [[ "$owner" == "$(/usr/bin/id -u)" ]] || return 1
+    (( 8#$mode & 8#077 )) && return 1
+    return 0
+}
+
 # Status: 0 unlocked (or no dedicated build keychain here), 1 no readable
-# password file, 2 the stored password did not unlock the keychain.
+# password file, 2 the stored password did not unlock the keychain, 3 the
+# password file is readable beyond its owner.
 unlock_build_keychain() {
     local password
 
     [[ -f "$BUILD_KEYCHAIN" ]] || return 0
     [[ -r "$BUILD_KEYCHAIN_PASSWORD_FILE" ]] || return 1
+    build_keychain_password_file_is_private || return 3
     password="$(head -n1 "$BUILD_KEYCHAIN_PASSWORD_FILE")" || return 1
     [[ -n "$password" ]] || return 1
     security unlock-keychain -p "$password" "$BUILD_KEYCHAIN" >/dev/null 2>&1 || return 2
@@ -263,6 +288,15 @@ preflight_build_keychain() {
        Correct the stored password, or unlock the keychain by hand from THIS
        session before re-running:
          security unlock-keychain '$BUILD_KEYCHAIN'"
+            ;;
+        3)
+            die "Build-keychain password file is readable beyond its owner: $BUILD_KEYCHAIN_PASSWORD_FILE
+       It holds the keychain password in cleartext and \$HOME is
+       world-executable, so every local account can read it. Refusing to use it
+       until it is the 0600 secret it is documented to be:
+         chmod 600 \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
+       Treat the stored password as disclosed: change it on the keychain and
+       re-store it."
             ;;
         *)
             # No readable password file. Signing can still succeed if this
