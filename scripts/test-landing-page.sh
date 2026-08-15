@@ -53,14 +53,18 @@ fail() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
-# make_page <name> <version> <artifact-url|-> <checksum-slot-payload>… → prints
-# the page path. One slot payload per checksum <div>; zero payloads yields a
-# page with none. A `-` URL yields a page that links no artifact at all.
-make_page() {
+# make_labelled_page <name> <version> <artifact-url|-> <algorithm-label>
+#                    <checksum-slot-payload>… → prints the page path.
+# One slot payload per checksum <div>; zero payloads yields a page with none. A
+# `-` URL yields a page that links no artifact at all. The label is a parameter
+# so a page can advertise our checksum under somebody else's algorithm while
+# keeping the slot's shape byte-for-byte.
+make_labelled_page() {
     local name="$1"
     local version="$2"
     local url="$3"
-    shift 3
+    local label="$4"
+    shift 4
     local page="$FIXTURE_ROOT/$name.html"
     local payload
 
@@ -72,8 +76,41 @@ make_page() {
             printf '    <a class="btn btn-primary"\n      href="%s"\n      >Download Pensieve.dmg</a\n    >\n' "$url"
         fi
         for payload in "$@"; do
-            printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$payload"
+            printf '    <div class="sha">%s<br />%s</div>\n' "$label" "$payload"
         done
+        printf '  </body>\n</html>\n'
+    } >"$page"
+    printf '%s\n' "$page"
+}
+
+# make_page <name> <version> <artifact-url|-> <checksum-slot-payload>… — the
+# same page with the label the real docs/index.html carries.
+make_page() {
+    local name="$1"
+    local version="$2"
+    local url="$3"
+    shift 3
+    make_labelled_page "$name" "$version" "$url" '<b>SHA-256</b>' "$@"
+}
+
+# make_versions_page <name> <slot-payload> <version>… → prints the page path.
+# A page whose download panel declares the given versions IN ORDER, each in its
+# own <dt>Version</dt> record; an empty argument yields `<dd></dd>`.
+make_versions_page() {
+    local name="$1"
+    local payload="$2"
+    shift 2
+    local page="$FIXTURE_ROOT/$name.html"
+    local version
+
+    {
+        printf '<!doctype html>\n<html>\n  <body>\n    <dl>\n'
+        for version in "$@"; do
+            printf '      <div><dt>Version</dt><dd>%s</dd></div>\n' "$version"
+        done
+        printf '    </dl>\n'
+        printf '    <a class="btn" href="%s">Download Pensieve.dmg</a>\n' "$URL_A"
+        printf '    <div class="sha"><b>SHA-256</b><br />%s</div>\n' "$payload"
         printf '  </body>\n</html>\n'
     } >"$page"
     printf '%s\n' "$page"
@@ -144,6 +181,21 @@ EMPTY_TRAILING_SLOT_PAGE="$(make_page empty-trailing-slot "$VERSION_A" "$URL_A" 
 assert_status "an empty trailing checksum slot is counted, not swallowed" 1 "found 2" \
     landing_page_assert_publishable "$EMPTY_TRAILING_SLOT_PAGE" "$VERSION_A" "$URL_A"
 
+# The slot keeps its exact shape and only the algorithm label changes. The
+# release computes a SHA-256, so a page presenting it as an MD5 tells every
+# reader who verifies it that the DMG was tampered with.
+MD5_LABEL_PAGE="$(make_labelled_page md5-label "$VERSION_A" "$URL_A" '<b>MD5</b>' "$PLACEHOLDER")"
+assert_status "a checksum slot relabelled as another algorithm is rejected" 1 \
+    "not labelled" landing_page_assert_publishable "$MD5_LABEL_PAGE" "$VERSION_A" "$URL_A"
+
+# The label has to sit where the reader sees it — before the value, not smuggled
+# in behind it.
+TRAILING_LABEL_PAGE="$FIXTURE_ROOT/trailing-label.html"
+printf '<div><dt>Version</dt><dd>%s</dd></div>\n<a href="%s">d</a>\n<div class="sha"><b>MD5</b><br />%s</div><b>SHA-256</b>\n' \
+    "$VERSION_A" "$URL_A" "$PLACEHOLDER" >"$TRAILING_LABEL_PAGE"
+assert_status "a SHA-256 label printed after the value does not vouch for the slot" 1 \
+    "not labelled" landing_page_assert_publishable "$TRAILING_LABEL_PAGE" "$VERSION_A" "$URL_A"
+
 RESHAPED_PAGE="$FIXTURE_ROOT/reshaped.html"
 printf '<div><dt>Version</dt><dd>%s</dd></div>\n<div class="sha">%s</div>\n' \
     "$VERSION_A" "$PLACEHOLDER" >"$RESHAPED_PAGE"
@@ -158,6 +210,26 @@ printf '<div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER" >"$NO_VE
 assert_status "a page that declares no download version is rejected" 1 \
     "exactly one download version" \
     landing_page_assert_publishable "$NO_VERSION_PAGE" "$VERSION_A" "$URL_A"
+
+# The swallowed-trailing-record bug, in the version parser this time: the page
+# declares the right version AND a second, empty declaration. `$(…)` dropped the
+# empty last line, so two competing declarations read as one clean version — and
+# a release cannot know which one the page will be read as advertising.
+EMPTY_TRAILING_VERSION_PAGE="$(make_versions_page empty-trailing-version "$PLACEHOLDER" "$VERSION_A" "")"
+assert_status "an empty trailing version record is counted, not swallowed" 1 "found 2" \
+    landing_page_assert_publishable "$EMPTY_TRAILING_VERSION_PAGE" "$VERSION_A" "$URL_A"
+
+EMPTY_VERSION_PAGE="$(make_versions_page empty-version "$PLACEHOLDER" "")"
+assert_status "a download panel declaring an empty version is rejected" 1 \
+    "empty download version" \
+    landing_page_assert_publishable "$EMPTY_VERSION_PAGE" "$VERSION_A" "$URL_A"
+
+RESHAPED_VERSION_PAGE="$FIXTURE_ROOT/reshaped-version.html"
+printf '<div><dt>Version</dt><dd><span>%s</span></dd></div>\n<a href="%s">d</a>\n<div class="sha"><b>SHA-256</b><br />%s</div>\n' \
+    "$VERSION_A" "$URL_A" "$PLACEHOLDER" >"$RESHAPED_VERSION_PAGE"
+assert_status "a version record in an unknown shape is rejected, not read as absent" 1 \
+    "the version record is no longer" \
+    landing_page_assert_publishable "$RESHAPED_VERSION_PAGE" "$VERSION_A" "$URL_A"
 
 FOREIGN_URL_PAGE="$(make_page foreign-url "$VERSION_A" "$URL_FOREIGN" "$PLACEHOLDER")"
 assert_status "a download button pointing at another repo's artifact is rejected up front" 1 \
@@ -180,6 +252,32 @@ assert_status "an expected artifact URL that is not an https .dmg is a usage err
 
 assert_status "preflight without an expected artifact URL is a usage error, not a pass" 2 \
     "usage" landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A"
+
+# Preflight only earns its keep while it rejects everything the stamp rejects.
+# These two are the stamp's own refusals, moved to the front of the run: a
+# writable page in a sealed directory (the stamped page is renamed in from a
+# temp file created there) and a symlinked page (a rename would replace the link
+# and leave the real page unstamped). Both used to fail AFTER the build and the
+# notarization round trip.
+SEALED_PREFLIGHT_DIR="$FIXTURE_ROOT/sealed-preflight"
+mkdir -p "$SEALED_PREFLIGHT_DIR"
+SEALED_PREFLIGHT_PAGE="$SEALED_PREFLIGHT_DIR/index.html"
+printf '<div><dt>Version</dt><dd>%s</dd></div>\n<a href="%s">d</a>\n<div class="sha"><b>SHA-256</b><br />%s</div>\n' \
+    "$VERSION_A" "$URL_A" "$PLACEHOLDER" >"$SEALED_PREFLIGHT_PAGE"
+chmod 500 "$SEALED_PREFLIGHT_DIR"
+if [[ -w "$SEALED_PREFLIGHT_DIR" ]]; then
+    printf '%b[SKIP]%b sealed-directory preflight case: this user can write a 0500 directory\n' "$C_RED" "$C_RESET"
+else
+    assert_status "a page in a directory the stamp cannot write is rejected up front" 1 \
+        "not a writable directory" \
+        landing_page_assert_publishable "$SEALED_PREFLIGHT_PAGE" "$VERSION_A" "$URL_A"
+fi
+chmod 700 "$SEALED_PREFLIGHT_DIR"
+
+SYMLINK_PREFLIGHT_PAGE="$FIXTURE_ROOT/symlinked-preflight.html"
+ln -sf "$(make_page symlink-preflight-target "$VERSION_A" "$URL_A" "$PLACEHOLDER")" "$SYMLINK_PREFLIGHT_PAGE"
+assert_status "a symlinked page is rejected up front, not at stamping time" 1 "is a symlink" \
+    landing_page_assert_publishable "$SYMLINK_PREFLIGHT_PAGE" "$VERSION_A" "$URL_A"
 
 # ─── Stamping: landing_page_stamp_checksum ────────────────────────────────
 
@@ -242,6 +340,14 @@ assert_status "stamping a missing page fails" 1 "no landing page at" \
 assert_status "stamping a page with no slot fails instead of writing nothing quietly" 1 \
     "could not rewrite exactly one checksum slot" \
     landing_page_stamp_checksum "$(make_page stamp-no-slot "$VERSION_A" "$URL_A")" "$SHA_A"
+
+# A SHA-256 must never be written into a slot promising another algorithm, even
+# though the slot's shape is stampable: the stamp leaves the line alone and the
+# run fails on the "exactly one slot" count.
+assert_status "a slot advertising another algorithm is not stamped with our SHA-256" 1 \
+    "could not rewrite exactly one checksum slot" \
+    landing_page_stamp_checksum \
+    "$(make_labelled_page stamp-md5 "$VERSION_A" "$URL_A" '<b>MD5</b>' "$PLACEHOLDER")" "$SHA_A"
 
 SYMLINK_PAGE="$FIXTURE_ROOT/symlinked.html"
 ln -sf "$(make_page symlink-target "$VERSION_A" "$URL_A" "$PLACEHOLDER")" "$SYMLINK_PAGE"
@@ -364,6 +470,92 @@ assert_status "a stray empty checksum slot cannot slip past the gate" 1 "found 2
 assert_status "an expected checksum that is not a SHA-256 is a usage error" 2 \
     "not a lowercase SHA-256" \
     landing_page_assert_published "$FILLED_PAGE" "deadbeef" "$VERSION_A" "$URL_A"
+
+# The value is this build's checksum and the slot's shape is untouched — only
+# the algorithm the page names changed. The gate is the last thing standing
+# between that page and the public.
+assert_status "a page presenting our checksum as another algorithm fails the gate" 1 \
+    "not labelled" landing_page_assert_published \
+    "$(make_labelled_page gate-md5 "$VERSION_A" "$URL_A" '<b>MD5</b>' "$SHA_A")" \
+    "$SHA_A" "$VERSION_A" "$URL_A"
+
+assert_status "a stray empty version record cannot slip past the gate" 1 "found 2" \
+    landing_page_assert_published \
+    "$(make_versions_page gate-empty-trailing-version "$SHA_A" "$VERSION_A" "")" \
+    "$SHA_A" "$VERSION_A" "$URL_A"
+
+# A gate that opens the page once per field can report success for a page no
+# revision of which was ever publishable — checksum read before an editor saved,
+# version read after. All four fields now come from ONE snapshot, and the
+# snapshot is proved to still be the page on disk. Simulated deterministically
+# by making the two digest reads disagree, which is what a racing writer
+# produces.
+GATE_RACE_PAGE="$(make_page gate-race "$VERSION_A" "$URL_A" "$SHA_A")"
+GATE_RACE_MARKER="$FIXTURE_ROOT/gate-race-digest-taken"
+# Overrides the lib's own function; the call comes back through
+# landing_page_assert_published, not from a name mentioned in this file.
+# shellcheck disable=SC2329
+landing_page_digest() {
+    if [[ -e "$GATE_RACE_MARKER" ]]; then
+        printf 'bbbb%060d\n' 0
+    else
+        : >"$GATE_RACE_MARKER"
+        printf 'aaaa%060d\n' 0
+    fi
+}
+assert_status "a page rewritten while the gate reads it fails instead of passing on mixed revisions" 1 \
+    "changed while this release was validating it" \
+    landing_page_assert_published "$GATE_RACE_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
+# shellcheck source=scripts/lib/landing-page.sh
+source "$LANDING_PAGE_LIB"
+
+# …and the isolation itself, which the race test above cannot see: every field
+# has to be read from the SAME file, and that file must not be the page. A gate
+# reading the page once per field is exactly how checksum and version end up
+# describing different revisions.
+READS_LOG="$FIXTURE_ROOT/gate-reads"
+: >"$READS_LOG"
+# Overrides of the lib's parsers; the calls come back through
+# landing_page_assert_published, not from names mentioned in this file.
+# shellcheck disable=SC2329
+landing_page_checksum_values() {
+    printf '%s\n' "$1" >>"$READS_LOG"
+    printf '%s\n' "$SHA_A"
+}
+# shellcheck disable=SC2329
+landing_page_declared_version() {
+    printf '%s\n' "$1" >>"$READS_LOG"
+    printf '%s\n' "$VERSION_A"
+}
+# shellcheck disable=SC2329
+landing_page_artifact_urls() {
+    printf '%s\n' "$1" >>"$READS_LOG"
+    printf '%s\n' "$URL_A"
+}
+ISOLATION_PAGE="$(make_page gate-isolation "$VERSION_A" "$URL_A" "$SHA_A")"
+if landing_page_assert_published "$ISOLATION_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"; then
+    READ_PATHS="$(sort -u "$READS_LOG")"
+    if [[ "$(wc -l <"$READS_LOG" | tr -d ' ')" -ge 2 ]] \
+        && [[ "$(printf '%s\n' "$READ_PATHS" | wc -l | tr -d ' ')" == "1" ]] \
+        && [[ "$READ_PATHS" != "$ISOLATION_PAGE" ]]; then
+        pass "every field the gate asserts is read from one snapshot, not from the page"
+    else
+        fail "every field the gate asserts is read from one snapshot, not from the page" \
+            "paths read: $(tr '\n' ' ' <"$READS_LOG")"
+    fi
+else
+    fail "every field the gate asserts is read from one snapshot, not from the page" \
+        "the gate rejected a page all of whose fields were stubbed as correct"
+fi
+# shellcheck source=scripts/lib/landing-page.sh
+source "$LANDING_PAGE_LIB"
+
+if compgen -G "${TMPDIR:-/tmp}/pensieve-landing-page-gate.*" >/dev/null; then
+    fail "the gate leaves no snapshot behind" \
+        "leftovers: $(echo "${TMPDIR:-/tmp}"/pensieve-landing-page-gate.*)"
+else
+    pass "the gate leaves no snapshot behind"
+fi
 
 # ─── Lane contract in scripts/build-release.sh ────────────────────────────
 # The page belongs to the lane that publishes a notarized DMG. `make

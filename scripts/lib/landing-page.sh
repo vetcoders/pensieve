@@ -31,8 +31,24 @@
 # The one line that carries the advertised checksum, e.g.
 #   <div class="sha"><b>SHA-256</b><br />…</div>
 LANDING_PAGE_CHECKSUM_SLOT_PATTERN='class="sha"'
+# The algorithm the slot promises the reader, and the only one this lib will
+# stamp into or vouch for. It is asserted rather than assumed: what the release
+# computes is a SHA-256, so a slot relabelled <b>MD5</b> while keeping the same
+# shape would sail through the parser, the stamper and the final gate, and the
+# published page would present this build's SHA-256 as a checksum of another
+# algorithm — a reader verifying it would compute an MD5 and conclude the DMG
+# was tampered with.
+LANDING_PAGE_ALGORITHM_LABEL='<b>SHA-256</b>'
 # A placeholder that must never reach a published page.
 LANDING_PAGE_UNFILLED_MARKER='DO-NOT-SHIP'
+
+# Every parser below prints one NON-EMPTY record per declaration it finds, using
+# `!empty` / `!unparsable` / `!wronglabel` sentinels for a declaration it cannot
+# vouch for. That is a hard rule, not a style: listings are read through `$(…)`,
+# which strips trailing newlines, so a record that printed as an empty line would
+# vanish from the end of a listing and turn "two declarations, one of them
+# broken" into "one clean declaration". Whoever adds a parser here keeps the
+# rule.
 
 # landing_page_readable <page> — 0 when the page exists and is readable.
 # Split out so callers report "missing" and "unreadable" as distinct failures
@@ -56,22 +72,26 @@ landing_page_readable() {
 
 # landing_page_checksum_values <page> — prints one line per checksum slot with
 # the advertised value (whitespace stripped), `!empty` for a slot that carries
-# no value, or `!unparsable` for a slot whose shape this lib no longer
-# understands. No output means no slot at all.
+# no value, `!wronglabel` for a slot that does not promise the reader a SHA-256,
+# or `!unparsable` for a slot whose shape this lib no longer understands. No
+# output means no slot at all.
 #
-# Every record is deliberately NON-EMPTY. Callers read this through `$(…)`,
-# which strips trailing newlines, so an empty trailing record would vanish: a
-# page with a filled slot plus an empty second one used to count as ONE slot,
-# which let a duplicated (and therefore unstampable) page through preflight and
-# let the final gate pass a page carrying a stray extra slot.
+# The label is read from BEFORE the value, because that is where the page prints
+# it: a `<b>SHA-256</b>` sitting after the `<br />` is not the label the reader
+# sees next to the number.
 landing_page_checksum_values() {
     local page="${1:-}"
 
     landing_page_readable "$page" || return $?
-    /usr/bin/awk -v slot="$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" '
+    /usr/bin/awk -v slot="$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" \
+        -v label="$LANDING_PAGE_ALGORITHM_LABEL" '
         index($0, slot) > 0 {
             line = $0
             if (match(line, /<br[^>]*>[^<]*<\/div>/)) {
+                if (index(substr(line, 1, RSTART - 1), label) == 0) {
+                    print "!wronglabel"
+                    next
+                }
                 payload = substr(line, RSTART, RLENGTH)
                 sub(/^<br[^>]*>/, "", payload)
                 sub(/<\/div>$/, "", payload)
@@ -85,6 +105,27 @@ landing_page_checksum_values() {
         printf 'landing-page: could not parse %s\n' "$page" >&2
         return 1
     }
+}
+
+# landing_page_assert_checksum_slot_shape <page> <values> — 0 unless <values> is
+# a sentinel record this lib refuses to vouch for. Shared by preflight and the
+# final gate so the two cannot disagree about what an untrustworthy slot is.
+landing_page_assert_checksum_slot_shape() {
+    local page="${1:-}"
+    local values="${2:-}"
+
+    case "$values" in
+        '!unparsable')
+            printf 'landing-page: %s: the checksum slot is no longer %s<br />VALUE</div> — teach scripts/lib/landing-page.sh the new shape before releasing\n' \
+                "$page" "$LANDING_PAGE_ALGORITHM_LABEL" >&2
+            return 1
+            ;;
+        '!wronglabel')
+            printf 'landing-page: %s: the checksum slot is not labelled %s — the page would present this build'"'"'s SHA-256 as another algorithm\n' \
+                "$page" "$LANDING_PAGE_ALGORITHM_LABEL" >&2
+            return 1
+            ;;
+    esac
 }
 
 # landing_page_count_records <records> — how many lines a values listing holds.
@@ -110,6 +151,10 @@ landing_page_count_records() {
 # construction: a button repointed at a URL that does not end in `.dmg` (an
 # installer page, a redirector) — that is a page redesign, not a swap the
 # checksum could be read as covering.
+#
+# No sentinel record here: a match is a matched URL, so every record this prints
+# is non-empty by construction and none can be swallowed off the end of a
+# listing.
 landing_page_artifact_urls() {
     local page="${1:-}"
 
@@ -128,9 +173,15 @@ landing_page_artifact_urls() {
     }
 }
 
-# landing_page_declared_version <page> — prints the version the download panel
-# advertises (the <dd> next to <dt>Version</dt>). No output means the panel no
-# longer declares one in the shape this lib understands.
+# landing_page_declared_version <page> — prints one line per <dt>Version</dt>
+# declaration with the version the panel advertises, `!empty` for a declaration
+# with no value, or `!unparsable` for one whose shape this lib no longer
+# understands. No output means the panel declares no version at all.
+#
+# Both sentinels exist for the counting rule above: a page carrying the real
+# version plus a trailing `<dt>Version</dt><dd></dd>` used to print "0.4.3" and
+# an empty line, and `$(…)` dropped the empty one — so two declarations, one of
+# which nobody could have stamped or trusted, were read as one clean version.
 landing_page_declared_version() {
     local page="${1:-}"
 
@@ -140,7 +191,9 @@ landing_page_declared_version() {
             if (match($0, /<dd>[^<]*<\/dd>/)) {
                 value = substr($0, RSTART + 4, RLENGTH - 9)
                 gsub(/^[ \t\r]+|[ \t\r]+$/, "", value)
-                print value
+                print (value == "" ? "!empty" : value)
+            } else {
+                print "!unparsable"
             }
         }
     ' "$page" || {
@@ -149,7 +202,7 @@ landing_page_declared_version() {
     }
 }
 
-# landing_page_assert_download_panel <page> <expected_version> <expected_url>
+# landing_page_assert_download_panel <page> <expected_version> <expected_url> [reported_path]
 #
 #   0 — the panel declares exactly this release's version and every artifact
 #       link on the page points at exactly <expected_url>
@@ -160,10 +213,15 @@ landing_page_declared_version() {
 # Asserted at BOTH ends of the run (preflight and the final gate), because the
 # checksum is only worth printing next to the version and the download link it
 # describes.
+#
+# <reported_path> is the path the diagnostics name, defaulting to the file being
+# read. The final gate reads a private snapshot of the page, and an operator
+# sent to a temporary copy that no longer exists cannot fix anything.
 landing_page_assert_download_panel() {
     local page="${1:-}"
     local expected_version="${2:-}"
     local expected_url="${3:-}"
+    local reported="${4:-${1:-}}"
     local version_values version_count urls url_count url
 
     if [[ -z "$page" || -z "$expected_version" || -z "$expected_url" ]]; then
@@ -180,12 +238,24 @@ landing_page_assert_download_panel() {
     version_count="$(landing_page_count_records "$version_values")"
     if (( version_count != 1 )); then
         printf 'landing-page: %s must declare exactly one download version (<dt>Version</dt><dd>…</dd>), found %s\n' \
-            "$page" "$version_count" >&2
+            "$reported" "$version_count" >&2
         return 1
     fi
+    case "$version_values" in
+        '!empty')
+            printf 'landing-page: %s declares an empty download version (<dt>Version</dt><dd></dd>) — fill it in before publishing\n' \
+                "$reported" >&2
+            return 1
+            ;;
+        '!unparsable')
+            printf 'landing-page: %s: the version record is no longer <dt>Version</dt><dd>VALUE</dd> — teach scripts/lib/landing-page.sh the new shape before releasing\n' \
+                "$reported" >&2
+            return 1
+            ;;
+    esac
     if [[ "$version_values" != "$expected_version" ]]; then
         printf 'landing-page: %s advertises version %s but this release is %s — update the download panel before publishing\n' \
-            "$page" "$version_values" "$expected_version" >&2
+            "$reported" "$version_values" "$expected_version" >&2
         return 1
     fi
 
@@ -193,14 +263,14 @@ landing_page_assert_download_panel() {
     url_count="$(landing_page_count_records "$urls")"
     if (( url_count < 1 )); then
         printf 'landing-page: %s advertises no downloadable artifact — a checksum with no link beside it is not publishable\n' \
-            "$page" >&2
+            "$reported" >&2
         return 1
     fi
     while IFS= read -r url; do
         [[ -n "$url" ]] || continue
         if [[ "$url" != "$expected_url" ]]; then
             printf 'landing-page: %s links the artifact %s but this release publishes %s — the advertised checksum would sit next to bytes it does not describe\n' \
-                "$page" "$url" "$expected_url" >&2
+                "$reported" "$url" "$expected_url" >&2
             return 1
         fi
     done <<<"$urls"
@@ -209,18 +279,23 @@ landing_page_assert_download_panel() {
 # landing_page_assert_publishable <page> <expected_version> <expected_url>
 #
 #   0 — the page can be stamped at the end of this run
-#   1 — missing/unreadable/unwritable page, no single stampable checksum slot,
-#       or a download panel that does not describe this release
+#   1 — a page or page DIRECTORY the stamp could not write, a symlinked page, no
+#       single stampable checksum slot, or a download panel that does not
+#       describe this release
 #   2 — called wrong
 #
 # Runs BEFORE anything is built or published, so a page that cannot carry this
 # release's checksum costs a preflight failure instead of a notarization round
-# trip followed by an artifact already copied onto the team shelf.
+# trip followed by an artifact already copied onto the team shelf. That is only
+# true while preflight rejects everything the stamp would reject: the checks
+# below deliberately mirror landing_page_stamp_checksum's own refusals — the
+# symlink, and the directory the stamped page is renamed from, not just the
+# page's own write bit.
 landing_page_assert_publishable() {
     local page="${1:-}"
     local expected_version="${2:-}"
     local expected_url="${3:-}"
-    local values slot_count
+    local values slot_count page_dir
 
     if [[ -z "$page" || -z "$expected_version" || -z "$expected_url" ]]; then
         printf 'landing-page: usage: landing_page_assert_publishable <page> <expected_version> <expected_url>\n' >&2
@@ -228,8 +303,23 @@ landing_page_assert_publishable() {
     fi
 
     landing_page_readable "$page" || return $?
+    if [[ -L "$page" ]]; then
+        printf 'landing-page: %s is a symlink — the stamp refuses to replace a link with a regular file, so point the release at the file it resolves to\n' \
+            "$page" >&2
+        return 1
+    fi
     if [[ ! -w "$page" ]]; then
         printf 'landing-page: %s is not writable — the release cannot stamp this build'"'"'s checksum into it\n' "$page" >&2
+        return 1
+    fi
+    # The stamped page is a temp file renamed into place from the page's OWN
+    # directory, so a writable page inside a sealed directory is not stampable.
+    # Without this the run failed at mktemp — after the build and the
+    # notarization round trip.
+    page_dir="$(/usr/bin/dirname "$page")"
+    if [[ ! -w "$page_dir" || ! -x "$page_dir" ]]; then
+        printf 'landing-page: %s is not a writable directory — the stamped page is written by renaming a temporary file created next to %s\n' \
+            "$page_dir" "$page" >&2
         return 1
     fi
 
@@ -240,11 +330,7 @@ landing_page_assert_publishable() {
             "$page" "$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" "$slot_count" >&2
         return 1
     fi
-    if [[ "$values" == "!unparsable" ]]; then
-        printf 'landing-page: %s: the checksum slot is no longer <b>SHA-256</b><br />VALUE</div> — teach scripts/lib/landing-page.sh the new shape before releasing\n' \
-            "$page" >&2
-        return 1
-    fi
+    landing_page_assert_checksum_slot_shape "$page" "$values" || return 1
 
     landing_page_assert_download_panel "$page" "$expected_version" "$expected_url"
 }
@@ -322,12 +408,19 @@ landing_page_stamp_checksum() {
             "$page" >&2
         return 1
     }
-    /usr/bin/awk -v slot="$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" -v sha="$sha" '
+    # The label is part of what makes a line stampable: the stamp writes a
+    # SHA-256, so a slot advertising anything else is left alone and the run
+    # fails on the "exactly one slot" count rather than filling this build's
+    # SHA-256 in under somebody else's algorithm name.
+    /usr/bin/awk -v slot="$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" \
+        -v label="$LANDING_PAGE_ALGORITHM_LABEL" -v sha="$sha" '
         BEGIN { stamped = 0 }
         {
             if (index($0, slot) > 0) {
                 line = $0
-                if (sub(/<br[^>]*>[^<]*<\/div>/, "<br />" sha "</div>", line)) {
+                if (match(line, /<br[^>]*>[^<]*<\/div>/) &&
+                    index(substr(line, 1, RSTART - 1), label) > 0 &&
+                    sub(/<br[^>]*>[^<]*<\/div>/, "<br />" sha "</div>", line)) {
                     stamped++
                     print line
                     next
@@ -380,12 +473,19 @@ landing_page_stamp_checksum() {
 # edit to <dt>Version</dt> during a build or notarization round trip would
 # otherwise leave the run reporting success for a page pairing this release's
 # checksum with a different release's version.
+#
+# The four fields are read from ONE snapshot of the page's bytes rather than
+# from four separate opens. A gate that opens the file once per field can pass a
+# page no revision of which was ever publishable: checksum read from the old
+# page, version from the one an editor saved a millisecond later. The snapshot
+# is then proved to still be the page on disk, so "the fields agree with each
+# other" also means "they agree with what is published".
 landing_page_assert_published() {
     local page="${1:-}"
     local sha="${2:-}"
     local expected_version="${3:-}"
     local expected_url="${4:-}"
-    local values slot_count marker_status
+    local snapshot page_digest snapshot_digest status=0
 
     if [[ -z "$page" || -z "$sha" || -z "$expected_version" || -z "$expected_url" ]]; then
         printf 'landing-page: usage: landing_page_assert_published <page> <sha256> <expected_version> <expected_url>\n' >&2
@@ -397,10 +497,52 @@ landing_page_assert_published() {
     fi
     landing_page_readable "$page" || return $?
 
+    snapshot="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/pensieve-landing-page-gate.XXXXXX")" || {
+        printf 'landing-page: could not create a temporary file to snapshot %s for validation\n' "$page" >&2
+        return 1
+    }
+    if ! /bin/cp "$page" "$snapshot"; then
+        /bin/rm -f "$snapshot"
+        printf 'landing-page: could not snapshot %s for validation\n' "$page" >&2
+        return 1
+    fi
+
+    landing_page_assert_published_snapshot \
+        "$snapshot" "$page" "$sha" "$expected_version" "$expected_url" || status=$?
+    if (( status == 0 )); then
+        # The snapshot is only evidence about the published page while it still
+        # IS the published page. A page rewritten during validation fails the
+        # gate loudly instead of being reported on from bytes nobody can read
+        # any more.
+        page_digest="$(landing_page_digest "$page")" || status=1
+        snapshot_digest="$(landing_page_digest "$snapshot")" || status=1
+        if (( status == 0 )) && [[ "$page_digest" != "$snapshot_digest" ]]; then
+            printf 'landing-page: %s changed while this release was validating it — the page that was checked is not the page on disk\n' \
+                "$page" >&2
+            status=1
+        fi
+    fi
+    /bin/rm -f "$snapshot"
+    return "$status"
+}
+
+# landing_page_assert_published_snapshot <snapshot> <page> <sha256> <version> <url>
+#
+# The body of the gate above, reading the snapshot but naming <page> in every
+# diagnostic: an operator debugging a failed release needs the path of the page
+# they can open, not of a temporary copy this function already deleted.
+landing_page_assert_published_snapshot() {
+    local snapshot="${1:-}"
+    local page="${2:-}"
+    local sha="${3:-}"
+    local expected_version="${4:-}"
+    local expected_url="${5:-}"
+    local values slot_count marker_status
+
     # grep exits 0 (match), 1 (no match) and 2 (read error) — collapsing 2 into
     # "no match" is exactly how a gate silently opens on an unreadable page.
     marker_status=0
-    /usr/bin/grep -q -- "$LANDING_PAGE_UNFILLED_MARKER" "$page" || marker_status=$?
+    /usr/bin/grep -q -- "$LANDING_PAGE_UNFILLED_MARKER" "$snapshot" || marker_status=$?
     case "$marker_status" in
         0)
             printf 'landing-page: %s still carries the %s placeholder — it must not be published\n' \
@@ -415,18 +557,19 @@ landing_page_assert_published() {
             ;;
     esac
 
-    values="$(landing_page_checksum_values "$page")" || return 1
+    values="$(landing_page_checksum_values "$snapshot")" || return 1
     slot_count="$(landing_page_count_records "$values")"
     if (( slot_count != 1 )); then
         printf 'landing-page: %s must carry exactly one %s checksum slot, found %s\n' \
             "$page" "$LANDING_PAGE_CHECKSUM_SLOT_PATTERN" "$slot_count" >&2
         return 1
     fi
+    landing_page_assert_checksum_slot_shape "$page" "$values" || return 1
     if [[ "$values" != "$sha" ]]; then
         printf 'landing-page: %s advertises checksum %s but this build'"'"'s DMG is %s\n' \
             "$page" "$values" "$sha" >&2
         return 1
     fi
 
-    landing_page_assert_download_panel "$page" "$expected_version" "$expected_url"
+    landing_page_assert_download_panel "$snapshot" "$expected_version" "$expected_url" "$page" || return 1
 }
