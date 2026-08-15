@@ -114,6 +114,36 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
+**The release unlocks its own build keychain.** The Developer ID identity lives
+in a dedicated keychain (`~/Library/Keychains/pensieve-build.keychain-db` by
+default), and a keychain's unlocked state belongs to the security session that
+unlocked it. Unlocking it in a GUI session therefore does nothing for a release
+driven over SSH: codesign fails there with `errSecInternalComponent`, minutes
+into the build. `scripts/build-release.sh` unlocks it itself, inside the same
+session that runs codesign, reading the password from
+`~/.keys/.build-keychain-pw` (0600). Both paths are overridable via
+`PENSIEVE_BUILD_KEYCHAIN` and `PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE`; a machine
+with no such keychain file is left alone entirely.
+
+The unlock is re-asserted before every signing site, not just in pre-flight,
+because a keychain's inactivity auto-lock can close it again while the run sits
+in `swift build` or waits on notarization — deliberately, in preference to
+raising the operator's auto-lock timeout, which would leave a persistent change
+to their security posture behind. `security find-identity` is not evidence that
+signing will work: it lists an identity out of a LOCKED keychain, since only the
+private key is sealed.
+
+With no password file the run continues rather than failing: signing may still
+succeed because this session already holds the keychain open. The one case that
+fails in pre-flight, with the remedy printed, is a locked keychain in a session
+that cannot be prompted. That branch is the only caller of
+`security show-keychain-info`, and it is fenced behind a GUI-session check for a
+concrete reason: against a locked keychain that call is not a passive read, it
+raises a SecurityAgent panel and blocks on it. Never lift it out of that branch,
+and never let a test reach a real keychain — `scripts/test-build-keychain.sh`
+shims `security` and `launchctl` on `PATH` and asserts the absence of that call
+in the sessions that could pop a panel.
+
 **The download page's checksum is stamped, not typed.** A lane that produces a
 notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
 the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG

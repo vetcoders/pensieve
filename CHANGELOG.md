@@ -28,6 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A release driven over SSH no longer dies on `errSecInternalComponent`.**
+  The Developer ID identity lives in a dedicated build keychain, and a
+  keychain's unlocked state belongs to the security session that unlocked it —
+  so unlocking it in a GUI session did nothing for a build running over SSH, and
+  codesign failed there with an error that names nothing and suggests nothing,
+  minutes into the run. `scripts/build-release.sh` now unlocks the keychain
+  itself, non-interactively, inside the same session that runs codesign, and
+  re-asserts that unlock before every signing site so an inactivity auto-lock
+  cannot close it again while the build sits in `swift build` or waits on
+  notarization. `security find-identity` passing was never evidence that signing
+  would work: it lists an identity straight out of a locked keychain, because
+  only the private key is sealed. A keychain that is locked in a session which
+  cannot be prompted now fails in pre-flight instead, naming the keychain and
+  printing the remedy. Machines with no dedicated build keychain, and sessions
+  that already hold theirs open, are untouched.
 - **Flipping your Mac between light and dark no longer leaves a Typewriter
   window in two halves.** The native tab bar and the toolbar's toggles jumped to
   the incoming half immediately while the titlebar, toolbar, sidebar and traffic
