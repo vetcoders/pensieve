@@ -668,14 +668,22 @@ struct SidebarView: View {
   /// but greyed-out and inert — no open-on-click, no expand/collapse chevron. The full
   /// filename (extension included) is shown, unlike a document row which shows the stem.
   private func foreignFileRow(_ node: WorkspaceNode, depth: Int) -> some View {
-    HStack {
+    HStack(spacing: 5) {
+      // Same leading recipe as `nodeRow` — shared guides plus the reserved
+      // disclosure slot — instead of the private `depth * 14 + 15` this row
+      // used to carry. That literal drifted from `indentStep` and left a
+      // foreign file misaligned with the documents it sits between.
+      indentGuides(depth: depth)
+
+      Color.clear.frame(width: Self.disclosureWidth)
+
       Image(systemName: "doc.text")
         .foregroundColor(.secondary)
       Text(node.name)
         .lineLimit(1)
+        .truncationMode(.middle)
         .foregroundColor(.secondary)
     }
-    .padding(.leading, CGFloat(depth) * 14 + 15)
     .padding(.vertical, 4)
     .padding(.horizontal, 6)
     .help(node.url?.path ?? node.name)
@@ -704,12 +712,17 @@ struct SidebarView: View {
           .foregroundColor(.secondary)
         Text(result.title)
           .lineLimit(1)
+          .truncationMode(.middle)
       }
 
+      // A path's informative ends are its first and last segments, so this one
+      // elides from the middle too. The snippet below deliberately does not —
+      // prose reads from the head.
       Text(result.displayPath)
         .font(.caption)
         .foregroundColor(.secondary)
         .lineLimit(1)
+        .truncationMode(.middle)
 
       if let snippet = result.snippet {
         Text(snippet)
@@ -775,7 +788,15 @@ struct SidebarView: View {
   }
 
   private static let rowHeight: CGFloat = 26
-  private static let indentStep: CGFloat = 22
+
+  /// Leading width one nesting level costs. The rail is a depth cue, not a
+  /// margin: at the sidebar's minimum column width (180 pt, see
+  /// `ContentView.navigationSplitViewColumnWidth`) the old 22 pt step spent
+  /// 110 pt of that on a depth-5 row and left ~13 pt for the filename, which
+  /// is why deep trees truncated names down to `2026-06-04_t…`. At 11 pt the
+  /// same row keeps ~68 pt of title, and a 1 pt guide line still reads clearly
+  /// inside an 11 pt column.
+  private static let indentStep: CGFloat = 11
   private static let disclosureWidth: CGFloat = 14
 
   /// One 1 px vertical guide per indentation level, in the theme's border tint —
@@ -831,8 +852,13 @@ struct SidebarView: View {
         }
       }
     } else {
+      // Middle truncation, not the default tail: workspace names are routinely
+      // date-prefixed (`2026-06-04_tab-close-plan`), so a tail-truncated title
+      // in a narrow sidebar collapses to the part every sibling shares. Keeping
+      // both ends leaves the row identifiable — `2026-06-04_…-close-plan`.
       Text(title)
         .lineLimit(1)
+        .truncationMode(.middle)
     }
   }
 

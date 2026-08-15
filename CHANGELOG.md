@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half a window already has, and the setting change itself re-dresses every open
   document window instead of only the ones that happen to be redrawn. Cold
   starts, skin switches and the white preview page are unchanged.
+- A deeply nested file in the workspace tree is readable again. The indent rail
+  charged 22 pt per nesting level, so at the sidebar's minimum width a depth-5
+  row had roughly 13 pt left for its name — enough for `2026-06-04_t…` and
+  nothing that told two siblings apart. A level now costs 11 pt (the depth
+  guides stay), which returns ~55 pt of that row to the filename, and every row
+  title, search hit and search path elides from the MIDDLE instead of the tail,
+  so a date-prefixed name keeps both its date and its distinguishing suffix.
+  Non-markdown rows also stop drawing their own indent from a private
+  `depth * 14 + 15`: they use the same guides and disclosure slot as document
+  rows, so a foreign file finally lines up with the files it sits between.
 - A release without `--clean` no longer stalls or dies while retiring the
   previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
   read-only, so the stale bundle carried unwritable `Assets.xcassets`
