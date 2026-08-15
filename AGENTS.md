@@ -136,9 +136,15 @@ renaming a fresh copy into place, and an edit that lands mid-stamp aborts the
 run instead of being silently overwritten.
 
 `scripts/lib/landing-page.sh` is a release runtime input like every other
-release helper — it is listed in `scripts/lib/build-provenance.sh`, so a
-release refuses to run with uncommitted edits to it and seals it into the
-provenance digest. Tested by `scripts/test-landing-page.sh`.
+release helper, so a release refuses to run with uncommitted edits to it and
+seals it into the provenance digest. The release enumerates its helpers by hand
+in several places — the snapshot archive in `scripts/build-release.sh`, the
+digest and status lists in `scripts/lib/build-provenance.sh`, and the
+dirty-input status list in `scripts/lib/isolated-app.sh` — and a helper added to
+some of them but not all breaks a release lane rather than failing a test. A
+helper is therefore added to EVERY such list at once;
+`scripts/test-landing-page.sh` checks that structurally, by requiring any
+multi-line helper list in those scripts to name every release helper.
 
 `Permission denied` or `Directory not empty` while a release retires `dist/` or
 `Pensieve/.build` is the read-only SwiftPM resource shape, not a race:

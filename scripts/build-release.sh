@@ -323,6 +323,7 @@ create_release_snapshot() {
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-provenance.sh \
+        scripts/lib/landing-page.sh \
         scripts/lib/rpath-hygiene.sh \
         | /usr/bin/tar -xf - -C "$RELEASE_SNAPSHOT_ROOT"; then
         die "Could not materialize the exact release commit into the source snapshot."

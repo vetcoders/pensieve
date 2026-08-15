@@ -619,14 +619,78 @@ fi
 # helper: a release must refuse to run with local edits to it, seal it into the
 # input digest, and materialize it from the commit it claims to build.
 
-PROVENANCE_LIB="$SCRIPT_DIR/lib/build-provenance.sh"
-RPATH_LIST_COUNT="$(grep -c 'scripts/lib/rpath-hygiene\.sh' "$PROVENANCE_LIB" || true)"
-LANDING_LIST_COUNT="$(grep -c 'scripts/lib/landing-page\.sh' "$PROVENANCE_LIB" || true)"
-if [[ "$LANDING_LIST_COUNT" == "$RPATH_LIST_COUNT" && "$LANDING_LIST_COUNT" != "0" ]]; then
-    pass "landing-page.sh is a release runtime input everywhere the other helpers are"
+# The release enumerates its own helpers by hand in several places — the git
+# archive that materializes a snapshot, the digest's existence check and hash
+# list, the archive that reproduces a commit, and the two `git status` lists
+# that decide whether the inputs are clean. Sealing a NEW helper into provenance
+# means editing every one of them, and a list quietly left behind does not fail
+# the release it belongs to: `landing-page.sh` reached the digest but not
+# build-release.sh's snapshot archive, and every lane that snapshots died on
+# "required runtime input is missing" AFTER preflight.
+#
+# So the invariant is checked structurally rather than per helper: any
+# multi-line list in the release scripts that names one release helper must name
+# them ALL. That is what makes the next helper's omission a test failure here
+# instead of a broken release lane, whatever the helper is called.
+RELEASE_HELPERS='bundle-identity.sh build-provenance.sh landing-page.sh rpath-hygiene.sh'
+RELEASE_ENUMERATORS=(
+    "$SCRIPT_DIR/build-release.sh"
+    "$SCRIPT_DIR/lib/build-provenance.sh"
+    "$SCRIPT_DIR/lib/isolated-app.sh"
+)
+HELPER_LISTS="$(awk -v helpers="$RELEASE_HELPERS" '
+    function flush(   name, missing) {
+        if (lines >= 2 && named) {
+            missing = ""
+            for (name in required) {
+                if (!(name in seen)) {
+                    missing = missing " " name
+                }
+            }
+            printf "%s\t%s\t%d\t%s\n", (missing == "" ? "OK" : "MISSING"), \
+                FILENAME, start, missing
+        }
+        lines = 0
+        named = 0
+        split("", seen)
+    }
+    BEGIN { split(helpers, list, " "); for (i in list) required[list[i]] }
+    FNR == 1 { flush(); open = 0 }
+    {
+        if (!open) { start = FNR; lines = 0; named = 0; split("", seen) }
+        open = 1
+        lines++
+        if (match($0, /scripts\/lib\/[A-Za-z0-9._-]+\.sh/)) {
+            name = substr($0, RSTART, RLENGTH)
+            sub(/.*\//, "", name)
+            if (name in required) { seen[name]; named = 1 }
+        }
+        if ($0 !~ /\\[ \t]*$/) { flush(); open = 0 }
+    }
+    END { flush() }
+' "${RELEASE_ENUMERATORS[@]}")"
+
+INCOMPLETE_LISTS="$(printf '%s\n' "$HELPER_LISTS" | grep '^MISSING' || true)"
+if [[ -z "$INCOMPLETE_LISTS" ]]; then
+    pass "every release-helper list in the release scripts names every release helper"
 else
-    fail "landing-page.sh is a release runtime input everywhere the other helpers are" \
-        "rpath-hygiene.sh appears in $RPATH_LIST_COUNT provenance lists, landing-page.sh in $LANDING_LIST_COUNT"
+    fail "every release-helper list in the release scripts names every release helper" \
+        "incomplete: $(printf '%s' "$INCOMPLETE_LISTS" | tr '\n\t' '; ')"
+fi
+
+# …and the check above cannot pass by finding nothing: each enumerator really
+# does declare at least one such list, so a matcher that stopped matching is a
+# failure rather than a silent all-clear.
+UNSCANNED=""
+for enumerator in "${RELEASE_ENUMERATORS[@]}"; do
+    printf '%s\n' "$HELPER_LISTS" | grep -q "^OK	$enumerator	" \
+        || UNSCANNED="$UNSCANNED $enumerator"
+done
+if [[ -z "$UNSCANNED" ]]; then
+    pass "the release-helper list check really reaches every release script"
+else
+    fail "the release-helper list check really reaches every release script" \
+        "no complete helper list found in:$UNSCANNED"
 fi
 
 printf '\n'

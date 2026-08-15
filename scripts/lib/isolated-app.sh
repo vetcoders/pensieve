@@ -292,6 +292,7 @@ isolated_app_runtime_input_status() {
     scripts/build-release.sh \
     scripts/lib/bundle-identity.sh \
     scripts/lib/build-provenance.sh \
+    scripts/lib/landing-page.sh \
     scripts/lib/rpath-hygiene.sh \
     Pensieve/Package.swift \
     Pensieve/Package.resolved \
