@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Non-markdown rows also stop drawing their own indent from a private
   `depth * 14 + 15`: they use the same guides and disclosure slot as document
   rows, so a foreign file finally lines up with the files it sits between.
+- The download page can no longer advertise a checksum that belongs to no
+  downloadable artifact. A lane that produces a notarized DMG now stamps the
+  SHA-256 of that exact DMG into `docs/index.html` and verifies it, instead of
+  waiting for a human to paste one — a hand-filled checksum can come from a run
+  that failed, and the next successful run necessarily produces a different DMG.
+  The page is also checked in pre-flight, before anything is built or copied to
+  the internal release shelf, and every check is fail-closed: a missing,
+  unreadable, read-only, reshaped or wrong-version page fails the release
+  instead of passing for lack of a match. Lanes that publish nothing
+  (`make release-local`, `make release-appstore`, any `--no-notarize` run)
+  neither stamp nor gate on the page.
 - A release without `--clean` no longer stalls or dies while retiring the
   previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
   read-only, so the stale bundle carried unwritable `Assets.xcassets`

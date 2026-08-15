@@ -10,6 +10,8 @@
 # Outputs:
 #   dist/Pensieve.app  (signed + hardened + stapled)
 #   dist/Pensieve.dmg  (signed + notarized + stapled)
+#   docs/index.html    (download-panel SHA-256 stamped from the DMG above —
+#                       publishable lane only, commit it with the release)
 #
 # Usage:
 #   ./scripts/build-release.sh            # full pipeline
@@ -118,6 +120,19 @@ else
     EXPECTED_SIGNATURE_POLICY="developer-id"
 fi
 
+# A lane "publishes" when it produces the notarized DMG humans actually
+# download — the same condition that puts an artifact on the internal release
+# shelf below. Everything else (--no-dmg, --no-notarize, --appstore) is a local
+# or store-lane build, so it must NOT touch or gate on the public download page:
+# `make release-local` runs --no-notarize --no-dmg on a repo that deliberately
+# keeps an unfilled checksum placeholder in docs/index.html.
+PUBLISHES_DMG=0
+if (( DO_DMG && DO_NOTARIZE )); then
+    PUBLISHES_DMG=1
+fi
+LANDING_PAGE="$REPO_ROOT/docs/index.html"
+DMG_SHA256=""
+
 # ─── Helpers ──────────────────────────────────────────────────────────────
 log()  { printf "\033[36m[build]\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
@@ -172,6 +187,13 @@ source "$SCRIPT_DIR/lib/bundle-identity.sh"
 # shellcheck source=scripts/lib/rpath-hygiene.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/rpath-hygiene.sh"
+
+# landing_page_*() — the docs/index.html download-panel checksum pair (stamp +
+# fail-closed verify). Same sourceable-lib arrangement as above, exercised by
+# scripts/test-landing-page.sh.
+# shellcheck source=scripts/lib/landing-page.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/landing-page.sh"
 
 # Runtime-input and normalized-payload provenance. The manifest written by
 # these helpers is sealed by the final bundle signature and later consumed by
@@ -421,6 +443,17 @@ PROVENANCE_MANIFEST="$APP_BUNDLE/Contents/Resources/$PENSIEVE_BUILD_PROVENANCE_R
 PROVENANCE_INPUT_DIGEST_BEFORE=""
 log "Version: $APP_VERSION ($COMMIT_SLUG), build $BUILD_NUMBER"
 log "FFI profile: $FFI_PROFILE"
+
+# The public download page is stamped with this run's DMG checksum further
+# down. Prove NOW that it can carry it — a page that is missing, unreadable,
+# unwritable, reshaped or still advertising another version must cost a
+# preflight failure, not a notarization round trip plus an artifact already
+# copied onto the team shelf.
+if (( PUBLISHES_DMG )); then
+    landing_page_assert_publishable "$LANDING_PAGE" "$APP_VERSION" \
+        || die "docs/index.html cannot carry this release's checksum (see above) — fix the download page before publishing."
+    ok "Landing page ready for stamping: $LANDING_PAGE"
+fi
 
 if (( ! DMG_ONLY )); then
     if (( DO_CLEAN )); then
@@ -863,6 +896,24 @@ verify_release_bundle_provenance "DMG publication" \
 cp -f "$DMG_PATH" "$DMG_STABLE_PATH"
 ok "Stable alias: $DMG_STABLE_PATH"
 
+# ─── Landing page checksum ────────────────────────────────────────────────
+# The download page advertises a SHA-256 for exactly this DMG, so the pipeline
+# stamps it instead of asking a human to paste it after the fact. Hand-filling
+# cannot be made correct: a failed run tempts the operator to paste the failed
+# artifact's checksum, and the next successful run necessarily produces a
+# different DMG (PensieveBuildDate is baked into the app; DMG creation is not
+# byte-reproducible either). Stamping happens BEFORE the internal shelf publish
+# so nothing is published while the page still describes another artifact.
+if (( PUBLISHES_DMG )); then
+    DMG_SHA256="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
+    [[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Could not compute the DMG SHA-256 for $DMG_PATH"
+    landing_page_stamp_checksum "$LANDING_PAGE" "$DMG_SHA256" \
+        || die "Could not stamp the release checksum into docs/index.html."
+    landing_page_assert_checksum "$LANDING_PAGE" "$DMG_SHA256" \
+        || die "docs/index.html does not advertise this build's DMG checksum after stamping."
+    ok "Landing page checksum: $DMG_SHA256"
+fi
+
 # Internal release shelf (Codescribe convention: <root>/<App>/<version>/ with
 # the artifact + SHA256SUMS.txt). Notarized lane only — local --no-notarize
 # builds are not releases and must not land on the team shelf.
@@ -889,11 +940,14 @@ if (( DO_DMG )); then
 fi
 
 # ─── Landing page checksum gate ────────────────────────────────────────────
-# docs/index.html ships a placeholder SHA-256 that a human fills in by hand
-# at publish time. Nothing else in the repo replaces or checks it, so catch
-# an unfilled placeholder here instead of shipping a broken download page.
-grep -q 'DO-NOT-SHIP' "$REPO_ROOT/docs/index.html" \
-    && die "docs/index.html still carries the placeholder checksum (DO-NOT-SHIP marker) — fill in the real SHA-256 before publishing."
+# Re-read the page at the end: this repo is worked in shared worktrees, so the
+# stamp above can be clobbered by a concurrent edit or a checkout between then
+# and now. The check is fail-closed — an unreadable, reshaped or differently
+# filled page fails the run instead of passing for lack of a match.
+if (( PUBLISHES_DMG )); then
+    landing_page_assert_checksum "$LANDING_PAGE" "$DMG_SHA256" \
+        || die "docs/index.html no longer advertises this build's DMG checksum ($DMG_SHA256)."
+fi
 
 ok "Release pipeline complete"
 echo ""
@@ -904,4 +958,8 @@ echo "  Open production identity/state: open '$APP_BUNDLE'  # fresh test: make m
 if (( DO_DMG )); then
     echo "  Verify staple: xcrun stapler validate '$APP_BUNDLE'"
     echo "  Open DMG: open '$DMG_PATH'"
+fi
+if (( PUBLISHES_DMG )); then
+    echo ""
+    echo "  docs/index.html now advertises $DMG_SHA256 — commit it with this release."
 fi

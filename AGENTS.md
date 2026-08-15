@@ -114,6 +114,17 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
+**The download page's checksum is stamped, not typed.** A lane that produces a
+notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
+the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG
+it just built, then verifies it — so commit `docs/index.html` together with the
+release. Local lanes (`make release-local`, `make release-appstore`, any
+`--no-notarize` run) never touch or gate on the page: the repo deliberately
+keeps an unfilled placeholder between releases. A page that cannot carry this
+build's checksum (missing, unreadable, read-only, reshaped, or advertising
+another version) fails in pre-flight, before anything is built or published.
+Helpers: `scripts/lib/landing-page.sh`, tested by `scripts/test-landing-page.sh`.
+
 `Permission denied` or `Directory not empty` while a release retires `dist/` or
 `Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
 `Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,
