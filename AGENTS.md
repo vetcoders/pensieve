@@ -114,6 +114,42 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
+**The download page's checksum is stamped, not typed.** A lane that produces a
+notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
+the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG
+it just built, then verifies it — so commit `docs/index.html` together with the
+release. Local lanes (`make release-local`, `make release-appstore`, any
+`--no-notarize` run) never touch or gate on the page: the repo deliberately
+keeps an unfilled placeholder between releases. A page that cannot carry this
+build's checksum (missing, unreadable, read-only, reshaped, or advertising
+another version) fails in pre-flight, before anything is built or published.
+
+What is asserted — in pre-flight and again at the end of the run — is the whole
+published claim: the checksum, the version in the panel's `<dt>Version</dt>`,
+and every place the page hands the reader the artifact. That last one is an
+exact census, not a spot check: the page carries three download targets (hero
+button, panel button, JSON-LD `downloadUrl`), each `href`/`downloadUrl` value
+must equal the `releases/latest/download/Pensieve.dmg` funnel this lane
+publishes IN FULL, and there must be exactly three of them
+(`LANDING_PAGE_ARTIFACT_LINK_COUNT`). Giving `docs/index.html` a fourth
+download target therefore means bumping that constant deliberately. So editing
+the version line or a download button of `docs/index.html` while a release is
+in flight fails that release rather than publishing a mismatched page. Stamping
+itself is concurrency-safe for the same reason: the page is rewritten by
+renaming a fresh copy into place, and an edit that lands mid-stamp aborts the
+run instead of being silently overwritten.
+
+`scripts/lib/landing-page.sh` is a release runtime input like every other
+release helper, so a release refuses to run with uncommitted edits to it and
+seals it into the provenance digest. The release enumerates its helpers by hand
+in several places — the snapshot archive in `scripts/build-release.sh`, the
+digest and status lists in `scripts/lib/build-provenance.sh`, and the
+dirty-input status list in `scripts/lib/isolated-app.sh` — and a helper added to
+some of them but not all breaks a release lane rather than failing a test. A
+helper is therefore added to EVERY such list at once;
+`scripts/test-landing-page.sh` checks that structurally, by requiring any
+multi-line helper list in those scripts to name every release helper.
+
 `Permission denied` or `Directory not empty` while a release retires `dist/` or
 `Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
 `Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,

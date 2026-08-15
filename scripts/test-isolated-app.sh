@@ -1166,6 +1166,7 @@ printf '%s\n' '# release recipe fixture' >"$PROVENANCE_REPO/scripts/build-releas
 printf '%s\n' '# bundle identity recipe fixture' \
   >"$PROVENANCE_REPO/scripts/lib/bundle-identity.sh"
 printf '%s\n' '# rpath recipe fixture' >"$PROVENANCE_REPO/scripts/lib/rpath-hygiene.sh"
+printf '%s\n' '# landing page recipe fixture' >"$PROVENANCE_REPO/scripts/lib/landing-page.sh"
 printf '%s\n' 'int ffi_input(void) { return 1; }' \
   | /usr/bin/clang -dynamiclib -x c \
     -o "$PROVENANCE_REPO/Pensieve/Vendor/qube-ffi/release/libqube_ffi.dylib" - \

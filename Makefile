@@ -114,6 +114,7 @@ test:  ## Run unit + integration tests
 test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
 	@$(SCRIPTS)/test-rpath-hygiene.sh
+	@$(SCRIPTS)/test-landing-page.sh
 	@$(SCRIPTS)/test-isolated-app.sh
 	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 	@$(SCRIPTS)/test-ui-smoke-contract.sh
