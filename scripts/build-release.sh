@@ -261,8 +261,8 @@ preflight_build_keychain() {
        session does not help a release driven over SSH — codesign would fail
        with errSecInternalComponent minutes into the build.
        Store the keychain password so this script unlocks itself:
-         printf '%s' 'PASSWORD' > $BUILD_KEYCHAIN_PASSWORD_FILE
-         chmod 600 $BUILD_KEYCHAIN_PASSWORD_FILE
+         printf '%s' 'PASSWORD' > \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
+         chmod 600 \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
        Or unlock it by hand from THIS session before re-running:
          security unlock-keychain '$BUILD_KEYCHAIN'"
             else
