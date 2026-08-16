@@ -96,7 +96,8 @@ build_keychain_password_file_is_private() {
 
 # Status: 0 unlocked (or no dedicated build keychain here), 1 no readable
 # password file, 2 the stored password did not unlock the keychain, 3 the
-# password file is readable beyond its owner.
+# password file is not an owner-only secret (wrong owner, unreadable owner or
+# mode, or group/other bits set).
 unlock_build_keychain() {
     local password
 
@@ -134,13 +135,20 @@ preflight_build_keychain() {
          security unlock-keychain '$BUILD_KEYCHAIN'"
             ;;
         3)
-            die "Build-keychain password file is readable beyond its owner: $BUILD_KEYCHAIN_PASSWORD_FILE
+            die "Build-keychain password file is not an owner-only secret: $BUILD_KEYCHAIN_PASSWORD_FILE
        It holds the keychain password in cleartext and \$HOME is
-       world-executable, so every local account can read it. Refusing to use it
-       until it is the 0600 secret it is documented to be:
+       world-executable, so the file's own mode is the whole of its
+       confidentiality. One of three things is wrong: it is not owned by the
+       user running the build, its owner and mode could not be read at all, or
+       it carries group or other permission bits — any of which leaves the
+       password reachable by an account that is not this one. Refusing to use
+       it until it is owned by this user and mode 0600, or 0400 for a file
+       deliberately kept read-only:
+         ls -l \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
+         sudo chown \"\$(/usr/bin/id -un)\" \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
          chmod 600 \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
-       Treat the stored password as disclosed: change it on the keychain and
-       re-store it."
+       If it was group- or world-accessible, treat the stored password as
+       disclosed: change it on the keychain and re-store it."
             ;;
         *)
             # No readable password file. Signing can still succeed if this
