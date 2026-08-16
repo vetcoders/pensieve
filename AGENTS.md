@@ -119,11 +119,23 @@ in a dedicated keychain (`~/Library/Keychains/pensieve-build.keychain-db` by
 default), and a keychain's unlocked state belongs to the security session that
 unlocked it. Unlocking it in a GUI session therefore does nothing for a release
 driven over SSH: codesign fails there with `errSecInternalComponent`, minutes
-into the build. `scripts/build-release.sh` unlocks it itself, inside the same
-session that runs codesign, reading the password from
+into the build. The unlock lives in `scripts/lib/build-keychain.sh` and runs
+inside the same session that runs codesign, reading the password from
 `~/.keys/.build-keychain-pw` (0600). Both paths are overridable via
 `PENSIEVE_BUILD_KEYCHAIN` and `PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE`; a machine
 with no such keychain file is left alone entirely.
+
+That helper is a sourceable lib, and therefore a release runtime input sealed
+into provenance, because it has two callers in two postures.
+`scripts/build-release.sh` sources it for the strict `preflight_build_keychain`
+gate. `scripts/test-isolated-app.sh` sources it for the opportunistic,
+non-fatal `unlock_build_keychain` alone — `make gates` runs long before any
+release lane, so without that call its fixture signing reached a keychain
+nothing had opened yet. That suite then qualifies its trusted lane on a **trial
+signature**, not on `security find-identity`: a listed identity it cannot sign
+with is downgraded, with the codesign error printed, to the existing certless
+skip lane instead of failing the gate. CI, which has no identity at all, skips
+exactly as before.
 
 That 0600 is enforced, not merely documented. The file holds the keychain
 password in cleartext and `$HOME` is world-executable on macOS, so its own mode

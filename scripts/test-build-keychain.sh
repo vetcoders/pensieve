@@ -4,12 +4,18 @@
 # that runs codesign, so a release driven over SSH stops dying on
 # `errSecInternalComponent`.
 #
-# The preflight lives in build-release.sh rather than in scripts/lib/, because a
-# new release helper has to be sealed into every provenance list at once and
-# this code contributes nothing to the artifact's bytes. So these tests extract
-# the fenced block verbatim and source that. The fence markers are asserted
-# below: renaming or deleting them fails this suite instead of silently
-# skipping it.
+# The preflight lives in scripts/lib/build-keychain.sh, sourced by
+# build-release.sh — `make gates` needs the same unlock long before any release
+# lane runs, so scripts/test-isolated-app.sh sources it too. That made it a
+# release helper, sealed into every provenance list at once (asserted
+# structurally by scripts/test-landing-page.sh). These tests still extract the
+# fenced block verbatim and source that, so the driver below gets the functions
+# without the lib's header. The fence markers are asserted here: renaming or
+# deleting them fails this suite instead of silently skipping it.
+#
+# The structural assertions further down stay pointed at build-release.sh: the
+# lane flag, the signing sites and the preflight call site all live there, not
+# in the lib.
 #
 # NOTHING here touches a real keychain. `security` and `launchctl` are replaced
 # by PATH shims, and that is not merely convenient — `security
@@ -24,6 +30,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd -P)"
 RELEASE_SCRIPT="$SCRIPT_DIR/build-release.sh"
+KEYCHAIN_LIB="$SCRIPT_DIR/lib/build-keychain.sh"
 FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-build-keychain.XXXXXX")"
 EXTRACTED="$FIXTURE_ROOT/preflight.sh"
 DRIVER="$FIXTURE_ROOT/driver.sh"
@@ -98,16 +105,28 @@ assert_status() {
     printf "${C_RED}[fail]${C_RESET} build-release.sh not found at %s\n" "$RELEASE_SCRIPT"
     exit 1
 }
+[[ -f "$KEYCHAIN_LIB" ]] || {
+    printf "${C_RED}[fail]${C_RESET} build-keychain.sh not found at %s\n" "$KEYCHAIN_LIB"
+    exit 1
+}
+
+# build-release.sh must actually source the lib; a copy of the block left behind
+# in the release script would let this suite pass against code nobody runs.
+if ! /usr/bin/grep -q '^source ".*/lib/build-keychain\.sh"$' "$RELEASE_SCRIPT"; then
+    printf "${C_RED}[fail]${C_RESET} %s\n" \
+        "build-release.sh does not source scripts/lib/build-keychain.sh — the tested block is not the one the release runs."
+    exit 1
+fi
 
 /usr/bin/awk '
     /^# >>> build-keychain preflight/ { inside = 1; next }
     /^# <<< build-keychain preflight/ { inside = 0; next }
     inside { print }
-' "$RELEASE_SCRIPT" >"$EXTRACTED"
+' "$KEYCHAIN_LIB" >"$EXTRACTED"
 
 if [[ ! -s "$EXTRACTED" ]]; then
     printf "${C_RED}[fail]${C_RESET} %s\n" \
-        "build-release.sh has no '# >>> build-keychain preflight' … '# <<< build-keychain preflight' fence — the block these tests source was renamed or removed."
+        "build-keychain.sh has no '# >>> build-keychain preflight' … '# <<< build-keychain preflight' fence — the block these tests source was renamed or removed."
     exit 1
 fi
 

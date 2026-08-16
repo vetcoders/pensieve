@@ -24,6 +24,15 @@ HOST_STATUS_BEFORE="$(
 # shellcheck source=scripts/lib/isolated-app.sh
 source "$SCRIPT_DIR/lib/isolated-app.sh"
 
+# unlock_build_keychain() — the Developer ID identity this suite signs its
+# fixtures with lives in the dedicated build keychain, and `make gates` runs
+# long before build-release.sh (the other caller) would unlock it. Sourced for
+# the opportunistic, NON-FATAL unlock only; preflight_build_keychain is the
+# release lane's strict gate and is deliberately not called here.
+# shellcheck source=scripts/lib/build-keychain.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/build-keychain.sh"
+
 FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-isolated-app-test.XXXXXX")"
 FIXTURE_ROOT="$(cd -P "$FIXTURE_ROOT" && pwd -P)"
 SOURCE_APP="$FIXTURE_ROOT/source/Pensieve.app"
@@ -1165,6 +1174,8 @@ printf '%s\n' '# release recipe fixture' >"$PROVENANCE_REPO/scripts/build-releas
   "$PROVENANCE_REPO/scripts/lib/build-provenance.sh"
 printf '%s\n' '# bundle identity recipe fixture' \
   >"$PROVENANCE_REPO/scripts/lib/bundle-identity.sh"
+printf '%s\n' '# build keychain recipe fixture' \
+  >"$PROVENANCE_REPO/scripts/lib/build-keychain.sh"
 printf '%s\n' '# rpath recipe fixture' >"$PROVENANCE_REPO/scripts/lib/rpath-hygiene.sh"
 printf '%s\n' '# landing page recipe fixture' >"$PROVENANCE_REPO/scripts/lib/landing-page.sh"
 printf '%s\n' 'int ffi_input(void) { return 1; }' \
@@ -1341,6 +1352,25 @@ isolated_app_verify_embedded_provenance "$NORMALIZED_APP" \
   || fail "embedded provenance did not survive identity rename/re-sign"
 pass "normalized payload provenance survives executable rename and re-signing"
 
+# The trusted lane needs an identity this session can actually SIGN with, which
+# is not what `security find-identity` answers: the Developer ID certificate is
+# public and stays listed out of a LOCKED keychain, because only the private key
+# is sealed. Qualifying the lane on the listing alone is exactly how `make gates`
+# died on "could not sign the main source fixture" over SSH — the identity lives
+# in the dedicated build keychain, which build-release.sh unlocks, and the gates
+# run long before any release lane does.
+#
+# So: unlock first (opportunistic and non-fatal — this is a test suite, not the
+# release gate), then qualify on a real trial signature.
+BUILD_KEYCHAIN_UNLOCK_STATUS=0
+unlock_build_keychain || BUILD_KEYCHAIN_UNLOCK_STATUS=$?
+if (( BUILD_KEYCHAIN_UNLOCK_STATUS == 0 )); then
+  printf '[isolated-app test] build keychain unlocked (or absent) for this session\n'
+else
+  printf '[isolated-app test] build keychain not unlocked (status %d) — signing may be unavailable\n' \
+    "$BUILD_KEYCHAIN_UNLOCK_STATUS"
+fi
+
 TRUSTED_SIGNING_IDENTITY="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null \
   | /usr/bin/awk -F'"' -v team="($ISOLATED_APP_TRUSTED_TEAM_IDENTIFIER)" \
     'index($0, team) && /Developer ID Application:/ { print $2; exit }')"
@@ -1348,7 +1378,34 @@ if [[ "${PENSIEVE_TEST_FORCE_CERTLESS:-0}" == "1" ]]; then
   # The cleanup/profile assertions deliberately have no certificate dependency.
   # This test-only lane keeps them runnable on a developer machine that happens
   # to have a Developer ID identity while provenance/staging is reviewed apart.
+  # Checked before the trial signature so this lane costs no codesign at all.
   TRUSTED_SIGNING_IDENTITY=""
+fi
+if [[ -n "$TRUSTED_SIGNING_IDENTITY" ]]; then
+  # The trial signature. A throwaway Mach-O, `--timestamp=none` so nothing
+  # reaches the network, and the failure is reported and DOWNGRADED to the
+  # existing certless lane rather than failing the suite: a machine that lists
+  # an identity it cannot use is a machine without one, as far as these
+  # assertions are concerned. `security find-identity` said yes; only codesign
+  # can say it meant it.
+  #
+  # This is not a new prompt surface — the trusted lane already drives codesign
+  # with this identity dozens of times. It only moves the first attempt to a
+  # cheap, self-describing place. Over SSH codesign fails closed with
+  # errSecInternalComponent; in a GUI session where a panel could appear,
+  # cancelling it now downgrades to the skip lane instead of failing a gate.
+  SIGNING_PROBE="$FIXTURE_ROOT/signing-probe"
+  SIGNING_PROBE_ERROR=""
+  printf '%s\n' 'int main(void) { return 0; }' \
+    | /usr/bin/clang -x c -o "$SIGNING_PROBE" - \
+    || fail "could not compile the signing-capability probe"
+  if ! SIGNING_PROBE_ERROR="$(/usr/bin/codesign --force --sign "$TRUSTED_SIGNING_IDENTITY" \
+    --timestamp=none "$SIGNING_PROBE" 2>&1)"; then
+    printf '[isolated-app test SKIP] %s\n' \
+      "Developer ID identity [$TRUSTED_SIGNING_IDENTITY] is listed but cannot sign in this session: ${SIGNING_PROBE_ERROR//$'\n'/ | }"
+    TRUSTED_SIGNING_IDENTITY=""
+  fi
+  /bin/rm -f "$SIGNING_PROBE"
 fi
 if [[ -n "$TRUSTED_SIGNING_IDENTITY" ]]; then
   sign_source_fixture "$TRUSTED_SIGNING_IDENTITY"
@@ -1456,7 +1513,7 @@ if [[ -n "$TRUSTED_SIGNING_IDENTITY" ]]; then
     "$SOURCE_APP/Contents/Info.plist" PensieveBuildCommit "$SOURCE_COMMIT"
   refresh_source_provenance
 else
-  pass "trusted-team success lane skipped because CI has no Developer ID identity"
+  pass "trusted-team success lane skipped because this session cannot sign with a Developer ID identity"
 fi
 
 BUNDLE_ID="$(isolated_app_generate_bundle_id manual)" \
