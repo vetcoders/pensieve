@@ -734,7 +734,7 @@ fi
 # multi-line list in the release scripts that names one release helper must name
 # them ALL. That is what makes the next helper's omission a test failure here
 # instead of a broken release lane, whatever the helper is called.
-RELEASE_HELPERS='bundle-identity.sh build-provenance.sh landing-page.sh rpath-hygiene.sh'
+RELEASE_HELPERS='bundle-identity.sh build-keychain.sh build-provenance.sh landing-page.sh rpath-hygiene.sh'
 RELEASE_ENUMERATORS=(
     "$SCRIPT_DIR/build-release.sh"
     "$SCRIPT_DIR/lib/build-provenance.sh"

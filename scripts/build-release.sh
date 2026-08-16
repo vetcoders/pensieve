@@ -182,145 +182,17 @@ plist_set_string() {
 # that unlocked it, so a keychain the operator opened in their GUI session is
 # still LOCKED for a release driven over SSH — and codesign then dies with the
 # famously unhelpful `errSecInternalComponent`, minutes into the build. That is
-# why the unlock has to happen HERE, inside the process tree that runs
-# codesign: unlocking beforehand from another session provably does not carry
-# over, which is the trap this preflight exists to close.
+# why the unlock has to happen inside the process tree that runs codesign:
+# unlocking beforehand from another session provably does not carry over, which
+# is the trap this preflight exists to close.
 #
-# Both locations are overridable so a second build machine (or a test) can
-# point them elsewhere without editing this script.
-#
-# >>> build-keychain preflight — extracted verbatim by scripts/test-build-keychain.sh >>>
-BUILD_KEYCHAIN="${PENSIEVE_BUILD_KEYCHAIN:-$HOME/Library/Keychains/pensieve-build.keychain-db}"
-BUILD_KEYCHAIN_PASSWORD_FILE="${PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE:-$KEYS_DIR/.build-keychain-pw}"
-
-# session_can_prompt — true only in an Aqua (GUI login) session, the one place
-# where Security can put a SecurityAgent unlock panel on a screen. An SSH or
-# launchd-driven session cannot, so there a keychain call fails closed instead
-# of blocking forever on a modal nobody can see.
-session_can_prompt() {
-    [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] || return 1
-    [[ "$(launchctl managername 2>/dev/null)" == "Aqua" ]]
-}
-
-# build_keychain_is_locked — called ONLY from the branch that has already
-# established this session cannot prompt. `show-keychain-info` on a locked
-# keychain is not a passive read: in an Aqua session it raises a modal unlock
-# panel and blocks until somebody answers it. Fenced behind session_can_prompt
-# it is a deterministic non-interactive lock probe; used anywhere else it is a
-# hang waiting to happen, so do not lift it out of this branch.
-build_keychain_is_locked() {
-    ! security show-keychain-info "$BUILD_KEYCHAIN" >/dev/null 2>&1
-}
-
-# unlock_build_keychain — idempotent and never interactive: given -p, `security
-# unlock-keychain` also succeeds on an already-unlocked keychain and never
-# reaches SecurityAgent. Cheap enough to call before every signing step, which
-# is the point — a keychain carries an inactivity auto-lock timeout, while a
-# release spends minutes inside `swift build` and minutes more inside
-# notarization between two signatures. Re-asserting the unlock at each signing
-# site beats raising the operator's auto-lock timeout, because it leaves no
-# persistent change to their security posture behind.
-#
-# The password does travel through argv, where `ps` can see it for the lifetime
-# of one exec. Accepted deliberately: `security` has no stdin or password-file
-# mode, so the only alternative is the interactive prompt this whole preflight
-# exists to avoid. The window is milliseconds on a single-operator build
-# machine, and the source is already a 0600 secret in $HOME.
-
-# build_keychain_password_file_is_private — the "already a 0600 secret" above is
-# a contract (AGENTS.md), and until here nothing checked it. $HOME is
-# world-executable on macOS, so this file's confidentiality rests entirely on
-# its own mode: a stray `chmod 644` hands the keychain password to every local
-# account and, before this check, did so silently. Required: owned by the user
-# running the build, with no group or other bits at all — 0600, or 0400 for a
-# file deliberately kept read-only. Anything wider is refused rather than read,
-# because reading it anyway would make the mode contract decorative.
-#
-# `stat -L` resolves a symlink on purpose: the mode that matters belongs to the
-# file whose bytes we are about to hand to `security`, not to the link.
-build_keychain_password_file_is_private() {
-    local metadata owner mode
-
-    metadata="$(/usr/bin/stat -L -f '%u %Lp' "$BUILD_KEYCHAIN_PASSWORD_FILE" 2>/dev/null)" || return 1
-    owner="${metadata%% *}"
-    mode="${metadata##* }"
-    [[ -n "$owner" && -n "$mode" ]] || return 1
-    [[ "$owner" == "$(/usr/bin/id -u)" ]] || return 1
-    (( 8#$mode & 8#077 )) && return 1
-    return 0
-}
-
-# Status: 0 unlocked (or no dedicated build keychain here), 1 no readable
-# password file, 2 the stored password did not unlock the keychain, 3 the
-# password file is readable beyond its owner.
-unlock_build_keychain() {
-    local password
-
-    [[ -f "$BUILD_KEYCHAIN" ]] || return 0
-    [[ -r "$BUILD_KEYCHAIN_PASSWORD_FILE" ]] || return 1
-    build_keychain_password_file_is_private || return 3
-    password="$(head -n1 "$BUILD_KEYCHAIN_PASSWORD_FILE")" || return 1
-    [[ -n "$password" ]] || return 1
-    security unlock-keychain -p "$password" "$BUILD_KEYCHAIN" >/dev/null 2>&1 || return 2
-    return 0
-}
-
-# Fail here, with the keychain named and the remedy spelled out, rather than
-# eight minutes later inside codesign with an errSecInternalComponent.
-#
-# Only the lane whose signing identity lives in this keychain may be *gated* on
-# it. LANE_SIGNS_FROM_BUILD_KEYCHAIN is decided up in the arg block, long before
-# this runs, and defaults to 1 here: an unset flag keeps the strict gate rather
-# than silently opening it, so a future lane cannot lose the check by omission.
-preflight_build_keychain() {
-    local status=0
-
-    (( ${LANE_SIGNS_FROM_BUILD_KEYCHAIN:-1} )) || return 0
-    [[ -f "$BUILD_KEYCHAIN" ]] || return 0
-
-    unlock_build_keychain || status=$?
-    case "$status" in
-        0)
-            ok "Build keychain unlocked for this session: $BUILD_KEYCHAIN"
-            ;;
-        2)
-            die "The password in $BUILD_KEYCHAIN_PASSWORD_FILE does not unlock $BUILD_KEYCHAIN.
-       Correct the stored password, or unlock the keychain by hand from THIS
-       session before re-running:
-         security unlock-keychain '$BUILD_KEYCHAIN'"
-            ;;
-        3)
-            die "Build-keychain password file is readable beyond its owner: $BUILD_KEYCHAIN_PASSWORD_FILE
-       It holds the keychain password in cleartext and \$HOME is
-       world-executable, so every local account can read it. Refusing to use it
-       until it is the 0600 secret it is documented to be:
-         chmod 600 \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
-       Treat the stored password as disclosed: change it on the keychain and
-       re-store it."
-            ;;
-        *)
-            # No readable password file. Signing can still succeed if this
-            # session already holds the keychain open, or — in a GUI session —
-            # if somebody answers the panel codesign will raise anyway.
-            if session_can_prompt; then
-                warn "No build-keychain password at $BUILD_KEYCHAIN_PASSWORD_FILE — signing may raise an interactive unlock panel."
-            elif build_keychain_is_locked; then
-                die "Build keychain is LOCKED and this session cannot unlock it: $BUILD_KEYCHAIN
-       Unlocking does not cross security sessions, so opening it in a GUI
-       session does not help a release driven over SSH — codesign would fail
-       with errSecInternalComponent minutes into the build.
-       Store the keychain password so this script unlocks itself:
-         printf '%s' 'PASSWORD' > \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
-         chmod 600 \"$BUILD_KEYCHAIN_PASSWORD_FILE\"
-       Or unlock it by hand from THIS session before re-running:
-         security unlock-keychain '$BUILD_KEYCHAIN'"
-            else
-                ok "Build keychain already unlocked in this session: $BUILD_KEYCHAIN"
-            fi
-            ;;
-    esac
-}
-# <<< build-keychain preflight <<<
+# Sourceable, because `make gates` needs the same unlock long before any
+# release lane runs: scripts/test-isolated-app.sh cannot sign its fixtures out
+# of a keychain this script has not opened yet. Being a release helper, the
+# lib is also a runtime input and is sealed into provenance below.
+# shellcheck source=scripts/lib/build-keychain.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/build-keychain.sh"
 
 # Hardened Runtime belongs to the Developer ID/notarization lane; the MAS lane
 # relies on the App Sandbox instead (adding `--options runtime` there is at best
@@ -478,6 +350,7 @@ create_release_snapshot() {
         "Pensieve/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib" \
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
+        scripts/lib/build-keychain.sh \
         scripts/lib/build-provenance.sh \
         scripts/lib/landing-page.sh \
         scripts/lib/rpath-hygiene.sh \
