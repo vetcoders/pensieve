@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import XCTest
 
 @testable import Pensieve
@@ -210,18 +211,42 @@ final class ProviderSettingsTests: XCTestCase {
   // it to the data-protection keychain, which Developer ID builds without a
   // provisioning profile cannot touch — SecItemAdd then fails with
   // errSecMissingEntitlement (-34018) and the API key can never be saved.
+  //
+  // That contract is exactly why this test performs a real round-trip through
+  // the login keychain instead of a fake. The login keychain is locked in a
+  // non-interactive session (SSH, `make release` over a remote shell), where
+  // Security cannot raise the unlock panel and every operation returns
+  // errSecInteractionNotAllowed (-25308). That single status — and nothing
+  // else — is skipped: -34018 and any other failure must still fail loudly,
+  // otherwise the guard above stops guarding anything.
+  //
+  // Keychain calls are hoisted out of the XCTAssert autoclosures on purpose:
+  // XCTest swallows errors thrown inside an assertion and records them as
+  // failures, which would never reach the catch below.
   func testKeychainStoreRoundTripsWithoutEntitlements() throws {
     let store = KeychainProviderAPIKeyStore(
       service: "io.vetcoders.pensieve.tests.completion-provider-\(UUID().uuidString)")
     addTeardownBlock { try? store.deleteAPIKey() }
 
-    XCTAssertNil(try store.loadAPIKey())
-    try store.storeAPIKey("sk-add-path")
-    XCTAssertEqual(try store.loadAPIKey(), "sk-add-path")
-    try store.storeAPIKey("sk-update-path")
-    XCTAssertEqual(try store.loadAPIKey(), "sk-update-path")
-    try store.deleteAPIKey()
-    XCTAssertNil(try store.loadAPIKey())
+    do {
+      let beforeAdd = try store.loadAPIKey()
+      XCTAssertNil(beforeAdd)
+
+      try store.storeAPIKey("sk-add-path")
+      let added = try store.loadAPIKey()
+      XCTAssertEqual(added, "sk-add-path")
+
+      try store.storeAPIKey("sk-update-path")
+      let updated = try store.loadAPIKey()
+      XCTAssertEqual(updated, "sk-update-path")
+
+      try store.deleteAPIKey()
+      let afterDelete = try store.loadAPIKey()
+      XCTAssertNil(afterDelete)
+    } catch ProviderSettingsError.keychain(errSecInteractionNotAllowed) {
+      throw XCTSkip(
+        "login keychain locked in a non-interactive session — run from a GUI session or CI")
+    }
   }
 
   func testKeychainServiceCanBeIsolatedForAStagedRuntime() {
