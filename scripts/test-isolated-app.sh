@@ -1362,25 +1362,61 @@ pass "normalized payload provenance survives executable rename and re-signing"
 #
 # So: unlock first (opportunistic and non-fatal — this is a test suite, not the
 # release gate), then qualify on a real trial signature.
-BUILD_KEYCHAIN_UNLOCK_STATUS=0
-unlock_build_keychain || BUILD_KEYCHAIN_UNLOCK_STATUS=$?
-if (( BUILD_KEYCHAIN_UNLOCK_STATUS == 0 )); then
-  printf '[isolated-app test] build keychain unlocked (or absent) for this session\n'
-else
-  printf '[isolated-app test] build keychain not unlocked (status %d) — signing may be unavailable\n' \
-    "$BUILD_KEYCHAIN_UNLOCK_STATUS"
-fi
-
-TRUSTED_SIGNING_IDENTITY="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null \
-  | /usr/bin/awk -F'"' -v team="($ISOLATED_APP_TRUSTED_TEAM_IDENTIFIER)" \
-    'index($0, team) && /Developer ID Application:/ { print $2; exit }')"
+#
+# But the certless override is decided BEFORE any of that. A run that has
+# declared it wants no certificate must not reach the operator's real security
+# session at all — no keychain unlock, no identity listing, no `security` call
+# whatsoever. Unlocking first and only then noticing the flag left an explicitly
+# certificate-free run mutating the state of a real keychain for nothing.
+#
+# The unlock stays unconditional on the branch that can still enter the trusted
+# lane: unlock_build_keychain already returns 0 when no dedicated build keychain
+# exists, so an extra existence check here would only duplicate its contract.
+TEST_TRUSTED_LANE_KEYCHAIN_UNLOCKS=0
+TEST_TRUSTED_LANE_IDENTITY_LOOKUPS=0
 if [[ "${PENSIEVE_TEST_FORCE_CERTLESS:-0}" == "1" ]]; then
   # The cleanup/profile assertions deliberately have no certificate dependency.
   # This test-only lane keeps them runnable on a developer machine that happens
   # to have a Developer ID identity while provenance/staging is reviewed apart.
-  # Checked before the trial signature so this lane costs no codesign at all.
   TRUSTED_SIGNING_IDENTITY=""
+  printf '[isolated-app test] PENSIEVE_TEST_FORCE_CERTLESS=1 — certless lane, the build keychain and signing identity stay untouched\n'
+else
+  BUILD_KEYCHAIN_UNLOCK_STATUS=0
+  TEST_TRUSTED_LANE_KEYCHAIN_UNLOCKS=$((TEST_TRUSTED_LANE_KEYCHAIN_UNLOCKS + 1))
+  unlock_build_keychain || BUILD_KEYCHAIN_UNLOCK_STATUS=$?
+  if (( BUILD_KEYCHAIN_UNLOCK_STATUS == 0 )); then
+    printf '[isolated-app test] build keychain unlocked (or absent) for this session\n'
+  else
+    printf '[isolated-app test] build keychain not unlocked (status %d) — signing may be unavailable\n' \
+      "$BUILD_KEYCHAIN_UNLOCK_STATUS"
+  fi
+
+  TEST_TRUSTED_LANE_IDENTITY_LOOKUPS=$((TEST_TRUSTED_LANE_IDENTITY_LOOKUPS + 1))
+  TRUSTED_SIGNING_IDENTITY="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null \
+    | /usr/bin/awk -F'"' -v team="($ISOLATED_APP_TRUSTED_TEAM_IDENTIFIER)" \
+      'index($0, team) && /Developer ID Application:/ { print $2; exit }')"
 fi
+
+# The counters record what actually ran, not what the source looks like: moving
+# either call back in front of the flag check fails this assertion instead of
+# silently touching the operator's keychain again. Both `security` invocations
+# on this path — the unlock inside unlock_build_keychain and the find-identity
+# listing above — are covered, and they are the only two the certless lane could
+# ever reach.
+if [[ "${PENSIEVE_TEST_FORCE_CERTLESS:-0}" == "1" ]]; then
+  (( TEST_TRUSTED_LANE_KEYCHAIN_UNLOCKS == 0 )) \
+    || fail "the certless lane unlocked the real build keychain"
+  (( TEST_TRUSTED_LANE_IDENTITY_LOOKUPS == 0 )) \
+    || fail "the certless lane listed the real signing identities"
+  [[ -z "$TRUSTED_SIGNING_IDENTITY" ]] \
+    || fail "the certless lane resolved a trusted signing identity"
+  pass "the certless lane reaches no security call at all"
+else
+  (( TEST_TRUSTED_LANE_KEYCHAIN_UNLOCKS == 1 && TEST_TRUSTED_LANE_IDENTITY_LOOKUPS == 1 )) \
+    || fail "the trusted lane did not resolve its identity exactly once"
+  pass "the trusted lane resolves its identity behind exactly one keychain unlock"
+fi
+
 if [[ -n "$TRUSTED_SIGNING_IDENTITY" ]]; then
   # The trial signature. A throwaway Mach-O, `--timestamp=none` so nothing
   # reaches the network, and the failure is reported and DOWNGRADED to the
