@@ -58,10 +58,11 @@ final class BookmarkStore {
   /// to leak, and no fixture can mint a real bookmark that fails this read.
   private let bookmarkedOrigin: (Data) -> URL?
 
-  /// How a working-set entry's persisted blob is minted. Injectable for the same
-  /// reason as `bookmarkedOrigin`: a `persistFile` that FAILS is the case whose
-  /// warning used to be swallowed by the save paths downstream of it, and no
-  /// fixture can make a real file on a real volume refuse to produce a bookmark.
+  /// How a persisted blob is minted for a working-set file (`persistFile`) and
+  /// for a stale root's in-place refresh (`restoreRootURLs`). Injectable because
+  /// a mint that FAILS is the case no live fixture can force on a real volume:
+  /// `persistFile`'s warning used to be swallowed, and restore used to keep a
+  /// stale root while discarding a later usable duplicate of it.
   private let mintFileBookmark: (URL) throws -> Data
 
   init(
@@ -132,14 +133,38 @@ final class BookmarkStore {
     try persistRoot(url: url, into: appState)
   }
 
+  /// Records one workspace root in the persisted root set.
+  ///
+  /// Identity is the RESOLVED path folded through `rootIdentityPath`, never the
+  /// bookmark blob. Blob equality is what this used to dedupe on and it does not
+  /// hold for roots any more than it holds for files (see `persistFile`): the
+  /// bytes minted for one directory vary with the spelling of the URL and with
+  /// volume metadata, so re-opening a folder already in the workspace appended a
+  /// SECOND root for it. The operator's `rootBookmarks` reached five entries for
+  /// two directories — `/tmp` four times, one more per launch — and the sidebar
+  /// build gives every entry its own full recursive walk.
+  ///
+  /// An existing root is REPLACED where it stands rather than moved to the end,
+  /// and copies a previous build already appended collapse onto that position:
+  /// the order of this key is the sidebar's root order, and its first entry is
+  /// what `bookmarkData` hands the workspace cache identity.
   func persistRoot(url: URL, into appState: AppState) throws {
     let data = try url.bookmarkData(
       options: [.withSecurityScope],
       includingResourceValuesForKeys: nil,
       relativeTo: nil
     )
+    let targetIdentity = Self.rootIdentityPath(url)
     var bookmarks = rootBookmarkData
-    if !bookmarks.contains(data) {
+    let matches = bookmarks.indices.filter {
+      resolvedRootIdentity(for: bookmarks[$0]) == targetIdentity
+    }
+    if let first = matches.first {
+      bookmarks[first] = data
+      for duplicate in matches.dropFirst().reversed() {
+        bookmarks.remove(at: duplicate)
+      }
+    } else {
       bookmarks.append(data)
     }
     defaults.set(bookmarks, forKey: rootBookmarksKey)
@@ -194,10 +219,12 @@ final class BookmarkStore {
   /// the persistence failure without erasing otherwise valid roots.
   ///
   /// This is the one writer that takes a whole list at once, so it is the one
-  /// writer that could put a file in the working set twice by simply being
-  /// handed it twice. Its only caller passes the live Open Files list, which is
-  /// de-duplicated upstream — the guard below is what keeps that a fact about
-  /// this key rather than a fact about today's callers.
+  /// writer that could put a file OR a root in the workspace twice by simply
+  /// being handed it twice. Its only caller passes the live Open Files list and
+  /// the live root list, both de-duplicated upstream — the guards below are what
+  /// keep that a fact about these keys rather than a fact about today's callers.
+  /// Roots fold through `rootIdentityPath`, files through the standardized path,
+  /// because the two keys answer different questions (see `identityPath`).
   ///
   /// A working-set file that can no longer be bookmarked does NOT abort the
   /// rewrite: its already-persisted blob is carried forward instead. All-or-
@@ -211,9 +238,13 @@ final class BookmarkStore {
   /// when the volume returns AND lets the rewrite complete, which is what
   /// actually retires the removed root's blob.
   func replaceWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) throws {
-    let roots = try rootURLs.map { url in
-      try makeWorkspaceBookmark(for: url)
-    }
+    var seenRootIdentities: Set<String> = []
+    let roots =
+      try rootURLs
+      .filter { seenRootIdentities.insert(Self.rootIdentityPath($0)).inserted }
+      .map { url in
+        try makeWorkspaceBookmark(for: url)
+      }
     // Read before anything is written: this is the key the fallback carries from.
     let persistedFileBookmarks = fileBookmarksByMintedIdentity()
     var seenFilePaths: Set<String> = []
@@ -452,9 +483,13 @@ final class BookmarkStore {
   /// (`standardizedFileURL` does not resolve them either), and it folds only
   /// items INSIDE the three aliases — the alias root spelled on its own
   /// (`/private/var`) is left as it stands, because identity keys are minted for
-  /// documents, not for the roots themselves. `FileWatcher.canonicalPath` folds
-  /// the same three aliases for FSEvents paths.
-  static func identityPath(_ url: URL) -> String {
+  /// documents, not for the roots themselves. A caller that keys a WORKSPACE
+  /// ROOT needs the roots folded too and must use `rootIdentityPath`.
+  /// `FileWatcher.canonicalPath` folds the same three aliases for FSEvents paths.
+  ///
+  /// `nonisolated` because the off-main workspace scanner has to fold roots
+  /// through this same contract rather than grow a second normalization.
+  nonisolated static func identityPath(_ url: URL) -> String {
     let path = url.standardizedFileURL.path
     for alias in privateSymlinkAliases where path.hasPrefix(alias) {
       return String(path.dropFirst("/private".count))
@@ -462,21 +497,66 @@ final class BookmarkStore {
     return path
   }
 
+  /// The identity of a WORKSPACE ROOT: `identityPath`, plus the three alias
+  /// roots spelled on their own.
+  ///
+  /// `identityPath` stops at the alias root deliberately — it keys documents,
+  /// and `/private/tmp` is never the document. For a root the alias root IS the
+  /// target: a bookmark minted for `/tmp` resolves to `/private/tmp`, so under
+  /// the document key one directory reads as two roots, each of which the
+  /// sidebar build walks recursively in full. Four such entries for `/tmp` is
+  /// what took one workspace scan to 8.6 GB.
+  ///
+  /// Folded HERE rather than by widening `identityPath` because that key also
+  /// files the security-scope grant accounting (`activeAccess`); changing what
+  /// it folds would silently re-file every document caller's grants too.
+  /// `standardizedFileURL` cannot stand in for this: it drops `/private` only
+  /// while the target still exists, and a stale or missing root is exactly the
+  /// entry this key has to keep matching.
+  nonisolated static func rootIdentityPath(_ url: URL) -> String {
+    let path = identityPath(url)
+    guard privateSymlinkRoots.contains(path) else { return path }
+    return String(path.dropFirst("/private".count))
+  }
+
+  /// The three directories macOS publishes twice — `/var`, `/tmp` and `/etc` are
+  /// symlinks into `/private`, which is what makes the two spellings one item.
+  nonisolated private static let privateSymlinkRoots = [
+    "/private/var", "/private/tmp", "/private/etc",
+  ]
+
   /// The only `/private` spellings `identityPath` folds. The trailing slash is
-  /// load-bearing: it keeps `/private/variants` out of `/private/var`.
-  private static let privateSymlinkAliases = ["/private/var/", "/private/tmp/", "/private/etc/"]
+  /// load-bearing: it keeps `/private/variants` out of `/private/var`, and it is
+  /// what leaves the alias roots themselves to `rootIdentityPath`.
+  nonisolated private static let privateSymlinkAliases = privateSymlinkRoots.map { $0 + "/" }
+
+  /// Identity-only resolve for `persistRoot` / `persistFile` de-dupe.
+  ///
+  /// `.withoutMounting` is the same load-bearing choice as `pruneTrashedFiles`
+  /// and `makeWorkspaceBookmark`: this runs on the main actor, and a resolve is
+  /// allowed to mount the volume it names. Comparing two bookmarks must not
+  /// change the machine. A blob that needs a mount before it even yields a path
+  /// is unresolvable today, so it matches nothing and is never collapsed away.
+  private func resolvedURL(for bookmark: Data) -> URL? {
+    var bookmarkIsStale = false
+    return try? URL(
+      resolvingBookmarkData: bookmark,
+      options: [.withSecurityScope, .withoutMounting],
+      relativeTo: nil,
+      bookmarkDataIsStale: &bookmarkIsStale
+    )
+  }
 
   private func resolvedPath(for bookmark: Data) -> String? {
-    var bookmarkIsStale = false
-    guard
-      let url = try? URL(
-        resolvingBookmarkData: bookmark,
-        options: [.withSecurityScope],
-        relativeTo: nil,
-        bookmarkDataIsStale: &bookmarkIsStale
-      )
-    else { return nil }
-    return url.standardizedFileURL.path
+    resolvedURL(for: bookmark)?.standardizedFileURL.path
+  }
+
+  /// The root a persisted blob names, folded through the one root-identity
+  /// contract. NIL when the blob cannot be resolved today: an unreachable root
+  /// is not evidence that some other entry is its duplicate, so it matches
+  /// nothing and is never collapsed away.
+  private func resolvedRootIdentity(for bookmark: Data) -> String? {
+    resolvedURL(for: bookmark).map(Self.rootIdentityPath)
   }
 
   /// Mints a blob for `url` and immediately resolves it, because in the App
@@ -671,35 +751,134 @@ final class BookmarkStore {
     defaults.array(forKey: fileBookmarksKey) as? [Data] ?? []
   }
 
+  /// Resolves the persisted root set AND writes back the duplicates resolution
+  /// proved, because a root recorded twice is a directory the sidebar build
+  /// walks twice.
+  ///
+  /// Bookmark blobs are not stable identities, so one folder could be recorded
+  /// several times (see `persistRoot`), and the stale-bookmark refresh used to
+  /// run through `persistRoot` itself — which APPENDED the refreshed blob while
+  /// the stale one stayed in the key. That is one guaranteed extra root every
+  /// time macOS invalidated a bookmark, which is how `/tmp` reached four entries
+  /// and one scan reached 8.6 GB. The refresh therefore replaces the entry WHERE
+  /// IT STANDS, and what this launch drops is dropped from the key too, so an
+  /// install that already carries the sediment is cleaned once instead of
+  /// paying to resolve it on every launch. If that remint fails, a later usable
+  /// blob for the same directory replaces the failed stale survivor in that
+  /// same place — first-seen still wins when the refresh succeeded.
+  ///
+  /// Duplication is judged on `rootIdentityPath` — the directory each blob
+  /// RESOLVES to. Nesting is not duplication: a root inside another root is a
+  /// second root the user asked for.
+  ///
+  /// Everything else keeps its bookmark, exactly as before: an entry that fails
+  /// to resolve (an unplugged volume) or points at a directory that is missing
+  /// today drops out of THIS launch's list and out of nothing else. Missing is
+  /// startup state, not a user-action failure — a bare launch must show the
+  /// empty launcher, not an old bookmark error.
   private func restoreRootURLs(from bookmarks: [Data], into appState: AppState) -> [URL] {
-    bookmarks.compactMap { data in
+    var survivingBookmarks: [Data] = []
+    var restoredURLs: [URL] = []
+    var seenIdentities: Set<String> = []
+    var liveRoots: [String: LiveRestoredRoot] = [:]
+
+    for data in bookmarks {
       var bookmarkIsStale = false
-      do {
-        let url = try URL(
+      guard
+        let url = try? URL(
           resolvingBookmarkData: data,
           options: [.withSecurityScope],
           relativeTo: nil,
           bookmarkDataIsStale: &bookmarkIsStale
         )
+      else {
+        survivingBookmarks.append(data)
+        continue
+      }
 
-        guard isExistingDirectory(url) else {
-          return nil
+      let identity = Self.rootIdentityPath(url)
+      if !seenIdentities.insert(identity).inserted {
+        replaceFailedStaleLiveRootIfNeeded(
+          identity: identity,
+          data: data,
+          url: url,
+          bookmarkIsStale: bookmarkIsStale,
+          liveRoots: &liveRoots,
+          survivingBookmarks: &survivingBookmarks,
+          restoredURLs: &restoredURLs)
+        continue
+      }
+      guard isExistingDirectory(url) else {
+        survivingBookmarks.append(data)
+        continue
+      }
+
+      // Minting the replacement needs the grant, so it happens AFTER the
+      // activation — the same order `restoreFileURLs` uses.
+      activate(url)
+      let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
+      liveRoots[identity] = LiveRestoredRoot(
+        survivingIndex: survivingBookmarks.count,
+        restoredIndex: restoredURLs.count,
+        refreshFailed: bookmarkIsStale && !stored.reminted)
+      survivingBookmarks.append(stored.data)
+      restoredURLs.append(url)
+    }
+
+    if survivingBookmarks != bookmarks {
+      defaults.set(survivingBookmarks, forKey: rootBookmarksKey)
+      // The legacy single-folder key and `appState.bookmarkData` both mirror the
+      // FIRST root — that is what `bookmarkData` hands the workspace cache
+      // identity — so a cleanup that changed which blob leads has to move them
+      // with it, or the two halves of one persisted workspace disagree.
+      if survivingBookmarks.first != bookmarks.first {
+        if let first = survivingBookmarks.first {
+          defaults.set(first, forKey: legacyFolderBookmarkKey)
+        } else {
+          defaults.removeObject(forKey: legacyFolderBookmarkKey)
         }
-
-        activate(url)
-
-        if bookmarkIsStale {
-          try persistRoot(url: url, into: appState)
-        }
-
-        return url
-      } catch {
-        // Missing/stale saved workspace entries are startup state, not a user action failure.
-        // Bare launch must still present the empty launcher instead of surfacing an old bookmark
-        // error when the only saved folder was removed outside Pensieve.
-        return nil
+        appState.bookmarkData = survivingBookmarks.first
       }
     }
+    return restoredURLs
+  }
+
+  private struct LiveRestoredRoot {
+    let survivingIndex: Int
+    let restoredIndex: Int
+    var refreshFailed: Bool
+  }
+
+  /// If the first blob for this directory was stale and could not be reminted,
+  /// a later usable blob for the same directory replaces it in place. First-seen
+  /// still wins when that refresh succeeded — order is the sidebar's.
+  private func replaceFailedStaleLiveRootIfNeeded(
+    identity: String,
+    data: Data,
+    url: URL,
+    bookmarkIsStale: Bool,
+    liveRoots: inout [String: LiveRestoredRoot],
+    survivingBookmarks: inout [Data],
+    restoredURLs: inout [URL]
+  ) {
+    guard var prior = liveRoots[identity], prior.refreshFailed else { return }
+    guard isExistingDirectory(url) else { return }
+    activate(url)
+    let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
+    let laterUsable = !bookmarkIsStale || stored.reminted
+    guard laterUsable else { return }
+    survivingBookmarks[prior.survivingIndex] = stored.data
+    restoredURLs[prior.restoredIndex] = url
+    prior.refreshFailed = false
+    liveRoots[identity] = prior
+  }
+
+  private func refreshedRootBookmark(
+    for url: URL, stale: Bool, fallback: Data
+  ) -> (data: Data, reminted: Bool) {
+    guard stale else { return (fallback, false) }
+    guard let reminted = try? mintFileBookmark(url) else { return (fallback, false) }
+    return (reminted, true)
   }
 
   /// Resolves the persisted working set AND writes back what resolution proved

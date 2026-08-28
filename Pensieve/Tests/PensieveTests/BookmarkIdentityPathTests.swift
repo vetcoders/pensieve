@@ -83,4 +83,70 @@ final class BookmarkIdentityPathTests: XCTestCase {
     XCTAssertEqual(identity("/Users/\(stamp)/note.md"), "/Users/\(stamp)/note.md")
     XCTAssertEqual(identity("/var/folders/\(stamp)/note.md"), "/var/folders/\(stamp)/note.md")
   }
+
+  // MARK: - Roots
+
+  /// THE ROOT KEY. A workspace root IS its target, so the alias root spelled
+  /// alone has to fold too: a bookmark minted for `/tmp` resolves to
+  /// `/private/tmp`, and under the document key those two spellings were two
+  /// roots naming one directory — each one getting its own full recursive walk.
+  /// Four of them for `/tmp` is what took a workspace scan to 8.6 GB.
+  func testTheAliasRootsThemselvesFoldForAWorkspaceRoot() {
+    XCTAssertEqual(rootIdentity("/private/tmp"), rootIdentity("/tmp"))
+    XCTAssertEqual(rootIdentity("/private/var"), rootIdentity("/var"))
+    XCTAssertEqual(rootIdentity("/private/etc"), rootIdentity("/etc"))
+
+    XCTAssertEqual(
+      rootIdentity("/private/tmp"), "/tmp", "the folded key must be the short spelling")
+  }
+
+  /// The root key is the document key PLUS the three alias roots, and nothing
+  /// else. The document key is deliberately not widened in its place: it also
+  /// files the security-scope grant accounting, so changing what it folds would
+  /// re-file every document caller's grants.
+  ///
+  /// `/private/tmp` reads the same through both today only because it exists and
+  /// `standardizedFileURL` folds it; the root key folds it structurally, which
+  /// is what a stale or missing root needs.
+  func testTheRootKeyAgreesWithTheDocumentKeyEverywhereElse() {
+    let stamp = UUID().uuidString
+
+    for path in [
+      "/private/var/folders/\(stamp)/note.md",
+      "/private/\(stamp)/note.md",
+      "/private/variants/\(stamp)",
+      "/Users/\(stamp)/Notes",
+      "/var/folders/\(stamp)",
+    ] {
+      XCTAssertEqual(
+        rootIdentity(path), identity(path),
+        "the root key must add the alias roots and nothing else: \(path)")
+    }
+  }
+
+  /// The root key inherits every narrowing of the document key: it folds the
+  /// three aliases and nothing else, and a directory whose name merely starts
+  /// with an alias name is not that alias.
+  func testTheRootKeyFoldsNothingBeyondTheThreeAliases() {
+    let stamp = UUID().uuidString
+
+    XCTAssertEqual(rootIdentity("/private/\(stamp)"), "/private/\(stamp)")
+    XCTAssertEqual(rootIdentity("/private/variants"), "/private/variants")
+    XCTAssertEqual(rootIdentity("/private/tmpfiles"), "/private/tmpfiles")
+    XCTAssertEqual(rootIdentity("/Users/\(stamp)/Notes"), "/Users/\(stamp)/Notes")
+  }
+
+  /// Nesting is not duplication. A root inside another root is a second root the
+  /// user asked for, and the key must keep them apart.
+  func testANestedRootKeepsAnIdentityOfItsOwn() {
+    let stamp = UUID().uuidString
+
+    XCTAssertNotEqual(
+      rootIdentity("/private/tmp/\(stamp)"), rootIdentity("/private/tmp"),
+      "a folder inside a root is not the root")
+  }
+
+  private func rootIdentity(_ path: String) -> String {
+    BookmarkStore.rootIdentityPath(URL(fileURLWithPath: path, isDirectory: true))
+  }
 }
