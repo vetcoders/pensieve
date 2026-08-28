@@ -58,10 +58,11 @@ final class BookmarkStore {
   /// to leak, and no fixture can mint a real bookmark that fails this read.
   private let bookmarkedOrigin: (Data) -> URL?
 
-  /// How a working-set entry's persisted blob is minted. Injectable for the same
-  /// reason as `bookmarkedOrigin`: a `persistFile` that FAILS is the case whose
-  /// warning used to be swallowed by the save paths downstream of it, and no
-  /// fixture can make a real file on a real volume refuse to produce a bookmark.
+  /// How a persisted blob is minted for a working-set file (`persistFile`) and
+  /// for a stale root's in-place refresh (`restoreRootURLs`). Injectable because
+  /// a mint that FAILS is the case no live fixture can force on a real volume:
+  /// `persistFile`'s warning used to be swallowed, and restore used to keep a
+  /// stale root while discarding a later usable duplicate of it.
   private let mintFileBookmark: (URL) throws -> Data
 
   init(
@@ -762,7 +763,9 @@ final class BookmarkStore {
   /// and one scan reached 8.6 GB. The refresh therefore replaces the entry WHERE
   /// IT STANDS, and what this launch drops is dropped from the key too, so an
   /// install that already carries the sediment is cleaned once instead of
-  /// paying to resolve it on every launch.
+  /// paying to resolve it on every launch. If that remint fails, a later usable
+  /// blob for the same directory replaces the failed stale survivor in that
+  /// same place — first-seen still wins when the refresh succeeded.
   ///
   /// Duplication is judged on `rootIdentityPath` — the directory each blob
   /// RESOLVES to. Nesting is not duplication: a root inside another root is a
@@ -810,8 +813,10 @@ final class BookmarkStore {
         continue
       }
 
-      let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
+      // Minting the replacement needs the grant, so it happens AFTER the
+      // activation — the same order `restoreFileURLs` uses.
       activate(url)
+      let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
       liveRoots[identity] = LiveRestoredRoot(
         survivingIndex: survivingBookmarks.count,
         restoredIndex: restoredURLs.count,
@@ -858,11 +863,13 @@ final class BookmarkStore {
   ) {
     guard var prior = liveRoots[identity], prior.refreshFailed else { return }
     guard isExistingDirectory(url) else { return }
-    let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
     activate(url)
+    let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
+    let laterUsable = !bookmarkIsStale || stored.reminted
+    guard laterUsable else { return }
     survivingBookmarks[prior.survivingIndex] = stored.data
     restoredURLs[prior.restoredIndex] = url
-    prior.refreshFailed = bookmarkIsStale && !stored.reminted
+    prior.refreshFailed = false
     liveRoots[identity] = prior
   }
 
@@ -870,12 +877,7 @@ final class BookmarkStore {
     for url: URL, stale: Bool, fallback: Data
   ) -> (data: Data, reminted: Bool) {
     guard stale else { return (fallback, false) }
-    guard
-      let reminted = try? url.bookmarkData(
-        options: [.withSecurityScope],
-        includingResourceValuesForKeys: nil,
-        relativeTo: nil)
-    else { return (fallback, false) }
+    guard let reminted = try? mintFileBookmark(url) else { return (fallback, false) }
     return (reminted, true)
   }
 

@@ -247,6 +247,71 @@ final class WorkspaceRootBookmarkHygieneTests: XCTestCase {
       "a refresh that leaves the entry stale re-runs on every launch")
   }
 
+  /// THE CODEX CASE: the first blob for a directory is stale and reminting it
+  /// fails, while a later blob for the same directory is already usable.
+  /// Marking the identity as seen before the survivor is known used to keep
+  /// the stale entry and throw the working copy away.
+  func testRestorePrefersALaterUsableDuplicateWhenStaleRefreshFails() throws {
+    let harness = try makeHarness()
+    let notes = try harness.makeFolder(named: "Notes")
+    let original = try harness.makeFolder(named: "Repeated")
+    let notesBlob = try harness.bookmarkData(for: notes)
+    let staleBlob = try harness.bookmarkData(for: original)
+    let moved = harness.container.appendingPathComponent("Repeated-moved", isDirectory: true)
+    try FileManager.default.moveItem(at: original, to: moved)
+    XCTAssertTrue(
+      harness.isStale(staleBlob),
+      "Precondition: the first blob for the repeated root must be stale")
+    let freshBlob = try harness.bookmarkData(for: moved)
+    XCTAssertFalse(
+      harness.isStale(freshBlob),
+      "Precondition: the later blob must be usable without reminting")
+    XCTAssertNotEqual(staleBlob, freshBlob)
+    harness.defaults.set(
+      [notesBlob, staleBlob, freshBlob], forKey: rootBookmarksKey)
+
+    let restored = harness.makeBookmarkStore(
+      mintFileBookmark: { _ in throw CocoaError(.fileWriteNoPermission) }
+    ).restoreWorkspace(into: AppState())
+
+    XCTAssertEqual(
+      restored.rootURLs.map(\.standardizedFileURL.path),
+      [notes.standardizedFileURL.path, moved.standardizedFileURL.path])
+    XCTAssertEqual(
+      harness.persistedRootBookmarks, [notesBlob, freshBlob],
+      "the stale first copy was kept and the later usable bookmark for the same directory was discarded"
+    )
+    XCTAssertFalse(harness.isStale(harness.persistedRootBookmarks[1]))
+  }
+
+  /// CONTROL: remint failure is not a reason to drop a root that still
+  /// resolves. With no later usable copy, the stale bookmark stays.
+  func testRestoreKeepsAStaleRootWhenRefreshFailsAndNoUsableDuplicateExists() throws {
+    let harness = try makeHarness()
+    let notes = try harness.makeFolder(named: "Notes")
+    let moving = try harness.makeFolder(named: "Moving")
+    let staleBlob = try harness.bookmarkData(for: moving)
+    let notesBlob = try harness.bookmarkData(for: notes)
+    let moved = harness.container.appendingPathComponent("Moved", isDirectory: true)
+    try FileManager.default.moveItem(at: moving, to: moved)
+    XCTAssertTrue(
+      harness.isStale(staleBlob),
+      "Precondition: the fixture must actually be a stale bookmark, or this pin proves nothing")
+    harness.defaults.set([staleBlob, notesBlob], forKey: rootBookmarksKey)
+
+    let restored = harness.makeBookmarkStore(
+      mintFileBookmark: { _ in throw CocoaError(.fileWriteNoPermission) }
+    ).restoreWorkspace(into: AppState())
+
+    XCTAssertEqual(
+      restored.rootURLs.map(\.standardizedFileURL.path),
+      [moved.standardizedFileURL.path, notes.standardizedFileURL.path],
+      "a stale bookmark that still resolves must still restore the folder")
+    XCTAssertEqual(
+      harness.persistedRootBookmarks, [staleBlob, notesBlob],
+      "remint failure without a later usable copy dropped or replaced the stale bookmark")
+  }
+
   /// CONTROL, and the line the cleanup must not cross: a root that is merely
   /// GONE keeps its bookmark. It drops out of this launch's list and out of
   /// nothing else — bare launch shows the empty launcher, and the folder can
@@ -416,8 +481,10 @@ private struct RootBookmarkHarness {
     persistedRootBookmarks.compactMap { resolve($0)?.standardizedFileURL.path }
   }
 
-  func makeBookmarkStore() -> BookmarkStore {
-    BookmarkStore(defaults: defaults)
+  func makeBookmarkStore(
+    mintFileBookmark: @escaping (URL) throws -> Data = BookmarkStore.securityScopedBookmark
+  ) -> BookmarkStore {
+    BookmarkStore(defaults: defaults, mintFileBookmark: mintFileBookmark)
   }
 
   func makeFolder(named name: String) throws -> URL {

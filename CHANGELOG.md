@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fact that `/tmp` and `/private/tmp` are the same folder, which the old
   comparison could not see — so re-opening replaces the entry where it stands,
   earlier copies collapse onto it, startup drops the duplicates from the saved
-  workspace for good, and the scanner refuses to walk one folder twice even if it
+  workspace for good, and if the first saved bookmark for a folder is stale and
+  cannot be rewritten, a later working bookmark for that same folder is kept
+  instead of the dead one. The scanner refuses to walk one folder twice even if it
   is handed it twice. A launch on a healthy workspace writes nothing and changes
   nothing. Unchanged on purpose: a folder that is merely missing today, or sits
   on a volume that is unplugged, keeps its bookmark and simply sits out that
