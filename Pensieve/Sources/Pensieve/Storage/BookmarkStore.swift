@@ -777,6 +777,7 @@ final class BookmarkStore {
     var survivingBookmarks: [Data] = []
     var restoredURLs: [URL] = []
     var seenIdentities: Set<String> = []
+    var liveRoots: [String: LiveRestoredRoot] = [:]
 
     for data in bookmarks {
       var bookmarkIsStale = false
@@ -792,21 +793,30 @@ final class BookmarkStore {
         continue
       }
 
-      guard seenIdentities.insert(Self.rootIdentityPath(url)).inserted else { continue }
+      let identity = Self.rootIdentityPath(url)
+      if !seenIdentities.insert(identity).inserted {
+        replaceFailedStaleLiveRootIfNeeded(
+          identity: identity,
+          data: data,
+          url: url,
+          bookmarkIsStale: bookmarkIsStale,
+          liveRoots: &liveRoots,
+          survivingBookmarks: &survivingBookmarks,
+          restoredURLs: &restoredURLs)
+        continue
+      }
       guard isExistingDirectory(url) else {
         survivingBookmarks.append(data)
         continue
       }
 
+      let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
       activate(url)
-      let refreshed =
-        bookmarkIsStale
-        ? (try? url.bookmarkData(
-          options: [.withSecurityScope],
-          includingResourceValuesForKeys: nil,
-          relativeTo: nil))
-        : nil
-      survivingBookmarks.append(refreshed ?? data)
+      liveRoots[identity] = LiveRestoredRoot(
+        survivingIndex: survivingBookmarks.count,
+        restoredIndex: restoredURLs.count,
+        refreshFailed: bookmarkIsStale && !stored.reminted)
+      survivingBookmarks.append(stored.data)
       restoredURLs.append(url)
     }
 
@@ -826,6 +836,47 @@ final class BookmarkStore {
       }
     }
     return restoredURLs
+  }
+
+  private struct LiveRestoredRoot {
+    let survivingIndex: Int
+    let restoredIndex: Int
+    var refreshFailed: Bool
+  }
+
+  /// If the first blob for this directory was stale and could not be reminted,
+  /// a later usable blob for the same directory replaces it in place. First-seen
+  /// still wins when that refresh succeeded — order is the sidebar's.
+  private func replaceFailedStaleLiveRootIfNeeded(
+    identity: String,
+    data: Data,
+    url: URL,
+    bookmarkIsStale: Bool,
+    liveRoots: inout [String: LiveRestoredRoot],
+    survivingBookmarks: inout [Data],
+    restoredURLs: inout [URL]
+  ) {
+    guard var prior = liveRoots[identity], prior.refreshFailed else { return }
+    guard isExistingDirectory(url) else { return }
+    let stored = refreshedRootBookmark(for: url, stale: bookmarkIsStale, fallback: data)
+    activate(url)
+    survivingBookmarks[prior.survivingIndex] = stored.data
+    restoredURLs[prior.restoredIndex] = url
+    prior.refreshFailed = bookmarkIsStale && !stored.reminted
+    liveRoots[identity] = prior
+  }
+
+  private func refreshedRootBookmark(
+    for url: URL, stale: Bool, fallback: Data
+  ) -> (data: Data, reminted: Bool) {
+    guard stale else { return (fallback, false) }
+    guard
+      let reminted = try? url.bookmarkData(
+        options: [.withSecurityScope],
+        includingResourceValuesForKeys: nil,
+        relativeTo: nil)
+    else { return (fallback, false) }
+    return (reminted, true)
   }
 
   /// Resolves the persisted working set AND writes back what resolution proved
