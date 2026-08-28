@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A folder can no longer end up in the workspace several times over, and one
+  that already is gets cleaned up on the next launch.** The saved workspace held
+  a bookmark per folder, and it decided whether it already knew a folder by
+  comparing the bookmark's raw bytes. Those bytes are not a name: the same folder
+  re-opened, or re-saved after macOS invalidated its bookmark, produces different
+  ones — so the folder was recorded a second time, and a third. Worse, the
+  refresh that runs at startup when a bookmark has gone stale ADDED the refreshed
+  copy and kept the old one, which is one extra copy of that folder on every
+  single launch. Nothing filtered them afterwards: the sidebar built a root per
+  entry and each root got its own complete recursive scan of the tree, so four
+  copies of a folder meant walking it four times. Measured on the operator's
+  install: a five-hour scan that reached 8.6 GB of memory, from a saved workspace
+  that named `/tmp` four times.
+
+  Now a root is identified by the folder it actually resolves to — including the
+  fact that `/tmp` and `/private/tmp` are the same folder, which the old
+  comparison could not see — so re-opening replaces the entry where it stands,
+  earlier copies collapse onto it, startup drops the duplicates from the saved
+  workspace for good, and the scanner refuses to walk one folder twice even if it
+  is handed it twice. A launch on a healthy workspace writes nothing and changes
+  nothing. Unchanged on purpose: a folder that is merely missing today, or sits
+  on a volume that is unplugged, keeps its bookmark and simply sits out that
+  launch.
+
 ## [0.4.4] - 2026-08-16
 
 ### Changed
