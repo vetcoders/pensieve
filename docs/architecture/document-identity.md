@@ -183,14 +183,20 @@ table above and decide explicitly for each one. In particular:
 - **Touching root persistence?** The contract, in four sentences. Root identity
   is the resolved canonical path (`rootIdentityPath`); **a bookmark blob is never
   an identity**, because the bytes minted for one directory vary with the URL
-  spelling and with volume metadata. A stale bookmark is refreshed **in place**
-  inside `restoreRootURLs` — never by calling `persistRoot`, which also rewrites
-  the legacy single-folder key and the live cache identity. The restore
-  **self-heals** historical duplicates: what it drops it drops from the key too,
-  and a second launch on the cleaned key changes nothing. And an identical real
-  root is **scanned at most once** — `FolderManager.uniqueRoots` is the canonical
-  upstream normalization, `WorkspaceScanner.build` keeps a cheap guard of its own
-  so the property belongs to the walk rather than to today's callers.
+  spelling and with volume metadata. Identity comparison (`persistRoot` /
+  `persistFile` de-dupe) resolves bookmarks **without mounting** — the same
+  load-bearing `.withoutMounting` as `pruneTrashedFiles` — so matching two
+  blobs must not attach a volume or stall the main actor. A stale bookmark is
+  refreshed **in place** inside `restoreRootURLs` — never by calling
+  `persistRoot`, which also rewrites the legacy single-folder key and the live
+  cache identity. If that remint fails, a later **usable** blob for the same
+  directory replaces the failed stale survivor rather than being discarded.
+  The restore **self-heals** historical duplicates: what it drops it drops from
+  the key too, and a second launch on the cleaned key changes nothing. And an
+  identical real root is **scanned at most once** — `FolderManager.uniqueRoots`
+  is the canonical upstream normalization, `WorkspaceScanner.build` keeps a
+  cheap guard of its own so the property belongs to the walk rather than to
+  today's callers.
 
   This is not theoretical. Production 0.4.4 reached 8.6 GB resident (peak 9.7 GB)
   over a five-hour workspace scan with one notes folder plus **four** entries for
