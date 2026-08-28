@@ -529,11 +529,18 @@ final class BookmarkStore {
   /// what leaves the alias roots themselves to `rootIdentityPath`.
   nonisolated private static let privateSymlinkAliases = privateSymlinkRoots.map { $0 + "/" }
 
+  /// Identity-only resolve for `persistRoot` / `persistFile` de-dupe.
+  ///
+  /// `.withoutMounting` is the same load-bearing choice as `pruneTrashedFiles`
+  /// and `makeWorkspaceBookmark`: this runs on the main actor, and a resolve is
+  /// allowed to mount the volume it names. Comparing two bookmarks must not
+  /// change the machine. A blob that needs a mount before it even yields a path
+  /// is unresolvable today, so it matches nothing and is never collapsed away.
   private func resolvedURL(for bookmark: Data) -> URL? {
     var bookmarkIsStale = false
     return try? URL(
       resolvingBookmarkData: bookmark,
-      options: [.withSecurityScope],
+      options: [.withSecurityScope, .withoutMounting],
       relativeTo: nil,
       bookmarkDataIsStale: &bookmarkIsStale
     )
