@@ -114,6 +114,99 @@ make install-app        # local install into /Applications
 Both release lanes are gated by `make gates`. The App Store lane has its own
 identities, entitlements and checklist — see `docs/appstore-lane.md`.
 
+**The release unlocks its own build keychain.** The Developer ID identity lives
+in a dedicated keychain (`~/Library/Keychains/pensieve-build.keychain-db` by
+default), and a keychain's unlocked state belongs to the security session that
+unlocked it. Unlocking it in a GUI session therefore does nothing for a release
+driven over SSH: codesign fails there with `errSecInternalComponent`, minutes
+into the build. The unlock lives in `scripts/lib/build-keychain.sh` and runs
+inside the same session that runs codesign, reading the password from
+`~/.keys/.build-keychain-pw` (0600). Both paths are overridable via
+`PENSIEVE_BUILD_KEYCHAIN` and `PENSIEVE_BUILD_KEYCHAIN_PASSWORD_FILE`; a machine
+with no such keychain file is left alone entirely.
+
+That helper is a sourceable lib, and therefore a release runtime input sealed
+into provenance, because it has two callers in two postures.
+`scripts/build-release.sh` sources it for the strict `preflight_build_keychain`
+gate. `scripts/test-isolated-app.sh` sources it for the opportunistic,
+non-fatal `unlock_build_keychain` alone — `make gates` runs long before any
+release lane, so without that call its fixture signing reached a keychain
+nothing had opened yet. That suite then qualifies its trusted lane on a **trial
+signature**, not on `security find-identity`: a listed identity it cannot sign
+with is downgraded, with the codesign error printed, to the existing certless
+skip lane instead of failing the gate. CI, which has no identity at all, skips
+exactly as before.
+
+That 0600 is enforced, not merely documented. The file holds the keychain
+password in cleartext and `$HOME` is world-executable on macOS, so its own mode
+is the whole of its confidentiality. The pre-flight requires it to be owned by
+the user running the build with no group or other bits set — `0600`, or `0400`
+for a copy kept read-only. Anything wider is refused rather than read, with
+`chmod 600` printed; treat a password that sat in a group- or world-readable
+file as disclosed and rotate it.
+
+Only the Developer ID lane is _gated_ on that keychain. The App Store lane signs
+with the `PENSIEVE_MAS_*` identities, which need not live there at all, so a
+stale password file must not refuse a `--appstore` build that never touches it.
+The MAS lane still gets the opportunistic, non-fatal unlock at each signing site,
+because a Developer ID identity is a documented stand-in for a MAS dry run and
+that one does live in the build keychain.
+
+The unlock is re-asserted before every signing site, not just in pre-flight,
+because a keychain's inactivity auto-lock can close it again while the run sits
+in `swift build` or waits on notarization — deliberately, in preference to
+raising the operator's auto-lock timeout, which would leave a persistent change
+to their security posture behind. `security find-identity` is not evidence that
+signing will work: it lists an identity out of a LOCKED keychain, since only the
+private key is sealed.
+
+With no password file the run continues rather than failing: signing may still
+succeed because this session already holds the keychain open. The one case that
+fails in pre-flight, with the remedy printed, is a locked keychain in a session
+that cannot be prompted. That branch is the only caller of
+`security show-keychain-info`, and it is fenced behind a GUI-session check for a
+concrete reason: against a locked keychain that call is not a passive read, it
+raises a SecurityAgent panel and blocks on it. Never lift it out of that branch,
+and never let a test reach a real keychain — `scripts/test-build-keychain.sh`
+shims `security` and `launchctl` on `PATH` and asserts the absence of that call
+in the sessions that could pop a panel.
+
+**The download page's checksum is stamped, not typed.** A lane that produces a
+notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
+the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG
+it just built, then verifies it — so commit `docs/index.html` together with the
+release. Local lanes (`make release-local`, `make release-appstore`, any
+`--no-notarize` run) never touch or gate on the page: the repo deliberately
+keeps an unfilled placeholder between releases. A page that cannot carry this
+build's checksum (missing, unreadable, read-only, reshaped, or advertising
+another version) fails in pre-flight, before anything is built or published.
+
+What is asserted — in pre-flight and again at the end of the run — is the whole
+published claim: the checksum, the version in the panel's `<dt>Version</dt>`,
+and every place the page hands the reader the artifact. That last one is an
+exact census, not a spot check: the page carries three download targets (hero
+button, panel button, JSON-LD `downloadUrl`), each `href`/`downloadUrl` value
+must equal the `releases/latest/download/Pensieve.dmg` funnel this lane
+publishes IN FULL, and there must be exactly three of them
+(`LANDING_PAGE_ARTIFACT_LINK_COUNT`). Giving `docs/index.html` a fourth
+download target therefore means bumping that constant deliberately. So editing
+the version line or a download button of `docs/index.html` while a release is
+in flight fails that release rather than publishing a mismatched page. Stamping
+itself is concurrency-safe for the same reason: the page is rewritten by
+renaming a fresh copy into place, and an edit that lands mid-stamp aborts the
+run instead of being silently overwritten.
+
+`scripts/lib/landing-page.sh` is a release runtime input like every other
+release helper, so a release refuses to run with uncommitted edits to it and
+seals it into the provenance digest. The release enumerates its helpers by hand
+in several places — the snapshot archive in `scripts/build-release.sh`, the
+digest and status lists in `scripts/lib/build-provenance.sh`, and the
+dirty-input status list in `scripts/lib/isolated-app.sh` — and a helper added to
+some of them but not all breaks a release lane rather than failing a test. A
+helper is therefore added to EVERY such list at once;
+`scripts/test-landing-page.sh` checks that structurally, by requiring any
+multi-line helper list in those scripts to name every release helper.
+
 `Permission denied` or `Directory not empty` while a release retires `dist/` or
 `Pensieve/.build` is the read-only SwiftPM resource shape, not a race:
 `Bundle.module` resources are copied `r--r--r--` inside `r-xr-xr-x` directories,

@@ -62,7 +62,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return false
     }
@@ -83,7 +83,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return false
     }
@@ -111,7 +111,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return false
     }
@@ -137,7 +137,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return true
     }
@@ -162,7 +162,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return false
     }
@@ -181,7 +181,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return asked == 1
     }
@@ -206,7 +206,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
-    ConsciousCloseHook.install(on: window) { _ in true }
+    ConsciousCloseHook.install(on: window) { _, _ in true }
 
     let installed = window.delegate
     XCTAssertFalse(installed === sceneDelegate, "the hook never went on")
@@ -232,7 +232,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     window.delegate = sceneDelegate
     var asked = 0
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return true
     }
@@ -253,10 +253,10 @@ final class ConsciousCloseHookTests: XCTestCase {
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
-    ConsciousCloseHook.install(on: window) { _ in true }
+    ConsciousCloseHook.install(on: window) { _, _ in true }
     let firstProxy = window.delegate
     var secondAsked = 0
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       secondAsked += 1
       return false
     }
@@ -287,7 +287,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     // is a REAL deallocation, not a deferred one.
     let proxy = try autoreleasepool { () -> ConsciousCloseDelegateProxy in
       window.delegate = sceneDelegate
-      ConsciousCloseHook.install(on: window) { _ in true }
+      ConsciousCloseHook.install(on: window) { _, _ in true }
       let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
       XCTAssertEqual(
         proxy.responds(to: #selector(NSWindowDelegate.windowDidBecomeKey(_:))), true,
@@ -323,7 +323,7 @@ final class ConsciousCloseHookTests: XCTestCase {
 
     let proxy = try autoreleasepool { () -> ConsciousCloseDelegateProxy in
       window.delegate = sceneDelegate
-      ConsciousCloseHook.install(on: window) { _ in true }
+      ConsciousCloseHook.install(on: window) { _, _ in true }
       let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
       XCTAssertTrue(
         proxy.responds(to: sel),
@@ -354,7 +354,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     let sceneDelegate = SwiftUIStyleWindowDelegate()
     window.delegate = sceneDelegate
 
-    ConsciousCloseHook.install(on: window) { _ in true }
+    ConsciousCloseHook.install(on: window) { _, _ in true }
     let proxy = try XCTUnwrap(window.delegate as? ConsciousCloseDelegateProxy)
 
     let unknown = NSSelectorFromString("windowDidFrobnicate:")
@@ -398,7 +398,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
-    ConsciousCloseHook.install(on: window) { _ in
+    ConsciousCloseHook.install(on: window) { _, _ in
       asked += 1
       return false
     }

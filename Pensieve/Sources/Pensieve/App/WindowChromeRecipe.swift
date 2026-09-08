@@ -270,6 +270,81 @@ enum WindowChromeRecipe {
     return view.subviews.contains(where: hostsTabBar)
   }
 
+  // MARK: - Which affordance asked for a close
+
+  /// Window-space rects of the titlebar accessories that host the native tab
+  /// bar — the region every tab affordance lives in.
+  ///
+  /// Measured on a two-tab probe (macOS 27.0, 900×500 content window, native
+  /// tab group): ONE accessory, `layoutAttribute == .bottom`, occupying
+  /// `(0, 432, 900, 36)` — full width, directly under the toolbar — with each
+  /// tab's "×" a 16×16 `NSButton` at the LEADING edge of its `NSTabButton`,
+  /// at `(15, 446)` and `(455, 446)`. The same window's red close button
+  /// measures `(9, 477, 14, 14)`. The two affordances occupy DISJOINT bands
+  /// (tab bar y 432…468, traffic lights y 477…491) and cannot be confused by a
+  /// hit test — which is what lets `closeGesture` tell them apart at all.
+  ///
+  /// Untitled helper windows are guarded because asking them for titlebar
+  /// accessories raises an AppKit exception — the same guard
+  /// `belowToolbarChromeHeight` wears. A hidden accessory is skipped: a tab bar
+  /// that is not on screen cannot have been clicked.
+  static func tabBarAccessoryFrames(in window: NSWindow) -> [NSRect] {
+    guard window.styleMask.contains(.titled) else { return [] }
+    return window.titlebarAccessoryViewControllers
+      .filter { !$0.view.isHidden && hostsTabBar($0.view) }
+      .map { $0.view.convert($0.view.bounds, to: nil) }
+  }
+
+  /// The decision itself, over plain geometry so it can be driven from a test
+  /// without a live tab bar or a synthesized `NSEvent`.
+  ///
+  /// Only a CLICK inside the tab bar answers `.tab`. Everything else is
+  /// `.unreadable`, including a click just outside it and a close with no click
+  /// behind it at all — the fail-safe direction, since `.unreadable` keeps the
+  /// behaviour this app had before the gesture was readable.
+  static func closeGesture(
+    clickLocationInWindow point: NSPoint?,
+    tabBarFrames: [NSRect]
+  ) -> WindowCloseGesture {
+    guard let point else { return .unreadable }
+    return tabBarFrames.contains { $0.contains(point) } ? .tab : .unreadable
+  }
+
+  /// Which affordance is asking `window` to close, read from the event AppKit
+  /// is dispatching right now.
+  ///
+  /// Measured on the probe (macOS 27.0): a click injected through the app's own
+  /// event queue is exactly what `NSApp.currentEvent` reports from inside the
+  /// close primitive — a red-button click at `(16, 484)` arrives as
+  /// `leftMouseUp locationInWindow=(16, 484) window=<the clicked window>`. The
+  /// tab "×" fires on `leftMouseDown` and the red button on `leftMouseUp`, so
+  /// both phases count; a keyboard `Shift+Cmd+W`, a programmatic close and a
+  /// close during teardown all arrive with a non-mouse event or none, and stay
+  /// `.unreadable`.
+  ///
+  /// `event.window === window` is deliberately strict. Measured on the same
+  /// probe: closing a NON-SELECTED tab is driven from the tab bar hosted by the
+  /// tab group's selected window, so the event's window is that HOST and not
+  /// the window being closed. Accepting a group sibling's tab bar would widen
+  /// the claim for no benefit — a window with siblings already resolves to
+  /// `.tab` through the surviving-sibling heuristic — while a LONE tab, the
+  /// case the gesture exists to settle, always hosts its own tab bar and passes
+  /// this test.
+  @MainActor
+  static func closeGesture(closing window: NSWindow, event: NSEvent?) -> WindowCloseGesture {
+    closeGesture(
+      clickLocationInWindow: clickLocationInWindow(of: event, closing: window),
+      tabBarFrames: tabBarAccessoryFrames(in: window))
+  }
+
+  static func clickLocationInWindow(of event: NSEvent?, closing window: NSWindow) -> NSPoint? {
+    guard let event, event.window === window else { return nil }
+    switch event.type {
+    case .leftMouseDown, .leftMouseUp, .leftMouseDragged: return event.locationInWindow
+    default: return nil
+    }
+  }
+
   /// Puts any tab-bar glass that has self-selected the WRONG SIDE back on the
   /// window's. Returns `true` when something had to be corrected.
   ///
@@ -296,10 +371,14 @@ enum WindowChromeRecipe {
   /// accessory views; no SwiftUI scene owns them and none writes an answer back.
   ///
   /// `tabBarViews` exists so the polarity rules can be driven against a known
-  /// view shape. It defaults to the real walk, and the end-to-end pin
-  /// (`testARealTabGroupsFlippedGlassIsRepairedThroughAssertWindowChrome`) goes
-  /// through `assertWindowChrome` with the default, so the discovery half is
-  /// never left unproven by the seam.
+  /// view shape. The POLARITY half is pinned through this seam; the DISCOVERY
+  /// half (`tabBarSelfSelectingViews`) is not, and saying so is the honest
+  /// state: `18ef85f` retired the end-to-end pin that drove the real walk,
+  /// because building a native tab group inside the unit-test process can
+  /// publish a WindowServer surface even from a hidden, offscreen fixture. The
+  /// walk's gate — `window.tabGroup?.isTabBarVisible` — has no headless
+  /// equivalent, so its non-empty case is covered by isolated UI smoke or not
+  /// at all.
   @discardableResult
   static func assertTabBarAppearance(
     on window: NSWindow, for theme: PensieveTheme, tabBarViews: [NSView]? = nil
@@ -523,6 +602,84 @@ enum WindowChromeRecipe {
     }
 
     return corrected
+  }
+
+  /// Whether the window is already dressed in the half the skin resolves to
+  /// RIGHT NOW — i.e. whether `assertWindowChrome` has caught up with the skin.
+  ///
+  /// For every skin but a paired one this is permanently true outside a skin
+  /// switch: the half is a function of the enum, and the enum is what both
+  /// sides read. A PAIRED skin is the case that separates them. Its half is a
+  /// function of the system light/dark setting, which can move without any
+  /// SwiftUI pass behind it, so between the flip and the next assert the window
+  /// is recorded on one half while `windowAppearance(for:)` already answers with
+  /// the other. That gap is the whole defect this predicate exists to close.
+  ///
+  /// It is read from `assertedAppearances` — our own intent — and not from the
+  /// window, for the reason that table exists at all: `NSWindow.appearance` does
+  /// not round-trip on a scene-owned window, so the window cannot be asked which
+  /// half it is on.
+  ///
+  /// A window `assertWindowChrome` has never reached answers TRUE. There is no
+  /// half of ours for it to be behind, and a first-ever repair (the launcher's
+  /// toggle chips, before its first chrome pass lands) must not be suppressed by
+  /// a rule about a flip that has not happened.
+  static func isAssertedToTheSkinsHalf(_ window: NSWindow, for theme: PensieveTheme) -> Bool {
+    guard let asserted = assertedAppearances.object(forKey: window) else { return true }
+    return asserted.name == windowAppearance(for: theme)?.name
+  }
+
+  /// The repair AppKit's own rebuilds need BETWEEN SwiftUI passes: the toolbar's
+  /// chip tint and the native tab bar, and nothing that decides which half the
+  /// window is on.
+  ///
+  /// Both surfaces are rebuilt by AppKit without a SwiftUI pass behind them (a
+  /// toolbar re-bridge, a tab selection), which is why they are re-asserted from
+  /// the window's own update cycle at all — see `WindowChromeSink`. Both also
+  /// derive their answer from the SKIN, and for a paired skin the skin's answer
+  /// moves the instant the system setting does. Left ungated, the first
+  /// `didUpdate` after a live flip therefore paints the tab bar and the chips in
+  /// the NEW half while the titlebar, the sidebar and the traffic lights are
+  /// still in the old one: the two-tone window the operator photographed, with
+  /// the boundary landing on the split divider.
+  ///
+  /// So this trigger may only ever repair a window INTO the half it already
+  /// has. `assertWindowChrome` stays the single writer of the half — it is the
+  /// one that moves a window across, and it is deliberately kept off this
+  /// notification (a per-update `NSWindow.appearance` write is the 99% CPU
+  /// start-up hang `assertedAppearances` exists to prevent). A flip reaches the
+  /// windows through `ThemeManager`'s sweep instead, one edge per flip.
+  @discardableResult
+  static func assertBetweenPassChrome(
+    on window: NSWindow, for theme: PensieveTheme, tabBarViews: [NSView]? = nil
+  ) -> Bool {
+    guard isAssertedToTheSkinsHalf(window, for: theme) else { return false }
+    var corrected = assertToolbarChipTint(on: window, for: theme)
+    if assertTabBarAppearance(on: window, for: theme, tabBarViews: tabBarViews) {
+      corrected = true
+    }
+    return corrected
+  }
+
+  /// Re-asserts the chrome of every document window among `windows`.
+  ///
+  /// The system light/dark setting is the one input to a paired skin's half that
+  /// changes with NO SwiftUI pass guaranteed behind it. A window that is not
+  /// re-evaluated keeps the half it was last dressed in — indefinitely, for a
+  /// background tab that nobody focuses — so the flip needs a sweep of its own
+  /// rather than a per-window repair riding some other trigger.
+  ///
+  /// EDGE-triggered: one sweep per flip, driven from `ThemeManager`'s
+  /// system-appearance observation. That is what keeps it clear of the write
+  /// loop `7908bfd` fixed, which came from asserting the appearance on a
+  /// PER-PASS trigger the window itself posted. Nothing here writes
+  /// `NSApp.appearance`, so the sweep cannot re-drive the observation that
+  /// started it.
+  @MainActor
+  static func assertDocumentWindowChrome(among windows: [NSWindow], for theme: PensieveTheme) {
+    for window in windows where DocumentWindowOwnership.isDocumentHost(window) {
+      assertWindowChrome(on: window, for: theme)
+    }
   }
 
   // MARK: - The pocket's precondition
@@ -800,6 +957,15 @@ private struct SkinAppearanceModifier: ViewModifier {
 /// start-up hang `assertedAppearances` exists to prevent. The appearance and the
 /// titlebar backing therefore stay on the bounded SwiftUI passes, exactly where
 /// the editor already drives them.
+///
+/// That split leaves ONE rule to state, and it is what the update trigger goes
+/// through `assertBetweenPassChrome` for: this trigger may repair a window only
+/// into the half it ALREADY has. Both surfaces read their side from the skin,
+/// and a paired skin's side moves the moment the system setting does — so
+/// ungated, the first `didUpdate` after a live flip would paint the tab bar and
+/// the chips in the new half a full run-loop turn before anything moved the
+/// window across. `assertWindowChrome` is the only writer of the half; a system
+/// flip reaches the windows through `ThemeManager`'s sweep, one edge per flip.
 struct WindowChromeSink: NSViewRepresentable {
   let theme: PensieveTheme
 
@@ -826,8 +992,7 @@ struct WindowChromeSink: NSViewRepresentable {
       ) { [weak self] _ in
         MainActor.assumeIsolated {
           guard let self, let window = self.window else { return }
-          WindowChromeRecipe.assertToolbarChipTint(on: window, for: self.theme)
-          WindowChromeRecipe.assertTabBarAppearance(on: window, for: self.theme)
+          WindowChromeRecipe.assertBetweenPassChrome(on: window, for: self.theme)
         }
       }
     }

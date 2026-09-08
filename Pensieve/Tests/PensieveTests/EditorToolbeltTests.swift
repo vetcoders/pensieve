@@ -3,34 +3,11 @@ import XCTest
 
 @testable import Pensieve
 
-/// Structural smoke for the toolbelt declutter: the appearance controls are
-/// preview-scoped, and the appearance-menu pickers keep auto-populating from the
-/// `CaseIterable` theme axes.
+/// Structural smoke for the toolbelt declutter, and for the axes the status
+/// bar's appearance chip renders now that the toolbar carries no appearance
+/// control at all.
 final class EditorToolbeltTests: XCTestCase {
-  // MARK: - Appearance visibility gate
-
-  func testAppearanceControlsHiddenInPureSourceMode() {
-    XCTAssertFalse(EditorToolbelt.showsAppearanceControls(for: .source))
-  }
-
-  func testAppearanceControlsHiddenInFocusMode() {
-    // Focus is a source-editing surface — no preview pane, no appearance item.
-    XCTAssertFalse(EditorToolbelt.showsAppearanceControls(for: .focus))
-  }
-
-  func testAppearanceControlsVisibleWhenPreviewPaneExists() {
-    XCTAssertTrue(EditorToolbelt.showsAppearanceControls(for: .preview))
-    XCTAssertTrue(EditorToolbelt.showsAppearanceControls(for: .split))
-  }
-
-  func testEveryEditorModeHasAnExplicitAppearanceDecision() {
-    // Adding a new EditorMode must consciously land on one side of the gate;
-    // this pins today's full mapping so a new case shows up as a test edit.
-    let visible = EditorMode.allCases.filter(EditorToolbelt.showsAppearanceControls(for:))
-    XCTAssertEqual(Set(visible), Set([.preview, .split]))
-  }
-
-  // MARK: - Appearance-menu pickers stay CaseIterable-driven
+  // MARK: - Appearance-chip pickers stay CaseIterable-driven
 
   func testFlavorAxisAutoPopulates() {
     XCTAssertFalse(ThemeManager.Theme.allCases.isEmpty)
@@ -38,8 +15,8 @@ final class EditorToolbeltTests: XCTestCase {
   }
 
   func testSkinAxisAutoPopulates() {
-    // The menu renders one row per case — every skin needs a display name
-    // and a symbol, and the ids the picker tags on must stay unique.
+    // The chip's menu renders one row per case — every skin needs a display
+    // name and a symbol, and the ids the picker tags on must stay unique.
     let skins = PensieveTheme.allCases
     XCTAssertFalse(skins.isEmpty)
     XCTAssertEqual(Set(skins.map(\.id)).count, skins.count)
@@ -175,7 +152,6 @@ final class EditorToolbeltTests: XCTestCase {
       + MarkdownFormat.allCases.map(\.toolbarAccessibilityIdentifier)
       + [
         EditorToolbelt.modePickerIdentifier,
-        EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
         EditorToolbelt.autoReloadIdentifier,
         EditorToolbelt.scrollSyncIdentifier,
@@ -232,9 +208,6 @@ final class EditorToolbeltTests: XCTestCase {
           expectedIdentifiers.append(contentsOf: historyAndEditing)
         }
         expectedIdentifiers.append(EditorToolbelt.modePickerIdentifier)
-        if mode == .split || mode == .preview {
-          expectedIdentifiers.append(EditorToolbelt.appearanceIdentifier)
-        }
         expectedIdentifiers.append(contentsOf: previewRuntimeAndAssistants)
 
         let families = EditorToolbelt.visibleToolbarFamilyOrder(
@@ -261,7 +234,6 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.shareIdentifier,
         EditorToolbelt.dispatchIdentifier,
         EditorToolbelt.modePickerIdentifier,
-        EditorToolbelt.appearanceIdentifier,
         EditorToolbelt.reloadIdentifier,
         EditorToolbelt.autoReloadIdentifier,
         EditorToolbelt.scrollSyncIdentifier,
@@ -283,6 +255,106 @@ final class EditorToolbeltTests: XCTestCase {
         EditorToolbelt.autocompleteIdentifier,
         EditorToolbelt.rewriteIdentifier,
       ])
+  }
+}
+
+/// THE ABSENCE PIN for the appearance diamond's removal.
+///
+/// The pickers left the titlebar for the status bar's chip because the toolbar
+/// ran out of width, and "it is gone" is only worth a test if the test would
+/// notice it coming back. So this reads the BRIDGED toolbar, not the SwiftUI
+/// declaration the removal edited: a pin over
+/// `visibleToolbarIdentifierOrder` alone would just restate the diff and would
+/// stay green if someone re-declared the menu without registering an
+/// identifier for it.
+///
+/// Measured shape of what was removed, and therefore of what this looks for:
+/// the diamond was a `Menu` declared DIRECTLY in the view `ToolbarItemGroup`,
+/// so AppKit bridged it to a second subitem of that group (the mode picker is
+/// the first), and `ToolbarOverflowRecipe` wrote its two axes — "Markdown
+/// Flavor" and "Theme" — into the family's authored "»" entry.
+@MainActor
+final class EditorToolbeltTestsWithoutAnAppearanceControl: XCTestCase {
+  private static let retiredIdentifiers = [
+    "pensieve.toolbar.appearance",
+    "pensieve.toolbar.themePicker",
+    "pensieve.toolbar.skinPicker",
+  ]
+  private static let retiredNames = ["Preview Appearance", "Markdown Flavor", "Theme"]
+
+  func testTheViewFamilyBridgesTheModePickerAndNothingElse() throws {
+    let rig = try makeToolbarRig(prefix: "EditorToolbeltTestsWithoutAnAppearanceControl")
+    defer { rig.tearDown() }
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
+
+    let viewIdentifier = ToolbarOverflowRecipe.formIdentifier(for: .view)
+    let viewGroup = try XCTUnwrap(
+      rig.itemGroups.first { $0.menuFormRepresentation?.identifier == viewIdentifier },
+      "the bridged toolbar has no view family at all — " + rig.overflowDiagnostics)
+
+    // The premise: this family is being read while it really does host the
+    // mode picker, so an empty group cannot pass the count below.
+    XCTAssertNotNil(
+      rig.modePickerControl(), "premise: the view family must still bridge the mode picker")
+    XCTAssertEqual(
+      viewGroup.subitems.count, 1,
+      "the view family bridged \(viewGroup.subitems.count) controls — the mode picker is the only "
+        + "one it may carry, so a second subitem is the appearance diamond back in the titlebar")
+    XCTAssertEqual(
+      viewGroup.menuFormRepresentation?.submenu?.items.map(\.title), ["Mode"],
+      "the view family's » entry offers more than the mode axis — " + rig.overflowDiagnostics)
+  }
+
+  func testNoToolbarSurfaceCarriesTheAppearanceAxesAnyMore() throws {
+    let rig = try makeToolbarRig(prefix: "EditorToolbeltTestsWithoutAnAppearanceControl")
+    defer { rig.tearDown() }
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
+
+    var names: [String] = []
+    var identifiers: [String] = []
+
+    func read(_ item: NSToolbarItem) {
+      names.append(item.label)
+      identifiers.append(item.itemIdentifier.rawValue)
+      guard let form = item.menuFormRepresentation else { return }
+      names.append(form.title)
+      names.append(contentsOf: (form.submenu?.items ?? []).map(\.title))
+    }
+
+    func collectIdentifiers(from view: NSView) {
+      identifiers.append(view.accessibilityIdentifier())
+      for subview in view.subviews { collectIdentifiers(from: subview) }
+    }
+
+    for item in rig.toolbar?.items ?? [] {
+      read(item)
+      if let view = item.view { collectIdentifiers(from: view) }
+      guard let group = item as? NSToolbarItemGroup else { continue }
+      for subitem in group.subitems {
+        read(subitem)
+        if let view = subitem.view { collectIdentifiers(from: view) }
+      }
+    }
+
+    // The premise again: a sweep that read nothing would clear every assertion
+    // below without looking at a toolbar.
+    XCTAssertTrue(
+      names.contains("Mode"),
+      "premise: the sweep found no mode axis, so it is not reading a live toolbar — "
+        + rig.overflowDiagnostics)
+
+    for name in Self.retiredNames {
+      XCTAssertFalse(
+        names.contains(name),
+        "'\(name)' is back on the toolbar. Both appearance axes live in the status bar's chip "
+          + "(`EditorStatusBar.appearanceChip`) and the titlebar has no width to spare for a "
+          + "second home; got \(names)")
+    }
+    for identifier in Self.retiredIdentifiers {
+      XCTAssertFalse(
+        identifiers.contains(identifier),
+        "the retired toolbar identifier '\(identifier)' is back on a bridged control")
+    }
   }
 }
 

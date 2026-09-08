@@ -32,7 +32,9 @@ struct PensieveApp: App {
     let workspaceStore = WorkspaceStore()
     let launchIntentCoordinator = LaunchIntentCoordinator.shared
     launchIntentCoordinator.applyComposerLaunchArguments(composerArgs)
-    let themeManager = ThemeManager()
+    // The shared one, not a fresh instance: Settings ▸ Appearance edits the same
+    // two axes from a window AppKit owns, outside this scene's environment.
+    let themeManager = ThemeManager.shared
     _workspaceStore = State(wrappedValue: workspaceStore)
     _launchIntentCoordinator = StateObject(wrappedValue: launchIntentCoordinator)
     _themeManager = StateObject(wrappedValue: themeManager)
@@ -195,8 +197,8 @@ struct DocumentWindowRootView: View {
           // restored session, a cold-start Finder open and ⌘N all land in. See
           // `ConsciousCloseHook` for how a window whose class and delegate
           // belong to SwiftUI is reached.
-          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow in
-            controller?.windowShouldClose(closingWindow) ?? true
+          ConsciousCloseHook.install(on: window) { [weak controller] closingWindow, gesture in
+            controller?.windowShouldClose(closingWindow, gesture: gesture) ?? true
           }
         }
       )

@@ -212,6 +212,46 @@ Closes the active tab/file, but **does not quit the application**.
   button does NOT remove it (a tidying gesture — files come back). Quit, crash,
   and emergency exit NEVER remove it — files come back after restart.
 
+#### Gesture rule: the "×" owns the document, the red button owns the window
+
+**RESOLVED (Monika, 14.08.2026).** Which of the two rules above applies is
+decided by the GESTURE the user made, never by how many tabs happen to be open:
+
+- **A tab's "×" always closes the tab/document** — including when it is the
+  last tab. The outcome is identical to `Cmd+W`: the close-decision matrix
+  below runs unchanged, a completed close removes the file from Open Files and
+  from the session, the window survives and shows the launcher, and the app
+  does not quit.
+- **The red traffic-light button always closes the window lifecycle.** The
+  files it held stay in Open Files and come back on restart. Unchanged.
+- A tab "×" on a window that shows **no document** (the launcher) has nothing
+  to retire and still means "this window goes away". A window with work already
+  in flight does NOT count as one, whether it is part-way through opening a
+  large file or converting a Word/PDF: the click turn has already committed
+  that tab to the file, so it is showing its document and its "×" retires the
+  file and cancels the read or conversion in flight, exactly as `Cmd+W` does.
+  Neither kind of in-flight work has an editable buffer to be judged by — the
+  window is "busy" by the same three-part test the launcher sweep and the open
+  router use.
+
+Rationale — **a control must have stable semantics independent of the current
+UI layout.** Before this decision the same "×" meant "retire the document" with
+two or more tabs and silently became "close the window, keep the file" on the
+last tab, because the app inferred the user's intent from the surviving sibling
+count. That made one control mean two different things depending on a layout
+detail. It was benign only while the tab bar appeared exclusively with two or
+more tabs; with the tab bar kept permanently visible both affordances sit on a
+one-tab window at once, and the inference has no resolution left. macOS has no
+single absolute last-tab pattern across apps, so this is argued from stable
+semantics, not from mimicry.
+
+Implementation note: the gesture is read from the click AppKit is dispatching
+when the close arrives — a click inside the native tab bar's titlebar accessory
+is the "×", anything else is not. A gesture the app cannot read with confidence
+(`Shift+Cmd+W`, a programmatic close, a close with no event behind it) falls
+back to the previous window-scope behaviour, so an unrecognised close can never
+retire a file.
+
 #### Close-decision matrix (canonical, Monika + Maciej, 10.08.2026)
 
 This matrix is the single per-document rule for `Cmd+W`, a tab's `X`, the
@@ -893,6 +933,13 @@ Close All must never cause silent data loss.
 - Recent Files (File → Open Recent, D5 from 26.07) is a list independent of
   Open Files and the working set; during ⌘W-retire it acts as a safety net
   ("file disappears from Open Files, stays in Recents").
+- Exactly ONE Recent list on the empty launcher — the detail pane's. The
+  sidebar's empty state carries the wordmark and the shortcut hints only
+  (decision 14.08); the copy it used to draw was the same history one column
+  away.
+- Shortcut hints render one key cap per key (`⌘` `⇧` `O`), and the key column
+  sizes itself to the widest shortcut in the block — a hint may never wrap onto
+  a second row (decision 14.08).
 
 ## Minimal smoke check
 
@@ -960,6 +1007,9 @@ An agent implementing or refactoring menu/commands must verify:
       `Shift+Cmd+Z` performs redo.
 - [ ] `Shift+Cmd+W` closes the window (= red button), files remain
       in Open Files.
+- [ ] A tab's "×" on the LAST tab retires the file exactly like `Cmd+W`: the
+      row leaves Open Files, the window stays and shows the launcher, and the
+      app does not quit. The red button on the same window keeps the file.
 - [ ] `Ctrl+Tab` and `Cmd+Shift+[`/`]` switch tabs; `Cmd+G`/`Shift+Cmd+G`
       walk through find-bar results.
 - [ ] No shortcut is bound to two different commands.

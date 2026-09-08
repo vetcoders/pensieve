@@ -43,9 +43,18 @@ enum ConsciousCloseHook {
   /// free to re-assign `window.delegate` during a scene update, and re-running
   /// this re-wraps whatever is there now instead of leaving the window
   /// unguarded.
+  ///
+  /// `shouldClose` is handed the window AND which affordance is asking. The
+  /// scene-owned `AppKitWindow` gets the SAME classification the factory's
+  /// `DocumentWindow` gets, and deliberately so: it is not "the launcher" in
+  /// any durable sense — it is the window a restored session, a cold-start
+  /// Finder open and ⌘N all land in, so its tab "×" is a decision about a
+  /// document exactly as often as a factory tab's is. When it genuinely holds
+  /// no document the gesture is inert: there is nothing to retire, and the
+  /// close keeps its previous meaning.
   static func install(
     on window: NSWindow,
-    shouldClose: @escaping @MainActor (NSWindow) -> Bool
+    shouldClose: @escaping @MainActor (NSWindow, WindowCloseGesture) -> Bool
   ) {
     if let documentWindow = window as? DocumentWindow {
       documentWindow.onShouldClose = shouldClose
@@ -121,7 +130,9 @@ enum ConsciousCloseHook {
       MainActor.assumeIsolated {
         if let state = closeState(for: window) {
           if state.consumeBypass() {
-          } else if !state.shouldClose(window) {
+          } else if !state.shouldClose(
+            window, WindowChromeRecipe.closeGesture(closing: window, event: NSApp.currentEvent))
+          {
             return
           }
         }
@@ -142,11 +153,11 @@ enum ConsciousCloseHook {
 }
 
 private final class ConsciousCloseState {
-  var shouldClose: @MainActor (NSWindow) -> Bool
+  var shouldClose: @MainActor (NSWindow, WindowCloseGesture) -> Bool
   private var nextBypassID: UInt64?
   private var bypassSequence: UInt64 = 0
 
-  init(shouldClose: @escaping @MainActor (NSWindow) -> Bool) {
+  init(shouldClose: @escaping @MainActor (NSWindow, WindowCloseGesture) -> Bool) {
     self.shouldClose = shouldClose
   }
 
@@ -186,13 +197,16 @@ private final class CloseOriginalImplementation {
 /// controller elsewhere — retaining it here would only risk a cycle through the
 /// window the controller holds.
 final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
-  var shouldClose: @MainActor (NSWindow) -> Bool
+  var shouldClose: @MainActor (NSWindow, WindowCloseGesture) -> Bool
   weak var wrapped: NSWindowDelegate?
   /// Selectors this proxy has already reported refusing, so the trace names each
   /// one once instead of on every `responds(to:)` AppKit asks.
   private var refusedSelectorNames: Set<String> = []
 
-  init(wrapping wrapped: NSWindowDelegate?, shouldClose: @escaping @MainActor (NSWindow) -> Bool) {
+  init(
+    wrapping wrapped: NSWindowDelegate?,
+    shouldClose: @escaping @MainActor (NSWindow, WindowCloseGesture) -> Bool
+  ) {
     self.wrapped = wrapped
     self.shouldClose = shouldClose
   }
@@ -209,7 +223,8 @@ final class ConsciousCloseDelegateProxy: NSObject, NSWindowDelegate {
     // AppKit only ever asks this on the main thread; the hop exists because the
     // proxy itself cannot be actor-isolated (`responds(to:)` is not).
     return MainActor.assumeIsolated {
-      let allowed = shouldClose(sender)
+      let allowed = shouldClose(
+        sender, WindowChromeRecipe.closeGesture(closing: sender, event: NSApp.currentEvent))
       if allowed {
         ConsciousCloseHook.armCloseFollowingDelegateConsent(on: sender)
       }

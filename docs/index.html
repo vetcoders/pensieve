@@ -52,7 +52,7 @@
         "applicationCategory": "Productivity",
         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "downloadUrl": "https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg",
-        "softwareVersion": "0.4.3",
+        "softwareVersion": "0.4.4",
         "author": { "@type": "Organization", "name": "Vetcoders", "url": "https://github.com/vetcoders" },
         "description": "Markdown editor for macOS: live preview, workspace search, backlinks, a table formatter, reading themes, Word DOCX export, and DOCX/PDF import back to Markdown."
       }
@@ -544,7 +544,7 @@
             >
           </div>
           <p class="release-note">
-            Version <code>0.4.3</code> · macOS 15+ · Apple silicon
+            Version <code>0.4.4</code> · macOS 15+ · Apple silicon
           </p>
         </div>
 
@@ -628,24 +628,24 @@
       <section class="whatsnew" id="whatsnew">
         <div class="section-inner">
           <div class="reveal">
-            <div class="section-label">Release 0.4.3</div>
+            <div class="section-label">Release 0.4.4</div>
             <h2>What’s new.</h2>
           </div>
           <div class="new-grid">
             <div class="new-card reveal">
-              <span class="tagchip">AI</span>
-              <h3>Rewrite, with intent</h3>
-              <p>Improve, Shorten, Expand, and Fix Grammar each carry their own dedicated prompt now — and a fifth action lets you tell Pensieve exactly what to do with the selected text. Every prompt is a plain text file on disk you can edit.</p>
+              <span class="tagchip">Settings</span>
+              <h3>Where the theme lives now</h3>
+              <p>The theme and flavor pickers left the toolbar's diamond for the status-bar chip at the bottom right — click <code>Graphite / Markdown</code> to change either one, from any mode. Settings gained a third tab, Appearance, carrying the same two pickers, so ⌘, reaches them even from an empty launcher.</p>
             </div>
             <div class="new-card reveal">
-              <span class="tagchip">Search</span>
-              <h3>Results you can hand to an agent</h3>
-              <p>⌘-click selects multiple search results; Copy for Agent packages the matched snippets with their file paths — exactly what the index returned, ready to paste into any AI conversation as context.</p>
+              <span class="tagchip">Themes</span>
+              <h3>Light and dark, in one piece</h3>
+              <p>Flipping your Mac between light and dark used to leave a Typewriter window half in each — tab bar and toolbar already switched, titlebar and sidebar not yet. Every window now turns over together, and a large document under a fixed-appearance theme no longer hangs the start-up at full CPU.</p>
             </div>
             <div class="new-card reveal">
-              <span class="tagchip">Stability</span>
-              <h3>Built for long sessions</h3>
-              <p>Workspace scans no longer stack up under heavy filesystem churn — one walk at a time, cancelled cleanly when outdated. Window handling owns the cold launch, and an empty workspace keeps the launcher alive instead of quitting.</p>
+              <span class="tagchip">Sidebar</span>
+              <h3>Deep files, whole names</h3>
+              <p>A nesting level costs half the indent it used to, and every row, search hit and path now elides from the middle — so a deeply nested, date-prefixed file keeps both its date and the suffix that tells it apart. Renaming a file no longer drops its extension.</p>
             </div>
           </div>
         </div>
@@ -665,7 +665,7 @@
           </div>
           <aside class="download-panel reveal" aria-label="Download details">
             <dl>
-              <div><dt>Version</dt><dd>0.4.3</dd></div>
+              <div><dt>Version</dt><dd>0.4.4</dd></div>
               <div><dt>Platform</dt><dd>macOS 15+</dd></div>
               <div><dt>CPU</dt><dd>Apple silicon</dd></div>
               <div><dt>Gatekeeper</dt><dd>Notarized DMG</dd></div>
@@ -675,7 +675,11 @@
               href="https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg"
               >Download Pensieve.dmg</a
             >
-            <div class="sha"><b>SHA-256</b><br />RELEASE-0-4-3-SHA256-FILLED-AT-PUBLISH-DO-NOT-SHIP-THIS-LINE</div>
+            <!-- The line below is rewritten by scripts/build-release.sh with the
+                 SHA-256 of the DMG it just notarized (scripts/lib/landing-page.sh).
+                 Keep exactly one checksum slot on the page and do not fill it by
+                 hand — the release stamps it and then verifies it. -->
+            <div class="sha"><b>SHA-256</b><br />addf2e8bec5779b85c97d2fe9ccee21c0307ceeb7d5faf1da253c31d3025b88c</div>
           </aside>
         </div>
       </section>

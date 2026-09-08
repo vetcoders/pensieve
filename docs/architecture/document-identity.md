@@ -63,9 +63,9 @@ architectural invariant and must not be copied into this document.
 | ------------------------- | ---------------------------- | ------------------------------------------------- | ----------------- |
 | Working set (`openFiles`) | `AppState` / `DocumentStore` | `URL`                                             | via bookmarks     |
 | Window registry           | `DocumentWindowRegistry`     | `DocumentIdentity` + `ObjectIdentifier(NSWindow)` | no                |
-| File bookmarks            | `BookmarkStore`              | path + bookmark `Data` bytes                      | yes               |
-| Workspace roots           | `BookmarkStore`              | separate defaults key                             | yes               |
-| Recovery drafts           | `RecoveryStore`              | draft `UUID` + payload/sidecars                    | yes               |
+| File bookmarks            | `BookmarkStore`              | resolved path (`identityPath`)                    | yes               |
+| Workspace roots           | `BookmarkStore`              | resolved path (`rootIdentityPath`), separate key  | yes               |
+| Recovery drafts           | `RecoveryStore`              | draft `UUID` + payload/sidecars                   | yes               |
 | Untitled documents        | `DocumentSession`            | in-memory `UUID` + optional `recoveryID`          | only via recovery |
 
 `BookmarkStore` alone holds three defaults keys:
@@ -169,6 +169,56 @@ table above and decide explicitly for each one. In particular:
   an unrelated `/foo`, and with them their security-scoped grants.
   `FileWatcher.canonicalPath` folds the same three aliases for FSEvents paths;
   the two must stay in step.
+- **Comparing WORKSPACE ROOTS?** Use `BookmarkStore.rootIdentityPath`, never
+  `identityPath` and never a bare `standardizedFileURL.path`. A root **is** its
+  target, so the alias roots spelled on their own have to fold too: a bookmark
+  minted for `/tmp` resolves to `/private/tmp`, and under the document key those
+  two spellings were two roots naming one directory. The extension lives in its
+  own function rather than inside `identityPath` because that key also files the
+  security-scope grant accounting (`activeAccess`); widening it would re-file
+  every document caller's grants. Everything else about the document key carries
+  over unchanged — three aliases and nothing more, no symlink resolution, and
+  **nesting is not duplication**: `/w` and `/w/sub` are two roots the user asked
+  for.
+- **Touching root persistence?** The contract, in four sentences. Root identity
+  is the resolved canonical path (`rootIdentityPath`); **a bookmark blob is never
+  an identity**, because the bytes minted for one directory vary with the URL
+  spelling and with volume metadata. Identity comparison (`persistRoot` /
+  `persistFile` de-dupe) resolves bookmarks **without mounting** — the same
+  load-bearing `.withoutMounting` as `pruneTrashedFiles` — so matching two
+  blobs must not attach a volume or stall the main actor. A stale bookmark is
+  refreshed **in place** inside `restoreRootURLs` — never by calling
+  `persistRoot`, which also rewrites the legacy single-folder key and the live
+  cache identity. If that remint fails, a later **usable** blob for the same
+  directory replaces the failed stale survivor rather than being discarded.
+  The restore **self-heals** historical duplicates: what it drops it drops from
+  the key too, and a second launch on the cleaned key changes nothing. And an
+  identical real root is **scanned at most once** — `FolderManager.uniqueRoots`
+  is the canonical upstream normalization, `WorkspaceScanner.build` keeps a
+  cheap guard of its own so the property belongs to the walk rather than to
+  today's callers.
+
+  This is not theoretical. Production 0.4.4 reached 8.6 GB resident (peak 9.7 GB)
+  over a five-hour workspace scan with one notes folder plus **four** entries for
+  `/tmp` in `rootBookmarks` — one more per launch, because `persistRoot` deduped
+  on blob equality and the restore's stale refresh went through it and appended.
+  Every entry in that key gets its own full recursive walk.
+
+  What must NOT change: an entry that fails to resolve (unplugged volume) or
+  points at a directory missing today drops out of that launch's list and out of
+  nothing else. **Unresolvable is not garbage**, and it is never treated as some
+  other entry's duplicate.
+
+  Deduplication removes the multiplier. It does not bound a single, legitimate
+  large workspace: there is no scan-size budget and `/tmp` is not banned. A
+  separate finding, out of this cut: `FolderManager.workspaceValidationTask`
+  keeps the completed `WorkspaceValidationResult.scans` (full trees) until the
+  next open — `cancel()` on a finished task is a no-op, and the handle is never
+  nilled. Clearing it belongs in a later cut, and only under an
+  `openFlowGeneration` guard so an old task cannot steal a newer open's
+  cancellation. Cancelled scans already throw instead of returning a partial
+  tree (`WorkspaceScanSafetyTests.testCancellableScannerThrowsWithoutReturningPartialScan`).
+
 - **Rewriting the whole persisted workspace?** `BookmarkStore.replaceWorkspace`
   is all-or-nothing on purpose, and its caller (`removeRoot`) has already changed
   the LIVE workspace by the time it hears about a failure — so a refused write

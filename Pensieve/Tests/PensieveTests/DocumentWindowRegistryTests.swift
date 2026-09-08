@@ -127,7 +127,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
       hasEditableBuffer: true,
       registry: registry,
       onWindow: { guardedWindow in
-        ConsciousCloseHook.install(on: guardedWindow) { _ in
+        ConsciousCloseHook.install(on: guardedWindow) { _, _ in
           closeGuardAsks += 1
           return false
         }

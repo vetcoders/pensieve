@@ -1461,7 +1461,10 @@ final class FolderManager {
     appState.documentSession.clear()
   }
 
-  private func openResolvedWorkspace(rootURLs: [URL], fileURLs: [URL], into appState: AppState) {
+  private func openResolvedWorkspace(
+    rootURLs requestedRootURLs: [URL], fileURLs: [URL], into appState: AppState
+  ) {
+    let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
@@ -1666,8 +1669,9 @@ final class FolderManager {
   }
 
   private func openResolvedWorkspaceInBackground(
-    rootURLs: [URL], fileURLs: [URL], into appState: AppState
+    rootURLs requestedRootURLs: [URL], fileURLs: [URL], into appState: AppState
   ) {
+    let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
     openFlowGeneration &+= 1
@@ -2597,10 +2601,26 @@ final class FolderManager {
   }
 
   private func mergedRoots(current: [URL], adding urls: [URL]) -> [URL] {
+    uniqueRoots(current + urls)
+  }
+
+  /// THE canonical normalization every open flow puts its roots through before
+  /// they reach the sidebar, the manifest, or the scanner.
+  ///
+  /// One entry per real directory, in the order the workspace first named it.
+  /// Two spellings of one folder are not two roots — every extra entry costs a
+  /// full recursive walk, and the restore path handed this list straight from
+  /// the persisted bookmark set, which is where the operator's four `/tmp`
+  /// entries came in. Identity is `BookmarkStore.rootIdentityPath`, the same
+  /// contract the persisted key dedupes on, so the live list and the durable one
+  /// cannot disagree about what counts as one root. Nesting is deliberately NOT
+  /// duplication: `/w` and `/w/sub` are two roots the user asked for.
+  private func uniqueRoots(_ urls: [URL]) -> [URL] {
     var seen = Set<String>()
-    return (current + urls)
+    return
+      urls
       .map(\.standardizedFileURL)
-      .filter { seen.insert($0.path).inserted }
+      .filter { seen.insert(BookmarkStore.rootIdentityPath($0)).inserted }
   }
 
   private func workspaceLabel(rootURLs: [URL], fileURLs: [URL]) -> String {
@@ -2843,6 +2863,13 @@ enum WorkspaceScanner {
     )
   }
 
+  /// The safety net, not the normalizer. Roots are made unique upstream, in
+  /// `FolderManager.uniqueRoots`, on the same `rootIdentityPath` contract the
+  /// persisted key uses; this guard is what makes "one walk per directory" a
+  /// property of the walk itself rather than a property of today's callers. It
+  /// is the cheapest possible place to be wrong about: the cost of a repeated
+  /// root here is a second full recursive traversal of it, and four repeats of
+  /// one large tree is what took a workspace scan to 8.6 GB.
   private static func build(
     rootURLs: [URL],
     exclusions: Set<String>,
@@ -2850,8 +2877,10 @@ enum WorkspaceScanner {
   ) throws -> [WorkspaceScan] {
     var scans: [WorkspaceScan] = []
     scans.reserveCapacity(rootURLs.count)
+    var scannedRoots: Set<String> = []
     for rootURL in rootURLs {
       try cancellationCheck()
+      guard scannedRoots.insert(BookmarkStore.rootIdentityPath(rootURL)).inserted else { continue }
       let rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
       scans.append(
         try scan(
@@ -3840,6 +3869,12 @@ final class DocumentStore {
     // launcher may offer it again. (Discard/Save already removed the file
     // outright; this only releases the claim when one survived.)
     recoveryStore.markDraftClosed(id: appState.documentSession.recoveryID)
+    // A conscious close is also an answer to "is that staged open still wanted?"
+    // — no, exactly as it is in `select(ref: nil)`. Without this the background
+    // read would land after the clear below, still holding the current claim,
+    // and reopen the document the user just closed. Reached only by a close that
+    // went through: every cancelled or failed branch returned above.
+    appState.cancelPendingDocumentLoad()
     appState.selectedDocumentID = nil
     appState.documentSession.clear()
     // The window is now empty BECAUSE the user asked for it. Any workspace

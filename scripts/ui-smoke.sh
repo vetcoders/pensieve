@@ -2500,7 +2500,6 @@ EXPECTED_TOOLBAR_IDENTIFIERS=(
   pensieve.toolbar.format.bulletedList
   pensieve.toolbar.format.numberedList
   pensieve.toolbar.modePicker
-  pensieve.toolbar.appearance
   pensieve.toolbar.reload
   pensieve.toolbar.autoReload
   pensieve.toolbar.scrollSync
@@ -2624,7 +2623,7 @@ on toolbarCensus(targetPID)
   -- Census the WINDOW UNDER TEST — always `window 1`, the frontmost/key window
   -- that receives the menu-driven mode changes and whose geometry the geometry
   -- assertions pin. The rest of this script already operates on `window 1`
-  -- (geometry reads, the Preview Appearance control lookup), so the census must
+  -- (geometry reads, the status-bar appearance chip lookup), so the census must
   -- follow the same window or it is measuring a different surface than the one
   -- being driven.
   --
@@ -2956,24 +2955,99 @@ on toolbarMenuItemsAfterSinglePress(targetPID, targetName, targetIdentifier, exp
     my joined(latestMenuItems, ",") & "}; " & my exactProcessDiagnostics(targetPID)
 end toolbarMenuItemsAfterSinglePress
 
+on windowElementByIdentifierOnce(targetPID, targetIdentifier)
+  set appProcess to my processForPID(targetPID, expectedBundleID)
+  if appProcess is missing value then return missing value
+  tell application "System Events" to tell appProcess
+    try
+      set windowElements to entire contents of window 1
+      repeat with elementRef in windowElements
+        try
+          set identifierValue to value of attribute "AXIdentifier" of elementRef
+          if identifierValue is targetIdentifier then return contents of elementRef
+        end try
+      end repeat
+    end try
+  end tell
+  return missing value
+end windowElementByIdentifierOnce
+
 on windowElementByIdentifier(targetPID, targetIdentifier, timeoutTenths)
   repeat with attemptNumber from 1 to timeoutTenths
-    set appProcess to my processForPID(targetPID, expectedBundleID)
-    if appProcess is not missing value then
-      tell application "System Events" to tell appProcess
-        set windowElements to entire contents of window 1
-        repeat with elementRef in windowElements
-          try
-            set identifierValue to value of attribute "AXIdentifier" of elementRef
-            if identifierValue is targetIdentifier then return contents of elementRef
-          end try
-        end repeat
-      end tell
-    end if
+    set elementRef to my windowElementByIdentifierOnce(targetPID, targetIdentifier)
+    if elementRef is not missing value then return contents of elementRef
     delay 0.1
   end repeat
   error "Timed out waiting for window element: " & targetIdentifier
 end windowElementByIdentifier
+
+-- The window-body counterpart of `toolbarMenuItemsAfterSinglePress`, for the
+-- status bar's appearance chip.
+--
+-- Two differences from the toolbar helper, both forced by where this control
+-- lives. The lookup walks the WINDOW rather than `toolbar 1`, because the chip
+-- is part of the document body and no toolbar traversal can reach it. And the
+-- lookup is by IDENTIFIER only: the toolbar helper cross-checks an accessible
+-- name because a toolbar item bridged out of a `ControlGroup` silently loses
+-- its label, which is a failure mode a status-bar control declared inline does
+-- not have.
+on statusBarMenuItemsAfterSinglePress(targetPID, targetName, targetIdentifier, expectedMenuItems, timeoutTenths)
+  -- `timeoutTenths` governs the POST-PRESS menu polling only, never this
+  -- lookup: "does the control exist" and "has SwiftUI published its menu yet"
+  -- are different waits with different failure meanings. The fixed 50 mirrors
+  -- the 5x1s in `toolbarElementByAccessibleName` that the toolbar twin uses, so
+  -- both helpers give a missing control the same budget; spending the caller's
+  -- shorter menu timeout here would quietly cut it to 3s and desynchronise them.
+  set controlRef to my windowElementByIdentifier(targetPID, targetIdentifier, 50)
+  tell application "System Events"
+    -- SwiftUI's borderless `Menu` bridges to an AppKit pop-up button, which AX
+    -- publishes as AXMenuButton or AXPopUpButton depending on the release.
+    -- Both are one-press menu controls; anything else means the chip stopped
+    -- being a menu and became decoration.
+    set observedRole to role of controlRef
+    if observedRole is not "AXMenuButton" and observedRole is not "AXPopUpButton" then
+      error targetName & " must be a native menu control, got " & observedRole
+    end if
+    if not (enabled of controlRef) then error targetName & " is disabled"
+    set observedActions to name of every action of controlRef
+    if observedActions does not contain "AXPress" then
+      error targetName & " does not expose AXPress; actions={" & ¬
+        my joined(observedActions, ",") & "}"
+    end if
+
+    -- Exactly ONE semantic press, for the same reason the toolbar helper
+    -- presses once: a repeat would hide a first click the product swallowed.
+    perform action "AXPress" of controlRef
+  end tell
+
+  set latestMenuItems to {}
+  repeat with sampleNumber from 1 to timeoutTenths
+    delay 0.1
+    set freshControl to my windowElementByIdentifierOnce(targetPID, targetIdentifier)
+    if freshControl is not missing value then
+      tell application "System Events"
+        try
+          if (count of menus of freshControl) > 0 then
+            set latestMenuItems to name of every menu item of menu 1 of freshControl
+            set hasAllExpectedItems to true
+            repeat with expectedItem in expectedMenuItems
+              if latestMenuItems does not contain (expectedItem as text) then
+                set hasAllExpectedItems to false
+                exit repeat
+              end if
+            end repeat
+            if hasAllExpectedItems then return {latestMenuItems, sampleNumber * 100}
+          end if
+        end try
+      end tell
+    end if
+  end repeat
+
+  error targetName & " menu did not publish expected items={" & ¬
+    my joined(expectedMenuItems, ",") & "} after one AXPress and " & ¬
+    (timeoutTenths * 100) & "ms of fresh-ref polling; observed={" & ¬
+    my joined(latestMenuItems, ",") & "}; " & my exactProcessDiagnostics(targetPID)
+end statusBarMenuItemsAfterSinglePress
 
 on run argv
 set targetPID to item 1 of argv as integer
@@ -3060,27 +3134,33 @@ delay 0.5
 set splitCensus to my settledToolbarCensus(targetPID, baseExpectedIdentifiers, {}, 40)
 my assertWindowGeometry(targetPID, coldPosition, coldSize, "split restore")
 
-set appearanceOpenResult to my toolbarMenuItemsAfterSinglePress(¬
-  targetPID, "Preview Appearance", "pensieve.toolbar.appearance", ¬
-  {"Flavor", "Theme"}, false, 30)
+-- BOTH APPEARANCE AXES, AT THEIR ONLY HOME. The titlebar's appearance diamond
+-- was removed — the toolbar had no width left for it — so the status bar's chip
+-- is the one place a mouse can reach markdown flavor or reading theme, and no
+-- menu-bar command carries either axis. That makes this probe the only proof
+-- the axes are reachable at all, which is why it survived the move instead of
+-- being deleted with the control it used to open.
+set appearanceOpenResult to my statusBarMenuItemsAfterSinglePress(¬
+  targetPID, "Preview Appearance", "pensieve.statusbar.appearance", ¬
+  {"Flavor", "Theme"}, 30)
 set appearanceItems to item 1 of appearanceOpenResult
 log "APPEARANCE_MENU_OPEN_MS=" & (item 2 of appearanceOpenResult)
 tell application "System Events"
     if appearanceItems does not contain "Flavor" then
-      error "Preview Appearance menu is missing the Flavor picker"
+      error "Status bar appearance chip is missing the Flavor picker"
     end if
     if appearanceItems does not contain "Theme" then
-      error "Preview Appearance menu is missing the Theme picker"
+      error "Status bar appearance chip is missing the Theme picker"
     end if
     key code 53
     delay 0.5
 
     -- Dismissing a native menu invalidates its AXUIElement; reacquiring the
-    -- toolbar control mirrors a later user click instead of testing a stale
-    -- Accessibility handle.
-    set appearanceReopenResult to my toolbarMenuItemsAfterSinglePress(¬
-      targetPID, "Preview Appearance", "pensieve.toolbar.appearance", ¬
-      {"Flavor", "Theme"}, false, 30)
+    -- chip mirrors a later user click instead of testing a stale Accessibility
+    -- handle.
+    set appearanceReopenResult to my statusBarMenuItemsAfterSinglePress(¬
+      targetPID, "Preview Appearance", "pensieve.statusbar.appearance", ¬
+      {"Flavor", "Theme"}, 30)
     log "APPEARANCE_MENU_REOPEN_MS=" & (item 2 of appearanceReopenResult)
     key code 53
 

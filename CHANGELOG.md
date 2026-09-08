@@ -9,6 +9,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A folder can no longer end up in the workspace several times over, and one
+  that already is gets cleaned up on the next launch.** The saved workspace held
+  a bookmark per folder, and it decided whether it already knew a folder by
+  comparing the bookmark's raw bytes. Those bytes are not a name: the same folder
+  re-opened, or re-saved after macOS invalidated its bookmark, produces different
+  ones — so the folder was recorded a second time, and a third. Worse, the
+  refresh that runs at startup when a bookmark has gone stale ADDED the refreshed
+  copy and kept the old one, which is one extra copy of that folder on every
+  single launch. Nothing filtered them afterwards: the sidebar built a root per
+  entry and each root got its own complete recursive scan of the tree, so four
+  copies of a folder meant walking it four times. Measured on the operator's
+  install: a five-hour scan that reached 8.6 GB of memory, from a saved workspace
+  that named `/tmp` four times.
+
+  Now a root is identified by the folder it actually resolves to — including the
+  fact that `/tmp` and `/private/tmp` are the same folder, which the old
+  comparison could not see — so re-opening replaces the entry where it stands,
+  earlier copies collapse onto it, startup drops the duplicates from the saved
+  workspace for good, and if the first saved bookmark for a folder is stale and
+  cannot be rewritten, a later working bookmark for that same folder is kept
+  instead of the dead one. The scanner refuses to walk one folder twice even if it
+  is handed it twice. A launch on a healthy workspace writes nothing and changes
+  nothing. Unchanged on purpose: a folder that is merely missing today, or sits
+  on a volume that is unplugged, keeps its bookmark and simply sits out that
+  launch.
+
+## [0.4.4] - 2026-08-16
+
+### Changed
+
+- **The theme and flavor pickers moved out of the toolbar.** The diamond that
+  carried them is gone, and with it the "Markdown Flavor" and "Theme" entries
+  the toolbar put in its "»" menu. The titlebar was out of room — every control
+  there decides how narrow a window has to get before whole families disappear
+  behind the chevron — and the status bar's chip at the bottom right already
+  offered exactly the same two pickers. It still does: click
+  `Graphite / Markdown` to change either the reading theme or the markdown
+  flavor, from any mode. Nothing about the themes themselves changed.
+- **Settings has a third tab, Appearance**, carrying those same two pickers.
+  The status-bar chip only exists in a window that is showing a document, so on
+  a freshly launched window — the launcher, with nothing open yet — there was no
+  way left to change the reading theme, even though the launcher is painted in
+  it. `Cmd+,` now reaches both axes from anywhere, and doubles as the way in
+  when a very narrow window squeezes the chip. It is a plain mirror: the same
+  two pickers writing the same setting, so the two places cannot fall out of
+  step with each other.
+
+### Fixed
+
+- **A release driven over SSH no longer dies on `errSecInternalComponent`.**
+  The Developer ID identity lives in a dedicated build keychain, and a
+  keychain's unlocked state belongs to the security session that unlocked it —
+  so unlocking it in a GUI session did nothing for a build running over SSH, and
+  codesign failed there with an error that names nothing and suggests nothing,
+  minutes into the run. `scripts/build-release.sh` now unlocks the keychain
+  itself, non-interactively, inside the same session that runs codesign, and
+  re-asserts that unlock before every signing site so an inactivity auto-lock
+  cannot close it again while the build sits in `swift build` or waits on
+  notarization. `security find-identity` passing was never evidence that signing
+  would work: it lists an identity straight out of a locked keychain, because
+  only the private key is sealed. A keychain that is locked in a session which
+  cannot be prompted now fails in pre-flight instead, naming the keychain and
+  printing the remedy. Machines with no dedicated build keychain, and sessions
+  that already hold theirs open, are untouched.
+- **Flipping your Mac between light and dark no longer leaves a Typewriter
+  window in two halves.** The native tab bar and the toolbar's toggles jumped to
+  the incoming half immediately while the titlebar, toolbar, sidebar and traffic
+  lights stayed in the outgoing one — the seam landing on the split divider —
+  and an open tab you were not looking at could keep the old half for the rest
+  of the session. The window's half now has a single owner: the chrome pass
+  writes it, the repairs that run between screen updates may only ever paint the
+  half a window already has, and the setting change itself re-dresses every open
+  document window instead of only the ones that happen to be redrawn. Cold
+  starts, skin switches and the white preview page are unchanged.
+- A deeply nested file in the workspace tree is readable again. The indent rail
+  charged 22 pt per nesting level, so at the sidebar's minimum width a depth-5
+  row had roughly 13 pt left for its name — enough for `2026-06-04_t…` and
+  nothing that told two siblings apart. A level now costs 11 pt (the depth
+  guides stay), which returns ~55 pt of that row to the filename, and every row
+  title, search hit and search path elides from the MIDDLE instead of the tail,
+  so a date-prefixed name keeps both its date and its distinguishing suffix.
+  Non-markdown rows also stop drawing their own indent from a private
+  `depth * 14 + 15`: they use the same guides and disclosure slot as document
+  rows, so a foreign file finally lines up with the files it sits between.
+- The download page can no longer advertise a checksum that belongs to no
+  downloadable artifact. A lane that produces a notarized DMG now stamps the
+  SHA-256 of that exact DMG into `docs/index.html` and verifies it, instead of
+  waiting for a human to paste one — a hand-filled checksum can come from a run
+  that failed, and the next successful run necessarily produces a different DMG.
+  The page is also checked in pre-flight, before anything is built or copied to
+  the internal release shelf, and every check is fail-closed: a missing,
+  unreadable, read-only, reshaped or wrong-version page — or one sitting in a
+  directory or behind a symlink the stamp could not have written — fails the
+  release instead of passing for lack of a match, and fails it before the build
+  rather than after the notarization round trip. What is asserted is the whole
+  published claim, at both ends of the run — the checksum, the algorithm the
+  page names it with, the version the panel declares, and the artifact every
+  download link on the page points at — so a release cannot report success for
+  a page pairing this build's checksum with another version's number, with a
+  link serving somebody else's bytes, or with a label telling readers to verify
+  it as an MD5. The final gate reads the page once and asserts all of that
+  against that single snapshot, then proves the snapshot is still the page on
+  disk, so the published claim can never be assembled out of two different
+  revisions of the file. Because this repo is worked in shared worktrees,
+  stamping is also concurrency safe: the page is rewritten by renaming a fresh
+  copy into place, and an edit that lands while the release is stamping or
+  validating aborts the run instead of being silently overwritten. Lanes that
+  publish nothing (`make release-local`, `make release-appstore`, any
+  `--no-notarize` run) neither stamp nor gate on the page.
 - A release without `--clean` no longer stalls or dies while retiring the
   previous `dist/Pensieve.app`. SwiftPM copies `Bundle.module` resources
   read-only, so the stale bundle carried unwritable `Assets.xcassets`
@@ -405,7 +514,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Launching with nothing open opens nothing.** Quitting with an empty session and starting Pensieve again brought back a document — reliably the same one, a file that had not been touched in weeks and was in no saved list of open files. Restoring a workspace ended in "and if nothing was selected, select the first document", and on a launch nothing is ever selected. "First" is not "most recent": the scan sorts folders before files and each group alphabetically, then walks depth-first, so it was the first Markdown file inside the alphabetically-first folder — an arbitrary file, picked by the app, that nothing in the previous session had opened. A launch now opens exactly what was left open: the files in Open Files, and otherwise the launcher. Opening a workspace still shows its tree; picking something to read from it is yours.
 - **Losing the document you were reading empties the editor, instead of putting a different file in it.** Deleting the open document, or hiding the folder it lives in, replaced it with whatever file the scanner reached first — a document you had not asked to open, in the pane you were just working in. The same fallback also meant that once a workspace was open, any file appearing or changing anywhere in it could open a document in a session where you had nothing open at all. A refresh now only ever keeps you where you were: the document you are reading stays and reloads, renaming or moving it keeps you in it under its new name, and creating or duplicating a file still opens the new one — but when there is nothing to keep you in, you get the empty state.
 - **Start-up hang:** opening a large document (a recovered draft of ~1 MB or more) under a theme with a fixed light/dark appearance — Parchment, Porcelain, Graphite, Ink, Typewriter — pinned the main thread at 100% CPU and left the document window blank at 0×0. The window's appearance is owned by the SwiftUI scene, which puts its own value back after anyone else writes it, so the per-pass chrome check never agreed with the window, re-wrote the appearance on every pass, and each write drove another full editor update — an unbounded loop whose every cycle paid the cost of the whole document. The theme's appearance is now re-asserted from what the app last applied to that window and whenever the titlebar backing was clobbered, so a settled window writes nothing while a toolbar re-bridge or tab-group reshuffle is still healed.
-- **Filesystem-watcher rescan storm on busy workspace roots** (observed at 550–800% CPU on an iCloud Drive root). The debounced refresh only looked coalesced: a new event cancelled the refresh _handle_, but the tree walk itself ran in a detached task that cancellation could never reach, so every surviving event batch started an additional full-workspace walk while the superseded ones kept running and then discarded their results. Watcher refreshes are now single-flight — events arriving during a walk collapse into exactly one follow-up pass instead of one walk each — and cancelling a refresh now actually stops its walk. External edits arriving mid-walk still reach the sidebar and the search index.
 - Released app binaries no longer carry absolute `LC_RPATH` entries. The linker baked the builder's `Vendor/qube-ffi/<profile>` checkout path (plus the Xcode toolchain path) into every shipped binary, and dyld searched those _before_ `@executable_path/../Frameworks` — so on a machine where the builder's path happened to exist, the app loaded a qube-ffi dylib from outside its own bundle. The release pipeline now strips every absolute rpath before signing, refuses to sign or package a bundle where one survives, and verifies that each remaining `@rpath` dependency still resolves inside the bundle.
 - **Renaming a file in the sidebar no longer drops its extension.** The inline-rename field prefilled with the full filename, extension included; retyping just the base name and committing silently dropped the `.md`/`.txt` suffix, which then fell out of the workspace scanner's markdown filter and made the file look deleted even though it was still on disk. The field now prefills without the extension for files (folders are unaffected), and a typed name that ends up with no extension — or with a fragment that isn't a real one, like the "5" in "ver 2.5" — has the source file's original extension reinstated.
 

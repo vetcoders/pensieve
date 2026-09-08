@@ -12,6 +12,16 @@ struct EditorStatusBar: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var themeManager: ThemeManager
 
+  /// The chip and its two axes, named once so the AX contract has a single
+  /// source. `scripts/ui-smoke.sh` looks the chip up by `appearanceIdentifier`
+  /// on the live app and asserts both pickers are in the menu it opens — the
+  /// only place that reachability can be proven, since `NSHostingView`
+  /// publishes no accessibility tree in a headless test process (see
+  /// `WindowErrorChromeRig`).
+  static let appearanceIdentifier = "pensieve.statusbar.appearance"
+  static let flavorPickerIdentifier = "pensieve.statusbar.flavorPicker"
+  static let skinPickerIdentifier = "pensieve.statusbar.skinPicker"
+
   private var text: String { appState.activeDocumentText }
 
   private var metrics: DocumentMetrics { DocumentMetrics.measure(text) }
@@ -93,10 +103,14 @@ struct EditorStatusBar: View {
   }
 
   /// The reading-surface chip: `Theme / Flavor` in a hairline capsule that opens
-  /// the SAME two appearance pickers as the toolbar's menu. Previously Flavor and
-  /// Theme were two inert text cells — the user could read the active theme but
-  /// had to travel to the toolbar to change it. Bound straight into the shared
-  /// `ThemeManager`, so a change here re-dresses both panels live.
+  /// both appearance pickers. The PRIMARY home for either axis — the one in
+  /// reach of the document being read — but since 14.08.2026 no longer the only
+  /// one. The titlebar's appearance menu was removed when the toolbar ran out of
+  /// width, and `Settings ▸ Appearance` now mirrors these two pickers for the
+  /// windows this chip does not exist in (a launcher has no status bar) and for
+  /// the narrow widths that can clip it. Both surfaces bind straight into the
+  /// shared `ThemeManager`, so a change on either re-dresses every panel live
+  /// and the two cannot drift apart.
   private var appearanceChip: some View {
     Menu {
       Picker("Flavor", selection: $themeManager.current) {
@@ -105,14 +119,24 @@ struct EditorStatusBar: View {
         }
       }
       .pickerStyle(.menu)
+      .help("Markdown flavor — plain Markdown or GitHub Flavored")
+      .accessibilityIdentifier(Self.flavorPickerIdentifier)
 
+      // Reading-surface skin, orthogonal to the flavor: it re-dresses BOTH the
+      // rendered preview and the source editor — surface, typography and syntax
+      // tokens — without changing the markdown dialect.
       Picker("Theme", selection: $themeManager.skin) {
         ForEach(PensieveTheme.allCases) { skin in
           Label(skin.displayName, systemImage: skin.systemImage).tag(skin)
         }
       }
       .pickerStyle(.menu)
+      .help("Preview theme — the reading surface for the rendered markdown")
+      .accessibilityIdentifier(Self.skinPickerIdentifier)
     } label: {
+      // Both axes, always, in this order: `EditorStatusBarAppearanceTests`
+      // spells this format out rather than calling back into it, so a chip that
+      // quietly drops an axis fails a test instead of shipping.
       Text("\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
         .foregroundStyle(.primary)
         .padding(.horizontal, 6)
@@ -125,6 +149,18 @@ struct EditorStatusBar: View {
     .menuStyle(.borderlessButton)
     .fixedSize()
     .help("Preview appearance — markdown flavor and reading theme")
-    .accessibilityIdentifier("pensieve.statusbar.appearance")
+    .accessibilityLabel("Preview Appearance")
+    // The static label names the ACTION; without a value beside it the control
+    // announces only that, and the current pair — which the sighted user reads
+    // straight off the chip — reaches nobody else. Since this chip is the only
+    // appearance entry point, that left the active skin and flavor discoverable
+    // solely by opening both pickers and inspecting their checkmarks. Not
+    // pinned in `EditorStatusBarAppearanceTests` on purpose: `NSHostingView`
+    // publishes no accessibility tree in a test process (measured, see that
+    // file's header), so a pin keyed on this would skip itself into a
+    // permanent green. `scripts/ui-smoke.sh` is where it is observable.
+    .accessibilityValue(
+      "\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
+    .accessibilityIdentifier(Self.appearanceIdentifier)
   }
 }
