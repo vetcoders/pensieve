@@ -31,6 +31,15 @@ pensieve_install_verify() {
         "$(cd "$PENSIEVE_INSTALL_SCRIPT_DIR/.." && pwd)" "$bundle" 0 0 >/dev/null
 }
 
+pensieve_install_verify_signature() {
+    # This is the production destination, not a smoke source. The isolation
+    # helper deliberately refuses /Applications/Pensieve.app. Its current-HEAD
+    # provenance was established on the source and staged copy; strict signed
+    # bundle validation plus the exact source comparison below carries that
+    # evidence across the rename without relaxing the isolation helper.
+    /usr/bin/codesign --verify --deep --strict "$1"
+}
+
 pensieve_install_copy() {
     /usr/bin/ditto "$1" "$2"
 }
@@ -92,7 +101,7 @@ pensieve_install_built_app() (
         fi
         return 1
     fi
-    if ! pensieve_install_verify "$destination" \
+    if ! pensieve_install_verify_signature "$destination" \
         || ! pensieve_install_compare "$source_bundle" "$destination"; then
         pensieve_install_error "installed verification failed; candidate and previous bundle retained at $capsule"
         # Never move a newly launched app in order to roll back a failed install.

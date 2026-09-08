@@ -7,6 +7,7 @@ fixture="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-install-test.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
 
 pensieve_install_verify() { [[ -f "$1/trusted" ]]; }
+pensieve_install_verify_signature() { [[ -f "$1/trusted" ]]; }
 pensieve_install_copy() { /bin/cp -R "$1" "$2"; }
 pensieve_install_receipt() { printf 'fixture receipt: %s\n' "$1"; }
 pensieve_install_assert_idle() {
@@ -52,11 +53,9 @@ reject_install
 pensieve_install_copy() { /bin/cp -R "$1" "$2"; }
 
 setup_case rejected_installed_payload
-pensieve_install_verify() {
-    [[ "$1" != "$case_root/apps/Pensieve.app" && -f "$1/trusted" ]]
-}
+pensieve_install_verify_signature() { return 1; }
 reject_install
-pensieve_install_verify() { [[ -f "$1/trusted" ]]; }
+pensieve_install_verify_signature() { [[ -f "$1/trusted" ]]; }
 
 setup_case successful_swap
 pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.app"
@@ -64,6 +63,25 @@ pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.app
 [[ ! -e "$case_root/apps/.pensieve-install-lock" ]]
 backup="$(find "$case_root/apps" -path '*/previous/Pensieve.app/payload')"
 [[ "$(cat "$backup")" == old ]]
+
+# The real source-provenance helper rejects the production install path. It
+# must still authenticate source and staging, while the final path uses strict
+# signature verification and byte comparison against that authenticated source.
+setup_case production_path_is_not_smoke_source
+pensieve_install_verify() {
+    [[ "$1" != "$case_root/apps/Pensieve.app" && -f "$1/trusted" ]] || return 1
+    printf '%s\n' "$1" >> "$case_root/source-verifications"
+}
+pensieve_install_verify_signature() {
+    [[ "$1" == "$case_root/apps/Pensieve.app" && -f "$1/trusted" ]] || return 1
+    printf '%s\n' "$1" >> "$case_root/signature-verifications"
+}
+pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.app"
+[[ "$(cat "$case_root/apps/Pensieve.app/payload")" == new ]]
+[[ "$(wc -l < "$case_root/source-verifications" | tr -d ' ')" == 2 ]]
+[[ "$(cat "$case_root/signature-verifications")" == "$case_root/apps/Pensieve.app" ]]
+pensieve_install_verify() { [[ -f "$1/trusted" ]]; }
+pensieve_install_verify_signature() { [[ -f "$1/trusted" ]]; }
 
 setup_case concurrent_installer
 mkdir "$case_root/apps/.pensieve-install-lock"
@@ -77,4 +95,4 @@ ln -s "$case_root/original.app" "$case_root/apps/Pensieve.app"
 if pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.app"; then exit 1; fi
 assert_old
 [[ -L "$case_root/apps/Pensieve.app" ]]
-printf 'PASS: eight idle-safe installation transaction cases\n'
+printf 'PASS: nine idle-safe installation transaction cases\n'
