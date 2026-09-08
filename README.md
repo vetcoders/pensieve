@@ -19,7 +19,7 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Line Numbers & Syntax Highlighting:** Built for people who mix prose with `json`, `swift`, `python`, and `rust`.
 - **Preview & Two-Way Links:** Rich markdown preview, backlinks, wikilinks, Mermaid, math, and source-first editing.
 - **Split Modes:** `SOURCE` (Cmd+1), `SPLIT` (Cmd+2), `PREVIEW` (Cmd+3), and `FOCUS` (Cmd+4).
-- **Fast Native Core:** Built on Swift 5.9+, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
+- **Fast Native Core:** Built on Swift 6, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
 - **Staged Opens for Large Files:** documents over ~1 MB are read in the background. The window or tab appears immediately with an `Opening …` placeholder, the visible text is coloured first and the rest of the document follows in frame-sized chunks, so a multi-megabyte note never freezes the app.
 - **Dictation:** Capture speech locally, review continuous transcript text, and insert it at the active Markdown selection with natural spacing and undo.
 - **Agent-Aware Writing:** Current-document dispatch and local AI autocomplete are wired into the native editor.
@@ -75,7 +75,7 @@ open the DMG, and drag Pensieve to Applications.
 
 ## Build from source
 
-Source builds require Xcode 16 command line tools with Swift 6.0+; the package remains in Swift 5 language mode.
+Source builds require Swift 6.2 or newer (Xcode 26+). Both the app and tests use Swift 6 language mode with complete concurrency checking; macOS 15 remains the deployment minimum.
 
 ```bash
 git clone https://github.com/vetcoders/pensieve.git

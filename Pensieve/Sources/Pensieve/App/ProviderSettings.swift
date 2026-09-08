@@ -2,6 +2,7 @@ import Combine
 import Darwin
 import Foundation
 import Security
+import Synchronization
 
 extension Notification.Name {
   /// Posted after provider settings have been persisted and applied to the
@@ -11,13 +12,13 @@ extension Notification.Name {
     "io.vetcoders.pensieve.completion-provider-settings-did-change")
 }
 
-protocol ProviderAPIKeyStoring {
+protocol ProviderAPIKeyStoring: Sendable {
   func loadAPIKey() throws -> String?
   func storeAPIKey(_ apiKey: String) throws
   func deleteAPIKey() throws
 }
 
-protocol ProviderEnvironmentManaging {
+protocol ProviderEnvironmentManaging: Sendable {
   func value(forKey key: String) -> String?
   func setValue(_ value: String, forKey key: String) throws
   func removeValue(forKey key: String) throws
@@ -164,38 +165,49 @@ struct KeychainProviderAPIKeyStore: ProviderAPIKeyStoring {
 }
 
 struct ProcessProviderEnvironment: ProviderEnvironmentManaging {
+  // getenv exposes a borrowed C pointer. Serialize our reads through the copy
+  // and our writes so another provider task cannot invalidate that pointer.
+  private static let access = Mutex(())
+
   func value(forKey key: String) -> String? {
-    guard let value = getenv(key) else { return nil }
-    return String(cString: value)
+    Self.access.withLock { _ in
+      guard let value = getenv(key) else { return nil }
+      return String(cString: value)
+    }
   }
 
   func setValue(_ value: String, forKey key: String) throws {
-    guard setenv(key, value, 1) == 0 else {
-      throw ProviderSettingsError.environment(operation: "apply", key: key, code: errno)
+    try Self.access.withLock { _ in
+      guard setenv(key, value, 1) == 0 else {
+        throw ProviderSettingsError.environment(operation: "apply", key: key, code: errno)
+      }
     }
   }
 
   func removeValue(forKey key: String) throws {
-    guard unsetenv(key) == 0 else {
-      throw ProviderSettingsError.environment(operation: "remove", key: key, code: errno)
+    try Self.access.withLock { _ in
+      guard unsetenv(key) == 0 else {
+        throw ProviderSettingsError.environment(operation: "remove", key: key, code: errno)
+      }
     }
   }
 }
 
+@MainActor
 final class ProviderSettings: ObservableObject {
   static let shared = ProviderSettings()
 
-  static let endpointEnvironmentKeys = [
+  nonisolated static let endpointEnvironmentKeys = [
     "LLM_ASSISTIVE_ENDPOINT", "LLM_FORMATTING_ENDPOINT", "LLM_ENDPOINT",
   ]
-  static let modelEnvironmentKeys = [
+  nonisolated static let modelEnvironmentKeys = [
     "LLM_ASSISTIVE_MODEL", "LLM_FORMATTING_MODEL", "LLM_MODEL",
   ]
-  static let apiKeyEnvironmentKeys = [
+  nonisolated static let apiKeyEnvironmentKeys = [
     "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY", "LLM_API_KEY",
   ]
-  static let anthropicAPIKeyEnvironmentKeys = ["LLM_ANTHROPIC_API_KEY"]
-  static let providerShapeEnvironmentKeys = [
+  nonisolated static let anthropicAPIKeyEnvironmentKeys = ["LLM_ANTHROPIC_API_KEY"]
+  nonisolated static let providerShapeEnvironmentKeys = [
     "LLM_ASSISTIVE_PROVIDER", "LLM_FORMATTING_PROVIDER", "LLM_PROVIDER",
   ]
 
@@ -467,14 +479,14 @@ final class ProviderSettings: ObservableObject {
     value.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  private static func isLocalProviderEndpoint(_ endpoint: String) -> Bool {
+  nonisolated private static func isLocalProviderEndpoint(_ endpoint: String) -> Bool {
     guard let host = URL(string: endpoint)?.host?.lowercased() else { return false }
     return host == "localhost" || host == "127.0.0.1" || host == "::1"
   }
 
   /// Canonicalizes every UI-managed OpenAI-compatible endpoint onto the only
   /// request shape vista-kernel can safely emit today: OpenAI Responses.
-  static func normalizeOpenAIResponsesEndpoint(_ endpoint: String) -> String {
+  nonisolated static func normalizeOpenAIResponsesEndpoint(_ endpoint: String) -> String {
     var base = endpoint.trimmingCharacters(
       in: .whitespacesAndNewlines.union(.init(charactersIn: "/")))
     guard !base.isEmpty else { return "" }
@@ -490,7 +502,7 @@ final class ProviderSettings: ObservableObject {
     return base + "/v1/responses"
   }
 
-  static func normalizeAnthropicMessagesEndpoint(_ endpoint: String) -> String {
+  nonisolated static func normalizeAnthropicMessagesEndpoint(_ endpoint: String) -> String {
     var base = endpoint.trimmingCharacters(
       in: .whitespacesAndNewlines.union(.init(charactersIn: "/")))
     guard !base.isEmpty else { return "" }

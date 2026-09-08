@@ -42,7 +42,7 @@ struct AutocompleteContext: Equatable, Sendable {
 /// transforms. OpenAI Responses and Anthropic Messages have deliberately
 /// separate request/header/response contracts behind this single task seam.
 final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteCompleting, AIRewriting,
-  AITextResponding, @unchecked Sendable
+  AITextResponding, Sendable
 {
   typealias RequestSender = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
 

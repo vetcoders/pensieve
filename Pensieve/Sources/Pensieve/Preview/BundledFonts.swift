@@ -1,5 +1,6 @@
 import CoreText
 import Foundation
+import Synchronization
 
 /// Registers the bundled OFL theme fonts into the **current process** font
 /// environment at startup.
@@ -70,19 +71,18 @@ enum BundledFonts {
     let failed: [(url: URL, error: String)]
   }
 
-  private static let onceLock = NSLock()
-  private static var didRegister = false
+  private static let registration = Mutex(false)
 
   /// Registers the bundled fonts exactly once for the process lifetime.
   /// Subsequent calls are no-ops and return `nil`. Safe to call from app
   /// startup; never blocks launch on failure.
   @discardableResult
   static func registerOnce() -> Result? {
-    onceLock.lock()
-    defer { onceLock.unlock() }
-    guard !didRegister else { return nil }
-    didRegister = true
-    return register(fontURLs: bundledFontURLs())
+    registration.withLock { didRegister in
+      guard !didRegister else { return nil }
+      didRegister = true
+      return register(fontURLs: bundledFontURLs())
+    }
   }
 
   /// Registers an explicit list of font file URLs (process scope). Non-fatal:
@@ -194,20 +194,19 @@ enum BundledFonts {
     }
   }
 
-  private static let base64Lock = NSLock()
-  private static var base64Cache: [String: String] = [:]
+  private static let base64Cache = Mutex<[String: String]>([:])
 
   /// Base64 of a face's bytes, computed once per file path per process. Returns
   /// `nil` when the file cannot be read (non-fatal — that face is skipped).
   static func base64EncodedFace(at url: URL) -> String? {
     let key = url.standardizedFileURL.path
-    base64Lock.lock()
-    defer { base64Lock.unlock() }
-    if let cached = base64Cache[key] { return cached }
-    guard let data = try? Data(contentsOf: url) else { return nil }
-    let encoded = data.base64EncodedString()
-    base64Cache[key] = encoded
-    return encoded
+    return base64Cache.withLock { cache in
+      if let cached = cache[key] { return cached }
+      guard let data = try? Data(contentsOf: url) else { return nil }
+      let encoded = data.base64EncodedString()
+      cache[key] = encoded
+      return encoded
+    }
   }
 
   /// `@font-face` rules for exactly the bundled families whose CSS family name is

@@ -11,6 +11,7 @@ import XCTest
 /// opened the picker has NO key — indistinguishable, from the key alone, from a
 /// machine that has never run Pensieve. Reading both as "fresh install" would
 /// silently re-theme every existing user on first launch.
+@MainActor
 final class SkinInstallOriginTests: XCTestCase {
   /// A container with nothing of Pensieve's in it is a new install, and takes
   /// this build's default.

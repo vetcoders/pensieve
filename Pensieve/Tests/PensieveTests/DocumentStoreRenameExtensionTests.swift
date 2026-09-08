@@ -159,7 +159,8 @@ final class DocumentStoreRenameExtensionTests: XCTestCase {
 
   private func makeTemporaryFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveRenameExtensionTests-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent(
+        "PensieveRenameExtensionTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     addTeardownBlock {
       try? FileManager.default.removeItem(at: folder)
@@ -169,7 +170,8 @@ final class DocumentStoreRenameExtensionTests: XCTestCase {
 
   private func temporaryMetadataStore() -> WorkspaceMetadataStore {
     let folder = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveRenameExtensionMetadataTests-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent(
+        "PensieveRenameExtensionMetadataTests-\(UUID().uuidString)", isDirectory: true)
     return WorkspaceMetadataStore(
       metadataURL: folder.appendingPathComponent("workspace.json", isDirectory: false))
   }

@@ -164,7 +164,7 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
     fatalError("init(coder:) has not been implemented")
   }
 
-  deinit {
+  isolated deinit {
     for observer in windowObservers {
       notificationCenter.removeObserver(observer)
     }
@@ -240,8 +240,9 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
         object: nil,
         queue: .main
       ) { [weak self] notification in
+        let window = notification.object as? NSWindow
         MainActor.assumeIsolated {
-          self?.synchronizeCommandSurfaceOwnership(keyWindow: notification.object as? NSWindow)
+          self?.synchronizeCommandSurfaceOwnership(keyWindow: window)
         }
       })
     windowObservers.append(

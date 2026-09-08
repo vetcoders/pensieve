@@ -26,6 +26,7 @@ import XCTest
 /// So the rule these pins hold to is a single-writer rule: `assertWindowChrome`
 /// owns the half, the update-cycle repair may only ever paint the half a window
 /// ALREADY has, and a flip reaches every document window through one sweep.
+@MainActor
 final class SystemFlipChromePolarityTests: XCTestCase {
 
   // MARK: - The invariant
@@ -44,7 +45,7 @@ final class SystemFlipChromePolarityTests: XCTestCase {
     defer { window.close() }
     let glass = makeTabBarGlass()
 
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       WindowChromeRecipe.assertWindowChrome(on: window, for: .typewriter)
       WindowChromeRecipe.assertTabBarAppearance(
         on: window, for: .typewriter, tabBarViews: [glass])
@@ -56,7 +57,7 @@ final class SystemFlipChromePolarityTests: XCTestCase {
         "premise: and so does its tab bar")
     }
 
-    try withSystemAppearance(dark: false) {
+    withSystemAppearance(dark: false) {
       WindowChromeRecipe.assertBetweenPassChrome(
         on: window, for: .typewriter, tabBarViews: [glass])
 
@@ -164,13 +165,13 @@ final class SystemFlipChromePolarityTests: XCTestCase {
     defer { window.close() }
     let glass = makeTabBarGlass()
 
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       WindowChromeRecipe.assertWindowChrome(on: window, for: .typewriter)
       WindowChromeRecipe.assertTabBarAppearance(
         on: window, for: .typewriter, tabBarViews: [glass])
     }
 
-    try withSystemAppearance(dark: false) {
+    withSystemAppearance(dark: false) {
       XCTAssertFalse(
         WindowChromeRecipe.isAssertedToTheSkinsHalf(window, for: .typewriter),
         "premise: the setting moved and nothing has moved the window across yet")

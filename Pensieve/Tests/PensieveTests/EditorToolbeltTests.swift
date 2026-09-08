@@ -6,6 +6,7 @@ import XCTest
 /// Structural smoke for the toolbelt declutter, and for the axes the status
 /// bar's appearance chip renders now that the toolbar carries no appearance
 /// control at all.
+@MainActor
 final class EditorToolbeltTests: XCTestCase {
   // MARK: - Appearance-chip pickers stay CaseIterable-driven
 
@@ -436,6 +437,7 @@ final class EditorToolbeltTestsHistory: XCTestCase {
 /// `allowed` rect models `visibleRect ∩ contentLayoutRect` in the flipped
 /// text-view space: content spans y 0…600 but the top 52pt strip (y < 52)
 /// lies under the chrome, so allowed = (0, 52, 800, 548).
+@MainActor
 final class EditorToolbeltFloatingClampTests: XCTestCase {
   private let allowed = NSRect(x: 0, y: 52, width: 800, height: 548)
   private let barSize = NSSize(width: 200, height: 28)
@@ -736,7 +738,7 @@ final class MarkdownTextViewUndoDetachTests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while !isDone(), Date() < deadline {
       autoreleasepool {
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
       }
     }
   }

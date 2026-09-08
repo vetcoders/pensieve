@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// The single place that answers "was this process told to keep its Application
 /// Support state somewhere other than the user's real one?".
@@ -112,15 +113,14 @@ enum AppSupportLocation {
   /// pin on the removal itself would have to outlive the process doing the
   /// asserting. Nothing in the app reads this.
   static var rootsRegisteredForRemovalAtExit: Set<String> {
-    registrationLock.lock()
-    defer { registrationLock.unlock() }
-    return registeredRoots
+    registeredRoots.withLock { $0 }
   }
 
   typealias ProcessExitHandler = @convention(block) () -> Void
 
-  private nonisolated(unsafe) static var registeredRoots: Set<String> = []
-  private static let registrationLock = NSLock()
+  // Registration invokes caller-owned synchronous closures while holding the lock.
+  // Mutex keeps that operation on the caller's isolation domain; only the Set is shared.
+  private static let registeredRoots = Mutex(Set<String>())
 
   /// Hands one directory to `atexit`, exactly once per path.
   ///
@@ -140,13 +140,12 @@ enum AppSupportLocation {
     removeItem: @escaping (String) -> Void
   ) -> Bool {
     let path = root.path
-    registrationLock.lock()
-    defer { registrationLock.unlock() }
-    guard !registeredRoots.contains(path) else { return true }
-
-    let result = registrar { removeItem(path) }
-    guard result == 0 else { return false }
-    registeredRoots.insert(path)
-    return true
+    return registeredRoots.withLock { roots in
+      guard !roots.contains(path) else { return true }
+      let result = registrar { removeItem(path) }
+      guard result == 0 else { return false }
+      roots.insert(path)
+      return true
+    }
   }
 }

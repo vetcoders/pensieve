@@ -160,7 +160,8 @@ struct EditorStatusBar: View {
     // file's header), so a pin keyed on this would skip itself into a
     // permanent green. `scripts/ui-smoke.sh` is where it is observable.
     .accessibilityValue(
-      "\(themeManager.skin.displayName) / \(themeManager.current.displayName)")
+      "\(themeManager.skin.displayName) / \(themeManager.current.displayName)"
+    )
     .accessibilityIdentifier(Self.appearanceIdentifier)
   }
 }

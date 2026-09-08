@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -309,7 +310,8 @@ final class WorkspaceFreshnessTests: XCTestCase {
       "a cold start whose persisted signature still describes the tree must take the valid-skip — the "
         + "round-21 corroboration tightens the gate, it does not retire it")
     XCTAssertEqual(
-      third.indexDatabase.search(query: "editedneedle", documents: thirdState.allDocuments).count, 1,
+      third.indexDatabase.search(query: "editedneedle", documents: thirdState.allDocuments).count,
+      1,
       "…and the index it skipped over must be the correct one")
   }
 
@@ -374,7 +376,8 @@ final class WorkspaceFreshnessTests: XCTestCase {
     await settle(third)
 
     XCTAssertEqual(
-      third.indexDatabase.search(query: "editedneedle", documents: thirdState.allDocuments).count, 1,
+      third.indexDatabase.search(query: "editedneedle", documents: thirdState.allDocuments).count,
+      1,
       "a cold start whose fingerprint matches an index the abandoned write never delivered must take "
         + "the FULL cold path and repair: the persisted `.md` signature is the only artifact written "
         + "AFTER its index write, so it is the only one that can corroborate the fingerprint")
@@ -569,47 +572,51 @@ final class WorkspaceFreshnessTests: XCTestCase {
   }
 }
 
-private final class FreshnessScanProbe: @unchecked Sendable {
-  private let lock = NSLock()
-  private var mainThreadFlags: [Bool] = []
+private final class FreshnessScanProbe: Sendable {
+  private struct State: Sendable {
+    var mainThreadFlags: [Bool] = []
+  }
+  private let state = Mutex(State())
 
   func record(isMainThread: Bool) {
-    lock.lock()
-    mainThreadFlags.append(isMainThread)
-    lock.unlock()
+    state.withLock { state in
+      state.mainThreadFlags.append(isMainThread)
+    }
   }
 
   var callCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return mainThreadFlags.count
+    return state.withLock { state in
+      return state.mainThreadFlags.count
+    }
   }
 
   func mainThreadSamples(after callCount: Int) -> [Bool] {
-    lock.lock()
-    defer { lock.unlock() }
-    return Array(mainThreadFlags.dropFirst(callCount))
+    return state.withLock { state in
+      return Array(state.mainThreadFlags.dropFirst(callCount))
+    }
   }
 }
 
-private final class SearchWriteRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var batchSizes: [Int] = []
+private final class SearchWriteRecorder: Sendable {
+  private struct State: Sendable {
+    var batchSizes: [Int] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ size: Int) {
-    lock.lock()
-    batchSizes.append(size)
-    lock.unlock()
+    state.withLock { state in
+      state.batchSizes.append(size)
+    }
   }
 
   var totalRecords: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return batchSizes.reduce(0, +)
+    return state.withLock { state in
+      return state.batchSizes.reduce(0, +)
+    }
   }
 }
 
-private final class InertFileWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
+private final class InertFileWatcherEventSource: FileWatcherEventSource, Sendable {
   func start(
     paths: [String],
     onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void

@@ -16,6 +16,7 @@ import XCTest
 ///
 /// The diagram now takes its colours from the `--vc-preview-*` tokens the SKIN
 /// defines, which is one source of truth rather than two readers of one setting.
+@MainActor
 final class PreviewMermaidSkinTests: XCTestCase {
   private func document(skin: PensieveTheme) -> PreviewDocument {
     PreviewDocument.make(

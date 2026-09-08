@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -611,17 +612,19 @@ final class AgentPromptDispatcherTests: XCTestCase {
   }
 }
 
-private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
-  struct Request: Equatable {
+private final class RecordingAgentPromptLauncher: AgentPromptLaunching, Sendable {
+  struct Request: Equatable, Sendable {
     let workflow: String
     let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
   }
 
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var recordedRequests: [Request] = []
+  }
+  private let state = Mutex(State())
   private let result: AgentDispatchMetadata
-  private var recordedRequests: [Request] = []
 
   init(
     result: AgentDispatchMetadata = AgentDispatchMetadata(
@@ -640,20 +643,20 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @uncheck
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    recordedRequests.append(
-      Request(
-        workflow: workflow,
-        agents: agents,
-        payload: payload,
-        workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
-    lock.unlock()
+    state.withLock { state in
+      state.recordedRequests.append(
+        Request(
+          workflow: workflow,
+          agents: agents,
+          payload: payload,
+          workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
+    }
     return result
   }
 
   func requests() -> [Request] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recordedRequests
+    return state.withLock { state in
+      return state.recordedRequests
+    }
   }
 }

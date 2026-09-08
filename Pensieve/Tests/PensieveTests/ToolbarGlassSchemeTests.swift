@@ -25,6 +25,7 @@ import XCTest
 /// must be the window's own answer rather than a second, independently derived
 /// one. These pins hold that contract for every skin, and for both halves of the
 /// pair that made the gap visible.
+@MainActor
 final class ToolbarGlassSchemeTests: XCTestCase {
   /// THE REGRESSION PIN. Under the shipped defect the toolbar had no declared
   /// scheme at all, so there was no second answer to compare — which is exactly
@@ -54,7 +55,7 @@ final class ToolbarGlassSchemeTests: XCTestCase {
 
     for skin in paired {
       for dark in [true, false] {
-        try withSystemAppearance(dark: dark) {
+        withSystemAppearance(dark: dark) {
           let chrome = WindowChromeRecipe.skinChrome(for: skin)
           XCTAssertEqual(
             chrome.toolbar, dark ? .dark : .light,

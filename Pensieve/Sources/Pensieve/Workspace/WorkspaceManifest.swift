@@ -1,6 +1,6 @@
 import Foundation
 
-struct WorkspaceManifest: Codable, Equatable {
+struct WorkspaceManifest: Codable, Equatable, Sendable {
   var workspaceID: String
   var roots: [URL]
   var exclusions: [String]

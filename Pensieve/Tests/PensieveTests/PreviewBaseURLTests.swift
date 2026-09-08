@@ -28,6 +28,7 @@ final class PreviewBaseURLTests: XCTestCase {
     )
   }
 
+  @MainActor
   func testPreviewAppearanceCSSRespondsToSystemScheme() {
     let css = PreviewWebView.appearanceCSS(fontSize: 17)
 
@@ -38,6 +39,7 @@ final class PreviewBaseURLTests: XCTestCase {
     XCTAssertTrue(css.contains("color: var(--vc-preview-text) !important"))
   }
 
+  @MainActor
   func testPreviewAppearanceCSSIsResponsive() {
     let css = PreviewWebView.appearanceCSS(fontSize: 14)
 

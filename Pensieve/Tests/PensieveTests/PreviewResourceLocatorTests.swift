@@ -28,6 +28,7 @@ final class PreviewResourceLocatorTests: XCTestCase {
     XCTAssertEqual(javascript, "window.mermaid = {};")
   }
 
+  @MainActor
   func testProductionThemesLoadWithoutBundleModuleAccessor() {
     let markdown = ThemeManager().css(for: .markdown)
     let gfm = ThemeManager().css(for: .gfm)

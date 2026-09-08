@@ -1,4 +1,5 @@
 import AppKit
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -823,75 +824,81 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 }
 
-private final class MockAITextResponder: AITextResponding, @unchecked Sendable {
+private final class MockAITextResponder: AITextResponding, Sendable {
   let isConfigured = true
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var storedInput: String? = nil
+    var storedInstructions: String? = nil
+  }
+  private let state = Mutex(State())
   private let result: String
-  private var storedInput: String?
-  private var storedInstructions: String?
 
   init(result: String) {
     self.result = result
   }
 
   func respond(input: String, instructions: String) async throws -> String {
-    lock.withLock {
-      storedInput = input
-      storedInstructions = instructions
+    state.withLock { state in
+      state.storedInput = input
+      state.storedInstructions = instructions
     }
     return result
   }
 
   var lastInput: String? {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedInput
+    return state.withLock { state in
+      return state.storedInput
+    }
   }
 
   var lastInstructions: String? {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedInstructions
+    return state.withLock { state in
+      return state.storedInstructions
+    }
   }
 }
 
-private final class LockedStringLog: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storage: [String] = []
+private final class LockedStringLog: Sendable {
+  private struct State: Sendable {
+    var storage: [String] = []
+  }
+  private let state = Mutex(State())
 
   func append(_ value: String) {
-    lock.lock()
-    storage.append(value)
-    lock.unlock()
+    state.withLock { state in
+      state.storage.append(value)
+    }
   }
 
   var values: [String] {
-    lock.lock()
-    defer { lock.unlock() }
-    return storage
+    return state.withLock { state in
+      return state.storage
+    }
   }
 }
 
-private final class LockedFlag: @unchecked Sendable {
-  private let lock = NSLock()
-  private var value = false
+private final class LockedFlag: Sendable {
+  private struct State: Sendable {
+    var value = false
+  }
+  private let state = Mutex(State())
 
   func set() {
-    lock.lock()
-    value = true
-    lock.unlock()
+    state.withLock { state in
+      state.value = true
+    }
   }
 
   func clear() {
-    lock.lock()
-    value = false
-    lock.unlock()
+    state.withLock { state in
+      state.value = false
+    }
   }
 
   var isSet: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
+    return state.withLock { state in
+      return state.value
+    }
   }
 }
 
@@ -900,49 +907,28 @@ private enum DictationLifecycleTestError: Error {
   case staleStop
 }
 
-private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
-  private let lock = NSLock()
+private final class MockAgentPromptLauncher: AgentPromptLaunching, Sendable {
+  private struct State: Sendable {
+    var prompts: [String] = []
+    var directories: [URL] = []
+  }
+  private let state = Mutex(State())
   private let result: AgentDispatchMetadata
-  private var prompts: [String] = []
-  private var directories: [URL] = []
-
   init(
     result: AgentDispatchMetadata = AgentDispatchMetadata(
-      runID: nil,
-      reportPath: nil,
-      exitCode: 0,
-      output: ""
-    )
+      runID: nil, reportPath: nil, exitCode: 0, output: "")
   ) {
     self.result = result
   }
-
   func dispatch(
-    workflow: String,
-    agents: [String],
-    payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workflow: String, agents: [String], payload: AgentDispatchPayload, workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    if case .prompt(let prompt) = payload {
-      prompts.append(prompt)
+    state.withLock { state in
+      if case .prompt(let prompt) = payload { state.prompts.append(prompt) }
+      state.directories.append(workingDirectoryURL)
     }
-    directories.append(workingDirectoryURL)
-    lock.unlock()
     return result
   }
-
-  func dispatchedPrompts() -> [String] {
-    lock.lock()
-    let snapshot = prompts
-    lock.unlock()
-    return snapshot
-  }
-
-  func workingDirectoryURLs() -> [URL] {
-    lock.lock()
-    let snapshot = directories
-    lock.unlock()
-    return snapshot
-  }
+  func dispatchedPrompts() -> [String] { state.withLock { $0.prompts } }
+  func workingDirectoryURLs() -> [URL] { state.withLock { $0.directories } }
 }

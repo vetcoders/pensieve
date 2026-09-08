@@ -1,4 +1,5 @@
 import AppKit
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -251,83 +252,69 @@ final class TrashConfirmationProbe {
   }
 }
 
-final class TrashRecycleProbe: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storedRequests: [[URL]] = []
-  private var storedCompletion: (@Sendable ([URL: URL], Error?) -> Void)?
-  private var storedEvents: [String] = []
-  private var windowDocumentIDs: [ObjectIdentifier: URL] = [:]
-
-  var requests: [[URL]] {
-    lock.withLock { storedRequests }
+final class TrashRecycleProbe: Sendable {
+  private struct State: Sendable {
+    var requests: [[URL]] = []
+    var completion: (@Sendable ([URL: URL], Error?) -> Void)?
+    var events: [String] = []
+    var windowDocumentIDs: [ObjectIdentifier: URL] = [:]
   }
-
-  var events: [String] {
-    lock.withLock { storedEvents }
-  }
-
-  var hasPendingCompletion: Bool {
-    lock.withLock { storedCompletion != nil }
-  }
-
-  func recordRequest(
-    _ urls: [URL],
-    completion: @escaping @Sendable ([URL: URL], Error?) -> Void
-  ) {
-    lock.withLock {
-      storedRequests.append(urls)
-      storedCompletion = completion
-      storedEvents.append("request:\(urls.map(\.path).joined(separator: ","))")
+  private let state = Mutex(State())
+  var requests: [[URL]] { state.withLock { $0.requests } }
+  var events: [String] { state.withLock { $0.events } }
+  var hasPendingCompletion: Bool { state.withLock { $0.completion != nil } }
+  func recordRequest(_ urls: [URL], completion: @escaping @Sendable ([URL: URL], Error?) -> Void) {
+    state.withLock { state in
+      state.requests.append(urls)
+      state.completion = completion
+      state.events.append("request:\(urls.map(\.path).joined(separator: ","))")
     }
   }
-
   func complete(error: Error?) {
-    let payload: ((@Sendable ([URL: URL], Error?) -> Void), [URL])? = lock.withLock {
-      guard let storedCompletion, let urls = storedRequests.last else { return nil }
-      self.storedCompletion = nil
-      storedEvents.append("completion:\(urls.map(\.path).joined(separator: ","))")
-      return (storedCompletion, urls)
+    let payload = state.withLock { state -> ((@Sendable ([URL: URL], Error?) -> Void), [URL])? in
+      guard let completion = state.completion, let urls = state.requests.last else { return nil }
+      state.completion = nil
+      state.events.append("completion:\(urls.map(\.path).joined(separator: ","))")
+      return (completion, urls)
     }
     guard let (completion, urls) = payload else {
       XCTFail("No recycle completion is pending")
       return
     }
-    if error == nil {
-      for url in urls {
-        try? FileManager.default.removeItem(at: url)
-      }
-    }
+    if error == nil { for url in urls { try? FileManager.default.removeItem(at: url) } }
     completion([:], error)
   }
-
+  @MainActor
   func register(_ window: NSWindow, documentID: URL) {
-    lock.withLock {
-      windowDocumentIDs[ObjectIdentifier(window)] = documentID.standardizedFileURL
+    state.withLock {
+      $0.windowDocumentIDs[ObjectIdentifier(window)] = documentID.standardizedFileURL
     }
   }
-
+  @MainActor
   func recordClose(_ window: NSWindow) {
-    lock.withLock {
-      let documentID = windowDocumentIDs[ObjectIdentifier(window)]
-      storedEvents.append("close:\(documentID?.path ?? "<unknown>")")
+    state.withLock { state in
+      let documentID = state.windowDocumentIDs[ObjectIdentifier(window)]
+      state.events.append("close:\(documentID?.path ?? "<unknown>")")
     }
   }
 }
 
-final class LockedCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storage = 0
+final class LockedCounter: Sendable {
+  private struct State: Sendable {
+    var storage = 0
+  }
+  private let state = Mutex(State())
 
   var value: Int {
-    lock.withLock { storage }
+    state.withLock { state in state.storage }
   }
 
   func add(_ amount: Int) {
-    lock.withLock { storage += amount }
+    state.withLock { state in state.storage += amount }
   }
 
   func reset() {
-    lock.withLock { storage = 0 }
+    state.withLock { state in state.storage = 0 }
   }
 }
 
@@ -336,30 +323,27 @@ final class LockedCounter: @unchecked Sendable {
 /// its walk through the injected builder, so an invocation is the arming made observable; asserting
 /// on the count is what turns "no refresh armed after quiescence" into a measurement instead of a
 /// claim about a private task handle.
-final class CountingWorkspaceBuilder: @unchecked Sendable {
+final class CountingWorkspaceBuilder: Sendable {
   private let counter = LockedCounter()
-
   var invocations: Int { counter.value }
-
   func reset() { counter.reset() }
-
-  lazy var builder: WorkspaceScanner.Builder = { [counter] roots, exclusions in
-    counter.add(1)
-    return WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+  var builder: WorkspaceScanner.Builder {
+    { [counter] roots, exclusions in
+      counter.add(1)
+      return WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+    }
   }
 }
 
-final class BlockingWorkspaceBuilder: @unchecked Sendable {
+final class BlockingWorkspaceBuilder: Sendable {
   private let release = DispatchSemaphore(value: 0)
-
-  lazy var builder: WorkspaceScanner.Builder = { [self] roots, exclusions in
-    release.wait()
-    return WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+  var builder: WorkspaceScanner.Builder {
+    { [release] roots, exclusions in
+      release.wait()
+      return WorkspaceScanner.build(rootURLs: roots, exclusions: exclusions)
+    }
   }
-
-  func releaseScan() {
-    release.signal()
-  }
+  func releaseScan() { release.signal() }
 }
 
 struct TrashStateSnapshot: Equatable {

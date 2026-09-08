@@ -103,11 +103,11 @@ final class ConsciousCloseHookTests: XCTestCase {
   func testDirectCloseRoutesASwiftUIStyleWindowThroughTheHook() {
     let window = Self.makeSwiftUIStyleWindow()
     var asked = 0
-    var willCloseNotifications = 0
+    let willCloseNotifications = LockedCounter()
     let token = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: window, queue: .main
     ) { _ in
-      willCloseNotifications += 1
+      willCloseNotifications.add(1)
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
@@ -118,7 +118,8 @@ final class ConsciousCloseHookTests: XCTestCase {
     window.close()
 
     XCTAssertEqual(asked, 1, "a direct native-tab close bypassed the conscious close hook")
-    XCTAssertEqual(willCloseNotifications, 0, "a vetoed direct close still tore the window down")
+    XCTAssertEqual(
+      willCloseNotifications.value, 0, "a vetoed direct close still tore the window down")
   }
 
   /// A close that needs no question still evaluates the guard exactly once.
@@ -129,11 +130,11 @@ final class ConsciousCloseHookTests: XCTestCase {
   func testAllowedPerformCloseAsksOnceAndClosesOnce() {
     let window = Self.makeSwiftUIStyleWindow()
     var asked = 0
-    var willCloseNotifications = 0
+    let willCloseNotifications = LockedCounter()
     let token = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: window, queue: .main
     ) { _ in
-      willCloseNotifications += 1
+      willCloseNotifications.add(1)
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
@@ -144,7 +145,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     window.performClose(nil)
 
     XCTAssertEqual(asked, 1, "performClose evaluated the same close decision twice")
-    XCTAssertEqual(willCloseNotifications, 1)
+    XCTAssertEqual(willCloseNotifications.value, 1)
   }
 
   /// Save / Don't Save has already settled when the controller closes from the
@@ -154,11 +155,11 @@ final class ConsciousCloseHookTests: XCTestCase {
   func testCloseAfterConsentBypassesExactlyOneGuardPass() {
     let window = Self.makeSwiftUIStyleWindow()
     var asked = 0
-    var willCloseNotifications = 0
+    let willCloseNotifications = LockedCounter()
     let token = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: window, queue: .main
     ) { _ in
-      willCloseNotifications += 1
+      willCloseNotifications.add(1)
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
@@ -169,7 +170,7 @@ final class ConsciousCloseHookTests: XCTestCase {
     ConsciousCloseHook.closeAfterConsent(window)
 
     XCTAssertEqual(asked, 0, "settled sheet completion asked the document again")
-    XCTAssertEqual(willCloseNotifications, 1)
+    XCTAssertEqual(willCloseNotifications.value, 1)
   }
 
   /// A delegate may return consent without AppKit immediately continuing into
@@ -390,11 +391,11 @@ final class ConsciousCloseHookTests: XCTestCase {
     window.isReleasedWhenClosed = false
     defer { ConsciousCloseHook.closeAfterConsent(window) }
     var asked = 0
-    var willCloseNotifications = 0
+    let willCloseNotifications = LockedCounter()
     let token = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification, object: window, queue: .main
     ) { _ in
-      willCloseNotifications += 1
+      willCloseNotifications.add(1)
     }
     defer { NotificationCenter.default.removeObserver(token) }
 
@@ -406,11 +407,11 @@ final class ConsciousCloseHookTests: XCTestCase {
     XCTAssertNil(window.delegate, "a DocumentWindow needs no delegate proxy; it overrides close")
     window.performClose(nil)
     XCTAssertEqual(asked, 1)
-    XCTAssertEqual(willCloseNotifications, 0)
+    XCTAssertEqual(willCloseNotifications.value, 0)
 
     window.close()
     XCTAssertEqual(asked, 2, "a factory tab's direct close bypassed its own guard")
-    XCTAssertEqual(willCloseNotifications, 0)
+    XCTAssertEqual(willCloseNotifications.value, 0)
   }
 
   @MainActor

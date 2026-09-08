@@ -121,8 +121,8 @@ final class BookmarkStore {
   /// process, so it is precisely the kind of call that must be allowed to run
   /// out of budget instead of beachballing the quit.
   func startFlush() -> Task<Void, Never> {
-    let defaults = defaults
-    return Task.detached { defaults.synchronize() }
+    let flush = DefaultsFlush(defaults: defaults)
+    return Task.detached { flush.run() }
   }
 
   var bookmarkData: Data? {
@@ -972,4 +972,16 @@ struct PrunedTrashedFile: Equatable {
   /// The path the bookmark was minted for — the pre-trash location a live
   /// working-set row still names. Nil when the blob carries no cached path.
   let originURL: URL?
+}
+
+/// Foundation documents UserDefaults as thread-safe, but its open Objective-C class does not
+/// provide a Sendable conformance. Only the cfprefsd flush crosses this boundary; the bookmark
+/// store and its mutable grant bookkeeping remain MainActor-owned. Retain the injected defaults
+/// instance so a custom suite is flushed, rather than accidentally flushing the standard domain.
+private struct DefaultsFlush: @unchecked Sendable {
+  let defaults: UserDefaults
+
+  func run() {
+    defaults.synchronize()
+  }
 }

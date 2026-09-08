@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 enum AgentLaunchVerification: Equatable, Sendable {
   /// The runtime metadata recorded a positive worker PID. This proves that the
@@ -233,7 +234,7 @@ enum AgentPromptLauncherError: LocalizedError {
   }
 }
 
-final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
+final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
   static let vibecraftedHomeEnvironmentKey = "VIBECRAFTED_HOME"
   static let workerSpawnRecordTimeout: TimeInterval = 3
@@ -421,21 +422,16 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
   }
 }
 
-private final class ProcessOutputBuffer: @unchecked Sendable {
-  private let lock = NSLock()
-  private var data = Data()
+private final class ProcessOutputBuffer: Sendable {
+  private let data = Mutex(Data())
 
   func append(_ next: Data) {
     guard !next.isEmpty else { return }
-    lock.lock()
-    data.append(next)
-    lock.unlock()
+    data.withLock { $0.append(next) }
   }
 
   func text() -> String {
-    lock.lock()
-    let snapshot = data
-    lock.unlock()
+    let snapshot = data.withLock { $0 }
     return String(data: snapshot, encoding: .utf8) ?? ""
   }
 }

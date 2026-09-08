@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 /// Regression guard for the test-plist leak.
@@ -70,8 +71,9 @@ final class EphemeralDefaultsTests: XCTestCase {
 
     EphemeralDefaults.destroy(suiteName: suiteName)
 
-    let stranded = (try? FileManager.default.contentsOfDirectory(
-      atPath: EphemeralDefaults.userPreferences.path)) ?? []
+    let stranded =
+      (try? FileManager.default.contentsOfDirectory(
+        atPath: EphemeralDefaults.userPreferences.path)) ?? []
     XCTAssertEqual(
       stranded.filter { $0.contains(prefix) }, [],
       "no file carrying the suite prefix may appear in ~/Library/Preferences")
@@ -95,31 +97,39 @@ final class EphemeralDefaultsTests: XCTestCase {
     XCTAssertNil(
       UserDefaults(suiteName: suiteName)?.object(forKey: "regression.marker"),
       "destroy must empty the domain")
-    assertPlistEventuallyGone(atPath: plistURL.path)
+    Self.assertPlistEventuallyGone(atPath: plistURL.path)
   }
 
   func testMakeEphemeralDefaultsCleansUpAfterTheTest() {
-    var plistPath: String?
+    let receipt = PlistPathReceipt()
     // Registered FIRST so it runs LAST (teardown blocks are LIFO) — i.e.
     // after the cleanup block that makeEphemeralDefaultsSuite registers.
     addTeardownBlock {
-      guard let plistPath else {
+      guard let plistPath = receipt.path else {
         XCTFail("plistPath was never set")
         return
       }
-      self.assertPlistEventuallyGone(atPath: plistPath)
+      Self.assertPlistEventuallyGone(atPath: plistPath)
     }
 
     let (defaults, suiteName) = makeEphemeralDefaultsSuite(
       prefix: "PensieveEphemeralDefaultsTests")
-    plistPath = EphemeralDefaults.plistURL(suiteName: suiteName).path
+    receipt.path = EphemeralDefaults.plistURL(suiteName: suiteName).path
     defaults.set("value", forKey: "teardown.marker")
     defaults.synchronize()
   }
 
+  private final class PlistPathReceipt: Sendable {
+    private let storage = Mutex<String?>(nil)
+    var path: String? {
+      get { storage.withLock { $0 } }
+      set { storage.withLock { $0 = newValue } }
+    }
+  }
+
   /// Waits (up to `timeout`) for the suite plist to be gone. Re-deleting a
   /// reappearing file is `destroy`'s job — the test only waits and reports.
-  private func assertPlistEventuallyGone(
+  private static func assertPlistEventuallyGone(
     atPath path: String, timeout: TimeInterval = 5,
     file: StaticString = #filePath, line: UInt = #line
   ) {

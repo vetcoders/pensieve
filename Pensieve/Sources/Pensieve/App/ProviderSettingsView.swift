@@ -216,7 +216,7 @@ final class ProviderOnboardingSettingsTransition: ObservableObject {
     self.timeout = timeout
   }
 
-  deinit {
+  isolated deinit {
     if let observer {
       notificationCenter.removeObserver(observer)
     }
@@ -342,8 +342,9 @@ struct ProviderOnboardingView: View {
   var settingsLane = ProviderOnboardingSettingsLane()
   var onSettingsTransitionFailure:
     @MainActor (ProviderOnboardingSettingsTransition.Failure) -> Void = { _ in }
-  var onSettingsPresentationFailure:
-    @MainActor (PensieveSettingsPresentationResult) -> Void = { _ in }
+  var onSettingsPresentationFailure: @MainActor (PensieveSettingsPresentationResult) -> Void = {
+    _ in
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {

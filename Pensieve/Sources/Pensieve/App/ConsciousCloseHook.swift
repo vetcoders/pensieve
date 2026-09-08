@@ -3,9 +3,11 @@ import ObjectiveC.runtime
 
 /// Associated-object key for the proxy the window has to keep alive. Its
 /// ADDRESS is the token; the value is never read.
+@MainActor
 private var consciousCloseProxyKey: UInt8 = 0
 /// Associated close state survives delegate replacement. Native tab chrome on
 /// macOS 27 calls `close()` directly, so a delegate-only guard is insufficient.
+@MainActor
 private var consciousCloseStateKey: UInt8 = 0
 
 /// Gives EVERY document-bearing window the conscious close lifecycle — the red
@@ -152,6 +154,7 @@ enum ConsciousCloseHook {
   }
 }
 
+@MainActor
 private final class ConsciousCloseState {
   var shouldClose: @MainActor (NSWindow, WindowCloseGesture) -> Bool
   private var nextBypassID: UInt64?
@@ -183,6 +186,7 @@ private final class ConsciousCloseState {
   }
 }
 
+@MainActor
 private final class CloseOriginalImplementation {
   var imp: IMP?
 }

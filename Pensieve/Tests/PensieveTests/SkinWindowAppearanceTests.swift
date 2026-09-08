@@ -19,6 +19,7 @@ import XCTest
 /// `aqua` on all 15. Re-asserting harder is the start-up hang, not the fix.
 ///
 /// So the appearance is DECLARED in SwiftUI, where the scene already owns it.
+@MainActor
 final class SkinWindowAppearanceTests: XCTestCase {
   /// The AppKit answer and the SwiftUI answer are the same demand written twice.
   /// Nothing else keeps `assertWindowChrome` and the root view's declaration
@@ -76,7 +77,7 @@ final class SkinWindowAppearanceTests: XCTestCase {
   @MainActor
   func testAPairedSkinPinsTheHostWindowToTheHalfTheSystemChose() throws {
     for dark in [true, false] {
-      try withSystemAppearance(dark: dark) {
+      withSystemAppearance(dark: dark) {
         let (window, _, _) = hostSkinRoot(.typewriter)
         defer { window.contentView = nil }
         XCTAssertEqual(
@@ -97,7 +98,7 @@ final class SkinWindowAppearanceTests: XCTestCase {
   /// observation reaching the declaration.
   @MainActor
   func testAPairedWindowFollowsALiveSystemFlip() throws {
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       let (window, _, _) = hostSkinRoot(.typewriter)
       defer { window.contentView = nil }
       XCTAssertEqual(window.appearance?.name, .darkAqua)

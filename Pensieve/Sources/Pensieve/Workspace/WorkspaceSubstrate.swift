@@ -1,6 +1,6 @@
 import Foundation
 
-enum StaleReason: Equatable, Hashable, CaseIterable {
+enum StaleReason: Equatable, Hashable, CaseIterable, Sendable {
   case rootMoved
   case bookmarkExpired
   case manifestSchemaBumped
@@ -8,7 +8,7 @@ enum StaleReason: Equatable, Hashable, CaseIterable {
   case exclusionsChanged
 }
 
-enum WorkspaceCacheVerdict: Equatable {
+enum WorkspaceCacheVerdict: Equatable, Sendable {
   case valid(WorkspaceManifest)
   case stale(
     StaleReason,
@@ -21,7 +21,7 @@ enum WorkspaceCacheVerdict: Equatable {
   case accessDenied(reason: String)
 }
 
-enum WorkspaceBookmarkStatus {
+enum WorkspaceBookmarkStatus: Sendable {
   case resolved
   case expiredButDirectPathAccessible
 }
@@ -33,7 +33,7 @@ enum WorkspaceValidationStage: String, CaseIterable, Hashable, Sendable {
   case searchSignature
 }
 
-struct WorkspaceValidationResult: @unchecked Sendable {
+struct WorkspaceValidationResult: Sendable {
   var scans: [WorkspaceScan]
   var fingerprint: TreeFingerprint?
   var verdict: WorkspaceCacheVerdict?
@@ -55,7 +55,7 @@ struct WorkspaceValidationResult: @unchecked Sendable {
 
 /// Immutable validation configuration shared with detached open jobs. The cache store is itself
 /// thread-safe (operation-local coders), and the bookmark callback is explicitly Sendable.
-final class WorkspaceSubstrate: @unchecked Sendable {
+final class WorkspaceSubstrate: Sendable {
   typealias ValidationProbe = @Sendable (WorkspaceValidationStage) -> Void
 
   static let shared = WorkspaceSubstrate()

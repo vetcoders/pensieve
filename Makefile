@@ -57,17 +57,14 @@ run-release: release-local  ## Launch signed .app with the production Pensieve p
 	@open "$(APP_BUNDLE)"
 
 .PHONY: install-app
-install-app: init-hooks release-local  ## Build signed .app + swap the production bundle in /Applications
-	@printf "$(C_CYAN)[install]$(C_RESET) quitting running Pensieve — a live process + bundle swap = SIGKILL (code signature invalid)\n"
-	@osascript -e 'tell application id "io.vetcoders.pensieve" to quit' >/dev/null 2>&1 || true
-	@pkill -x Pensieve >/dev/null 2>&1 || true
-	@sleep 0.6
-	@printf "$(C_CYAN)[install]$(C_RESET) swapping /Applications/Pensieve.app\n"
-	@rm -rf "/Applications/Pensieve.app"
-	@ditto "$(APP_BUNDLE)" "/Applications/Pensieve.app"
-	@printf "$(C_CYAN)[install]$(C_RESET) relaunching from /Applications\n"
-	@open "/Applications/Pensieve.app"
-	@printf "$(C_GREEN)[ ok ]$(C_RESET) installed $(APP_BUNDLE) → /Applications/Pensieve.app\n"
+install-app: init-hooks  ## Build signed .app, then install only when Pensieve is idle
+	@$(SCRIPTS)/install-built-app.sh --check-idle
+	@$(MAKE) release-local
+	@$(SCRIPTS)/install-built-app.sh "$(APP_BUNDLE)"
+
+.PHONY: install-built-app
+install-built-app:  ## Verify + install the existing signed/notarized .app without rebuilding or quitting
+	@$(SCRIPTS)/install-built-app.sh "$(APP_BUNDLE)"
 
 .PHONY: clean
 clean:  ## Remove .build/ + dist/
@@ -114,6 +111,8 @@ test:  ## Run unit + integration tests
 test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-bundle-identity.sh
 	@$(SCRIPTS)/test-build-keychain.sh
+	@$(SCRIPTS)/test-install-built-app.sh
+	@$(SCRIPTS)/test-release-product-path.sh
 	@$(SCRIPTS)/test-rpath-hygiene.sh
 	@$(SCRIPTS)/test-landing-page.sh
 	@$(SCRIPTS)/test-isolated-app.sh
@@ -158,7 +157,7 @@ lint:  ## Required format check; fails if swift-format is missing
 		printf "$(C_YELLOW)[missing]$(C_RESET) swift-format is required for lint/release gates (brew install swift-format)\n"; \
 		exit 1; \
 	fi
-	@cd $(PKG_DIR) && swift-format lint $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' -print)
+	@cd $(PKG_DIR) && swift-format lint --strict $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' -print)
 
 .PHONY: format
 format:  ## Apply swift-format in-place when installed (best-effort helper)

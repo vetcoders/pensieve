@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 enum WindowChromeRecipe {
   static let documentTabbingIdentifier = "Pensieve.DocumentWindow"
   static let defaultContentSize = NSSize(width: 1180, height: 760)
@@ -510,7 +511,7 @@ enum WindowChromeRecipe {
   /// healing property `c454889` and `da7954a` exist for is kept by the backing
   /// colour, which DOES round-trip faithfully and which the same external resets
   /// take out: see `assertWindowChrome`.
-  nonisolated(unsafe) private static let assertedAppearances =
+  @MainActor private static let assertedAppearances =
     NSMapTable<NSWindow, AssertedAppearance>.weakToStrongObjects()
 
   /// Boxed `NSAppearance.Name?` — `NSMapTable` stores objects, and "this window
@@ -1002,7 +1003,7 @@ struct WindowChromeSink: NSViewRepresentable {
       WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
     }
 
-    deinit {
+    isolated deinit {
       if let observer { NotificationCenter.default.removeObserver(observer) }
     }
   }
@@ -1098,7 +1099,7 @@ struct SidebarChromeInsetSink: NSViewRepresentable {
       onChange(height)
     }
 
-    deinit {
+    isolated deinit {
       if let observer { NotificationCenter.default.removeObserver(observer) }
     }
   }

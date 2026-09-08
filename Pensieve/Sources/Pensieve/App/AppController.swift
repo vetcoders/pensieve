@@ -273,20 +273,19 @@ final class AppController: ObservableObject {
       return alert.runModal() == .alertFirstButtonReturn
     },
     confirmQuitAfterRecoveryRetirementFailure:
-      @escaping
-    QuitAfterRecoveryRetirementFailureConfirmation = { title in
-      let alert = NSAlert()
-      alert.messageText = "The recovery copy couldn’t be removed."
-      alert.informativeText =
-        "Pensieve can keep “\(title)” open so you can retry, or quit without removing its recovery copy. If you quit, the discarded copy may appear in Recovered Drafts the next time Pensieve opens."
-      alert.alertStyle = .warning
-      let keepOpenButton = alert.addButton(withTitle: "Keep Pensieve Open")
-      keepOpenButton.keyEquivalent = "\u{1b}"
-      let quitAnywayButton = alert.addButton(withTitle: "Quit Anyway")
-      quitAnywayButton.hasDestructiveAction = true
-      alert.window.defaultButtonCell = keepOpenButton.cell as? NSButtonCell
-      return alert.runModal() == .alertSecondButtonReturn
-    }
+      @escaping QuitAfterRecoveryRetirementFailureConfirmation = { title in
+        let alert = NSAlert()
+        alert.messageText = "The recovery copy couldn’t be removed."
+        alert.informativeText =
+          "Pensieve can keep “\(title)” open so you can retry, or quit without removing its recovery copy. If you quit, the discarded copy may appear in Recovered Drafts the next time Pensieve opens."
+        alert.alertStyle = .warning
+        let keepOpenButton = alert.addButton(withTitle: "Keep Pensieve Open")
+        keepOpenButton.keyEquivalent = "\u{1b}"
+        let quitAnywayButton = alert.addButton(withTitle: "Quit Anyway")
+        quitAnywayButton.hasDestructiveAction = true
+        alert.window.defaultButtonCell = keepOpenButton.cell as? NSButtonCell
+        return alert.runModal() == .alertSecondButtonReturn
+      }
   ) {
     self.appState = appState
     self.folderManager = folderManager

@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -462,7 +463,7 @@ final class ProviderSettingsTests: XCTestCase {
   }
 }
 
-private final class BlockingProviderDiscovery: ProviderModelDiscovering, @unchecked Sendable {
+private final class BlockingProviderDiscovery: ProviderModelDiscovering, Sendable {
   private let started: XCTestExpectation
   private let cancelled: XCTestExpectation
 
@@ -488,12 +489,21 @@ private final class BlockingProviderDiscovery: ProviderModelDiscovering, @unchec
 }
 
 private final class InMemoryProviderAPIKeyStore: ProviderAPIKeyStoring {
-  var apiKey: String?
-  private(set) var loadCount = 0
-
+  private struct State: Sendable {
+    var apiKey: String?
+    var loadCount = 0
+  }
+  private let state = Mutex(State())
+  var apiKey: String? {
+    get { state.withLock { $0.apiKey } }
+    set { state.withLock { $0.apiKey = newValue } }
+  }
+  var loadCount: Int { state.withLock { $0.loadCount } }
   func loadAPIKey() throws -> String? {
-    loadCount += 1
-    return apiKey
+    state.withLock { state in
+      state.loadCount += 1
+      return state.apiKey
+    }
   }
   func storeAPIKey(_ apiKey: String) throws { self.apiKey = apiKey }
   func deleteAPIKey() throws { apiKey = nil }
@@ -513,43 +523,50 @@ private actor RecordingProviderDiscovery: ProviderModelDiscovering {
 }
 
 private final class InMemoryProviderEnvironment: ProviderEnvironmentManaging {
-  var values: [String: String]
-  private(set) var setCalls: [(key: String, value: String)] = []
-  private(set) var removeCalls: [String] = []
-
-  init(values: [String: String] = [:]) {
-    self.values = values
+  private struct State: Sendable {
+    var values: [String: String]
+    var setCalls: [(key: String, value: String)] = []
+    var removeCalls: [String] = []
   }
-
-  func value(forKey key: String) -> String? {
-    values[key]
+  private let state: Mutex<State>
+  var values: [String: String] {
+    get { state.withLock { $0.values } }
+    set { state.withLock { $0.values = newValue } }
   }
-
+  var setCalls: [(key: String, value: String)] { state.withLock { $0.setCalls } }
+  var removeCalls: [String] { state.withLock { $0.removeCalls } }
+  init(values: [String: String] = [:]) { state = Mutex(State(values: values)) }
+  func value(forKey key: String) -> String? { state.withLock { $0.values[key] } }
   func setValue(_ value: String, forKey key: String) throws {
-    values[key] = value
-    setCalls.append((key, value))
+    state.withLock { state in
+      state.values[key] = value
+      state.setCalls.append((key, value))
+    }
   }
-
   func removeValue(forKey key: String) throws {
-    values.removeValue(forKey: key)
-    removeCalls.append(key)
+    state.withLock { state in
+      state.values.removeValue(forKey: key)
+      state.removeCalls.append(key)
+    }
   }
 }
 
-private final class ProviderAttemptCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storedValue = 0
+private final class ProviderAttemptCounter: Sendable {
+  private struct State: Sendable {
+    var storedValue = 0
+  }
+  private let state = Mutex(State())
 
   var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedValue
+    return state.withLock { state in
+      return state.storedValue
+    }
   }
 
   func incrementAndGet() -> Int {
-    lock.lock()
-    defer { lock.unlock() }
-    storedValue += 1
-    return storedValue
+    return state.withLock { state in
+      state.storedValue += 1
+      return state.storedValue
+    }
   }
 }

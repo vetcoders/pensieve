@@ -1,6 +1,6 @@
 import Foundation
 
-enum DocumentIdentity: Hashable {
+enum DocumentIdentity: Hashable, Sendable {
   case file(URL)
   case untitled(UUID)
   case recovered(UUID)
@@ -27,8 +27,8 @@ enum DocumentIdentity: Hashable {
   }
 }
 
-struct DocumentSession: Equatable {
-  enum Kind: Equatable {
+struct DocumentSession: Equatable, Sendable {
+  enum Kind: Equatable, Sendable {
     case empty
     /// A file this window has CLAIMED but whose bytes are still being read off
     /// the main actor — the staged half of a large-document open.

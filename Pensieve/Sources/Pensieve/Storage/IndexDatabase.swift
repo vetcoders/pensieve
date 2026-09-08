@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import os
 
 @MainActor
 final class IndexDatabase {
@@ -303,7 +304,8 @@ final class IndexDatabase {
     guard isClosedForTermination else { return false }
     terminationRejectedEntryPoints.append(entryPoint)
     NSLog(
-      "Pensieve quit: index entry point refused after the termination latch closed (%@)", entryPoint)
+      "Pensieve quit: index entry point refused after the termination latch closed (%@)", entryPoint
+    )
     return true
   }
 
@@ -1300,7 +1302,8 @@ final class IndexDatabase {
   /// `indexBatchTruncationRetryMaximumDelayNanoseconds`. A second is short next to the reader it is
   /// waiting out and long next to the ~0.2 ms a refused checkpoint costs, and the ceiling keeps a
   /// reader that never lets go from turning into a busy poll for the rest of the session.
-  private nonisolated static let indexBatchTruncationRetryBaseDelayNanoseconds: UInt64 = 1_000_000_000
+  private nonisolated static let indexBatchTruncationRetryBaseDelayNanoseconds: UInt64 =
+    1_000_000_000
   private nonisolated static let indexBatchTruncationRetryMaximumDelayNanoseconds: UInt64 =
     30_000_000_000
 
@@ -1607,7 +1610,7 @@ final class IndexDatabase {
   /// time revalidation created. `downgraded` carries the hot-path result so the caller can re-arm the
   /// truncation ladder on the main actor, and whether the one-off `VACUUM` conversion was paid for,
   /// so a pass that gave way before it does not retire it.
-  private enum ClosePassOutcome {
+  private enum ClosePassOutcome: Sendable {
     case excludedReaders
     case downgraded(IndexBatchMaintenanceOutcome, didAttemptConversion: Bool)
   }
@@ -1616,7 +1619,7 @@ final class IndexDatabase {
   /// alongside the outcome rather than inside it because the two answer different questions — what
   /// the pass did at its lock, and whether the one-shot conversion is still owed — and round 21 made
   /// the second reachable on its own.
-  private struct ClosePassResult {
+  private struct ClosePassResult: Sendable {
     var outcome: ClosePassOutcome
     var conversionDeferredByOpen: Bool
   }
@@ -1625,7 +1628,7 @@ final class IndexDatabase {
   /// "over the byte ceiling" and "the attempt failed": all three are answers this process is not
   /// going to improve on, so all three retire the obligation. `deferredByOpen` is the one that keeps
   /// it — see `autoVacuumConversionsDeferredByOpen`.
-  private enum AutoVacuumConversionOutcome: Equatable {
+  private enum AutoVacuumConversionOutcome: Equatable, Sendable {
     case converted
     case notOwed
     case deferredByOpen
@@ -1633,7 +1636,7 @@ final class IndexDatabase {
 
   /// What one hot-path hygiene pass achieved. `readerHeldTheWal` is the state that has to be told
   /// apart from the other two: it is not a failure and not a success, it is "come back later".
-  private enum IndexBatchMaintenanceOutcome {
+  private enum IndexBatchMaintenanceOutcome: Sendable {
     case truncated
     case readerHeldTheWal
     case failed
@@ -2219,7 +2222,8 @@ final class IndexDatabase {
     {
       return isolationRoot
     }
-    return try fileManager
+    return
+      try fileManager
       .url(
         for: .applicationSupportDirectory,
         in: .userDomainMask,
@@ -3343,20 +3347,15 @@ private struct IndexDocumentRecord: Sendable {
 ///
 /// One-way, like the flag it mirrors: `close()` has no counterpart, so a batch loop that reads
 /// `false` can only be racing a latch that has not closed yet — never one that has re-opened.
-private final class TerminationLatch: @unchecked Sendable {
-  private let lock = NSLock()
-  private var isClosed = false
+private final class TerminationLatch: Sendable {
+  private let closed = OSAllocatedUnfairLock(initialState: false)
 
   var isClosedForTermination: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return isClosed
+    closed.withLock { $0 }
   }
 
   func close() {
-    lock.lock()
-    isClosed = true
-    lock.unlock()
+    closed.withLock { $0 = true }
   }
 }
 
