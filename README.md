@@ -20,10 +20,19 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Preview & Two-Way Links:** Rich markdown preview, backlinks, wikilinks, Mermaid, math, and source-first editing.
 - **Split Modes:** `SOURCE` (Cmd+1), `SPLIT` (Cmd+2), `PREVIEW` (Cmd+3), and `FOCUS` (Cmd+4).
 - **Fast Native Core:** Built on Swift 6, SwiftUI, and AppKit's `NSTextView` with TextKit 2.
-- **Staged Opens for Large Files:** documents over ~1 MB are read in the background. The window or tab appears immediately with an `Opening …` placeholder, the visible text is coloured first and the rest of the document follows in frame-sized chunks, so a multi-megabyte note never freezes the app.
-- **Dictation:** Capture speech locally, review continuous transcript text, and insert it at the active Markdown selection with natural spacing and undo.
+- **Staged Opens for Large Files:** documents over ~1 MB are read in the background. The window or tab appears with an `Opening …` placeholder; visible text is coloured first and the rest follows in frame-sized chunks. This opening path does not qualify large AI rewrites.
+- **Dictation (experimental):** The transcript review and insertion workflow is present, but the reported recording failure remains unresolved. Dictation is not qualified for the upcoming release.
 - **Agent-Aware Writing:** Current-document dispatch and local AI autocomplete are wired into the native editor.
 - **Word/PDF Transfer Bridge:** Export Markdown to `.docx`; open or import `.docx` and text-based `.pdf` files as editable Markdown drafts.
+
+## Current AI and dictation limits
+
+Custom rewrite instructions use a single-line field. Rewrite sends the entire
+selection (or the current paragraph when nothing is selected) in one provider
+request, without input chunking or a context-budget preflight. Selecting a large
+document can exceed provider limits; staged file opening does not prevent this.
+Dictation currently uses the Vista/qube-ffi capture engine; integration of the
+CodeScribe engine remains separate work.
 
 ## Word and PDF transfer
 
