@@ -1,3 +1,4 @@
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -263,43 +264,47 @@ final class WorkspaceScanSafetyTests: XCTestCase {
   }
 }
 
-private final class ScanSafetyCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
+private final class ScanSafetyCounter: Sendable {
+  private struct State: Sendable {
+    var count = 0
+  }
+  private let state = Mutex(State())
 
   @discardableResult
   func increment() -> Int {
-    lock.lock()
-    defer { lock.unlock() }
-    count += 1
-    return count
+    return state.withLock { state in
+      state.count += 1
+      return state.count
+    }
   }
 
   var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return count
+    return state.withLock { state in
+      return state.count
+    }
   }
 }
 
-private final class ScanSafetyProbeRecorder: @unchecked Sendable {
+private final class ScanSafetyProbeRecorder: Sendable {
   struct Observation: Sendable {
     var stage: WorkspaceValidationStage
     var wasMainThread: Bool
   }
 
-  private let lock = NSLock()
-  private var observations: [Observation] = []
+  private struct State: Sendable {
+    var observations: [Observation] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ stage: WorkspaceValidationStage) {
-    lock.lock()
-    defer { lock.unlock() }
-    observations.append(Observation(stage: stage, wasMainThread: Thread.isMainThread))
+    return state.withLock { state in
+      state.observations.append(Observation(stage: stage, wasMainThread: Thread.isMainThread))
+    }
   }
 
   func snapshot() -> [Observation] {
-    lock.lock()
-    defer { lock.unlock() }
-    return observations
+    return state.withLock { state in
+      return state.observations
+    }
   }
 }

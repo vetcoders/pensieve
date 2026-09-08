@@ -142,7 +142,12 @@ final class EditorFocusRequestTests: XCTestCase {
       defaults: makeEphemeralDefaults(prefix: "editor-focus-live-bridge"))
     defer { rig.tearDown() }
     let sentinel = FocusSentinel(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
-    rig.hosting.addSubview(sentinel)
+    // Keep the test responder beside SwiftUI's owned hierarchy.
+    let container = NSView(frame: rig.hosting.frame)
+    rig.window.contentView = container
+    rig.hosting.autoresizingMask = [.width, .height]
+    container.addSubview(rig.hosting)
+    container.addSubview(sentinel)
     XCTAssertTrue(rig.window.makeFirstResponder(sentinel))
 
     XCTAssertTrue(rig.controller.createUntitledDocument())

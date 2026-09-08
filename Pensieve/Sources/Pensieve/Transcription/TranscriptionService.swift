@@ -149,7 +149,7 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
 }
 
 @MainActor
-final class TranscriptionService: ObservableObject, VistaEventListener, @unchecked Sendable {
+final class TranscriptionService: ObservableObject, VistaEventListener {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
   typealias MicrophonePermissionPolicy = @Sendable (VistaEngineProtocol) -> Bool
   typealias MicrophonePermissionRequester = @Sendable () async throws -> Void

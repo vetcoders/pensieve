@@ -13,6 +13,7 @@ import XCTest
 /// Neither is measurable from a unit test: SwiftUI does not hand back a laid-out
 /// tree here, and text wrapping is a rendering outcome. So both are pinned one
 /// level below the pixels — at the composition that produces them.
+@MainActor
 final class EmptyStateCompositionTests: XCTestCase {
 
   // MARK: - KT-2 — one Recent list, in the launcher

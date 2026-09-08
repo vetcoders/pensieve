@@ -196,6 +196,7 @@ final class LauncherSweepKeepsLiveWorkTests: XCTestCase {
 
   /// Mutable state the registry's injected closures write into. It has to be a
   /// reference the closures can capture before `Harness` finishes initializing.
+  @MainActor
   private final class SweepJournal {
     var pendingSweeps: [() -> Void] = []
     var closedWindows: [NSWindow] = []

@@ -274,6 +274,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// setting — `tokens` is what resolves the half, and `ThemeManager` re-reads
   /// it on every system flip — but every consumer, SwiftUI included, now gets
   /// that ONE answer rather than deriving a second one.
+  @MainActor
   var appearanceName: NSAppearance.Name? {
     switch tokens.mode {
     case .light: return .aqua
@@ -294,6 +295,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// halves, which is the decision this skin exists to express.
   ///
   /// Unpaired skins answer exactly as before.
+  @MainActor
   var readingSurfaceAppearanceName: NSAppearance.Name? {
     guard let pair = Self.pairedPalettes[self] else { return appearanceName }
     switch pair.light.mode {
@@ -308,6 +310,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// token accessor that is not a pure function of the enum. Everything that
   /// must not depend on the machine's current setting — export above all — goes
   /// through `exportTokens` or `tokens(underDarkSystem:)` instead.
+  @MainActor
   var tokens: ThemeTokens {
     if let pair = Self.pairedPalettes[self] {
       return SystemAppearance.isDark ? pair.dark : pair.light
@@ -328,14 +331,18 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// feature — the page is white in both halves of the pair on screen too.
   var exportTokens: ThemeTokens {
     if let pair = Self.pairedPalettes[self] { return pair.light }
-    return tokens
+    return tokens(underDarkSystem: false)
   }
 
   /// Appearance to pin while rendering an export. Same reasoning as
   /// `exportTokens`, applied to the media queries in the flavour bundle.
   var exportAppearanceName: NSAppearance.Name? {
     if Self.pairedPalettes[self] != nil { return .aqua }
-    return appearanceName
+    switch exportTokens.mode {
+    case .light: return .aqua
+    case .dark: return .darkAqua
+    case .none: return nil
+    }
   }
 
   /// True when this skin is two fixed palettes paired to the system setting
@@ -356,6 +363,7 @@ enum PensieveTheme: String, CaseIterable, Identifiable {
   /// Unpaired skins read no system setting, so their identity deliberately
   /// ignores it: they keep memoizing exactly as before and a system flip costs
   /// them no repaint at all.
+  @MainActor
   var paintedIdentity: PaintedSkin { paintedIdentity(underDarkSystem: SystemAppearance.isDark) }
 
   /// The same identity with the system setting passed in rather than read, so a
@@ -659,6 +667,7 @@ struct PaintedSkin: Equatable {
 /// needs a nudge is SwiftUI — a system flip changes no `@Published` value on its
 /// own — and that nudge lives in `ThemeManager`, deliberately away from here.
 enum SystemAppearance {
+  @MainActor
   static var isDark: Bool { isDark(NSApplication.shared.effectiveAppearance) }
 
   /// Split out so a test can ask the same question of an appearance it built

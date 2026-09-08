@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -175,9 +176,11 @@ final class DispatchRootPersistenceTests: XCTestCase {
   }
 }
 
-private final class DispatchRootRecordingLauncher: AgentPromptLaunching, @unchecked Sendable {
-  private let lock = NSLock()
-  private var directories: [URL] = []
+private final class DispatchRootRecordingLauncher: AgentPromptLaunching, Sendable {
+  private struct State: Sendable {
+    var directories: [URL] = []
+  }
+  private let state = Mutex(State())
 
   func dispatch(
     workflow: String,
@@ -185,9 +188,9 @@ private final class DispatchRootRecordingLauncher: AgentPromptLaunching, @unchec
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    directories.append(workingDirectoryURL.standardizedFileURL)
-    lock.unlock()
+    state.withLock { state in
+      state.directories.append(workingDirectoryURL.standardizedFileURL)
+    }
     return AgentDispatchMetadata(
       runID: "dispatch-root-test",
       reportPath: nil,
@@ -197,8 +200,8 @@ private final class DispatchRootRecordingLauncher: AgentPromptLaunching, @unchec
   }
 
   func workingDirectories() -> [URL] {
-    lock.lock()
-    defer { lock.unlock() }
-    return directories
+    return state.withLock { state in
+      return state.directories
+    }
   }
 }

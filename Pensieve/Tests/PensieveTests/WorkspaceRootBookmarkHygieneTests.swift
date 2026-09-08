@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -544,19 +545,21 @@ private struct RootBookmarkHarness {
 
 /// Every root list the injected scanner was handed, recorded off the main actor
 /// because the workspace walk runs there.
-private final class ScannedRootRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var recorded: [[URL]] = []
+private final class ScannedRootRecorder: Sendable {
+  private struct State: Sendable {
+    var recorded: [[URL]] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ roots: [URL]) {
-    lock.lock()
-    defer { lock.unlock() }
-    recorded.append(roots)
+    return state.withLock { state in
+      state.recorded.append(roots)
+    }
   }
 
   var walks: [[URL]] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recorded
+    return state.withLock { state in
+      return state.recorded
+    }
   }
 }

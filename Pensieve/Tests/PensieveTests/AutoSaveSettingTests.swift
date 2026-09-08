@@ -810,13 +810,14 @@ final class AutoSaveSettingTests: XCTestCase {
     BookmarkStore(defaults: makeEphemeralDefaults(prefix: "PensieveAutoSaveBookmarkTests"))
   }
 
+  @MainActor
   private func waitUntil(
     timeout: TimeInterval = 2,
     condition: @escaping @MainActor () -> Bool
   ) async throws {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-      if await MainActor.run(body: condition) { return }
+      if condition() { return }
       try await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("Timed out waiting for condition")

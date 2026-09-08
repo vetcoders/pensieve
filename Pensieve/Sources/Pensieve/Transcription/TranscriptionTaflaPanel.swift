@@ -32,7 +32,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     self.panelIsVisible = panelIsVisible
   }
 
-  deinit {
+  isolated deinit {
     if let sendEventMonitor {
       NSEvent.removeMonitor(sendEventMonitor)
     }

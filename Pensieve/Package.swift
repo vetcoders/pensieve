@@ -1,4 +1,4 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.2
 // Pensieve — native macOS markdown editor (file-first, source-first)
 
 import Foundation
@@ -30,13 +30,11 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
             resources: [
-                .process("Resources/Assets.xcassets"),
                 .copy("Resources/markdown.css"),
                 .copy("Resources/gfm.css"),
                 .copy("Resources/mermaid.min.js"),
                 .copy("Resources/katex.min.js"),
                 .copy("Resources/katex.inline.min.css"),
-                .copy("Resources/sample.md"),
                 // Bundled OFL theme fonts (family→files manifest in
                 // BundledFonts.swift). `.copy` preserves the per-family
                 // directory tree verbatim — including each family's OFL.txt
@@ -66,8 +64,5 @@ let package = Package(
             ]
         )
     ],
-    // Tools bumped to 6.0 for the macOS 15 target (Observation needs >= 14).
-    // Pin Swift 5 language mode: this is NOT a Swift 6 strict-concurrency
-    // migration — that would be a separate, much larger change.
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v6]
 )

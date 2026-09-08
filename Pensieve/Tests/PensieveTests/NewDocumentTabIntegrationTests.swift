@@ -293,6 +293,7 @@ final class NewDocumentTabIntegrationTests: XCTestCase {
     }
   }
 
+  @MainActor
   fileprivate final class Counters {
     var factoryCalls = 0
     var merges = 0

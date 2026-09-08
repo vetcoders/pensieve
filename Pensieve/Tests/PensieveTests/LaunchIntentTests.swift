@@ -650,17 +650,17 @@ final class LaunchIntentTests: XCTestCase {
 
   @MainActor
   func testApplicationGlobalQuitHonorsTheProtectedTerminationReply() {
-    var reply: NSApplication.TerminateReply = .terminateCancel
+    let reply = MainActorTestValue<NSApplication.TerminateReply>(.terminateCancel)
     var terminateCalls = 0
     let lane = ApplicationCommandLane(
-      resolveTermination: { reply },
+      resolveTermination: { reply.value },
       terminate: { terminateCalls += 1 },
       showAbout: {})
 
     lane.quit()
     XCTAssertEqual(terminateCalls, 0, "a cancelled dirty-session pass still terminated the app")
 
-    reply = .terminateNow
+    reply.value = .terminateNow
     lane.quit()
     XCTAssertEqual(terminateCalls, 1)
   }
@@ -813,21 +813,22 @@ final class LaunchIntentTests: XCTestCase {
     let live = try makeRestoreHarness(documentNames: [])
     var createCalls = 0
     var didReenter = false
-    var coordinator: LaunchIntentCoordinator!
-    coordinator = LaunchIntentCoordinator(
+    let coordinator = MainActorTestValue<LaunchIntentCoordinator?>(nil)
+    defer { coordinator.value = nil }
+    coordinator.value = LaunchIntentCoordinator(
       focusedControllerProvider: { nil },
       hasLiveDocumentCapableWindow: { true },
       createUntitledDocument: { _ in
         createCalls += 1
         if !didReenter {
           didReenter = true
-          coordinator.commandTargetDidBecomeAvailable(live.controller)
+          coordinator.value!.commandTargetDidBecomeAvailable(live.controller)
         }
         return true
       })
 
-    coordinator.requestNewDocument()
-    coordinator.commandTargetDidBecomeAvailable(live.controller)
+    coordinator.value!.requestNewDocument()
+    coordinator.value!.commandTargetDidBecomeAvailable(live.controller)
 
     XCTAssertEqual(createCalls, 1, "reentrant adoption consumed one New request twice")
   }

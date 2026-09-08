@@ -87,7 +87,7 @@ enum ToolbarOverflowRecipe {
 
   /// Strong per-window holder for the menu targets. `NSMenuItem.target` is weak,
   /// so an action object dropped here would leave every overflow entry dead.
-  private static let controllers =
+  @MainActor private static let controllers =
     NSMapTable<NSWindow, ToolbarOverflowController>.weakToStrongObjects()
 
   /// Gives every family that needs one an authored overflow entry. Returns
@@ -251,7 +251,7 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
     }
   }
 
-  deinit {
+  isolated deinit {
     if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
   }
 

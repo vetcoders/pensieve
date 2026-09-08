@@ -68,7 +68,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   /// Falls back to the preview resource bundle so a fresh app (no document
   /// loaded) is still well-defined without invoking SwiftPM's crash-prone
   /// `Bundle.module` accessor in packaged apps.
-  static func resolveBaseURL(for documentURL: URL?) -> URL? {
+  nonisolated static func resolveBaseURL(for documentURL: URL?) -> URL? {
     if let documentURL {
       return documentURL.deletingLastPathComponent()
     }
@@ -121,6 +121,7 @@ struct PreviewRepresentable: NSViewRepresentable {
   /// text mutations no longer reach the pipeline; theme switches, font-size
   /// changes, document switches, and explicit refresh-token bumps always
   /// pass through.
+  @MainActor
   final class Coordinator {
     let pipeline: PreviewPipeline
     private weak var previewView: PreviewWebView?

@@ -1,6 +1,7 @@
 import AppKit
 import GRDB
 import SwiftUI
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -1272,7 +1273,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let calls = BuilderCallCounter()
     let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
-      calls.count += 1
+      calls.increment()
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let recorder = BatchSizeRecorder()
@@ -1346,8 +1347,10 @@ final class PensieveSmokeTests: XCTestCase {
 
   /// Reference-typed call counter so the @Sendable workspace builder closure can tally
   /// invocations without capturing a mutable var (Swift 6 SendableClosureCaptures).
-  private final class BuilderCallCounter: @unchecked Sendable {
-    var count = 0
+  private final class BuilderCallCounter: Sendable {
+    private let storage = Mutex(0)
+    var count: Int { storage.withLock { $0 } }
+    func increment() { storage.withLock { $0 += 1 } }
   }
 
   // MARK: - RC-2: debounced, off-main watcher refresh
@@ -1367,7 +1370,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let calls = BuilderCallCounter()
     let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
-      calls.count += 1
+      calls.increment()
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let appState = AppState()
@@ -1408,7 +1411,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let calls = BuilderCallCounter()
     let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
-      calls.count += 1
+      calls.increment()
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let recorder = BatchSizeRecorder()
@@ -1469,7 +1472,7 @@ final class PensieveSmokeTests: XCTestCase {
 
     let calls = BuilderCallCounter()
     let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
-      calls.count += 1
+      calls.increment()
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let appState = AppState()
@@ -2291,7 +2294,7 @@ final class PensieveSmokeTests: XCTestCase {
     let recorder = BatchSizeRecorder()
     let calls = BuilderCallCounter()
     let builder: WorkspaceScanner.Builder = { rootURLs, exclusions in
-      calls.count += 1
+      calls.increment()
       return WorkspaceScanner.build(rootURLs: rootURLs, exclusions: exclusions)
     }
     let indexDatabase = IndexDatabase(
@@ -6993,7 +6996,7 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testDocumentWindowOpenDefersWindowCreationDuringModalRunLoop() throws {
-    var canMutateWindowTabs = false
+    let canMutateWindowTabs = MainActorTestValue(false)
     var scheduledWork: [@MainActor () -> Void] = []
     var factoryRefs: [DocumentRef?] = []
     let documentWindow = NSWindow(
@@ -7007,7 +7010,7 @@ final class PensieveSmokeTests: XCTestCase {
     }
 
     let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { canMutateWindowTabs },
+      canMutateWindowTabs: { canMutateWindowTabs.value },
       scheduleDeferredMainWork: { scheduledWork.append($0) },
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
@@ -7031,7 +7034,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(scheduledWork.count, 1, "modal-time open retries coalesce per document")
     XCTAssertTrue(factoryRefs.isEmpty)
 
-    canMutateWindowTabs = true
+    canMutateWindowTabs.value = true
     let deferredOpen = try XCTUnwrap(scheduledWork.popLast())
     deferredOpen()
 
@@ -7041,13 +7044,13 @@ final class PensieveSmokeTests: XCTestCase {
 
   @MainActor
   func testDocumentWindowAttachDefersNativeTabMutationDuringModalRunLoop() throws {
-    var canMutateWindowTabs = false
+    let canMutateWindowTabs = MainActorTestValue(false)
     var scheduledWork: [@MainActor () -> Void] = []
     var mergeCount = 0
     var orderCount = 0
 
     let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { canMutateWindowTabs },
+      canMutateWindowTabs: { canMutateWindowTabs.value },
       scheduleDeferredMainWork: { scheduledWork.append($0) },
       mergeWindowIntoTabs: { _, _ in mergeCount += 1 },
       orderAndActivateWindow: { _ in orderCount += 1 }
@@ -7078,7 +7081,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertEqual(mergeCount, 0)
     XCTAssertEqual(orderCount, 0)
 
-    canMutateWindowTabs = true
+    canMutateWindowTabs.value = true
     let deferredAttach = try XCTUnwrap(scheduledWork.popLast())
     deferredAttach()
 
@@ -7271,7 +7274,7 @@ final class PensieveSmokeTests: XCTestCase {
       documentWindow.close()
     }
 
-    var mergeTarget: NSWindow? = targetWindow
+    let mergeTarget = MainActorTestValue<NSWindow?>(targetWindow)
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in XCTFail("open should not defer outside modal UI") },
@@ -7285,7 +7288,7 @@ final class PensieveSmokeTests: XCTestCase {
         events.append("activate")
         XCTAssertTrue(window === documentWindow)
       },
-      currentMergeTarget: { mergeTarget },
+      currentMergeTarget: { mergeTarget.value },
       makeDocumentWindow: { ref, _ in
         events.append("create")
         factoryRefs.append(ref)
@@ -7306,7 +7309,7 @@ final class PensieveSmokeTests: XCTestCase {
     // activates it instead of creating another window. By then the document
     // window is the key window itself.
     events.removeAll()
-    mergeTarget = documentWindow
+    mergeTarget.value = documentWindow
     registry.open(DocumentRef(id: documentID))
 
     XCTAssertEqual(
@@ -7605,7 +7608,7 @@ final class PensieveSmokeTests: XCTestCase {
     var scheduledSweeps: [@MainActor () -> Void] = []
     var closedWindows: [NSWindow] = []
     var closedWindowIDs: Set<ObjectIdentifier> = []
-    var documentWindowIsAttached = false
+    let documentWindowIsAttached = MainActorTestValue(false)
 
     let launcherA = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
@@ -7646,7 +7649,7 @@ final class PensieveSmokeTests: XCTestCase {
       orderAndActivateWindow: { _ in },
       applicationWindows: {
         var windows = [launcherA, launcherB, strayWindow]
-        if documentWindowIsAttached {
+        if documentWindowIsAttached.value {
           windows.append(documentWindow)
         }
         return windows.filter {
@@ -7672,7 +7675,7 @@ final class PensieveSmokeTests: XCTestCase {
     XCTAssertLessThanOrEqual(Set(closedWindows.map { ObjectIdentifier($0) }).count, 2)
     XCTAssertTrue(closedWindows.allSatisfy { $0 === launcherA || $0 === launcherB })
 
-    documentWindowIsAttached = true
+    documentWindowIsAttached.value = true
     registry.attach(
       documentWindow,
       documentID: documentID,
@@ -8213,12 +8216,13 @@ final class PensieveSmokeTests: XCTestCase {
     RunLoop.main.run(until: Date().addingTimeInterval(0.5))
   }
 
+  @MainActor
   private func waitUntil(
     timeoutNanoseconds: UInt64 = 2_000_000_000,
     pollNanoseconds: UInt64 = 20_000_000,
     file: StaticString = #filePath,
     line: UInt = #line,
-    _ condition: () async throws -> Bool
+    _ condition: @MainActor () async throws -> Bool
   ) async throws {
     let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
 
@@ -8246,48 +8250,42 @@ private final class RecordingPreviewSink: PreviewSink {
   }
 }
 
-private final class BuildCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
+private final class BuildCounter: Sendable {
+  private struct State: Sendable {
+    var count = 0
+  }
+  private let state = Mutex(State())
 
   var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return count
+    return state.withLock { state in
+      return state.count
+    }
   }
 
   func increment() {
-    lock.lock()
-    count += 1
-    lock.unlock()
+    state.withLock { state in
+      state.count += 1
+    }
   }
 }
 
-private final class RebuildProbe: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
-  private var nextRebuildExpectation: XCTestExpectation?
-
-  var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return count
+private final class RebuildProbe: Sendable {
+  private struct State: Sendable {
+    var count = 0
+    var next: XCTestExpectation?
   }
-
+  private let state = Mutex(State())
+  var value: Int { state.withLock { $0.count } }
   func expectNextRebuild(_ expectation: XCTestExpectation) {
-    lock.lock()
-    nextRebuildExpectation = expectation
-    lock.unlock()
+    state.withLock { $0.next = expectation }
   }
-
   func recordBuild() {
-    lock.lock()
-    count += 1
-    let expectation = count > 1 ? nextRebuildExpectation : nil
-    if expectation != nil {
-      nextRebuildExpectation = nil
+    let expectation = state.withLock { state -> XCTestExpectation? in
+      state.count += 1
+      guard state.count > 1 else { return nil }
+      defer { state.next = nil }
+      return state.next
     }
-    lock.unlock()
     expectation?.fulfill()
   }
 }
@@ -8296,7 +8294,7 @@ private final class RebuildProbe: @unchecked Sendable {
 /// reconciles: a live FSEvents stream on the fixture root would deliver real events for the
 /// same mutations and add machine-timing-dependent scans (same discipline as
 /// WorkspaceFreshnessTests).
-private final class InertWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
+private final class InertWatcherEventSource: FileWatcherEventSource, Sendable {
   func start(
     paths: [String],
     onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void
@@ -8306,67 +8304,60 @@ private final class InertWatcherEventSource: FileWatcherEventSource, @unchecked 
 }
 
 /// Thread-placement probe for injected workspace builders (Sendable-safe counter + flags).
-private final class ScanThreadRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var mainThreadFlags: [Bool] = []
+private final class ScanThreadRecorder: Sendable {
+  private struct State: Sendable {
+    var mainThreadFlags: [Bool] = []
+  }
+  private let state = Mutex(State())
 
   func record(isMainThread: Bool) {
-    lock.lock()
-    mainThreadFlags.append(isMainThread)
-    lock.unlock()
+    state.withLock { state in
+      state.mainThreadFlags.append(isMainThread)
+    }
   }
 
   var count: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return mainThreadFlags.count
+    return state.withLock { state in
+      return state.mainThreadFlags.count
+    }
   }
 
   func samples(after callCount: Int) -> [Bool] {
-    lock.lock()
-    defer { lock.unlock() }
-    return Array(mainThreadFlags.dropFirst(callCount))
+    return state.withLock { state in
+      return Array(state.mainThreadFlags.dropFirst(callCount))
+    }
   }
 }
 
-private final class BatchSizeRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var recordedValues: [Int] = []
+private final class BatchSizeRecorder: Sendable {
+  private struct State: Sendable {
+    var recordedValues: [Int] = []
+  }
+  private let state = Mutex(State())
 
   var values: [Int] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recordedValues
+    return state.withLock { state in
+      return state.recordedValues
+    }
   }
 
   func record(_ size: Int) {
-    lock.lock()
-    recordedValues.append(size)
-    lock.unlock()
+    state.withLock { state in
+      state.recordedValues.append(size)
+    }
   }
 }
 
-private final class BlockingBatchProbe: @unchecked Sendable {
-  private let lock = NSLock()
-  private var didBlock = false
+private final class BlockingBatchProbe: Sendable {
+  private let didBlock = Mutex(false)
   private let onFirstBatch: @Sendable () -> Void
-
-  init(onFirstBatch: @escaping @Sendable () -> Void) {
-    self.onFirstBatch = onFirstBatch
-  }
-
+  init(onFirstBatch: @escaping @Sendable () -> Void) { self.onFirstBatch = onFirstBatch }
   func recordBatch(_ size: Int) {
     guard size > 0 else { return }
-
-    lock.lock()
-    let shouldBlock = !didBlock
-    if shouldBlock {
-      didBlock = true
+    let shouldBlock = didBlock.withLock { value in
+      defer { value = true }
+      return !value
     }
-    lock.unlock()
-
-    if shouldBlock {
-      onFirstBatch()
-    }
+    if shouldBlock { onFirstBatch() }
   }
 }

@@ -411,6 +411,7 @@ struct EditorRepresentable: NSViewRepresentable {
     Coordinator()
   }
 
+  @MainActor
   final class Coordinator {
     var surface: MarkdownEditorSurface?
     /// Guards the surface re-theme, so `updateNSView` re-themes only on a real
@@ -476,6 +477,7 @@ private final class EditorSurfaceScrollView: NSScrollView {
   }
 }
 
+@MainActor
 final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   let scrollView: NSScrollView
   let textView: MarkdownTextView
@@ -944,7 +946,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
   }
 
-  deinit {
+  isolated deinit {
     pendingScrollSyncSample?.cancel()
     NotificationCenter.default.removeObserver(self)
   }
@@ -1484,7 +1486,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     return ParagraphSeparatorScan(count: count, lastSeparatorEnd: lastSeparatorEnd)
   }
 
-  static func centeredScrollY(
+  nonisolated static func centeredScrollY(
     caretMidY: CGFloat,
     visibleHeight: CGFloat,
     documentHeight: CGFloat

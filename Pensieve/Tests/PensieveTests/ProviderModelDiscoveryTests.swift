@@ -1,8 +1,10 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
 
+@MainActor
 final class ProviderModelDiscoveryTests: XCTestCase {
   func testOpenAIDiscoversNormalizesAndCachesModels() async throws {
     let defaults = makeDiscoveryDefaults()
@@ -100,7 +102,9 @@ final class ProviderModelDiscoveryTests: XCTestCase {
     XCTAssertEqual(result.models.map(\.id), ["gpt-cached"])
   }
 
-  private static func response(for request: URLRequest, statusCode: Int) -> HTTPURLResponse {
+  nonisolated private static func response(for request: URLRequest, statusCode: Int)
+    -> HTTPURLResponse
+  {
     HTTPURLResponse(
       url: request.url!, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
   }
@@ -110,19 +114,21 @@ final class ProviderModelDiscoveryTests: XCTestCase {
   }
 }
 
-private final class ModelRequestRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storedRequests: [URLRequest] = []
+private final class ModelRequestRecorder: Sendable {
+  private struct State: Sendable {
+    var storedRequests: [URLRequest] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ request: URLRequest) {
-    lock.lock()
-    storedRequests.append(request)
-    lock.unlock()
+    state.withLock { state in
+      state.storedRequests.append(request)
+    }
   }
 
   var requests: [URLRequest] {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedRequests
+    return state.withLock { state in
+      return state.storedRequests
+    }
   }
 }

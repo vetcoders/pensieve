@@ -299,8 +299,8 @@ struct ApplicationCommandLane {
   var showAbout: @MainActor () -> Void = {
     PensieveAboutPanel.show()
   }
-  var showSettings:
-    @MainActor (PensieveSettingsSection) -> PensieveSettingsPresentationResult = { section in
+  var showSettings: @MainActor (PensieveSettingsSection) -> PensieveSettingsPresentationResult = {
+    section in
     PensieveSettingsWindowController.shared.show(section: section)
   }
 
@@ -385,12 +385,12 @@ struct PensieveCommands: Commands {
       SettingsWindowCommands(controller: settingsController)
     case .document:
       if let target {
-      ActivePensieveCommands(
-        appState: target.state,
-        controller: target.controller,
-        themeManager: themeManager,
-        recentDocuments: target.controller.recentDocuments
-      )
+        ActivePensieveCommands(
+          appState: target.state,
+          controller: target.controller,
+          themeManager: themeManager,
+          recentDocuments: target.controller.recentDocuments
+        )
       }
     case .zeroWindow:
       // Closing the last window leaves the process alive on purpose, and every

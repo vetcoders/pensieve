@@ -845,7 +845,9 @@ struct SidebarView: View {
           .accessibilityIdentifier("pensieve.sidebar.cancelRename")
         }
 
-        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: renameText, isFolder: isFolder) {
+        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(
+          typedName: renameText, isFolder: isFolder)
+        {
           Text("Will be shown as non-markdown")
             .font(.caption2)
             .foregroundColor(.secondary)
@@ -1269,6 +1271,7 @@ private struct InlineRenameField: NSViewRepresentable {
     Coordinator(parent: self)
   }
 
+  @MainActor
   final class Coordinator: NSObject, NSTextFieldDelegate {
     var parent: InlineRenameField
     var lastFocusToken: Int

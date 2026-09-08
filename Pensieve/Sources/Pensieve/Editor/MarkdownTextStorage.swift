@@ -1,6 +1,10 @@
 import AppKit
 
-class MarkdownTextStorage: NSTextContentStorage {
+// NSTextContentStorage predates actor annotations. This subclass confines all
+// mutable highlighting state to MainActor and checks its legacy processEditing
+// callback with assumeIsolated; no background task may drive TextKit editing.
+@MainActor
+final class MarkdownTextStorage: NSTextContentStorage {
   let highlighter = SyntaxHighlighter()
   let codeBlockHighlighter = CodeBlockHighlighter()
   private var highlightWorkItem: DispatchWorkItem?
@@ -126,7 +130,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     MarkdownTextStorage.timerRethemeChunkScheduler
 
   /// The production scheduler, named so a pin that swaps it can put it back.
-  static let timerRethemeChunkScheduler: (TimeInterval, DispatchWorkItem) -> Void = {
+  static let timerRethemeChunkScheduler: @Sendable (TimeInterval, DispatchWorkItem) -> Void = {
     delay, work in
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
   }
@@ -399,7 +403,7 @@ class MarkdownTextStorage: NSTextContentStorage {
     highlighter.baseFont
   }
 
-  override func processEditing(
+  nonisolated override func processEditing(
     for textStorage: NSTextStorage, edited editMask: NSTextStorageEditActions,
     range newCharRange: NSRange, changeInLength delta: Int,
     invalidatedRange invalidatedCharRange: NSRange
@@ -409,9 +413,28 @@ class MarkdownTextStorage: NSTextContentStorage {
       for: textStorage, edited: editMask, range: newCharRange, changeInLength: delta,
       invalidatedRange: invalidatedCharRange)
 
-    if editMask.contains(.editedCharacters) {
+    // TextKit invokes this override on the UI thread; keep its legacy
+    // nonisolated entry point and assert that boundary before touching UI state.
+    let editedString = textStorage.string
+    let editedCharacters = editMask.contains(.editedCharacters)
+    // NSTextContentStorage's nonisolated Objective-C override cannot express this UI-only
+    // subclass contract. This local alias is consumed synchronously by the checked actor
+    // entry below; it is never stored, sent to a task, or exposed as Sendable.
+    nonisolated(unsafe) let uiStorage = self
+    MainActor.assumeIsolated {
+      uiStorage.processUIEdit(
+        editedString: editedString, editedCharacters: editedCharacters,
+        newCharRange: newCharRange, delta: delta, invalidatedCharRange: invalidatedCharRange)
+    }
+  }
+
+  private func processUIEdit(
+    editedString: String, editedCharacters: Bool, newCharRange: NSRange,
+    delta: Int, invalidatedCharRange: NSRange
+  ) {
+    if editedCharacters {
       let oldString = lastProcessedString as NSString
-      let newString = textStorage.string as NSString
+      let newString = editedString as NSString
       let editedRange = postEditRange(
         newCharRange: newCharRange,
         invalidatedCharRange: invalidatedCharRange,
@@ -433,7 +456,7 @@ class MarkdownTextStorage: NSTextContentStorage {
         delta: delta,
         requiresFullRefresh: requiresFullRefresh
       )
-      lastProcessedString = textStorage.string
+      lastProcessedString = editedString
       onCharactersEdited?(editedRange.location, delta)
     }
   }

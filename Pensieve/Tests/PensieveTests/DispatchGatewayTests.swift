@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -551,6 +552,7 @@ final class DispatchGatewayTests: XCTestCase {
     XCTFail("Timed out waiting for the capability probe to settle")
   }
 
+  @MainActor
   private func waitUntil(
     timeout: TimeInterval = 2,
     condition: @escaping @Sendable () -> Bool
@@ -564,17 +566,19 @@ final class DispatchGatewayTests: XCTestCase {
   }
 }
 
-private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked Sendable {
-  struct Request: Equatable {
+private final class GatewayRecordingLauncher: AgentPromptLaunching, Sendable {
+  struct Request: Equatable, Sendable {
     let workflow: String
     let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
   }
 
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var recordedRequests: [Request] = []
+  }
+  private let state = Mutex(State())
   private let result: AgentDispatchMetadata?
-  private var recordedRequests: [Request] = []
 
   init(result: AgentDispatchMetadata? = nil) {
     self.result = result
@@ -586,14 +590,14 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    recordedRequests.append(
-      Request(
-        workflow: workflow,
-        agents: agents,
-        payload: payload,
-        workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
-    lock.unlock()
+    state.withLock { state in
+      state.recordedRequests.append(
+        Request(
+          workflow: workflow,
+          agents: agents,
+          payload: payload,
+          workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
+    }
     return result
       ?? AgentDispatchMetadata(
         runID: "gateway-test", reportPath: nil, exitCode: 0, output: "receipt",
@@ -603,18 +607,20 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, @unchecked S
   }
 
   func requests() -> [Request] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recordedRequests
+    return state.withLock { state in
+      return state.recordedRequests
+    }
   }
 }
 
 /// Holds the launch open until released so the in-flight guard is observable
 /// deterministically (no timing races).
-private final class BlockingLauncher: AgentPromptLaunching, @unchecked Sendable {
-  private let lock = NSLock()
+private final class BlockingLauncher: AgentPromptLaunching, Sendable {
+  private struct State: Sendable {
+    var started = 0
+  }
+  private let state = Mutex(State())
   private let gate = DispatchSemaphore(value: 0)
-  private var started = 0
 
   func dispatch(
     workflow: String,
@@ -622,9 +628,9 @@ private final class BlockingLauncher: AgentPromptLaunching, @unchecked Sendable 
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    started += 1
-    lock.unlock()
+    state.withLock { state in
+      state.started += 1
+    }
     gate.wait()
     return AgentDispatchMetadata(
       runID: "blocking-test", reportPath: nil, exitCode: 0, output: "receipt",
@@ -632,9 +638,9 @@ private final class BlockingLauncher: AgentPromptLaunching, @unchecked Sendable 
   }
 
   func startedCount() -> Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return started
+    return state.withLock { state in
+      return state.started
+    }
   }
 
   func release() {

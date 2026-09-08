@@ -63,7 +63,7 @@ final class PreviewWebView: NSView {
     fatalError("init(coder:) not used")
   }
 
-  deinit {
+  isolated deinit {
     titlebarGlassController.invalidate()
   }
 
@@ -307,7 +307,6 @@ final class PreviewWebView: NSView {
   /// `appearanceCSS` meant every debounced keystroke rescanned the `Fonts`
   /// directory, re-read the faces and re-joined the whole blob before anything
   /// compared it. Assembled at most once per skin instead.
-  private static let fontFaceCSSLock = NSLock()
   private static var fontFaceCSSBySkin: [PensieveTheme: String] = [:]
 
   /// Test seam: how many times a skin payload has actually been assembled, so
@@ -317,8 +316,6 @@ final class PreviewWebView: NSView {
   private static func cachedFontFaceCSS(for skin: PensieveTheme, referencedIn skinBlock: String)
     -> String
   {
-    fontFaceCSSLock.lock()
-    defer { fontFaceCSSLock.unlock() }
     if let cached = fontFaceCSSBySkin[skin] { return cached }
     let assembled = BundledFonts.fontFaceCSS(referencedIn: skinBlock)
     fontFaceCSSBySkin[skin] = assembled
@@ -1304,6 +1301,7 @@ final class PreviewWebView: NSView {
 /// silent — the OS pocket owns both the offset and the scrolled dissolve, and
 /// the CSS variable keeps its 0px default (polarize L3). One offset owner per
 /// OS generation, boundary explicit here.
+@MainActor
 final class PreviewTitlebarGlassController: NSObject {
   static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
 
@@ -1334,7 +1332,7 @@ final class PreviewTitlebarGlassController: NSObject {
   private var pendingUpdateNeedsForce = false
   private var lastAppliedHeight: CGFloat?
 
-  deinit {
+  isolated deinit {
     invalidate()
   }
 
@@ -1426,8 +1424,13 @@ final class PreviewTitlebarGlassController: NSObject {
     // measured mid-construction — the stale value that both parked the page
     // start a band below the editor's and painted the 7-9 underlay stripe.
     contentLayoutObservation?.invalidate()
-    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) { [weak self] _, _ in
-      self?.scheduleUpdate()
+    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) {
+      @Sendable [weak self] _, _ in
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.scheduleUpdate() }
+      } else {
+        Task { @MainActor [weak self] in self?.scheduleUpdate() }
+      }
     }
   }
 
@@ -1482,7 +1485,7 @@ extension PreviewWebView: WKNavigationDelegate {
   func webView(
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction,
-    decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
   ) {
     if navigationAction.navigationType == .linkActivated,
       let url = navigationAction.request.url

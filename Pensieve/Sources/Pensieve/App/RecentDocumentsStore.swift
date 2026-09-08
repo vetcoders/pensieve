@@ -5,6 +5,7 @@ import Foundation
 /// `NSDocumentController` owns persistence (ordering, dedupe, relaunch
 /// survival); this protocol mirrors only the three operations Pensieve uses,
 /// so no second persisted list can grow behind the system one.
+@MainActor
 protocol RecentDocumentsControlling: AnyObject {
   var recentDocumentURLs: [URL] { get }
   func noteNewRecentDocumentURL(_ url: URL)

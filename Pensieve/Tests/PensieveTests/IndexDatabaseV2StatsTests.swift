@@ -1,5 +1,6 @@
 import GRDB
 import Observation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -779,18 +780,21 @@ final class IndexDatabaseV2StatsTests: XCTestCase {
 
 /// Thread-safe walk counter so the `@Sendable` workspace builder closure can tally how many
 /// times the tree was walked (proves the single-walk invariant on a valid-skip relaunch).
-private final class BuilderCallCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
+private final class BuilderCallCounter: Sendable {
+  private struct State: Sendable {
+    var count = 0
+  }
+  private let state = Mutex(State())
+
   var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return count
+    return state.withLock { state in
+      return state.count
+    }
   }
   func increment() {
-    lock.lock()
-    count += 1
-    lock.unlock()
+    state.withLock { state in
+      state.count += 1
+    }
   }
 }
 

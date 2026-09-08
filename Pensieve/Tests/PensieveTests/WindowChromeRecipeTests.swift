@@ -4,6 +4,7 @@ import XCTest
 
 @testable import Pensieve
 
+@MainActor
 final class WindowChromeRecipeTests: XCTestCase {
   @MainActor
   func testAppKitRecipeAppliesUnifiedDocumentChrome() {

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-struct WorkspaceIdentity: Codable, Equatable, Hashable {
+struct WorkspaceIdentity: Codable, Equatable, Hashable, Sendable {
   var workspaceID: String
   var canonicalRootURL: URL
   var canonicalRootURLs: [URL]

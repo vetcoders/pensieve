@@ -4,7 +4,7 @@ import Foundation
 
 // MARK: - Pipeline value types
 
-enum PreviewRenderMode: Equatable {
+enum PreviewRenderMode: Equatable, Sendable {
   case markdown
   case plainText
 }
@@ -17,7 +17,7 @@ enum PreviewRenderMode: Equatable {
 /// button, `AppState.requestPreviewRefresh()`); it carries no semantic payload
 /// but participates in equality so the dedupe step releases an otherwise
 /// identical request.
-struct PreviewRenderRequest: Equatable {
+struct PreviewRenderRequest: Equatable, Sendable {
   let markdown: String
   let fontSize: CGFloat
   let theme: ThemeManager.Theme
@@ -61,7 +61,7 @@ struct PreviewRenderRequest: Equatable {
 ///     markdown -> render scheduling -> HTML document -> WKWebView load
 ///
 /// Tests inspect `html` directly without spinning up a WebView.
-struct PreviewDocument: Equatable {
+struct PreviewDocument: Equatable, Sendable {
   let html: String
   let baseURL: URL?
   let bodyHTML: String
@@ -83,6 +83,7 @@ extension PreviewDocument {
   /// sanitized so an embedded `</style>` fragment cannot escape the style
   /// block; appearance CSS comes from `PreviewWebView` so the renderer-side and
   /// webview-side surfaces share one source of truth.
+  @MainActor
   static func make(
     body: String,
     css: String,
@@ -180,6 +181,7 @@ extension PreviewDocument {
 /// The output stage of the pipeline: anything that can swallow a composed
 /// `PreviewDocument`. `PreviewWebView` is the only production sink; tests use
 /// a recording sink to assert on document construction and scheduling.
+@MainActor
 protocol PreviewSink: AnyObject {
   func load(document: PreviewDocument)
 }
@@ -201,6 +203,7 @@ protocol PreviewSink: AnyObject {
 ///
 /// The pipeline outlives SwiftUI re-renders because it is owned by
 /// `PreviewRepresentable.Coordinator`.
+@MainActor
 final class PreviewPipeline {
   private let renderer: MarkdownRenderer
   private let themeManager: ThemeManager
@@ -239,8 +242,12 @@ final class PreviewPipeline {
       subject
       .removeDuplicates()
       .debounce(for: debounceInterval, scheduler: scheduler)
-      .sink { [weak self] request in
-        self?.apply(request)
+      .sink { @Sendable [weak self] request in
+        if Thread.isMainThread {
+          MainActor.assumeIsolated { self?.apply(request) }
+        } else {
+          Task { @MainActor [weak self] in self?.apply(request) }
+        }
       }
   }
 

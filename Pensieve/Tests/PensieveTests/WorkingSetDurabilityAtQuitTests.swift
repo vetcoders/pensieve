@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -179,25 +180,13 @@ final class TerminationRunCompletion {
 /// cfprefsd's business. Backed by an absolute-path suite, so it strands nothing
 /// in `~/Library/Preferences`.
 class FlushCountingDefaults: UserDefaults {
-  private let lock = NSLock()
-  private nonisolated(unsafe) var flushes = 0
-
-  var synchronizeCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return flushes
-  }
-
+  private let flushes = Mutex(0)
+  var synchronizeCount: Int { flushes.withLock { $0 } }
   override func synchronize() -> Bool {
     countFlush()
     return super.synchronize()
   }
-
-  final func countFlush() {
-    lock.lock()
-    flushes += 1
-    lock.unlock()
-  }
+  final func countFlush() { flushes.withLock { $0 += 1 } }
 }
 
 /// `UserDefaults` whose flush never comes back until the test lets it, standing in for the case the

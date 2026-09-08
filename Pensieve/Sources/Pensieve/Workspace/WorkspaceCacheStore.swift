@@ -1,6 +1,6 @@
 import Foundation
 
-struct TreeFingerprint: Codable, Equatable {
+struct TreeFingerprint: Codable, Equatable, Sendable {
   var treeHash: String
   var fileCount: Int
   var folderCount: Int
@@ -179,7 +179,7 @@ enum BasicCacheVerdict: Equatable {
 
 /// Immutable cache-root handle safe to share with detached validation jobs. Encoders/decoders are
 /// created per operation below; Foundation coders are not shared across threads.
-final class WorkspaceCacheStore: @unchecked Sendable {
+final class WorkspaceCacheStore: Sendable {
   static let shared = WorkspaceCacheStore()
 
   private static let protectedWriteOptions: Data.WritingOptions = [

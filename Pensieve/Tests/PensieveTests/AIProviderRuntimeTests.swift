@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -354,66 +355,66 @@ private struct StubProviderEnvironment: ProviderEnvironmentManaging {
   func removeValue(forKey key: String) throws {}
 }
 
-private final class RequestRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storedRequests: [URLRequest] = []
+private final class RequestRecorder: Sendable {
+  private struct State: Sendable {
+    var storedRequests: [URLRequest] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ request: URLRequest) {
-    lock.lock()
-    storedRequests.append(request)
-    lock.unlock()
+    state.withLock { state in
+      state.storedRequests.append(request)
+    }
   }
 
   var request: URLRequest? {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedRequests.last
+    return state.withLock { state in
+      return state.storedRequests.last
+    }
   }
 
   var requests: [URLRequest] {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedRequests
+    return state.withLock { state in
+      return state.storedRequests
+    }
   }
 }
 
-private final class SequencedRequestSender: @unchecked Sendable {
-  private let lock = NSLock()
-  private var responses: [(Int, String)]
-
-  init(responses: [(Int, String)]) {
-    self.responses = responses
-  }
-
+private final class SequencedRequestSender: Sendable {
+  private let responses: Mutex<[(Int, String)]>
+  init(responses: [(Int, String)]) { self.responses = Mutex(responses) }
   func send(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
-    lock.lock()
-    defer { lock.unlock() }
-    guard !responses.isEmpty else { throw URLError(.badServerResponse) }
-    let next = responses.removeFirst()
+    let next = try responses.withLock { responses in
+      guard !responses.isEmpty else { throw URLError(.badServerResponse) }
+      return responses.removeFirst()
+    }
     return (
       Data(next.1.utf8),
       HTTPURLResponse(
-        url: request.url!, statusCode: next.0, httpVersion: "HTTP/1.1", headerFields: nil)!
+        url: request.url!, statusCode: next.0,
+        httpVersion: "HTTP/1.1", headerFields: nil)!
     )
   }
 }
 
-private final class StubProviderKeychain: ProviderAPIKeyStoring, @unchecked Sendable {
-  private let lock = NSLock()
+private final class StubProviderKeychain: ProviderAPIKeyStoring, Sendable {
+  private struct State: Sendable {
+    var loads = 0
+  }
+  private let state = Mutex(State())
   private let value: String?
-  private var loads = 0
 
   init(value: String?) {
     self.value = value
   }
 
   func loadAPIKey() throws -> String? {
-    lock.withLock { loads += 1 }
+    state.withLock { state in state.loads += 1 }
     return value
   }
 
   func storeAPIKey(_ apiKey: String) throws {}
   func deleteAPIKey() throws {}
 
-  var loadCount: Int { lock.withLock { loads } }
+  var loadCount: Int { state.withLock { state in state.loads } }
 }
