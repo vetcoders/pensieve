@@ -54,4 +54,10 @@ struct DispatchIntent: Equatable, Identifiable {
   var subjectIsEmpty: Bool {
     payload.isEmpty
   }
+
+  /// W6-01 ready predicate: a non-empty subject is not enough; vibecrafted-mcp
+  /// must be connected. Existing stored properties stay unchanged.
+  func isReady(mcpStatus: VibecraftedMCPConnectionStatus) -> Bool {
+    !subjectIsEmpty && mcpStatus.isReady
+  }
 }

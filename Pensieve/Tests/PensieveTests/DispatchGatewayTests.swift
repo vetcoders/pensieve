@@ -365,6 +365,128 @@ final class DispatchGatewayTests: XCTestCase {
         observeAgent: "swarm"))
   }
 
+  // MARK: - MCP ready predicate (W6-01)
+
+  @MainActor
+  func testDispatchConfirmDisabledWhenMCPIsNotConnected() {
+    XCTAssertFalse(
+      DispatchPopover.canConfirmDispatch(
+        subjectIsEmpty: false, plan: .singleAgent, mcpStatus: .notConfigured))
+    XCTAssertFalse(
+      DispatchPopover.canConfirmDispatch(
+        subjectIsEmpty: false, plan: .singleAgent, mcpStatus: .unreachable))
+    XCTAssertTrue(
+      DispatchPopover.canConfirmDispatch(
+        subjectIsEmpty: false, plan: .singleAgent, mcpStatus: .connected))
+    XCTAssertFalse(
+      DispatchPopover.canConfirmDispatch(
+        subjectIsEmpty: true, plan: .singleAgent, mcpStatus: .connected))
+    XCTAssertFalse(
+      DispatchPopover.canConfirmDispatch(
+        subjectIsEmpty: false, plan: .loading, mcpStatus: .connected))
+  }
+
+  func testIntentReadyPredicateRequiresMCPConnection() {
+    let url = URL(fileURLWithPath: "/tmp/plan.md")
+    let intent = DispatchIntent(
+      subject: .fileURL(url), workflow: "review", source: .sidebar)
+    XCTAssertTrue(intent.isReady(mcpStatus: .connected))
+    XCTAssertFalse(intent.isReady(mcpStatus: .notConfigured))
+    XCTAssertFalse(intent.isReady(mcpStatus: .unreachable))
+  }
+
+  @MainActor
+  func testConfirmFailsClosedWhenProductionLauncherHasNoMCPConnection() async {
+    let transport = FakeVibecraftedMCPTransport(probeStatus: .notConfigured)
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(),
+      transport: transport,
+      isExecutable: { _ in false })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: TranscriptionService(cadenceCommitNanoseconds: 0),
+      agentPromptLauncher: launcher)
+    let intent = DispatchIntent(
+      subject: .fileURL(URL(fileURLWithPath: "/tmp/gateway-mcp.md")),
+      workflow: "review",
+      source: .sidebar)
+
+    let outcome = await controller.confirmDispatch(
+      intent: intent, workflow: "review", agents: ["codex"],
+      rootURL: URL(fileURLWithPath: "/tmp"))
+    guard case .failure(let message) = outcome else {
+      return XCTFail("Expected confirm to fail closed without MCP")
+    }
+    XCTAssertTrue(
+      message.contains("not configured"),
+      "refusal must name the MCP gap: \(message)")
+    XCTAssertTrue(transport.toolCalls().isEmpty)
+  }
+
+  @MainActor
+  func testConfirmProceedsThroughConnectedFakeMCPTransportToAReceipt() async {
+    let transport = FakeVibecraftedMCPTransport(
+      probeStatus: .connected,
+      toolResult: [
+        "ok": true,
+        "run_id": "gateway-mcp-1",
+        "agent": "grok",
+        "report": "/tmp/reports/gateway-mcp-1.md",
+      ])
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/live-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/live-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+    let appState = AppState()
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: TranscriptionService(cadenceCommitNanoseconds: 0),
+      agentPromptLauncher: launcher)
+    let fileURL = URL(fileURLWithPath: "/tmp/gateway-mcp-connected.md")
+    let rootURL = URL(fileURLWithPath: "/tmp/mcp-root", isDirectory: true)
+
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(subject: .fileURL(fileURL), workflow: "review", source: .sidebar),
+      workflow: "review",
+      agents: ["grok"],
+      rootURL: rootURL)
+    guard
+      case .success(let runID, let reportPath, let observeAgent, _) = outcome
+    else {
+      return XCTFail("Expected a connected fake MCP transport to yield a receipt")
+    }
+    XCTAssertEqual(runID, "gateway-mcp-1")
+    XCTAssertEqual(reportPath, "/tmp/reports/gateway-mcp-1.md")
+    XCTAssertEqual(observeAgent, "grok")
+    XCTAssertEqual(transport.toolCalls().map(\.name), ["vc_run_launch"])
+    XCTAssertEqual(
+      DispatchPopover.resolvedPhase(for: outcome),
+      .dispatched(
+        runID: "gateway-mcp-1",
+        reportPath: "/tmp/reports/gateway-mcp-1.md",
+        observeAgent: "grok"))
+  }
+
+  func testDispatchPopoverStillOwnsTheModalWorkflowMenuAndReceiptActions() throws {
+    let popover = try Self.source(of: "App/DispatchPopover.swift")
+    XCTAssertTrue(popover.contains("struct DispatchPopover: View"))
+    XCTAssertTrue(popover.contains("Picker(\"Workflow\""))
+    XCTAssertTrue(popover.contains("pensieve.dispatch.workflow"))
+    XCTAssertTrue(popover.contains("func swarmSection"))
+    XCTAssertTrue(popover.contains("Reveal report"))
+    XCTAssertTrue(popover.contains("Check status in Terminal"))
+    XCTAssertTrue(popover.contains("static func receiptActions"))
+    XCTAssertFalse(popover.contains("ComposerPalette"))
+    XCTAssertFalse(popover.contains("AgentChat"))
+  }
+
   // MARK: - Receipt actions (what a launch receipt earns)
 
   /// An older/trimmed receipt may omit `agent:`, but a single-agent dispatch
@@ -645,5 +767,20 @@ private final class BlockingLauncher: AgentPromptLaunching, Sendable {
 
   func release() {
     gate.signal()
+  }
+}
+
+extension DispatchGatewayTests {
+  fileprivate static func packageRoot() -> URL {
+    URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+  }
+
+  fileprivate static func source(of relativePath: String) throws -> String {
+    try String(
+      contentsOf: packageRoot().appendingPathComponent("Sources/Pensieve/\(relativePath)"),
+      encoding: .utf8)
   }
 }

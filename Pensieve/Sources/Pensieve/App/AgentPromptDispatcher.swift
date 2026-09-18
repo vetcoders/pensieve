@@ -1,5 +1,4 @@
 import Foundation
-import Synchronization
 
 enum AgentLaunchVerification: Equatable, Sendable {
   /// The runtime metadata recorded a positive worker PID. This proves that the
@@ -220,6 +219,7 @@ enum AgentDispatchPayload: Equatable, Sendable {
 
 enum AgentPromptLauncherError: LocalizedError {
   case executableNotFound(searchedPaths: [String])
+  case mcpNotReady(VibecraftedMCPConnectionStatus)
 
   var errorDescription: String? {
     switch self {
@@ -230,6 +230,8 @@ enum AgentPromptLauncherError: LocalizedError {
         + "Set the PENSIEVE_VIBECRAFTED_PATH environment variable to the full path "
         + "of the vibecrafted script, or install vibecrafted under "
         + "~/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted."
+    case .mcpNotReady(let status):
+      return status.refusalExplanation
     }
   }
 }
@@ -242,6 +244,12 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
     ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
   static let defaultExecutableRelativePath =
     ".local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
+
+  private let mcpClient: VibecraftedMCPClient
+
+  init(mcpClient: VibecraftedMCPClient = .shared) {
+    self.mcpClient = mcpClient
+  }
 
   static func resolveExecutablePath() throws -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser
@@ -348,15 +356,6 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
     return String(output[valueRange])
   }
 
-  private static func waitForWorkerSpawnRecord(at metadataURL: URL) -> Bool {
-    let deadline = Date().addingTimeInterval(workerSpawnRecordTimeout)
-    repeat {
-      if workerSpawnRecorded(at: metadataURL) { return true }
-      if Date() >= deadline { return false }
-      Thread.sleep(forTimeInterval: 0.05)
-    } while true
-  }
-
   static func arguments(
     workflow: String,
     agents: [String],
@@ -376,62 +375,10 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    let executablePath = try Self.resolveExecutablePath()
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = Self.arguments(workflow: workflow, agents: agents, payload: payload)
-    process.currentDirectoryURL = workingDirectoryURL
-    let launchEnvironment = Self.launchEnvironment(
-      base: ProcessInfo.processInfo.environment,
-      home: FileManager.default.homeDirectoryForCurrentUser)
-    process.environment = launchEnvironment
-
-    let stdout = Pipe()
-    let stderr = Pipe()
-    let buffer = ProcessOutputBuffer()
-    process.standardOutput = stdout
-    process.standardError = stderr
-
-    stdout.fileHandleForReading.readabilityHandler = { handle in
-      buffer.append(handle.availableData)
-    }
-    stderr.fileHandleForReading.readabilityHandler = { handle in
-      buffer.append(handle.availableData)
-    }
-
-    try process.run()
-    process.waitUntilExit()
-
-    stdout.fileHandleForReading.readabilityHandler = nil
-    stderr.fileHandleForReading.readabilityHandler = nil
-    buffer.append(stdout.fileHandleForReading.availableData)
-    buffer.append(stderr.fileHandleForReading.availableData)
-
-    let output = buffer.text()
-    let metadata = AgentDispatchMetadata.parse(output: output, exitCode: process.terminationStatus)
-    guard metadata.exitCode == 0, let runID = metadata.runID else {
-      return metadata.classified(workerSpawnRecorded: false)
-    }
-
-    let metadataURL = Self.runtimeMetadataURL(
-      runID: runID,
-      output: output,
-      home: FileManager.default.homeDirectoryForCurrentUser,
-      environment: launchEnvironment)
-    return metadata.classified(workerSpawnRecorded: Self.waitForWorkerSpawnRecord(at: metadataURL))
-  }
-}
-
-private final class ProcessOutputBuffer: Sendable {
-  private let data = Mutex(Data())
-
-  func append(_ next: Data) {
-    guard !next.isEmpty else { return }
-    data.withLock { $0.append(next) }
-  }
-
-  func text() -> String {
-    let snapshot = data.withLock { $0 }
-    return String(data: snapshot, encoding: .utf8) ?? ""
+    try mcpClient.dispatch(
+      workflow: workflow,
+      agents: agents,
+      payload: payload,
+      workingDirectoryURL: workingDirectoryURL)
   }
 }

@@ -18,12 +18,14 @@ struct DispatchPopover: View {
   let intent: DispatchIntent
   let onRootSelected: (URL) -> Void
   let onClose: () -> Void
+  let mcpClient: VibecraftedMCPClient
 
   @State private var agent: String
   @State private var workflow: String
   @State private var rootURL: URL
   @State private var hostWindow: NSWindow?
   @State private var phase: Phase = .configuring
+  @State private var mcpStatus: VibecraftedMCPConnectionStatus
   /// Swarm-only: the chosen report writer ("" = the workflow's own default,
   /// which launches with NO positional agent). Only offered when the
   /// descriptor declares the positional-synthesizer policy.
@@ -55,17 +57,29 @@ struct DispatchPopover: View {
     }
   }
 
+  /// The sheet's Dispatch button. Capability truth AND MCP connection.
+  static func canConfirmDispatch(
+    subjectIsEmpty: Bool,
+    plan: WorkflowDispatchPlan,
+    mcpStatus: VibecraftedMCPConnectionStatus
+  ) -> Bool {
+    !subjectIsEmpty && plan.isLaunchable(mcpStatus: mcpStatus)
+  }
+
   init(
     controller: AppController,
     intent: DispatchIntent,
     defaultRoot: URL,
     onRootSelected: @escaping (URL) -> Void,
-    onClose: @escaping () -> Void
+    onClose: @escaping () -> Void,
+    mcpClient: VibecraftedMCPClient = .shared
   ) {
     self.controller = controller
     self.intent = intent
     self.onRootSelected = onRootSelected
     self.onClose = onClose
+    self.mcpClient = mcpClient
+    self._mcpStatus = State(initialValue: mcpClient.status())
     // Agent defaults to codex (the ⇧⌘D default) whenever the fleet offers it;
     // the picker stays fully editable before Dispatch.
     let agents = controller.availableAgents
@@ -158,6 +172,7 @@ struct DispatchPopover: View {
       // Fresh truth for THIS sheet session: a config edit between two sheet
       // presentations must never serve yesterday's swarm membership.
       controller.refreshWorkflowCapabilities(force: true)
+      mcpStatus = mcpClient.refreshStatus()
     }
     .onChange(of: workflow) { synthesizer = "" }
   }
@@ -264,6 +279,12 @@ struct DispatchPopover: View {
           .frame(maxWidth: .infinity, alignment: .leading)
           .accessibilityIdentifier("pensieve.dispatch.emptySubjectNote")
       }
+      if !mcpStatus.isReady {
+        Text(mcpStatus.refusalExplanation)
+          .font(.system(size: 11)).foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("pensieve.dispatch.mcpNotReady")
+      }
       HStack {
         Spacer()
         Button("Cancel") { onClose() }
@@ -274,11 +295,23 @@ struct DispatchPopover: View {
           // enqueue two launches before the first re-render hides the button —
           // one user intent must never spawn two agent runs.
           guard isConfiguring else { return }
+          mcpStatus = mcpClient.refreshStatus()
+          guard
+            Self.canConfirmDispatch(
+              subjectIsEmpty: intent.subjectIsEmpty,
+              plan: plan,
+              mcpStatus: mcpStatus)
+          else { return }
           phase = .dispatching
           Task { await runDispatch() }
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(intent.subjectIsEmpty || !plan.isLaunchable)
+        .disabled(
+          !Self.canConfirmDispatch(
+            subjectIsEmpty: intent.subjectIsEmpty,
+            plan: plan,
+            mcpStatus: mcpStatus)
+        )
         .accessibilityIdentifier("pensieve.dispatch.confirm")
       }
     case .dispatching:

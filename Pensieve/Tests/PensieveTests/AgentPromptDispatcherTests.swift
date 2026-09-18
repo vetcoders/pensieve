@@ -127,6 +127,57 @@ final class AgentPromptDispatcherTests: XCTestCase {
     XCTAssertEqual(arguments, ["workflow", "codex", "--prompt", "ship the proof"])
   }
 
+  func testProductionLauncherDispatchesThroughMCPNotProcess() throws {
+    let transport = FakeVibecraftedMCPTransport(
+      probeStatus: .connected,
+      toolResult: [
+        "ok": true,
+        "run_id": "launcher-mcp-1",
+        "agent": "codex",
+        "report": "/tmp/reports/launcher-mcp-1.md",
+      ])
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/live-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/live-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+    let root = URL(fileURLWithPath: "/tmp/mcp-root", isDirectory: true)
+
+    let metadata = try launcher.dispatch(
+      workflow: "review",
+      agents: ["codex"],
+      payload: .file("/tmp/note.md"),
+      workingDirectoryURL: root)
+
+    XCTAssertEqual(metadata.runID, "launcher-mcp-1")
+    XCTAssertEqual(metadata.launchVerification, .workerSpawnRecorded)
+    XCTAssertEqual(transport.toolCalls().map(\.name), ["vc_run_launch"])
+    XCTAssertEqual(transport.toolCalls().first?.arguments["skill"], "review")
+    XCTAssertEqual(transport.toolCalls().first?.arguments["file"], "/tmp/note.md")
+  }
+
+  func testProductionLauncherRefusesWhenMCPIsNotConnected() {
+    let transport = FakeVibecraftedMCPTransport(probeStatus: .unreachable)
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/dead-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/dead-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+
+    XCTAssertThrowsError(
+      try launcher.dispatch(
+        workflow: "review",
+        agents: ["codex"],
+        payload: .prompt("ship it"),
+        workingDirectoryURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+    ) { error in
+      guard case AgentPromptLauncherError.mcpNotReady(.unreachable) = error else {
+        return XCTFail("expected unreachable MCP, got \(error)")
+      }
+    }
+    XCTAssertTrue(transport.toolCalls().isEmpty)
+  }
+
   func testBuildsSwarmArgumentsWithoutFabricatingAnAgent() {
     // A default swarm run launches the workflow with NO positional agent —
     // the CLI resolves its own configured members.
