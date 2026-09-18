@@ -1149,7 +1149,8 @@ run_certless_cleanup_tests() {
   "$PROVENANCE_REPO/Pensieve/Sources" \
   "$PROVENANCE_REPO/Pensieve/Resources" \
   "$PROVENANCE_REPO/Pensieve/scripts" \
-  "$PROVENANCE_REPO/Pensieve/Vendor/qube-ffi/release"
+  "$PROVENANCE_REPO/Pensieve/Vendor/qube-ffi/release" \
+  "$PROVENANCE_REPO/Pensieve/Vendor/codescribe-ffi/release"
 printf '%s\n' '0.0.0' >"$PROVENANCE_REPO/VERSION"
 cat >"$PROVENANCE_REPO/Pensieve/Package.swift" <<'SWIFT'
 // swift-tools-version: 6.0
@@ -1182,6 +1183,10 @@ printf '%s\n' 'int ffi_input(void) { return 1; }' \
   | /usr/bin/clang -dynamiclib -x c \
     -o "$PROVENANCE_REPO/Pensieve/Vendor/qube-ffi/release/libqube_ffi.dylib" - \
   || fail "could not compile the runtime-input FFI fixture"
+printf '%s\n' 'int codescribe_ffi_input(void) { return 1; }' \
+  | /usr/bin/clang -dynamiclib -x c \
+    -o "$PROVENANCE_REPO/Pensieve/Vendor/codescribe-ffi/release/libcodescribe_ffi.dylib" - \
+  || fail "could not compile the codescribe runtime-input FFI fixture"
 /usr/bin/git -C "$PROVENANCE_REPO" init -q
 /usr/bin/git -C "$PROVENANCE_REPO" add .
 /usr/bin/git -C "$PROVENANCE_REPO" \
