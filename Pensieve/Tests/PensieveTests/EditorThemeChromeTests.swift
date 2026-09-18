@@ -15,6 +15,7 @@ import XCTest
 /// by detaching the content view — not `close()` — to stay clear of the
 /// window-undo-manager teardown SIGSEGV that `MarkdownEditorSurface`'s text view
 /// guards on detach (same pattern as `EditorScrollStabilityProbeTests`).
+@MainActor
 final class EditorThemeChromeTests: XCTestCase {
   @MainActor
   private func makeHostedSurface(skin: PensieveTheme, windowAppearance: NSAppearance.Name)

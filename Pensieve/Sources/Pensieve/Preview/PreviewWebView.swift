@@ -63,7 +63,7 @@ final class PreviewWebView: NSView {
     fatalError("init(coder:) not used")
   }
 
-  deinit {
+  isolated deinit {
     titlebarGlassController.invalidate()
   }
 
@@ -307,7 +307,6 @@ final class PreviewWebView: NSView {
   /// `appearanceCSS` meant every debounced keystroke rescanned the `Fonts`
   /// directory, re-read the faces and re-joined the whole blob before anything
   /// compared it. Assembled at most once per skin instead.
-  private static let fontFaceCSSLock = NSLock()
   private static var fontFaceCSSBySkin: [PensieveTheme: String] = [:]
 
   /// Test seam: how many times a skin payload has actually been assembled, so
@@ -317,8 +316,6 @@ final class PreviewWebView: NSView {
   private static func cachedFontFaceCSS(for skin: PensieveTheme, referencedIn skinBlock: String)
     -> String
   {
-    fontFaceCSSLock.lock()
-    defer { fontFaceCSSLock.unlock() }
     if let cached = fontFaceCSSBySkin[skin] { return cached }
     let assembled = BundledFonts.fontFaceCSS(referencedIn: skinBlock)
     fontFaceCSSBySkin[skin] = assembled
@@ -326,9 +323,11 @@ final class PreviewWebView: NSView {
     return assembled
   }
 
-  static func appearanceCSS(fontSize: CGFloat, skin: PensieveTheme = .default)
-    -> String
-  {
+  static func appearanceCSS(
+    fontSize: CGFloat,
+    skin: PensieveTheme = .default,
+    wrapLines: Bool = WrapPreference.wrapLinesDefault
+  ) -> String {
     let skinBlock = skinCSS(for: skin)
     // Deliver the bundled families to WebContent via @font-face data URIs —
     // process-scope CTFontManager registration does not cross into the WebView's
@@ -359,6 +358,8 @@ final class PreviewWebView: NSView {
         --vc-preview-diagram-error-text: #8c1d18;
         --vc-preview-math-bg: #f6f8fa;
         --vc-preview-page-background: transparent;
+        --vc-preview-pre-white-space: \(wrapLines ? "pre-wrap" : "pre");
+        --vc-preview-code-white-space: \(wrapLines ? "normal" : "nowrap");
         \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
       }
 
@@ -712,6 +713,8 @@ final class PreviewWebView: NSView {
          body typography. Comes last so it wins over the base block above without
          re-implementing any flavor (markdown.css / gfm.css) rules. */
       \(skinBlock)
+
+      \(WrapPreference.previewStylesheet(wrapLines: wrapLines))
       """
   }
 
@@ -1304,6 +1307,7 @@ final class PreviewWebView: NSView {
 /// silent — the OS pocket owns both the offset and the scrolled dissolve, and
 /// the CSS variable keeps its 0px default (polarize L3). One offset owner per
 /// OS generation, boundary explicit here.
+@MainActor
 final class PreviewTitlebarGlassController: NSObject {
   static let titlebarGlassHeightCSSVariable = "--vc-preview-titlebar-glass-height"
 
@@ -1334,7 +1338,7 @@ final class PreviewTitlebarGlassController: NSObject {
   private var pendingUpdateNeedsForce = false
   private var lastAppliedHeight: CGFloat?
 
-  deinit {
+  isolated deinit {
     invalidate()
   }
 
@@ -1426,8 +1430,13 @@ final class PreviewTitlebarGlassController: NSObject {
     // measured mid-construction — the stale value that both parked the page
     // start a band below the editor's and painted the 7-9 underlay stripe.
     contentLayoutObservation?.invalidate()
-    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) { [weak self] _, _ in
-      self?.scheduleUpdate()
+    contentLayoutObservation = nextWindow.observe(\.contentLayoutRect) {
+      @Sendable [weak self] _, _ in
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.scheduleUpdate() }
+      } else {
+        Task { @MainActor [weak self] in self?.scheduleUpdate() }
+      }
     }
   }
 
@@ -1482,7 +1491,7 @@ extension PreviewWebView: WKNavigationDelegate {
   func webView(
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction,
-    decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
   ) {
     if navigationAction.navigationType == .linkActivated,
       let url = navigationAction.request.url

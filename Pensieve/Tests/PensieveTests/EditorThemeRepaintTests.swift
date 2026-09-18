@@ -17,6 +17,7 @@ import XCTest
 /// re-colour inside a frame repaints the VIEWPORT synchronously and defers the
 /// rest, the deferred pass still reaches the whole document, and a burst of
 /// switches collapses into one full pass instead of one per click.
+@MainActor
 final class EditorThemeRepaintTests: XCTestCase {
   /// Comfortably past `synchronousRethemeCharacterBudget` so the deferral is the
   /// path under test, and made of plain paragraphs so `.foregroundColor` at any

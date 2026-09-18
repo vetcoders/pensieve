@@ -1,5 +1,6 @@
 import CoreServices
 import Foundation
+import os
 
 struct FileWatcherEvent: Equatable, Sendable {
   struct Flags: OptionSet, Equatable, Sendable {
@@ -85,9 +86,17 @@ final class FileWatcher {
 
   private let sourceFactory: SourceFactory
   private let stateLock = NSLock()
-  private var generation: UInt64 = 0
+  // The delivery queue only receives this checked, lock-backed generation value.
+  // Source lifecycle and caller-facing state never cross into its callback.
+  private let generation = OSAllocatedUnfairLock(initialState: UInt64(0))
   private var source: (any FileWatcherEventSource)?
-  private(set) var watchedPaths: [String] = []
+  private var activePaths: [String] = []
+
+  var watchedPaths: [String] {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return activePaths
+  }
 
   init(sourceFactory: @escaping SourceFactory = { FSEventsFileWatcherEventSource() }) {
     self.sourceFactory = sourceFactory
@@ -121,15 +130,17 @@ final class FileWatcher {
     let nextSource = sourceFactory()
     let token: UInt64
     stateLock.lock()
-    generation &+= 1
-    token = generation
+    token = generation.withLock { value in
+      value &+= 1
+      return value
+    }
     source = nextSource
-    watchedPaths = paths
+    activePaths = paths
     stateLock.unlock()
 
     do {
-      try nextSource.start(paths: paths) { [weak self] events in
-        guard let self, self.isCurrentGeneration(token) else { return }
+      try nextSource.start(paths: paths) { [generation] events in
+        guard generation.withLock({ $0 == token }) else { return }
         onEvents(events)
       }
     } catch {
@@ -142,10 +153,10 @@ final class FileWatcher {
   func stop() {
     let stoppedSource: (any FileWatcherEventSource)?
     stateLock.lock()
-    generation &+= 1
+    generation.withLock { $0 &+= 1 }
     stoppedSource = source
     source = nil
-    watchedPaths = []
+    activePaths = []
     stateLock.unlock()
     stoppedSource?.stop()
   }
@@ -156,19 +167,13 @@ final class FileWatcher {
     return source != nil
   }
 
-  private func isCurrentGeneration(_ token: UInt64) -> Bool {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    return source != nil && generation == token
-  }
-
   private func discardSource(generation token: UInt64) {
     stateLock.lock()
     defer { stateLock.unlock() }
-    guard generation == token else { return }
-    generation &+= 1
+    guard generation.withLock({ $0 == token }) else { return }
+    generation.withLock { $0 &+= 1 }
     source = nil
-    watchedPaths = []
+    activePaths = []
   }
 }
 

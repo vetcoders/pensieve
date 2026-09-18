@@ -40,6 +40,7 @@ final class PreviewPipelineTests: XCTestCase {
 
   // MARK: - Document construction
 
+  @MainActor
   func testMakeDocumentEmbedsBodyThemeCSSAndFontSize() {
     let sourceURL = URL(fileURLWithPath: "/tmp/notes/a.md")
     let document = PreviewDocument.make(
@@ -74,6 +75,7 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertEqual(document.refreshToken, 3)
   }
 
+  @MainActor
   func testMakeDocumentIncludesMermaidRuntimeOnlyWhenProvided() {
     let withoutMermaid = PreviewDocument.make(
       body: "<p data-vc-block=\"0\">hello</p>",
@@ -95,6 +97,7 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(withMermaid.html.contains("suppressErrors: true"))
   }
 
+  @MainActor
   func testMakeDocumentIncludesMathBootstrapOnlyForMathBody() {
     let withoutMath = PreviewDocument.make(
       body: "<p data-vc-block=\"0\">hello</p>",
@@ -117,6 +120,7 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(withMath.html.contains("data-vc-tex=\"x+y\""))
   }
 
+  @MainActor
   func testMakeDocumentIncludesKatexRuntimeOnlyWhenProvided() {
     let mathBody =
       "<p data-vc-block=\"0\">A <span class=\"vc-math vc-math-inline\" data-vc-math=\"inline\" data-vc-tex=\"x+y\">x+y</span></p>"
@@ -156,6 +160,7 @@ final class PreviewPipelineTests: XCTestCase {
     }
   }
 
+  @MainActor
   func testMakeDocumentEscapesEmbeddedClosersInKatexAssets() {
     let document = PreviewDocument.make(
       body: "<p data-vc-math=\"inline\" data-vc-tex=\"x\">x</p>",
@@ -171,6 +176,7 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("'<\\/style>'"))
   }
 
+  @MainActor
   func testMakeDocumentEscapesEmbeddedStyleClose() {
     // A hostile theme CSS string trying to break out of the <style> block
     // must be neutralized.
@@ -184,6 +190,7 @@ final class PreviewPipelineTests: XCTestCase {
     XCTAssertTrue(document.html.contains("<\\/style>"))
   }
 
+  @MainActor
   func testMakeDocumentEscapesEmbeddedScriptCloseInMermaidRuntime() {
     let document = PreviewDocument.make(
       body: "<div class=\"mermaid\">graph TD\nA--&gt;B</div>",

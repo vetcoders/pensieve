@@ -5,6 +5,7 @@ import XCTest
 
 /// The source panel's typeface contract: every theme dresses it in its own
 /// bundled monospace family, and the adaptive skins keep the system face.
+@MainActor
 final class MonoFontResolverTests: XCTestCase {
   // MARK: - Family resolution
 

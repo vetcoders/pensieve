@@ -121,7 +121,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     transientKeyWindow.isReleasedWhenClosed = false
     addTeardownBlock { await MainActor.run { transientKeyWindow.close() } }
     probe.windows.append(launchWindow)
-    var currentTarget: NSWindow? = launchWindow
+    let currentTarget = MainActorTestValue<NSWindow?>(launchWindow)
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in },
@@ -133,7 +133,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       isApplicationActive: { true },
-      currentMergeTarget: { currentTarget },
+      currentMergeTarget: { currentTarget.value },
       setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
@@ -147,7 +147,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     }
 
     registry.openRestoredDocuments(refs)
-    currentTarget = transientKeyWindow
+    currentTarget.value = transientKeyWindow
     while !probe.restoreSteps.isEmpty {
       probe.restoreSteps.removeFirst()()
     }
@@ -167,11 +167,11 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let launchWindow = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
     let unrelatedWindow = makeWindow(frame: NSRect(x: 900, y: 140, width: 500, height: 400))
     probe.windows.append(contentsOf: [launchWindow, unrelatedWindow])
-    var canMutate = true
-    var currentTarget: NSWindow? = launchWindow
+    let canMutate = MainActorTestValue(true)
+    let currentTarget = MainActorTestValue<NSWindow?>(launchWindow)
     var gateTransitions: [Bool] = []
     let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { canMutate },
+      canMutateWindowTabs: { canMutate.value },
       scheduleDeferredMainWork: { _ in
         XCTFail("startup restore must remain on its transaction scheduler while a modal blocks it")
       },
@@ -183,7 +183,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       isApplicationActive: { true },
-      currentMergeTarget: { currentTarget },
+      currentMergeTarget: { currentTarget.value },
       setStartupRestoreInProgress: { gateTransitions.append($0) },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
@@ -200,15 +200,15 @@ final class StartupRestoreTabCostTests: XCTestCase {
     XCTAssertEqual(probe.createdWindows.count, 1)
     XCTAssertEqual(gateTransitions, [true])
 
-    canMutate = false
-    currentTarget = unrelatedWindow
+    canMutate.value = false
+    currentTarget.value = unrelatedWindow
     probe.restoreSteps.removeFirst()()
     XCTAssertEqual(
       probe.createdWindows.count, 1,
       "the blocked ref left the restore transaction and opened through a generic deferred route")
     XCTAssertEqual(gateTransitions, [true], "the restore gate opened while a ref was still pending")
 
-    canMutate = true
+    canMutate.value = true
     while !probe.restoreSteps.isEmpty {
       probe.restoreSteps.removeFirst()()
     }
@@ -228,7 +228,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let probe = RestoreCostProbe()
     let launchWindow = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
     probe.windows.append(launchWindow)
-    var currentTarget: NSWindow? = launchWindow
+    let currentTarget = MainActorTestValue<NSWindow?>(launchWindow)
     var gateTransitions: [Bool] = []
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
@@ -241,7 +241,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       isApplicationActive: { true },
-      currentMergeTarget: { currentTarget },
+      currentMergeTarget: { currentTarget.value },
       setStartupRestoreInProgress: { gateTransitions.append($0) },
       makeDocumentWindow: { [weak probe] _, _ in
         guard let probe else { return nil }
@@ -257,7 +257,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     registry.openRestoredDocuments(refs)
     let firstRestoredWindow = probe.createdWindows[0]
     registry.handleWindowClosed(launchWindow, tombstonePolicy: .reusableWindow)
-    currentTarget = launchWindow  // AppKit can report the closing window for one more turn.
+    currentTarget.value = launchWindow  // AppKit can report the closing window for one more turn.
 
     while !probe.restoreSteps.isEmpty {
       probe.restoreSteps.removeFirst()()
@@ -286,7 +286,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let launchWindow = makeWindow(frame: NSRect(x: -9000, y: -9000, width: 700, height: 500))
     launchWindow.alphaValue = 0
     probe.windows.append(launchWindow)
-    var currentTarget: NSWindow? = launchWindow
+    let currentTarget = MainActorTestValue<NSWindow?>(launchWindow)
     var blockedHost: NSWindow?
     var gateTransitions: [Bool] = []
     let registry = DocumentWindowRegistry(
@@ -302,7 +302,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       },
       orderAndActivateWindow: { probe.activations.append($0) },
       isApplicationActive: { true },
-      currentMergeTarget: { currentTarget },
+      currentMergeTarget: { currentTarget.value },
       setStartupRestoreInProgress: { gateTransitions.append($0) },
       isTabMutationHost: { window in
         DocumentWindowOwnership.isDocumentHost(window) && window !== blockedHost
@@ -322,7 +322,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     registry.openRestoredDocuments(refs)
     let survivor = probe.createdWindows[0]
     registry.handleWindowClosed(launchWindow, tombstonePolicy: .reusableWindow)
-    currentTarget = launchWindow  // AppKit can report the closing window for one more turn.
+    currentTarget.value = launchWindow  // AppKit can report the closing window for one more turn.
     blockedHost = survivor
 
     // The adoption turn. The transaction has no host, the survivor is the only
@@ -406,7 +406,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
     let userTab = makeWindow(frame: target.frame)
     probe.windows.append(contentsOf: [target, userTab])
-    var selectedWindow: NSWindow? = target
+    let selectedWindow = MainActorTestValue<NSWindow?>(target)
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in },
@@ -416,7 +416,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       orderAndActivateWindow: { probe.activations.append($0) },
       orderWindowWithoutActivating: { probe.orderedWithoutActivation.append($0) },
       isApplicationActive: { true },
-      currentKeyWindow: { selectedWindow },
+      currentKeyWindow: { selectedWindow.value },
       currentMergeTarget: { target },
       setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in
@@ -438,7 +438,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     // Models a successful New Tab gesture while the remaining restore steps
     // are still queued. The new host is deliberately outside the restore's
     // participant set even if AppKit later places it in the same tab group.
-    selectedWindow = userTab
+    selectedWindow.value = userTab
     while !probe.restoreSteps.isEmpty {
       probe.restoreSteps.removeFirst()()
     }
@@ -466,7 +466,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
     let probe = RestoreCostProbe()
     let target = makeWindow(frame: NSRect(x: 120, y: 140, width: 700, height: 500))
     probe.windows.append(target)
-    var selectedWindow: NSWindow? = target
+    let selectedWindow = MainActorTestValue<NSWindow?>(target)
     let registry = DocumentWindowRegistry(
       canMutateWindowTabs: { true },
       scheduleDeferredMainWork: { _ in },
@@ -477,7 +477,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       orderAndActivateWindow: { probe.activations.append($0) },
       orderWindowWithoutActivating: { probe.orderedWithoutActivation.append($0) },
       isApplicationActive: { true },
-      currentKeyWindow: { selectedWindow },
+      currentKeyWindow: { selectedWindow.value },
       currentMergeTarget: { target },
       setStartupRestoreInProgress: { _ in },
       makeDocumentWindow: { [weak probe] _, _ in
@@ -507,7 +507,7 @@ final class StartupRestoreTabCostTests: XCTestCase {
       probe.activations.last === userWindow,
       "the interactive open must front the file the user asked for; without that this pin has no"
         + " user selection to defend")
-    selectedWindow = userWindow
+    selectedWindow.value = userWindow
     let activationsBeforeCompletion = probe.activations.count
 
     while !probe.restoreSteps.isEmpty {

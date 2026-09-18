@@ -3,6 +3,7 @@ import XCTest
 
 @testable import Pensieve
 
+@MainActor
 final class PreviewThemeTests: XCTestCase {
   // MARK: - skinCSS overlay composition
 

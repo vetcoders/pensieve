@@ -133,7 +133,7 @@ final class DocumentWindowModel {
     documentLoadClaim &+= 1
   }
 
-  deinit {
+  isolated deinit {
     pendingDocumentLoad?.cancel()
   }
 

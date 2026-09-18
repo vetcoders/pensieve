@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Synchronization
 
 /// Loads preview CSS bundles from release-safe resource locations and caches them.
 ///
@@ -20,6 +21,7 @@ import Foundation
 ///
 /// Keeping the two axes separate is deliberate: a reader can want GitHub
 /// Flavored tables *and* a paper-like serif body at the same time.
+@MainActor
 final class ThemeManager: ObservableObject {
   /// The app's one appearance state, reachable from surfaces AppKit owns.
   ///
@@ -38,7 +40,7 @@ final class ThemeManager: ObservableObject {
   static let shared = ThemeManager()
 
   /// Markdown dialect stylesheet (the heavy base CSS bundle).
-  enum Theme: String, CaseIterable, Identifiable {
+  enum Theme: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case gfm
 
@@ -79,7 +81,7 @@ final class ThemeManager: ObservableObject {
   @Published private(set) var systemAppearanceGeneration: Int = 0
 
   private let defaults: UserDefaults
-  private var cache: [Theme: String] = [:]
+  nonisolated private let cache = Mutex<[Theme: String]>([:])
   private var appearanceObservation: NSKeyValueObservation?
 
   static let flavorKey = "pensieve.preview.flavor"
@@ -246,13 +248,13 @@ final class ThemeManager: ObservableObject {
     }
   }
 
-  func css(for theme: Theme) -> String {
-    if let cached = cache[theme] {
-      return cached
+  nonisolated func css(for theme: Theme) -> String {
+    cache.withLock { values in
+      if let cached = values[theme] { return cached }
+      let loaded = PreviewResourceLocator.css(named: theme.resourceName) ?? ""
+      values[theme] = loaded
+      return loaded
     }
-    let loaded = PreviewResourceLocator.css(named: theme.resourceName) ?? ""
-    cache[theme] = loaded
-    return loaded
   }
 
   private func persist(_ key: String, _ value: String) {

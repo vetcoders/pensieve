@@ -25,6 +25,7 @@ import CoreText
 /// family-name lookups remain as fallbacks for a family that is not bundled at
 /// all, and the last stop is always the system monospaced font — the same
 /// graceful degradation the skin CSS fallback chains give the preview.
+@MainActor
 enum MonoFontResolver {
   /// Slant synthesised for a themed family that ships no italic face (Sometype
   /// Mono, JetBrains Mono and IBM Plex Mono are bundled as upright weights
@@ -33,7 +34,7 @@ enum MonoFontResolver {
 
   /// What to fall back to when the theme carries no family (`default`/`raw`) or
   /// the named family cannot be resolved.
-  enum SystemFallback: Hashable {
+  enum SystemFallback: Hashable, Sendable {
     /// `NSFont.monospacedSystemFont` — SF Mono, the source panel's historical face.
     case mono
     /// `NSFont.monospacedDigitSystemFont` — proportional SF with tabular figures,
@@ -83,7 +84,7 @@ enum MonoFontResolver {
 
   // MARK: - Resolution
 
-  private struct Key: Hashable {
+  private struct Key: Hashable, Sendable {
     let family: String
     let size: CGFloat
     let weight: Int
@@ -91,33 +92,36 @@ enum MonoFontResolver {
     let fallback: SystemFallback
   }
 
-  /// One lock over both caches. The highlighter resolves fonts per keystroke and
+  /// Main-actor ownership covers both caches and NSFontManager. The highlighter
+  /// resolves fonts per keystroke and
   /// the gutter per scroll repaint, so resolution must never reach CoreText more
   /// than once per (family, size, weight, slant).
-  private static let lock = NSLock()
-  private static var fontCache: [Key: NSFont] = [:]
-  private static var postScriptNameCache: [String: String] = [:]
+  private struct Cache {
+    var fonts: [Key: NSFont] = [:]
+    var postScriptNames: [String: String] = [:]
+    var resolutionCount = 0
+  }
+
+  private static var cache = Cache()
 
   /// How many times a font was actually constructed (test seam for the caching
   /// contract above — the highlighter resolves per keystroke and the gutter per
   /// scroll repaint, so this must not grow with either).
-  private(set) static var resolutionCount = 0
+  static var resolutionCount: Int { cache.resolutionCount }
 
   private static func resolved(
     family: String, size: CGFloat, weight: NSFont.Weight, italic: Bool, fallback: SystemFallback
   ) -> NSFont {
     let key = Key(
       family: family, size: size, weight: cssWeight(weight), italic: italic, fallback: fallback)
-    lock.lock()
-    defer { lock.unlock() }
-    if let cached = fontCache[key] { return cached }
-    let font = build(key: key, appKitWeight: weight)
-    resolutionCount += 1
-    fontCache[key] = font
+    if let cached = cache.fonts[key] { return cached }
+    let font = build(key: key, appKitWeight: weight, cache: &cache)
+    cache.resolutionCount += 1
+    cache.fonts[key] = font
     return font
   }
 
-  private static func build(key: Key, appKitWeight: NSFont.Weight) -> NSFont {
+  private static func build(key: Key, appKitWeight: NSFont.Weight, cache: inout Cache) -> NSFont {
     let systemFont = key.fallback.font(size: key.size, weight: appKitWeight)
     guard !key.family.isEmpty else {
       return key.italic ? italicised(systemFont) : systemFont
@@ -125,11 +129,11 @@ enum MonoFontResolver {
 
     // The editor can be built before (or entirely without) the app delegate that
     // registers the bundled tree, and an unregistered face resolves to nothing.
-    // Registration is a one-shot guard, so this costs a lock and a Bool.
+    // Registration is a one-shot guard.
     BundledFonts.registerOnce()
 
     if let face = bestBundledFace(family: key.family, weight: key.weight, italic: key.italic),
-      let name = postScriptName(at: face.url),
+      let name = postScriptName(at: face.url, cache: &cache),
       let font = NSFont(name: name, size: key.size)
     {
       // A family whose italic is only faux still needs the slant the caller adds.
@@ -177,17 +181,17 @@ enum MonoFontResolver {
 
   /// PostScript name of the single face inside a bundled `.ttf`, read from the
   /// file itself rather than from any family index. Cached per path (callers
-  /// hold `lock`).
-  private static func postScriptName(at url: URL) -> String? {
+  /// execute on the main actor).
+  private static func postScriptName(at url: URL, cache: inout Cache) -> String? {
     let path = url.standardizedFileURL.path
-    if let cached = postScriptNameCache[path] { return cached }
+    if let cached = cache.postScriptNames[path] { return cached }
     guard
       let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL)
         as? [CTFontDescriptor],
       let descriptor = descriptors.first,
       let name = CTFontDescriptorCopyAttribute(descriptor, kCTFontNameAttribute) as? String
     else { return nil }
-    postScriptNameCache[path] = name
+    cache.postScriptNames[path] = name
     return name
   }
 

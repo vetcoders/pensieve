@@ -1,3 +1,10 @@
+import AppKit
+import GRDB
+import Synchronization
+import XCTest
+
+@testable import Pensieve
+
 //  IndexDatabaseStorageHygieneTests.swift
 //  PensieveTests
 //
@@ -8,12 +15,6 @@
 //  reindex storm. These tests assert on FILE SIZES and SQLite pragmas, not on
 //  "the maintenance function ran": a green checkpoint call that leaves the WAL
 //  at its high-water mark would be exactly the bug this cut exists to prevent.
-
-import AppKit
-import GRDB
-import XCTest
-
-@testable import Pensieve
 
 @MainActor
 final class IndexDatabaseStorageHygieneTests: XCTestCase {
@@ -279,7 +280,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     // needs is held by the wedged batch. This is `workspaceOpenGeneration.bump()`, one layer down.
     probe.markWorkspaceOpened()
     harness.releaseWedgedWriter.signal()
-    try await waitUntil("the close pass to complete", timeout: 30) { harness.maintenanceFinished.isSet
+    try await waitUntil("the close pass to complete", timeout: 30) {
+      harness.maintenanceFinished.isSet
     }
 
     XCTAssertEqual(
@@ -323,7 +325,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
 
     // The gap is opened and closed with NOTHING happening in it. That is the whole experiment.
     harness.releaseWedgedWriter.signal()
-    try await waitUntil("the close pass to complete", timeout: 30) { harness.maintenanceFinished.isSet
+    try await waitUntil("the close pass to complete", timeout: 30) {
+      harness.maintenanceFinished.isSet
     }
 
     XCTAssertEqual(
@@ -438,48 +441,52 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
   ///
   /// `markWorkspaceOpened()` stands in for `workspaceOpenGeneration.bump()`: monotone, one-way, and
   /// therefore incapable of flapping back to "still quiet" the way a raced real open could.
-  private final class ExclusionRevalidationProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var readCount = 0
-    private var workspaceOpened = false
+  private final class ExclusionRevalidationProbe: Sendable {
+    private struct State: Sendable {
+      var readCount = 0
+      var workspaceOpened = false
+    }
+    private let state = Mutex(State())
 
     var reads: Int {
-      lock.lock()
-      defer { lock.unlock() }
-      return readCount
+      return state.withLock { state in
+        return state.readCount
+      }
     }
 
     func markWorkspaceOpened() {
-      lock.lock()
-      workspaceOpened = true
-      lock.unlock()
+      state.withLock { state in
+        state.workspaceOpened = true
+      }
     }
 
     func stillWarranted() -> Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      readCount += 1
-      return !workspaceOpened
+      return state.withLock { state in
+        state.readCount += 1
+        return !state.workspaceOpened
+      }
     }
   }
 
   /// Counts batch boundaries from GRDB's writer thread while the test reads the count from the main
   /// thread — the same reason `WedgeSignal` is lock-guarded.
-  private final class WriterWedge: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
+  private final class WriterWedge: Sendable {
+    private struct State: Sendable {
+      var count = 0
+    }
+    private let state = Mutex(State())
 
     var value: Int {
-      lock.lock()
-      defer { lock.unlock() }
-      return count
+      return state.withLock { state in
+        return state.count
+      }
     }
 
     func next() -> Int {
-      lock.lock()
-      defer { lock.unlock() }
-      count += 1
-      return count
+      return state.withLock { state in
+        state.count += 1
+        return state.count
+      }
     }
   }
 
@@ -855,7 +862,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     churn(database: database, root: root, count: 300, deleting: 0)
     let walBefore = walSize(for: databaseURL)
     XCTAssertGreaterThan(
-      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers")
+      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers"
+    )
     database.walCheckpointThresholdBytesOverride = Int64(walBefore)
 
     // Parked exactly where the reader-excluding barrier would be: this is the wedged reader, without
@@ -979,7 +987,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     churn(database: database, root: root, count: 300, deleting: 0)
     let walBefore = walSize(for: databaseURL)
     XCTAssertGreaterThan(
-      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers")
+      walBefore, 0, "fixture precondition: the WAL must be non-empty, or maintenance never triggers"
+    )
     database.walCheckpointThresholdBytesOverride = Int64(walBefore)
     // Milliseconds instead of the production second: this pin waits for the re-arm, and a real-second
     // ladder in a test is a wall-clock flake waiting to happen.
@@ -1054,7 +1063,8 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
         document: behindRef, body: "poolwedgebehindneedle", appState: nil)
       behindWriteFinished.isSet = true
     }
-    try await waitUntil("the index write submitted behind the hygiene pass to complete", timeout: 5) {
+    try await waitUntil("the index write submitted behind the hygiene pass to complete", timeout: 5)
+    {
       behindWriteFinished.isSet
     }
     XCTAssertEqual(
@@ -2022,20 +2032,22 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
 
   /// Thread-safe "the writer got inside the transaction" latch. The hook that sets it runs on GRDB's
   /// writer thread while the test reads it from the main thread, so the flag cannot be a plain `var`.
-  private final class WedgeSignal: @unchecked Sendable {
-    private let lock = NSLock()
-    private var reached = false
+  private final class WedgeSignal: Sendable {
+    private struct State: Sendable {
+      var reached = false
+    }
+    private let state = Mutex(State())
 
     var isReached: Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      return reached
+      return state.withLock { state in
+        return state.reached
+      }
     }
 
     func markReached() {
-      lock.lock()
-      reached = true
-      lock.unlock()
+      state.withLock { state in
+        state.reached = true
+      }
     }
   }
 

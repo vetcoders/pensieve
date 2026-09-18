@@ -87,8 +87,16 @@ enum ToolbarOverflowRecipe {
 
   /// Strong per-window holder for the menu targets. `NSMenuItem.target` is weak,
   /// so an action object dropped here would leave every overflow entry dead.
-  private static let controllers =
+  @MainActor private static let controllers =
     NSMapTable<NSWindow, ToolbarOverflowController>.weakToStrongObjects()
+
+  /// Test seam: the live controller `didUpdate` is gated through. Parent menu
+  /// items (Mode, Rewrite) have no target of their own, so tests read this
+  /// rather than fishing a leaf item.
+  @MainActor
+  static func controller(for window: NSWindow) -> ToolbarOverflowController? {
+    controllers.object(forKey: window)
+  }
 
   /// Gives every family that needs one an authored overflow entry. Returns
   /// `true` when something had to be corrected.
@@ -215,6 +223,16 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   private weak var window: NSWindow?
   private var windowObserver: NSObjectProtocol?
 
+  /// Times `repairClobberedBridge` actually ran. The `didUpdate` gate is the
+  /// whole point of the counter: a converged toolbar must not increment this
+  /// on a window update, or the 2026-09-17 sample's `updateWindows` → apply →
+  /// `NSImage` rebuild is back.
+  private(set) var repairClobberedBridgeCallCount = 0
+  /// Times `apply` was invoked from `repairClobberedBridge` (not from the
+  /// SwiftUI sink pass). A didUpdate on an already-authored toolbar must leave
+  /// this unchanged.
+  private(set) var repairApplyCallCount = 0
+
   /// Watches the window for a toolbar that came back wearing SwiftUI's derived
   /// form again or lost its AppKit-authored mode tooltips.
   ///
@@ -227,10 +245,14 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// the difference is only that the editor's representable re-runs often enough
   /// to hide it, and this pass does not.
   ///
-  /// `didUpdate` fires on every window update cycle. The menu-form half stays a
-  /// pointer-cheap identifier check; the tooltip half walks the toolbar's small
-  /// view-backed control tree and only writes when a mode segment lost its
-  /// authored name. Neither half rebuilds a converged toolbar.
+  /// `didUpdate` fires on every window update cycle. It is a cheap gate, not a
+  /// chrome rebuild: identifier (or, if AppKit stripped the identifier, title +
+  /// submenu titles) is enough to prove the authored form is still on the group,
+  /// and then `repairClobberedBridge` / `apply(_:to:)` are not called. The
+  /// tooltip half still walks the toolbar's small view-backed control tree and
+  /// only writes when a mode segment lost its authored name. Neither half
+  /// rebuilds a converged toolbar — that rebuild is what the 2026-09-17 sample
+  /// caught on the main thread inside `updateWindows`.
   func attach(
     to window: NSWindow,
     families: [ToolbarOverflowFamily],
@@ -246,13 +268,46 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
       forName: NSWindow.didUpdateNotification, object: window, queue: .main
     ) { [weak self] _ in
       MainActor.assumeIsolated {
-        _ = self?.repairClobberedBridge()
+        self?.handleWindowDidUpdate()
       }
     }
   }
 
-  deinit {
+  isolated deinit {
     if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
+  }
+
+  /// Cheap `didUpdate` gate. Identifier match is the fast path; title + submenu
+  /// titles cover an AppKit getter that dropped the identifier while leaving
+  /// our authored menu in place. Either way the group is already correct, and
+  /// `repairClobberedBridge` / `apply(_:to:)` must not run.
+  func needsFormRepair() -> Bool {
+    guard let toolbar = window?.toolbar else { return false }
+    let groups = toolbar.items.compactMap { $0 as? NSToolbarItemGroup }
+    guard groups.count == families.count, groups.count == wantedIdentifiers.count,
+      !groups.isEmpty
+    else { return false }
+    for (index, group) in groups.enumerated() {
+      let family = families[index]
+      if family.commands.isEmpty { continue }
+      if !Self.isAuthoredForm(
+        group.menuFormRepresentation, wanted: wantedIdentifiers[index], family: family)
+      {
+        return true
+      }
+    }
+    return false
+  }
+
+  private func handleWindowDidUpdate() {
+    guard needsFormRepair() else {
+      if let window {
+        _ = ToolbarOverflowRecipe.assertModeSegmentTooltips(
+          on: window, families: families, titles: modeSegmentTitles)
+      }
+      return
+    }
+    _ = repairClobberedBridge()
   }
 
   /// Restores AppKit-authored state that a late SwiftUI bridge pass can clear.
@@ -263,6 +318,7 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   /// acts on exactly the state the operator is looking at.
   @discardableResult
   func repairClobberedBridge() -> Bool {
+    repairClobberedBridgeCallCount += 1
     guard let window, let toolbar = window.toolbar else { return false }
     var repaired = ToolbarOverflowRecipe.assertModeSegmentTooltips(
       on: window, families: families, titles: modeSegmentTitles)
@@ -274,12 +330,34 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
     for (index, group) in groups.enumerated() {
       let family = families[index]
       guard !family.commands.isEmpty,
-        group.menuFormRepresentation?.identifier != wantedIdentifiers[index]
+        !Self.isAuthoredForm(
+          group.menuFormRepresentation, wanted: wantedIdentifiers[index], family: family)
       else { continue }
-      signatures[family.identifier] = nil
+      repairApplyCallCount += 1
       if apply(family, to: group) { repaired = true }
     }
     return repaired
+  }
+
+  /// True when this group already carries the recipe's overflow form, so a
+  /// `didUpdate` must not rebuild it. Identifier is the cheap proof; title +
+  /// child titles are the fallback if the identifier was stripped but the
+  /// authored submenu is still sitting there.
+  static func isAuthoredForm(
+    _ form: NSMenuItem?,
+    wanted: NSUserInterfaceItemIdentifier,
+    family: ToolbarOverflowFamily
+  ) -> Bool {
+    guard let form else { return false }
+    let wantedTitles = family.commands.map(\.title)
+    let childTitles = form.submenu?.items.map(\.title) ?? []
+    if form.identifier == wanted {
+      return childTitles == wantedTitles
+    }
+    guard form.title == family.title, childTitles == wantedTitles else { return false }
+    // Identifier stripped, but the submenu is still the one we built — not a
+    // SwiftUI-derived form that merely reused the same titles.
+    return (form.submenu?.items ?? []).allSatisfy { $0 is ToolbarOverflowMenuItem }
   }
 
   @discardableResult

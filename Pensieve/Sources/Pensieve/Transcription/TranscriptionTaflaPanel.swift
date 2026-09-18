@@ -32,7 +32,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     self.panelIsVisible = panelIsVisible
   }
 
-  deinit {
+  isolated deinit {
     if let sendEventMonitor {
       NSEvent.removeMonitor(sendEventMonitor)
     }
@@ -40,6 +40,12 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
   var isVisible: Bool {
     panel.map(panelIsVisible) == true
+  }
+
+  /// Record stays off unless `TranscriptionService.isCaptureReady` is true
+  /// (TCC microphone AND codescribe STT) and a take is not already live.
+  static func recordControlEnabled(for service: TranscriptionService) -> Bool {
+    service.isCaptureReady && !service.isRecording && !service.isPreparingRecording
   }
 
   func toggle() {
@@ -55,12 +61,20 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 
   func hide() {
-    if let panel { dismissPanel(panel) }
-    removeSendEventMonitor()
-    onVisibilityChanged?()
+    closePanel()
   }
 
   func windowWillClose(_ notification: Notification) {
+    // Title-bar close is a real dismiss, not chrome theatre. AppKit may
+    // already have ordered the window out; still run the same path as
+    // hide() so visibility tracking cannot leave a zombie panel.
+    closePanel()
+  }
+
+  /// One close path for programmatic hide, the title-bar close box, and
+  /// the in-panel dismiss control.
+  private func closePanel() {
+    if let panel { dismissPanel(panel) }
     removeSendEventMonitor()
     onVisibilityChanged?()
   }
@@ -98,15 +112,17 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     panel.contentMinSize = NSSize(width: 560, height: 420)
     panel.backgroundColor = .clear
     panel.isOpaque = false
+    // Default HUD chrome can sit at `.none` and vanish from screen
+    // recordings. `.readOnly` keeps the panel capturable without handing
+    // remote control to a screen-sharing peer.
+    panel.sharingType = .readOnly
 
     let root = TranscriptionTaflaPanelView(
       service: service,
       routingState: routingState,
       onSend: { [weak self] target in self?.sendComposition(target: target) == true },
-      onClose: { [weak panel, weak self] in
-        if let panel { self?.dismissPanel(panel) }
-        self?.removeSendEventMonitor()
-        self?.onVisibilityChanged?()
+      onClose: { [weak self] in
+        self?.hide()
       }
     )
     let hostingView = NSHostingView(rootView: root)
@@ -313,8 +329,8 @@ private struct TranscriptionTaflaPanelView: View {
       }
       .buttonStyle(.borderedProminent)
       .frame(minWidth: 92)
-      .disabled(service.isRecording || service.isPreparingRecording)
-      .help(service.isPreparingRecording ? "Loading speech model…" : "Start Recording")
+      .disabled(!TranscriptionTaflaPanelController.recordControlEnabled(for: service))
+      .help(recordHelp)
       .accessibilityIdentifier("pensieve.dictation.start")
 
       Button(action: stop) {
@@ -466,6 +482,13 @@ private struct TranscriptionTaflaPanelView: View {
       return "Configure an AI provider in Settings to use this action."
     }
     return routingState.formatMode.detail
+  }
+
+  private var recordHelp: String {
+    if !service.isCaptureReady {
+      return "Recording is unavailable until capture is ready."
+    }
+    return service.isPreparingRecording ? "Loading speech model…" : "Start Recording"
   }
 
   private func start() {

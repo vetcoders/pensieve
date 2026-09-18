@@ -10,6 +10,7 @@ import XCTest
 /// attributes/colors/fonts, same order of application. These tests pin the
 /// observable attribute output for representative markdown so a future change to
 /// caching can't silently alter highlighting.
+@MainActor
 final class SyntaxHighlighterTests: XCTestCase {
   private let fontSize: CGFloat = 14
 

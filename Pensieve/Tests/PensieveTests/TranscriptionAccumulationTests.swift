@@ -1,4 +1,5 @@
 import AppKit
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -104,7 +105,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testStopRecordingCommitsTheEngineFinalEvenWithoutAFinalCallback() throws {
-    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let engine = FakeDictationEngine(stopRecordingHandler: { "confirmed final words" })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.receivePreview("draft words")
@@ -117,7 +118,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testStopRecordingDoesNotDuplicateFinalAlreadyDeliveredByCallback() throws {
-    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let engine = FakeDictationEngine(stopRecordingHandler: { "confirmed final words" })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
     service.receiveFinal("confirmed final words", language: "en")
 
@@ -131,7 +132,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
 
   @MainActor
   func testStartRecordingLoadsModelOffMainAndEntersRecordingState() async {
-    let engine = MockVistaAutocompleteEngine(modelLoaded: false, initModelHandler: {})
+    let engine = FakeDictationEngine(modelLoaded: false, initModelHandler: {})
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.startRecording()
@@ -151,7 +152,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStartRecordingRequestsMicrophoneBeforeRealEngineCapture() async {
     let events = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       startRecordingHandler: { _ in events.append("startRecording") })
     let service = TranscriptionService(
       engine: engine,
@@ -176,7 +177,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStartRecordingPassesSelectedRecognitionLanguageToEngine() async {
     let languages = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       startRecordingHandler: { language in languages.append(language ?? "auto") })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
@@ -194,7 +195,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testPartialCaptureStartFailureRollsBackAndAllowsRetry() async {
     let events = LockedStringLog()
     let recording = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in
@@ -235,7 +236,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let events = LockedStringLog()
     let recording = LockedFlag()
     recording.set()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       startRecordingHandler: { _ in
         events.append("start")
@@ -261,7 +262,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStaleEngineStopFailureDetachesListenerAndDoesNotStartOverActiveCapture() async {
     let events = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { true },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in events.append("start") },
@@ -288,7 +289,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let events = LockedStringLog()
     let recording = LockedFlag()
     recording.set()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in
@@ -317,7 +318,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testAsynchronousEngineErrorStopsCaptureDetachesListenerAndDrainsFinalText() async {
     let events = LockedStringLog()
     let recording = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in recording.set() },
@@ -352,7 +353,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
     let recordingStarted = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: {
         modelLoadStarted.fulfill()
@@ -383,7 +384,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
     let recordingStarted = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: {
         modelLoadStarted.fulfill()
@@ -415,7 +416,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     struct ModelInitBoom: Error, LocalizedError {
       var errorDescription: String? { "model boom" }
     }
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: { throw ModelInitBoom() })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
@@ -431,7 +432,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionUsesVistaEngineFormatterWhenAvailable() async {
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       formattingAvailable: true,
       formattingHandler: { text, assistive in
         XCTAssertFalse(assistive)
@@ -452,7 +453,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionUsesWritingAssistantFormatterWhenSelected() async {
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       formattingAvailable: true,
       formattingHandler: { text, assistive in
         XCTAssertTrue(assistive)
@@ -475,7 +476,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testProductionFormattingSeamUsesProviderSafeResponsesBackend() async {
     let responder = MockAITextResponder(result: "rewritten transcript")
     let service = TranscriptionService(
-      engine: MockVistaAutocompleteEngine(formattingAvailable: false),
+      engine: FakeDictationEngine(formattingAvailable: false),
       aiTextResponder: responder,
       cadenceCommitNanoseconds: 0)
     service.receivePreview("chaotic spoken mission")
@@ -490,7 +491,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionFallsBackToRawTextWhenFormatterUnavailable() async {
-    let engine = MockVistaAutocompleteEngine(formattingAvailable: false)
+    let engine = FakeDictationEngine(formattingAvailable: false)
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.receivePreview("raw transcript")
@@ -713,7 +714,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(appState.lastError, service.dispatchStatus)
   }
 
-  func testVistaEventListenerCallbacksMarshalIntoAccumulationState() async {
+  func testDictationEventListenerCallbacksMarshalIntoAccumulationState() async {
     let service = TranscriptionService()
 
     service.onTranscriptionPreview(text: "preview window")
@@ -823,75 +824,81 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 }
 
-private final class MockAITextResponder: AITextResponding, @unchecked Sendable {
+private final class MockAITextResponder: AITextResponding, Sendable {
   let isConfigured = true
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var storedInput: String? = nil
+    var storedInstructions: String? = nil
+  }
+  private let state = Mutex(State())
   private let result: String
-  private var storedInput: String?
-  private var storedInstructions: String?
 
   init(result: String) {
     self.result = result
   }
 
   func respond(input: String, instructions: String) async throws -> String {
-    lock.withLock {
-      storedInput = input
-      storedInstructions = instructions
+    state.withLock { state in
+      state.storedInput = input
+      state.storedInstructions = instructions
     }
     return result
   }
 
   var lastInput: String? {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedInput
+    return state.withLock { state in
+      return state.storedInput
+    }
   }
 
   var lastInstructions: String? {
-    lock.lock()
-    defer { lock.unlock() }
-    return storedInstructions
+    return state.withLock { state in
+      return state.storedInstructions
+    }
   }
 }
 
-private final class LockedStringLog: @unchecked Sendable {
-  private let lock = NSLock()
-  private var storage: [String] = []
+private final class LockedStringLog: Sendable {
+  private struct State: Sendable {
+    var storage: [String] = []
+  }
+  private let state = Mutex(State())
 
   func append(_ value: String) {
-    lock.lock()
-    storage.append(value)
-    lock.unlock()
+    state.withLock { state in
+      state.storage.append(value)
+    }
   }
 
   var values: [String] {
-    lock.lock()
-    defer { lock.unlock() }
-    return storage
+    return state.withLock { state in
+      return state.storage
+    }
   }
 }
 
-private final class LockedFlag: @unchecked Sendable {
-  private let lock = NSLock()
-  private var value = false
+private final class LockedFlag: Sendable {
+  private struct State: Sendable {
+    var value = false
+  }
+  private let state = Mutex(State())
 
   func set() {
-    lock.lock()
-    value = true
-    lock.unlock()
+    state.withLock { state in
+      state.value = true
+    }
   }
 
   func clear() {
-    lock.lock()
-    value = false
-    lock.unlock()
+    state.withLock { state in
+      state.value = false
+    }
   }
 
   var isSet: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
+    return state.withLock { state in
+      return state.value
+    }
   }
 }
 
@@ -900,49 +907,28 @@ private enum DictationLifecycleTestError: Error {
   case staleStop
 }
 
-private final class MockAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
-  private let lock = NSLock()
+private final class MockAgentPromptLauncher: AgentPromptLaunching, Sendable {
+  private struct State: Sendable {
+    var prompts: [String] = []
+    var directories: [URL] = []
+  }
+  private let state = Mutex(State())
   private let result: AgentDispatchMetadata
-  private var prompts: [String] = []
-  private var directories: [URL] = []
-
   init(
     result: AgentDispatchMetadata = AgentDispatchMetadata(
-      runID: nil,
-      reportPath: nil,
-      exitCode: 0,
-      output: ""
-    )
+      runID: nil, reportPath: nil, exitCode: 0, output: "")
   ) {
     self.result = result
   }
-
   func dispatch(
-    workflow: String,
-    agents: [String],
-    payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workflow: String, agents: [String], payload: AgentDispatchPayload, workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    if case .prompt(let prompt) = payload {
-      prompts.append(prompt)
+    state.withLock { state in
+      if case .prompt(let prompt) = payload { state.prompts.append(prompt) }
+      state.directories.append(workingDirectoryURL)
     }
-    directories.append(workingDirectoryURL)
-    lock.unlock()
     return result
   }
-
-  func dispatchedPrompts() -> [String] {
-    lock.lock()
-    let snapshot = prompts
-    lock.unlock()
-    return snapshot
-  }
-
-  func workingDirectoryURLs() -> [URL] {
-    lock.lock()
-    let snapshot = directories
-    lock.unlock()
-    return snapshot
-  }
+  func dispatchedPrompts() -> [String] { state.withLock { $0.prompts } }
+  func workingDirectoryURLs() -> [URL] { state.withLock { $0.directories } }
 }

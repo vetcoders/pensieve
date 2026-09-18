@@ -1199,10 +1199,10 @@ final class DocumentWindowRegistryTests: XCTestCase {
     let window = Self.makeWindow()
     defer { window.close() }
 
-    var canMutate = false
+    let canMutate = MainActorTestValue(false)
     var deferredWork: [() -> Void] = []
     let registry = DocumentWindowRegistry(
-      canMutateWindowTabs: { canMutate },
+      canMutateWindowTabs: { canMutate.value },
       scheduleDeferredMainWork: { deferredWork.append($0) },
       scheduleLauncherWindowSweep: { _ in },
       mergeWindowIntoTabs: { _, _ in },
@@ -1225,7 +1225,7 @@ final class DocumentWindowRegistryTests: XCTestCase {
 
     // Modal closes; the deferred attach runs. It must NOT re-publish the
     // descriptor as clean.
-    canMutate = true
+    canMutate.value = true
     for work in deferredWork { work() }
 
     XCTAssertEqual(
@@ -1284,20 +1284,20 @@ final class DocumentWindowRegistryTests: XCTestCase {
       self.documentWindow = documentWindow
       // Built before `registry` so the closures below can capture it; the registry is the only thing
       // that ever calls them, and it is created on the next line.
-      var recordSweep: ((@escaping () -> Void) -> Void)!
-      var recordClose: ((NSWindow) -> Void)!
+      let recordSweep = MainActorTestValue<((@escaping () -> Void) -> Void)?>(nil)
+      let recordClose = MainActorTestValue<((NSWindow) -> Void)?>(nil)
       registry = DocumentWindowRegistry(
         canMutateWindowTabs: { true },
         scheduleDeferredMainWork: { _ in },
-        scheduleLauncherWindowSweep: { recordSweep($0) },
+        scheduleLauncherWindowSweep: { recordSweep.value!($0) },
         mergeWindowIntoTabs: { _, _ in },
         orderAndActivateWindow: { _ in },
         currentMergeTarget: { nil },
         applicationWindows: { [launcher, documentWindow] },
-        closeWindow: { recordClose($0) },
+        closeWindow: { recordClose.value!($0) },
         makeDocumentWindow: { _, _ in documentWindow })
-      recordSweep = { [weak self] work in self?.sweeps.append(work) }
-      recordClose = { [weak self] window in self?.closedIDs.append(ObjectIdentifier(window)) }
+      recordSweep.value = { [weak self] work in self?.sweeps.append(work) }
+      recordClose.value = { [weak self] window in self?.closedIDs.append(ObjectIdentifier(window)) }
       registry.open(DocumentRef(id: documentID))
     }
 
@@ -1548,7 +1548,7 @@ private final class SceneOwnedLikeWindow: NSWindow {
 /// bridge has to DISPLACE an implementation and keep it reachable for every
 /// window of that class which is not Pensieve's.
 private final class SceneOwnedAnsweringWindow: NSWindow {
-  nonisolated(unsafe) static var displacedCalls = 0
+  @MainActor static var displacedCalls = 0
 
   override func newWindowForTab(_ sender: Any?) {
     Self.displacedCalls += 1

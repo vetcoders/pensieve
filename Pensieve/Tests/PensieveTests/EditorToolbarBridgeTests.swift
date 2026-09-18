@@ -11,8 +11,9 @@ import XCTest
 /// `ControlGroup` with a `Toggle` becomes a sticky chip). None of that is
 /// visible from the SwiftUI side, so these tests host the REAL `EditorToolbelt`
 /// in a window (`ToolbarBridgeRig`), read the bridged `NSToolbar`, and drive it
-/// with synthesized mouse events — the only way a regression here fails a test
-/// instead of an operator.
+/// through its segment accessibility actions. The deferred test window has no
+/// WindowServer identity, so physical mouse events cannot name it reliably.
+@MainActor
 final class EditorToolbarBridgeTests: XCTestCase {
   // MARK: - Mode picker
 
@@ -88,19 +89,19 @@ final class EditorToolbarBridgeTests: XCTestCase {
   }
 
   @MainActor
-  func testClickingAModeSegmentSwitchesTheEditorMode() throws {
+  func testPressingAModeSegmentSwitchesTheEditorMode() throws {
     let rig = try makeRig()
     defer { rig.tearDown() }
 
     let picker = try XCTUnwrap(rig.modePickerControl())
     let before = rig.appState.mode
-    // Aim at the last segment; the assertion reads back which segment AppKit
-    // actually landed on, so it never depends on exact segment geometry.
-    rig.click(picker, segment: picker.segmentCount - 1)
+    // Address the real bridged segment without asking an unbacked window to
+    // participate in physical mouse-event tracking.
+    try pressSegment(picker, segment: picker.segmentCount - 1)
     rig.settle()
 
     let landed = picker.selectedSegment
-    XCTAssertGreaterThanOrEqual(landed, 0, "the click did not select any segment")
+    XCTAssertEqual(landed, picker.segmentCount - 1, "the requested mode segment was not selected")
     XCTAssertNotEqual(rig.appState.mode, before, "clicking the mode picker changed nothing")
     XCTAssertEqual(
       rig.appState.mode, EditorMode.allCases[landed],
@@ -176,7 +177,7 @@ final class EditorToolbarBridgeTests: XCTestCase {
       (0..<formats.segmentCount).first {
         formats.toolTip(forSegment: $0) == MarkdownFormat.bold.label
       })
-    rig.click(formats, segment: bold)
+    try pressSegment(formats, segment: bold)
     rig.settle()
 
     XCTAssertEqual(
@@ -347,6 +348,22 @@ final class EditorToolbarBridgeTests: XCTestCase {
     XCTAssertTrue(
       entries.contains("Mode"),
       "the mode picker must survive a narrow window through the overflow menu, got \(entries)")
+  }
+
+  /// Invoke the same accessibility action assistive clients use on the native segment.
+  /// Mouse tracking is not a valid unit-test driver here: the intentionally deferred window
+  /// has windowNumber -1, so synthesized events cannot resolve their target window. Calling
+  /// the SwiftUI coordinator's target/action selector directly also bypasses its control
+  /// activation contract. A segment press keeps the real bridge responsible for the action.
+  private func pressSegment(_ control: NSSegmentedControl, segment: Int) throws {
+    let children = try XCTUnwrap(control.cell?.accessibilityChildren())
+    XCTAssertEqual(children.count, control.segmentCount)
+    let child = try XCTUnwrap(children.indices.contains(segment) ? children[segment] : nil)
+    let button = try XCTUnwrap(child as? NSAccessibilityElement)
+    // AppKit's segment returns false on this deferred window even when SwiftUI handles
+    // the action. The caller asserts the actual selected mode or edited document bytes;
+    // that observable result is the contract, not this platform-dependent return value.
+    _ = button.accessibilityPerformPress()
   }
 
   // MARK: - Rig

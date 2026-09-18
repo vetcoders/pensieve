@@ -4,6 +4,7 @@ import XCTest
 
 @testable import Pensieve
 
+@MainActor
 final class BundledFontsTests: XCTestCase {
   /// The bundled fonts must resolve by their CSS family name after
   /// registration. Registration is idempotent, so registering here on top of

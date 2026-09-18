@@ -1,6 +1,6 @@
 import Foundation
 
-struct RecoveryDraft: Equatable, Identifiable {
+struct RecoveryDraft: Equatable, Identifiable, Sendable {
   let id: UUID
   let url: URL
   let title: String
@@ -49,6 +49,7 @@ struct RecoveryDraft: Equatable, Identifiable {
   private static let snippetLimit = 80
 }
 
+@MainActor
 final class RecoveryStore {
   static let shared = RecoveryStore()
 
@@ -288,7 +289,8 @@ final class RecoveryStore {
       fileManager: fileManager,
       isTestProcess: isTestProcess)
     {
-      return isolationRoot
+      return
+        isolationRoot
         .appendingPathComponent("Recovery", isDirectory: true)
     }
     let appSupport =

@@ -5,7 +5,7 @@ protocol AutocompleteCompleting: Sendable {
   func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String
 }
 
-private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked Sendable {
+private final class VistaAutocompleteAdapter: AutocompleteCompleting, Sendable {
   private let engine: VistaEngineProtocol
 
   init(engine: VistaEngineProtocol) {
@@ -17,7 +17,8 @@ private final class VistaAutocompleteAdapter: AutocompleteCompleting, @unchecked
   }
 }
 
-final class AutocompleteController: ObservableObject, @unchecked Sendable {
+@MainActor
+final class AutocompleteController: ObservableObject {
   typealias EngineFactory = @Sendable () -> VistaEngineProtocol
   typealias CompletionFactory = @Sendable () -> any AutocompleteCompleting
 
@@ -53,9 +54,6 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private let debounceNanoseconds: UInt64
   private let maxTokens: UInt32
   private let sessionStore: DocumentAISessionStore
-  // Backend resolution happens post-debounce inside the completion task, so
-  // the cache is guarded by a lock rather than main-actor isolation.
-  private let completionLock = NSLock()
   private var completionBackend: (any AutocompleteCompleting)?
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
@@ -110,26 +108,27 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   private func observeProviderSettings() {
     self.providerSettingsCancellable = NotificationCenter.default.publisher(
       for: .completionProviderSettingsDidChange
-    ).sink { [weak self] _ in
+    ).sink { @Sendable [weak self] _ in
       // The live backend resolves provider env on every request. Saving settings
       // only needs to clear the permanent-unavailable latch; the next keystroke
       // immediately observes the new process values.
-      self?.cancel()
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.cancel() }
+      } else {
+        Task { @MainActor [weak self] in self?.cancel() }
+      }
     }
   }
 
   deinit {
     completionTask?.cancel()
     rewriteTask?.cancel()
-    providerSettingsCancellable?.cancel()
   }
 
   /// True when a suggestion could ever be produced (injected engine or
   /// factory). Checked on the typing path instead of resolving the engine,
   /// so no FFI call happens between keystrokes.
   var hasEngineSource: Bool {
-    completionLock.lock()
-    defer { completionLock.unlock() }
     return completionBackend != nil || completionFactory != nil
   }
 
@@ -390,8 +389,6 @@ final class AutocompleteController: ObservableObject, @unchecked Sendable {
   /// uses a small Responses client; the Vista adapter remains for focused tests
   /// and compatible injected engines without coupling autocomplete to STT.
   private func resolveCompletionBackend() -> (any AutocompleteCompleting)? {
-    completionLock.lock()
-    defer { completionLock.unlock() }
     if let completionBackend {
       return completionBackend
     }

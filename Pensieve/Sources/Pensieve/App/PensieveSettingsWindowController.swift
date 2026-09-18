@@ -10,6 +10,8 @@ enum PensieveSettingsSection: Hashable {
   /// showing a document, so the axes needed one route reachable with ⌘, from
   /// anywhere — including the launcher.
   case appearance
+  /// W6-01: dedicated MCP wizard (detect / point / status). Not the AI tab.
+  case mcp
 }
 
 enum PensieveSettingsPresentationResult: Equatable {
@@ -164,7 +166,7 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
     fatalError("init(coder:) has not been implemented")
   }
 
-  deinit {
+  isolated deinit {
     for observer in windowObservers {
       notificationCenter.removeObserver(observer)
     }
@@ -240,8 +242,9 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
         object: nil,
         queue: .main
       ) { [weak self] notification in
+        let window = notification.object as? NSWindow
         MainActor.assumeIsolated {
-          self?.synchronizeCommandSurfaceOwnership(keyWindow: notification.object as? NSWindow)
+          self?.synchronizeCommandSurfaceOwnership(keyWindow: window)
         }
       })
     windowObservers.append(

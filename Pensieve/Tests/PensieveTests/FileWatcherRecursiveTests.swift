@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -521,32 +522,38 @@ private struct WatcherRefreshHarness {
   let searchWrites: WatcherSearchWriteRecorder
 }
 
-private final class WatcherScanProbe: @unchecked Sendable {
-  private let lock = NSLock()
-  private var samples: [Bool] = []
+private final class WatcherScanProbe: Sendable {
+  private struct State: Sendable {
+    var samples: [Bool] = []
+  }
+  private let state = Mutex(State())
 
   func record(isMainThread: Bool) {
-    lock.lock()
-    samples.append(isMainThread)
-    lock.unlock()
+    state.withLock { state in
+      state.samples.append(isMainThread)
+    }
   }
 
   var callCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return samples.count
+    return state.withLock { state in
+      return state.samples.count
+    }
   }
 
   func mainThreadSamples(after count: Int) -> [Bool] {
-    lock.lock()
-    defer { lock.unlock() }
-    return Array(samples.dropFirst(count))
+    return state.withLock { state in
+      return Array(state.samples.dropFirst(count))
+    }
   }
 }
 
 /// Holds injected workspace walks open so refresh-pass overlap is observable as logic instead of
 /// CPU. A closed gate parks each walk on a condition (with its own deadline, so a regression fails
 /// the assertion rather than hanging the suite) and records how many walks were in flight at once.
+// NSCondition atomically releases/reacquires its lock while a background scanner
+// waits. Every mutable field below is accessed under that same condition lock;
+// expectation callbacks are copied out and fulfilled after unlocking. Mutex cannot
+// replace this storage without breaking the condition wait's atomic handoff.
 private final class WatcherWalkGate: @unchecked Sendable {
   private static let holdTimeout: TimeInterval = 10
 
@@ -626,166 +633,155 @@ private final class WatcherWalkGate: @unchecked Sendable {
   }
 }
 
-private final class WatcherSearchWriteRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var batchSizes: [Int] = []
+private final class WatcherSearchWriteRecorder: Sendable {
+  private struct State: Sendable {
+    var batchSizes: [Int] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ count: Int) {
-    lock.lock()
-    batchSizes.append(count)
-    lock.unlock()
+    state.withLock { state in
+      state.batchSizes.append(count)
+    }
   }
 
   var totalRecords: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return batchSizes.reduce(0, +)
+    return state.withLock { state in
+      return state.batchSizes.reduce(0, +)
+    }
   }
 }
 
-private final class FileWatcherEventRecorder: @unchecked Sendable {
-  private let lock = NSLock()
-  private var batches: [[FileWatcher.Event]] = []
+private final class FileWatcherEventRecorder: Sendable {
+  private struct State: Sendable {
+    var batches: [[FileWatcher.Event]] = []
+  }
+  private let state = Mutex(State())
 
   func record(_ events: [FileWatcher.Event]) {
-    lock.lock()
-    batches.append(events)
-    lock.unlock()
+    state.withLock { state in
+      state.batches.append(events)
+    }
   }
 
   var batchCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return batches.count
+    return state.withLock { state in
+      return state.batches.count
+    }
   }
 }
 
-private final class FileWatcherSourceTracker: @unchecked Sendable {
-  private let lock = NSLock()
-  private var sources: [InjectedFileWatcherEventSource] = []
-  private var active = 0
-  private var maximumActive = 0
+private final class FileWatcherSourceTracker: Sendable {
+  private struct State: Sendable {
+    var sources: [InjectedFileWatcherEventSource] = []
+    var active = 0
+    var maximumActive = 0
+  }
+  private let state = Mutex(State())
 
   func makeSource() -> any FileWatcherEventSource {
     let source = InjectedFileWatcherEventSource(tracker: self)
-    lock.lock()
-    sources.append(source)
-    lock.unlock()
+    state.withLock { state in
+      state.sources.append(source)
+    }
     return source
   }
 
   func didStart() {
-    lock.lock()
-    active += 1
-    maximumActive = max(maximumActive, active)
-    lock.unlock()
+    state.withLock { state in
+      state.active += 1
+      state.maximumActive = max(state.maximumActive, state.active)
+    }
   }
 
   func didStop() {
-    lock.lock()
-    active -= 1
-    lock.unlock()
+    state.withLock { state in
+      state.active -= 1
+    }
   }
 
   var latestSource: InjectedFileWatcherEventSource? {
-    lock.lock()
-    defer { lock.unlock() }
-    return sources.last
+    return state.withLock { state in
+      return state.sources.last
+    }
   }
 
   var activeCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return active
+    return state.withLock { state in
+      return state.active
+    }
   }
 
   var maximumActiveCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return maximumActive
+    return state.withLock { state in
+      return state.maximumActive
+    }
   }
 }
 
-private final class InjectedFileWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
-  private weak var tracker: FileWatcherSourceTracker?
-  private let lock = NSLock()
-  private var onEvents: (@Sendable ([FileWatcherEvent]) -> Void)?
-  private var started = false
-  private(set) var paths: [String] = []
-
-  init(tracker: FileWatcherSourceTracker) {
-    self.tracker = tracker
+private final class InjectedFileWatcherEventSource: FileWatcherEventSource, Sendable {
+  private struct State: Sendable {
+    weak var tracker: FileWatcherSourceTracker?
+    var onEvents: (@Sendable ([FileWatcherEvent]) -> Void)?
+    var started = false
+    var paths: [String] = []
   }
-
-  func start(
-    paths: [String],
-    onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void
-  ) throws {
-    lock.lock()
-    self.paths = paths
-    self.onEvents = onEvents
-    started = true
-    lock.unlock()
+  private let state: Mutex<State>
+  var paths: [String] { state.withLock { $0.paths } }
+  init(tracker: FileWatcherSourceTracker) { state = Mutex(State(tracker: tracker)) }
+  func start(paths: [String], onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void) throws {
+    let tracker = state.withLock { state in
+      state.paths = paths
+      state.onEvents = onEvents
+      state.started = true
+      return state.tracker
+    }
     tracker?.didStart()
   }
-
   func stop() {
-    lock.lock()
-    let wasStarted = started
-    started = false
-    lock.unlock()
-    if wasStarted { tracker?.didStop() }
+    let tracker = state.withLock { state -> FileWatcherSourceTracker? in
+      guard state.started else { return nil }
+      state.started = false
+      return state.tracker
+    }
+    tracker?.didStop()
   }
-
-  /// Deliberately invokes the captured callback even after stop. FileWatcher's generation fence,
-  /// not a cooperative fake, must prove that stale source delivery cannot escape a restart.
+  /// Deliberately deliver after stop to exercise production generation fences.
   func emit(_ events: [FileWatcherEvent]) {
-    lock.lock()
-    let callback = onEvents
-    lock.unlock()
+    let callback = state.withLock { $0.onEvents }
     callback?(events)
   }
 }
 
-private final class FileWatcherEventProbe: @unchecked Sendable {
-  private struct Rule {
+private final class FileWatcherEventProbe: Sendable {
+  private struct Rule: Sendable {
     let predicate: @Sendable (FileWatcher.Event) -> Bool
     let expectation: XCTestExpectation
   }
-
-  private let lock = NSLock()
-  private var rules: [Rule] = []
-  private var threadSamples: [Bool] = []
-
-  func expectation(
-    description: String,
-    predicate: @escaping @Sendable (FileWatcher.Event) -> Bool
-  ) -> XCTestExpectation {
+  private struct State: Sendable {
+    var rules: [Rule] = []
+    var threadSamples: [Bool] = []
+  }
+  private let state = Mutex(State())
+  func expectation(description: String, predicate: @escaping @Sendable (FileWatcher.Event) -> Bool)
+    -> XCTestExpectation
+  {
     let expectation = XCTestExpectation(description: description)
-    lock.lock()
-    rules.append(Rule(predicate: predicate, expectation: expectation))
-    lock.unlock()
+    state.withLock { $0.rules.append(Rule(predicate: predicate, expectation: expectation)) }
     return expectation
   }
-
   func record(_ events: [FileWatcher.Event]) {
-    var fulfilled: [XCTestExpectation] = []
-    lock.lock()
-    threadSamples.append(Thread.isMainThread)
-    rules.removeAll { rule in
-      guard events.contains(where: rule.predicate) else { return false }
-      fulfilled.append(rule.expectation)
-      return true
+    let fulfilled = state.withLock { state -> [XCTestExpectation] in
+      var fulfilled: [XCTestExpectation] = []
+      state.threadSamples.append(Thread.isMainThread)
+      state.rules.removeAll { rule in
+        guard events.contains(where: rule.predicate) else { return false }
+        fulfilled.append(rule.expectation)
+        return true
+      }
+      return fulfilled
     }
-    lock.unlock()
-    for expectation in fulfilled {
-      expectation.fulfill()
-    }
+    for expectation in fulfilled { expectation.fulfill() }
   }
-
-  var mainThreadSamples: [Bool] {
-    lock.lock()
-    defer { lock.unlock() }
-    return threadSamples
-  }
+  var mainThreadSamples: [Bool] { state.withLock { $0.threadSamples } }
 }

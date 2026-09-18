@@ -219,6 +219,7 @@ enum AgentDispatchPayload: Equatable, Sendable {
 
 enum AgentPromptLauncherError: LocalizedError {
   case executableNotFound(searchedPaths: [String])
+  case mcpNotReady(VibecraftedMCPConnectionStatus)
 
   var errorDescription: String? {
     switch self {
@@ -229,11 +230,13 @@ enum AgentPromptLauncherError: LocalizedError {
         + "Set the PENSIEVE_VIBECRAFTED_PATH environment variable to the full path "
         + "of the vibecrafted script, or install vibecrafted under "
         + "~/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted."
+    case .mcpNotReady(let status):
+      return status.refusalExplanation
     }
   }
 }
 
-final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
+final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
   static let vibecraftedHomeEnvironmentKey = "VIBECRAFTED_HOME"
   static let workerSpawnRecordTimeout: TimeInterval = 3
@@ -241,6 +244,12 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
   static let defaultExecutableRelativePath =
     ".local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
+
+  private let mcpClient: VibecraftedMCPClient
+
+  init(mcpClient: VibecraftedMCPClient = .shared) {
+    self.mcpClient = mcpClient
+  }
 
   static func resolveExecutablePath() throws -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser
@@ -347,15 +356,6 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     return String(output[valueRange])
   }
 
-  private static func waitForWorkerSpawnRecord(at metadataURL: URL) -> Bool {
-    let deadline = Date().addingTimeInterval(workerSpawnRecordTimeout)
-    repeat {
-      if workerSpawnRecorded(at: metadataURL) { return true }
-      if Date() >= deadline { return false }
-      Thread.sleep(forTimeInterval: 0.05)
-    } while true
-  }
-
   static func arguments(
     workflow: String,
     agents: [String],
@@ -375,67 +375,10 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, @unchecked Sen
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    let executablePath = try Self.resolveExecutablePath()
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = Self.arguments(workflow: workflow, agents: agents, payload: payload)
-    process.currentDirectoryURL = workingDirectoryURL
-    let launchEnvironment = Self.launchEnvironment(
-      base: ProcessInfo.processInfo.environment,
-      home: FileManager.default.homeDirectoryForCurrentUser)
-    process.environment = launchEnvironment
-
-    let stdout = Pipe()
-    let stderr = Pipe()
-    let buffer = ProcessOutputBuffer()
-    process.standardOutput = stdout
-    process.standardError = stderr
-
-    stdout.fileHandleForReading.readabilityHandler = { handle in
-      buffer.append(handle.availableData)
-    }
-    stderr.fileHandleForReading.readabilityHandler = { handle in
-      buffer.append(handle.availableData)
-    }
-
-    try process.run()
-    process.waitUntilExit()
-
-    stdout.fileHandleForReading.readabilityHandler = nil
-    stderr.fileHandleForReading.readabilityHandler = nil
-    buffer.append(stdout.fileHandleForReading.availableData)
-    buffer.append(stderr.fileHandleForReading.availableData)
-
-    let output = buffer.text()
-    let metadata = AgentDispatchMetadata.parse(output: output, exitCode: process.terminationStatus)
-    guard metadata.exitCode == 0, let runID = metadata.runID else {
-      return metadata.classified(workerSpawnRecorded: false)
-    }
-
-    let metadataURL = Self.runtimeMetadataURL(
-      runID: runID,
-      output: output,
-      home: FileManager.default.homeDirectoryForCurrentUser,
-      environment: launchEnvironment)
-    return metadata.classified(workerSpawnRecorded: Self.waitForWorkerSpawnRecord(at: metadataURL))
-  }
-}
-
-private final class ProcessOutputBuffer: @unchecked Sendable {
-  private let lock = NSLock()
-  private var data = Data()
-
-  func append(_ next: Data) {
-    guard !next.isEmpty else { return }
-    lock.lock()
-    data.append(next)
-    lock.unlock()
-  }
-
-  func text() -> String {
-    lock.lock()
-    let snapshot = data
-    lock.unlock()
-    return String(data: snapshot, encoding: .utf8) ?? ""
+    try mcpClient.dispatch(
+      workflow: workflow,
+      agents: agents,
+      payload: payload,
+      workingDirectoryURL: workingDirectoryURL)
   }
 }

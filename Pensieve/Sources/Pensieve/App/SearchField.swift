@@ -48,6 +48,7 @@ struct NativeSearchField: NSViewRepresentable {
     Coordinator(parent: self)
   }
 
+  @MainActor
   final class Coordinator: NSObject, NSSearchFieldDelegate {
     var parent: NativeSearchField
     var lastFocusToken: Int

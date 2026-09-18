@@ -10,6 +10,7 @@ import XCTest
 /// the resolver counted `0x0A` alone, so a CR-only or U+2029 document reported
 /// line 1 for the whole file. And HOW MUCH that answer costs — it walked from
 /// offset 0 on every call, twice per keystroke, three times in Focus mode.
+@MainActor
 final class EditorLineResolverTests: XCTestCase {
   @MainActor
   private func makeSurface(text: String) -> MarkdownEditorSurface {

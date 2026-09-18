@@ -1,3 +1,4 @@
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -202,14 +203,17 @@ final class WorkspaceOpenActivityTests: XCTestCase {
 
 /// Thread-safe walk counter for the `@Sendable` builder closure (mirrors the pattern in
 /// `IndexDatabaseV2StatsTests`).
-private final class WalkCallCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
+private final class WalkCallCounter: Sendable {
+  private struct State: Sendable {
+    var count = 0
+  }
+  private let state = Mutex(State())
+
   @discardableResult
   func increment() -> Int {
-    lock.lock()
-    defer { lock.unlock() }
-    count += 1
-    return count
+    return state.withLock { state in
+      state.count += 1
+      return state.count
+    }
   }
 }

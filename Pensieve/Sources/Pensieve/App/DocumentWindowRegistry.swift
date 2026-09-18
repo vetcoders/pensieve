@@ -107,6 +107,7 @@ enum DocumentWindowOwnership {
       && relationship.styleMask.contains(.titled)
   }
 
+  @MainActor
   static func isRootSurface(_ window: NSWindow) -> Bool {
     isRootSurface(
       SurfaceRelationship(
@@ -1790,6 +1791,7 @@ struct DocumentWindowAccessor: NSViewRepresentable {
   /// per interaction in field traces. The coordinator remembers what was last
   /// attached and only goes to the registry when something it cares about
   /// actually changed.
+  @MainActor
   final class Coordinator {
     var lastWindowID: ObjectIdentifier?
     var lastIdentity: DocumentIdentity?

@@ -50,6 +50,7 @@ final class RecoveredDraftsPaginationTests: XCTestCase {
 ///     20-draft cap);
 ///   * the three launcher actions (Open / Save As… / Discard), each of which
 ///     may retire a draft only when the work is safely elsewhere.
+@MainActor
 final class RecoveredDraftsTests: XCTestCase {
 
   // MARK: - A draft outlives everything but a decision

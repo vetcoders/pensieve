@@ -13,6 +13,7 @@ import XCTest
 /// and assert what the window chrome resolves to afterwards. Nothing here
 /// hand-feeds a `WindowError`: the severity under test is the one the write site
 /// actually chose.
+@MainActor
 final class WindowErrorSurfaceTests: XCTestCase {
 
   // MARK: - A recorded error reaches the chrome, in the RIGHT window
@@ -271,7 +272,8 @@ final class WindowErrorSurfaceTests: XCTestCase {
     XCTAssertNil(appState.unresolvedDataLoss)
     XCTAssertEqual(appState.currentError?.severity, .status)
     XCTAssertTrue(appState.currentError?.message.contains("recovery copy is safe") == true)
-    XCTAssertTrue(appState.currentError?.message.contains("original file was not overwritten") == true)
+    XCTAssertTrue(
+      appState.currentError?.message.contains("original file was not overwritten") == true)
   }
 
   /// The explicit close route used to publish original failure X and recovery

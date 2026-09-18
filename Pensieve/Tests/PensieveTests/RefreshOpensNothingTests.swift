@@ -244,7 +244,7 @@ private struct RefreshHarness {
 }
 
 /// A watcher that never fires: these tests schedule every refresh themselves.
-private final class SilentWatcherEventSource: FileWatcherEventSource, @unchecked Sendable {
+private final class SilentWatcherEventSource: FileWatcherEventSource, Sendable {
   func start(
     paths: [String],
     onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void

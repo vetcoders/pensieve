@@ -40,15 +40,15 @@ final class FindHighlightBatchingTests: XCTestCase {
   private func countEditTransactions(
     of textStorage: NSTextStorage, during work: () -> Void
   ) -> Int {
-    var count = 0
+    let count = LockedCounter()
     let observer = NotificationCenter.default.addObserver(
       forName: NSTextStorage.didProcessEditingNotification,
       object: textStorage,
       queue: nil
-    ) { _ in count += 1 }
+    ) { _ in count.add(1) }
     defer { NotificationCenter.default.removeObserver(observer) }
     work()
-    return count
+    return count.value
   }
 
   /// One keystroke in the find field must cost O(1) edit transactions, not

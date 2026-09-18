@@ -32,6 +32,11 @@ struct PensieveSettingsView: View {
             Label("Appearance", systemImage: "paintpalette")
           }
           .tag(PensieveSettingsSection.appearance)
+        MCPSettingsWizard()
+          .tabItem {
+            Label("MCP", systemImage: "cable.connector")
+          }
+          .tag(PensieveSettingsSection.mcp)
       }
 
       if let message = selection.presentationError {

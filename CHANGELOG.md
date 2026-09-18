@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - Unreleased
+
+### Changed
+
+- Adopt Swift 6 language mode and complete concurrency checking across the app
+  and tests; source builds now require Swift 6.2 or newer. The deployment
+  minimum remains macOS 15.
+- Remove unused bundled resources and make shared mutable state explicitly
+  owned across the native app lifecycle.
+
+### Release engineering
+
+- Verify the installed production bundle against its build provenance and
+  executable/FFI payloads before accepting installation.
+- Seal the notarized DMG checksum into the download page and verify the complete
+  version, checksum, and artifact-link claim.
+
+### Known limitations
+
+- Dictation is not qualified for this release: the reported recording failure
+  remains open, and the CodeScribe engine integration needs separate work.
+- Whole-document AI rewrites have no input chunking or context-budget preflight;
+  large requests can fail at the configured provider. Do not treat staged large
+  file opening as evidence that large AI rewrites are supported.
+- Custom rewrite instructions still use a single-line field.
+
 ### Fixed
 
 - **A folder can no longer end up in the workspace several times over, and one

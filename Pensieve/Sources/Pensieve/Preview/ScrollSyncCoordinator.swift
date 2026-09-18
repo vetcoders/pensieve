@@ -12,6 +12,7 @@ struct ScrollSyncPosition: Equatable, Sendable {
   }
 }
 
+@MainActor
 protocol ScrollSyncPreviewTarget: AnyObject {
   func applyScrollSyncPosition(_ position: ScrollSyncPosition)
 }
@@ -23,6 +24,7 @@ protocol ScrollSyncPreviewTarget: AnyObject {
 /// by ScrollSyncTests: while a programmatic preview scroll is in flight, an
 /// observed preview scroll must be rejected. Do not wire a preview-side
 /// producer without revisiting that contract.
+@MainActor
 final class ScrollSyncCoordinator {
   enum Side: Equatable {
     case editor
@@ -40,11 +42,11 @@ final class ScrollSyncCoordinator {
   private weak var previewTarget: ScrollSyncPreviewTarget?
   private var lockedProgrammaticSide: Side?
   private var lockGeneration: UInt64 = 0
-  private let unlockScheduler: (@escaping () -> Void) -> Void
+  private let unlockScheduler: (@escaping @MainActor @Sendable () -> Void) -> Void
 
   init(
-    unlockScheduler: @escaping (@escaping () -> Void) -> Void = { action in
-      RunLoop.main.perform(action)
+    unlockScheduler: @escaping (@escaping @MainActor @Sendable () -> Void) -> Void = { action in
+      RunLoop.main.perform { MainActor.assumeIsolated { action() } }
     }
   ) {
     self.unlockScheduler = unlockScheduler

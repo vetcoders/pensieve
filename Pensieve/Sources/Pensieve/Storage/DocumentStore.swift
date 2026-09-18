@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import UniformTypeIdentifiers
+import os
 
 /// What an open/restore flow knew about a window's selection at the moment it
 /// STARTED. Every selection decision at the end of such a flow is made from
@@ -951,6 +952,7 @@ final class FolderManager {
         appState.excludedWorkspacePaths == exclusions
       else { return }
 
+      // Publisher only: the walk is already done. applyRefresh must not await FTS.
       self.applyRefresh(
         into: appState,
         snapshot: snapshot,
@@ -1025,6 +1027,13 @@ final class FolderManager {
   /// signatures derived by the same off-main scan. Folder-only changes never write search;
   /// content-only changes never republish the tree. Selection and dirty-buffer protection apply
   /// whenever either visible universe changes.
+  ///
+  /// This method is the MainActor publisher, not the walk and not the GRDB writer. The
+  /// filesystem walk already finished off-main in `cancellableRefreshSnapshot`. FTS is armed
+  /// on the way out via `updateWorkspaceSearchIndex` and is never awaited here — click-file
+  /// and `waitForPendingForcedRefresh` return against the in-memory snapshot even if search
+  /// is still catching up. A stale FTS for a moment is legal; treating the walk as UI work
+  /// is not.
   private func applyRefresh(
     into appState: AppState,
     snapshot: WorkspaceRefreshSnapshot,
@@ -1066,11 +1075,16 @@ final class FolderManager {
       }
     }
 
-    if searchChanged {
-      updateWorkspaceSearchIndex(
-        signature: snapshot.searchSignature,
-        into: appState
-      )
+    // Arm FTS after the in-memory snapshot (and selection) are published, on every
+    // return path. The mapping + GRDB write live in `updateWorkspaceSearchIndex`'s
+    // off-main task; awaiting them here would make click-file wait for FTS.
+    defer {
+      if searchChanged {
+        updateWorkspaceSearchIndex(
+          signature: snapshot.searchSignature,
+          into: appState
+        )
+      }
     }
     let documents = appState.allDocuments
 
@@ -2715,7 +2729,7 @@ struct WorkspacePresentationSignature: Equatable, Sendable {
 
 /// One off-main filesystem walk and every artifact derived from it. `TreeFingerprint` remains a
 /// cache-validation artifact; it is carried beside, not reused as, either live freshness gate.
-struct WorkspaceRefreshSnapshot: @unchecked Sendable {
+struct WorkspaceRefreshSnapshot: Sendable {
   var scans: [WorkspaceScan]
   var presentationSignature: WorkspacePresentationSignature
   var searchSignature: WorkspaceSignature?
@@ -5152,20 +5166,15 @@ final class DocumentStore {
 /// anything happened since?" is the only question with a stable answer. `hasChanged(since:)` is
 /// monotone for a fixed snapshot, which is what lets the pass ask it twice and trust the second
 /// answer.
-private final class WorkspaceOpenGeneration: @unchecked Sendable {
-  private let lock = NSLock()
-  private var value: UInt64 = 0
+private final class WorkspaceOpenGeneration: Sendable {
+  private let value = OSAllocatedUnfairLock(initialState: UInt64(0))
 
   var current: UInt64 {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
+    value.withLock { $0 }
   }
 
   func bump() {
-    lock.lock()
-    value &+= 1
-    lock.unlock()
+    value.withLock { $0 &+= 1 }
   }
 
   func hasChanged(since snapshot: UInt64) -> Bool {

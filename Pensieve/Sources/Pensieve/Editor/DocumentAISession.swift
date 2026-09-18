@@ -1,11 +1,6 @@
 import CryptoKit
 import Foundation
-
-enum AIEditingTask: Equatable, Sendable {
-  case inlineContinuation(AutocompleteContext)
-  case rewrite(RewriteContext, RewriteIntent)
-  case transformDictation(text: String, mode: String)
-}
+import Synchronization
 
 struct RewriteContext: Codable, Equatable, Sendable {
   let text: String
@@ -232,72 +227,77 @@ protocol AIRewriting: Sendable {
   ) async throws -> AICandidate
 }
 
-final class DocumentAISessionStore: @unchecked Sendable {
+final class DocumentAISessionStore: Sendable {
   static let shared = DocumentAISessionStore()
 
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var sessions: [String: DocumentAISession] = [:]
+    var persistedRecords: [String: PersistedRecord]
+  }
+
   private let fileURL: URL
-  private var sessions: [String: DocumentAISession]
-  private var persistedRecords: [String: PersistedRecord]
+  private let state: Mutex<State>
 
   init(fileURL: URL? = nil) {
     self.fileURL = fileURL ?? Self.defaultFileURL()
+    let persistedRecords: [String: PersistedRecord]
     if let data = try? Data(contentsOf: self.fileURL),
       let envelope = try? JSONDecoder().decode(PersistedEnvelope.self, from: data),
       envelope.version == PersistedEnvelope.currentVersion
     {
-      self.persistedRecords = envelope.records
+      persistedRecords = envelope.records
     } else {
-      self.persistedRecords = [:]
+      persistedRecords = [:]
       // Pre-release builds briefly stored document paths and accepted text in
       // this file. Never carry that plaintext format forward.
       if FileManager.default.fileExists(atPath: self.fileURL.path) {
         try? FileManager.default.removeItem(at: self.fileURL)
       }
     }
-    self.sessions = [:]
+    self.state = Mutex(State(persistedRecords: persistedRecords))
   }
 
   func session(for documentID: String) -> DocumentAISession {
-    lock.lock()
-    defer { lock.unlock() }
-    if let session = sessions[documentID] { return session }
-    let persisted = persistedRecords[Self.documentDigest(documentID)]
-    let session = DocumentAISession(
-      documentID: documentID,
-      restoredProviderFingerprintDigest: persisted?.providerFingerprintDigest,
-      continuation: persisted?.continuation ?? .none)
-    sessions[documentID] = session
-    return session
+    state.withLock { state in
+      if let session = state.sessions[documentID] { return session }
+      let persisted = state.persistedRecords[Self.documentDigest(documentID)]
+      let session = DocumentAISession(
+        documentID: documentID,
+        restoredProviderFingerprintDigest: persisted?.providerFingerprintDigest,
+        continuation: persisted?.continuation ?? .none)
+      state.sessions[documentID] = session
+      return session
+    }
   }
 
   func save(_ session: DocumentAISession) {
-    lock.lock()
-    defer { lock.unlock() }
-    sessions[session.documentID] = session
+    state.withLock { state in
+      state.sessions[session.documentID] = session
 
-    do {
-      let key = Self.documentDigest(session.documentID)
-      if case .none = session.continuation {
-        persistedRecords.removeValue(forKey: key)
-      } else if let fingerprintDigest = session.persistenceFingerprintDigest {
-        persistedRecords[key] = PersistedRecord(
-          providerFingerprintDigest: fingerprintDigest,
-          continuation: session.continuation)
+      do {
+        let key = Self.documentDigest(session.documentID)
+        if case .none = session.continuation {
+          state.persistedRecords.removeValue(forKey: key)
+        } else if let fingerprintDigest = session.persistenceFingerprintDigest {
+          state.persistedRecords[key] = PersistedRecord(
+            providerFingerprintDigest: fingerprintDigest,
+            continuation: session.continuation)
+        }
+        let data = try JSONEncoder().encode(
+          PersistedEnvelope(
+            version: PersistedEnvelope.currentVersion, records: state.persistedRecords))
+        try FileManager.default.createDirectory(
+          at: fileURL.deletingLastPathComponent(),
+          withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+          [.posixPermissions: 0o700],
+          ofItemAtPath: fileURL.deletingLastPathComponent().path)
+        try data.write(to: fileURL, options: .atomic)
+        try FileManager.default.setAttributes(
+          [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+      } catch {
+        DebugTrace.log("could not persist document AI session: \(error.localizedDescription)")
       }
-      let data = try JSONEncoder().encode(
-        PersistedEnvelope(version: PersistedEnvelope.currentVersion, records: persistedRecords))
-      try FileManager.default.createDirectory(
-        at: fileURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o700],
-        ofItemAtPath: fileURL.deletingLastPathComponent().path)
-      try data.write(to: fileURL, options: .atomic)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-    } catch {
-      DebugTrace.log("could not persist document AI session: \(error.localizedDescription)")
     }
   }
 
@@ -331,7 +331,7 @@ final class DocumentAISessionStore: @unchecked Sendable {
     let records: [String: PersistedRecord]
   }
 
-  private struct PersistedRecord: Codable {
+  private struct PersistedRecord: Codable, Sendable {
     let providerFingerprintDigest: String
     let continuation: DocumentAIContinuation
   }

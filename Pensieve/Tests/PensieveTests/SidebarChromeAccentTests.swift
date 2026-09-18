@@ -10,6 +10,7 @@ import XCTest
 /// sidebar it disappears, and it took four consumers with it (the selected-file
 /// glyph, the selection wash, the 2 px leading bar, the selected Open Files row)
 /// plus the sidebar's empty-state wordmark.
+@MainActor
 final class SidebarChromeAccentTests: XCTestCase {
   /// The system sidebar material under a dark appearance, as reported on the
   /// operator's machine. Kept here rather than in the product because nothing

@@ -75,6 +75,7 @@ enum EditRecency {
 /// A one-shot request for the source editor to become first responder for one
 /// specific document session. The request object owns its consumed bit so a
 /// SwiftUI remount cannot replay an already handled focus change.
+@MainActor
 final class EditorFocusRequest {
   let id = UUID()
   let sessionIdentity: DocumentIdentity

@@ -12,7 +12,7 @@ struct MockVistaAutocompleteEngineUnsupportedOperation: Error, LocalizedError {
   }
 }
 
-final class MockVistaAutocompleteEngine: VistaEngineProtocol, @unchecked Sendable {
+final class MockVistaAutocompleteEngine: VistaEngineProtocol, Sendable {
   typealias CompletionHandler = @Sendable (String, UInt32) async throws -> String
   typealias FormattingHandler = @Sendable (String, Bool) async throws -> String
   typealias InitModelHandler = @Sendable () throws -> Void

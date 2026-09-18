@@ -134,12 +134,12 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let window = makeWindow()
     let blocker = makeWindow()
     let selection = PensieveSettingsSelection(selectedSection: .general)
-    var isBlocked = true
+    let isBlocked = MainActorTestValue(true)
     var presentedWindows: [NSWindow] = []
     let controller = PensieveSettingsWindowController(
       window: window,
       selection: selection,
-      blockingNativeModalOwner: { isBlocked ? blocker : nil },
+      blockingNativeModalOwner: { isBlocked.value ? blocker : nil },
       presentWindow: { presentedWindows.append($0) },
       reportBlockedPresentation: { _, _ in false })
     defer {
@@ -156,7 +156,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     assertUnpublished(window)
     assertUnpublished(blocker)
 
-    isBlocked = false
+    isBlocked.value = false
     XCTAssertEqual(controller.show(section: .ai), .presented)
     XCTAssertNil(selection.presentationError)
     XCTAssertEqual(selection.selectedSection, .ai)
@@ -268,9 +268,9 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
   func testOnboardingSettingsTransitionWaitsForNativeSheetDetachmentAndRunsOnce() async {
     let parent = makeWindow()
     let sheet = makeWindow()
-    var isDetached = false
+    let isDetached = MainActorTestValue(false)
     let transition = makeTransition(parent: parent, sheet: sheet) {
-      isDetached
+      isDetached.value
     }
     var completionCount = 0
     let completed = expectation(description: "Settings handoff completed")
@@ -287,7 +287,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
           XCTFail("Settings handoff failed unexpectedly: \(failure)")
         },
         completion: {
-          XCTAssertTrue(isDetached)
+          XCTAssertTrue(isDetached.value)
           completionCount += 1
           completed.fulfill()
         }))
@@ -300,7 +300,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     await nextMainQueueTurn()
     XCTAssertEqual(completionCount, 0, "Settings opened before AppKit detached the sheet")
 
-    isDetached = true
+    isDetached.value = true
     NotificationCenter.default.post(name: NSWindow.didEndSheetNotification, object: parent)
     await fulfillment(of: [completed], timeout: 1)
     XCTAssertEqual(completionCount, 1)
@@ -363,13 +363,13 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let notificationCenter = NotificationCenter()
     let parent = makeWindow()
     let sheet = makeWindow()
-    var isDetached = false
+    let isDetached = MainActorTestValue(false)
     let transition = makeTransition(
       notificationCenter: notificationCenter,
       parent: parent,
       sheet: sheet
     ) {
-      isDetached
+      isDetached.value
     }
     let completed = expectation(description: "Settings handoff completed after delayed bookkeeping")
     defer {
@@ -391,7 +391,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     notificationCenter.post(name: NSWindow.didEndSheetNotification, object: parent)
     await nextMainQueueTurn()
 
-    isDetached = true
+    isDetached.value = true
     await fulfillment(of: [completed], timeout: 1)
   }
 
@@ -401,13 +401,13 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let notificationCenter = NotificationCenter()
     let parent = makeWindow()
     let sheet = makeWindow()
-    var isDetached = false
+    let isDetached = MainActorTestValue(false)
     let transition = makeTransition(
       notificationCenter: notificationCenter,
       parent: parent,
       sheet: sheet
     ) {
-      isDetached
+      isDetached.value
     }
     var completionCount = 0
     let completed = expectation(description: "Settings handoff completed after native detachment")
@@ -428,7 +428,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
           completed.fulfill()
         }))
 
-    isDetached = true
+    isDetached.value = true
     await fulfillment(of: [completed], timeout: 1)
     XCTAssertEqual(completionCount, 1)
   }
@@ -438,14 +438,14 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let parent = makeWindow()
     let sheet = makeWindow()
     var hasAttachedSheet = true
-    var isDetached = false
+    let isDetached = MainActorTestValue(false)
     let transition = ProviderOnboardingSettingsTransition(
       notificationCenter: notificationCenter,
       attachedSheetProvider: { window in
         window === parent && hasAttachedSheet ? sheet : nil
       },
       isDetachedProvider: { host, capturedSheet in
-        host === parent && capturedSheet === sheet && isDetached
+        host === parent && capturedSheet === sheet && isDetached.value
       })
     let completed = expectation(description: "Original handoff survived invalid rearm")
     defer {
@@ -474,7 +474,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
           XCTFail("Invalid replacement handoff ran")
         }))
 
-    isDetached = true
+    isDetached.value = true
     notificationCenter.post(name: NSWindow.didEndSheetNotification, object: parent)
     await fulfillment(of: [completed], timeout: 1)
   }
@@ -486,7 +486,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let sheetA = makeWindow()
     let parentB = makeWindow()
     let sheetB = makeWindow()
-    var detachedPair: ObjectIdentifier?
+    let detachedPair = MainActorTestValue<ObjectIdentifier?>(nil)
     let transition = ProviderOnboardingSettingsTransition(
       notificationCenter: notificationCenter,
       attachedSheetProvider: { window in
@@ -497,7 +497,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
         }
       },
       isDetachedProvider: { host, sheet in
-        detachedPair == ObjectIdentifier(host)
+        detachedPair.value == ObjectIdentifier(host)
           && host === parentB
           && sheet === sheetB
       },
@@ -531,7 +531,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
           XCTFail("Replacement Settings handoff B failed unexpectedly: \(failure)")
         },
         completion: { completionB += 1 }))
-    detachedPair = ObjectIdentifier(parentB)
+    detachedPair.value = ObjectIdentifier(parentB)
 
     scheduler.runNext()
     XCTAssertEqual(completionA, 0, "A stale scheduled check completed the replaced pair")
@@ -600,14 +600,14 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let scheduler = TransitionScheduler()
     let parent = makeWindow()
     let sheet = makeWindow()
-    var isDetached = false
+    let isDetached = MainActorTestValue(false)
     let transition = ProviderOnboardingSettingsTransition(
       notificationCenter: notificationCenter,
       attachedSheetProvider: { window in
         window === parent ? sheet : nil
       },
       isDetachedProvider: { host, capturedSheet in
-        host === parent && capturedSheet === sheet && isDetached
+        host === parent && capturedSheet === sheet && isDetached.value
       },
       nowProvider: { scheduler.now },
       scheduleAfter: { delay, operation in
@@ -637,7 +637,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
 
     XCTAssertTrue(view.beginConfiguration())
     XCTAssertFalse(isPresented)
-    isDetached = true
+    isDetached.value = true
     scheduler.runNext()
 
     XCTAssertEqual(settingsRequests, 1)
@@ -734,8 +734,8 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     let scheduler = TransitionScheduler()
     var parent: NSWindow? = makeWindow()
     var sheet: NSWindow? = makeWindow()
-    weak var retainedParent = parent
-    weak var retainedSheet = sheet
+    let retainedParent = WeakWindowBox(parent)
+    let retainedSheet = WeakWindowBox(sheet)
     let sheetBox = WeakWindowBox(sheet)
     let transition = ProviderOnboardingSettingsTransition(
       notificationCenter: notificationCenter,
@@ -750,8 +750,8 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     var failures: [ProviderOnboardingSettingsTransition.Failure] = []
     defer {
       transition.cancel()
-      if let retainedSheet { close(retainedSheet) }
-      if let retainedParent { close(retainedParent) }
+      if let window = retainedSheet.window { close(window) }
+      if let window = retainedParent.window { close(window) }
     }
 
     XCTAssertTrue(
@@ -764,11 +764,13 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     parent = nil
     sheet = nil
 
-    XCTAssertNotNil(retainedParent, "The armed transition dropped its captured host")
-    XCTAssertNotNil(retainedSheet, "The armed transition dropped its captured sheet")
+    XCTAssertNotNil(retainedParent.window, "The armed transition dropped its captured host")
+    XCTAssertNotNil(retainedSheet.window, "The armed transition dropped its captured sheet")
     scheduler.runNext()
-    XCTAssertNotNil(retainedParent, "A retry dropped its captured host before terminal resolution")
-    XCTAssertNotNil(retainedSheet, "A retry dropped its captured sheet before terminal resolution")
+    XCTAssertNotNil(
+      retainedParent.window, "A retry dropped its captured host before terminal resolution")
+    XCTAssertNotNil(
+      retainedSheet.window, "A retry dropped its captured sheet before terminal resolution")
     scheduler.runNext()
 
     XCTAssertEqual(failures, [.sheetDidNotDetach])
@@ -828,6 +830,7 @@ final class PensieveSettingsWindowControllerTests: XCTestCase {
     XCTAssertEqual(window.windowNumber, -1)
   }
 
+  @MainActor
   private final class WeakWindowBox {
     weak var window: NSWindow?
 

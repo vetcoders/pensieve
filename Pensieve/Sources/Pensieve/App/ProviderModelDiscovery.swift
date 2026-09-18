@@ -46,7 +46,8 @@ protocol ProviderModelDiscovering: Sendable {
   ) async throws -> ProviderModelDiscoveryResult
 }
 
-final class ProviderModelDiscovery: ProviderModelDiscovering, @unchecked Sendable {
+@MainActor
+final class ProviderModelDiscovery: ProviderModelDiscovering {
   typealias RequestSender = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
 
   private let defaults: UserDefaults

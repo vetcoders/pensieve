@@ -4,7 +4,7 @@ struct WorkspaceMetadata: Codable, Equatable {
   var excludedPaths: [String] = []
 }
 
-final class WorkspaceMetadataStore {
+final class WorkspaceMetadataStore: Sendable {
   static let shared = WorkspaceMetadataStore()
 
   private static let protectedWriteOptions: Data.WritingOptions = [
@@ -60,7 +60,8 @@ final class WorkspaceMetadataStore {
       return isolationRoot
     }
     do {
-      return try fileManager
+      return
+        try fileManager
         .url(
           for: .applicationSupportDirectory,
           in: .userDomainMask,

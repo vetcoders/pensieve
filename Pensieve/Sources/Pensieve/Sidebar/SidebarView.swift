@@ -11,6 +11,10 @@ struct SidebarView: View {
   @ObservedObject private var windowRegistry = DocumentWindowRegistry.shared
   @State private var expandedNodeIDs: Set<WorkspaceNode.ID> = []
   @State private var knownRootNodeIDs: Set<WorkspaceNode.ID> = []
+  /// Flattened workspace rows, computed off the main actor. `body` renders this
+  /// published snapshot instead of re-walking the live tree on every
+  /// invalidation (hover, selection, workspace tick).
+  @State private var treeSnapshot = WorkspaceTreeSnapshotStore()
   @State private var hoveredDocumentID: DocumentRef.ID?
   @State private var hoveredFolderID: WorkspaceNode.ID?
   @State private var dropTargetFolderID: WorkspaceNode.ID?
@@ -62,9 +66,19 @@ struct SidebarView: View {
     .pensieveSidebarChromeInset()
     .onAppear {
       reconcileWorkspaceRootExpansion()
+      scheduleTreeSnapshot()
     }
     .onChange(of: rootNodeIDs) { _, _ in
       reconcileWorkspaceRootExpansion()
+    }
+    .onChange(of: appState.sortedWorkspaceTree) { _, _ in
+      scheduleTreeSnapshot()
+    }
+    .onChange(of: expandedNodeIDs) { _, _ in
+      scheduleTreeSnapshot()
+    }
+    .onChange(of: appState.showAllFilesInSidebar) { _, _ in
+      scheduleTreeSnapshot()
     }
     .onChange(of: appState.pendingSidebarRenameURL) { _, url in
       guard let url else { return }
@@ -286,7 +300,7 @@ struct SidebarView: View {
         }
       } else {
         List {
-          ForEach(flattenedWorkspaceRows) { row in
+          ForEach(treeSnapshot.rows) { row in
             workspaceRowView(row)
           }
         }
@@ -528,12 +542,12 @@ struct SidebarView: View {
     .background(selectionBackground(selected || hovered))
   }
 
-  /// Currently-visible workspace rows, flattened so the `List` only materializes
-  /// on-screen rows instead of eagerly building the entire expanded subtree.
-  /// Walks only expanded branches (O(visible)).
-  private var flattenedWorkspaceRows: [FlattenedWorkspaceRow] {
-    flattenWorkspaceTree(
-      appState.sortedWorkspaceTree,
+  /// Feeds the current tree + expansion + visibility inputs into the snapshot
+  /// store. The flatten runs off the main actor and coalesces latest-wins, so
+  /// this stays cheap no matter how often workspace ticks invalidate `body`.
+  private func scheduleTreeSnapshot() {
+    treeSnapshot.publish(
+      tree: appState.sortedWorkspaceTree,
       expandedNodeIDs: expandedNodeIDs,
       includeForeignFiles: appState.showAllFilesInSidebar
     )
@@ -845,7 +859,9 @@ struct SidebarView: View {
           .accessibilityIdentifier("pensieve.sidebar.cancelRename")
         }
 
-        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(typedName: renameText, isFolder: isFolder) {
+        if WorkspaceScanner.warnsAboutLeavingMarkdownFamily(
+          typedName: renameText, isFolder: isFolder)
+        {
           Text("Will be shown as non-markdown")
             .font(.caption2)
             .foregroundColor(.secondary)
@@ -1269,6 +1285,7 @@ private struct InlineRenameField: NSViewRepresentable {
     Coordinator(parent: self)
   }
 
+  @MainActor
   final class Coordinator: NSObject, NSTextFieldDelegate {
     var parent: InlineRenameField
     var lastFocusToken: Int

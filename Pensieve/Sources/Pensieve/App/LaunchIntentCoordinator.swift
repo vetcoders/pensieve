@@ -355,6 +355,7 @@ final class LaunchIntentCoordinator: ObservableObject {
   }
 }
 
+@MainActor
 final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   private var traceObservers: [NSObjectProtocol] = []
 

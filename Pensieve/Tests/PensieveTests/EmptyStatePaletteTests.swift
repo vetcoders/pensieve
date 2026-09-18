@@ -9,6 +9,7 @@ import XCTest
 /// to dress from the active skin, not from the system window colours — the
 /// reported break was parchment showing a cream titlebar strip above a system
 /// grey body that never moved on a skin switch.
+@MainActor
 final class EmptyStatePaletteTests: XCTestCase {
   /// Every skin's empty state paints the SAME surface the document pane and the
   /// titlebar backing use. This is the pin the pre-fix

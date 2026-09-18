@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -124,6 +125,57 @@ final class AgentPromptDispatcherTests: XCTestCase {
     )
 
     XCTAssertEqual(arguments, ["workflow", "codex", "--prompt", "ship the proof"])
+  }
+
+  func testProductionLauncherDispatchesThroughMCPNotProcess() throws {
+    let transport = FakeVibecraftedMCPTransport(
+      probeStatus: .connected,
+      toolResult: [
+        "ok": true,
+        "run_id": "launcher-mcp-1",
+        "agent": "codex",
+        "report": "/tmp/reports/launcher-mcp-1.md",
+      ])
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/live-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/live-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+    let root = URL(fileURLWithPath: "/tmp/mcp-root", isDirectory: true)
+
+    let metadata = try launcher.dispatch(
+      workflow: "review",
+      agents: ["codex"],
+      payload: .file("/tmp/note.md"),
+      workingDirectoryURL: root)
+
+    XCTAssertEqual(metadata.runID, "launcher-mcp-1")
+    XCTAssertEqual(metadata.launchVerification, .workerSpawnRecorded)
+    XCTAssertEqual(transport.toolCalls().map(\.name), ["vc_run_launch"])
+    XCTAssertEqual(transport.toolCalls().first?.arguments["skill"], "review")
+    XCTAssertEqual(transport.toolCalls().first?.arguments["file"], "/tmp/note.md")
+  }
+
+  func testProductionLauncherRefusesWhenMCPIsNotConnected() {
+    let transport = FakeVibecraftedMCPTransport(probeStatus: .unreachable)
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/dead-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/dead-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+
+    XCTAssertThrowsError(
+      try launcher.dispatch(
+        workflow: "review",
+        agents: ["codex"],
+        payload: .prompt("ship it"),
+        workingDirectoryURL: URL(fileURLWithPath: "/tmp", isDirectory: true))
+    ) { error in
+      guard case AgentPromptLauncherError.mcpNotReady(.unreachable) = error else {
+        return XCTFail("expected unreachable MCP, got \(error)")
+      }
+    }
+    XCTAssertTrue(transport.toolCalls().isEmpty)
   }
 
   func testBuildsSwarmArgumentsWithoutFabricatingAnAgent() {
@@ -611,17 +663,19 @@ final class AgentPromptDispatcherTests: XCTestCase {
   }
 }
 
-private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @unchecked Sendable {
-  struct Request: Equatable {
+private final class RecordingAgentPromptLauncher: AgentPromptLaunching, Sendable {
+  struct Request: Equatable, Sendable {
     let workflow: String
     let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
   }
 
-  private let lock = NSLock()
+  private struct State: Sendable {
+    var recordedRequests: [Request] = []
+  }
+  private let state = Mutex(State())
   private let result: AgentDispatchMetadata
-  private var recordedRequests: [Request] = []
 
   init(
     result: AgentDispatchMetadata = AgentDispatchMetadata(
@@ -640,20 +694,20 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, @uncheck
     payload: AgentDispatchPayload,
     workingDirectoryURL: URL
   ) throws -> AgentDispatchMetadata {
-    lock.lock()
-    recordedRequests.append(
-      Request(
-        workflow: workflow,
-        agents: agents,
-        payload: payload,
-        workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
-    lock.unlock()
+    state.withLock { state in
+      state.recordedRequests.append(
+        Request(
+          workflow: workflow,
+          agents: agents,
+          payload: payload,
+          workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
+    }
     return result
   }
 
   func requests() -> [Request] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recordedRequests
+    return state.withLock { state in
+      return state.recordedRequests
+    }
   }
 }

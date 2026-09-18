@@ -1,3 +1,10 @@
+import AppKit
+import GRDB
+import Synchronization
+import XCTest
+
+@testable import Pensieve
+
 //  TerminationQuiescenceTests.swift
 //  PensieveTests
 //
@@ -18,12 +25,6 @@
 //
 //  Siblings: `IndexDatabaseStorageHygieneTests` owns the WAL/checkpoint ordering pins and the two
 //  budget pins (a wedged writer and a wedged reader, both wedged INSIDE the pool).
-
-import AppKit
-import GRDB
-import XCTest
-
-@testable import Pensieve
 
 @MainActor
 final class TerminationQuiescenceTests: XCTestCase {
@@ -46,9 +47,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     let savingSession = AppState()
 
     // A CLEAN owner: this pin is about flush mechanics, and a clean owner is the case that flushes.
-    autosaver.scheduleIndex(owner: indexingSession, document: document, ownerIsDirty: { false }) {
-      runs.increment()
-    }
+    autosaver.scheduleIndex(
+      owner: indexingSession, document: document, ownerIsDirty: { false }, { runs.increment() })
     XCTAssertEqual(
       runs.value, 0,
       "fixture precondition: with a ten-minute debounce the body must still be asleep")
@@ -72,9 +72,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     autosaver.quiesceForTermination()
     XCTAssertTrue(autosaver.isQuiescedForTermination)
 
-    autosaver.scheduleIndex(owner: indexingSession, document: document, ownerIsDirty: { false }) {
-      runs.increment()
-    }
+    autosaver.scheduleIndex(
+      owner: indexingSession, document: document, ownerIsDirty: { false }, { runs.increment() })
     autosaver.scheduleSave(owner: savingSession) { runs.increment() }
     autosaver.flushIndex()
     XCTAssertEqual(
@@ -126,7 +125,8 @@ final class TerminationQuiescenceTests: XCTestCase {
       recoveryStore: RecoveryStore(
         directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
     )
-    let folderManager = makeIsolatedFolderManager(in: folder, database: database, prefix: "AdHocFlush")
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "AdHocFlush")
     let registry = DocumentWindowRegistry()
     let controller = AppController(
       appState: appState,
@@ -299,12 +299,13 @@ final class TerminationQuiescenceTests: XCTestCase {
     try "postlatchneedle".write(to: lateRef.url, atomically: true, encoding: .utf8)
     let finished = CompletionFlag()
     Task { @MainActor in
-      _ = await database.indexInBackground(document: lateRef, body: "postlatchneedle", appState: nil)
+      _ = await database.indexInBackground(
+        document: lateRef, body: "postlatchneedle", appState: nil)
       await database.updateSearchIndexInBackground(
         upserting: [lateRef], deletingPaths: [], appState: nil)
       _ = await database.reindexInBackground(documents: [lateRef], appState: nil)
       await database.performMaintenanceInBackground(reason: .workspaceClose)
-      database.scheduleIndexWrite { }
+      database.scheduleIndexWrite {}
       finished.isSet = true
     }
     pumpMainRunLoop(until: { finished.isSet }, timeout: 10)
@@ -697,7 +698,8 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// ambiguity: if the gate leaks, the directory and the file both appear.
   func testAPostLatchReadCannotCreateOrMigrateTheIndex() throws {
     let folder = try makeTemporaryFolder()
-    let databaseURL = folder
+    let databaseURL =
+      folder
       .appendingPathComponent("Index", isDirectory: true)
       .appendingPathComponent("index.db", isDirectory: false)
     let database = IndexDatabase(databaseURL: databaseURL)
@@ -762,7 +764,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     database.backgroundWriteGateOverride = { await gate.arrive() }
 
     let parkedRef = documentRef(root: root, name: "parked-write.md")
-    try "the write that never gets there".write(to: parkedRef.url, atomically: true, encoding: .utf8)
+    try "the write that never gets there".write(
+      to: parkedRef.url, atomically: true, encoding: .utf8)
     let writeFinished = CompletionFlag()
     database.scheduleIndexWrite {
       await database.updateSearchIndexInBackground(
@@ -778,7 +781,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     TerminationSequence(
       registry: DocumentWindowRegistry(),
       indexDatabase: database,
-      folderManager: makeIsolatedFolderManager(in: folder, database: database, prefix: "SpentBudget"),
+      folderManager: makeIsolatedFolderManager(
+        in: folder, database: database, prefix: "SpentBudget"),
       autosaver: Autosaver(),
       drainTimeout: Self.shrunkDrainBudget
     ).runBlockingMainRunLoop()
@@ -840,7 +844,8 @@ final class TerminationQuiescenceTests: XCTestCase {
         defaults: makeEphemeralDefaults(prefix: "PensieveWatcherQuiesceBookmarks")),
       workspaceSubstrate: WorkspaceSubstrate(
         store: WorkspaceCacheStore(
-          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true))
+          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true)
+        )
       ),
       watcher: FileWatcher(sourceFactory: { source })
     )
@@ -850,7 +855,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     await settle(manager, indexDatabase)
     XCTAssertTrue(
       source.isStarted,
-      "fixture precondition: opening a workspace must start the watcher, or there is nothing to stop")
+      "fixture precondition: opening a workspace must start the watcher, or there is nothing to stop"
+    )
     let stopsBeforeQuit = source.stopCount
 
     let sequence = TerminationSequence(
@@ -915,7 +921,8 @@ final class TerminationQuiescenceTests: XCTestCase {
         defaults: makeEphemeralDefaults(prefix: "PensieveQueuedHopBookmarks")),
       workspaceSubstrate: WorkspaceSubstrate(
         store: WorkspaceCacheStore(
-          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true))
+          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true)
+        )
       ),
       watcher: FileWatcher(sourceFactory: { source })
     )
@@ -1129,7 +1136,8 @@ final class TerminationQuiescenceTests: XCTestCase {
         defaults: makeEphemeralDefaults(prefix: "PensieveCloseThenQuitBookmarks")),
       workspaceSubstrate: WorkspaceSubstrate(
         store: WorkspaceCacheStore(
-          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true))
+          baseDirectory: sandbox.support.appendingPathComponent("WorkspaceCache", isDirectory: true)
+        )
       )
     )
     let databaseURL = sandbox.support.appendingPathComponent("index.db", isDirectory: false)
@@ -1225,7 +1233,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     XCTAssertFalse(
       drained.isSet,
       "the drain completed while the created document's index write was still queued — that write "
-        + "was handed to a bare `Task`, so the quit would checkpoint before it ever reached the pool")
+        + "was handed to a bare `Task`, so the quit would checkpoint before it ever reached the pool"
+    )
 
     Task { await gate.open() }
     pumpMainRunLoop(until: { drained.isSet }, timeout: 10)
@@ -1363,7 +1372,8 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     Task { await gate.open() }
     pumpMainRunLoop(until: { quitFinished.isSet }, timeout: 10)
-    XCTAssertTrue(quitFinished.isSet, "…and the quit must complete once the open is allowed through")
+    XCTAssertTrue(
+      quitFinished.isSet, "…and the quit must complete once the open is allowed through")
 
     XCTAssertTrue(
       database.isClosedForTermination, "a completed sequence must leave the funnel closed")
@@ -2147,7 +2157,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     pumpMainRunLoop(until: { closeGate.arrivalCount >= 1 }, timeout: 10)
     XCTAssertEqual(
       closeGate.arrivalCount, 1,
-      "fixture precondition: the close's pass must be parked in the same gap the downgrade pin uses")
+      "fixture precondition: the close's pass must be parked in the same gap the downgrade pin uses"
+    )
 
     // The gap is opened and closed with NOTHING happening in it. That is the whole experiment.
     pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
@@ -2549,7 +2560,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     }
     XCTAssertFalse(
       ownerState.documentSession.isDirty,
-      "…and it is the OWNER's own debounce that cleaned its buffer, exactly as the deferral assumes")
+      "…and it is the OWNER's own debounce that cleaned its buffer, exactly as the deferral assumes"
+    )
 
     try await waitUntil("the deferred index write to fire over the saved bytes") {
       await database.drainPendingIndexWrites()
@@ -2707,7 +2719,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     let gate = ParkingGate()
     database.backgroundWriteGateOverride = { await gate.arrive() }
     let parkedRef = documentRef(root: root, name: "parked-write.md")
-    try "the write that never gets there".write(to: parkedRef.url, atomically: true, encoding: .utf8)
+    try "the write that never gets there".write(
+      to: parkedRef.url, atomically: true, encoding: .utf8)
     let parkedWriteFinished = CompletionFlag()
     database.scheduleIndexWrite {
       await database.updateSearchIndexInBackground(
@@ -2722,7 +2735,8 @@ final class TerminationQuiescenceTests: XCTestCase {
 
     let log = EventLog()
     let registry = DocumentWindowRegistry()
-    let folderManager = makeIsolatedFolderManager(in: folder, database: database, prefix: "SaveFirst")
+    let folderManager = makeIsolatedFolderManager(
+      in: folder, database: database, prefix: "SaveFirst")
     let autosaver = Autosaver(saveDelayMilliseconds: 600_000, indexDelayMilliseconds: 600_000)
 
     var windows: [NSWindow] = []
@@ -2731,7 +2745,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     // so controllers dropped at the end of the loop below would be reaped before the quit ever asked
     // for them and this pin would pass with zero saves.
     var controllers: [AppController] = []
-    defer { windows.forEach { $0.close() } }
+    defer { for window in windows { window.close() } }
 
     for name in ["window-a", "window-b"] {
       let noteURL = folder.appendingPathComponent("\(name).md")
@@ -3106,7 +3120,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     coordinator.startWhenLaunchIntentsSettle(controller: controller, intent: .coldLaunch)
     XCTAssertFalse(
       appState.documentSession.hasEditableBuffer,
-      "fixture precondition: the startup decision must still be pending, so nothing has restored yet")
+      "fixture precondition: the startup decision must still be pending, so nothing has restored yet"
+    )
 
     let delegate = PensieveAppDelegate()
     delegate.terminationWindowRegistryOverride = registry
@@ -3120,7 +3135,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     // Everything that CAN still run gets its chance — this pin asserts that something did NOT happen.
     pumpMainRunLoop(until: { false }, timeout: Self.settleSeconds)
 
-    XCTAssertEqual(recoveryStore.loadDrafts().count, 1, "fixture: the seeded draft is still on disk")
+    XCTAssertEqual(
+      recoveryStore.loadDrafts().count, 1, "fixture: the seeded draft is still on disk")
     XCTAssertTrue(
       controller.recoveredDrafts.isEmpty,
       "the launch-intent startup task must not run after phase Q: the draft it would have listed is "
@@ -3156,7 +3172,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     let recoveryStore = RecoveryStore(
       directoryURL: folder.appendingPathComponent("Recovery", isDirectory: true))
     let seededDraft = try recoveryStore.saveDraft(
-      id: nil, title: "Recovered Untitled.md", text: "settledlaunchneedle from the previous session")
+      id: nil, title: "Recovered Untitled.md", text: "settledlaunchneedle from the previous session"
+    )
     // Writing a draft claims it for the window that produced it. This one came
     // from a PREVIOUS session, so release the claim — that is the state a draft
     // left behind by a crash is actually in, and the only one the launcher lists.
@@ -3816,7 +3833,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     let bodyB = "betaneedle window B's text, edited SECOND and therefore the winner"
 
     var windows: [NSWindow] = []
-    defer { windows.forEach { $0.close() } }
+    defer { for window in windows { window.close() } }
     var controllers: [String: AppController] = [:]
     var states: [String: AppState] = [:]
 
@@ -3885,7 +3902,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     XCTAssertEqual(
       try String(contentsOf: sharedURL, encoding: .utf8), bodyB,
       "the bytes that survive a quit must be the ones the user typed most recently, never the ones "
-        + "belonging to whichever window a dictionary happened to hand over last (events: \(events))")
+        + "belonging to whichever window a dictionary happened to hand over last (events: \(events))"
+    )
     XCTAssertEqual(
       events, ["save:A", "save:B"],
       "…which means the flush ran oldest-edit FIRST, regardless of the order it was handed")
@@ -3919,7 +3937,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     let registry = DocumentWindowRegistry()
 
     var windows: [NSWindow] = []
-    defer { windows.forEach { $0.close() } }
+    defer { for window in windows { window.close() } }
     var controllers: [String: AppController] = [:]
     var urls: [String: URL] = [:]
 
@@ -4041,7 +4059,7 @@ final class TerminationQuiescenceTests: XCTestCase {
     let bodyNewer = "betaneedle the SECOND save, which is what the user last typed"
 
     var windows: [NSWindow] = []
-    defer { windows.forEach { $0.close() } }
+    defer { for window in windows { window.close() } }
     var controllers: [String: AppController] = [:]
 
     for (name, body) in [("older", bodyOlder), ("newer", bodyNewer)] {
@@ -4098,7 +4116,8 @@ final class TerminationQuiescenceTests: XCTestCase {
     pumpMainRunLoop(until: { handoffGate.arrivalCount >= 2 }, timeout: 10)
     XCTAssertEqual(
       handoffGate.arrivalCount, 2,
-      "fixture precondition: both hand-offs must be registered and parked before either is released")
+      "fixture precondition: both hand-offs must be registered and parked before either is released"
+    )
     XCTAssertEqual(
       try String(contentsOf: sharedURL, encoding: .utf8), bodyNewer,
       "fixture precondition: the DISK half is already settled — both saves write their bytes "
@@ -4250,7 +4269,8 @@ final class TerminationQuiescenceTests: XCTestCase {
 
   private func makeTemporaryFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory
-      .appendingPathComponent("PensieveTerminationQuiescence-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent(
+        "PensieveTerminationQuiescence-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
     return folder
@@ -4329,7 +4349,8 @@ final class TerminationQuiescenceTests: XCTestCase {
   private func churn(database: IndexDatabase, root: URL, count: Int) {
     let body = String(repeating: "pensieve termination churn payload ", count: 600)
     for index in 0..<count {
-      database.index(document: documentRef(root: root, name: "churn-\(index).md"), body: "\(body) \(index)")
+      database.index(
+        document: documentRef(root: root, name: "churn-\(index).md"), body: "\(body) \(index)")
     }
   }
 
@@ -4406,55 +4427,45 @@ final class TerminationQuiescenceTests: XCTestCase {
 
   /// Thread-safe counter for hooks that fire on GRDB's writer thread while the test reads them from
   /// the main thread, and for closures whose call count is the assertion.
-  private final class Counter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
+  private final class Counter: Sendable {
+    private struct State: Sendable {
+      var count = 0
+    }
+    private let state = Mutex(State())
 
     var value: Int {
-      lock.lock()
-      defer { lock.unlock() }
-      return count
+      return state.withLock { state in
+        return state.count
+      }
     }
 
     func increment() {
-      lock.lock()
-      count += 1
-      lock.unlock()
+      state.withLock { state in
+        state.count += 1
+      }
     }
 
     /// Increments and reads back under ONE lock, so a seam that fires from two concurrent tasks can
     /// tell which arrival it is. `increment()` followed by `value` cannot: two callers can interleave
     /// between the two locks and both read the same number.
     func next() -> Int {
-      lock.lock()
-      defer { lock.unlock() }
-      count += 1
-      return count
+      return state.withLock { state in
+        state.count += 1
+        return state.count
+      }
     }
   }
 
   /// Which file writes the `writeDocument` seam should reject, mutable mid-test so a pin can show
   /// the SAME buffer failing and then succeeding. Locked because the seam is a plain closure the
   /// store may call from wherever it saves.
-  private final class WriteFailureGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var failing: Set<URL>
-
-    init(failing: Set<URL>) {
-      self.failing = failing
-    }
-
+  private final class WriteFailureGate: Sendable {
+    private let failing: Mutex<Set<URL>>
+    init(failing: Set<URL>) { self.failing = Mutex(failing) }
     func fails(_ url: URL) -> Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      return failing.contains(url.standardizedFileURL)
+      failing.withLock { $0.contains(url.standardizedFileURL) }
     }
-
-    func stopFailing(_ url: URL) {
-      lock.lock()
-      failing.remove(url.standardizedFileURL)
-      lock.unlock()
-    }
+    func stopFailing(_ url: URL) { _ = failing.withLock { $0.remove(url.standardizedFileURL) } }
   }
 
   /// Holds EVERY background index write until the test opens it. The gate sits at the head of the
@@ -4534,61 +4545,46 @@ final class TerminationQuiescenceTests: XCTestCase {
   /// An ordered log two different seams write into, so a test can assert on their INTERLEAVING
   /// rather than on wall-clock durations. Locked because `TerminationSequence`'s `pumpRunLoop` seam
   /// is a plain nonisolated closure.
-  private final class EventLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var recorded: [String] = []
+  private final class EventLog: Sendable {
+    private struct State: Sendable {
+      var recorded: [String] = []
+    }
+    private let state = Mutex(State())
 
     var events: [String] {
-      lock.lock()
-      defer { lock.unlock() }
-      return recorded
+      return state.withLock { state in
+        return state.recorded
+      }
     }
 
     func append(_ event: String) {
-      lock.lock()
-      recorded.append(event)
-      lock.unlock()
+      state.withLock { state in
+        state.recorded.append(event)
+      }
     }
   }
 
   /// A `FileWatcherEventSource` the test drives by hand: it records the stop the quiescence phase is
   /// supposed to issue, and it can deliver an event AFTER that stop — the batch already in flight on
   /// the watcher queue, which is the case a `stop()` alone cannot prevent.
-  private final class RecordingWatcherSource: FileWatcherEventSource, @unchecked Sendable {
-    private let lock = NSLock()
-    private var handler: (@Sendable ([FileWatcherEvent]) -> Void)?
-    private var stops = 0
-    private var started = false
-
-    var stopCount: Int {
-      lock.lock()
-      defer { lock.unlock() }
-      return stops
+  private final class RecordingWatcherSource: FileWatcherEventSource, Sendable {
+    private struct State: Sendable {
+      var handler: (@Sendable ([FileWatcherEvent]) -> Void)?
+      var stops = 0
+      var started = false
     }
-
-    var isStarted: Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      return started
-    }
-
+    private let state = Mutex(State())
+    var stopCount: Int { state.withLock { $0.stops } }
+    var isStarted: Bool { state.withLock { $0.started } }
     func start(paths: [String], onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void) throws {
-      lock.lock()
-      handler = onEvents
-      started = true
-      lock.unlock()
+      state.withLock { state in
+        state.handler = onEvents
+        state.started = true
+      }
     }
-
-    func stop() {
-      lock.lock()
-      stops += 1
-      lock.unlock()
-    }
-
+    func stop() { state.withLock { $0.stops += 1 } }
     func deliver(_ events: [FileWatcherEvent]) {
-      lock.lock()
-      let handler = self.handler
-      lock.unlock()
+      let handler = state.withLock { $0.handler }
       handler?(events)
     }
   }

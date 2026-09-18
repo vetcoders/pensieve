@@ -11,6 +11,7 @@ import XCTest
 /// `.backgroundColor` over every chunk it touches — instead of disappearing
 /// until the last chunk lands. And whatever the wash is, the text under it has
 /// to stay readable on every skin, which the fixed dark palettes did not.
+@MainActor
 final class EditorFindWashTests: XCTestCase {
   /// Comfortably past `MarkdownTextStorage.synchronousRethemeCharacterBudget`
   /// so a skin switch takes the DEFERRED path, and seeded with a word the find

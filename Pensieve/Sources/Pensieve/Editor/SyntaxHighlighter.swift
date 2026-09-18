@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 class SyntaxHighlighter {
   var baseFontSize: CGFloat = 14
 
@@ -55,6 +56,7 @@ class SyntaxHighlighter {
   /// Fonts that depend on `baseFontSize` and the theme's `monoFamily`. Rebuilt
   /// only when one of those two changes (the italic derivation is the most
   /// expensive piece, so caching it is the biggest per-keystroke win).
+  @MainActor
   private struct FontCache {
     let size: CGFloat
     let family: String

@@ -588,14 +588,24 @@ if ! swift build -c release --arch arm64 >"$BUILD_LOG" 2>&1; then
     die "swift build failed — full log: $BUILD_LOG"
 fi
 tail -8 "$BUILD_LOG"
-EXECUTABLE="$BUILD_PKG_DIR/.build/arm64-apple-macosx/release/$APP_NAME"
+# Ask the same compiler/configuration that just built the snapshot. SwiftPM's
+# native and swiftbuild backends use different product layouts; guessing a
+# .build/arm64-apple-macosx path can package stale output from the other backend.
+# FFI_PROFILE remains exported from preflight for this package evaluation too.
+# BEGIN selected SwiftPM products
+BUILD_BIN_DIR="$(swift build -c release --arch arm64 --show-bin-path 2>>"$BUILD_LOG")" \
+    || die "Could not resolve SwiftPM release products — full log: $BUILD_LOG"
+[[ "$BUILD_BIN_DIR" == /* && -d "$BUILD_BIN_DIR" ]] \
+    || die "SwiftPM returned an invalid release products directory: $BUILD_BIN_DIR"
+EXECUTABLE="$BUILD_BIN_DIR/$APP_NAME"
 [[ -x "$EXECUTABLE" ]] || die "Executable not built at $EXECUTABLE"
 ok "Executable: $EXECUTABLE ($(du -h "$EXECUTABLE" | cut -f1))"
 
-# Bundle resources from SwiftPM (Bundle.module)
-SPM_BUNDLE_DIR="$(find "$BUILD_PKG_DIR/.build/arm64-apple-macosx/release" -maxdepth 1 -name "${APP_NAME}_${APP_NAME}.bundle" -type d | head -1)"
-[[ -d "$SPM_BUNDLE_DIR" ]] || die "SwiftPM resource bundle not found"
+# Bundle.module resources must come from that SAME build-products directory.
+SPM_BUNDLE_DIR="$BUILD_BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
+[[ -d "$SPM_BUNDLE_DIR" ]] || die "SwiftPM resource bundle not found at $SPM_BUNDLE_DIR"
 ok "SwiftPM resources: $SPM_BUNDLE_DIR"
+# END selected SwiftPM products
 
 # ─── Bundle into .app ─────────────────────────────────────────────────────
 log "Building $APP_NAME.app structure"

@@ -4,6 +4,7 @@ import XCTest
 
 @testable import Pensieve
 
+@MainActor
 final class WindowChromeRecipeTests: XCTestCase {
   @MainActor
   func testAppKitRecipeAppliesUnifiedDocumentChrome() {
@@ -919,10 +920,16 @@ final class WindowChromeRecipeTests: XCTestCase {
     }
 
     // Converged: the same pass over an already-correct tab bar writes nothing,
-    // which is what makes it safe on every window update cycle.
+    // which is what makes it safe on every window update cycle. The overflow
+    // half of that cycle is gated in `ToolbarOverflowController` so it does
+    // not call `repairClobberedBridge` / `apply(_:to:)` when the form is
+    // already ours; this pin is the chrome half of the same rule.
     XCTAssertFalse(
       WindowChromeRecipe.assertTabBarAppearance(on: window, for: .ink, tabBarViews: found),
       "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
+    XCTAssertFalse(
+      WindowChromeRecipe.assertBetweenPassChrome(on: window, for: .ink, tabBarViews: found),
+      "an already-correct window was rewritten by the didUpdate chrome gate")
   }
 
   // MARK: - Sidebar chrome inset

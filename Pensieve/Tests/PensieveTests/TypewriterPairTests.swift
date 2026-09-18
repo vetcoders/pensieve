@@ -29,6 +29,7 @@ extension XCTestCase {
   }
 }
 
+@MainActor
 final class TypewriterPairTests: XCTestCase {
 
   // MARK: - The pair itself
@@ -45,12 +46,12 @@ final class TypewriterPairTests: XCTestCase {
       PensieveTheme.typewriter.tokens(underDarkSystem: false).source.css, pair.light.source.css)
 
     // ...and the live accessor every surface actually reads.
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       XCTAssertEqual(PensieveTheme.typewriter.tokens.source.css, "#171717")
       XCTAssertEqual(PensieveTheme.typewriter.tokens.text.css, "#d4d4d4")
       XCTAssertEqual(PensieveTheme.typewriter.tokens.mode, .dark)
     }
-    try withSystemAppearance(dark: false) {
+    withSystemAppearance(dark: false) {
       XCTAssertEqual(PensieveTheme.typewriter.tokens.source.css, "#ffffff")
       XCTAssertEqual(PensieveTheme.typewriter.tokens.text.css, "#1c1c1c")
       XCTAssertEqual(PensieveTheme.typewriter.tokens.mode, .light)
@@ -66,13 +67,13 @@ final class TypewriterPairTests: XCTestCase {
   /// the setting through the same chrome recipe the window pass uses.
   @MainActor
   func testTitlebarBackingFollowsTheSystemSetting() throws {
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       XCTAssertTrue(
         WindowChromeRecipe.colorsMatch(
           WindowChromeRecipe.titlebarGlassBackingColor(for: .typewriter),
           ColorSpec.nsColor(fromHex: "#171717")))
     }
-    try withSystemAppearance(dark: false) {
+    withSystemAppearance(dark: false) {
       XCTAssertTrue(
         WindowChromeRecipe.colorsMatch(
           WindowChromeRecipe.titlebarGlassBackingColor(for: .typewriter),
@@ -96,7 +97,7 @@ final class TypewriterPairTests: XCTestCase {
   func testTheWindowTakesTheSystemsHalfWhileThePaperStaysLight() throws {
     for dark in [true, false] {
       let wanted: NSAppearance.Name = dark ? .darkAqua : .aqua
-      try withSystemAppearance(dark: dark) {
+      withSystemAppearance(dark: dark) {
         XCTAssertEqual(
           PensieveTheme.typewriter.appearanceName, wanted,
           "a paired skin must state the half it resolved, not decline to answer")
@@ -120,7 +121,7 @@ final class TypewriterPairTests: XCTestCase {
   func testExportAlwaysTakesTheLightHalf() throws {
     let pair = try XCTUnwrap(PensieveTheme.pairedPalettes[.typewriter])
     for dark in [true, false] {
-      try withSystemAppearance(dark: dark) {
+      withSystemAppearance(dark: dark) {
         XCTAssertEqual(
           PensieveTheme.typewriter.exportTokens.source.css, pair.light.source.css,
           "export must take the light half whatever the machine is set to")

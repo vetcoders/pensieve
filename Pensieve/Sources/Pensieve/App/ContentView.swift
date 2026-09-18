@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -8,6 +9,8 @@ struct ContentView: View {
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
+  @StateObject private var askThreads = DocumentAskThreadStore()
+  @State private var lastIngestedDictation = ""
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
 
@@ -47,6 +50,12 @@ struct ContentView: View {
           WindowErrorBanner(error: error) { appState.dismissVisibleError() }
         }
         if appState.documentHasEditableBuffer {
+          AskComposerView(
+            thread: askThreads.thread(for: appState.documentSession.askThreadID),
+            documentText: appState.documentSession.text,
+            apiKey: providerSettings.apiKey
+          )
+          .id(appState.documentSession.askThreadID)
           EditorStatusBar()
             .opacity(appState.mode == .focus ? 0.45 : 1)
         }
@@ -138,6 +147,9 @@ struct ContentView: View {
       providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)
       evaluateProviderOnboarding()
     }
+    .onReceive(controller.transcriptionService.$committed) { committed in
+      ingestDictation(committed)
+    }
   }
 
   /// Built once per pass and used twice — as the toolbar's content and as the
@@ -190,6 +202,22 @@ struct ContentView: View {
     providerOnboardingCoordinator.evaluate(
       windowID: hostWindowID,
       isKeyWindow: hostWindow?.isKeyWindow == true)
+  }
+
+  private func ingestDictation(_ committed: String) {
+    guard appState.documentHasEditableBuffer else { return }
+    let trimmed = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed != lastIngestedDictation else { return }
+    let utterance: String
+    if trimmed.hasPrefix(lastIngestedDictation), !lastIngestedDictation.isEmpty {
+      utterance = String(trimmed.dropFirst(lastIngestedDictation.count))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    } else {
+      utterance = trimmed
+    }
+    lastIngestedDictation = trimmed
+    guard !utterance.isEmpty else { return }
+    askThreads.thread(for: appState.documentSession.askThreadID).appendDictation(utterance)
   }
 
   private func saveRecoveredFileAs() {

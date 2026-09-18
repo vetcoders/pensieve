@@ -170,6 +170,7 @@ final class AppSupportLocationTests: XCTestCase {
     XCTAssertEqual(removedPaths, [root.path])
   }
 
+  @MainActor
   func testRecoveryDefaultsToTemporaryStorageInsideATestProcess() {
     let resolved = RecoveryStore.defaultDirectoryURL(
       fileManager: .default, environment: [:], isTestProcess: true)
@@ -180,6 +181,7 @@ final class AppSupportLocationTests: XCTestCase {
     XCTAssertNotEqual(resolved.standardizedFileURL, production.standardizedFileURL)
   }
 
+  @MainActor
   func testExplicitSupportOverrideWinsInsideATestProcess() throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("pensieve-explicit-test-root-\(UUID().uuidString)", isDirectory: true)
@@ -195,6 +197,7 @@ final class AppSupportLocationTests: XCTestCase {
       root.appendingPathComponent("Recovery", isDirectory: true).standardizedFileURL)
   }
 
+  @MainActor
   func testEveryDefaultStoreSharesOneTemporaryRootInsideATestProcess() throws {
     let expectedRoot = AppSupportLocation.isolationRoot(
       environment: [:], fileManager: .default, isTestProcess: true)
@@ -220,6 +223,7 @@ final class AppSupportLocationTests: XCTestCase {
     }
   }
 
+  @MainActor
   func testExplicitSupportOverrideWinsForEveryDefaultStoreInsideATestProcess() throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("pensieve-all-store-override-\(UUID().uuidString)", isDirectory: true)

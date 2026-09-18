@@ -24,6 +24,7 @@ import XCTest
 /// and the real editor surface, and assert the panel and the window agree at
 /// every step. Windows are hosted but never ordered on screen and are torn down
 /// by detaching the content view, matching `EditorThemeChromeTests`.
+@MainActor
 final class PairedSkinLiveFlipTests: XCTestCase {
   @MainActor
   private func makeHostedSurface(skin: PensieveTheme) -> (MarkdownEditorSurface, NSWindow) {
@@ -58,7 +59,7 @@ final class PairedSkinLiveFlipTests: XCTestCase {
     var memo = EditorRepresentable.RethemeMemo()
     let skin = PensieveTheme.typewriter
 
-    let (surface, window) = try withSystemAppearance(dark: true) {
+    let (surface, window) = withSystemAppearance(dark: true) {
       let hosted = makeHostedSurface(skin: skin)
       // The surface themes itself in its initialiser, which is what the
       // representable records rather than re-running.
@@ -68,7 +69,7 @@ final class PairedSkinLiveFlipTests: XCTestCase {
     defer { window.contentView = nil }
 
     for (step, dark) in [(1, true), (2, false), (3, true)] {
-      try withSystemAppearance(dark: dark) {
+      withSystemAppearance(dark: dark) {
         if memo.needsReapply(skin.paintedIdentity) {
           surface.applyTheme(skin)
         }
@@ -93,7 +94,7 @@ final class PairedSkinLiveFlipTests: XCTestCase {
   @MainActor
   func testThePageStaysWhiteAcrossTheSameCycle() throws {
     for dark in [true, false, true] {
-      try withSystemAppearance(dark: dark) {
+      withSystemAppearance(dark: dark) {
         XCTAssertEqual(
           PensieveTheme.typewriter.readingSurfaceAppearanceName, .aqua,
           "the reading surface followed the system flip")
@@ -110,7 +111,7 @@ final class PairedSkinLiveFlipTests: XCTestCase {
   @MainActor
   func testRepeatedPassesWithinOneHalfDoNotRetheme() throws {
     var memo = EditorRepresentable.RethemeMemo()
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       XCTAssertTrue(memo.needsReapply(PensieveTheme.typewriter.paintedIdentity))
       for pass in 1...20 {
         XCTAssertFalse(
@@ -127,10 +128,10 @@ final class PairedSkinLiveFlipTests: XCTestCase {
   @MainActor
   func testAnUnpairedSkinIsNotRethemedByASystemFlip() throws {
     var memo = EditorRepresentable.RethemeMemo()
-    try withSystemAppearance(dark: true) {
+    withSystemAppearance(dark: true) {
       XCTAssertTrue(memo.needsReapply(PensieveTheme.ink.paintedIdentity))
     }
-    try withSystemAppearance(dark: false) {
+    withSystemAppearance(dark: false) {
       XCTAssertFalse(
         memo.needsReapply(PensieveTheme.ink.paintedIdentity),
         "a single-mode skin was re-themed for a system change its palette cannot see")

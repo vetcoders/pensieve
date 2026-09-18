@@ -554,11 +554,13 @@ final class ClosingADocumentRetiresItTests: XCTestCase {
 /// Deferred main-actor work the registry parked, run on demand so the "one
 /// runloop turn later" the close scope is resolved on is explicit in the test
 /// rather than a sleep.
+@MainActor
 private final class PendingCloseSettlements {
   var work: [DocumentWindowRegistry.DeferredMainWork] = []
 }
 
 /// The native tab group, which cannot be built in a headless test bundle.
+@MainActor
 private final class TabGroupStub {
   var windows: [NSWindow] = []
 }
@@ -599,7 +601,8 @@ private struct RetirementHarness {
       named: name,
       contents: String(repeating: "large document line for the size gate\n", count: 30_000))
     XCTAssertTrue(
-      LargeDocument.isLargeFile(at: url), "fixture must be past the gate or the open is synchronous")
+      LargeDocument.isLargeFile(at: url), "fixture must be past the gate or the open is synchronous"
+    )
     controller.openFile(url: url)
     return url
   }

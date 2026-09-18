@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -142,49 +143,51 @@ final class WatcherRefreshCoalescingTests: XCTestCase {
 /// `releaseAll`, so the test can inject watcher events while a walk is provably in flight.
 /// `armCancellationWatch` makes the next walk spin until it observes task cancellation (or a
 /// deadline), recording whether cancellation ever reached the walk's task.
-private final class BlockingScanProbe: @unchecked Sendable {
-  private let lock = NSLock()
+private final class BlockingScanProbe: Sendable {
+  private struct State: Sendable {
+    var _callCount = 0
+    var _active = 0
+    var _maxActive = 0
+    var _blocking = false
+    var _watchingCancellation = false
+    var _blockedScanEntered = false
+    var _sawCancellation = false
+  }
+  private let state = Mutex(State())
   private let gate = DispatchSemaphore(value: 0)
-  private var _callCount = 0
-  private var _active = 0
-  private var _maxActive = 0
-  private var _blocking = false
-  private var _watchingCancellation = false
-  private var _blockedScanEntered = false
-  private var _sawCancellation = false
 
-  var callCount: Int { lock.withLock { _callCount } }
-  var maxConcurrentScans: Int { lock.withLock { _maxActive } }
-  var blockedScanEntered: Bool { lock.withLock { _blockedScanEntered } }
-  var sawCancellation: Bool { lock.withLock { _sawCancellation } }
+  var callCount: Int { state.withLock { state in state._callCount } }
+  var maxConcurrentScans: Int { state.withLock { state in state._maxActive } }
+  var blockedScanEntered: Bool { state.withLock { state in state._blockedScanEntered } }
+  var sawCancellation: Bool { state.withLock { state in state._sawCancellation } }
 
   func armBlocking() {
-    lock.withLock { _blocking = true }
+    state.withLock { state in state._blocking = true }
   }
 
   func armCancellationWatch() {
-    lock.withLock { _watchingCancellation = true }
+    state.withLock { state in state._watchingCancellation = true }
   }
 
   func releaseAll() {
-    lock.withLock { _blocking = false }
+    state.withLock { state in state._blocking = false }
     for _ in 0..<16 { gate.signal() }
   }
 
   func enter() {
-    let (shouldBlock, shouldWatchCancellation): (Bool, Bool) = lock.withLock {
-      _callCount += 1
-      _active += 1
-      _maxActive = max(_maxActive, _active)
-      if _blocking || _watchingCancellation { _blockedScanEntered = true }
-      return (_blocking, _watchingCancellation)
+    let (shouldBlock, shouldWatchCancellation): (Bool, Bool) = state.withLock { state in
+      state._callCount += 1
+      state._active += 1
+      state._maxActive = max(state._maxActive, state._active)
+      if state._blocking || state._watchingCancellation { state._blockedScanEntered = true }
+      return (state._blocking, state._watchingCancellation)
     }
     if shouldWatchCancellation {
-      lock.withLock { _watchingCancellation = false }
+      state.withLock { state in state._watchingCancellation = false }
       let deadline = Date().addingTimeInterval(5)
       while Date() < deadline {
         if Task.isCancelled {
-          lock.withLock { _sawCancellation = true }
+          state.withLock { state in state._sawCancellation = true }
           return
         }
         usleep(5_000)
@@ -197,11 +200,11 @@ private final class BlockingScanProbe: @unchecked Sendable {
   }
 
   func exit() {
-    lock.withLock { _active -= 1 }
+    state.withLock { state in state._active -= 1 }
   }
 }
 
-private final class CoalescingInertEventSource: FileWatcherEventSource, @unchecked Sendable {
+private final class CoalescingInertEventSource: FileWatcherEventSource, Sendable {
   func start(
     paths: [String],
     onEvents: @escaping @Sendable ([FileWatcherEvent]) -> Void

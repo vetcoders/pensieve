@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 class CodeBlockHighlighter {
   var baseFontSize: CGFloat = 14
 

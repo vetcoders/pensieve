@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -94,26 +95,28 @@ enum WorkflowCapabilitiesFixtures {
 /// Injectable capability provider for controller tests: records the calling
 /// thread and serves a canned result, so loading/loaded/failed sheet states
 /// and the off-main contract are all drivable without the CLI.
-final class FakeWorkflowCapabilitiesProvider: WorkflowCapabilitiesProviding, @unchecked Sendable {
-  private let lock = NSLock()
+final class FakeWorkflowCapabilitiesProvider: WorkflowCapabilitiesProviding, Sendable {
+  private struct State: Sendable {
+    var fetchThreadsWereMain: [Bool] = []
+  }
+  private let state = Mutex(State())
   private let result: Result<WorkflowCapabilities, Error>
-  private var fetchThreadsWereMain: [Bool] = []
 
   init(result: Result<WorkflowCapabilities, Error>) {
     self.result = result
   }
 
   func fetchCapabilities() throws -> WorkflowCapabilities {
-    lock.lock()
-    fetchThreadsWereMain.append(Thread.isMainThread)
-    lock.unlock()
+    state.withLock { state in
+      state.fetchThreadsWereMain.append(Thread.isMainThread)
+    }
     return try result.get()
   }
 
   func recordedMainThreadFlags() -> [Bool] {
-    lock.lock()
-    defer { lock.unlock() }
-    return fetchThreadsWereMain
+    return state.withLock { state in
+      return state.fetchThreadsWereMain
+    }
   }
 }
 

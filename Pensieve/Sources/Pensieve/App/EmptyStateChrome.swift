@@ -42,6 +42,7 @@ struct EmptyStatePalette {
   /// Raised chip surface for the shortcut key caps.
   let keyCapFill: NSColor
 
+  @MainActor
   init(theme: PensieveTheme) {
     let tokens = theme.tokens
     let surface = tokens.source.nsColor
@@ -143,7 +144,7 @@ struct EmptyStateRowButtonStyle: ButtonStyle {
   /// Wash strength for a row's current interaction state. Static so the pin can
   /// state the affordance contract — a resting row paints nothing, hover and
   /// pressed are visibly distinct — without rendering SwiftUI.
-  static func fillOpacity(isHovering: Bool, isPressed: Bool) -> Double {
+  nonisolated static func fillOpacity(isHovering: Bool, isPressed: Bool) -> Double {
     if isPressed { return 0.24 }
     return isHovering ? 0.12 : 0
   }

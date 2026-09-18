@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -917,26 +918,28 @@ final class AutocompleteControllerTests: XCTestCase {
   }
 }
 
-private final class AttemptCounter: @unchecked Sendable {
-  private let lock = NSLock()
-  private var count = 0
+private final class AttemptCounter: Sendable {
+  private struct State: Sendable {
+    var count = 0
+  }
+  private let state = Mutex(State())
 
   func increment() {
-    lock.lock()
-    count += 1
-    lock.unlock()
+    state.withLock { state in
+      state.count += 1
+    }
   }
 
   func record(_ newValue: Int) {
-    lock.lock()
-    count = newValue
-    lock.unlock()
+    state.withLock { state in
+      state.count = newValue
+    }
   }
 
   var value: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return count
+    return state.withLock { state in
+      return state.count
+    }
   }
 }
 
@@ -966,10 +969,12 @@ private actor AsyncGate {
   }
 }
 
-private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, @unchecked Sendable {
-  private let lock = NSLock()
+private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, Sendable {
+  private struct State: Sendable {
+    var storedContext: RewriteContext? = nil
+  }
+  private let state = Mutex(State())
   private let output: String
-  private var storedContext: RewriteContext?
 
   init(output: String) {
     self.output = output
@@ -984,8 +989,8 @@ private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, @un
     intent: RewriteIntent,
     session: DocumentAISession
   ) async throws -> AICandidate {
-    lock.withLock {
-      storedContext = context
+    state.withLock { state in
+      state.storedContext = context
     }
     return AICandidate(
       documentID: session.documentID,
@@ -1000,7 +1005,7 @@ private final class RewriteStubBackend: AutocompleteCompleting, AIRewriting, @un
   }
 
   var context: RewriteContext? {
-    lock.withLock { storedContext }
+    state.withLock { state in state.storedContext }
   }
 }
 

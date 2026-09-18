@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 enum WindowChromeRecipe {
   static let documentTabbingIdentifier = "Pensieve.DocumentWindow"
   static let defaultContentSize = NSSize(width: 1180, height: 760)
@@ -510,7 +511,7 @@ enum WindowChromeRecipe {
   /// healing property `c454889` and `da7954a` exist for is kept by the backing
   /// colour, which DOES round-trip faithfully and which the same external resets
   /// take out: see `assertWindowChrome`.
-  nonisolated(unsafe) private static let assertedAppearances =
+  @MainActor private static let assertedAppearances =
     NSMapTable<NSWindow, AssertedAppearance>.weakToStrongObjects()
 
   /// Boxed `NSAppearance.Name?` — `NSMapTable` stores objects, and "this window
@@ -644,11 +645,18 @@ enum WindowChromeRecipe {
   /// the boundary landing on the split divider.
   ///
   /// So this trigger may only ever repair a window INTO the half it already
-  /// has. `assertWindowChrome` stays the single writer of the half — it is the
-  /// one that moves a window across, and it is deliberately kept off this
-  /// notification (a per-update `NSWindow.appearance` write is the 99% CPU
-  /// start-up hang `assertedAppearances` exists to prevent). A flip reaches the
-  /// windows through `ThemeManager`'s sweep instead, one edge per flip.
+  /// has. `didUpdate` is a cheap gate here, not a chrome rebuild: polarity
+  /// mismatch returns before any chip or tab-bar walk, and an already-correct
+  /// surface is a compare-and-set no-op. It never calls
+  /// `ToolbarOverflowController.repairClobberedBridge` / `apply(_:to:)` — that
+  /// overflow rebuild is gated on the same notification in
+  /// `ToolbarOverflowController.handleWindowDidUpdate`, which skips both when
+  /// the authored form is still on the group. `assertWindowChrome` stays the
+  /// single writer of the half — it is the one that moves a window across, and
+  /// it is deliberately kept off this notification (a per-update
+  /// `NSWindow.appearance` write is the 99% CPU start-up hang
+  /// `assertedAppearances` exists to prevent). A flip reaches the windows
+  /// through `ThemeManager`'s sweep instead, one edge per flip.
   @discardableResult
   static func assertBetweenPassChrome(
     on window: NSWindow, for theme: PensieveTheme, tabBarViews: [NSView]? = nil
@@ -940,7 +948,10 @@ private struct SkinAppearanceModifier: ViewModifier {
 ///   * one runloop turn later, which is where both the first toolbar build and
 ///     the skin switch's re-bridge land;
 ///   * every window update cycle — the same `NSWindow.didUpdateNotification`
-///     repair `ToolbarOverflowController` runs, for the same measured reason.
+///     `ToolbarOverflowController` watches. Overflow's observer is a cheap
+///     already-authored gate and does not call `repairClobberedBridge` /
+///     `apply(_:to:)` when the form is still ours; this sink's observer is the
+///     matching cheap gate for chip tint and tab-bar polarity.
 ///
 /// The update-cycle trigger deliberately re-asserts the CHIP TINT and the TAB
 /// BAR ONLY, not the whole chrome. Both round-trip faithfully — measured, 45
@@ -992,6 +1003,13 @@ struct WindowChromeSink: NSViewRepresentable {
       ) { [weak self] _ in
         MainActor.assumeIsolated {
           guard let self, let window = self.window else { return }
+          // Cheap polarity gate before the chip/tab walk. A window still on
+          // the outgoing half after a live flip must not be painted from this
+          // notification — `assertBetweenPassChrome` repeats the same guard,
+          // and this keeps `didUpdate` from even entering the repair.
+          guard WindowChromeRecipe.isAssertedToTheSkinsHalf(window, for: self.theme) else {
+            return
+          }
           WindowChromeRecipe.assertBetweenPassChrome(on: window, for: self.theme)
         }
       }
@@ -1002,7 +1020,7 @@ struct WindowChromeSink: NSViewRepresentable {
       WindowChromeRecipe.assertWindowChrome(on: window, for: theme)
     }
 
-    deinit {
+    isolated deinit {
       if let observer { NotificationCenter.default.removeObserver(observer) }
     }
   }
@@ -1098,7 +1116,7 @@ struct SidebarChromeInsetSink: NSViewRepresentable {
       onChange(height)
     }
 
-    deinit {
+    isolated deinit {
       if let observer { NotificationCenter.default.removeObserver(observer) }
     }
   }

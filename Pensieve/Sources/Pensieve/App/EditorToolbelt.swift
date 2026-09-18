@@ -69,7 +69,7 @@ struct EditorToolbelt: ToolbarContent {
   // read in this toolbar body. controller stays ObservableObject.
   var appState: AppState
   @ObservedObject var controller: AppController
-  let onDispatchToAgent: () -> Void
+  let onDispatchToAgent: @MainActor () -> Void
   let isDispatchDisabled: Bool
   let dispatchHelp: String
   @State private var customRewriteInstruction = ""
