@@ -149,10 +149,12 @@ enum TranscriptionSendTarget: String, CaseIterable, Identifiable, Sendable {
 }
 
 @MainActor
-final class TranscriptionService: ObservableObject, VistaEventListener {
-  typealias EngineFactory = @Sendable () -> VistaEngineProtocol
-  typealias MicrophonePermissionPolicy = @Sendable (VistaEngineProtocol) -> Bool
+final class TranscriptionService: ObservableObject, DictationEventListener {
+  typealias EngineFactory = @Sendable () -> DictationEngine
+  typealias MicrophonePermissionPolicy = @Sendable (DictationEngine) -> Bool
   typealias MicrophonePermissionRequester = @Sendable () async throws -> Void
+  typealias MicrophoneAuthorizationProvider = @Sendable () -> AVAuthorizationStatus
+  typealias STTReadinessProbe = @Sendable () -> Bool
 
   @Published private(set) var committed: String
   @Published private(set) var preview: String
@@ -164,13 +166,24 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
   @Published private(set) var lastStatus: VistaStatusSignal?
   @Published private(set) var lastError: String?
   @Published private(set) var dispatchStatus: String?
+  /// Record-ready means BOTH ends of the capture path are green: microphone
+  /// authorised (TCC) AND the STT engine answering ready. Provider/OAuth state
+  /// never participates — formatting providers are a separate lane. Refreshed
+  /// via `refreshCaptureReadiness()`; starts false, never assumed.
+  @Published private(set) var isCaptureReady: Bool = false
+
+  /// Production dictation factory. Tests inject a fake; nothing on this path
+  /// constructs `VistaEngine`.
+  nonisolated static let productionEngineFactory: EngineFactory = { CodescribeSTTEngine() }
 
   private let engineFactory: EngineFactory
   private let requiresMicrophonePermission: MicrophonePermissionPolicy
   private let microphonePermissionRequester: MicrophonePermissionRequester
+  private let microphoneAuthorizationProvider: MicrophoneAuthorizationProvider
+  private let sttReadinessProbe: STTReadinessProbe
   private let cadenceCommitNanoseconds: UInt64
   private let aiTextResponder: (any AITextResponding)?
-  private var engine: VistaEngineProtocol?
+  private var engine: DictationEngine?
   private var cadenceCommitTask: Task<Void, Never>?
   private var errorCleanupTask: Task<Void, Never>?
   private var startRecordingTask: Task<Void, Never>?
@@ -179,12 +192,18 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
   private var promotedPreviewPrefix: String?
 
   init(
-    engine: VistaEngineProtocol? = nil,
-    engineFactory: @escaping EngineFactory = { VistaEngine() },
-    requiresMicrophonePermission: @escaping MicrophonePermissionPolicy = { $0 is VistaEngine },
+    engine: DictationEngine? = nil,
+    engineFactory: @escaping EngineFactory = TranscriptionService.productionEngineFactory,
+    requiresMicrophonePermission: @escaping MicrophonePermissionPolicy = {
+      $0 is CodescribeSTTEngine
+    },
     microphonePermissionRequester: @escaping MicrophonePermissionRequester = {
       try await TranscriptionService.ensureMicrophonePermission()
     },
+    microphoneAuthorizationProvider: @escaping MicrophoneAuthorizationProvider = {
+      AVCaptureDevice.authorizationStatus(for: .audio)
+    },
+    sttReadinessProbe: @escaping STTReadinessProbe = { CodescribeSTTRuntime.isSTTReady },
     aiTextResponder: (any AITextResponding)? = nil,
     cadenceCommitNanoseconds: UInt64 = 8_000_000_000
   ) {
@@ -192,7 +211,9 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
     self.engineFactory = engineFactory
     self.requiresMicrophonePermission = requiresMicrophonePermission
     self.microphonePermissionRequester = microphonePermissionRequester
-    // Production keeps speech capture in qube-ffi but routes provider text
+    self.microphoneAuthorizationProvider = microphoneAuthorizationProvider
+    self.sttReadinessProbe = sttReadinessProbe
+    // Production keeps speech capture in codescribe-ffi but routes provider text
     // through the same provider-neutral runtime as autocomplete. Explicit engine
     // injection keeps existing unit seams deterministic unless a responder is
     // also supplied deliberately.
@@ -261,8 +282,7 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
           // two owners never compete for the same microphone session.
           if engine.isRecording() {
             throw staleStopError
-              ?? VistaError.ModelError(
-                msg: "dictation unavailable: stale microphone capture is still active")
+              ?? DictationEngineError.staleCaptureActive
           }
         }
         if !engine.isModelLoaded() {
@@ -368,6 +388,15 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
 
   func updateDispatchStatus(_ status: String?) {
     dispatchStatus = status
+  }
+
+  /// Recomputes `isCaptureReady` from the two live inputs. Sync and cheap:
+  /// the mic axis is a TCC status read, the STT axis is the injected probe
+  /// (FFI liveness in production). Call it when the panel appears and on
+  /// permission changes; readiness is never cached across those moments.
+  func refreshCaptureReadiness() {
+    let microphoneReady = microphoneAuthorizationProvider() == .authorized
+    isCaptureReady = microphoneReady && sttReadinessProbe()
   }
 
   @discardableResult
@@ -523,7 +552,9 @@ final class TranscriptionService: ObservableObject, VistaEventListener {
     refreshRendered()
   }
 
-  private func activeEngine() -> VistaEngineProtocol {
+  /// Internal (not private) so tests can verify which engine the factory seam
+  /// produced; production code paths are unchanged.
+  func activeEngine() -> DictationEngine {
     if let engine {
       return engine
     }

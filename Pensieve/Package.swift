@@ -8,6 +8,7 @@ let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pa
 let qubeFFIProfile =
     ProcessInfo.processInfo.environment["FFI_PROFILE"] == "release" ? "release" : "debug"
 let qubeFFILibraryPath = "\(packageRoot)/Vendor/qube-ffi/\(qubeFFIProfile)"
+let codescribeFFILibraryPath = "\(packageRoot)/Vendor/codescribe-ffi/\(qubeFFIProfile)"
 
 let package = Package(
     name: "Pensieve",
@@ -26,6 +27,7 @@ let package = Package(
             name: "Pensieve",
             dependencies: [
                 "qube_ffiFFI",
+                "CodescribeBridge",
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
@@ -48,7 +50,11 @@ let package = Package(
                     "-L", qubeFFILibraryPath,
                     "-lqube_ffi",
                     "-Xlinker", "-rpath",
-                    "-Xlinker", qubeFFILibraryPath
+                    "-Xlinker", qubeFFILibraryPath,
+                    "-L", codescribeFFILibraryPath,
+                    "-lcodescribe_ffi",
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", codescribeFFILibraryPath
                 ])
             ]
         ),
@@ -56,11 +62,41 @@ let package = Package(
             name: "qube_ffiFFI",
             path: "Sources/qube_ffiFFI"
         ),
+        .systemLibrary(
+            name: "codescribe_ffiFFI",
+            path: "Sources/codescribe_ffiFFI"
+        ),
+        // Vendored UniFFI bindings for the codescribe engine (hotkeys facade,
+        // transcription listener, agent streaming). Kept in a dedicated module
+        // because two uniffi-generated files in one module redeclare the same
+        // public free functions (startRecording, transcribeFile, ...).
+        .target(
+            name: "CodescribeBridge",
+            dependencies: ["codescribe_ffiFFI"],
+            path: "Sources/CodescribeBridge",
+            linkerSettings: [
+                .unsafeFlags([
+                    "-L", codescribeFFILibraryPath,
+                    "-lcodescribe_ffi",
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", codescribeFFILibraryPath
+                ])
+            ]
+        ),
         .testTarget(
             name: "PensieveTests",
             dependencies: [
                 "Pensieve",
+                "CodescribeBridge",
                 .product(name: "GRDB", package: "GRDB.swift")
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-L", codescribeFFILibraryPath,
+                    "-lcodescribe_ffi",
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", codescribeFFILibraryPath
+                ])
             ]
         )
     ],

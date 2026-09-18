@@ -157,12 +157,12 @@ lint:  ## Required format check; fails if swift-format is missing
 		printf "$(C_YELLOW)[missing]$(C_RESET) swift-format is required for lint/release gates (brew install swift-format)\n"; \
 		exit 1; \
 	fi
-	@cd $(PKG_DIR) && swift-format lint --strict $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' -print)
+	@cd $(PKG_DIR) && swift-format lint --strict $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' ! -path 'Sources/CodescribeBridge/codescribe_ffi.swift' -print)
 
 .PHONY: format
 format:  ## Apply swift-format in-place when installed (best-effort helper)
 	@command -v swift-format >/dev/null 2>&1 \
-		&& cd $(PKG_DIR) && swift-format format --in-place $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' -print) \
+		&& cd $(PKG_DIR) && swift-format format --in-place $$(find Sources Tests -name '*.swift' ! -path 'Sources/Pensieve/VistaBridge/qube_ffi.swift' ! -path 'Sources/CodescribeBridge/codescribe_ffi.swift' -print) \
 		|| printf "$(C_YELLOW)[skip]$(C_RESET) swift-format not installed (brew install swift-format)\n"
 
 .PHONY: semgrep
