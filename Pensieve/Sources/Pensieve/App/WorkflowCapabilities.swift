@@ -157,6 +157,11 @@ enum WorkflowDispatchPlan: Equatable {
     case .loading, .unavailable: return false
     }
   }
+
+  /// The workflow menu stays visible; launch additionally requires MCP.
+  func isLaunchable(mcpStatus: VibecraftedMCPConnectionStatus) -> Bool {
+    isLaunchable && mcpStatus.isReady
+  }
 }
 
 struct SwarmDispatchPlan: Equatable, Sendable {

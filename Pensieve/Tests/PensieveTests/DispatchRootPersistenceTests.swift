@@ -153,6 +153,50 @@ final class DispatchRootPersistenceTests: XCTestCase {
     XCTAssertEqual(launcher.workingDirectories(), [injectedRoot.standardizedFileURL])
   }
 
+  @MainActor
+  func testMCPLauncherForwardsTheChosenRootAsTheLaunchWorkingDirectory() async throws {
+    let injectedRoot = try makeDirectory("mcp-root")
+    let documentURL = temporaryRoot.appendingPathComponent("plan.md").standardizedFileURL
+    let transport = FakeVibecraftedMCPTransport(
+      probeStatus: .connected,
+      toolResult: [
+        "ok": true,
+        "run_id": "dispatch-root-mcp",
+        "agent": "codex",
+      ])
+    let client = VibecraftedMCPClient(
+      pointing: MemoryVibecraftedMCPPointing(path: "/tmp/live-mcp"),
+      transport: transport,
+      isExecutable: { $0 == "/tmp/live-mcp" })
+    let launcher = VibecraftedAgentPromptLauncher(mcpClient: client)
+    let appState = AppState()
+    appState.documentSession = DocumentSession(
+      document: DocumentRef(id: documentURL),
+      text: "# Plan",
+      isDirty: false)
+    let controller = AppController(
+      appState: appState,
+      folderManager: .shared,
+      documentStore: .shared,
+      transcriptionService: TranscriptionService(cadenceCommitNanoseconds: 0),
+      agentPromptLauncher: launcher,
+      agentWorkspaceRoot: injectedRoot)
+
+    let outcome = await controller.confirmDispatch(
+      intent: DispatchIntent(
+        subject: .savedDocument(documentURL), workflow: "review", source: .agentsMenu),
+      workflow: "review",
+      agents: ["codex"],
+      rootURL: injectedRoot)
+    guard case .success(let runID, _, _, _) = outcome else {
+      return XCTFail("Expected MCP confirm to succeed with the injected root")
+    }
+    XCTAssertEqual(runID, "dispatch-root-mcp")
+    XCTAssertEqual(
+      transport.toolCalls().first?.arguments["root"],
+      injectedRoot.standardizedFileURL.path)
+  }
+
   private func makeDefaults() throws -> UserDefaults {
     makeEphemeralDefaults(prefix: "Pensieve.DispatchRootPersistenceTests")
   }

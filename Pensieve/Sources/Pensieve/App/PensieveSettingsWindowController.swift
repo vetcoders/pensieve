@@ -10,6 +10,8 @@ enum PensieveSettingsSection: Hashable {
   /// showing a document, so the axes needed one route reachable with ⌘, from
   /// anywhere — including the launcher.
   case appearance
+  /// W6-01: dedicated MCP wizard (detect / point / status). Not the AI tab.
+  case mcp
 }
 
 enum PensieveSettingsPresentationResult: Equatable {
