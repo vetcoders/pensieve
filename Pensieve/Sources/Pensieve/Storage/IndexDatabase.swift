@@ -880,6 +880,14 @@ final class IndexDatabase {
   ///
   /// The `pendingIndexUpdateTask` chain returns `Void` (its supersede contract is unchanged); the
   /// success flag is observed by awaiting the dedicated `write` task this call owns.
+  ///
+  /// The write orchestration itself is DETACHED, not `@MainActor`: the gate await, the supersede
+  /// wait, the open join and the maintenance arming are GRDB coordination, not UI work, and a
+  /// 20 000-document reindex has no business occupying the main executor between its suspension
+  /// points. Only the synchronous chain reservation stays on the main actor (see
+  /// `reserveSupersedePosition(_:)`), and the genuinely main-actor halves — the pool publication
+  /// inside `ensureOpenInBackground` and the search-result publication inside
+  /// `refreshSearchResultsInBackground` — hop there under `await`.
   @discardableResult
   func reindexInBackground(documents: [DocumentRef], appState: AppState? = nil) async -> Bool {
     guard !isRefusedAfterTermination("reindexInBackground") else { return false }
@@ -890,7 +898,7 @@ final class IndexDatabase {
     // `reserveSupersedePosition(_:)`. The open moved INSIDE the task for exactly that reason.
     let previous = pendingIndexUpdateTask
 
-    let write = Task { @MainActor [weak self] () -> Bool in
+    let write = Task.detached(priority: .utility) { [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
       guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
@@ -912,13 +920,13 @@ final class IndexDatabase {
         // pool reader that blocked the truncate blocked every write submitted behind it. Tests sync
         // on it through `drainPendingIndexWrites()`, which tracks it, rather than through
         // `waitForPendingReindex()`, which no longer does.
-        self.scheduleIndexBatchMaintenance()
+        await self.scheduleIndexBatchMaintenance()
         return true
       } catch is IndexWriteAbandonedAfterTermination {
         Self.logAbandonedWriteAfterTermination("reindexInBackground")
         return false
       } catch {
-        self.report(error, appState: appState, action: "rebuild Pensieve search index")
+        await self.report(error, appState: appState, action: "rebuild Pensieve search index")
         return false
       }
     }
@@ -1173,7 +1181,9 @@ final class IndexDatabase {
 
   /// Off-main incremental index update mirroring `reindexInBackground`'s
   /// detached/`.utility`/batched pattern. The body reads + the single
-  /// `pool.write` transaction run on a detached background task; only the
+  /// `pool.write` transaction run on a detached background task, and — like its
+  /// twins — the write orchestration around them is detached too, so a watcher
+  /// delta never occupies the main executor between suspension points; only the
   /// `appState`-touching search refresh hops back to the main actor.
   ///
   /// Supersede-safe: each call chains onto `pendingIndexUpdateTask` before it
@@ -1201,7 +1211,7 @@ final class IndexDatabase {
     // `reserveSupersedePosition(_:)`.
     let previous = pendingIndexUpdateTask
 
-    let write = Task { @MainActor [weak self] () -> Bool in
+    let write = Task.detached(priority: .utility) { [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
       guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
@@ -1222,13 +1232,13 @@ final class IndexDatabase {
         // Watcher deltas are small individually but relentless in aggregate; the WAL-size throttle
         // inside `performMaintenanceInBackground` keeps this to a no-op until the log actually grows.
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
-        self.scheduleIndexBatchMaintenance()
+        await self.scheduleIndexBatchMaintenance()
         return true
       } catch is IndexWriteAbandonedAfterTermination {
         Self.logAbandonedWriteAfterTermination("updateSearchIndexInBackground")
         return false
       } catch {
-        self.report(error, appState: appState, action: "update Pensieve search index")
+        await self.report(error, appState: appState, action: "update Pensieve search index")
         return false
       }
     }
@@ -1930,8 +1940,9 @@ final class IndexDatabase {
   /// save tail uses. The sync `index` ran `ensureOpen` + `pool.write` (ensure-workspace + upsert) AND
   /// `refreshSearchResults` (a `pool.read`) ON THE MAIN ACTOR on every persisted edit — a synchronous
   /// SQLite stall on the run loop per save. This routes the write through the shared supersede chain
-  /// (`pendingIndexUpdateTask`) on a detached `.utility` task and hops back to the main actor only to
-  /// publish the refreshed search results, so a save never blocks typing/scrolling. Mirrors
+  /// (`pendingIndexUpdateTask`) on a detached `.utility` task whose orchestration never touches the
+  /// main executor either, hopping back to the main actor only to publish the refreshed search
+  /// results, so a save never blocks typing/scrolling. Mirrors
   /// `updateSearchIndexInBackground`'s detached/chained/`refreshSearchResultsInBackground` shape, so
   /// concurrent index writes serialize in submission order and a failed write can never leave the FTS
   /// index half-applied (single transaction).
@@ -1951,8 +1962,12 @@ final class IndexDatabase {
     // hardest: two saves of the SAME document parked on the initial open would resume unordered,
     // and the loser is the user's NEWER text.
     let previous = pendingIndexUpdateTask
+    // Read with the reservation, on the main actor: the latch object is a constant of this
+    // instance, so entry-time and transaction-entry-time reads are the same reference — what the
+    // in-transaction consultation checks is the latch's own one-way state.
+    let latch = terminationLatch
 
-    let write = Task { @MainActor [weak self] () -> Bool in
+    let write = Task.detached(priority: .utility) { [weak self] () -> Bool in
       await self?.awaitBackgroundWriteGate()
       await previous?.value
       guard let self, let pool = await self.ensureOpenInBackground(into: appState) else {
@@ -1964,8 +1979,9 @@ final class IndexDatabase {
       // Its entry guard and `ensureOpenInBackground` cover every suspension up to the open; what they
       // cannot cover is the detached hop below and the wait for the pool's serialized writer, and a
       // save queued behind a long reindex spends the whole quit exactly there.
-      let latch = self.terminationLatch
-      if let transactionGate = self.singleDocumentIndexWriteGateOverride { await transactionGate() }
+      if let transactionGate = await self.singleDocumentIndexWriteGateOverride {
+        await transactionGate()
+      }
       do {
         try await Task.detached(priority: .utility) {
           try pool.write { db in
@@ -1981,7 +1997,7 @@ final class IndexDatabase {
         // ceiling would only be enforced on reindex/delta paths a plain "edit and save" never
         // takes. The WAL-size throttle keeps a small save free: it stats one file and returns.
         // Armed rather than awaited — see `scheduleIndexBatchMaintenance()`.
-        self.scheduleIndexBatchMaintenance()
+        await self.scheduleIndexBatchMaintenance()
         return true
       } catch is IndexWriteAbandonedAfterTermination {
         // R17 routing: an abandonment is a decision the quit made, not an error the user can act on,
@@ -1992,7 +2008,7 @@ final class IndexDatabase {
         Self.logAbandonedWriteAfterTermination("indexInBackground")
         return false
       } catch {
-        self.report(error, appState: appState, action: "update Pensieve search index")
+        await self.report(error, appState: appState, action: "update Pensieve search index")
         return false
       }
     }
