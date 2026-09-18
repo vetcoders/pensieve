@@ -30,8 +30,19 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
       [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
     )
     XCTAssertEqual(panel.contentView?.accessibilityIdentifier(), "pensieve.dictation.panel")
+    XCTAssertNotEqual(panel.sharingType, .none)
+    XCTAssertEqual(panel.sharingType, .readOnly)
     XCTAssertFalse(panel.isKeyWindow)
     XCTAssertFalse(panel.isMainWindow)
+  }
+
+  func testConfiguredPanelSharingTypeIsCapturable() {
+    let fixture = makeFixture()
+    defer { close(fixture) }
+    fixture.controller.show()
+    assertUnpublished(fixture.panel)
+    XCTAssertNotEqual(fixture.panel.sharingType, .none)
+    XCTAssertEqual(fixture.panel.sharingType, .readOnly)
   }
 
   func testPanelOwnsSizingAndKeepsHostedContentPinnedToItsBounds() {
@@ -123,6 +134,46 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
     assertUnpublished(fixture.panel)
     XCTAssertTrue(dismissedPanel === fixture.panel)
     XCTAssertFalse(fixture.controller.isVisible)
+  }
+
+  func testTitleBarCloseUsesTheSameDismissPathAsHide() {
+    var dismissedPanel: NSPanel?
+    var visible = false
+    let fixture = makeFixture(
+      presentPanel: { _ in visible = true },
+      dismissPanel: {
+        dismissedPanel = $0
+        visible = false
+      },
+      panelIsVisible: { _ in visible })
+    defer { close(fixture) }
+
+    fixture.controller.show()
+    assertUnpublished(fixture.panel)
+    XCTAssertTrue(fixture.controller.isVisible)
+
+    fixture.controller.windowWillClose(
+      Notification(name: NSWindow.willCloseNotification, object: fixture.panel)
+    )
+    assertUnpublished(fixture.panel)
+    XCTAssertTrue(dismissedPanel === fixture.panel)
+    XCTAssertFalse(fixture.controller.isVisible)
+  }
+
+  func testRecordControlFollowsPublishedCaptureReadyFlag() {
+    let readyService = TranscriptionService(cadenceCommitNanoseconds: 0)
+    XCTAssertTrue(readyService.isCaptureReady)
+    XCTAssertTrue(TranscriptionTaflaPanelController.recordControlEnabled(for: readyService))
+
+    let notReadyService = TranscriptionService(
+      engine: MockVistaAutocompleteEngine(),
+      cadenceCommitNanoseconds: 0
+    )
+    notReadyService.startRecording()
+    defer { notReadyService.cancelPreparation() }
+    XCTAssertTrue(notReadyService.isPreparingRecording)
+    XCTAssertFalse(notReadyService.isCaptureReady)
+    XCTAssertFalse(TranscriptionTaflaPanelController.recordControlEnabled(for: notReadyService))
   }
 
   private struct Fixture {
