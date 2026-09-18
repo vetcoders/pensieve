@@ -17,7 +17,8 @@ main,
 nav,
 section,
 summary {
-  display: block; }
+  display: block;
+}
 
 /**
  * Correct `inline-block` display not defined in IE 8/9.
@@ -25,7 +26,8 @@ summary {
 audio,
 canvas,
 video {
-  display: inline-block; }
+  display: inline-block;
+}
 
 /**
  * Prevent modern browsers from displaying `audio` without controls.
@@ -33,7 +35,8 @@ video {
  */
 audio:not([controls]) {
   display: none;
-  height: 0; }
+  height: 0;
+}
 
 /**
  * Address `[hidden]` styling not present in IE 8/9.
@@ -41,7 +44,8 @@ audio:not([controls]) {
  */
 [hidden],
 template {
-  display: none; }
+  display: none;
+}
 
 /* ==========================================================================
    Base
@@ -57,13 +61,15 @@ html {
   -ms-text-size-adjust: 100%;
   /* 2 */
   -webkit-text-size-adjust: 100%;
-  /* 2 */ }
+  /* 2 */
+}
 
 /**
  * Remove default margin.
  */
 body {
-  margin: 0; }
+  margin: 0;
+}
 
 /* ==========================================================================
    Links
@@ -72,28 +78,33 @@ body {
  * Remove the gray background color from active links in IE 10.
  */
 a {
-  background: transparent; }
+  background: transparent;
+}
 a.wikilink {
   background: rgba(75, 107, 251, 0.1);
   border-radius: 4px;
   padding: 0 0.18em;
-  text-decoration: none; }
+  text-decoration: none;
+}
 a.wikilink:hover {
   background: rgba(75, 107, 251, 0.16);
-  text-decoration: underline; }
+  text-decoration: underline;
+}
 
 /**
  * Address `outline` inconsistency between Chrome and other browsers.
  */
 a:focus {
-  outline: thin dotted; }
+  outline: thin dotted;
+}
 
 /**
  * Improve readability when focused and also mouse hovered in all browsers.
  */
 a:active,
 a:hover {
-  outline: 0; }
+  outline: 0;
+}
 
 /* ==========================================================================
    Typography
@@ -104,26 +115,30 @@ a:hover {
  */
 h1 {
   font-size: 2em;
-  margin: 0.67em 0; }
+  margin: 0.67em 0;
+}
 
 /**
  * Address styling not present in IE 8/9, Safari 5, and Chrome.
  */
 abbr[title] {
-  border-bottom: 1px dotted; }
+  border-bottom: 1px dotted;
+}
 
 /**
  * Address style set to `bolder` in Firefox 4+, Safari 5, and Chrome.
  */
 b,
 strong {
-  font-weight: bold; }
+  font-weight: bold;
+}
 
 /**
  * Address styling not present in Safari 5 and Chrome.
  */
 dfn {
-  font-style: italic; }
+  font-style: italic;
+}
 
 /**
  * Address differences between Firefox and other browsers.
@@ -131,14 +146,16 @@ dfn {
 hr {
   -moz-box-sizing: content-box;
   box-sizing: content-box;
-  height: 0; }
+  height: 0;
+}
 
 /**
  * Address styling not present in IE 8/9.
  */
 mark {
   background: #ff0;
-  color: #000; }
+  color: #000;
+}
 
 /**
  * Correct font family set oddly in Safari 5 and Chrome.
@@ -148,25 +165,29 @@ kbd,
 pre,
 samp {
   font-family: monospace, serif;
-  font-size: 1em; }
+  font-size: 1em;
+}
 
 /**
  * Improve readability of pre-formatted text in all browsers.
  */
 pre {
-  white-space: pre-wrap; }
+  white-space: pre-wrap;
+}
 
 /**
  * Set consistent quote types.
  */
 q {
-  quotes: "\201C" "\201D" "\2018" "\2019"; }
+  quotes: "\201C" "\201D" "\2018" "\2019";
+}
 
 /**
  * Address inconsistent and variable font size in all browsers.
  */
 small {
-  font-size: 80%; }
+  font-size: 80%;
+}
 
 /**
  * Prevent `sub` and `sup` affecting `line-height` in all browsers.
@@ -176,13 +197,16 @@ sup {
   font-size: 75%;
   line-height: 0;
   position: relative;
-  vertical-align: baseline; }
+  vertical-align: baseline;
+}
 
 sup {
-  top: -0.5em; }
+  top: -0.5em;
+}
 
 sub {
-  bottom: -0.25em; }
+  bottom: -0.25em;
+}
 
 /* ==========================================================================
    Embedded content
@@ -191,13 +215,15 @@ sub {
  * Remove border when inside `a` element in IE 8/9.
  */
 img {
-  border: 0; }
+  border: 0;
+}
 
 /**
  * Correct overflow displayed oddly in IE 9.
  */
 svg:not(:root) {
-  overflow: hidden; }
+  overflow: hidden;
+}
 
 /* ==========================================================================
    Figures
@@ -206,7 +232,8 @@ svg:not(:root) {
  * Address margin not present in IE 8/9 and Safari 5.
  */
 figure {
-  margin: 0; }
+  margin: 0;
+}
 
 /* ==========================================================================
    Forms
@@ -217,7 +244,8 @@ figure {
 fieldset {
   border: 1px solid #c0c0c0;
   margin: 0 2px;
-  padding: 0.35em 0.625em 0.75em; }
+  padding: 0.35em 0.625em 0.75em;
+}
 
 /**
  * 1. Correct `color` not being inherited in IE 8/9.
@@ -227,7 +255,8 @@ legend {
   border: 0;
   /* 1 */
   padding: 0;
-  /* 2 */ }
+  /* 2 */
+}
 
 /**
  * 1. Correct font family not being inherited in all browsers.
@@ -243,7 +272,8 @@ textarea {
   font-size: 100%;
   /* 2 */
   margin: 0;
-  /* 3 */ }
+  /* 3 */
+}
 
 /**
  * Address Firefox 4+ setting `line-height` on `input` using `!important` in
@@ -251,7 +281,8 @@ textarea {
  */
 button,
 input {
-  line-height: normal; }
+  line-height: normal;
+}
 
 /**
  * Address inconsistent `text-transform` inheritance for `button` and `select`.
@@ -261,7 +292,8 @@ input {
  */
 button,
 select {
-  text-transform: none; }
+  text-transform: none;
+}
 
 /**
  * 1. Avoid the WebKit bug in Android 4.0.* where (2) destroys native `audio`
@@ -277,14 +309,16 @@ input[type="submit"] {
   -webkit-appearance: button;
   /* 2 */
   cursor: pointer;
-  /* 3 */ }
+  /* 3 */
+}
 
 /**
  * Re-set default cursor for disabled elements.
  */
 button[disabled],
 html input[disabled] {
-  cursor: default; }
+  cursor: default;
+}
 
 /**
  * 1. Address box sizing set to `content-box` in IE 8/9/10.
@@ -295,7 +329,8 @@ input[type="radio"] {
   box-sizing: border-box;
   /* 1 */
   padding: 0;
-  /* 2 */ }
+  /* 2 */
+}
 
 /**
  * 1. Address `appearance` set to `searchfield` in Safari 5 and Chrome.
@@ -308,7 +343,8 @@ input[type="search"] {
   -moz-box-sizing: content-box;
   -webkit-box-sizing: content-box;
   /* 2 */
-  box-sizing: content-box; }
+  box-sizing: content-box;
+}
 
 /**
  * Remove inner padding and search cancel button in Safari 5 and Chrome
@@ -316,7 +352,8 @@ input[type="search"] {
  */
 input[type="search"]::-webkit-search-cancel-button,
 input[type="search"]::-webkit-search-decoration {
-  -webkit-appearance: none; }
+  -webkit-appearance: none;
+}
 
 /**
  * Remove inner padding and border in Firefox 4+.
@@ -324,7 +361,8 @@ input[type="search"]::-webkit-search-decoration {
 button::-moz-focus-inner,
 input::-moz-focus-inner {
   border: 0;
-  padding: 0; }
+  padding: 0;
+}
 
 /**
  * 1. Remove default vertical scrollbar in IE 8/9.
@@ -334,7 +372,8 @@ textarea {
   overflow: auto;
   /* 1 */
   vertical-align: top;
-  /* 2 */ }
+  /* 2 */
+}
 
 /* ==========================================================================
    Tables
@@ -344,7 +383,8 @@ textarea {
  */
 table {
   border-collapse: collapse;
-  border-spacing: 0; }
+  border-spacing: 0;
+}
 
 /* ==========================================================================
    Markdown styles
@@ -353,220 +393,311 @@ body {
   background-image: url("markdown_background.png");
   margin: 1em;
   font-size: 13px;
-  font-family: Helvetica Neue, Helvetica, "Hiragino Kaku Gothic Pro", "Lucida Grande", Verdana, Arial, Meiryo, "Monaco", monospace, sans-serif;
+  font-family:
+    Helvetica Neue,
+    Helvetica,
+    "Hiragino Kaku Gothic Pro",
+    "Lucida Grande",
+    Verdana,
+    Arial,
+    Meiryo,
+    "Monaco",
+    monospace,
+    sans-serif;
 }
 
-h1, h2, h3, h4, h5, h6 {
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
   color: #000;
-  margin: 1.3em 0 .8em 0;
-  font-weight: 600; }
+  margin: 1.3em 0 0.8em 0;
+  font-weight: 600;
+}
 
 h1 {
   line-height: 1.62em;
-  font-size: 1.8em; }
-  h1:first-child {
-    margin-top: .7em; }
+  font-size: 1.8em;
+}
+h1:first-child {
+  margin-top: 0.7em;
+}
 
 h2 {
   border-bottom: solid 1px #d4d4d4;
   padding-bottom: 0.2em;
   line-height: 1.5em;
-  font-size: 1.5em; }
+  font-size: 1.5em;
+}
 
 h3 {
   line-height: 1.56em;
-  font-size: 1.3em; }
+  font-size: 1.3em;
+}
 
 h4 {
   line-height: 1.43em;
-  font-size: 1.1em; }
+  font-size: 1.1em;
+}
 
 h5 {
   line-height: 1.4em;
-  font-size: 1em; }
+  font-size: 1em;
+}
 
 h6 {
   line-height: 1.35em;
-  font-size: 0.9em; }
+  font-size: 0.9em;
+}
 
 blockquote {
-  color: #7A7A7A;
+  color: #7a7a7a;
   border-left: solid 4px #d4d4d4;
   margin-top: 1em;
   margin-bottom: 1em;
-  margin-left: .8em;
-  padding-left: .8em; }
-  blockquote h1, blockquote h2, blockquote h3, blockquote h4, blockquote h5, blockquote h6 {
-    color: #4A4A4A; }
+  margin-left: 0.8em;
+  padding-left: 0.8em;
+}
+blockquote h1,
+blockquote h2,
+blockquote h3,
+blockquote h4,
+blockquote h5,
+blockquote h6 {
+  color: #4a4a4a;
+}
 
 ul {
   line-height: 1.6em;
   margin: 1em 0;
-  padding-left: 2em; }
-  ul > li {
-    list-style-type: disc; }
-  ul li {
-    line-height: 1.6; }
-    ul li p:first-child {
-      margin: 0; }
-  ul ol {
-    margin: 0; }
-  ul ul {
-    margin: 0; }
+  padding-left: 2em;
+}
+ul > li {
+  list-style-type: disc;
+}
+ul li {
+  line-height: 1.6;
+}
+ul li p:first-child {
+  margin: 0;
+}
+ul ol {
+  margin: 0;
+}
+ul ul {
+  margin: 0;
+}
 
 ol {
   line-height: 1.6em;
   margin: 1em 0;
-  padding-left: 2em; }
-  ol > li {
-    list-style-type: decimal; }
-  ol li {
-    line-height: 1.6; }
-    ol li p:first-child {
-      margin: 0; }
-  ol ul {
-    margin: 0; }
-  ol ol {
-    margin: 0; }
+  padding-left: 2em;
+}
+ol > li {
+  list-style-type: decimal;
+}
+ol li {
+  line-height: 1.6;
+}
+ol li p:first-child {
+  margin: 0;
+}
+ol ul {
+  margin: 0;
+}
+ol ol {
+  margin: 0;
+}
 
 hr {
   border: 0;
   height: 1px;
-  background-color: #CCC;
-  margin: 1em 0; }
+  background-color: #ccc;
+  margin: 1em 0;
+}
 
 em {
-  font-style: italic; }
+  font-style: italic;
+}
 
-b, strong, ins {
-  font-weight: 900; }
+b,
+strong,
+ins {
+  font-weight: 900;
+}
 
 del {
-  text-decoration: line-through; }
+  text-decoration: line-through;
+}
 
 p {
   margin: 1em 0;
   font-size: 1em;
-  line-height: 1.6em; }
+  line-height: 1.6em;
+}
 
 img {
-  max-width: 100%; }
+  max-width: 100%;
+}
 
 a {
-  border-bottom: dashed 1px #117EC6;
-  margin: 0px 2px; }
-  a:link, a:visited {
-    color: #117EC6;
-    text-decoration: none; }
-  a:hover {
-    -webkit-border-radius: 3px;
-    -moz-border-radius: 3px;
-    border-radius: 3px;
-    -webkit-box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
-    -moz-box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
-    box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
-    background-color: #0f72b3;
-    background-image: -moz-linear-gradient(top, #117EC6, #0d6097);
-    background-image: -webkit-gradient(linear, 0 0, 0 100%, from(#117EC6), to(#0d6097));
-    background-image: -webkit-linear-gradient(top, #117EC6, #0d6097);
-    background-image: -o-linear-gradient(top, #117EC6, #0d6097);
-    background-image: linear-gradient(to bottom, #117EC6, #0d6097);
-    background-repeat: repeat-x;
-    filter: progid:DXImageTransform.Microsoft.gradient(startColorstr='#FF117EC6', endColorstr='#FF0D6097', GradientType=0);
-    color: #fff;
-    border: solid 1px #117EC6;
-    text-decoration: none;
-    text-shadow: -1px -1px 0px rgba(0, 0, 0, 0.1);
-    padding: 1px;
-    margin: 0px; }
-  a:active {
-    color: #fff;
-    text-decoration: none; }
+  border-bottom: dashed 1px #117ec6;
+  margin: 0px 2px;
+}
+a:link,
+a:visited {
+  color: #117ec6;
+  text-decoration: none;
+}
+a:hover {
+  -webkit-border-radius: 3px;
+  -moz-border-radius: 3px;
+  border-radius: 3px;
+  -webkit-box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
+  -moz-box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
+  box-shadow: inset 0px 1px 0px rgba(255, 255, 255, 0.2);
+  background-color: #0f72b3;
+  background-image: -moz-linear-gradient(top, #117ec6, #0d6097);
+  background-image: -webkit-gradient(
+    linear,
+    0 0,
+    0 100%,
+    from(#117ec6),
+    to(#0d6097)
+  );
+  background-image: -webkit-linear-gradient(top, #117ec6, #0d6097);
+  background-image: -o-linear-gradient(top, #117ec6, #0d6097);
+  background-image: linear-gradient(to bottom, #117ec6, #0d6097);
+  background-repeat: repeat-x;
+  filter: progid:DXImageTransform.Microsoft.gradient(startColorstr='#FF117EC6', endColorstr='#FF0D6097', GradientType=0);
+  color: #fff;
+  border: solid 1px #117ec6;
+  text-decoration: none;
+  text-shadow: -1px -1px 0px rgba(0, 0, 0, 0.1);
+  padding: 1px;
+  margin: 0px;
+}
+a:active {
+  color: #fff;
+  text-decoration: none;
+}
 
 dl {
-  margin: 1em 0; }
-  dl dd {
-    margin-left: 2em; }
+  margin: 1em 0;
+}
+dl dd {
+  margin-left: 2em;
+}
 
 table {
   margin: 1em 0;
-  border-top: solid 1px #CCC;
-  border-left: solid 1px #CCC; }
-  table thead td, table th {
-    padding: 8px 10px;
-    font-weight: 600;
-    border-right: solid 1px #CCC;
-    border-bottom: solid 1px #CCC; }
-  table tbody tr:nth-child(odd) {
-    background-color: rgba(0, 0, 0, 0.03); }
-  table td {
-    word-wrap: break-word;
-    padding: 8px 10px;
-    border-right: solid 1px #CCC;
-    border-bottom: solid 1px #CCC; }
-    table td a {
-      word-wrap: break-word;
-      word-break: break-all; }
+  border-top: solid 1px #ccc;
+  border-left: solid 1px #ccc;
+}
+table thead td,
+table th {
+  padding: 8px 10px;
+  font-weight: 600;
+  border-right: solid 1px #ccc;
+  border-bottom: solid 1px #ccc;
+}
+table tbody tr:nth-child(odd) {
+  background-color: rgba(0, 0, 0, 0.03);
+}
+table td {
+  word-wrap: break-word;
+  padding: 8px 10px;
+  border-right: solid 1px #ccc;
+  border-bottom: solid 1px #ccc;
+}
+table td a {
+  word-wrap: break-word;
+  word-break: break-all;
+}
 
 code {
   -webkit-border-radius: 3px;
   -moz-border-radius: 3px;
   border-radius: 3px;
   padding: 0 2px;
-  border: solid 1px #CCC;
+  border: solid 1px #ccc;
   background-color: #f6f6f6;
-  font-size: .9em;
-  font-family: "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono"; }
+  font-size: 0.9em;
+  font-family:
+    "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono";
+}
 
 .code-frame {
   -webkit-border-radius: 3px;
   -moz-border-radius: 3px;
   border-radius: 3px;
   margin: 1em 0;
-  border: solid 1px #CCC;
+  border: solid 1px #ccc;
   background-color: #f6f6f6;
-  line-height: 0; }
-  .code-frame .code-lang {
-    -webkit-border-bottom-right-radius: 3px;
-    -moz-border-radius-bottomright: 3px;
-    border-bottom-right-radius: 3px;
-    color: #4A4A4A;
-    display: inline-block;
-    padding: 3px 6px;
-    margin: 0;
-    line-height: .85em;
-    background-color: #e6e6e6;
-    font-size: .85em;
-    font-weight: 400;
-    border-right: solid 1px #CCC;
-    border-bottom: solid 1px #CCC; }
-  .code-frame pre {
-    overflow: auto;
-    border: none;
-    padding: .5em 1em;
-    margin: 0;
-    background-color: transparent; }
-    .code-frame pre code {
-      border: none;
-      padding: 0;
-      margin: 0;
-      background-color: transparent;
-      line-height: 1.44em;
-      font-size: 0.9em;
-      font-family: "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono"; }
+  line-height: 0;
+}
+.code-frame .code-lang {
+  -webkit-border-bottom-right-radius: 3px;
+  -moz-border-radius-bottomright: 3px;
+  border-bottom-right-radius: 3px;
+  color: #4a4a4a;
+  display: inline-block;
+  padding: 3px 6px;
+  margin: 0;
+  line-height: 0.85em;
+  background-color: #e6e6e6;
+  font-size: 0.85em;
+  font-weight: 400;
+  border-right: solid 1px #ccc;
+  border-bottom: solid 1px #ccc;
+}
+.code-frame pre {
+  overflow: auto;
+  border: none;
+  padding: 0.5em 1em;
+  margin: 0;
+  background-color: transparent;
+}
+.code-frame pre code {
+  border: none;
+  padding: 0;
+  margin: 0;
+  background-color: transparent;
+  line-height: 1.44em;
+  font-size: 0.9em;
+  font-family:
+    "Monaco", monospace, "Courier", "Inconsolata", "Bitstream Vera Sans Mono";
+}
 
 pre {
   background-color: #f7f7f7;
-  padding: 8px 15px; }
+  padding: 8px 15px;
+}
 
 /* ==========================================================================
    Markdown styles - task list
    ========================================================================== */
 .task-list-item {
-  list-style-type: none; }
+  list-style-type: none;
+}
 
 .task-list-item-checkbox {
-  margin: .4em .5em 0 -1.3em; }
+  margin: 0.4em 0.5em 0 -1.3em;
+}
 
 .task-list-item-checkbox[disabled] {
-  cursor: default; }
+  cursor: default;
+}
+
+/* ==========================================================================
+   W2-01 wrap-toggle — one window preference drives pre/code wrap.
+   Appearance CSS sets --vc-preview-pre-white-space; this section must not
+   fight it with an unconditional nowrap.
+   ========================================================================== */
+pre,
+pre code,
+pre tt {
+  white-space: var(--vc-preview-pre-white-space, pre-wrap);
+}

@@ -323,9 +323,11 @@ final class PreviewWebView: NSView {
     return assembled
   }
 
-  static func appearanceCSS(fontSize: CGFloat, skin: PensieveTheme = .default)
-    -> String
-  {
+  static func appearanceCSS(
+    fontSize: CGFloat,
+    skin: PensieveTheme = .default,
+    wrapLines: Bool = WrapPreference.wrapLinesDefault
+  ) -> String {
     let skinBlock = skinCSS(for: skin)
     // Deliver the bundled families to WebContent via @font-face data URIs —
     // process-scope CTFontManager registration does not cross into the WebView's
@@ -356,6 +358,8 @@ final class PreviewWebView: NSView {
         --vc-preview-diagram-error-text: #8c1d18;
         --vc-preview-math-bg: #f6f8fa;
         --vc-preview-page-background: transparent;
+        --vc-preview-pre-white-space: \(wrapLines ? "pre-wrap" : "pre");
+        --vc-preview-code-white-space: \(wrapLines ? "normal" : "nowrap");
         \(PreviewTitlebarGlassController.titlebarGlassHeightCSSVariable): 0px;
       }
 
@@ -709,6 +713,8 @@ final class PreviewWebView: NSView {
          body typography. Comes last so it wins over the base block above without
          re-implementing any flavor (markdown.css / gfm.css) rules. */
       \(skinBlock)
+
+      \(WrapPreference.previewStylesheet(wrapLines: wrapLines))
       """
   }
 

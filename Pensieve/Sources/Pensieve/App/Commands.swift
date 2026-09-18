@@ -754,6 +754,18 @@ private struct ActivePensieveCommands: Commands {
       )
       .disabled(!appState.documentHasEditableBuffer)
       .accessibilityIdentifier("pensieve.scrollSync.menuToggle")
+
+      Toggle(
+        WrapPreference.commandTitle,
+        isOn: Binding(
+          get: { WrapPreference.shared.wrapLines },
+          set: { newValue in
+            WrapPreference.shared.wrapLines = newValue
+            appState.requestPreviewRefresh()
+          }
+        )
+      )
+      .accessibilityIdentifier("pensieve.wrapLines.menuToggle")
     }
 
     // Tab navigation (Quick Win)
