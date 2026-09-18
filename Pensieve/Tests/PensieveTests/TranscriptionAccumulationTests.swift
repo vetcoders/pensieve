@@ -105,7 +105,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testStopRecordingCommitsTheEngineFinalEvenWithoutAFinalCallback() throws {
-    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let engine = FakeDictationEngine(stopRecordingHandler: { "confirmed final words" })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.receivePreview("draft words")
@@ -118,7 +118,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testStopRecordingDoesNotDuplicateFinalAlreadyDeliveredByCallback() throws {
-    let engine = MockVistaAutocompleteEngine(stopRecordingHandler: { "confirmed final words" })
+    let engine = FakeDictationEngine(stopRecordingHandler: { "confirmed final words" })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
     service.receiveFinal("confirmed final words", language: "en")
 
@@ -132,7 +132,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
 
   @MainActor
   func testStartRecordingLoadsModelOffMainAndEntersRecordingState() async {
-    let engine = MockVistaAutocompleteEngine(modelLoaded: false, initModelHandler: {})
+    let engine = FakeDictationEngine(modelLoaded: false, initModelHandler: {})
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.startRecording()
@@ -152,7 +152,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStartRecordingRequestsMicrophoneBeforeRealEngineCapture() async {
     let events = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       startRecordingHandler: { _ in events.append("startRecording") })
     let service = TranscriptionService(
       engine: engine,
@@ -177,7 +177,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStartRecordingPassesSelectedRecognitionLanguageToEngine() async {
     let languages = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       startRecordingHandler: { language in languages.append(language ?? "auto") })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
@@ -195,7 +195,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testPartialCaptureStartFailureRollsBackAndAllowsRetry() async {
     let events = LockedStringLog()
     let recording = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in
@@ -236,7 +236,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let events = LockedStringLog()
     let recording = LockedFlag()
     recording.set()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       startRecordingHandler: { _ in
         events.append("start")
@@ -262,7 +262,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   @MainActor
   func testStaleEngineStopFailureDetachesListenerAndDoesNotStartOverActiveCapture() async {
     let events = LockedStringLog()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { true },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in events.append("start") },
@@ -289,7 +289,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let events = LockedStringLog()
     let recording = LockedFlag()
     recording.set()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in
@@ -318,7 +318,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testAsynchronousEngineErrorStopsCaptureDetachesListenerAndDrainsFinalText() async {
     let events = LockedStringLog()
     let recording = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       isRecordingHandler: { recording.isSet },
       removeEventListenerHandler: { events.append("removeListener") },
       startRecordingHandler: { _ in recording.set() },
@@ -353,7 +353,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
     let recordingStarted = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: {
         modelLoadStarted.fulfill()
@@ -384,7 +384,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     let modelLoadStarted = expectation(description: "model load entered")
     let releaseModelLoad = DispatchSemaphore(value: 0)
     let recordingStarted = LockedFlag()
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: {
         modelLoadStarted.fulfill()
@@ -416,7 +416,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     struct ModelInitBoom: Error, LocalizedError {
       var errorDescription: String? { "model boom" }
     }
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       modelLoaded: false,
       initModelHandler: { throw ModelInitBoom() })
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
@@ -432,7 +432,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionUsesVistaEngineFormatterWhenAvailable() async {
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       formattingAvailable: true,
       formattingHandler: { text, assistive in
         XCTAssertFalse(assistive)
@@ -453,7 +453,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionUsesWritingAssistantFormatterWhenSelected() async {
-    let engine = MockVistaAutocompleteEngine(
+    let engine = FakeDictationEngine(
       formattingAvailable: true,
       formattingHandler: { text, assistive in
         XCTAssertTrue(assistive)
@@ -476,7 +476,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   func testProductionFormattingSeamUsesProviderSafeResponsesBackend() async {
     let responder = MockAITextResponder(result: "rewritten transcript")
     let service = TranscriptionService(
-      engine: MockVistaAutocompleteEngine(formattingAvailable: false),
+      engine: FakeDictationEngine(formattingAvailable: false),
       aiTextResponder: responder,
       cadenceCommitNanoseconds: 0)
     service.receivePreview("chaotic spoken mission")
@@ -491,7 +491,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
   }
 
   func testFormatCompositionFallsBackToRawTextWhenFormatterUnavailable() async {
-    let engine = MockVistaAutocompleteEngine(formattingAvailable: false)
+    let engine = FakeDictationEngine(formattingAvailable: false)
     let service = TranscriptionService(engine: engine, cadenceCommitNanoseconds: 0)
 
     service.receivePreview("raw transcript")
@@ -714,7 +714,7 @@ final class TranscriptionAccumulationTests: XCTestCase {
     XCTAssertEqual(appState.lastError, service.dispatchStatus)
   }
 
-  func testVistaEventListenerCallbacksMarshalIntoAccumulationState() async {
+  func testDictationEventListenerCallbacksMarshalIntoAccumulationState() async {
     let service = TranscriptionService()
 
     service.onTranscriptionPreview(text: "preview window")
