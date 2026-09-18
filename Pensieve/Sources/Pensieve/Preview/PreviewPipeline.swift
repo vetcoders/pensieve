@@ -99,7 +99,11 @@ extension PreviewDocument {
     let safeCSS = sanitizedForInlineEmbedding(css)
     let styleHTML = """
       \(safeCSS)
-      \(PreviewWebView.appearanceCSS(fontSize: fontSize, skin: skin))
+      \(PreviewWebView.appearanceCSS(
+        fontSize: fontSize,
+        skin: skin,
+        wrapLines: WrapPreference.shared.wrapLines
+      ))
       """
     let mermaidScripts =
       mermaidJavaScript.map { javascript in

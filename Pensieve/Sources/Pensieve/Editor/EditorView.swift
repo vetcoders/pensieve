@@ -7,6 +7,7 @@ struct EditorView: View {
   @EnvironmentObject private var controller: AppController
   @EnvironmentObject private var themeManager: ThemeManager
   @State private var autocompleteError: String?
+  @State private var wrapLines = WrapPreference.wrapLinesDefault
   private let scrollSyncCoordinator: ScrollSyncCoordinator?
 
   init(scrollSyncCoordinator: ScrollSyncCoordinator? = nil) {
@@ -36,6 +37,7 @@ struct EditorView: View {
         tableTidyOnPaste: appState.tableTidyOnPaste,
         asciiSafeTables: appState.asciiSafeTables,
         aiAutocompleteEnabled: appState.aiAutocompleteEnabled,
+        wrapLines: wrapLines,
         documentID: appState.aiDocumentID,
         documentIdentity: appState.documentSession.identity,
         editorFocusRequest: appState.editorFocusRequest,
@@ -132,6 +134,18 @@ struct EditorView: View {
       }
     }
     .background(Color(themeManager.skin.tokens.source.nsColor))
+    .onAppear {
+      wrapLines = WrapPreference.shared.wrapLines
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(for: WrapPreference.didChangeNotification)
+    ) { note in
+      if let value = note.userInfo?[WrapPreference.wrapLinesUserInfoKey] as? Bool {
+        wrapLines = value
+      } else {
+        wrapLines = WrapPreference.shared.wrapLines
+      }
+    }
   }
 
   private var documentText: Binding<String> {
@@ -173,6 +187,7 @@ struct EditorRepresentable: NSViewRepresentable {
   let tableTidyOnPaste: Bool
   let asciiSafeTables: Bool
   let aiAutocompleteEnabled: Bool
+  let wrapLines: Bool
   let documentID: String
   let documentIdentity: DocumentIdentity?
   let editorFocusRequest: EditorFocusRequest?
@@ -204,6 +219,7 @@ struct EditorRepresentable: NSViewRepresentable {
     tableTidyOnPaste: Bool,
     asciiSafeTables: Bool,
     aiAutocompleteEnabled: Bool,
+    wrapLines: Bool = WrapPreference.wrapLinesDefault,
     documentID: String = "transient",
     documentIdentity: DocumentIdentity? = nil,
     editorFocusRequest: EditorFocusRequest? = nil,
@@ -231,6 +247,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self.tableTidyOnPaste = tableTidyOnPaste
     self.asciiSafeTables = asciiSafeTables
     self.aiAutocompleteEnabled = aiAutocompleteEnabled
+    self.wrapLines = wrapLines
     self.documentID = documentID
     self.documentIdentity = documentIdentity
     self.editorFocusRequest = editorFocusRequest
@@ -254,7 +271,8 @@ struct EditorRepresentable: NSViewRepresentable {
       tableTidyOnPaste: tableTidyOnPaste,
       asciiSafeTables: asciiSafeTables,
       aiAutocompleteEnabled: aiAutocompleteEnabled,
-      documentID: documentID
+      documentID: documentID,
+      wrapLines: wrapLines
     )
     context.coordinator.rethemeMemo.record(skin.paintedIdentity)
     surface.onTextChanged = { newText in
@@ -345,6 +363,7 @@ struct EditorRepresentable: NSViewRepresentable {
       coordinator: scrollSyncCoordinator,
       enabled: scrollSyncEnabled
     )
+    surface.applyWrapPreference(wrapLines)
     surface.update(
       text: text,
       fontSize: fontSize,
@@ -556,7 +575,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // after the debounce. STT/formatting stay in qube-ffi; editor completion uses
     // the current provider-safe Responses request contract directly.
     autocompleteController: AutocompleteController = AutocompleteController(
-      completionFactory: { OpenAIResponsesAutocompleteBackend() })
+      completionFactory: { OpenAIResponsesAutocompleteBackend() }),
+    wrapLines: Bool = WrapPreference.wrapLinesDefault
   ) {
     textLayoutManager = NSTextLayoutManager()
     textContentStorage = MarkdownTextStorage()
@@ -695,9 +715,17 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     textView.gutter?.lineNumberForUTF16Offset = { [weak self] offset in
       (self?.lineIndex(forUTF16Offset: offset) ?? 0) + 1
     }
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(wrapPreferenceDidChange(_:)),
+      name: WrapPreference.didChangeNotification,
+      object: nil
+    )
+
     // Theme the surface BEFORE the initial content load so the first highlight
     // pass in `update` already uses the theme's source-panel colours.
     applyTheme(skin)
+    applyWrapPreference(wrapLines)
     update(
       text: text,
       fontSize: fontSize,
@@ -808,6 +836,33 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     request.consume()
     pendingEditorFocusRequest = nil
     _ = window.makeFirstResponder(textView)
+  }
+
+  /// Injectable wrap seam. Tests drive ON/OFF here without showing a window.
+  func applyWrapPreference(_ wrapLines: Bool) {
+    let config = WrapPreference.textContainerConfiguration(wrapLines: wrapLines)
+    textContainer.widthTracksTextView = config.widthTracksTextView
+    textView.isHorizontallyResizable = config.isHorizontallyResizable
+    if config.autoresizesWidth {
+      textView.autoresizingMask = [.width]
+      let trackedWidth = max(scrollView.contentSize.width, textView.bounds.width, 640)
+      textContainer.size = NSSize(
+        width: trackedWidth,
+        height: CGFloat.greatestFiniteMagnitude)
+    } else {
+      textView.autoresizingMask = []
+      textContainer.size = NSSize(
+        width: CGFloat.greatestFiniteMagnitude,
+        height: CGFloat.greatestFiniteMagnitude)
+    }
+    scrollView.hasHorizontalScroller = config.hasHorizontalScroller
+  }
+
+  @objc private func wrapPreferenceDidChange(_ notification: Notification) {
+    let wrapLines =
+      (notification.userInfo?[WrapPreference.wrapLinesUserInfoKey] as? Bool)
+      ?? WrapPreference.shared.wrapLines
+    applyWrapPreference(wrapLines)
   }
 
   // No default parameter values on purpose: a defaulted behavior flag already

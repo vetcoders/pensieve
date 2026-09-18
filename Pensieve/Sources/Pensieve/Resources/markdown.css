@@ -570,3 +570,14 @@ pre {
 
 .task-list-item-checkbox[disabled] {
   cursor: default; }
+
+/* ==========================================================================
+   W2-01 wrap-toggle — one window preference drives pre/code wrap.
+   Appearance CSS sets --vc-preview-pre-white-space; this section must not
+   fight it with an unconditional nowrap.
+   ========================================================================== */
+pre,
+pre code,
+pre tt {
+  white-space: var(--vc-preview-pre-white-space, pre-wrap);
+}

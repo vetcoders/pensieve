@@ -284,3 +284,15 @@ pre {
   pre code, pre tt {
     background-color: transparent;
     border: none; }
+
+/* ==========================================================================
+   W2-01 wrap-toggle — one window preference drives pre/code wrap.
+   The earlier `code, tt { white-space: nowrap }` must not stamp wrap as
+   personality. Appearance CSS sets --vc-preview-pre-white-space.
+   ========================================================================== */
+pre,
+pre code,
+pre tt,
+.highlight pre {
+  white-space: var(--vc-preview-pre-white-space, pre-wrap);
+}
