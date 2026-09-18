@@ -341,6 +341,7 @@ final class EditorToolbarOverflowTests: XCTestCase {
     let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
     defer { rig.tearDown() }
     XCTAssertNotNil(Self.authoredItem(named: "Mode", in: rig))
+    let controller = try Self.overflowController(in: rig)
 
     for group in rig.itemGroups {
       group.menuFormRepresentation = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -353,10 +354,49 @@ final class EditorToolbarOverflowTests: XCTestCase {
       Self.authoredItem(named: "Mode", in: rig),
       "if waiting alone repaired this, the repair is riding a trigger this test does not name")
 
+    let repairsBefore = controller.repairClobberedBridgeCallCount
+    let appliesBefore = controller.repairApplyCallCount
     rig.window.update()
     XCTAssertNotNil(
       Self.authoredItem(named: "Mode", in: rig),
       "a window update must put the authored overflow menus back, with no SwiftUI pass to help")
+    XCTAssertGreaterThan(
+      controller.repairClobberedBridgeCallCount, repairsBefore,
+      "a real clobber must still enter repairClobberedBridge on didUpdate")
+    XCTAssertGreaterThan(
+      controller.repairApplyCallCount, appliesBefore,
+      "a real clobber must still call apply(_:to:) once to restore the authored form")
+  }
+
+  /// THE LOOP PIN: `didUpdate` on an already-authored toolbar is a cheap gate.
+  /// The 2026-09-17 sample had the main thread in `updateWindows` →
+  /// `repairClobberedBridge` → `apply(_:to:)` → `NSImage` on every cycle; these
+  /// counters are the seam that fails if that rebuild comes back.
+  @MainActor
+  func testDidUpdateDoesNotRebuildAnAlreadyCorrectToolbar() throws {
+    let rig = try makeToolbarRig(prefix: "EditorToolbarOverflowTests")
+    defer { rig.tearDown() }
+    XCTAssertTrue(rig.awaitOverflowConvergence(), rig.overflowDiagnostics)
+
+    let controller = try Self.overflowController(in: rig)
+    XCTAssertFalse(
+      controller.needsFormRepair(),
+      "premise: a converged toolbar must not still look clobbered to the didUpdate gate")
+    let repairs = controller.repairClobberedBridgeCallCount
+    let applies = controller.repairApplyCallCount
+
+    for _ in 0..<5 { rig.window.update() }
+
+    XCTAssertEqual(
+      controller.repairClobberedBridgeCallCount, repairs,
+      "an already-correct overflow form was repaired — on a didUpdate trigger that is the loop")
+    XCTAssertEqual(
+      controller.repairApplyCallCount, applies,
+      "an already-correct overflow form called apply(_:to:) — that is the NSImage rebuild in the sample"
+    )
+    XCTAssertNotNil(
+      Self.authoredItem(named: "Mode", in: rig),
+      "the cheap gate must not drop the authored form it decided not to rebuild")
   }
 
   // MARK: - Re-assertion
@@ -448,6 +488,15 @@ final class EditorToolbarOverflowTests: XCTestCase {
       }
     }
     return titles
+  }
+
+  @MainActor
+  private static func overflowController(in rig: ToolbarBridgeRig) throws
+    -> ToolbarOverflowController
+  {
+    try XCTUnwrap(
+      ToolbarOverflowRecipe.controller(for: rig.window),
+      "the overflow sink never attached a controller — " + rig.overflowDiagnostics)
   }
 
   @MainActor
