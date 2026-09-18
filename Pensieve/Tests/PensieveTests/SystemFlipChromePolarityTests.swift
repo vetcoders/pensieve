@@ -205,6 +205,10 @@ final class SystemFlipChromePolarityTests: XCTestCase {
     XCTAssertEqual(WindowChromeRecipe.appearancePolarity(glass.appearance), .darkAqua)
 
     WindowChromeRecipe.assertWindowChrome(on: window, for: .ink)
+    XCTAssertTrue(
+      WindowChromeRecipe.isAssertedToTheSkinsHalf(window, for: .ink),
+      "premise: the window is already on the skin's half, so the didUpdate observer's cheap polarity"
+        + " gate must still allow a clobber repair and must not rewrite a correct surface")
     XCTAssertFalse(
       WindowChromeRecipe.assertBetweenPassChrome(on: window, for: .ink, tabBarViews: [glass]),
       "an already-correct tab bar was rewritten — on a didUpdate trigger that is the loop")
