@@ -89,6 +89,11 @@ struct DocumentSession: Equatable, Sendable {
   private var storedOriginalSaveFailure: String?
   var text: String
   var isDirty: Bool
+  /// Birth UUID for the codescribe Ask thread. Minted with the session, not
+  /// derived from `persistentID` (that is still `file:<url>` and would fork
+  /// the conversation on Save As). Rename / Save As keep this value; opening
+  /// a different file or creating a new untitled buffer mints a new one.
+  var askThreadID: UUID
 
   static let empty = DocumentSession(kind: .empty, text: "", isDirty: false)
 
@@ -231,15 +236,28 @@ struct DocumentSession: Equatable, Sendable {
     self.kind = document.map(Kind.fileBacked) ?? .empty
     self.text = text
     self.isDirty = isDirty
+    self.askThreadID = UUID()
   }
 
-  private init(kind: Kind, text: String, isDirty: Bool) {
+  private init(kind: Kind, text: String, isDirty: Bool, askThreadID: UUID = UUID()) {
     self.kind = kind
     self.text = text
     self.isDirty = isDirty
+    self.askThreadID = askThreadID
   }
 
   mutating func load(document: DocumentRef, text: String) {
+    // Untitled → file is the identity-test Save As stand-in; loading → file
+    // finishes a staged open of THIS buffer. Both keep the birth thread.
+    // Empty or already file-backed `load` is a different document: remint.
+    let keepAskThread: Bool = {
+      switch kind {
+      case .untitled, .loading:
+        return true
+      case .empty, .fileBacked:
+        return false
+      }
+    }()
     self.kind = .fileBacked(document)
     self.storedRecoveryID = nil
     self.storedRecoverySourceURL = nil
@@ -247,6 +265,9 @@ struct DocumentSession: Equatable, Sendable {
     self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = false
+    if !keepAskThread {
+      self.askThreadID = UUID()
+    }
   }
 
   /// Claims `document` for this window while its bytes are read off the main
@@ -260,6 +281,7 @@ struct DocumentSession: Equatable, Sendable {
     self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
+    self.askThreadID = UUID()
   }
 
   /// The current buffer reached its intended durable destination, so its
@@ -292,6 +314,7 @@ struct DocumentSession: Equatable, Sendable {
     self.storedOriginalSaveFailure = nil
     self.text = ""
     self.isDirty = false
+    self.askThreadID = UUID()
   }
 
   mutating func restoreUntitled(
@@ -307,6 +330,9 @@ struct DocumentSession: Equatable, Sendable {
     self.storedOriginalSaveFailure = nil
     self.text = text
     self.isDirty = true
+    // Recovery records do not yet carry askThreadID (DocumentStore is W1-C).
+    // A restored draft therefore starts a new thread in this cut.
+    self.askThreadID = UUID()
   }
 
   mutating func clear() {
