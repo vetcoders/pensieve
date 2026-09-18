@@ -42,9 +42,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
     panel.map(panelIsVisible) == true
   }
 
-  /// Record stays off when published capture posture is not ready, and also
-  /// while a take is already live. W4 may replace `isCaptureReady` with a
-  /// dedicated publisher that stays true during recording.
+  /// Record stays off unless `TranscriptionService.isCaptureReady` is true
+  /// (TCC microphone AND codescribe STT) and a take is not already live.
   static func recordControlEnabled(for service: TranscriptionService) -> Bool {
     service.isCaptureReady && !service.isRecording && !service.isPreparingRecording
   }
@@ -554,16 +553,6 @@ private struct TaflaVisualEffect: NSViewRepresentable {
   }
 
   func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
-extension TranscriptionService {
-  /// Panel-local read of published capture posture. W4 owns the Founder
-  /// publisher (TCC microphone AND codescribe STT). Not Grok OAuth, and
-  /// not a second STT stack — this only composes fields that already
-  /// exist on the service.
-  var isCaptureReady: Bool {
-    !isRecording && !isPreparingRecording && lastStatus != .error
-  }
 }
 
 extension VistaStatusSignal {

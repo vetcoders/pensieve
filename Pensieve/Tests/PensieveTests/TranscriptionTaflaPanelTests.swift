@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import XCTest
 
 @testable import Pensieve
@@ -161,17 +162,21 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
   }
 
   func testRecordControlFollowsPublishedCaptureReadyFlag() {
-    let readyService = TranscriptionService(cadenceCommitNanoseconds: 0)
+    let readyService = TranscriptionService(
+      microphoneAuthorizationProvider: { .authorized },
+      sttReadinessProbe: { true },
+      cadenceCommitNanoseconds: 0
+    )
+    readyService.refreshCaptureReadiness()
     XCTAssertTrue(readyService.isCaptureReady)
     XCTAssertTrue(TranscriptionTaflaPanelController.recordControlEnabled(for: readyService))
 
     let notReadyService = TranscriptionService(
-      engine: MockVistaAutocompleteEngine(),
+      microphoneAuthorizationProvider: { .denied },
+      sttReadinessProbe: { true },
       cadenceCommitNanoseconds: 0
     )
-    notReadyService.startRecording()
-    defer { notReadyService.cancelPreparation() }
-    XCTAssertTrue(notReadyService.isPreparingRecording)
+    notReadyService.refreshCaptureReadiness()
     XCTAssertFalse(notReadyService.isCaptureReady)
     XCTAssertFalse(TranscriptionTaflaPanelController.recordControlEnabled(for: notReadyService))
   }
