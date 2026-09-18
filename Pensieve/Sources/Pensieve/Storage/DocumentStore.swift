@@ -952,6 +952,7 @@ final class FolderManager {
         appState.excludedWorkspacePaths == exclusions
       else { return }
 
+      // Publisher only: the walk is already done. applyRefresh must not await FTS.
       self.applyRefresh(
         into: appState,
         snapshot: snapshot,
@@ -1026,6 +1027,13 @@ final class FolderManager {
   /// signatures derived by the same off-main scan. Folder-only changes never write search;
   /// content-only changes never republish the tree. Selection and dirty-buffer protection apply
   /// whenever either visible universe changes.
+  ///
+  /// This method is the MainActor publisher, not the walk and not the GRDB writer. The
+  /// filesystem walk already finished off-main in `cancellableRefreshSnapshot`. FTS is armed
+  /// on the way out via `updateWorkspaceSearchIndex` and is never awaited here — click-file
+  /// and `waitForPendingForcedRefresh` return against the in-memory snapshot even if search
+  /// is still catching up. A stale FTS for a moment is legal; treating the walk as UI work
+  /// is not.
   private func applyRefresh(
     into appState: AppState,
     snapshot: WorkspaceRefreshSnapshot,
@@ -1067,11 +1075,16 @@ final class FolderManager {
       }
     }
 
-    if searchChanged {
-      updateWorkspaceSearchIndex(
-        signature: snapshot.searchSignature,
-        into: appState
-      )
+    // Arm FTS after the in-memory snapshot (and selection) are published, on every
+    // return path. The mapping + GRDB write live in `updateWorkspaceSearchIndex`'s
+    // off-main task; awaiting them here would make click-file wait for FTS.
+    defer {
+      if searchChanged {
+        updateWorkspaceSearchIndex(
+          signature: snapshot.searchSignature,
+          into: appState
+        )
+      }
     }
     let documents = appState.allDocuments
 
