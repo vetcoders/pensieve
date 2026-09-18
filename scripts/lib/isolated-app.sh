@@ -300,7 +300,8 @@ isolated_app_runtime_input_status() {
     Pensieve/Sources \
     Pensieve/Resources \
     Pensieve/scripts \
-    "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" 2>/dev/null
+    "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" \
+    "Pensieve/Vendor/codescribe-ffi/$ffi_profile/libcodescribe_ffi.dylib" 2>/dev/null
 }
 
 # isolated_app_assert_source_provenance <repo-root> <source.app>

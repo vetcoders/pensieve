@@ -308,7 +308,8 @@ assert_app_rpath_hygiene() {
     local target
     for target in \
         "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
-        "$APP_BUNDLE/Contents/Frameworks/libqube_ffi.dylib"
+        "$APP_BUNDLE/Contents/Frameworks/libqube_ffi.dylib" \
+        "$APP_BUNDLE/Contents/Frameworks/libcodescribe_ffi.dylib"
     do
         [[ -f "$target" ]] || continue
         rpath_assert_clean "$target" || die "$hint"
@@ -348,6 +349,7 @@ create_release_snapshot() {
         Pensieve/Resources \
         Pensieve/scripts \
         "Pensieve/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib" \
+        "Pensieve/Vendor/codescribe-ffi/$FFI_PROFILE/libcodescribe_ffi.dylib" \
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-keychain.sh \
@@ -379,6 +381,7 @@ create_release_snapshot() {
         "$RELEASE_SNAPSHOT_PKG/Resources" \
         "$RELEASE_SNAPSHOT_PKG/scripts" \
         "$RELEASE_SNAPSHOT_PKG/Vendor/qube-ffi/$FFI_PROFILE" \
+        "$RELEASE_SNAPSHOT_PKG/Vendor/codescribe-ffi/$FFI_PROFILE" \
         "$RELEASE_SNAPSHOT_PKG/.build/checkouts" \
         || die "Could not make the release snapshot inputs read-only."
 
@@ -520,6 +523,7 @@ if (( ! DMG_ONLY )); then
     BUILD_INFO_PLIST_SRC="$BUILD_PKG_DIR/Resources/Info.plist"
     BUILD_ICON_SRC="$BUILD_PKG_DIR/Resources/$APP_NAME.icns"
     BUILD_QUBE_DYLIB_SRC="$BUILD_PKG_DIR/Vendor/qube-ffi/$FFI_PROFILE/libqube_ffi.dylib"
+    BUILD_CODESCRIBE_DYLIB_SRC="$BUILD_PKG_DIR/Vendor/codescribe-ffi/$FFI_PROFILE/libcodescribe_ffi.dylib"
     BUILD_ENTITLEMENTS="$RELEASE_SNAPSHOT_ROOT/$ENTITLEMENTS_RELATIVE"
 fi
 
@@ -664,6 +668,17 @@ if [[ -f "$BUILD_QUBE_DYLIB_SRC" ]]; then
     fi
     install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 
+    [[ -f "$BUILD_CODESCRIBE_DYLIB_SRC" ]] \
+        || die "codescribe-ffi dylib not found at $BUILD_CODESCRIBE_DYLIB_SRC — the app links libcodescribe_ffi.dylib unconditionally. Vendor it under Pensieve/Vendor/codescribe-ffi/$FFI_PROFILE/ and re-run."
+    log "Embedding codescribe-ffi dylib (repoint to @rpath + re-sign)"
+    cp "$BUILD_CODESCRIBE_DYLIB_SRC" "$FRAMEWORKS_DIR/libcodescribe_ffi.dylib"
+    chmod u+w "$FRAMEWORKS_DIR/libcodescribe_ffi.dylib"
+    CODESCRIBE_OLD_REF="$(otool -L "$APP_BUNDLE/Contents/MacOS/$APP_NAME" | awk '/libcodescribe_ffi\.dylib/{print $1; exit}')"
+    install_name_tool -id "@rpath/libcodescribe_ffi.dylib" "$FRAMEWORKS_DIR/libcodescribe_ffi.dylib"
+    if [[ -n "$CODESCRIBE_OLD_REF" ]]; then
+        install_name_tool -change "$CODESCRIBE_OLD_REF" "@rpath/libcodescribe_ffi.dylib" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+    fi
+
     # …and drop the absolute ones the link step left behind. Package.swift passes
     # `-Xlinker -rpath -Xlinker <packageRoot>/Vendor/qube-ffi/<profile>` so a bare
     # `swift build` can find the vendored dylib, and the toolchain adds absolute
@@ -681,6 +696,8 @@ if [[ -f "$BUILD_QUBE_DYLIB_SRC" ]]; then
     log "Stripping absolute LC_RPATH entries"
     rpath_strip_absolute "$FRAMEWORKS_DIR/libqube_ffi.dylib" \
         || die "Could not strip absolute LC_RPATH entries from the embedded qube-ffi dylib."
+    rpath_strip_absolute "$FRAMEWORKS_DIR/libcodescribe_ffi.dylib" \
+        || die "Could not strip absolute LC_RPATH entries from the embedded codescribe-ffi dylib."
     rpath_strip_absolute "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
         || die "Could not strip absolute LC_RPATH entries from $APP_NAME."
     assert_app_rpath_hygiene "Absolute LC_RPATH entries survived the strip — refusing to sign a bundle
@@ -691,7 +708,8 @@ if [[ -f "$BUILD_QUBE_DYLIB_SRC" ]]; then
     # Same identity (= same Team ID) as the main executable: the sandbox's
     # library validation refuses dylibs signed by another team.
     sign_code "$FRAMEWORKS_DIR/libqube_ffi.dylib"
-    ok "qube-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
+    sign_code "$FRAMEWORKS_DIR/libcodescribe_ffi.dylib"
+    ok "qube-ffi + codescribe-ffi embedded → @rpath, re-signed with $SIGNING_IDENTITY"
 else
     die "qube-ffi dylib not found at $BUILD_QUBE_DYLIB_SRC — the app binary links libqube_ffi.dylib unconditionally, so a bundle without it aborts in dyld at launch. Run Pensieve/scripts/build-ffi.sh to produce it, then re-run this script."
 fi

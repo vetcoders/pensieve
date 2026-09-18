@@ -613,7 +613,8 @@ build_provenance_runtime_input_status() {
         Pensieve/Sources \
         Pensieve/Resources \
         Pensieve/scripts \
-        "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" 2>/dev/null
+        "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" \
+        "Pensieve/Vendor/codescribe-ffi/$ffi_profile/libcodescribe_ffi.dylib" 2>/dev/null
 }
 
 build_provenance_assert_runtime_inputs_clean() {
@@ -649,6 +650,7 @@ build_provenance_assert_runtime_inputs_clean() {
         Pensieve/Resources \
         Pensieve/scripts \
         "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" \
+        "Pensieve/Vendor/codescribe-ffi/$ffi_profile/libcodescribe_ffi.dylib" \
         >"$ignored_file" 2>/dev/null; then
         /bin/rm -f "$ignored_file"
         return 1
@@ -696,12 +698,13 @@ build_provenance_assert_head() {
 # Hashes the complete runtime-producing source surface plus the narrow release
 # recipe in a deterministic, path-sensitive format. Timestamps, ownership and
 # permissions are excluded; file/symlink identity and bytes are included. The
-# vendored runtime input is deliberately ONE profile-specific dylib, not the
-# whole Vendor tree; smoke harnesses are deliberately not recipe inputs.
+# vendored runtime inputs are deliberately the two profile-specific dylibs the
+# product links (qube-ffi + codescribe-ffi), not the whole Vendor tree; smoke
+# harnesses are deliberately not recipe inputs.
 build_provenance_runtime_input_digest() {
     local repo_root="$1"
     local ffi_profile="$2"
-    local package_root sources_root resources_root package_scripts_root ffi_path
+    local package_root sources_root resources_root package_scripts_root ffi_path codescribe_ffi_path
     local work_dir paths_file records_file path relative digest
     local package_resolved checkouts_root pin_count pin_index pin_identity pin_location pin_revision
     local checkout candidate candidate_revision candidate_origin expected_origin matches checkout_digest
@@ -723,6 +726,7 @@ build_provenance_runtime_input_digest() {
     resources_root="$package_root/Resources"
     package_scripts_root="$package_root/scripts"
     ffi_path="$package_root/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib"
+    codescribe_ffi_path="$package_root/Vendor/codescribe-ffi/$ffi_profile/libcodescribe_ffi.dylib"
     package_resolved="$package_root/Package.resolved"
     checkouts_root="$package_root/.build/checkouts"
 
@@ -736,7 +740,8 @@ build_provenance_runtime_input_digest() {
         "$repo_root/scripts/lib/build-provenance.sh" \
         "$repo_root/scripts/lib/landing-page.sh" \
         "$repo_root/scripts/lib/rpath-hygiene.sh" \
-        "$ffi_path"
+        "$ffi_path" \
+        "$codescribe_ffi_path"
     do
         [[ -f "$path" ]] || {
             build_provenance_error "required runtime input is missing: $path"
@@ -766,7 +771,8 @@ build_provenance_runtime_input_digest() {
             "$repo_root/scripts/lib/build-provenance.sh" \
             "$repo_root/scripts/lib/landing-page.sh" \
             "$repo_root/scripts/lib/rpath-hygiene.sh" \
-            "$ffi_path"
+            "$ffi_path" \
+            "$codescribe_ffi_path"
         /usr/bin/find "$sources_root" "$resources_root" "$package_scripts_root" \
             ! -name .DS_Store \( -type f -o -type l \) -print0
     } | LC_ALL=C /usr/bin/sort -zu >"$paths_file"; then
@@ -951,6 +957,7 @@ build_provenance_commit_runtime_input_digest() (
         Pensieve/Resources \
         Pensieve/scripts \
         "Pensieve/Vendor/qube-ffi/$ffi_profile/libqube_ffi.dylib" \
+        "Pensieve/Vendor/codescribe-ffi/$ffi_profile/libcodescribe_ffi.dylib" \
         scripts/build-release.sh \
         scripts/lib/bundle-identity.sh \
         scripts/lib/build-keychain.sh \
