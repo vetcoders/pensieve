@@ -8,24 +8,30 @@ struct AskComposerView: View {
   let apiKey: String
   var oauthToken: String = ""
 
+  /// Persisted across launches — the composer is a permanent detail resident,
+  /// so collapsing it must survive the window it lives in.
+  @AppStorage("pensieve.ask.collapsed") private var isCollapsed = false
+
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       header
-      turnList
-      if let preflight = thread.preflight, thread.phase == .awaitingConfirmation {
-        preflightPanel(preflight)
+      if !isCollapsed {
+        turnList
+        if let preflight = thread.preflight, thread.phase == .awaitingConfirmation {
+          preflightPanel(preflight)
+        }
+        if let error = thread.lastError, !thread.isStreaming {
+          Text(error)
+            .font(.caption)
+            .foregroundStyle(.red)
+            .accessibilityIdentifier("pensieve.ask.error")
+        }
+        composer
       }
-      if let error = thread.lastError, !thread.isStreaming {
-        Text(error)
-          .font(.caption)
-          .foregroundStyle(.red)
-          .accessibilityIdentifier("pensieve.ask.error")
-      }
-      composer
     }
     .padding(.horizontal, 12)
     .padding(.vertical, 8)
-    .frame(minHeight: 140, maxHeight: 280)
+    .frame(minHeight: isCollapsed ? 0 : 140, maxHeight: isCollapsed ? 30 : 280)
     .background(.bar)
     .overlay(alignment: .top) { Divider() }
     .accessibilityIdentifier("pensieve.ask.composer")
@@ -33,9 +39,27 @@ struct AskComposerView: View {
 
   private var header: some View {
     HStack {
-      Text("Ask")
-        .font(.callout.weight(.semibold))
+      Button {
+        withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+      } label: {
+        HStack(spacing: 4) {
+          Image(systemName: isCollapsed ? "chevron.up" : "chevron.down")
+            .font(.caption.weight(.semibold))
+          Text("Ask")
+            .font(.callout.weight(.semibold))
+        }
+        .foregroundStyle(.primary)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityIdentifier("pensieve.ask.toggle")
+      .accessibilityLabel(isCollapsed ? "Expand Ask" : "Collapse Ask")
       Spacer()
+      if isCollapsed, thread.isStreaming {
+        ProgressView()
+          .controlSize(.small)
+          .accessibilityIdentifier("pensieve.ask.streaming")
+      }
       Text(AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken) ? "Ready" : "Needs API key")
         .font(.caption)
         .foregroundStyle(
