@@ -309,6 +309,13 @@ final class DocumentAskThreadStore: ObservableObject {
     objectWillChange.send()
     return created
   }
+
+  /// Non-minting lookup for chrome that only OBSERVES a thread (the status
+  /// bar's Ask chip). Minting on read would birth an empty thread for every
+  /// document the window merely displays.
+  func existingThread(for id: UUID) -> DocumentAskThread? {
+    threads[id]
+  }
 }
 
 /// Constructs the real FFI agent only on first send so XCTest hosts of

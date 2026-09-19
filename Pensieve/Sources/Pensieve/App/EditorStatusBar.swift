@@ -21,6 +21,7 @@ struct EditorStatusBar: View {
   static let appearanceIdentifier = "pensieve.statusbar.appearance"
   static let flavorPickerIdentifier = "pensieve.statusbar.flavorPicker"
   static let skinPickerIdentifier = "pensieve.statusbar.skinPicker"
+  static let askToggleIdentifier = "pensieve.statusbar.askToggle"
 
   private var text: String { appState.activeDocumentText }
 
@@ -73,6 +74,8 @@ struct EditorStatusBar: View {
       }
 
       appearanceChip
+
+      askToggleChip
     }
     .font(.system(size: 10.5))
     .lineLimit(1)
@@ -163,5 +166,63 @@ struct EditorStatusBar: View {
       "\(themeManager.skin.displayName) / \(themeManager.current.displayName)"
     )
     .accessibilityIdentifier(Self.appearanceIdentifier)
+  }
+
+  /// The Ask panel switch, living where the TextForge reference puts global
+  /// chrome: the status bar. Same `@AppStorage` key the composer header and
+  /// ContentView read, so the three surfaces cannot drift. When the panel is
+  /// hidden and its thread is mid-stream, the chip carries the activity dot —
+  /// an in-flight Ask is never invisible.
+  private var askToggleChip: some View {
+    AskToggleChip(threadID: appState.documentSession.askThreadID)
+  }
+}
+
+/// The live half of the status-bar Ask toggle. Observing the thread directly
+/// (not the store) keeps streaming updates flowing into the chip; the store is
+/// only asked for a NON-minting lookup so a document never opened for Ask does
+/// not birth an empty thread just by being displayed.
+private struct AskToggleChip: View {
+  @EnvironmentObject private var askThreads: DocumentAskThreadStore
+  @AppStorage("pensieve.ask.visible") private var askVisible = true
+  let threadID: UUID
+
+  var body: some View {
+    if let thread = askThreads.existingThread(for: threadID) {
+      button(isStreaming: thread.isStreaming, hasTurns: !thread.turns.isEmpty)
+    } else {
+      button(isStreaming: false, hasTurns: false)
+    }
+  }
+
+  private func button(isStreaming: Bool, hasTurns: Bool) -> some View {
+    Button {
+      askVisible.toggle()
+    } label: {
+      HStack(spacing: 4) {
+        Image(systemName: "bubble.left.and.bubble.right")
+          .font(.system(size: 10.5))
+        if isStreaming {
+          Circle()
+            .fill(Color.accentColor)
+            .frame(width: 5, height: 5)
+            .accessibilityIdentifier("pensieve.statusbar.askStreaming")
+        }
+      }
+      .foregroundStyle(askVisible || hasTurns ? .primary : .secondary)
+      .padding(.horizontal, 6)
+      .padding(.vertical, 2)
+      .overlay(
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+          .stroke(
+            askVisible ? Color.accentColor.opacity(0.6) : Color.secondary.opacity(0.3),
+            lineWidth: 1)
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help(askVisible ? "Hide the Ask panel" : "Show the Ask panel")
+    .accessibilityLabel(askVisible ? "Hide Ask panel" : "Show Ask panel")
+    .accessibilityIdentifier(EditorStatusBar.askToggleIdentifier)
   }
 }

@@ -11,6 +11,9 @@ struct ContentView: View {
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @StateObject private var askThreads = DocumentAskThreadStore()
   @State private var lastIngestedDictation = ""
+  /// Shared with the status bar's Ask chip and the composer header — one key,
+  /// three surfaces. Default visible preserves the pre-toggle behavior.
+  @AppStorage("pensieve.ask.visible") private var askVisible = true
   @Binding private var hostWindow: NSWindow?
   private let providerSettings: ProviderSettings
 
@@ -50,13 +53,16 @@ struct ContentView: View {
           WindowErrorBanner(error: error) { appState.dismissVisibleError() }
         }
         if appState.documentHasEditableBuffer {
-          AskComposerView(
-            thread: askThreads.thread(for: appState.documentSession.askThreadID),
-            documentText: appState.documentSession.text,
-            apiKey: providerSettings.apiKey
-          )
-          .id(appState.documentSession.askThreadID)
+          if askVisible {
+            AskComposerView(
+              thread: askThreads.thread(for: appState.documentSession.askThreadID),
+              documentText: appState.documentSession.text,
+              apiKey: providerSettings.apiKey
+            )
+            .id(appState.documentSession.askThreadID)
+          }
           EditorStatusBar()
+            .environmentObject(askThreads)
             .opacity(appState.mode == .focus ? 0.45 : 1)
         }
       }
@@ -218,6 +224,8 @@ struct ContentView: View {
     lastIngestedDictation = trimmed
     guard !utterance.isEmpty else { return }
     askThreads.thread(for: appState.documentSession.askThreadID).appendDictation(utterance)
+    // Dictation landing in a hidden composer is feedback nobody sees. Reopen it.
+    askVisible = true
   }
 
   private func saveRecoveredFileAs() {
