@@ -30,4 +30,20 @@ enum SandboxCapabilities {
   static let dispatchUnavailableExplanation =
     "Agent dispatch runs external tools (vibecrafted, Terminal) and is not available "
     + "in the App Store version. Use the Developer ID build of Pensieve for agent workflows."
+
+  /// Whether this process may run the Grok (xAI) device-code sign-in. The flow
+  /// itself is sandbox-clean — codescribe opens no loopback listener for xAI
+  /// and never launches a browser; Pensieve opens the verification page through
+  /// NSWorkspace — but it has to reach auth.x.ai, and the App Store lane's
+  /// deliberately small `Pensieve.mas.entitlements` grants no
+  /// `com.apple.security.network.client`. Adding that entitlement is a release
+  /// decision; until it is made, the sandboxed build shows sign-in disabled
+  /// with an explanation instead of failing mid-flow as "offline".
+  static func allowsAccountSignIn(isSandboxed: Bool = Self.isSandboxed) -> Bool {
+    !isSandboxed
+  }
+
+  static let accountSignInUnavailableExplanation =
+    "Grok sign-in needs outgoing network access, which the App Store version does not "
+    + "grant. Use the Developer ID build of Pensieve to sign in with Grok."
 }

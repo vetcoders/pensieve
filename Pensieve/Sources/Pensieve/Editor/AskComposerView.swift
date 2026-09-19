@@ -4,14 +4,25 @@ import SwiftUI
 /// This is the Ask send path — it is not the rewrite one-line alert.
 struct AskComposerView: View {
   @ObservedObject var thread: DocumentAskThread
+  /// Grok's account and Ask routing, read from the codescribe FFI and shared
+  /// with Settings ▸ AI.
+  @ObservedObject var grokAccount: GrokAccount
   let documentText: String
   let apiKey: String
-  var oauthToken: String = ""
+  /// The API-key provider Ask falls back to when it is not routed to Grok.
+  var apiKeyProvider: CompletionProviderShape = .openAIResponses
+  var openProviderSettings: @MainActor () -> Void = {
+    _ = PensieveSettingsWindowController.shared.show(section: .ai)
+  }
 
   /// Persisted across launches and shared with the status bar's Ask chip —
   /// one key, two surfaces, no drift. Hidden while streaming still shows
   /// activity on the chip, so an in-flight Ask is never invisible.
   @AppStorage("pensieve.ask.visible") private var isVisible = true
+
+  private var provider: AskProvider {
+    grokAccount.snapshot.askProvider(apiKey: apiKey)
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -26,6 +37,12 @@ struct AskComposerView: View {
           .foregroundStyle(.red)
           .accessibilityIdentifier("pensieve.ask.error")
       }
+      if let error = grokAccount.lastError {
+        Text(error)
+          .font(.caption)
+          .foregroundStyle(.red)
+          .accessibilityIdentifier("pensieve.ask.providerError")
+      }
       composer
     }
     .padding(.horizontal, 12)
@@ -34,20 +51,19 @@ struct AskComposerView: View {
     .background(.bar)
     .overlay(alignment: .top) { Divider() }
     .accessibilityIdentifier("pensieve.ask.composer")
+    .task { await grokAccount.refreshIfStale() }
   }
 
   private var header: some View {
     HStack {
       Text("Ask")
         .font(.callout.weight(.semibold))
+      providerMenu
       Spacer()
-      Text(AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken) ? "Ready" : "Needs API key")
+      Text(AskReadiness.chipLabel(for: provider))
         .font(.caption)
-        .foregroundStyle(
-          AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken)
-            ? Color.secondary
-            : Color.orange
-        )
+        .foregroundStyle(AskReadiness.isReady(provider) ? Color.secondary : Color.orange)
+        .help(AskReadiness.isReady(provider) ? "" : AskReadiness.notReadyMessage(for: provider))
         .accessibilityIdentifier("pensieve.ask.ready")
       Button {
         isVisible = false
@@ -62,6 +78,50 @@ struct AskComposerView: View {
       .help("Hide Ask — bring it back from the status bar")
       .accessibilityIdentifier("pensieve.ask.toggle")
       .accessibilityLabel("Hide Ask panel")
+    }
+  }
+
+  /// Which provider answers. Grok is selectable only once its account is
+  /// authorized; choosing either one reroutes codescribe's assistive lane, so
+  /// the menu, the chip and the next send all read the same truth.
+  private var providerMenu: some View {
+    let snapshot = grokAccount.snapshot
+    return Menu {
+      Button {
+        Task { await grokAccount.useAPIKeyProviderForAsk(apiKeyProvider) }
+      } label: {
+        providerItemLabel(
+          "\(apiKeyProvider.displayName) (API key)", isSelected: !snapshot.askUsesGrok)
+      }
+      Button {
+        Task { await grokAccount.useGrokForAsk() }
+      } label: {
+        providerItemLabel("Grok (xAI account)", isSelected: snapshot.askUsesGrok)
+      }
+      .disabled(!snapshot.isSignedIn)
+      if !snapshot.isSignedIn {
+        Divider()
+        Button("Sign In to Grok…") {
+          openProviderSettings()
+        }
+      }
+    } label: {
+      Text(snapshot.askUsesGrok ? "Grok" : apiKeyProvider.displayName)
+        .font(.caption)
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .disabled(thread.isStreaming)
+    .help("Choose which provider answers Ask")
+    .accessibilityIdentifier("pensieve.ask.provider")
+  }
+
+  @ViewBuilder
+  private func providerItemLabel(_ title: String, isSelected: Bool) -> some View {
+    if isSelected {
+      Label(title, systemImage: "checkmark")
+    } else {
+      Text(title)
     }
   }
 
@@ -102,8 +162,7 @@ struct AskComposerView: View {
         }
         .accessibilityIdentifier("pensieve.ask.cancel")
         Button("Send \(preflight.totalCharacters) characters") {
-          _ = thread.confirmAndSend(
-            document: documentText, apiKey: apiKey, oauthToken: oauthToken)
+          _ = thread.confirmAndSend(document: documentText, provider: provider)
         }
         .keyboardShortcut(.defaultAction)
         .accessibilityIdentifier("pensieve.ask.confirm")
@@ -131,13 +190,12 @@ struct AskComposerView: View {
         .accessibilityIdentifier("pensieve.ask.draft")
 
       Button(thread.isStreaming ? "Asking…" : "Ask") {
-        _ = thread.prepareSend(
-          document: documentText, apiKey: apiKey, oauthToken: oauthToken)
+        _ = thread.prepareSend(document: documentText, provider: provider)
       }
       .disabled(
         thread.isStreaming
           || thread.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          || !AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken)
+          || !AskReadiness.isReady(provider)
       )
       .accessibilityIdentifier("pensieve.ask.send")
     }

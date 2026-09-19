@@ -56,8 +56,10 @@ struct ContentView: View {
           if askVisible {
             AskComposerView(
               thread: askThreads.thread(for: appState.documentSession.askThreadID),
+              grokAccount: .shared,
               documentText: appState.documentSession.text,
-              apiKey: providerSettings.apiKey
+              apiKey: providerSettings.apiKey,
+              apiKeyProvider: providerSettings.providerShape
             )
             .id(appState.documentSession.askThreadID)
           }
