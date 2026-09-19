@@ -40,10 +40,10 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   /// Computes char counts and pages. Does not send. The user must confirm.
   @discardableResult
-  func prepareSend(document: String, apiKey: String?, oauthToken: String? = nil) -> AskPreflight? {
+  func prepareSend(document: String, provider: AskProvider) -> AskPreflight? {
     lastError = nil
-    guard AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken) else {
-      lastError = AskReadiness.notReadyMessage
+    guard AskReadiness.isReady(provider) else {
+      lastError = AskReadiness.notReadyMessage(for: provider)
       preflight = nil
       phase = .idle
       return nil
@@ -63,7 +63,7 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   /// Grill contract: send is blocked until the user has confirmed the preflight.
   @discardableResult
-  func sendWithoutConfirm(document: String, apiKey: String?, oauthToken: String? = nil) -> Bool {
+  func sendWithoutConfirm(document: String, provider: AskProvider) -> Bool {
     lastError = "Confirm the character counts before sending."
     return false
   }
@@ -77,9 +77,9 @@ final class DocumentAskThread: ObservableObject, Identifiable {
   }
 
   @discardableResult
-  func confirmAndSend(document: String, apiKey: String?, oauthToken: String? = nil) -> Bool {
-    guard AskReadiness.isReady(apiKey: apiKey, oauthToken: oauthToken) else {
-      lastError = AskReadiness.notReadyMessage
+  func confirmAndSend(document: String, provider: AskProvider) -> Bool {
+    guard AskReadiness.isReady(provider) else {
+      lastError = AskReadiness.notReadyMessage(for: provider)
       return false
     }
     guard phase == .awaitingConfirmation, let prepared = preflight, !prepared.pages.isEmpty else {
@@ -213,15 +213,46 @@ struct AskTurn: Equatable, Identifiable, Sendable {
   }
 }
 
-/// Ask is ready when the selected provider has an API key. A dummy OAuth token
-/// does not count — Grok is provider #3 later, and this cut does not add OAuth.
-enum AskReadiness {
-  static let notReadyMessage = "Add a provider API key in Settings before asking."
+/// The credential Ask is gated on. Which case applies is read from the lane Ask
+/// actually streams through — codescribe's assistive lane (see
+/// `GrokAccountSnapshot.askProvider(apiKey:)`) — so Pensieve keeps no provider
+/// choice of its own that could disagree with where a question is sent.
+enum AskProvider: Equatable, Sendable {
+  /// OpenAI / Anthropic: the configured provider's API key (the W5 rule).
+  case apiKey(String?)
+  /// Grok (xAI), authenticated by device-code OAuth — never by an API key field.
+  case grok(accountAuthorized: Bool)
+}
 
-  static func isReady(apiKey: String?, oauthToken: String? = nil) -> Bool {
-    let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    _ = oauthToken
-    return !key.isEmpty
+/// API-key providers are ready when the key is non-empty; Grok is ready only
+/// when the codescribe FFI reports its xAI account authorized.
+enum AskReadiness {
+  static let apiKeyNotReadyMessage = "Add a provider API key in Settings before asking."
+  static let grokNotReadyMessage = "Sign in to Grok in Settings ▸ AI before asking."
+
+  static func isReady(_ provider: AskProvider) -> Bool {
+    switch provider {
+    case .apiKey(let apiKey):
+      let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      return !key.isEmpty
+    case .grok(let accountAuthorized):
+      return accountAuthorized
+    }
+  }
+
+  static func notReadyMessage(for provider: AskProvider) -> String {
+    switch provider {
+    case .apiKey: return apiKeyNotReadyMessage
+    case .grok: return grokNotReadyMessage
+    }
+  }
+
+  /// The composer's chip names the credential that will actually be used.
+  static func chipLabel(for provider: AskProvider) -> String {
+    switch provider {
+    case .apiKey: return isReady(provider) ? "Ready" : "Needs API key"
+    case .grok: return isReady(provider) ? "Grok ready" : "Grok: sign in"
+    }
   }
 }
 
@@ -308,6 +339,13 @@ final class DocumentAskThreadStore: ObservableObject {
     threads[id] = created
     objectWillChange.send()
     return created
+  }
+
+  /// Non-minting lookup for chrome that only OBSERVES a thread (the status
+  /// bar's Ask chip). Minting on read would birth an empty thread for every
+  /// document the window merely displays.
+  func existingThread(for id: UUID) -> DocumentAskThread? {
+    threads[id]
   }
 }
 

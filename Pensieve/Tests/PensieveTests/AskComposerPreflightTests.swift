@@ -35,7 +35,7 @@ final class AskComposerPreflightTests: XCTestCase {
     thread.draft = "Please summarise."
 
     XCTAssertFalse(
-      thread.sendWithoutConfirm(document: "doc", apiKey: "sk-test"),
+      thread.sendWithoutConfirm(document: "doc", provider: .apiKey("sk-test")),
       "Ask must not send until the user confirms the preflight")
     XCTAssertEqual(thread.phase, .idle)
     XCTAssertTrue(agent.texts.isEmpty)
@@ -46,34 +46,60 @@ final class AskComposerPreflightTests: XCTestCase {
     let agent = ImmediateCodescribeAgent()
     let thread = DocumentAskThread(id: UUID(), agent: agent)
 
-    XCTAssertNil(thread.prepareSend(document: "doc", apiKey: "sk-test"))
+    XCTAssertNil(thread.prepareSend(document: "doc", provider: .apiKey("sk-test")))
     XCTAssertEqual(thread.lastError, "Write a question before sending.")
 
     thread.draft = "Please summarise."
-    let preflight = thread.prepareSend(document: "doc", apiKey: "sk-test")
+    let preflight = thread.prepareSend(document: "doc", provider: .apiKey("sk-test"))
     XCTAssertNotNil(preflight)
     XCTAssertEqual(thread.phase, .awaitingConfirmation)
     XCTAssertEqual(preflight?.promptCharacters, "Please summarise.".count)
     XCTAssertEqual(preflight?.documentCharacters, 3)
 
-    XCTAssertTrue(thread.confirmAndSend(document: "doc", apiKey: "sk-test"))
+    XCTAssertTrue(thread.confirmAndSend(document: "doc", provider: .apiKey("sk-test")))
     XCTAssertEqual(thread.phase, .streaming)
   }
 
-  func testPrepareIsBlockedWhenAPIKeyIsMissingEvenWithOAuth() {
+  func testPrepareIsBlockedWhenTheSelectedProviderIsNotReady() {
     let thread = DocumentAskThread(id: UUID(), agent: ImmediateCodescribeAgent())
     thread.draft = "Hello"
 
-    XCTAssertNil(thread.prepareSend(document: "doc", apiKey: "", oauthToken: "oauth-dummy"))
-    XCTAssertEqual(thread.lastError, AskReadiness.notReadyMessage)
+    XCTAssertNil(thread.prepareSend(document: "doc", provider: .apiKey("")))
+    XCTAssertEqual(thread.lastError, AskReadiness.apiKeyNotReadyMessage)
     XCTAssertEqual(thread.phase, .idle)
+
+    XCTAssertNil(thread.prepareSend(document: "doc", provider: .grok(accountAuthorized: false)))
+    XCTAssertEqual(thread.lastError, AskReadiness.grokNotReadyMessage)
+    XCTAssertEqual(thread.phase, .idle)
+    XCTAssertFalse(
+      thread.confirmAndSend(document: "doc", provider: .grok(accountAuthorized: false)),
+      "an unauthorized Grok account must not reach the send path")
+  }
+
+  func testAuthorizedGrokPreparesConfirmsAndSendsWithoutAnAPIKey() async {
+    let agent = ImmediateCodescribeAgent()
+    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    thread.draft = "Please summarise."
+    let grok = AskProvider.grok(accountAuthorized: true)
+
+    XCTAssertNotNil(thread.prepareSend(document: "doc", provider: grok))
+    XCTAssertEqual(thread.phase, .awaitingConfirmation)
+    XCTAssertTrue(thread.confirmAndSend(document: "doc", provider: grok))
+    XCTAssertEqual(thread.phase, .streaming)
+
+    let deadline = Date().addingTimeInterval(1)
+    while thread.phase != .completed, Date() < deadline {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertEqual(thread.phase, .completed)
+    XCTAssertEqual(agent.texts.count, 1)
   }
 
   func testCancelPreflightReturnsToIdleWithoutSending() {
     let agent = ImmediateCodescribeAgent()
     let thread = DocumentAskThread(id: UUID(), agent: agent)
     thread.draft = "Keep this draft"
-    XCTAssertNotNil(thread.prepareSend(document: "doc", apiKey: "sk-test"))
+    XCTAssertNotNil(thread.prepareSend(document: "doc", provider: .apiKey("sk-test")))
 
     thread.cancelPreflight()
 

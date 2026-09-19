@@ -61,15 +61,22 @@ final class DocumentAskThreadTests: XCTestCase {
     XCTAssertNotEqual(session.askThreadID, first)
   }
 
-  func testAskReadyRequiresAPIKeyAndIgnoresOAuth() {
-    XCTAssertFalse(AskReadiness.isReady(apiKey: ""))
-    XCTAssertFalse(AskReadiness.isReady(apiKey: "   "))
-    XCTAssertFalse(AskReadiness.isReady(apiKey: nil, oauthToken: "oauth-dummy-token"))
+  func testAPIKeyProvidersKeepTheKeyRuleAndGrokNeedsItsAccount() {
+    XCTAssertFalse(AskReadiness.isReady(.apiKey("")))
+    XCTAssertFalse(AskReadiness.isReady(.apiKey("   ")))
+    XCTAssertFalse(AskReadiness.isReady(.apiKey(nil)))
+    XCTAssertTrue(AskReadiness.isReady(.apiKey("sk-test")))
+    XCTAssertEqual(AskReadiness.chipLabel(for: .apiKey("")), "Needs API key")
+    XCTAssertEqual(AskReadiness.chipLabel(for: .apiKey("sk-test")), "Ready")
+
     XCTAssertFalse(
-      AskReadiness.isReady(apiKey: "", oauthToken: "oauth-dummy-token"),
-      "a dummy OAuth token must not flip Ask ready")
-    XCTAssertTrue(AskReadiness.isReady(apiKey: "sk-test"))
-    XCTAssertTrue(AskReadiness.isReady(apiKey: "sk-test", oauthToken: "oauth-dummy-token"))
+      AskReadiness.isReady(.grok(accountAuthorized: false)),
+      "Grok is gated on its OAuth account, never on an API key field")
+    XCTAssertTrue(AskReadiness.isReady(.grok(accountAuthorized: true)))
+    XCTAssertNotEqual(
+      AskReadiness.notReadyMessage(for: .grok(accountAuthorized: false)),
+      AskReadiness.notReadyMessage(for: .apiKey("")),
+      "the blocked message names the credential that is actually missing")
   }
 
   func testPaginationSplitsOversizedContextInsteadOfRefusing() {
@@ -93,9 +100,9 @@ final class DocumentAskThreadTests: XCTestCase {
     thread.draft = "Say hello."
 
     XCTAssertEqual(thread.phase, .idle)
-    XCTAssertTrue(thread.prepareSend(document: "note", apiKey: "sk-test") != nil)
+    XCTAssertTrue(thread.prepareSend(document: "note", provider: .apiKey("sk-test")) != nil)
     XCTAssertEqual(thread.phase, .awaitingConfirmation)
-    XCTAssertTrue(thread.confirmAndSend(document: "note", apiKey: "sk-test"))
+    XCTAssertTrue(thread.confirmAndSend(document: "note", provider: .apiKey("sk-test")))
     XCTAssertEqual(thread.phase, .streaming)
     XCTAssertTrue(thread.isStreaming)
     XCTAssertTrue(thread.turns.contains(where: { $0.role == .assistant && $0.isStreaming }))
@@ -128,9 +135,9 @@ final class DocumentAskThreadTests: XCTestCase {
     let thread = DocumentAskThread(id: UUID(), agent: agent)
     let document = String(repeating: "x", count: AskPreflight.pageCharacterLimit * 2 + 20)
     thread.draft = "Continue."
-    XCTAssertNotNil(thread.prepareSend(document: document, apiKey: "sk-test"))
+    XCTAssertNotNil(thread.prepareSend(document: document, provider: .apiKey("sk-test")))
     XCTAssertGreaterThan(thread.preflight?.pageCount ?? 0, 1)
-    XCTAssertTrue(thread.confirmAndSend(document: document, apiKey: "sk-test"))
+    XCTAssertTrue(thread.confirmAndSend(document: document, provider: .apiKey("sk-test")))
 
     let finished = await waitUntil(timeout: 1.0) { thread.phase == .completed }
     XCTAssertTrue(finished)
