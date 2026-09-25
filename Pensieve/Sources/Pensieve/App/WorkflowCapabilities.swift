@@ -280,7 +280,7 @@ struct VibecraftedWorkflowCapabilitiesProvider: WorkflowCapabilitiesProviding {
         String(data: errorOutput, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       throw WorkflowCapabilitiesError.probeFailed(
-        "`vibecrafted capabilities` exited \(process.terminationStatus)"
+        "`\(executablePath) capabilities` exited \(process.terminationStatus)"
           + (detail.isEmpty ? "." : ": \(detail)"))
     }
     return try WorkflowCapabilities.decode(from: output)

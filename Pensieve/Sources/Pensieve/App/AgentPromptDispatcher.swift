@@ -228,8 +228,8 @@ enum AgentPromptLauncherError: LocalizedError {
       return
         "vibecrafted executable not found (searched: \(searched)). "
         + "Set the PENSIEVE_VIBECRAFTED_PATH environment variable to the full path "
-        + "of the vibecrafted script, or install vibecrafted under "
-        + "~/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted."
+        + "of the vibecrafted script, or install vibecrafted at "
+        + "~/.local/bin/vibecrafted."
     case .mcpNotReady(let status):
       return status.refusalExplanation
     }
@@ -240,8 +240,9 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
   static let executablePathEnvironmentKey = "PENSIEVE_VIBECRAFTED_PATH"
   static let vibecraftedHomeEnvironmentKey = "VIBECRAFTED_HOME"
   static let workerSpawnRecordTimeout: TimeInterval = 3
-  static let uvToolExecutableRelativePath =
-    ".local/share/uv/tools/vibecrafted/bin/vibecrafted"
+  /// User-level CLI. The uv tool entry under `~/.local/share/uv/tools` is a
+  /// different binary and is not a candidate.
+  static let userBinExecutableRelativePath = ".local/bin/vibecrafted"
   static let defaultExecutableRelativePath =
     ".local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted"
 
@@ -252,12 +253,19 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
   }
 
   static func resolveExecutablePath() throws -> String {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let candidates = executableCandidates(
-      home: home,
-      override: ProcessInfo.processInfo.environment[executablePathEnvironmentKey])
+    try resolveExecutablePath(
+      home: FileManager.default.homeDirectoryForCurrentUser,
+      override: ProcessInfo.processInfo.environment[executablePathEnvironmentKey],
+      isExecutable: { FileManager.default.isExecutableFile(atPath: $0) })
+  }
 
-    for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+  static func resolveExecutablePath(
+    home: URL,
+    override: String?,
+    isExecutable: (String) -> Bool
+  ) throws -> String {
+    let candidates = executableCandidates(home: home, override: override)
+    for candidate in candidates where isExecutable(candidate) {
       return candidate
     }
     throw AgentPromptLauncherError.executableNotFound(searchedPaths: candidates)
@@ -268,13 +276,11 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
     if let override, !override.isEmpty {
       candidates.append(override)
     }
-    // LaunchServices gives GUI apps a system-only PATH. Prefer uv's absolute
-    // entrypoint, whose shebang names the tool's own Python, so a normal Finder/
-    // Dock launch cannot fall through to Xcode's older /usr/bin/python3. The
-    // ~/.local/bin link may target the interactive command deck and is therefore
-    // only a compatibility fallback.
-    candidates.append(home.appendingPathComponent(uvToolExecutableRelativePath).path)
-    candidates.append(home.appendingPathComponent(".local/bin/vibecrafted").path)
+    // LaunchServices gives GUI apps a system-only PATH, so the CLI is an
+    // absolute path under the user's home. Prefer ~/.local/bin/vibecrafted.
+    // The uv tool entry is a different, often broken, entrypoint and is not
+    // searched.
+    candidates.append(home.appendingPathComponent(userBinExecutableRelativePath).path)
     candidates.append(home.appendingPathComponent(defaultExecutableRelativePath).path)
     return candidates
   }

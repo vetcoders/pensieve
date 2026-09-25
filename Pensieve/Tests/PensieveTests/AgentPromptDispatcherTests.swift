@@ -35,7 +35,7 @@ final class AgentPromptDispatcherTests: XCTestCase {
       .workerSpawnRecorded)
   }
 
-  func testExecutableCandidatesPreferOverrideThenEnvironmentIndependentUVEntrypoint() {
+  func testExecutableCandidatesPreferOverrideThenHomeLocalBin() {
     let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
 
     XCTAssertEqual(
@@ -43,10 +43,37 @@ final class AgentPromptDispatcherTests: XCTestCase {
         home: home, override: "/custom/vibecrafted"),
       [
         "/custom/vibecrafted",
-        "/Users/tester/.local/share/uv/tools/vibecrafted/bin/vibecrafted",
         "/Users/tester/.local/bin/vibecrafted",
         "/Users/tester/.local/share/vibecrafted/tools/vibecrafted-current/scripts/vibecrafted",
       ])
+    XCTAssertFalse(
+      VibecraftedAgentPromptLauncher.executableCandidates(home: home, override: nil)
+        .contains { $0.contains("uv/tools/vibecrafted") })
+  }
+
+  func testResolveExecutablePathChoosesHomeLocalBinWhenItIsExecutable() throws {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+    let chosen = try VibecraftedAgentPromptLauncher.resolveExecutablePath(
+      home: home,
+      override: nil,
+      isExecutable: { $0 == home.appendingPathComponent(".local/bin/vibecrafted").path })
+
+    XCTAssertEqual(chosen, "/Users/tester/.local/bin/vibecrafted")
+  }
+
+  func testResolveExecutablePathNamesSearchedHomeLocalBinWhenMissing() {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+
+    XCTAssertThrowsError(
+      try VibecraftedAgentPromptLauncher.resolveExecutablePath(
+        home: home, override: nil, isExecutable: { _ in false })
+    ) { error in
+      guard case AgentPromptLauncherError.executableNotFound(let searched) = error else {
+        return XCTFail("expected missing executable, got \(error)")
+      }
+      XCTAssertEqual(searched.first, "/Users/tester/.local/bin/vibecrafted")
+      XCTAssertFalse(searched.contains { $0.contains("uv/tools/vibecrafted") })
+    }
   }
 
   func testLaunchEnvironmentPrependsAgentBinsToFinderPathWithoutDuplicates() {
