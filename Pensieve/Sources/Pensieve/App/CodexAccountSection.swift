@@ -1,12 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// Settings ▸ AI: the Grok (xAI) account Ask can use. Everything shown is
-/// either read from the codescribe FFI — signed in, status copy, where Ask is
-/// routed — or is the in-flight device-code attempt. Pensieve persists none of
-/// it.
-struct GrokAccountSection: View {
-  @ObservedObject var account: GrokAccount
+/// Settings ▸ AI: the Codex (OpenAI account) Ask can use. Parallel to
+/// "Ask with Grok" — a separate section, not a second mode of that control.
+struct CodexAccountSection: View {
+  @ObservedObject var account: CodexAccount
   let apiKeyProvider: CompletionProviderShape
 
   var body: some View {
@@ -17,7 +15,7 @@ struct GrokAccountSection: View {
           .font(.caption)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
-          .accessibilityIdentifier("pensieve.provider.grok.sandboxed")
+          .accessibilityIdentifier("pensieve.provider.codex.sandboxed")
       }
       phaseContent
       if let error = account.lastError {
@@ -25,16 +23,16 @@ struct GrokAccountSection: View {
           .font(.caption)
           .foregroundStyle(.red)
           .fixedSize(horizontal: false, vertical: true)
-          .accessibilityIdentifier("pensieve.provider.grok.error")
+          .accessibilityIdentifier("pensieve.provider.codex.error")
       }
       if account.hasLoaded {
         askRoutingRow
       }
     } header: {
-      Text("Ask with Grok")
+      Text("Ask with Codex")
     } footer: {
       Text(
-        "Grok signs in with an xAI device code you approve on any device. "
+        "Codex signs in with the OpenAI/Codex device code you approve. "
           + "Changes apply at once — Save is only for the autocomplete provider."
       )
       .font(.caption)
@@ -49,11 +47,11 @@ struct GrokAccountSection: View {
         .fill(account.snapshot.isSignedIn ? Color.green : Color.secondary.opacity(0.5))
         .frame(width: 8, height: 8)
       VStack(alignment: .leading, spacing: 2) {
-        Text("Grok account")
+        Text("Codex account")
         Text(statusText)
           .font(.caption)
           .foregroundStyle(.secondary)
-          .accessibilityIdentifier("pensieve.provider.grok.status")
+          .accessibilityIdentifier("pensieve.provider.codex.status")
       }
       Spacer()
       actionButton
@@ -71,21 +69,21 @@ struct GrokAccountSection: View {
       Button("Cancel") {
         account.cancelSignIn()
       }
-      .accessibilityIdentifier("pensieve.provider.grok.cancel")
+      .accessibilityIdentifier("pensieve.provider.codex.cancel")
     } else if account.snapshot.isSignedIn {
       Button("Sign Out") {
         Task { await account.signOut() }
       }
-      .help("Remove the stored Grok account tokens. API keys are untouched.")
-      .accessibilityIdentifier("pensieve.provider.grok.signOut")
+      .help("Remove the stored Codex account tokens. API keys are untouched.")
+      .accessibilityIdentifier("pensieve.provider.codex.signOut")
     } else {
-      Button("Sign In with xAI…") {
+      Button("Sign In with OpenAI…") {
         Task { await account.signIn() }
       }
       .disabled(
         !account.signInAllowed || !account.hasLoaded || !account.snapshot.isLoginConfigured
       )
-      .accessibilityIdentifier("pensieve.provider.grok.signIn")
+      .accessibilityIdentifier("pensieve.provider.codex.signIn")
     }
   }
 
@@ -97,85 +95,84 @@ struct GrokAccountSection: View {
       HStack(spacing: 8) {
         ProgressView()
           .controlSize(.small)
-        Text("Requesting a sign-in code from xAI…")
+        Text("Requesting a sign-in code from OpenAI…")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
-      .accessibilityIdentifier("pensieve.provider.grok.requesting")
+      .accessibilityIdentifier("pensieve.provider.codex.requesting")
     case .awaitingApproval(let code):
-      GrokDeviceCodePanel(code: code)
+      CodexDeviceCodePanel(code: code)
     case .authorized:
-      Label("Signed in. Grok can answer Ask.", systemImage: "checkmark.circle.fill")
+      Label("Signed in. Codex can answer Ask.", systemImage: "checkmark.circle.fill")
         .font(.caption)
         .foregroundStyle(.green)
-        .accessibilityIdentifier("pensieve.provider.grok.authorized")
+        .accessibilityIdentifier("pensieve.provider.codex.authorized")
     case .failed(let failure):
       Label(failure.message, systemImage: "exclamationmark.triangle.fill")
         .font(.caption)
         .foregroundStyle(.red)
         .fixedSize(horizontal: false, vertical: true)
-        .accessibilityIdentifier("pensieve.provider.grok.failed")
+        .accessibilityIdentifier("pensieve.provider.codex.failed")
     case .cancelled:
       Text("Sign-in cancelled.")
         .font(.caption)
         .foregroundStyle(.secondary)
-        .accessibilityIdentifier("pensieve.provider.grok.cancelled")
+        .accessibilityIdentifier("pensieve.provider.codex.cancelled")
     }
   }
 
   @ViewBuilder private var askRoutingRow: some View {
     let snapshot = account.snapshot
-    if snapshot.askUsesGrok {
+    if snapshot.askUsesCodex {
       HStack {
-        Text(
-          snapshot.isSignedIn
-            ? "Ask uses Grok." : "Ask is set to Grok, but no Grok account is signed in."
-        )
-        .font(.caption)
-        .foregroundStyle(snapshot.isSignedIn ? Color.secondary : Color.orange)
+        Text("Ask uses Codex.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
         Spacer()
         Button("Use \(apiKeyProvider.displayName) Instead") {
           Task { await account.useAPIKeyProviderForAsk(apiKeyProvider) }
         }
       }
-      .accessibilityIdentifier("pensieve.provider.grok.routing")
+      .accessibilityIdentifier("pensieve.provider.codex.routing")
     } else if snapshot.isSignedIn {
       HStack {
-        Text(
-          snapshot.assistiveProviderID == CodexAccount.providerID
-            ? "Ask uses Codex." : "Ask uses your \(apiKeyProvider.displayName) API key."
-        )
+        Text(laneSentence)
           .font(.caption)
           .foregroundStyle(.secondary)
         Spacer()
-        Button("Use Grok for Ask") {
-          Task { await account.useGrokForAsk() }
+        Button("Use Codex for Ask") {
+          Task { await account.useCodexForAsk() }
         }
       }
-      .accessibilityIdentifier("pensieve.provider.grok.routing")
+      .accessibilityIdentifier("pensieve.provider.codex.routing")
     }
+  }
+
+  private var laneSentence: String {
+    if account.snapshot.assistiveProviderID == GrokAccount.providerID {
+      return "Ask uses Grok."
+    }
+    return "Ask uses your \(apiKeyProvider.displayName) API key."
   }
 }
 
-/// The pending half of the device-code flow: the code to confirm and the page
-/// to confirm it on — both copyable, so approval can happen on another device.
-struct GrokDeviceCodePanel: View {
-  let code: GrokDeviceCode
+struct CodexDeviceCodePanel: View {
+  let code: CodexDeviceCode
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       if let userCode = code.userCode {
-        Text("Enter this code on the xAI page:")
+        Text("Enter this code on the OpenAI page:")
           .font(.caption)
         HStack(spacing: 10) {
           Text(userCode)
             .font(.title3.monospaced().weight(.semibold))
             .textSelection(.enabled)
-            .accessibilityIdentifier("pensieve.provider.grok.userCode")
+            .accessibilityIdentifier("pensieve.provider.codex.userCode")
           Button("Copy Code") {
             Self.copy(userCode)
           }
-          .accessibilityIdentifier("pensieve.provider.grok.copyCode")
+          .accessibilityIdentifier("pensieve.provider.codex.copyCode")
         }
       } else {
         Text(code.instructions)
@@ -189,26 +186,26 @@ struct GrokDeviceCodePanel: View {
           .textSelection(.enabled)
           .lineLimit(1)
           .truncationMode(.middle)
-          .accessibilityIdentifier("pensieve.provider.grok.verificationURL")
+          .accessibilityIdentifier("pensieve.provider.codex.verificationURL")
         Spacer(minLength: 4)
         Button("Open Page") {
           _ = NSWorkspace.shared.open(code.verificationURL)
         }
-        .accessibilityIdentifier("pensieve.provider.grok.openPage")
+        .accessibilityIdentifier("pensieve.provider.codex.openPage")
         Button("Copy Link") {
           Self.copy(code.verificationURL.absoluteString)
         }
-        .accessibilityIdentifier("pensieve.provider.grok.copyLink")
+        .accessibilityIdentifier("pensieve.provider.codex.copyLink")
       }
       HStack(spacing: 8) {
         ProgressView()
           .controlSize(.small)
-        Text("Waiting for approval — stops after \(GrokAccount.loginTimeoutSeconds / 60) minutes.")
+        Text("Waiting for approval — stops after \(CodexAccount.loginTimeoutSeconds / 60) minutes.")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
     }
-    .accessibilityIdentifier("pensieve.provider.grok.pending")
+    .accessibilityIdentifier("pensieve.provider.codex.pending")
   }
 
   private static func copy(_ value: String) {

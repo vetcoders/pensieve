@@ -222,20 +222,24 @@ enum AskProvider: Equatable, Sendable {
   case apiKey(String?)
   /// Grok (xAI), authenticated by device-code OAuth — never by an API key field.
   case grok(accountAuthorized: Bool)
+  /// Codex (OpenAI account), authenticated by the provider's OAuth sign-in —
+  /// never by the API-key field.
+  case codex(accountAuthorized: Bool)
 }
 
-/// API-key providers are ready when the key is non-empty; Grok is ready only
-/// when the codescribe FFI reports its xAI account authorized.
+/// API-key providers are ready when the key is non-empty. Grok and Codex are
+/// ready only when the codescribe FFI reports that account authorized.
 enum AskReadiness {
   static let apiKeyNotReadyMessage = "Add a provider API key in Settings before asking."
   static let grokNotReadyMessage = "Sign in to Grok in Settings ▸ AI before asking."
+  static let codexNotReadyMessage = "Sign in to Codex in Settings ▸ AI before asking."
 
   static func isReady(_ provider: AskProvider) -> Bool {
     switch provider {
     case .apiKey(let apiKey):
       let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       return !key.isEmpty
-    case .grok(let accountAuthorized):
+    case .grok(let accountAuthorized), .codex(let accountAuthorized):
       return accountAuthorized
     }
   }
@@ -244,6 +248,7 @@ enum AskReadiness {
     switch provider {
     case .apiKey: return apiKeyNotReadyMessage
     case .grok: return grokNotReadyMessage
+    case .codex: return codexNotReadyMessage
     }
   }
 
@@ -252,6 +257,7 @@ enum AskReadiness {
     switch provider {
     case .apiKey: return isReady(provider) ? "Ready" : "Needs API key"
     case .grok: return isReady(provider) ? "Grok ready" : "Grok: sign in"
+    case .codex: return isReady(provider) ? "Codex ready" : "Codex: sign in"
     }
   }
 }

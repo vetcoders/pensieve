@@ -4,10 +4,14 @@ import SwiftUI
 struct ProviderSettingsView: View {
   @ObservedObject var settings: ProviderSettings
   @ObservedObject private var grokAccount: GrokAccount
+  @ObservedObject private var codexAccount: CodexAccount
 
-  init(settings: ProviderSettings, grokAccount: GrokAccount? = nil) {
+  init(
+    settings: ProviderSettings, grokAccount: GrokAccount? = nil, codexAccount: CodexAccount? = nil
+  ) {
     _settings = ObservedObject(wrappedValue: settings)
     _grokAccount = ObservedObject(wrappedValue: grokAccount ?? .shared)
+    _codexAccount = ObservedObject(wrappedValue: codexAccount ?? .shared)
   }
 
   var body: some View {
@@ -74,9 +78,15 @@ struct ProviderSettingsView: View {
         .accessibilityIdentifier("pensieve.provider.forgetAPIKey")
 
         GrokAccountSection(account: grokAccount, apiKeyProvider: settings.providerShape)
+        CodexAccountSection(account: codexAccount, apiKeyProvider: settings.providerShape)
       }
       .formStyle(.grouped)
-      .task { await grokAccount.refresh() }
+      .task {
+        await grokAccount.refresh()
+        await codexAccount.refresh()
+        await grokAccount.adoptGrokForAskIfSignedIn()
+        await codexAccount.adoptCodexForAskIfSignedIn()
+      }
 
       VStack(alignment: .leading, spacing: 5) {
         Label("Your API key is stored only in the macOS Keychain.", systemImage: "key.fill")
