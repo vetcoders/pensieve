@@ -74,6 +74,7 @@ struct EditorToolbelt: ToolbarContent {
   let dispatchHelp: String
   @State private var customRewriteInstruction = ""
   @State private var isCustomRewritePromptPresented = false
+  @FocusState private var isCustomRewriteFieldFocused: Bool
 
   static let shareIdentifier = "pensieve.toolbar.share"
   static let dispatchIdentifier = "pensieve.toolbar.dispatchToAgent"
@@ -610,27 +611,49 @@ struct EditorToolbelt: ToolbarContent {
     // lookup (`scripts/ui-smoke.sh`) can catch this going anonymous again.
     .accessibilityLabel("Rewrite with AI")
     .accessibilityIdentifier(Self.rewriteIdentifier)
-    .alert(
-      "Tell Pensieve what to do with this text",
-      isPresented: $isCustomRewritePromptPresented
-    ) {
-      TextField("Instruction", text: $customRewriteInstruction)
+    .popover(isPresented: $isCustomRewritePromptPresented, arrowEdge: .top) {
+      customRewritePrompt
+    }
+  }
+
+  /// One row: a field that rests at a single line and grows with the text,
+  /// plus Cancel and Rewrite on the trailing side. The range keeps the empty
+  /// field one line tall and stops the popover short of a dialog; past the
+  /// cap the field scrolls instead of clipping.
+  private var customRewritePrompt: some View {
+    HStack(alignment: .center, spacing: 8) {
+      TextField("Instruction", text: $customRewriteInstruction, axis: .vertical)
+        .lineLimit(1...4)
+        .textFieldStyle(.roundedBorder)
+        .focused($isCustomRewriteFieldFocused)
       Button("Cancel", role: .cancel) {
         customRewriteInstruction = ""
+        isCustomRewritePromptPresented = false
       }
+      .keyboardShortcut(.cancelAction)
       Button("Rewrite") {
-        let instruction = customRewriteInstruction.trimmingCharacters(
-          in: .whitespacesAndNewlines)
-        guard !instruction.isEmpty else { return }
-        appState.pendingAIRewriteCommand = AIRewriteCommand(
-          action: .request(.custom(instruction)))
-        customRewriteInstruction = ""
+        submitCustomRewrite()
       }
-      .disabled(
-        customRewriteInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-    } message: {
-      Text("Describe a one-off change for the selection or the current paragraph.")
+      .disabled(trimmedCustomRewriteInstruction.isEmpty)
     }
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .frame(minWidth: 320)
+    .fixedSize(horizontal: false, vertical: true)
+    .onAppear { isCustomRewriteFieldFocused = true }
+  }
+
+  private var trimmedCustomRewriteInstruction: String {
+    customRewriteInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func submitCustomRewrite() {
+    let instruction = trimmedCustomRewriteInstruction
+    guard !instruction.isEmpty else { return }
+    appState.pendingAIRewriteCommand = AIRewriteCommand(
+      action: .request(.custom(instruction)))
+    customRewriteInstruction = ""
+    isCustomRewritePromptPresented = false
   }
 }
 

@@ -57,6 +57,7 @@ struct ContentView: View {
             AskComposerView(
               thread: askThreads.thread(for: appState.documentSession.askThreadID),
               grokAccount: .shared,
+              codexAccount: .shared,
               documentText: appState.documentSession.text,
               apiKey: providerSettings.apiKey,
               apiKeyProvider: providerSettings.providerShape
