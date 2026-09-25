@@ -118,6 +118,7 @@ test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-isolated-app.sh
 	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 	@$(SCRIPTS)/test-ui-smoke-contract.sh
+	@$(SCRIPTS)/test-ffi-freshness.sh
 
 .PHONY: test-semgrep-contract
 test-semgrep-contract:  ## Verify the Tests-only native-window presentation Semgrep rule
@@ -198,8 +199,12 @@ init-hooks:  ## Install git hooks via lefthook (Vibecrafted standard)
 ffi:  ## Rebuild and vendor qube-ffi bridge/dylib (FFI_PROFILE=debug|release)
 	@$(PKG_DIR)/scripts/build-ffi.sh
 
+.PHONY: codescribe-ffi
+codescribe-ffi:  ## Rebuild and vendor codescribe-ffi from CODESCRIBE_ROOT (FFI_PROFILE=debug|release)
+	@$(PKG_DIR)/scripts/build-codescribe-ffi.sh
+
 .PHONY: ffi-check
-ffi-check:  ## Warn if vendored qube-ffi provenance is stale
+ffi-check:  ## Warn if vendored codescribe-ffi (and optional qube-ffi) provenance is stale
 	@$(PKG_DIR)/scripts/check-ffi-freshness.sh
 
 # =========================================================================
