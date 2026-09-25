@@ -117,6 +117,9 @@ struct GrokAccountSnapshot: Equatable, Sendable {
   /// The assistive lane — the one `CodescribeAgent.streamReply` sends Ask
   /// through — resolves to xAI.
   var askUsesGrok = false
+  /// Provider id currently on the assistive lane, so Settings can name Codex
+  /// when Ask is not on Grok and not on an API key.
+  var assistiveProviderID = ""
 
   static let unknown = GrokAccountSnapshot()
 
@@ -124,12 +127,14 @@ struct GrokAccountSnapshot: Equatable, Sendable {
     isSignedIn: Bool = false,
     isLoginConfigured: Bool = false,
     statusMessage: String = "",
-    askUsesGrok: Bool = false
+    askUsesGrok: Bool = false,
+    assistiveProviderID: String = ""
   ) {
     self.isSignedIn = isSignedIn
     self.isLoginConfigured = isLoginConfigured
     self.statusMessage = statusMessage
     self.askUsesGrok = askUsesGrok
+    self.assistiveProviderID = assistiveProviderID
   }
 
   init(providers: [CsProviderOption], assistiveLane: CsRuntimeLlmLane) {
@@ -138,7 +143,8 @@ struct GrokAccountSnapshot: Equatable, Sendable {
       isSignedIn: grok?.accountSignedIn ?? false,
       isLoginConfigured: grok?.accountLoginEnabled ?? false,
       statusMessage: grok?.accountStatusMessage ?? "",
-      askUsesGrok: assistiveLane.providerId == GrokAccount.providerID)
+      askUsesGrok: assistiveLane.providerId == GrokAccount.providerID,
+      assistiveProviderID: assistiveLane.providerId)
   }
 
   /// Ask's provider as the lane states it: Grok when the assistive lane is
@@ -277,11 +283,18 @@ enum GrokLoginPhase: Equatable, Sendable {
 @MainActor
 final class GrokAccount: ObservableObject {
   nonisolated static let providerID = "xai-responses"
+  /// Set when the user explicitly hands Ask back to an API-key provider.
+  /// Absent or false means a signed-in account may own Ask.
+  static let apiKeyLanePinnedKey = "pensieve.ask.apiKeyLanePinned"
+  /// Provider id of the account the user explicitly chose for Ask
+  /// (`xai-responses` or `openai-responses`). Empty means no account pin.
+  /// An explicit pin blocks the other account from adopting the lane.
+  static let accountLanePinnedKey = "pensieve.ask.accountLanePinned"
   /// codescribe P2-09: the OAuth human step (a second screen, 2FA) routinely
   /// outlasts a short timeout. Five minutes matches the Codescribe app.
   nonisolated static let loginTimeoutSeconds: UInt64 = 300
 
-  static let shared = GrokAccount()
+  static let shared = GrokAccount(laneChoiceDefaults: .standard)
 
   @Published private(set) var snapshot: GrokAccountSnapshot = .unknown
   @Published private(set) var phase: GrokLoginPhase = .idle
@@ -291,6 +304,7 @@ final class GrokAccount: ObservableObject {
   let signInAllowed: Bool
 
   private let bridge: any CodescribeAccountBridging
+  private let laneChoiceDefaults: UserDefaults?
   private let staleAfter: TimeInterval
   private let now: () -> Date
   private var lastRefresh: Date?
@@ -304,11 +318,13 @@ final class GrokAccount: ObservableObject {
   init(
     bridge: (any CodescribeAccountBridging)? = nil,
     signInAllowed: Bool = SandboxCapabilities.allowsAccountSignIn(),
+    laneChoiceDefaults: UserDefaults? = nil,
     staleAfter: TimeInterval = 30,
     now: @escaping () -> Date = Date.init
   ) {
     self.bridge = bridge ?? Self.defaultBridge()
     self.signInAllowed = signInAllowed
+    self.laneChoiceDefaults = laneChoiceDefaults
     self.staleAfter = staleAfter
     self.now = now
   }
@@ -393,10 +409,16 @@ final class GrokAccount: ObservableObject {
     guard current == attempt else { return }
     switch outcome {
     case .success(let result) where result.status == "signed_in":
-      phase =
-        snapshot.isSignedIn
-        ? .authorized
-        : .failed(.other("xAI reported success, but no Grok account was stored."))
+      if snapshot.isSignedIn {
+        phase = .authorized
+        // Signing in is the choice to ask with Grok. The assistive lane stays
+        // on the API-key provider until something writes it, and that left the
+        // chip on "Needs API key" after a successful xAI login.
+        Self.pinAccount(Self.providerID, defaults: laneChoiceDefaults)
+        await routeAsk(to: providerID)
+      } else {
+        phase = .failed(.other("xAI reported success, but no Grok account was stored."))
+      }
     case .success(let result):
       phase = .failed(.classify(status: result.status, message: result.message))
     case .failure(let error):
@@ -441,6 +463,21 @@ final class GrokAccount: ObservableObject {
       lastError = AskReadiness.grokNotReadyMessage
       return
     }
+    Self.pinAccount(Self.providerID, defaults: laneChoiceDefaults)
+    guard !snapshot.askUsesGrok else { return }
+    await routeAsk(to: Self.providerID)
+  }
+
+  /// A signed-in Grok account drives Ask unless the user pinned the API-key
+  /// lane or explicitly pinned Codex. Settings and the composer call this
+  /// after a refresh so an account that was authorized earlier still leaves
+  /// the API-key lane.
+  func adoptGrokForAskIfSignedIn() async {
+    if Self.apiKeyLaneIsPinned(laneChoiceDefaults) { return }
+    if let pinned = Self.pinnedAccountProvider(laneChoiceDefaults), pinned != Self.providerID {
+      return
+    }
+    guard snapshot.isSignedIn, !snapshot.askUsesGrok else { return }
     await routeAsk(to: Self.providerID)
   }
 
@@ -452,7 +489,27 @@ final class GrokAccount: ObservableObject {
   /// app, and Pensieve only owns the move into and out of Grok.
   func useAPIKeyProviderForAsk(_ shape: CompletionProviderShape) async {
     guard snapshot.askUsesGrok else { return }
+    Self.pinAPIKey(laneChoiceDefaults)
     await routeAsk(to: shape.rawValue)
+  }
+
+  static func apiKeyLaneIsPinned(_ defaults: UserDefaults?) -> Bool {
+    defaults?.bool(forKey: apiKeyLanePinnedKey) == true
+  }
+
+  static func pinnedAccountProvider(_ defaults: UserDefaults?) -> String? {
+    let value = defaults?.string(forKey: accountLanePinnedKey) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  static func pinAccount(_ providerID: String, defaults: UserDefaults?) {
+    defaults?.set(false, forKey: apiKeyLanePinnedKey)
+    defaults?.set(providerID, forKey: accountLanePinnedKey)
+  }
+
+  static func pinAPIKey(_ defaults: UserDefaults?) {
+    defaults?.set(true, forKey: apiKeyLanePinnedKey)
+    defaults?.removeObject(forKey: accountLanePinnedKey)
   }
 
   private func routeAsk(to providerID: String) async {

@@ -356,12 +356,42 @@ final class GrokAccountTests: XCTestCase {
 
     await account.signIn()
     XCTAssertEqual(account.phase, .authorized)
-    await account.useGrokForAsk()
+    XCTAssertEqual(bridge.laneWrites, ["xai-responses"], "signing in selects Grok for Ask")
+    XCTAssertEqual(
+      account.snapshot.askProvider(apiKey: ""), .grok(accountAuthorized: true))
+    XCTAssertEqual(
+      AskReadiness.chipLabel(for: account.snapshot.askProvider(apiKey: "")), "Grok ready")
 
-    XCTAssertEqual(bridge.laneWrites, ["xai-responses"])
+    await account.useGrokForAsk()
+    XCTAssertEqual(bridge.laneWrites, ["xai-responses"], "already on Grok writes the lane once")
     XCTAssertTrue(account.snapshot.askUsesGrok)
     XCTAssertNil(account.lastError)
-    XCTAssertEqual(account.snapshot.askProvider(apiKey: ""), .grok(accountAuthorized: true))
+  }
+
+  func testSignedInAccountOnTheAPIKeyLaneAdoptsGrokUntilPinned() async {
+    let defaults = UserDefaults(suiteName: "pensieve.tests.grok-ask-lane")!
+    defaults.removePersistentDomain(forName: "pensieve.tests.grok-ask-lane")
+    let bridge = FakeCodescribeAccountBridge(signedIn: true, laneProviderID: "openai-responses")
+    let account = GrokAccount(bridge: bridge, signInAllowed: true, laneChoiceDefaults: defaults)
+    await account.refresh()
+    XCTAssertEqual(account.snapshot.askProvider(apiKey: ""), .apiKey(""))
+
+    await account.adoptGrokForAskIfSignedIn()
+
+    XCTAssertEqual(bridge.laneWrites, ["xai-responses"])
+    XCTAssertEqual(
+      AskReadiness.chipLabel(for: account.snapshot.askProvider(apiKey: "")), "Grok ready")
+
+    await account.useAPIKeyProviderForAsk(.openAIResponses)
+    XCTAssertEqual(bridge.laneWrites, ["xai-responses", "openai-responses"])
+    XCTAssertEqual(account.snapshot.askProvider(apiKey: ""), .apiKey(""))
+
+    await account.adoptGrokForAskIfSignedIn()
+    XCTAssertEqual(
+      bridge.laneWrites, ["xai-responses", "openai-responses"],
+      "an explicit API-key choice stays put across the next refresh")
+    XCTAssertEqual(
+      AskReadiness.chipLabel(for: account.snapshot.askProvider(apiKey: "sk-test")), "Ready")
   }
 
   func testAskReturnsToTheAPIKeyProviderByItsSharedID() async {
