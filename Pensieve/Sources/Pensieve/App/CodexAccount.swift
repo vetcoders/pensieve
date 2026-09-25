@@ -207,7 +207,8 @@ final class CodexAccount: ObservableObject {
       bridge.cancelAccountLogin()
       phase = .failed(
         started.clientIdConfigured
-          ? .classify(status: started.status, message: started.message) : .underlying(.notConfigured)
+          ? .classify(status: started.status, message: started.message)
+          : .underlying(.notConfigured)
       )
       return
     }

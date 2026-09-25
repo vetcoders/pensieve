@@ -145,8 +145,8 @@ struct GrokAccountSection: View {
           snapshot.assistiveProviderID == CodexAccount.providerID
             ? "Ask uses Codex." : "Ask uses your \(apiKeyProvider.displayName) API key."
         )
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        .font(.caption)
+        .foregroundStyle(.secondary)
         Spacer()
         Button("Use Grok for Ask") {
           Task { await account.useGrokForAsk() }
