@@ -122,10 +122,12 @@ if (( APPSTORE )); then
     # touches it. It still gets the opportunistic, non-fatal unlock at every
     # signing site, because a Developer ID identity is a documented stand-in
     # for a MAS dry run (docs/appstore-lane.md) and that one does live there.
+    # shellcheck disable=SC2034 # read by scripts/lib/build-keychain.sh
     LANE_SIGNS_FROM_BUILD_KEYCHAIN=0
 else
     EXPECTED_HARDENED_RUNTIME="true"
     EXPECTED_SIGNATURE_POLICY="developer-id"
+    # shellcheck disable=SC2034 # read by scripts/lib/build-keychain.sh
     LANE_SIGNS_FROM_BUILD_KEYCHAIN=1
 fi
 
@@ -428,13 +430,20 @@ if (( APPSTORE )); then
         die "PENSIEVE_MAS_PROVISIONING_PROFILE points to a missing file: $MAS_PROFILE"
     fi
     log "App Store lane: sandbox entitlements $ENTITLEMENTS"
-    # The pkg embeds Vendor/qube-ffi/$FFI_PROFILE/ verbatim. ffi-check only
-    # compares vista-kernel HEADs — it is blind to the build profile and to a
-    # dirty source tree, so a MAS artifact could silently ship a debug or
-    # untraceable dylib. Warn (not die): local dry-runs must keep working.
+    # The pkg embeds Vendor/{qube,codescribe}-ffi/$FFI_PROFILE/ verbatim.
+    # ffi-check pins codescribe-ffi against ../codescribe; qube-ffi is optional.
+    # Warn (not die): local dry-runs must keep working.
     if [[ "$FFI_PROFILE" != "release" ]]; then
-        warn "FFI_PROFILE=$FFI_PROFILE — the pkg will embed the $FFI_PROFILE-profile qube-ffi dylib."
-        warn "A submittable MAS build needs FFI_PROFILE=release (Pensieve/scripts/build-ffi.sh)."
+        warn "FFI_PROFILE=$FFI_PROFILE — the pkg will embed the $FFI_PROFILE-profile FFI dylibs."
+        warn "A submittable MAS build needs FFI_PROFILE=release (Pensieve/scripts/build-codescribe-ffi.sh)."
+    fi
+    CS_PROVENANCE="$PKG_DIR/Vendor/codescribe-ffi/PROVENANCE.txt"
+    if [[ -f "$CS_PROVENANCE" ]]; then
+        CS_DESCRIBE="$(awk -F= '$1 == "codescribe-describe" { print $2 }' "$CS_PROVENANCE" 2>/dev/null || true)"
+        if [[ "$CS_DESCRIBE" == *-dirty ]]; then
+            warn "Vendored codescribe-ffi was built from a DIRTY codescribe tree ($CS_DESCRIBE) —"
+            warn "its source is untraceable; rebuild from a clean checkout before submitting."
+        fi
     fi
     FFI_PROVENANCE="$PKG_DIR/Vendor/qube-ffi/PROVENANCE.txt"
     if [[ -f "$FFI_PROVENANCE" ]]; then

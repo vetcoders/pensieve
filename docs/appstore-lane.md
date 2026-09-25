@@ -121,19 +121,21 @@ dist/mas/Pensieve.pkg     productbuild, signed if the installer identity was set
 
 ### The FFI dylib has to be a release build
 
-The `.pkg` embeds `Pensieve/Vendor/qube-ffi/$FFI_PROFILE/` verbatim. `FFI_PROFILE`
+The `.pkg` embeds `Pensieve/Vendor/qube-ffi/$FFI_PROFILE/` and
+`Pensieve/Vendor/codescribe-ffi/$FFI_PROFILE/` verbatim. `FFI_PROFILE`
 defaults to `release` in every release lane, but if you override it the build
 warns rather than dies, so dry-runs keep working — read those warnings before
 submitting.
 
-`make ffi-check` only compares vista-kernel HEADs. It is blind both to the build
-profile and to a dirty source tree, so a MAS artifact can silently ship an
-untraceable dylib. The build reads `Vendor/qube-ffi/PROVENANCE.txt` and warns
-when `vista-kernel-describe` ends in `-dirty`. Rebuild from a clean vista-kernel
-before submitting:
+`make ffi-check` compares vendored `libcodescribe_ffi.dylib` against the sibling
+`../codescribe` checkout (`CODESCRIBE_ROOT`). That is the Ask/STT donor. Missing
+`vista-kernel` is silent unless `VISTA_KERNEL_ROOT` is set; qube-ffi is the
+optional leftover bridge. The check is blind to a dirty source tree unless
+`codescribe-describe` / `vista-kernel-describe` ends in `-dirty`. Rebuild from a
+clean codescribe before submitting:
 
 ```bash
-FFI_PROFILE=release Pensieve/scripts/build-ffi.sh
+FFI_PROFILE=release Pensieve/scripts/build-codescribe-ffi.sh
 ```
 
 ---
