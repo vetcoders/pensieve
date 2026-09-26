@@ -12,6 +12,8 @@
 #   dist/Pensieve.dmg  (signed + notarized + stapled)
 #   docs/index.html    (download-panel SHA-256 stamped from the DMG above —
 #                       publishable lane only, commit it with the release)
+#   GitHub Release     (publishable lane only: tag v<version>+<commit>, marked
+#                       latest, so releases/latest/download/Pensieve.dmg is this DMG)
 #
 # Usage:
 #   ./scripts/build-release.sh            # full pipeline
@@ -149,12 +151,75 @@ LANDING_PAGE="$REPO_ROOT/docs/index.html"
 # resolves to, which is exactly why the checksum beside it has to be restamped.
 LANDING_PAGE_ARTIFACT_URL="https://github.com/vetcoders/pensieve/releases/latest/download/$(basename "$DMG_STABLE_PATH")"
 DMG_SHA256=""
+GITHUB_RELEASE_URL=""
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 log()  { printf "\033[36m[build]\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
+
+# Upload the stapled DMG to the GitHub Release the download page already
+# points at. The page's three artifact links are releases/latest/download/<dmg>,
+# so a notarized lane that only stamps the checksum leaves that URL serving
+# the previous release. Local and App Store lanes never call this.
+publish_notarized_github_release() {
+    local repo tag sums_dir stable_sha notes
+    local stable_name versioned_name digest versioned_digest
+    (( PUBLISHES_DMG )) \
+        || die "GitHub publish is only for the notarized DMG lane."
+    command -v gh >/dev/null 2>&1 \
+        || die "gh is required to publish the notarized DMG. Install GitHub CLI and authenticate it."
+    [[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || die "Refusing to publish a GitHub release without a DMG SHA-256."
+    xcrun stapler validate "$DMG_PATH" >/dev/null \
+        || die "Refusing to publish $DMG_PATH — the notarization ticket is not stapled."
+    stable_sha="$(shasum -a 256 "$DMG_STABLE_PATH" | awk '{print $1}')"
+    [[ "$stable_sha" == "$DMG_SHA256" ]] \
+        || die "Stable alias $DMG_STABLE_PATH does not match the notarized DMG ($DMG_SHA256)."
+    repo="$(printf '%s\n' "$LANDING_PAGE_ARTIFACT_URL" | sed -n \
+        's#^https://github.com/\([^/]*\)/\([^/]*\)/releases/latest/download/.*#\1/\2#p')"
+    [[ "$repo" == */* ]] \
+        || die "Cannot derive the GitHub repo from $LANDING_PAGE_ARTIFACT_URL"
+    tag="v${BUILD_LABEL}"
+    sums_dir="$(mktemp -d "${TMPDIR:-/tmp}/pensieve-gh-release.XXXXXX")"
+    {
+        printf '%s  %s\n' "$DMG_SHA256" "$(basename "$DMG_PATH")"
+        printf '%s  %s\n' "$DMG_SHA256" "$(basename "$DMG_STABLE_PATH")"
+    } > "$sums_dir/SHA256SUMS.txt"
+    notes="$(printf 'Notarized Developer ID build %s.\n\nSHA-256: %s\n' \
+        "$BUILD_LABEL" "$DMG_SHA256")"
+    if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+        gh release upload "$tag" --repo "$repo" --clobber \
+            "$DMG_PATH" "$DMG_STABLE_PATH" "$sums_dir/SHA256SUMS.txt" \
+            || { rm -rf "$sums_dir"; die "GitHub release upload failed for $tag"; }
+        gh release edit "$tag" --repo "$repo" --latest \
+            --title "$APP_NAME $BUILD_LABEL" --notes "$notes" >/dev/null \
+            || { rm -rf "$sums_dir"; die "Could not mark $tag as the latest GitHub release."; }
+    else
+        gh release create "$tag" \
+            --repo "$repo" \
+            --target "$COMMIT_FULL" \
+            --latest \
+            --title "$APP_NAME $BUILD_LABEL" \
+            --notes "$notes" \
+            "$DMG_PATH" "$DMG_STABLE_PATH" "$sums_dir/SHA256SUMS.txt" \
+            || { rm -rf "$sums_dir"; die "GitHub release create failed for $tag"; }
+    fi
+    rm -rf "$sums_dir"
+    stable_name="$(basename "$DMG_STABLE_PATH")"
+    versioned_name="$(basename "$DMG_PATH")"
+    digest="$(gh release view "$tag" --repo "$repo" --json assets \
+        --jq ".assets[] | select(.name==\"${stable_name}\") | .digest")"
+    [[ "$digest" == "sha256:${DMG_SHA256}" ]] \
+        || die "GitHub ${stable_name} digest is '${digest:-missing}', expected sha256:${DMG_SHA256}."
+    versioned_digest="$(gh release view "$tag" --repo "$repo" --json assets \
+        --jq ".assets[] | select(.name==\"${versioned_name}\") | .digest")"
+    [[ "$versioned_digest" == "sha256:${DMG_SHA256}" ]] \
+        || die "GitHub ${versioned_name} digest is '${versioned_digest:-missing}', expected sha256:${DMG_SHA256}."
+    GITHUB_RELEASE_URL="https://github.com/${repo}/releases/tag/${tag}"
+    ok "GitHub release: $GITHUB_RELEASE_URL"
+}
 
 case "$FFI_PROFILE" in
     debug|release) ;;
@@ -984,8 +1049,9 @@ ok "Stable alias: $DMG_STABLE_PATH"
 # cannot be made correct: a failed run tempts the operator to paste the failed
 # artifact's checksum, and the next successful run necessarily produces a
 # different DMG (PensieveBuildDate is baked into the app; DMG creation is not
-# byte-reproducible either). Stamping happens BEFORE the internal shelf publish
-# so nothing is published while the page still describes another artifact.
+# byte-reproducible either). Stamping happens BEFORE anything is published,
+# so neither GitHub nor the internal shelf can go out while the page still
+# describes another artifact.
 if (( PUBLISHES_DMG )); then
     DMG_SHA256="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
     [[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Could not compute the DMG SHA-256 for $DMG_PATH"
@@ -994,19 +1060,26 @@ if (( PUBLISHES_DMG )); then
     landing_page_assert_published "$LANDING_PAGE" "$DMG_SHA256" "$APP_VERSION" "$LANDING_PAGE_ARTIFACT_URL" \
         || die "docs/index.html does not describe this build (checksum, version or artifact link) after stamping."
     ok "Landing page checksum: $DMG_SHA256"
+    publish_notarized_github_release \
+        || die "Could not publish the notarized DMG to GitHub Releases."
 fi
 
 # Internal release shelf (Codescribe convention: <root>/<App>/<version>/ with
 # the artifact + SHA256SUMS.txt). Notarized lane only — local --no-notarize
-# builds are not releases and must not land on the team shelf.
+# builds are not releases and must not land on the team shelf. A root that
+# exists but cannot be written (the volume is there, the mkdir is refused)
+# must not abort the GitHub publish that already happened above.
 INTERNAL_RELEASES_ROOT="${PENSIEVE_INTERNAL_RELEASES:-/Volumes/vc-workspace/_RELEASES}"
 if (( DO_NOTARIZE )); then
     if [[ -d "$INTERNAL_RELEASES_ROOT" ]]; then
         INTERNAL_DIR="$INTERNAL_RELEASES_ROOT/$APP_NAME/$APP_VERSION"
-        mkdir -p "$INTERNAL_DIR"
-        cp -f "$DMG_PATH" "$INTERNAL_DIR/"
-        (cd "$INTERNAL_DIR" && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
-        ok "Internal release: $INTERNAL_DIR/$(basename "$DMG_PATH")"
+        if mkdir -p "$INTERNAL_DIR"; then
+            cp -f "$DMG_PATH" "$INTERNAL_DIR/"
+            (cd "$INTERNAL_DIR" && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+            ok "Internal release: $INTERNAL_DIR/$(basename "$DMG_PATH")"
+        else
+            warn "Internal releases root not writable at $INTERNAL_RELEASES_ROOT — skipped internal publish"
+        fi
     else
         warn "Internal releases root missing at $INTERNAL_RELEASES_ROOT — skipped internal publish"
     fi
@@ -1046,4 +1119,7 @@ fi
 if (( PUBLISHES_DMG )); then
     echo ""
     echo "  docs/index.html now advertises $DMG_SHA256 — commit it with this release."
+    if [[ -n "$GITHUB_RELEASE_URL" ]]; then
+        echo "  GitHub: $GITHUB_RELEASE_URL"
+    fi
 fi

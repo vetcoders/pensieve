@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANDING_PAGE_LIB="$SCRIPT_DIR/lib/landing-page.sh"
-# shellcheck source=scripts/lib/landing-page.sh
+# shellcheck disable=SC1091 source=scripts/lib/landing-page.sh
 source "$LANDING_PAGE_LIB"
 
 C_GREEN='\033[32m'
@@ -484,6 +484,8 @@ CONFLICT_PAGE="$(make_page conflict "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 CONFLICT_MARKER="$FIXTURE_ROOT/conflict-digest-taken"
 # The counter lives in a file: each digest is read through `$(…)`, i.e. in a
 # subshell, so a shell variable would come back to 0 on the second call.
+# Overrides the lib helper; the stamp calls it. Shellcheck does not follow that.
+# shellcheck disable=SC2329
 landing_page_digest() {
     if [[ -e "$CONFLICT_MARKER" ]]; then
         printf 'bbbb%060d\n' 0
@@ -494,7 +496,7 @@ landing_page_digest() {
 }
 CONFLICT_OUTPUT="$(landing_page_stamp_checksum "$CONFLICT_PAGE" "$SHA_A" 2>&1 >/dev/null)" \
     && CONFLICT_STATUS=0 || CONFLICT_STATUS=$?
-# shellcheck source=scripts/lib/landing-page.sh
+# shellcheck disable=SC1091 source=scripts/lib/landing-page.sh
 source "$LANDING_PAGE_LIB"
 if (( CONFLICT_STATUS == 1 )) && [[ "$CONFLICT_OUTPUT" == *"changed while this release was stamping it"* ]]; then
     if grep -q "DO-NOT-SHIP" "$CONFLICT_PAGE"; then
@@ -608,7 +610,7 @@ landing_page_digest() {
 assert_status "a page rewritten while the gate reads it fails instead of passing on mixed revisions" 1 \
     "changed while this release was validating it" \
     landing_page_assert_published "$GATE_RACE_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
-# shellcheck source=scripts/lib/landing-page.sh
+# shellcheck disable=SC1091 source=scripts/lib/landing-page.sh
 source "$LANDING_PAGE_LIB"
 
 # …and the isolation itself, which the race test above cannot see: every field
@@ -649,7 +651,7 @@ else
     fail "every field the gate asserts is read from one snapshot, not from the page" \
         "the gate rejected a page all of whose fields were stubbed as correct"
 fi
-# shellcheck source=scripts/lib/landing-page.sh
+# shellcheck disable=SC1091 source=scripts/lib/landing-page.sh
 source "$LANDING_PAGE_LIB"
 
 if compgen -G "${TMPDIR:-/tmp}/pensieve-landing-page-gate.*" >/dev/null; then
@@ -706,6 +708,30 @@ if grep -q 'landing_page_assert_publishable .*LANDING_PAGE.*APP_VERSION.*LANDING
 else
     fail "preflight checks the artifact URL before anything is built" \
         "no landing_page_assert_publishable call carrying \$LANDING_PAGE_ARTIFACT_URL"
+fi
+
+UNGUARDED_GH="$(awk '
+    /^if \(\( PUBLISHES_DMG \)\); then$/ { guard = 1; next }
+    /^fi$/ { guard = 0; next }
+    /publish_notarized_github_release/ && !/publish_notarized_github_release\(\)/ {
+        if (!guard) printf "%d: %s\n", NR, $0
+    }
+' "$RELEASE_SCRIPT")"
+if [[ -z "$UNGUARDED_GH" ]]; then
+    pass "the GitHub release publish sits behind the notarized-DMG guard"
+else
+    fail "the GitHub release publish sits behind the notarized-DMG guard" \
+        "unguarded: $UNGUARDED_GH"
+fi
+
+if grep -q "xcrun stapler validate \"\$DMG_PATH\"" "$RELEASE_SCRIPT" \
+    && grep -q -- '--latest' "$RELEASE_SCRIPT" \
+    && grep -q "sha256:\${DMG_SHA256}" "$RELEASE_SCRIPT" \
+    && grep -q "if mkdir -p \"\$INTERNAL_DIR\"" "$RELEASE_SCRIPT"; then
+    pass "the GitHub publish requires a stapled DMG, marks the release latest, and checks the uploaded digest"
+else
+    fail "the GitHub publish requires a stapled DMG, marks the release latest, and checks the uploaded digest" \
+        "missing stapler validate, --latest, digest check, or non-fatal shelf mkdir"
 fi
 
 if grep -Eq "grep .*(DO-NOT-SHIP|docs/index\.html)" "$RELEASE_SCRIPT"; then

@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executable/FFI payloads before accepting installation.
 - Seal the notarized DMG checksum into the download page and verify the complete
   version, checksum, and artifact-link claim.
+- Publish that same notarized DMG to GitHub Releases as `releases/latest`, tag
+  `v<version>+<commit>`, with `Pensieve.dmg`, the versioned DMG, and
+  `SHA256SUMS.txt`. An unwritable internal shelf no longer aborts that publish.
 
 ### Known limitations
 

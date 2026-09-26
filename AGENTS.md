@@ -197,6 +197,8 @@ itself is concurrency-safe for the same reason: the page is rewritten by
 renaming a fresh copy into place, and an edit that lands mid-stamp aborts the
 run instead of being silently overwritten.
 
+**The notarized lane publishes that DMG to GitHub Releases.** After the checksum is stamped, `publish_notarized_github_release` uploads the stapled DMG, the stable `Pensieve.dmg` alias, and `SHA256SUMS.txt` to tag `v<version>+<commit>` and marks that release latest. That is what `releases/latest/download/Pensieve.dmg` resolves to. The upload refuses a DMG whose staple does not validate, then checks the uploaded `Pensieve.dmg` digest against the stamp. Local lanes and the App Store lane do not call it. The internal shelf copy is not this publish: a shelf root that exists but cannot be written is a warning, and the script continues.
+
 `scripts/lib/landing-page.sh` is a release runtime input like every other
 release helper, so a release refuses to run with uncommitted edits to it and
 seals it into the provenance digest. The release enumerates its helpers by hand
