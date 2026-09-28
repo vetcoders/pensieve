@@ -262,6 +262,10 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
       switch configuration.shape {
       case .openAIResponses:
         let decoded = try JSONDecoder().decode(ResponsesResponse.self, from: data)
+        if let status = decoded.status, status != "completed" {
+          throw VistaError.ModelError(
+            msg: "completion request failed: provider response is \(status)")
+        }
         guard let completion = decoded.completionText else {
           throw VistaError.ModelError(
             msg: "completion response parse failed: response did not contain output text")
@@ -506,21 +510,26 @@ extension AIProviderRuntime {
 
   fileprivate struct ResponsesResponse: Decodable {
     let id: String?
+    let status: String?
     let outputText: String?
     let output: [ResponsesOutputItem]?
 
     enum CodingKeys: String, CodingKey {
-      case id
+      case id, status
       case outputText = "output_text"
       case output
     }
 
     var completionText: String? {
       if let outputText, !outputText.isEmpty { return outputText }
-      return output?
-        .flatMap { $0.content ?? [] }
-        .first { $0.type == "output_text" && !($0.text ?? "").isEmpty }?
-        .text
+      var parts: [String] = []
+      for item in output ?? [] {
+        for content in item.content ?? [] where content.type == "output_text" {
+          if let text = content.text { parts.append(text) }
+        }
+      }
+      let text = parts.joined()
+      return text.isEmpty ? nil : text
     }
   }
 

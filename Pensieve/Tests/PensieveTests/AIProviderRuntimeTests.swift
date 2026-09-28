@@ -5,6 +5,50 @@ import XCTest
 @testable import Pensieve
 
 final class AIProviderRuntimeTests: XCTestCase {
+  func testRewriteRejectsUnfinishedResponseEvenWhenItContainsText() async throws {
+    for status in ["failed", "incomplete", "cancelled", "in_progress", "queued"] {
+      let runtime = AIProviderRuntime(
+        environment: StubProviderEnvironment([
+          "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+          "LLM_ASSISTIVE_MODEL": "gpt-test",
+          "LLM_ASSISTIVE_API_KEY": "test-key",
+        ])
+      ) { request in
+        let data = try JSONSerialization.data(withJSONObject: [
+          "status": status, "id": "resp-unfinished", "output_text": "Only the first sentence.",
+        ])
+        return (data, Self.response(for: request, statusCode: 200))
+      }
+      do {
+        _ = try await runtime.rewrite(
+          context: RewriteContext(
+            text: "A complete document.", rangeLocation: 0, rangeLength: 20, documentRevision: 1),
+          intent: .improve,
+          session: DocumentAISession(documentID: "doc"))
+        XCTFail("\(status) text must not be offered as a complete replacement")
+      } catch {
+        XCTAssertTrue(error.localizedDescription.contains(status))
+      }
+    }
+  }
+
+  func testResponsePreservesEveryOutputTextPartInOrder() async throws {
+    let runtime = AIProviderRuntime(
+      environment: StubProviderEnvironment([
+        "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",
+        "LLM_ASSISTIVE_MODEL": "gpt-test",
+        "LLM_ASSISTIVE_API_KEY": "test-key",
+      ])
+    ) { request in
+      let data = Data(
+        #"{"status":"completed","output":[{"content":[{"type":"output_text","text":"First"},{"type":"output_text","text":" paragraph."}]},{"content":[{"type":"output_text","text":" Second paragraph."}]}]}"#
+          .utf8)
+      return (data, Self.response(for: request, statusCode: 200))
+    }
+    let text = try await runtime.respond(input: "Original document", instructions: "Improve it")
+    XCTAssertEqual(text, "First paragraph. Second paragraph.")
+  }
+
   func testKeychainSecretLoadsLazilyOnlyWhenAIRequestStarts() async throws {
     let environment = StubProviderEnvironment([
       "LLM_ASSISTIVE_ENDPOINT": "https://api.openai.com/v1/responses",

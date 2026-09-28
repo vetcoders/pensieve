@@ -211,13 +211,14 @@ table above and decide explicitly for each one. In particular:
 
   Deduplication removes the multiplier. It does not bound a single, legitimate
   large workspace: there is no scan-size budget and `/tmp` is not banned. A
-  separate finding, out of this cut: `FolderManager.workspaceValidationTask`
-  keeps the completed `WorkspaceValidationResult.scans` (full trees) until the
-  next open — `cancel()` on a finished task is a no-op, and the handle is never
-  nilled. Clearing it belongs in a later cut, and only under an
-  `openFlowGeneration` guard so an old task cannot steal a newer open's
-  cancellation. Cancelled scans already throw instead of returning a partial
-  tree (`WorkspaceScanSafetyTests.testCancellableScannerThrowsWithoutReturningPartialScan`).
+  completed `WorkspaceValidationResult.scans` must also leave the task owner:
+  `cancel()` on a finished task does not release its return value.
+  `FolderManager` now drops the validation handle on cancellation and at the
+  end of its open flow, guarded by `openFlowGeneration` so an old task cannot
+  steal a newer open's cancellation handle. `WorkspaceScanSafetyTests` covers
+  completion, close, and superseded ownership. Cancelled scans throw instead
+  of returning a partial tree
+  (`WorkspaceScanSafetyTests.testCancellableScannerThrowsWithoutReturningPartialScan`).
 
 - **Rewriting the whole persisted workspace?** `BookmarkStore.replaceWorkspace`
   is all-or-nothing on purpose, and its caller (`removeRoot`) has already changed

@@ -190,6 +190,9 @@ final class FolderManager {
   /// background path, so every early `return` in the build task tears the spinner down.
   private func finishOpenFlow(generation: UInt64, into appState: AppState) {
     guard generation == openFlowGeneration else { return }
+    // A completed value-returning task still owns its full scan result.
+    // Only this generation may release the current cancellation handle.
+    workspaceValidationTask = nil
     guard appState.workspaceActivity != nil else { return }
     setOpenActivity(nil, into: appState)
   }
@@ -1059,6 +1062,7 @@ final class FolderManager {
 
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     let previousSelection = appState.selectedDocumentID
     let protectsDirtySession = appState.documentSession.isDirty
 
@@ -1393,6 +1397,7 @@ final class FolderManager {
     forcedRefreshTask?.cancel()
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
   }
 
   /// Deterministic sync point for the post-close index housekeeping, and the quit's only handle on
@@ -1426,6 +1431,7 @@ final class FolderManager {
   func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     // Take ownership of the activity display so the cancelled build's terminal clear
     // cannot race the direct `workspaceActivity = nil` below.
     openFlowGeneration &+= 1
@@ -1481,6 +1487,7 @@ final class FolderManager {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     openFlowGeneration &+= 1
     // Before the hot-reopen short-circuit below, so BOTH open shapes are covered by one bump.
     workspaceOpenGeneration.bump()
@@ -1688,6 +1695,7 @@ final class FolderManager {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     openFlowGeneration &+= 1
     // The background sibling of the bump in `openResolvedWorkspace` — same reason, and it covers
     // this path's own hot-reopen branch too.

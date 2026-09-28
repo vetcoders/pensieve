@@ -597,6 +597,46 @@ final class SyntaxHighlighterTests: XCTestCase {
       "stale cached colours would leave fenced code on the previous skin")
   }
 
+  func testFenceScanKeepsUnicodeOffsetsAndContinuesAfterUnknownLanguage() {
+    let text = "😀 prose\n```unknown\nraw\n```\n```swift\nlet value = 1\n```\nend"
+    let storage = NSTextStorage(string: text)
+    let highlighter = CodeBlockHighlighter()
+    highlighter.tokens = PensieveTheme.parchment.tokens
+    let start = (text as NSString).range(of: "```unknown").location
+    highlighter.highlight(
+      storage, range: NSRange(location: start, length: storage.length - start - 3))
+    XCTAssertNil(storage.attribute(.foregroundColor, at: 0, effectiveRange: nil))
+    XCTAssertEqual(
+      color(storage, at: index(of: "raw", in: text)), PensieveTheme.parchment.tokens.muted.nsColor)
+    XCTAssertEqual(
+      color(storage, at: index(of: "let", in: text)), PensieveTheme.parchment.tokens.accent.nsColor)
+    XCTAssertNil(storage.attribute(.foregroundColor, at: storage.length - 1, effectiveRange: nil))
+  }
+
+  func testUnclosedFenceThroughFullTextReplacementFinishesPromptly() {
+    let text = "```text\n" + String(repeating: "unfinished log line\n", count: 20_000)
+    let storage = NSTextStorage(string: text)
+    let content = MarkdownTextStorage()
+    content.textStorage = storage
+    let start = ContinuousClock.now
+    content.refreshHighlightingAfterFullTextReplacement()
+    XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(500))
+    XCTAssertEqual(storage.string, text)
+  }
+
+  func testUnclosedFenceBelowLargeDocumentThresholdFinishesPromptly() {
+    // A normal-sized pasted log must not pin the main actor while its closing
+    // delimiter has not been typed yet. The old matcher retries every newline.
+    let text = "```text\n" + String(repeating: "unfinished log line\n", count: 4_000)
+    XCTAssertFalse(LargeDocument.isLarge(text.utf16.count))
+    let storage = NSTextStorage(string: text)
+    let highlighter = CodeBlockHighlighter()
+    let start = ContinuousClock.now
+    highlighter.highlight(storage, range: NSRange(location: 0, length: storage.length))
+    XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(500))
+    XCTAssertNil(storage.attribute(.foregroundColor, at: 20, effectiveRange: nil))
+  }
+
   // MARK: - Idempotence / cache reuse
 
   func testRepeatedHighlightingIsStable() {
