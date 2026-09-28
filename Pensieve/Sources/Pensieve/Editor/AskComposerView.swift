@@ -1,15 +1,18 @@
+import CodescribeBridge
 import SwiftUI
 
 /// Multiline Ask composer: informed preflight, then a visible streamed turn.
 /// This is the Ask send path — it is not the rewrite one-line alert.
 struct AskComposerView: View {
   @ObservedObject var thread: DocumentAskThread
-  /// Grok's account and Ask routing, read from the codescribe FFI and shared
+  /// Grok's account and Ask routing, read from Pensieve’s embedded engine and shared
   /// with Settings ▸ AI.
   @ObservedObject var grokAccount: GrokAccount
   @ObservedObject var codexAccount: CodexAccount
   let documentText: String
   let apiKey: String
+  let makeDocumentHost: @MainActor () -> DocumentToolHost
+  let apiConfiguration: CsDocumentProvider
   /// The API-key provider Ask falls back to when it is not routed to Grok.
   var apiKeyProvider: CompletionProviderShape = .openAIResponses
   var openProviderSettings: @MainActor () -> Void = {
@@ -49,6 +52,14 @@ struct AskComposerView: View {
           .font(.system(size: 10.5))
           .foregroundStyle(.red)
           .accessibilityIdentifier("pensieve.ask.providerError")
+      }
+      if let activity = thread.activity, thread.isStreaming {
+        HStack {
+          Text(activity).font(.caption).foregroundStyle(.secondary)
+          Spacer()
+          Button("Stop") { thread.cancel() }
+            .accessibilityIdentifier("pensieve.ask.stop")
+        }
       }
       composer
     }
@@ -91,7 +102,7 @@ struct AskComposerView: View {
   }
 
   /// Which provider answers. Grok is selectable only once its account is
-  /// authorized; choosing either one reroutes codescribe's assistive lane, so
+  /// authorized; choosing either one reroutes the embedded assistive lane, so
   /// the menu, the chip and the next send all read the same truth.
   private var providerMenu: some View {
     let grok = grokAccount.snapshot
@@ -195,8 +206,11 @@ struct AskComposerView: View {
           thread.cancelPreflight()
         }
         .accessibilityIdentifier("pensieve.ask.cancel")
-        Button("Send \(preflight.totalCharacters) characters") {
-          _ = thread.confirmAndSend(document: documentText, provider: provider)
+        Button("Send") {
+          _ = thread.confirmAndSend(
+            document: documentText, provider: provider, host: makeDocumentHost(),
+            configuration: grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
+              ? nil : apiConfiguration)
         }
         .keyboardShortcut(.defaultAction)
         .accessibilityIdentifier("pensieve.ask.confirm")
@@ -211,7 +225,7 @@ struct AskComposerView: View {
     HStack(alignment: .bottom, spacing: 8) {
       ZStack(alignment: .topLeading) {
         if thread.draft.isEmpty {
-          Text("Ask about this document")
+          Text("Ask or edit this document")
             .font(.callout)
             .foregroundStyle(.tertiary)
             .padding(.top, 1)

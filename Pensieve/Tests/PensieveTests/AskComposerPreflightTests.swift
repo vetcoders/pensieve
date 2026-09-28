@@ -13,20 +13,10 @@ final class AskComposerPreflightTests: XCTestCase {
 
     XCTAssertEqual(preflight.promptCharacters, prompt.count)
     XCTAssertEqual(preflight.documentCharacters, document.count)
-    XCTAssertEqual(preflight.pageCount, 1)
     XCTAssertTrue(preflight.summary.contains("\(prompt.count)"))
     XCTAssertTrue(preflight.summary.contains("\(document.count)"))
-    XCTAssertTrue(preflight.summary.contains("will be processed"))
-    XCTAssertTrue(preflight.summary.contains("20 minutes"))
-  }
-
-  func testOversizedDocumentBecomesMoreThanOnePage() {
-    let document = String(repeating: "d", count: 20_000)
-    let preflight = AskPreflight.make(prompt: "Explain.", document: document)
-
-    XCTAssertGreaterThan(preflight.pageCount, 1)
-    XCTAssertEqual(preflight.pages.count, preflight.pageCount)
-    XCTAssertTrue(preflight.pages[1].contains("[continued"))
+    XCTAssertTrue(preflight.summary.contains("undoable edits"))
+    XCTAssertTrue(preflight.summary.contains("document save settings"))
   }
 
   func testSendIsBlockedWithoutConfirmEvenWhenReady() {
@@ -39,7 +29,7 @@ final class AskComposerPreflightTests: XCTestCase {
       "Ask must not send until the user confirms the preflight")
     XCTAssertEqual(thread.phase, .idle)
     XCTAssertTrue(agent.texts.isEmpty)
-    XCTAssertEqual(thread.lastError, "Confirm the character counts before sending.")
+    XCTAssertEqual(thread.lastError, "Confirm document access before sending.")
   }
 
   func testPrepareThenConfirmSendsAndEmptyDraftIsBlocked() {
@@ -56,7 +46,9 @@ final class AskComposerPreflightTests: XCTestCase {
     XCTAssertEqual(preflight?.promptCharacters, "Please summarise.".count)
     XCTAssertEqual(preflight?.documentCharacters, 3)
 
-    XCTAssertTrue(thread.confirmAndSend(document: "doc", provider: .apiKey("sk-test")))
+    XCTAssertTrue(
+      thread.confirmAndSend(
+        document: "doc", provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "doc")))
     XCTAssertEqual(thread.phase, .streaming)
   }
 
@@ -72,7 +64,9 @@ final class AskComposerPreflightTests: XCTestCase {
     XCTAssertEqual(thread.lastError, AskReadiness.grokNotReadyMessage)
     XCTAssertEqual(thread.phase, .idle)
     XCTAssertFalse(
-      thread.confirmAndSend(document: "doc", provider: .grok(accountAuthorized: false)),
+      thread.confirmAndSend(
+        document: "doc", provider: .grok(accountAuthorized: false),
+        host: AskDocumentFixture.host(text: "doc")),
       "an unauthorized Grok account must not reach the send path")
   }
 
@@ -84,7 +78,9 @@ final class AskComposerPreflightTests: XCTestCase {
 
     XCTAssertNotNil(thread.prepareSend(document: "doc", provider: grok))
     XCTAssertEqual(thread.phase, .awaitingConfirmation)
-    XCTAssertTrue(thread.confirmAndSend(document: "doc", provider: grok))
+    XCTAssertTrue(
+      thread.confirmAndSend(
+        document: "doc", provider: grok, host: AskDocumentFixture.host(text: "doc")))
     XCTAssertEqual(thread.phase, .streaming)
 
     let deadline = Date().addingTimeInterval(1)
@@ -128,7 +124,15 @@ private final class ImmediateCodescribeAgent: CodescribeAgentStreaming, @uncheck
     state.withLock { $0.texts }
   }
 
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
+  func cancelTurn(threadId: String) -> Bool { true }
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool { false }
+
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+    listener: CsAgentListener
+  ) async throws
     -> String
   {
     state.withLock { $0.texts.append(text) }

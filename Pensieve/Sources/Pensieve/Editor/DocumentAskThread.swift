@@ -2,7 +2,7 @@ import CodescribeBridge
 import Combine
 import Foundation
 
-/// One codescribe Ask conversation, keyed by the document's birth UUID — never
+/// One Pensieve Ask conversation, keyed by the document's birth UUID — never
 /// by path. Save As / rename keep talking to the same thread; a new untitled
 /// buffer or a different file mints a new one.
 @MainActor
@@ -17,6 +17,9 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   private let agent: any CodescribeAgentStreaming
   private var inFlightTask: Task<Void, Never>?
+  private var activeHost: DocumentToolHost?
+  private var generation: UUID?
+  @Published private(set) var activity: String?
 
   init(id: UUID, agent: any CodescribeAgentStreaming) {
     self.id = id
@@ -38,9 +41,10 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     turns.append(AskTurn(role: .dictation, text: utterance))
   }
 
-  /// Computes char counts and pages. Does not send. The user must confirm.
+  /// Explains document access before starting the agent.
   @discardableResult
   func prepareSend(document: String, provider: AskProvider) -> AskPreflight? {
+    guard !isStreaming else { return nil }
     lastError = nil
     guard AskReadiness.isReady(provider) else {
       lastError = AskReadiness.notReadyMessage(for: provider)
@@ -61,10 +65,10 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     return prepared
   }
 
-  /// Grill contract: send is blocked until the user has confirmed the preflight.
+  /// Document access starts only after the user confirms.
   @discardableResult
   func sendWithoutConfirm(document: String, provider: AskProvider) -> Bool {
-    lastError = "Confirm the character counts before sending."
+    lastError = "Confirm document access before sending."
     return false
   }
 
@@ -77,13 +81,16 @@ final class DocumentAskThread: ObservableObject, Identifiable {
   }
 
   @discardableResult
-  func confirmAndSend(document: String, provider: AskProvider) -> Bool {
+  func confirmAndSend(
+    document: String, provider: AskProvider, host: DocumentToolHost,
+    configuration: CsDocumentProvider? = nil
+  ) -> Bool {
     guard AskReadiness.isReady(provider) else {
       lastError = AskReadiness.notReadyMessage(for: provider)
       return false
     }
-    guard phase == .awaitingConfirmation, let prepared = preflight, !prepared.pages.isEmpty else {
-      lastError = "Confirm the character counts before sending."
+    guard phase == .awaitingConfirmation, preflight != nil else {
+      lastError = "Confirm document access before sending."
       return false
     }
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -91,98 +98,97 @@ final class DocumentAskThread: ObservableObject, Identifiable {
       lastError = "Write a question before sending."
       return false
     }
-    startStreaming(prompt: prompt, pages: prepared.pages)
+    preflight = AskPreflight.make(prompt: prompt, document: document)
+    startStreaming(prompt: prompt, host: host, configuration: configuration)
     return true
   }
 
-  private func startStreaming(prompt: String, pages: [String]) {
+  func cancel() {
+    guard isStreaming else { return }
+    activeHost?.invalidate()
+    activeHost = nil
+    generation = nil
+    _ = agent.cancelTurn(threadId: id.uuidString.lowercased())
     inFlightTask?.cancel()
+    for index in turns.indices { turns[index].isStreaming = false }
+    activity = "Stopped"
+    phase = .idle
+    preflight = nil
+  }
+
+  private func startStreaming(
+    prompt: String, host: DocumentToolHost, configuration: CsDocumentProvider?
+  ) {
+    let token = UUID()
+    generation = token
+    activeHost = host
     turns.append(AskTurn(role: .user, text: prompt))
     let assistantID = UUID()
     turns.append(AskTurn(id: assistantID, role: .assistant, text: "", isStreaming: true))
     phase = .streaming
+    activity = "Working…"
     draft = ""
     lastError = nil
-
     let threadID = id.uuidString.lowercased()
     let agent = self.agent
     inFlightTask = Task { [weak self] in
       let listener = AskStreamListener()
-      listener.onDelta = { [weak self] delta in
-        Task { @MainActor in
-          self?.appendDelta(assistantID: assistantID, delta: delta)
+      let reader = Task { @MainActor [weak self] in
+        for await event in listener.events {
+          guard let self, self.generation == token else { continue }
+          self.consume(event, assistantID: assistantID)
         }
       }
-      listener.onComplete = { [weak self] text in
-        Task { @MainActor in
-          self?.replaceAssistantText(assistantID: assistantID, text: text)
-        }
-      }
-      listener.onFailure = { [weak self] message in
-        Task { @MainActor in
-          self?.failStreaming(assistantID: assistantID, message: message)
-        }
-      }
-
       do {
-        var last = ""
-        for page in pages {
-          try Task.checkCancellation()
-          last = try await agent.streamReply(
-            text: page, threadId: threadID, listener: listener)
-        }
-        await MainActor.run { [weak self] in
-          self?.finishAssistant(assistantID: assistantID, text: last)
-        }
-      } catch is CancellationError {
-        await MainActor.run { [weak self] in
-          self?.failStreaming(assistantID: assistantID, message: "Ask was cancelled.")
-        }
+        try Task.checkCancellation()
+        let final = try await agent.streamDocument(
+          text: prompt, threadId: threadID, document: host,
+          provider: configuration, listener: listener)
+        listener.finish()
+        await reader.value
+        guard let self, self.generation == token else { return }
+        self.complete(assistantID: assistantID, text: final, error: self.lastError)
       } catch {
-        await MainActor.run { [weak self] in
-          self?.failStreaming(
-            assistantID: assistantID, message: error.localizedDescription)
-        }
+        listener.finish()
+        await reader.value
+        guard let self, self.generation == token else { return }
+        self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
   }
 
-  private func appendDelta(assistantID: UUID, delta: String) {
+  private func consume(_ event: AskStreamListener.Event, assistantID: UUID) {
     guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    turns[index].text += delta
-    turns[index].isStreaming = true
-    phase = .streaming
+    switch event {
+    case .delta(let text): turns[index].text += text
+    case .text(let text):
+      if !text.isEmpty { turns[index].text = text }
+    case .activity(let text): activity = text
+    case .failure(let message): lastError = message
+    case .approval(let request):
+      // The document registry grants only this buffer's reversible actions.
+      // Unexpected permissions are refused explicitly, never left waiting.
+      _ = agent.resolveToolApproval(
+        sessionId: request.sessionId, threadId: request.threadId, callId: request.callId,
+        approved: false, remember: false)
+      lastError = "The agent requested an action outside this document. It was refused."
+    }
   }
 
-  private func replaceAssistantText(assistantID: UUID, text: String) {
+  private func complete(assistantID: UUID, text: String, error: String?) {
     guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    if !text.isEmpty {
-      turns[index].text = text
-    }
-    turns[index].isStreaming = true
-    phase = .streaming
-  }
-
-  private func finishAssistant(assistantID: UUID, text: String) {
-    guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    if !text.isEmpty {
-      turns[index].text = text
-    }
+    if !text.isEmpty { turns[index].text = text }
     turns[index].isStreaming = false
-    phase = .completed
+    activeHost?.invalidate()
+    activeHost = nil
+    generation = nil
+    lastError = error
+    phase = error.map(AskThreadPhase.failed) ?? .completed
+    activity = error == nil ? nil : "Failed"
     preflight = nil
+    inFlightTask = nil
   }
 
-  private func failStreaming(assistantID: UUID, message: String) {
-    if let index = turns.firstIndex(where: { $0.id == assistantID }) {
-      turns[index].isStreaming = false
-      if turns[index].text.isEmpty {
-        turns[index].text = message
-      }
-    }
-    lastError = message
-    phase = .failed(message)
-  }
 }
 
 enum AskThreadPhase: Equatable, Sendable {
@@ -214,7 +220,7 @@ struct AskTurn: Equatable, Identifiable, Sendable {
 }
 
 /// The credential Ask is gated on. Which case applies is read from the lane Ask
-/// actually streams through — codescribe's assistive lane (see
+/// actually streams through — Pensieve's embedded assistive lane (see
 /// `GrokAccountSnapshot.askProvider(apiKey:)`) — so Pensieve keeps no provider
 /// choice of its own that could disagree with where a question is sent.
 enum AskProvider: Equatable, Sendable {
@@ -228,7 +234,7 @@ enum AskProvider: Equatable, Sendable {
 }
 
 /// API-key providers are ready when the key is non-empty. Grok and Codex are
-/// ready only when the codescribe FFI reports that account authorized.
+/// ready only when the embedded engine reports that Pensieve account authorized.
 enum AskReadiness {
   static let apiKeyNotReadyMessage = "Add a provider API key in Settings before asking."
   static let grokNotReadyMessage = "Sign in to Grok in Settings ▸ AI before asking."
@@ -263,69 +269,17 @@ enum AskReadiness {
 }
 
 struct AskPreflight: Equatable, Sendable {
-  /// Pagination protects the app: oversized context is split, never refused.
-  static let pageCharacterLimit = 8_000
-
   var promptCharacters: Int
   var documentCharacters: Int
-  var pageCount: Int
-  var totalCharacters: Int
-  var pages: [String]
   var summary: String
 
   static func make(prompt: String, document: String) -> AskPreflight {
-    let pages = paginate(prompt: prompt, document: document)
-    let total = pages.reduce(0) { $0 + $1.count }
-    return AskPreflight(
-      promptCharacters: prompt.count,
-      documentCharacters: document.count,
-      pageCount: pages.count,
-      totalCharacters: total,
-      pages: pages,
-      summary: summary(
-        promptCharacters: prompt.count,
-        documentCharacters: document.count,
-        pageCount: pages.count,
-        totalCharacters: total))
-  }
-
-  static func paginate(prompt: String, document: String) -> [String] {
-    let header = "Prompt:\n\(prompt)\n\nDocument:\n"
-    let combined = header + document
-    if combined.isEmpty { return [""] }
-    if combined.count <= pageCharacterLimit { return [combined] }
-
-    var pages: [String] = []
-    var remainder = combined
-    var index = 1
-    while !remainder.isEmpty {
-      let limit =
-        index == 1
-        ? pageCharacterLimit
-        : max(pageCharacterLimit - 32, 1)
-      let prefix = String(remainder.prefix(limit))
-      remainder = String(remainder.dropFirst(prefix.count))
-      if index == 1 {
-        pages.append(prefix)
-      } else {
-        pages.append("[continued \(index)]\n" + prefix)
-      }
-      index += 1
-    }
-    return pages
-  }
-
-  static func summary(
-    promptCharacters: Int,
-    documentCharacters: Int,
-    pageCount: Int,
-    totalCharacters: Int
-  ) -> String {
-    let pageWord = pageCount == 1 ? "page" : "pages"
-    return
-      "Prompt \(promptCharacters) characters. Document \(documentCharacters) characters. "
-      + "\(totalCharacters) characters will be processed across \(pageCount) \(pageWord). "
-      + "A long reply may take up to 20 minutes."
+    AskPreflight(
+      promptCharacters: prompt.count, documentCharacters: document.count,
+      summary:
+        "Instruction: \(prompt.count) characters. Current document: \(document.count) characters. "
+        + "The agent can read this document and make undoable edits when requested. Changes follow your document save settings."
+    )
   }
 }
 
@@ -347,6 +301,8 @@ final class DocumentAskThreadStore: ObservableObject {
     return created
   }
 
+  func cancelAll() { for thread in threads.values { thread.cancel() } }
+
   /// Non-minting lookup for chrome that only OBSERVES a thread (the status
   /// bar's Ask chip). Minting on read would birth an empty thread for every
   /// document the window merely displays.
@@ -366,11 +322,27 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
     self.factory = factory
   }
 
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
-    -> String
-  {
-    let agent = resolved()
-    return try await agent.streamReply(text: text, threadId: threadId, listener: listener)
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    try await resolved().streamDocument(
+      text: text, threadId: threadId, document: document, provider: provider, listener: listener)
+  }
+
+  func cancelTurn(threadId: String) -> Bool {
+    lock.lock()
+    let agent = boxed
+    lock.unlock()
+    return agent?.cancelTurn(threadId: threadId) ?? false
+  }
+
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool {
+    resolved().resolveToolApproval(
+      sessionId: sessionId, threadId: threadId, callId: callId, approved: approved,
+      remember: remember)
   }
 
   private func resolved() -> any CodescribeAgentStreaming {
@@ -383,17 +355,43 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
   }
 }
 
-final class AskStreamListener: CsAgentListener, @unchecked Sendable {
-  var onDelta: @Sendable (String) -> Void = { _ in }
-  var onComplete: @Sendable (String) -> Void = { _ in }
-  var onFailure: @Sendable (String) -> Void = { _ in }
+final class AskStreamListener: CsAgentListener, Sendable {
+  enum Event: Sendable {
+    case delta(String)
+    case text(String)
+    case activity(String)
+    case failure(String)
+    case approval(CsToolApprovalRequest)
+  }
+  let events: AsyncStream<Event>
+  private let continuation: AsyncStream<Event>.Continuation
 
-  func onTextDelta(delta: String) { onDelta(delta) }
-  func onTextDone(text: String) { onComplete(text) }
+  init() {
+    let stream = AsyncStream<Event>.makeStream()
+    events = stream.stream
+    continuation = stream.continuation
+  }
+
+  func finish() { continuation.finish() }
+  func onTextDelta(delta: String) { continuation.yield(.delta(delta)) }
+  func onTextDone(text: String) { continuation.yield(.text(text)) }
   func onReasoningDelta(delta: String) {}
-  func onToolExecuting(name: String, id: String) {}
-  func onToolApprovalRequested(request: CsToolApprovalRequest) {}
-  func onToolResult(name: String, id: String, summary: String, isError: Bool) {}
+  func onToolExecuting(name: String, id: String) {
+    let label: String
+    switch name {
+    case "document_read": label = "Reading document…"
+    case "document_search": label = "Searching document…"
+    case "document_replace": label = "Editing document…"
+    default: label = "Working…"
+    }
+    continuation.yield(.activity(label))
+  }
+  func onToolApprovalRequested(request: CsToolApprovalRequest) {
+    continuation.yield(.approval(request))
+  }
+  func onToolResult(name: String, id: String, summary: String, isError: Bool) {
+    continuation.yield(.activity(isError ? "Action failed: \(summary)" : "Action completed"))
+  }
   func onDone() {}
-  func onError(message: String) { onFailure(message) }
+  func onError(message: String) { continuation.yield(.failure(message)) }
 }

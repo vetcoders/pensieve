@@ -79,18 +79,12 @@ final class DocumentAskThreadTests: XCTestCase {
       "the blocked message names the credential that is actually missing")
   }
 
-  func testPaginationSplitsOversizedContextInsteadOfRefusing() {
-    let prompt = "Summarise this note."
-    let document = String(repeating: "x", count: AskPreflight.pageCharacterLimit * 2 + 50)
-    let preflight = AskPreflight.make(prompt: prompt, document: document)
-
-    XCTAssertGreaterThan(preflight.pageCount, 1)
-    XCTAssertEqual(preflight.pages.count, preflight.pageCount)
-    XCTAssertEqual(preflight.promptCharacters, prompt.count)
-    XCTAssertEqual(preflight.documentCharacters, document.count)
-    XCTAssertGreaterThan(preflight.totalCharacters, AskPreflight.pageCharacterLimit)
-    XCTAssertTrue(preflight.summary.contains("will be processed"))
-    XCTAssertFalse(preflight.summary.lowercased().contains("refus"))
+  func testLargeDocumentAccessIsDescribedWithoutPromisingSeparateTurns() {
+    let document = String(repeating: "x", count: 20_000)
+    let preflight = AskPreflight.make(prompt: "Summarise", document: document)
+    XCTAssertEqual(preflight.documentCharacters, 20_000)
+    XCTAssertTrue(preflight.summary.contains("read this document"))
+    XCTAssertFalse(preflight.summary.contains("pages"))
   }
 
   func testStreamingPhaseIsObservableAndUsesTheDocumentThreadID() async throws {
@@ -102,7 +96,10 @@ final class DocumentAskThreadTests: XCTestCase {
     XCTAssertEqual(thread.phase, .idle)
     XCTAssertTrue(thread.prepareSend(document: "note", provider: .apiKey("sk-test")) != nil)
     XCTAssertEqual(thread.phase, .awaitingConfirmation)
-    XCTAssertTrue(thread.confirmAndSend(document: "note", provider: .apiKey("sk-test")))
+    XCTAssertTrue(
+      thread.confirmAndSend(
+        document: "note", provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note"))
+    )
     XCTAssertEqual(thread.phase, .streaming)
     XCTAssertTrue(thread.isStreaming)
     XCTAssertTrue(thread.turns.contains(where: { $0.role == .assistant && $0.isStreaming }))
@@ -130,20 +127,37 @@ final class DocumentAskThreadTests: XCTestCase {
     XCTAssertTrue(agent.texts.isEmpty)
   }
 
-  func testOversizedSendStreamsEveryPageOnTheSameThread() async throws {
+  func testLargeDocumentUsesOneAgentTurn() async throws {
     let agent = RecordingCodescribeAgent()
     let thread = DocumentAskThread(id: UUID(), agent: agent)
-    let document = String(repeating: "x", count: AskPreflight.pageCharacterLimit * 2 + 20)
+    let document = String(repeating: "x", count: 8000 * 2 + 20)
     thread.draft = "Continue."
     XCTAssertNotNil(thread.prepareSend(document: document, provider: .apiKey("sk-test")))
-    XCTAssertGreaterThan(thread.preflight?.pageCount ?? 0, 1)
-    XCTAssertTrue(thread.confirmAndSend(document: document, provider: .apiKey("sk-test")))
+    XCTAssertTrue(
+      thread.confirmAndSend(
+        document: document, provider: .apiKey("sk-test"),
+        host: AskDocumentFixture.host(text: document)))
 
     let finished = await waitUntil(timeout: 1.0) { thread.phase == .completed }
     XCTAssertTrue(finished)
-    XCTAssertGreaterThan(agent.texts.count, 1, "pagination must continue, not refuse")
+    XCTAssertEqual(agent.texts.count, 1, "One instruction must not become independent page turns")
     XCTAssertEqual(Set(agent.threadIDs).count, 1)
     XCTAssertEqual(agent.threadIDs.first, thread.id.uuidString.lowercased())
+  }
+
+  func testConfirmationDoesNotSendAStaleDocument() async {
+    let agent = RecordingCodescribeAgent()
+    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    thread.draft = "Find the decision."
+    XCTAssertNotNil(thread.prepareSend(document: "OLD decision", provider: .apiKey("test")))
+    XCTAssertTrue(
+      thread.confirmAndSend(
+        document: "CURRENT decision", provider: .apiKey("test"),
+        host: AskDocumentFixture.host(text: "CURRENT decision")))
+    let finished = await waitUntil(timeout: 1) { thread.phase == .completed }
+    XCTAssertTrue(finished)
+    XCTAssertFalse(agent.texts.joined().contains("OLD decision"))
+    XCTAssertTrue(agent.documentReads.joined().contains("CURRENT decision"))
   }
 
   func testStoreReusesTheSameThreadObjectForABirthID() {
@@ -155,6 +169,24 @@ final class DocumentAskThreadTests: XCTestCase {
 
     XCTAssertTrue(first === second)
     XCTAssertEqual(second.turns.map(\.text), ["keep me"])
+  }
+
+  func testStopCancelsEngineAndIgnoresLateEvents() async {
+    let agent = SuspendedDocumentAgent()
+    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    let host = AskDocumentFixture.host(text: "unsaved")
+    thread.draft = "Edit this"
+    _ = thread.prepareSend(document: "unsaved", provider: .apiKey("test"))
+    XCTAssertTrue(thread.confirmAndSend(document: "unsaved", provider: .apiKey("test"), host: host))
+    let started = await waitUntil(timeout: 1) { agent.started }
+    XCTAssertTrue(started)
+    thread.cancel()
+    XCTAssertEqual(agent.cancelledThread, thread.id.uuidString.lowercased())
+    XCTAssertFalse(host.isActive())
+    agent.finishLate()
+    for _ in 0..<10 { await Task.yield() }
+    XCTAssertEqual(thread.phase, .idle)
+    XCTAssertFalse(thread.turns.contains { $0.text.contains("late reply") })
   }
 
   private func waitUntil(timeout: TimeInterval, predicate: @escaping () -> Bool) async -> Bool {
@@ -171,6 +203,7 @@ private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @uncheck
   private struct State: Sendable {
     var texts: [String] = []
     var threadIDs: [String] = []
+    var documentReads: [String] = []
   }
 
   private let state = Mutex(State())
@@ -179,21 +212,75 @@ private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @uncheck
     state.withLock { $0.texts }
   }
 
+  var documentReads: [String] { state.withLock { $0.documentReads } }
+
   var threadIDs: [String] {
     state.withLock { $0.threadIDs }
   }
 
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
+  func cancelTurn(threadId: String) -> Bool { true }
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool { false }
+
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+    listener: CsAgentListener
+  ) async throws
     -> String
   {
     state.withLock {
       $0.texts.append(text)
       $0.threadIDs.append(threadId)
     }
+    let read = try document.execute(
+      name: "document_read", argumentsJson: "{\"offset\":0,\"limit\":8000}")
+    state.withLock { $0.documentReads.append(read) }
     listener.onTextDelta(delta: "Hel")
     listener.onTextDelta(delta: "lo")
     listener.onTextDone(text: "Hello there now")
     listener.onDone()
     return "Hello there now"
+  }
+}
+
+private final class SuspendedDocumentAgent: CodescribeAgentStreaming, Sendable {
+  private struct State: Sendable {
+    var listener: CsAgentListener?
+    var completion: CheckedContinuation<String, Never>?
+    var cancelledThread: String?
+  }
+  private let state = Mutex(State())
+  var started: Bool { state.withLock { $0.completion != nil } }
+  var cancelledThread: String? { state.withLock { $0.cancelledThread } }
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+    listener: CsAgentListener
+  ) async throws -> String {
+    await withCheckedContinuation { completion in
+      state.withLock {
+        $0.listener = listener
+        $0.completion = completion
+      }
+      listener.onToolExecuting(name: "document_read", id: "read")
+    }
+  }
+  func cancelTurn(threadId: String) -> Bool {
+    state.withLock { $0.cancelledThread = threadId }
+    return true
+  }
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool { false }
+  func finishLate() {
+    let pending = state.withLock { current in
+      let pending = (current.listener, current.completion)
+      current.listener = nil
+      current.completion = nil
+      return pending
+    }
+    pending.0?.onTextDelta(delta: "late reply")
+    pending.0?.onTextDone(text: "late reply")
+    pending.1?.resume(returning: "late reply")
   }
 }

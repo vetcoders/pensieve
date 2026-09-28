@@ -1,4 +1,5 @@
 import AppKit
+import CodescribeBridge
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
@@ -15,7 +16,7 @@ struct ContentView: View {
   /// three surfaces. Default visible preserves the pre-toggle behavior.
   @AppStorage("pensieve.ask.visible") private var askVisible = true
   @Binding private var hostWindow: NSWindow?
-  private let providerSettings: ProviderSettings
+  @ObservedObject private var providerSettings: ProviderSettings
 
   @MainActor
   init(
@@ -24,11 +25,27 @@ struct ContentView: View {
     providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil
   ) {
     _hostWindow = hostWindow
-    self.providerSettings = providerSettings
+    _providerSettings = ObservedObject(wrappedValue: providerSettings)
     _providerOnboardingCoordinator = ObservedObject(
       wrappedValue: providerOnboardingCoordinator ?? .shared)
     _providerSettingsTransition = StateObject(
       wrappedValue: ProviderOnboardingSettingsTransition())
+  }
+
+  private func makeDocumentHost() -> DocumentToolHost {
+    let id = appState.documentSession.askThreadID
+    return DocumentToolHost(
+      documentID: id,
+      snapshot: { [weak appState] in
+        guard let appState, appState.documentHasEditableBuffer else { return nil }
+        return AskDocumentSnapshot(
+          id: appState.documentSession.askThreadID,
+          title: appState.documentTitle, text: appState.documentSession.text)
+      },
+      replace: { [weak controller] expected, replacement in
+        controller?.applyAgentDocumentEdit(id: id, expected: expected, replacement: replacement)
+          ?? false
+      })
   }
 
   var body: some View {
@@ -60,6 +77,13 @@ struct ContentView: View {
               codexAccount: .shared,
               documentText: appState.documentSession.text,
               apiKey: providerSettings.apiKey,
+              makeDocumentHost: makeDocumentHost,
+              apiConfiguration: CsDocumentProvider(
+                wire: providerSettings.providerShape.rawValue,
+                endpoint: providerSettings.providerShape.normalizeEndpoint(
+                  providerSettings.endpoint),
+                model: providerSettings.model,
+                apiKey: providerSettings.apiKey),
               apiKeyProvider: providerSettings.providerShape
             )
             .id(appState.documentSession.askThreadID)
@@ -69,6 +93,15 @@ struct ContentView: View {
             .opacity(appState.mode == .focus ? 0.45 : 1)
         }
       }
+    }
+    .onChange(of: appState.documentSession.askThreadID) { oldID, _ in
+      askThreads.existingThread(for: oldID)?.cancel()
+    }
+    .onDisappear { askThreads.cancelAll() }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
+      notification in
+      guard let closing = notification.object as? NSWindow, closing === hostWindow else { return }
+      askThreads.cancelAll()
     }
     .navigationTitle(
       DocumentWindowSurface.navigationTitle(

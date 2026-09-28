@@ -24,6 +24,17 @@ struct PensieveApp: App {
       exit(0)
     }
 
+    do {
+      try PensieveEngineHost.configure()
+    } catch {
+      let alert = NSAlert()
+      alert.messageText = "Pensieve could not initialize its agent"
+      alert.informativeText = error.localizedDescription
+      alert.addButton(withTitle: "Quit")
+      alert.runModal()
+      exit(1)
+    }
+
     // Register the bundled OFL theme fonts into this process's font environment
     // before any view builds. Idempotent and non-fatal — a missing/failed font
     // never blocks launch; the skin CSS fallback chains cover absence.

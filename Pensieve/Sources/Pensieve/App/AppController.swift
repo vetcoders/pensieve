@@ -2157,6 +2157,29 @@ final class AppController: ObservableObject {
     documentStore.documentDidChange(appState: appState)
   }
 
+  /// Commit an agent edit to this window's current buffer, with the same dirty
+  /// and recovery notification as typing. A late tool cannot target a new tab.
+  @discardableResult
+  func applyAgentDocumentEdit(id: UUID, expected: String, replacement: String) -> Bool {
+    guard appState.documentHasEditableBuffer,
+      appState.documentSession.askThreadID == id,
+      appState.documentSession.text == expected
+    else { return false }
+    guard replacement != expected else { return true }
+    let window = documentWindowRegistry.window(hosting: self) ?? hostWindowProvider?()
+    guard let undo = window?.undoManager else { return false }
+    undo.registerUndo(withTarget: self) { controller in
+      MainActor.assumeIsolated {
+        _ = controller.applyAgentDocumentEdit(id: id, expected: replacement, replacement: expected)
+      }
+    }
+    undo.setActionName("Agent Edit")
+    appState.documentSession.text = replacement
+    appState.documentSession.isDirty = true
+    documentDidChange()
+    return true
+  }
+
   // MARK: - Toolbar Actions
 
   func applyMarkdownFormat(_ format: MarkdownFormat) {

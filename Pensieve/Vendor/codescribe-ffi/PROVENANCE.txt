@@ -1,7 +1,7 @@
 codescribe-root=/Volumes/vc-workspace/vetcoders/codescribe
-codescribe-head=UNSTAMPED
-codescribe-describe=unpinned-vendored-blob
+codescribe-head=1a40e65c8e2c2f09ed47ab65e00fed03180f4210
+codescribe-describe=baseline/transcription-1292-87-g1a40e65c
 ffi-profile=release
-dylib-sha256=57fe14b0737169e63da4b14bf0fd4494371d74e09cad310a5a7a7a5e2ed71d9c
-built-at=2026-09-19T00:00:00Z
-host=unpinned-import
+dylib-sha256=d83c3b4c51d73177572661e3691998a52288c340df631da3a95f38cd5f6bfc0c
+built-at=2026-09-28T22:04:22Z
+host=dragon
