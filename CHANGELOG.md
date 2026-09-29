@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - Unreleased
+
+### Added
+
+- **Ask can read, search, and edit the current document**, including unsaved
+  changes. Its document tools retrieve text as needed and apply edits through
+  the editor, with native Undo/Redo and the usual recovery and auto-save rules.
+- Show tool activity while Ask works. Stop cancels the engine's active turn;
+  switching documents or closing the document window revokes its access.
+
+### Changed
+
+- **Pensieve owns its AI engine configuration, credentials, and conversation
+  history.** The engine ships inside Pensieve; using Ask does not require the
+  Codescribe application, its account setup, or a running companion process.
+- Send each Ask instruction as one agent turn. Long documents are read in
+  bounded portions on demand instead of becoming separate page conversations
+  whose earlier answers were discarded.
+
+### Fixed
+
+- Keep ordinary typing and line-break highlighting scoped to the actual text
+  edit. TextKit's wider formatting invalidation no longer incorrectly triggers
+  a whole-document repaint when a nearby code fence has not changed. This
+  removes a reproduced cause of viewport jumps in editor and split views while
+  preserving native caret scrolling.
+- Replace expensive fenced-code pattern matching with a linear scan, preventing
+  pathological highlighting stalls on large or unfinished fenced blocks.
+- Parse Markdown previews off the main thread, coalesce pending work, and reject
+  stale results so rapid edits cannot build an unbounded rendering backlog or
+  display an older document revision.
+- Release completed workspace-validation tasks and their retained scan results.
+- Reject unfinished AI Responses before replacing document text, and preserve
+  every output text part of a completed response.
+- Reject Ask edits based on stale document content or ambiguous replacement
+  text. Ignore late events from cancelled turns so they cannot restart a stopped
+  task or update the wrong document session.
+
+### Release engineering
+
+- Pin the embedded engine and generated bindings together, using the same
+  optimized engine payload in debug and release builds.
+- Extend isolated runtime credential cleanup to Pensieve's agent account.
+
+### Known limitations
+
+- Installed-app verification of editor scroll stability and Ask's live provider
+  workflow remains pending; automated regression tests do not establish that
+  all reported scrolling, heating, or responsiveness issues are resolved.
+- Dictation remains unqualified for release. Outstanding upstream ASR and Apple
+  streaming test failures require separate resolution.
+- Whole-document Rewrite still has no input chunking or context-budget
+  preflight. Ask's bounded document reads do not remove that separate limit.
+
 ## [0.5.0] - Unreleased
 
 ### Changed
