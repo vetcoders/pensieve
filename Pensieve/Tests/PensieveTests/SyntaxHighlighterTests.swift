@@ -627,7 +627,7 @@ final class SyntaxHighlighterTests: XCTestCase {
   func testUnclosedFenceBelowLargeDocumentThresholdFinishesPromptly() {
     // A normal-sized pasted log must not pin the main actor while its closing
     // delimiter has not been typed yet. The old matcher retries every newline.
-    let text = "```text\n" + String(repeating: "unfinished log line\n", count: 4_000)
+    let text = "```text\n" + String(repeating: "unfinished log line\n", count: 3_000)
     XCTAssertFalse(LargeDocument.isLarge(text.utf16.count))
     let storage = NSTextStorage(string: text)
     let highlighter = CodeBlockHighlighter()

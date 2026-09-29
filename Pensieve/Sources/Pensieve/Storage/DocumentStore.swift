@@ -1067,7 +1067,8 @@ final class FolderManager {
     let protectsDirtySession = appState.documentSession.isDirty
 
     if presentationChanged {
-      applyWorkspaceScans(snapshot.scans, into: appState)
+      applyWorkspaceScans(
+        snapshot.scans, presentationSignature: snapshot.presentationSignature, into: appState)
       if let fingerprint = snapshot.fingerprint {
         workspaceIndexWriteTask = commitWorkspaceManifest(
           rootURLs: roots,
@@ -1805,7 +1806,8 @@ final class FolderManager {
       }
 
       // Publication happens only after cancellation, generation, roots, and open-file guards.
-      self.applyWorkspaceScans(validation.scans, into: appState)
+      self.applyWorkspaceScans(
+        validation.scans, presentationSignature: validation.presentationSignature, into: appState)
 
       // Open the index OFF the main thread (coalesced — subsequent DB consumers reuse this pool).
       await self.indexDatabase.openInBackground(into: appState)
@@ -2349,9 +2351,6 @@ final class FolderManager {
         exclusions: exclusions,
         fingerprint: fingerprint
       )
-      if let cachedScans {
-        try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
-      }
       let documents = appState.documents
       // Handed over through `scheduleIndexWrite` rather than a bare `Task` for the same reason the
       // save tail is: these three calls are `IndexDatabase` WRITES, and a bare task is invisible to
@@ -2360,7 +2359,18 @@ final class FolderManager {
       // landing mid-manifest used to drain, checkpoint, and only THEN take these writes' frames,
       // recreating the WAL the maintenance had just truncated. One mechanism for every writer.
       let indexDatabase = self.indexDatabase
+      let cacheStore = self.cacheStore
       return indexDatabase.scheduleIndexWrite {
+        if let cachedScans {
+          let cacheWrite = Task.detached(priority: .utility) {
+            try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
+          }
+          do {
+            try await cacheWrite.value
+          } catch {
+            NSLog("%@", "Presentation cache write failed: \(error)")
+          }
+        }
         await indexDatabase.upsertWorkspace(
           identity: identity,
           roots: rootURLs,
@@ -2399,10 +2409,15 @@ final class FolderManager {
     }
   }
 
-  private func applyWorkspaceScans(_ scans: [WorkspaceScan], into appState: AppState) {
+  private func applyWorkspaceScans(
+    _ scans: [WorkspaceScan],
+    presentationSignature: WorkspacePresentationSignature? = nil,
+    into appState: AppState
+  ) {
     appState.documents = scans.flatMap(\.documents)
     appState.workspaceTree = scans.map(\.rootNode)
-    lastWorkspacePresentationSignature = WorkspacePresentationSignature(scans: scans)
+    lastWorkspacePresentationSignature =
+      presentationSignature ?? WorkspacePresentationSignature(scans: scans)
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }

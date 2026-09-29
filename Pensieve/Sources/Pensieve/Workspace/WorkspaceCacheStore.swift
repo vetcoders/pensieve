@@ -180,6 +180,9 @@ enum BasicCacheVerdict: Equatable {
 /// Immutable cache-root handle safe to share with detached validation jobs. Encoders/decoders are
 /// created per operation below; Foundation coders are not shared across threads.
 final class WorkspaceCacheStore: Sendable {
+  /// Decoding a larger tree during workspace opening can monopolize the main
+  /// thread. Such a tree is rebuilt by the existing detached validation walk.
+  static let synchronousPresentationCacheBudget = 65_536
   static let shared = WorkspaceCacheStore()
 
   private static let protectedWriteOptions: Data.WritingOptions = [
@@ -238,9 +241,22 @@ final class WorkspaceCacheStore: Sendable {
   /// a fresh filesystem walk validates it in the background. Search correctness remains guarded
   /// independently by the signature + index cache.
   func writeWorkspaceScans(_ scans: [WorkspaceScan], for identity: WorkspaceIdentity) throws {
-    let root = try ensureCacheRoot(for: identity)
+    guard Self.fitsPresentationCacheBudget(scans) else { return }
     let data = try Self.treeEncoder().encode(scans)
+    guard data.count <= Self.synchronousPresentationCacheBudget else { return }
+    let root = try ensureCacheRoot(for: identity)
     try Self.writeProtected(data, to: root.appendingPathComponent("workspace-tree.plist"))
+  }
+
+  private static func fitsPresentationCacheBudget(_ scans: [WorkspaceScan]) -> Bool {
+    var remaining = synchronousPresentationCacheBudget
+    var pending = scans.map(\.rootNode)
+    while let node = pending.popLast() {
+      remaining -= node.id.utf8.count + node.name.utf8.count + 64
+      guard remaining >= 0 else { return false }
+      pending.append(contentsOf: node.children ?? [])
+    }
+    return true
   }
 
   func clearCache(for identity: WorkspaceIdentity) throws {
@@ -324,7 +340,12 @@ final class WorkspaceCacheStore: Sendable {
     guard existingCacheRoot(for: identity) != nil else { return nil }
     let url = workspaceScansURL(for: identity)
     guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+    guard
+      let byteCount = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+      byteCount <= Self.synchronousPresentationCacheBudget
+    else { return nil }
     let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    guard data.count <= Self.synchronousPresentationCacheBudget else { return nil }
     return try PropertyListDecoder().decode([WorkspaceScan].self, from: data)
   }
 

@@ -66,7 +66,8 @@ struct AskComposerView: View {
     .padding(.horizontal, 12)
     .padding(.top, 6)
     .padding(.bottom, 8)
-    .frame(maxHeight: 280)
+    .frame(height: isCompact ? 120 : nil, alignment: .top)
+    .fixedSize(horizontal: false, vertical: true)
     .background(.bar)
     .overlay(alignment: .top) { Divider() }
     .accessibilityIdentifier("pensieve.ask.composer")
@@ -76,6 +77,15 @@ struct AskComposerView: View {
       await grokAccount.adoptGrokForAskIfSignedIn()
       await codexAccount.adoptCodexForAskIfSignedIn()
     }
+  }
+
+  private var isCompact: Bool {
+    thread.turns.isEmpty
+      && (thread.preflight == nil || thread.phase != .awaitingConfirmation)
+      && thread.lastError == nil
+      && grokAccount.lastError == nil
+      && codexAccount.lastError == nil
+      && thread.activity == nil
   }
 
   private var header: some View {
