@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import Synchronization
 import XCTest
@@ -314,6 +315,70 @@ final class AutocompleteControllerTests: XCTestCase {
     surface.textView.undoManager?.undo()
     XCTAssertEqual(surface.textStorage.string, "A rough sentence.")
     XCTAssertEqual(store.session(for: "doc-rewrite").continuation, .none)
+  }
+
+  func testSupersededRewriteFailureCannotDisableCancellationOfCurrentRewrite() async {
+    let backend = SuspendedRewriteBackend()
+    let controller = AutocompleteController(completionFactory: { backend })
+    func request(_ text: String) {
+      controller.requestRewrite(
+        context: RewriteContext(
+          text: text, rangeLocation: 0, rangeLength: text.utf16.count, documentRevision: 0),
+        intent: .improve)
+    }
+    request("old")
+    await backend.waitForRequest("old")
+    request("current")
+    await backend.waitForRequest("current")
+
+    let staleError = expectation(description: "superseded failure must not reach the UI")
+    staleError.isInverted = true
+    let subscription = controller.$lastError.compactMap { $0 }.sink { _ in staleError.fulfill() }
+    await backend.fail("old")
+    await fulfillment(of: [staleError], timeout: 0.15)
+    subscription.cancel()
+
+    controller.cancelRewrite()
+    await backend.succeed("current")
+    let cancelled = await backend.waitForReturn("current")
+    XCTAssertTrue(cancelled, "the current task must still be reachable by Cancel")
+    // Drain publication after the controlled backend returns.
+    await nonCancellableSleep(nanoseconds: 30_000_000)
+    XCTAssertNil(controller.rewritePreview, "Cancel must not resurrect a late rewrite")
+    XCTAssertNil(controller.lastError)
+  }
+
+  func testLateRewriteFailureCannotPublishIntoAnotherDocument() async {
+    let backend = SuspendedRewriteBackend()
+    let controller = AutocompleteController(completionFactory: { backend })
+    controller.configureDocument(id: "first")
+    controller.requestRewrite(
+      context: RewriteContext(text: "first", rangeLocation: 0, rangeLength: 5, documentRevision: 0),
+      intent: .improve)
+    await backend.waitForRequest("first")
+    controller.configureDocument(id: "second")
+
+    let staleError = expectation(description: "previous document must not publish an error")
+    staleError.isInverted = true
+    let subscription = controller.$lastError.compactMap { $0 }.sink { _ in staleError.fulfill() }
+    await backend.fail("first")
+    await fulfillment(of: [staleError], timeout: 0.15)
+    subscription.cancel()
+    XCTAssertNil(controller.lastError)
+    XCTAssertNil(controller.rewritePreview)
+  }
+
+  func testCurrentRewriteFailureStillReportsItsError() async {
+    let backend = SuspendedRewriteBackend()
+    let controller = AutocompleteController(completionFactory: { backend })
+    controller.requestRewrite(
+      context: RewriteContext(
+        text: "current", rangeLocation: 0, rangeLength: 7, documentRevision: 0),
+      intent: .improve)
+    await backend.waitForRequest("current")
+    await backend.fail("current")
+    await waitUntil { controller.lastError != nil }
+    XCTAssertNil(controller.rewritePreview)
   }
 
   func testRewriteWithoutSelectionUsesCurrentParagraphAndRefusesStaleRange() async {
@@ -966,6 +1031,63 @@ private actor AsyncGate {
     isOpen = true
     continuation?.resume()
     continuation = nil
+  }
+}
+
+private actor SuspendedRewriteBackend: AutocompleteCompleting, AIRewriting {
+  private struct Pending {
+    let context: RewriteContext
+    let session: DocumentAISession
+    let continuation: CheckedContinuation<AICandidate, Error>
+  }
+  private var pending: [String: Pending] = [:]
+  private var returned: [String: Bool] = [:]
+
+  func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String { "" }
+
+  func rewrite(context: RewriteContext, intent: RewriteIntent, session: DocumentAISession)
+    async throws -> AICandidate
+  {
+    defer { returned[context.text] = Task.isCancelled }
+    return try await withCheckedThrowingContinuation { continuation in
+      pending[context.text] = Pending(
+        context: context, session: session, continuation: continuation)
+    }
+  }
+
+  func waitForRequest(_ text: String) async {
+    for _ in 0..<1000 {
+      if pending[text] != nil { return }
+      try? await Task.sleep(for: .milliseconds(1))
+    }
+    XCTFail("rewrite request did not start: \(text)")
+  }
+
+  func waitForReturn(_ text: String) async -> Bool {
+    for _ in 0..<1000 {
+      if let cancelled = returned[text] { return cancelled }
+      try? await Task.sleep(for: .milliseconds(1))
+    }
+    XCTFail("rewrite request did not return: \(text)")
+    return false
+  }
+
+  func fail(_ text: String) {
+    pending.removeValue(forKey: text)?.continuation.resume(
+      throwing: URLError(.networkConnectionLost))
+  }
+
+  func succeed(_ text: String) {
+    guard let request = pending.removeValue(forKey: text) else { return }
+    request.continuation.resume(
+      returning: AICandidate(
+        documentID: request.session.documentID, text: "rewritten \(text)", providerInput: text,
+        providerFingerprint: ProviderFingerprint(
+          shape: .openAIResponses, endpoint: "injected", model: "injected"),
+        pendingContinuation: .none, invalidatedOpaqueContinuation: false,
+        documentRevision: request.context.documentRevision,
+        replacementRange: NSRange(
+          location: request.context.rangeLocation, length: request.context.rangeLength)))
   }
 }
 
