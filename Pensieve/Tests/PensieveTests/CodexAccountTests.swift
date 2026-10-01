@@ -121,6 +121,74 @@ final class CodexAccountTests: XCTestCase {
     XCTAssertEqual(bridge.laneWrites, [], "an explicit Grok pin stays put")
   }
 
+  func testBothAccountSurfacesFollowEveryExplicitSelectionIncludingOpenAIAPIKey() async {
+    let suite = "pensieve.tests.ask-routing.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let bridge = FakeCodexAccountBridge(
+      signedIn: true, grokSignedIn: true, laneProviderID: "xai-responses")
+    let state = AskAccountState(bridge: bridge, defaults: defaults)
+    let grok = GrokAccount(laneChoiceDefaults: defaults, accountState: state)
+    let codex = CodexAccount(laneChoiceDefaults: defaults, accountState: state)
+    await grok.refresh()
+    XCTAssertTrue(grok.snapshot.askUsesGrok)
+    XCTAssertFalse(codex.snapshot.askUsesCodex)
+
+    await codex.useCodexForAsk()
+    XCTAssertFalse(grok.snapshot.askUsesGrok)
+    XCTAssertTrue(grok.snapshot.askUsesCodex)
+    XCTAssertTrue(codex.snapshot.askUsesCodex)
+
+    await codex.useAPIKeyProviderForAsk(.openAIResponses)
+    XCTAssertFalse(grok.snapshot.askUsesGrok)
+    XCTAssertFalse(grok.snapshot.askUsesCodex)
+    XCTAssertFalse(codex.snapshot.askUsesCodex)
+    XCTAssertEqual(codex.snapshot.askProvider(apiKey: "test-key"), .apiKey("test-key"))
+    // The choice survives reconstruction and distinguishes an API key from
+    // stored OAuth tokens for the same provider id.
+    let reopened = AskAccountState(bridge: bridge, defaults: defaults)
+    await reopened.refresh()
+    XCTAssertFalse(reopened.snapshot?.codex.askUsesCodex ?? true)
+    try? await state.select("xai-responses", choice: .automatic)
+    XCTAssertFalse(grok.snapshot.askUsesGrok)
+    // Opening Settings or another document must not undo the user's choice.
+    await grok.refresh()
+    await codex.refresh()
+    await grok.adoptGrokForAskIfSignedIn()
+    await codex.adoptCodexForAskIfSignedIn()
+    XCTAssertFalse(codex.snapshot.askUsesCodex)
+    XCTAssertFalse(grok.snapshot.askUsesGrok)
+
+    await grok.useGrokForAsk()
+    XCTAssertTrue(grok.snapshot.askUsesGrok)
+    XCTAssertFalse(codex.snapshot.askUsesCodex)
+    XCTAssertEqual(codex.snapshot.assistiveProviderID, "xai-responses")
+    await codex.useCodexForAsk()
+    XCTAssertFalse(grok.snapshot.askUsesGrok)
+    XCTAssertTrue(codex.snapshot.askUsesCodex)
+    XCTAssertEqual(
+      bridge.laneWrites,
+      [
+        "openai-responses", "openai-responses", "xai-responses", "openai-responses",
+      ])
+  }
+
+  func testExplicitChoiceOutranksOldProcessEnvironmentWithoutChangingAutocomplete() async {
+    let environment = AskTestEnvironment(values: ["LLM_ASSISTIVE_PROVIDER": "openai-responses"])
+    let bridge = FakeCodexAccountBridge(
+      signedIn: true, grokSignedIn: true, environment: environment)
+    let state = AskAccountState(bridge: bridge, environment: environment)
+    let grok = GrokAccount(accountState: state)
+    let codex = CodexAccount(accountState: state)
+    await grok.refresh()
+    XCTAssertTrue(codex.snapshot.askUsesCodex)
+    await grok.useGrokForAsk()
+    XCTAssertTrue(grok.snapshot.askUsesGrok)
+    XCTAssertFalse(codex.snapshot.askUsesCodex)
+    XCTAssertEqual(environment.value(forKey: "LLM_ASSISTIVE_PROVIDER"), "xai-responses")
+    XCTAssertEqual(environment.value(forKey: "PENSIEVE_COMPLETION_PROVIDER"), "openai-responses")
+  }
+
   private func waitUntil(
     timeout: TimeInterval = 2.0, _ predicate: @escaping () -> Bool
   ) async -> Bool {
@@ -191,13 +259,16 @@ private final class FakeCodexAccountBridge: CodescribeAccountBridging {
 
   private let state: Mutex<State>
   private let awaitGate: DispatchSemaphore?
+  private let environment: (any ProviderEnvironmentManaging)?
 
   init(
     signedIn: Bool = false,
     grokSignedIn: Bool = false,
     laneProviderID: String = "anthropic-messages",
-    gateAwait: Bool = false
+    gateAwait: Bool = false,
+    environment: (any ProviderEnvironmentManaging)? = nil
   ) {
+    self.environment = environment
     state = Mutex(
       State(signedIn: signedIn, grokSignedIn: grokSignedIn, laneProviderID: laneProviderID))
     awaitGate = gateAwait ? DispatchSemaphore(value: 0) : nil
@@ -220,7 +291,8 @@ private final class FakeCodexAccountBridge: CodescribeAccountBridging {
   }
 
   func assistiveLane() -> CsRuntimeLlmLane {
-    CodexAccountTests.lane(state.withLock { $0.laneProviderID })
+    CodexAccountTests.lane(
+      environment?.value(forKey: "LLM_ASSISTIVE_PROVIDER") ?? state.withLock { $0.laneProviderID })
   }
 
   func startAccountLogin(providerId: String) throws -> CsAccountLoginResult {
@@ -254,5 +326,15 @@ private final class FakeCodexAccountBridge: CodescribeAccountBridging {
       state.laneWrites.append(providerId)
       state.laneProviderID = providerId
     }
+  }
+}
+
+private final class AskTestEnvironment: ProviderEnvironmentManaging {
+  private let values: Mutex<[String: String]>
+  init(values: [String: String]) { self.values = Mutex(values) }
+  func value(forKey key: String) -> String? { values.withLock { $0[key] } }
+  func setValue(_ value: String, forKey key: String) throws { values.withLock { $0[key] = value } }
+  func removeValue(forKey key: String) throws {
+    _ = values.withLock { $0.removeValue(forKey: key) }
   }
 }

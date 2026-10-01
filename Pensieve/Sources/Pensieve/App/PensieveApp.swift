@@ -239,9 +239,8 @@ struct DocumentWindowRootView: View {
           openInitialDocument(initialDocument)
         }
       }
-      .onOpenURL { url in
-        controller.openFile(url: url)
-      }
+      // External URL opens belong to AppDelegate -> LaunchIntentCoordinator.
+      // This root is also hosted by AppKit; onOpenURL requires a SwiftUI scene.
       // Keep the command-surface fallback pointed at the root the user is
       // actually on. `.task` adopts early so the cold menu bar has content
       // before anything is focusable; from the first key transition onwards

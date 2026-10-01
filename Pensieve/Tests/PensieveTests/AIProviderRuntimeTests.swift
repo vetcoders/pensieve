@@ -191,7 +191,8 @@ final class AIProviderRuntimeTests: XCTestCase {
 
   func testAnthropicReplaysAcceptedLedgerAndNeverUsesMessageIDAsContinuation() async throws {
     let environment = StubProviderEnvironment([
-      "LLM_ASSISTIVE_PROVIDER": "anthropic-messages",
+      "PENSIEVE_COMPLETION_PROVIDER": "anthropic-messages",
+      "LLM_ASSISTIVE_PROVIDER": "xai-responses",
       "LLM_ASSISTIVE_ENDPOINT": "https://api.anthropic.com/v1/messages",
       "LLM_ASSISTIVE_MODEL": "claude-test",
       "LLM_ANTHROPIC_API_KEY": "key",

@@ -124,7 +124,7 @@ final class CodexAccount: ObservableObject {
   nonisolated static let providerID = "openai-responses"
   nonisolated static let loginTimeoutSeconds: UInt64 = GrokAccount.loginTimeoutSeconds
 
-  static let shared = CodexAccount(laneChoiceDefaults: .standard)
+  static let shared = CodexAccount(laneChoiceDefaults: .standard, accountState: .shared)
 
   @Published private(set) var snapshot: CodexAccountSnapshot = .unknown
   @Published private(set) var phase: CodexLoginPhase = .idle
@@ -135,6 +135,8 @@ final class CodexAccount: ObservableObject {
 
   private let bridge: any CodescribeAccountBridging
   private let laneChoiceDefaults: UserDefaults?
+  private let accountState: AskAccountState
+  private var stateSubscription: AnyCancellable?
   private let staleAfter: TimeInterval
   private let now: () -> Date
   private var lastRefresh: Date?
@@ -146,27 +148,26 @@ final class CodexAccount: ObservableObject {
     signInAllowed: Bool = SandboxCapabilities.allowsAccountSignIn(),
     laneChoiceDefaults: UserDefaults? = nil,
     staleAfter: TimeInterval = 30,
-    now: @escaping () -> Date = Date.init
+    now: @escaping () -> Date = Date.init,
+    accountState: AskAccountState? = nil
   ) {
-    self.bridge = bridge ?? Self.defaultBridge()
+    let state = accountState ?? AskAccountState(bridge: bridge, defaults: laneChoiceDefaults)
+    self.accountState = state
+    self.bridge = state.bridge
     self.signInAllowed = signInAllowed
     self.laneChoiceDefaults = laneChoiceDefaults
     self.staleAfter = staleAfter
     self.now = now
-  }
-
-  nonisolated private static func defaultBridge() -> any CodescribeAccountBridging {
-    if AppSupportLocation.isRunningTests() { return InertCodescribeAccountBridge() }
-    return LiveCodescribeAccountBridge()
+    stateSubscription = state.$snapshot.sink { [weak self] snapshot in
+      guard let self, let snapshot else { return }
+      self.snapshot = snapshot.codex
+      self.hasLoaded = true
+      self.lastRefresh = self.now()
+    }
   }
 
   func refresh() async {
-    let bridge = self.bridge
-    if let read = try? await Self.offMain({
-      (providers: bridge.availableProviders(), lane: bridge.assistiveLane())
-    }) {
-      snapshot = CodexAccountSnapshot(providers: read.providers, assistiveLane: read.lane)
-    }
+    await accountState.refresh()
     hasLoaded = true
     lastRefresh = now()
   }
@@ -230,8 +231,7 @@ final class CodexAccount: ObservableObject {
     case .success(let result) where result.status == "signed_in":
       if snapshot.isSignedIn {
         phase = .authorized
-        GrokAccount.pinAccount(providerID, defaults: laneChoiceDefaults)
-        await routeAsk(to: providerID)
+        await routeAsk(to: providerID, choice: .account)
       } else {
         phase = .failed(
           .underlying(.other("OpenAI reported success, but no Codex account was stored.")))
@@ -269,9 +269,7 @@ final class CodexAccount: ObservableObject {
       lastError = AskReadiness.codexNotReadyMessage
       return
     }
-    GrokAccount.pinAccount(Self.providerID, defaults: laneChoiceDefaults)
-    guard !snapshot.askUsesCodex else { return }
-    await routeAsk(to: Self.providerID)
+    await routeAsk(to: Self.providerID, choice: .account)
   }
 
   /// A signed-in Codex account drives Ask unless the user pinned another
@@ -291,22 +289,18 @@ final class CodexAccount: ObservableObject {
   }
 
   func useAPIKeyProviderForAsk(_ shape: CompletionProviderShape) async {
-    guard snapshot.askUsesCodex else { return }
-    GrokAccount.pinAPIKey(laneChoiceDefaults)
-    await routeAsk(to: shape.rawValue)
+    await routeAsk(to: shape.rawValue, choice: .apiKey)
   }
 
-  private func routeAsk(to providerID: String) async {
-    let bridge = self.bridge
+  private func routeAsk(
+    to providerID: String, choice: AskAccountState.Choice = .automatic
+  ) async {
     do {
-      try await Self.offMain {
-        try bridge.setLaneProvider(lane: .assistive, providerId: providerID)
-      }
+      try await accountState.select(providerID, choice: choice)
       lastError = nil
     } catch {
       lastError = "Could not switch the Ask provider: \(GrokLoginFailure.detail(of: error))"
     }
-    await refresh()
   }
 
   nonisolated private static func offMain<T: Sendable>(

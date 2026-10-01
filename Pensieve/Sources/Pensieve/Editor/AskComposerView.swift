@@ -35,30 +35,37 @@ struct AskComposerView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       header
-      if !thread.turns.isEmpty {
-        turnList
-      }
-      if let preflight = thread.preflight, thread.phase == .awaitingConfirmation {
-        preflightPanel(preflight)
-      }
-      if let error = thread.lastError, !thread.isStreaming {
-        Text(error)
-          .font(.system(size: 10.5))
-          .foregroundStyle(.red)
-          .accessibilityIdentifier("pensieve.ask.error")
-      }
-      if let error = grokAccount.lastError ?? codexAccount.lastError {
-        Text(error)
-          .font(.system(size: 10.5))
-          .foregroundStyle(.red)
-          .accessibilityIdentifier("pensieve.ask.providerError")
-      }
-      if let activity = thread.activity, thread.isStreaming {
-        HStack {
-          Text(activity).font(.caption).foregroundStyle(.secondary)
-          Spacer()
-          Button("Stop") { thread.cancel() }
-            .accessibilityIdentifier("pensieve.ask.stop")
+      if !isCompact {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 6) {
+            if !thread.turns.isEmpty {
+              turnList
+            }
+            if let preflight = thread.preflight, thread.phase == .awaitingConfirmation {
+              preflightPanel(preflight)
+            }
+            if let error = thread.lastError, !thread.isStreaming {
+              Text(error)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.red)
+                .accessibilityIdentifier("pensieve.ask.error")
+            }
+            if let error = grokAccount.lastError ?? codexAccount.lastError {
+              Text(error)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.red)
+                .accessibilityIdentifier("pensieve.ask.providerError")
+            }
+            if let activity = thread.activity, thread.isStreaming {
+              HStack {
+                Text(activity).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Stop") { thread.cancel() }
+                  .accessibilityIdentifier("pensieve.ask.stop")
+              }
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
       composer
@@ -66,7 +73,7 @@ struct AskComposerView: View {
     .padding(.horizontal, 12)
     .padding(.top, 6)
     .padding(.bottom, 8)
-    .frame(height: isCompact ? 120 : nil, alignment: .top)
+    .frame(height: isCompact ? 120 : 280, alignment: .top)
     .fixedSize(horizontal: false, vertical: true)
     .background(.bar)
     .overlay(alignment: .top) { Divider() }
@@ -243,16 +250,18 @@ struct AskComposerView: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
-        TextEditor(text: $thread.draft)
-          .font(.callout)
-          .scrollContentBackground(.hidden)
-          .frame(height: 64)
-          .disabled(thread.isStreaming)
-          .accessibilityLabel("Ask question")
-          .accessibilityIdentifier("pensieve.ask.draft")
+        AskDraftEditor(text: $thread.draft, isEnabled: !thread.isStreaming) {
+          prepareSend()
+        }
+        .font(.callout)
+        .scrollContentBackground(.hidden)
+        .frame(height: 64)
+        .disabled(thread.isStreaming)
+        .accessibilityLabel("Ask question")
+        .accessibilityIdentifier("pensieve.ask.draft")
       }
       Button(thread.isStreaming ? "Asking…" : "Ask") {
-        _ = thread.prepareSend(document: documentText, provider: provider)
+        prepareSend()
       }
       .buttonStyle(.borderedProminent)
       .controlSize(.small)
@@ -272,6 +281,17 @@ struct AskComposerView: View {
     .overlay {
       RoundedRectangle(cornerRadius: 8, style: .continuous)
         .strokeBorder(Color.secondary.opacity(0.3), lineWidth: 1)
+    }
+  }
+
+  private func prepareSend() {
+    if thread.phase == .awaitingConfirmation {
+      _ = thread.confirmAndSend(
+        document: documentText, provider: provider, host: makeDocumentHost(),
+        configuration: grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
+          ? nil : apiConfiguration)
+    } else {
+      _ = thread.prepareSend(document: documentText, provider: provider)
     }
   }
 

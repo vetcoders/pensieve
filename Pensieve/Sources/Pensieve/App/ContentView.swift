@@ -10,7 +10,7 @@ struct ContentView: View {
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
-  @StateObject private var askThreads = DocumentAskThreadStore()
+  @StateObject private var askThreads: DocumentAskThreadStore
   @State private var lastIngestedDictation = ""
   /// Shared with the status bar's Ask chip and the composer header — one key,
   /// three surfaces. Default visible preserves the pre-toggle behavior.
@@ -22,8 +22,10 @@ struct ContentView: View {
   init(
     hostWindow: Binding<NSWindow?> = .constant(nil),
     providerSettings: ProviderSettings = .shared,
-    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil
+    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil,
+    askThreads: DocumentAskThreadStore? = nil
   ) {
+    _askThreads = StateObject(wrappedValue: askThreads ?? DocumentAskThreadStore())
     _hostWindow = hostWindow
     _providerSettings = ObservedObject(wrappedValue: providerSettings)
     _providerOnboardingCoordinator = ObservedObject(
@@ -70,9 +72,11 @@ struct ContentView: View {
           WindowErrorBanner(error: error) { appState.dismissVisibleError() }
         }
         if appState.documentHasEditableBuffer {
-          if askVisible {
+          if askVisible,
+            let thread = askThreads.existingThread(for: appState.documentSession.askThreadID)
+          {
             AskComposerView(
-              thread: askThreads.thread(for: appState.documentSession.askThreadID),
+              thread: thread,
               grokAccount: .shared,
               codexAccount: .shared,
               documentText: appState.documentSession.text,
@@ -92,6 +96,16 @@ struct ContentView: View {
             .environmentObject(askThreads)
             .opacity(appState.mode == .focus ? 0.45 : 1)
         }
+      }
+    }
+    .task(id: appState.documentHasEditableBuffer ? appState.documentSession.askThreadID : nil) {
+      if askVisible, appState.documentHasEditableBuffer {
+        _ = askThreads.thread(for: appState.documentSession.askThreadID)
+      }
+    }
+    .onChange(of: askVisible) { _, visible in
+      if visible, appState.documentHasEditableBuffer {
+        _ = askThreads.thread(for: appState.documentSession.askThreadID)
       }
     }
     .onChange(of: appState.documentSession.askThreadID) { oldID, _ in
@@ -328,7 +342,7 @@ struct EditorPreviewSplit: View {
     }
     .frame(
       minWidth: Self.paneMinWidth, maxWidth: .infinity,
-      minHeight: 320, maxHeight: .infinity)
+      minHeight: 0, maxHeight: .infinity)
   }
 
   @ViewBuilder

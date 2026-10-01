@@ -198,26 +198,28 @@ final class ProviderSettings: ObservableObject {
   static let shared = ProviderSettings()
 
   nonisolated static let endpointEnvironmentKeys = [
-    "LLM_ASSISTIVE_ENDPOINT", "LLM_FORMATTING_ENDPOINT", "LLM_ENDPOINT",
+    "PENSIEVE_COMPLETION_ENDPOINT", "LLM_ASSISTIVE_ENDPOINT", "LLM_FORMATTING_ENDPOINT",
+    "LLM_ENDPOINT",
   ]
   nonisolated static let modelEnvironmentKeys = [
-    "LLM_ASSISTIVE_MODEL", "LLM_FORMATTING_MODEL", "LLM_MODEL",
+    "PENSIEVE_COMPLETION_MODEL", "LLM_ASSISTIVE_MODEL", "LLM_FORMATTING_MODEL", "LLM_MODEL",
   ]
   nonisolated static let apiKeyEnvironmentKeys = [
-    "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY", "LLM_API_KEY",
+    "PENSIEVE_COMPLETION_API_KEY", "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY", "LLM_API_KEY",
   ]
   nonisolated static let anthropicAPIKeyEnvironmentKeys = ["LLM_ANTHROPIC_API_KEY"]
   nonisolated static let providerShapeEnvironmentKeys = [
-    "LLM_ASSISTIVE_PROVIDER", "LLM_FORMATTING_PROVIDER", "LLM_PROVIDER",
+    "PENSIEVE_COMPLETION_PROVIDER", "LLM_ASSISTIVE_PROVIDER", "LLM_FORMATTING_PROVIDER",
+    "LLM_PROVIDER",
   ]
 
   private static let endpointDefaultsKey = "Pensieve.completionProvider.endpoint"
   private static let modelDefaultsKey = "Pensieve.completionProvider.model"
   private static let providerShapeDefaultsKey = "Pensieve.completionProvider.shape"
-  private static let assistiveEndpointKey = "LLM_ASSISTIVE_ENDPOINT"
-  private static let assistiveModelKey = "LLM_ASSISTIVE_MODEL"
-  private static let assistiveAPIKey = "LLM_ASSISTIVE_API_KEY"
-  private static let assistiveProviderKey = "LLM_ASSISTIVE_PROVIDER"
+  private static let completionEndpointKey = "PENSIEVE_COMPLETION_ENDPOINT"
+  private static let completionModelKey = "PENSIEVE_COMPLETION_MODEL"
+  private static let completionAPIKey = "PENSIEVE_COMPLETION_API_KEY"
+  private static let completionProviderKey = "PENSIEVE_COMPLETION_PROVIDER"
 
   @Published var providerShape: CompletionProviderShape
   @Published var endpoint: String
@@ -375,7 +377,7 @@ final class ProviderSettings: ObservableObject {
   }
 
   /// Explicit Save is the user override: it writes the highest-priority
-  /// assistive variables. At launch, however, any non-empty inherited provider
+  /// autocomplete variables, separate from the engine's Ask lane. At launch, any inherited provider
   /// variable wins and persisted UI values only fill missing fields. This keeps
   /// terminal/developer workflows intact while making Finder launches work.
   func save() throws {
@@ -398,11 +400,11 @@ final class ProviderSettings: ObservableObject {
       self.model = model
       self.apiKey = apiKey
 
-      try setManagedValue(endpoint, forKey: Self.assistiveEndpointKey)
-      try setManagedValue(model, forKey: Self.assistiveModelKey)
-      try setManagedValue(providerShape.rawValue, forKey: Self.assistiveProviderKey)
+      try setManagedValue(endpoint, forKey: Self.completionEndpointKey)
+      try setManagedValue(model, forKey: Self.completionModelKey)
+      try setManagedValue(providerShape.rawValue, forKey: Self.completionProviderKey)
       if !apiKey.isEmpty {
-        try setManagedValue(apiKey, forKey: Self.assistiveAPIKey)
+        try setManagedValue(apiKey, forKey: Self.completionAPIKey)
       }
 
       lastError = nil
@@ -418,7 +420,7 @@ final class ProviderSettings: ObservableObject {
   func forgetSavedAPIKey() throws {
     do {
       try keychain.deleteAPIKey()
-      try removeManagedValueIfOwned(forKey: Self.assistiveAPIKey)
+      try removeManagedValueIfOwned(forKey: Self.completionAPIKey)
       apiKey = ""
       lastError = nil
       saveStatus = "Saved API key removed."
@@ -436,16 +438,16 @@ final class ProviderSettings: ObservableObject {
     try fillMissingEnvironmentValue(
       persistedEndpoint,
       aliases: Self.endpointEnvironmentKeys,
-      key: Self.assistiveEndpointKey)
+      key: Self.completionEndpointKey)
     try fillMissingEnvironmentValue(
-      persistedModel, aliases: Self.modelEnvironmentKeys, key: Self.assistiveModelKey)
+      persistedModel, aliases: Self.modelEnvironmentKeys, key: Self.completionModelKey)
     if !launchHadEndpointEnvironment && !launchHadModelEnvironment
       && !persistedEndpoint.isEmpty && !persistedModel.isEmpty
     {
       try fillMissingEnvironmentValue(
         providerShape.rawValue,
         aliases: Self.providerShapeEnvironmentKeys,
-        key: Self.assistiveProviderKey)
+        key: Self.completionProviderKey)
     }
     // Never pair a saved secret with a developer-inherited endpoint/model: a
     // stale cloud key must not be sent to an unrelated local or test server.

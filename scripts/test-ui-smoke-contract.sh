@@ -456,6 +456,8 @@ assert_fixed_count 'prepare_first_smoke_scenario' 2
 assert_fixed_count 'prepare_next_smoke_scenario "Settings lifecycle scenario"' 1
 assert_fixed_count 'prepare_next_smoke_scenario "Settings onboarding transition scenario"' 1
 for environment_key in \
+  PENSIEVE_COMPLETION_ENDPOINT PENSIEVE_COMPLETION_MODEL \
+  PENSIEVE_COMPLETION_PROVIDER PENSIEVE_COMPLETION_API_KEY \
   LLM_ASSISTIVE_ENDPOINT LLM_FORMATTING_ENDPOINT LLM_ENDPOINT \
   LLM_ASSISTIVE_MODEL LLM_FORMATTING_MODEL LLM_MODEL
 do
