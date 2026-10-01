@@ -96,3 +96,117 @@ if pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.
 assert_old
 [[ -L "$case_root/apps/Pensieve.app" ]]
 printf 'PASS: nine idle-safe installation transaction cases\n'
+
+# Restart fixtures exercise the real graceful-Quit policy with process and
+# AppleEvent seams. No fixture can inspect or signal a desktop process.
+pensieve_install_running_pids() {
+    [[ "$process_lookup_fails" == false ]] || return 2
+    [[ -f "$case_root/running" ]] || return 1
+    cat "$case_root/running"
+}
+pensieve_install_process_path() { cat "$case_root/process-path"; }
+pensieve_install_pause() { :; }
+pensieve_install_verify() {
+    [[ -f "$1/trusted" ]] || return 1
+    printf 'verify\n' >> "$case_root/events"
+}
+pensieve_install_request_quit() {
+    # Both source and staged copies must be verified before interrupting work.
+    [[ "$(grep -c '^verify$' "$case_root/events")" == 2 ]] || return 1
+    printf 'quit\n' >> "$case_root/events"
+    [[ "$quit_mode" != cancelled ]] || return 1
+    if [[ "$quit_mode" == accepted ]]; then rm "$case_root/running"; fi
+}
+pensieve_install_launch() {
+    [[ "$(cat "$1/payload")" == new && -f "$1/trusted" ]] || return 1
+    printf 'launch\n' >> "$case_root/events"
+    [[ "$launch_fails" == false ]]
+}
+restart_case() {
+    setup_case "$1"
+    quit_mode=accepted
+    launch_fails=false
+    process_lookup_fails=false
+    printf '123\n' > "$case_root/running"
+    printf '%s\n' "$case_root/apps/Pensieve.app/Contents/MacOS/Pensieve" > "$case_root/process-path"
+    : > "$case_root/events"
+}
+restart_install() {
+    pensieve_install_built_app "$case_root/source.app" "$case_root/apps/Pensieve.app" true
+}
+reject_restart() {
+    if restart_install; then
+        printf 'FAIL: unsafe restart installation unexpectedly succeeded\n' >&2
+        exit 1
+    fi
+    assert_old
+    [[ ! -e "$case_root/apps/.pensieve-install-lock" ]]
+    ! grep -q '^launch$' "$case_root/events"
+}
+
+restart_case normal_restart
+restart_install
+[[ "$(cat "$case_root/events")" == $'verify\nverify\nquit\nlaunch' ]]
+[[ ! -e "$case_root/running" ]]
+
+restart_case cancelled_quit
+quit_mode=cancelled
+reject_restart
+[[ -f "$case_root/running" ]]
+
+restart_case quit_returned_but_app_still_running
+quit_mode=deferred
+reject_restart
+[[ -f "$case_root/running" ]]
+
+restart_case different_running_bundle
+printf '/another/checkout/Pensieve\n' > "$case_root/process-path"
+reject_restart
+! grep -q '^quit$' "$case_root/events"
+
+restart_case failed_process_census
+process_lookup_fails=true
+reject_restart
+! grep -q '^quit$' "$case_root/events"
+
+restart_case untrusted_candidate_does_not_quit
+rm "$case_root/source.app/trusted"
+reject_restart
+[[ ! -s "$case_root/events" ]]
+
+restart_case app_reopened_before_swap
+busy_call=1
+reject_restart
+
+restart_case failed_install_does_not_launch
+pensieve_install_verify_signature() { return 1; }
+reject_restart
+pensieve_install_verify_signature() { [[ -f "$1/trusted" ]]; }
+
+restart_case failed_launch_keeps_verified_install
+launch_fails=true
+if restart_install; then exit 1; fi
+[[ "$(cat "$case_root/apps/Pensieve.app/payload")" == new ]]
+[[ ! -e "$case_root/apps/.pensieve-install-lock" ]]
+
+restart_case already_idle
+rm "$case_root/running"
+restart_install
+[[ "$(cat "$case_root/events")" == $'verify\nverify\nlaunch' ]]
+
+restart_case fresh_install
+rm -rf "$case_root/apps/Pensieve.app"
+rm "$case_root/running"
+restart_install
+[[ "$(cat "$case_root/apps/Pensieve.app/payload")" == new ]]
+
+# The build target must leave the running app alone until the new build exists.
+python3 - "$SCRIPT_DIR/../Makefile" <<'PY'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+target = text.split('install-app: init-hooks', 1)[1].split('\n\n', 1)[0]
+assert '--check-idle' not in target
+assert target.index('$(MAKE) release-local') < target.index('--restart')
+PY
+printf 'PASS: graceful restart, cancellation, ownership, failure and target-ordering cases\n'

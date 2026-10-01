@@ -99,6 +99,11 @@ To install the locally built app into `/Applications`:
 make install-app
 ```
 
+This builds and verifies the new app, asks the running Pensieve to quit normally,
+installs it, and reopens it. Save prompts remain interactive; cancelling Quit
+leaves the installed app unchanged. Use `make install-built-app` to install an
+already built app only when Pensieve is closed, without automatically launching it.
+
 Developer and release checks:
 
 ```bash
