@@ -210,3 +210,47 @@ assert '--check-idle' not in target
 assert target.index('$(MAKE) release-local') < target.index('--restart')
 PY
 printf 'PASS: graceful restart, cancellation, ownership, failure and target-ordering cases\n'
+
+# A missing disposable cache must be reconstructed before provenance checks,
+# without updating the graph or replacing any existing checkout bytes.
+dependency_root="$fixture/dependencies"
+mkdir -p "$dependency_root/Pensieve"
+printf 'pinned graph\n' > "$dependency_root/Pensieve/Package.resolved"
+resolve_mode=success
+pensieve_install_resolve_package() {
+    printf 'resolve\n' >> "$dependency_root/calls"
+    [[ "$resolve_mode" != failure ]] || return 1
+    [[ "$resolve_mode" != missing ]] || return 0
+    mkdir -p "$1/.build/checkouts"
+    if [[ "$resolve_mode" == rewrite ]]; then
+        printf 'changed graph\n' > "$1/Package.resolved"
+    fi
+}
+pensieve_install_prepare_dependencies "$dependency_root"
+[[ "$(cat "$dependency_root/Pensieve/Package.resolved")" == 'pinned graph' ]]
+[[ "$(wc -l < "$dependency_root/calls" | tr -d ' ')" == 1 ]]
+printf 'existing checkout evidence\n' > "$dependency_root/Pensieve/.build/checkouts/evidence"
+pensieve_install_prepare_dependencies "$dependency_root"
+[[ "$(wc -l < "$dependency_root/calls" | tr -d ' ')" == 1 ]]
+[[ -f "$dependency_root/Pensieve/.build/checkouts/evidence" ]]
+for resolve_mode in failure missing rewrite; do
+    rm -rf "$dependency_root/Pensieve/.build"
+    printf 'pinned graph\n' > "$dependency_root/Pensieve/Package.resolved"
+    if pensieve_install_prepare_dependencies "$dependency_root"; then
+        printf 'FAIL: unsafe dependency restoration accepted (%s)\n' "$resolve_mode" >&2
+        exit 1
+    fi
+done
+rm -rf "$dependency_root/Pensieve/.build"
+rm "$dependency_root/Pensieve/Package.resolved"
+if pensieve_install_prepare_dependencies "$dependency_root"; then exit 1; fi
+python3 - "$SCRIPT_DIR/install-built-app.sh" <<'PY'
+from pathlib import Path
+import sys
+s = Path(sys.argv[1]).read_text()
+resolver = s.split('pensieve_install_resolve_package() {', 1)[1].split('\n}', 1)[0]
+assert '--force-resolved-versions resolve' in resolver
+verify = s.split('pensieve_install_verify() {', 1)[1].split('\n}', 1)[0]
+assert verify.index('pensieve_install_prepare_dependencies') < verify.index('isolated_app_assert_source_provenance')
+PY
+printf 'PASS: missing dependency recovery preserves pins and existing checkout evidence\n'

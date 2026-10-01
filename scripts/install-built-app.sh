@@ -78,13 +78,42 @@ pensieve_install_assert_idle() {
     fi
 }
 
+pensieve_install_resolve_package() {
+    swift package --package-path "$1" --force-resolved-versions resolve
+}
+
+pensieve_install_prepare_dependencies() {
+    local package="$1/Pensieve" pin_before pin_after
+    [[ -d "$package/.build/checkouts" ]] && return 0
+    [[ -f "$package/Package.resolved" ]] || {
+        pensieve_install_error 'cannot restore dependencies without Package.resolved'
+        return 1
+    }
+    pin_before="$(/usr/bin/shasum -a 256 "$package/Package.resolved")" || return 1
+    printf 'install: restoring missing SwiftPM checkouts from Package.resolved\n' >&2
+    pensieve_install_resolve_package "$package" >&2 || {
+        pensieve_install_error 'could not restore pinned dependencies; no bundle was changed'
+        return 1
+    }
+    pin_after="$(/usr/bin/shasum -a 256 "$package/Package.resolved")" || return 1
+    [[ "$pin_before" == "$pin_after" && -d "$package/.build/checkouts" ]] || {
+        pensieve_install_error 'dependency restoration changed the pins or left checkouts missing'
+        return 1
+    }
+}
+
 pensieve_install_verify() {
     local bundle="$1"
+    local repo_root
+    repo_root="$(cd "$PENSIEVE_INSTALL_SCRIPT_DIR/.." && pwd)" || return 1
+    # .build is disposable. Restore absent checkouts, then let the existing
+    # byte-level verifier authenticate them; never repair or hide dirty ones.
+    pensieve_install_prepare_dependencies "$repo_root" || return 1
     # Reuse only the read-only verification seam; no smoke identity is created.
     # No historical or dirty-source override is accepted for installation.
     source "$PENSIEVE_INSTALL_SCRIPT_DIR/lib/isolated-app.sh"
     isolated_app_assert_source_provenance \
-        "$(cd "$PENSIEVE_INSTALL_SCRIPT_DIR/.." && pwd)" "$bundle" 0 0 >/dev/null
+        "$repo_root" "$bundle" 0 0 >/dev/null
 }
 
 pensieve_install_verify_signature() {
