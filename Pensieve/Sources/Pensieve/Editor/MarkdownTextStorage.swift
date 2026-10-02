@@ -274,6 +274,14 @@ final class MarkdownTextStorage: NSTextContentStorage {
       return
     }
 
+    // The sweep will cover every pending edit. Absorb its debounce just as a
+    // synchronous full refresh does; otherwise a plain-document load queues
+    // an unbounded scoped repaint behind this viewport-first pass.
+    highlightWorkItem?.cancel()
+    highlightWorkItem = nil
+    pendingHighlightRange = nil
+    pendingRequiresFullRefresh = false
+
     let scope = codeBlockAwareScope(
       for: scopedHighlightRange(for: viewportRange, in: string))
     refreshHighlighting(in: scope)

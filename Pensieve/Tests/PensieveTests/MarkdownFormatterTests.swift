@@ -5,6 +5,33 @@ import XCTest
 @testable import Pensieve
 
 final class MarkdownFormatterTests: XCTestCase {
+  func testLargestIncrementableOrdinalStillContinuesListsAndTasks() {
+    for (suffix, nextSuffix) in [(". item", ". "), (") [x] done", ") [ ] ")] {
+      let original = "\(Int.max - 1)" + suffix
+      let conversion = MarkdownFormatter.autoconversion(
+        in: original, range: NSRange(location: original.utf16.count, length: 0), replacement: "\n")
+      XCTAssertEqual(conversion?.replacement, "\n\(Int.max)" + nextSuffix)
+    }
+  }
+
+  @MainActor
+  func testReturnOnUnrepresentableOrdinalPreservesTextWithoutAutoconversion() {
+    for number in [String(Int.max), String(repeating: "9", count: 80)] {
+      for suffix in [". item", ") [x] done"] {
+        let original = number + suffix
+        let surface = MarkdownEditorSurface(text: original, fontSize: 14)
+        let end = (original as NSString).length
+        surface.textView.setSelectedRange(NSRange(location: end, length: 0))
+
+        surface.textView.insertText("\n", replacementRange: NSRange(location: end, length: 0))
+
+        XCTAssertEqual(surface.textStorage.string, original + "\n")
+        surface.textView.undoManager?.undo()
+        XCTAssertEqual(surface.textStorage.string, original)
+      }
+    }
+  }
+
   @MainActor
   func testListReturnDoesNotForceWholeDocumentHighlighting() async throws {
     let tail = String(repeating: "A paragraph in a large document.\n\n", count: 4_000)
