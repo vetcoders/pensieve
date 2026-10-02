@@ -1,7 +1,7 @@
-codescribe-root=/Volumes/vc-workspace/vetcoders/codescribe
-codescribe-head=1a40e65c8e2c2f09ed47ab65e00fed03180f4210
-codescribe-describe=baseline/transcription-1292-87-g1a40e65c
+codescribe-root=/Users/polyversai/.vibecrafted/worktrees/vetcoders/codescribe/2026_1002/w1-04
+codescribe-head=e5582881e0eb56735251f37dcd42525f6c52d15d
+codescribe-describe=baseline/transcription-1292-88-ge5582881
 ffi-profile=release
-dylib-sha256=d83c3b4c51d73177572661e3691998a52288c340df631da3a95f38cd5f6bfc0c
-built-at=2026-09-28T22:04:22Z
+dylib-sha256=33f9eb104dca6186f53f8e59de21fa85f84e599e88ba5da36203f6fbf5fa387f
+built-at=2026-10-02T17:11:09Z
 host=dragon
