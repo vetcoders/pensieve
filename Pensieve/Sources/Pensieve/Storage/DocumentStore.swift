@@ -3028,100 +3028,111 @@ enum WorkspaceScanner {
     visitedDirectories: inout Set<String>,
     cancellationCheck: () throws -> Void
   ) throws -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
-    try cancellationCheck()
-    let standardizedDirectory = url.standardizedFileURL
-    guard contains(standardizedDirectory, in: root),
-      visitedDirectories.insert(standardizedDirectory.path).inserted
-    else {
-      return ([], [])
-    }
-
-    let fm = FileManager.default
-    guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
-      return ([], [])
-    }
-    // The URL-based directory API rejects a workspace root that is itself a
-    // symlink on current macOS. Enumerate names through the path API, then
-    // anchor each child to the logical workspace URL. Entry classification
-    // below reads link identity before directory/file target type.
-    let urls = childNames.map { url.appendingPathComponent($0) }
-
-    var documents: [DocumentRef] = []
-    var nodes: [WorkspaceNode] = []
-    let gitIgnoreRules =
-      inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
-    var entries: [WorkspaceDirectoryEntry] = []
-    entries.reserveCapacity(urls.count)
-    for childURL in urls {
+    // Recursive results survive the pool; directory enumeration, sorting and URL temporaries
+    // do not accumulate across the entire workspace walk.
+    return try autoreleasepool {
       try cancellationCheck()
-      if let entry = entry(
-        for: childURL,
-        root: root,
-        exclusions: exclusions,
-        gitIgnoreRules: gitIgnoreRules
-      ) {
-        entries.append(entry)
+      let standardizedDirectory = url.standardizedFileURL
+      guard contains(standardizedDirectory, in: root),
+        visitedDirectories.insert(standardizedDirectory.path).inserted
+      else {
+        return ([], [])
       }
-    }
-    entries.sort(by: workspaceSort)
 
-    for entry in entries {
-      try cancellationCheck()
-      if entry.isDirectory {
-        let childScan = try scanChildren(
-          folder: entry.url,
-          root: root,
-          exclusions: exclusions,
-          gitIgnoreRules: gitIgnoreRules,
-          visitedDirectories: &visitedDirectories,
-          cancellationCheck: cancellationCheck
-        )
-        documents.append(contentsOf: childScan.documents)
-        nodes.append(
-          WorkspaceNode(
-            id: "folder:\(entry.standardizedURL.path)",
-            name: entry.name,
-            kind: .folder,
-            url: entry.standardizedURL,
-            children: childScan.nodes
-          )
-        )
-      } else if entry.isRegularFile, isMarkdownFile(entry.url) {
-        let ref = DocumentRef(
-          id: entry.standardizedURL,
-          rootURL: root,
-          relativePath: entry.relativePath,
-          isAdHoc: false
-        )
-        documents.append(ref)
-        nodes.append(
-          WorkspaceNode(
-            id: "document:\(entry.standardizedURL.path)",
-            name: entry.url.deletingPathExtension().lastPathComponent,
-            kind: .document,
-            url: entry.standardizedURL,
-            children: nil
-          )
-        )
-      } else if entry.isRegularFile {
-        // Outside the markdown allow-list, but still on disk: surface it as an inert
-        // sidebar node instead of silently dropping it (that silence is how a rename
-        // that loses its extension used to look like data loss). It never joins
-        // `documents`, so FTS indexing, Open Files, and the open-document guards
-        // stay untouched.
-        nodes.append(
-          WorkspaceNode(
-            id: "foreign:\(entry.standardizedURL.path)",
-            name: entry.url.lastPathComponent,
-            kind: .foreignFile,
-            url: entry.standardizedURL,
-            children: nil
-          )
-        )
+      let fm = FileManager.default
+      guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
+        return ([], [])
       }
-    }
+      // The URL-based directory API rejects a workspace root that is itself a
+      // symlink on current macOS. Enumerate names through the path API, then
+      // anchor each child to the logical workspace URL. Entry classification
+      // below reads link identity before directory/file target type.
+      let urls = childNames.map { url.appendingPathComponent($0) }
 
-    return (documents, nodes)
+      var documents: [DocumentRef] = []
+      var nodes: [WorkspaceNode] = []
+      let gitIgnoreRules =
+        inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
+      var entries: [WorkspaceDirectoryEntry] = []
+      entries.reserveCapacity(urls.count)
+      for childURL in urls {
+        try cancellationCheck()
+        // Foundation path/metadata calls autorelease temporary objects. A detached scan can walk
+        // the entire workspace before its executor drains them; only retain the classified entry.
+        let classified = autoreleasepool {
+          entry(
+            for: childURL,
+            root: root,
+            exclusions: exclusions,
+            gitIgnoreRules: gitIgnoreRules
+          )
+        }
+        if let classified {
+          entries.append(classified)
+        }
+      }
+      entries.sort(by: workspaceSort)
+
+      for entry in entries {
+        try cancellationCheck()
+        try autoreleasepool {
+          if entry.isDirectory {
+            let childScan = try scanChildren(
+              folder: entry.url,
+              root: root,
+              exclusions: exclusions,
+              gitIgnoreRules: gitIgnoreRules,
+              visitedDirectories: &visitedDirectories,
+              cancellationCheck: cancellationCheck
+            )
+            documents.append(contentsOf: childScan.documents)
+            nodes.append(
+              WorkspaceNode(
+                id: "folder:\(entry.standardizedURL.path)",
+                name: entry.name,
+                kind: .folder,
+                url: entry.standardizedURL,
+                children: childScan.nodes
+              )
+            )
+          } else if entry.isRegularFile, isMarkdownFile(entry.url) {
+            let ref = DocumentRef(
+              id: entry.standardizedURL,
+              rootURL: root,
+              relativePath: entry.relativePath,
+              isAdHoc: false
+            )
+            documents.append(ref)
+            nodes.append(
+              WorkspaceNode(
+                id: "document:\(entry.standardizedURL.path)",
+                name: entry.url.deletingPathExtension().lastPathComponent,
+                kind: .document,
+                url: entry.standardizedURL,
+                children: nil
+              )
+            )
+          } else if entry.isRegularFile {
+            // Outside the markdown allow-list, but still on disk: surface it as an inert
+            // sidebar node instead of silently dropping it (that silence is how a rename
+            // that loses its extension used to look like data loss). It never joins
+            // `documents`, so FTS indexing, Open Files, and the open-document guards
+            // stay untouched.
+            nodes.append(
+              WorkspaceNode(
+                id: "foreign:\(entry.standardizedURL.path)",
+                name: entry.url.lastPathComponent,
+                kind: .foreignFile,
+                url: entry.standardizedURL,
+                children: nil
+              )
+            )
+          }
+        }
+      }
+
+      return (documents, nodes)
+    }
   }
 
   private static func entry(
@@ -3229,7 +3240,7 @@ enum WorkspaceScanner {
 }
 
 private struct GitIgnoreRule: Sendable {
-  let pattern: String
+  let expression: NSRegularExpression
   let baseRelativePath: String
   let isNegated: Bool
   let isDirectoryOnly: Bool
@@ -3262,7 +3273,8 @@ private struct GitIgnoreRule: Sendable {
     }
     guard !line.isEmpty else { return nil }
 
-    self.pattern = line
+    guard let expression = Self.compile(line) else { return nil }
+    self.expression = expression
     self.baseRelativePath = baseRelativePath
     self.isNegated = isNegated
     self.isDirectoryOnly = isDirectoryOnly
@@ -3278,10 +3290,10 @@ private struct GitIgnoreRule: Sendable {
       return false
     }
 
-    if isAnchored || containsSlash {
-      return Self.glob(pattern, matches: candidate)
-    }
-    return Self.glob(pattern, matches: name)
+    let value = isAnchored || containsSlash ? candidate : name
+    return expression.rangeOfFirstMatch(
+      in: value, range: NSRange(value.startIndex..<value.endIndex, in: value)
+    ).location != NSNotFound
   }
 
   private func candidatePath(for relativePath: String) -> String? {
@@ -3295,7 +3307,9 @@ private struct GitIgnoreRule: Sendable {
     return String(relativePath.dropFirst(baseRelativePath.count + 1))
   }
 
-  private static func glob(_ pattern: String, matches value: String) -> Bool {
+  /// A rule is immutable and inherited by its descendants. Compile once when it is loaded,
+  /// rather than rebuilding the same ICU expression for every directory entry.
+  private static func compile(_ pattern: String) -> NSRegularExpression? {
     let regex =
       "^"
       + pattern.reduce(into: "") { result, character in
@@ -3310,7 +3324,7 @@ private struct GitIgnoreRule: Sendable {
           result.append(character)
         }
       } + "$"
-    return value.range(of: regex, options: .regularExpression) != nil
+    return try? NSRegularExpression(pattern: regex)
   }
 }
 
