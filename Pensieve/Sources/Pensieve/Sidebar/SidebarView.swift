@@ -299,13 +299,9 @@ struct SidebarView: View {
           emptyWorkspaceRoot
         }
       } else {
-        List {
-          ForEach(treeSnapshot.rows) { row in
-            workspaceRowView(row)
-          }
+        SidebarWorkspaceList(rows: treeSnapshot.rows) { row in
+          workspaceRowView(row)
         }
-        .listStyle(.sidebar)
-        .accessibilityIdentifier("pensieve.sidebar.list.workspace")
       }
     }
   }
@@ -1243,6 +1239,39 @@ struct SidebarView: View {
       expandedNodeIDs.remove(id)
     } else {
       expandedNodeIDs.insert(id)
+    }
+  }
+}
+
+/// The shipped workspace list, also exercised without a window by the native
+/// list cost tests. Its row closure keeps the document/folder actions owned by
+/// SidebarView.
+struct SidebarWorkspaceList<RowContent: View>: View {
+  let rows: [FlattenedWorkspaceRow]
+  @ViewBuilder var rowContent: (FlattenedWorkspaceRow) -> RowContent
+
+  var body: some View {
+    List {
+      ForEach(rows) { row in
+        SidebarWorkspaceRow {
+          rowContent(row)
+        }
+      }
+    }
+    .listStyle(.sidebar)
+    .accessibilityIdentifier("pensieve.sidebar.list.workspace")
+  }
+}
+
+/// List can count one direct row without evaluating the conditional
+/// document/folder/foreign-file content. Keep the closure deferred until this
+/// row's body is needed; calling it in ForEach would still build the whole list.
+private struct SidebarWorkspaceRow<Content: View>: View {
+  @ViewBuilder var content: () -> Content
+
+  var body: some View {
+    HStack(spacing: 0) {
+      content()
     }
   }
 }
