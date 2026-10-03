@@ -354,6 +354,50 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertLessThanOrEqual(
       model.retainedDocumentCount,
       AskConversationModel.retentionBudget + AskTranscriptWindow.pageSize)
+
+    // Re-observing the identical history is semantically free: no new
+    // parses, no new snapshot emissions, no scroll churn.
+    let emissionsBefore = model.snapshotEmissions
+    model.observe(
+      turns: ids.map { AskTurn(id: $0, role: .assistant, text: "answer \($0.uuidString)") })
+    await drain(model)
+    parses = ids.reduce(0) { $0 + model.parseCount(for: $1.uuidString) }
+    XCTAssertLessThanOrEqual(parses, AskTranscriptWindow.pageSize * 2)
+    XCTAssertEqual(
+      model.snapshotEmissions, emissionsBefore,
+      "an unchanged history re-observation publishes nothing")
+  }
+
+  /// A parse suspended while its thread is replaced must land nowhere: the
+  /// old epoch's result is dropped, never reinserted into the cache, and the
+  /// retired pending request leaves no work behind.
+  func testRetiredInFlightParseResultIsDroppedAfterThreadReplacement() async {
+    let gate = ParseGate()
+    let model = AskConversationModel(
+      clock: { 0 },
+      parse: { text in
+        gate.wait()
+        return AskMarkdownParser.parse(text)
+      })
+    let oldID = UUID()
+    model.observe(turns: [AskTurn(id: oldID, role: .assistant, text: "old thread reply")])
+    // The parse is in flight, suspended at the gate.
+    model.replaceThread()
+    gate.open()
+    await drain(model)
+
+    XCTAssertNil(
+      model.document(for: oldID.uuidString),
+      "a retired thread's in-flight result is dropped")
+    XCTAssertFalse(model.hasPendingWork, "retired pending work leaves nothing behind")
+
+    let newID = UUID()
+    model.observe(turns: [AskTurn(id: newID, role: .assistant, text: "new thread reply")])
+    await drain(model)
+    XCTAssertNil(
+      model.document(for: oldID.uuidString),
+      "the retired result never reappears after the new thread settles")
+    XCTAssertEqual(model.document(for: newID.uuidString)?.source, "new thread reply")
   }
 
   /// Fifty thread replacements cannot pile up ASTs: every visible turn still
@@ -380,6 +424,29 @@ final class AskConversationIntegrationTests: XCTestCase {
   }
 
   // MARK: Table work budget
+
+  /// The production width flow: the real slot width minus the transcript's
+  /// own padding feeds the markdown layout, so the readable column and the
+  /// code/table viewports use actual geometry — never the 280pt minimum or
+  /// the zero-width collapse the containerWidth:0 integration produced.
+  func testTranscriptWidthPolicyUsesRealConfiguredWidth() {
+    let slot: CGFloat = 640
+    let configured = slot - AskConversationTranscript.horizontalPadding * 2
+    XCTAssertEqual(configured, 616)
+    XCTAssertEqual(
+      AskTranscriptWidthPolicy.documentWidth(for: configured), 616,
+      "the real width beats the 280pt minimum")
+    let content = AskTranscriptWidthPolicy.contentWidth(for: configured)
+    XCTAssertEqual(content, 576)
+    let plan = AskMarkdownOverflow.plan(
+      containerWidth: content, codeCharacters: 40, tableColumns: 3)
+    XCTAssertGreaterThan(plan.codeViewportWidth, 0, "code keeps a real viewport")
+    XCTAssertGreaterThan(plan.tableViewportWidth, 0, "tables keep a real viewport")
+    XCTAssertTrue(plan.wideContentScrollsInsideMessage)
+    XCTAssertEqual(
+      AskTranscriptWidthPolicy.contentWidth(for: 0), 0,
+      "the zero-width defect this guards against is measurable")
+  }
 
   /// One huge table below the inline cap: the block page cannot bound it, so
   /// the table budget does — bounded first page, bounded weight scan, every

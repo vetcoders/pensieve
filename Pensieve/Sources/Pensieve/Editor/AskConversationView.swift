@@ -68,6 +68,10 @@ final class AskConversationModel: ObservableObject {
   private var latestRequests: [String: (text: String, revision: UInt64)] = [:]
   /// Access-ordered turn ids (least → most recent) for bounded retention.
   private var recency: [String] = []
+  /// Thread generation. Bumped on `replaceThread`; a parse round that started
+  /// before the bump drops its results instead of writing a retired thread's
+  /// ASTs back into the cache.
+  private var epoch: UInt64 = 0
   private var scrollRequests = 0
   private var worker: Task<Void, Never>?
 
@@ -108,6 +112,12 @@ final class AskConversationModel: ObservableObject {
   /// subinterval delta publishes nothing. Parsing is requested only for the
   /// visible window; hidden history waits for `revealEarlier`.
   func observe(turns newTurns: [AskTurn]) {
+    // One index build per pass: with a 10000-turn history, per-turn
+    // contains/firstIndex lookups would be O(N²) on the UI actor.
+    var indexByID: [String: Int] = [:]
+    indexByID.reserveCapacity(turns.count)
+    for (index, turn) in turns.enumerated() { indexByID[turn.id] = index }
+
     var seen: Set<String> = []
     var structural = false
     var visibleWork = false
@@ -119,7 +129,7 @@ final class AskConversationModel: ObservableObject {
         // Unchanged since the last observation. If a scope switch evicted it
         // from the visible list, put it back with its remembered revision —
         // the cached document still matches, so nothing reparses.
-        if let memory, !turns.contains(where: { $0.id == id }) {
+        if let memory, indexByID[id] == nil {
           turns.append(
             ObservedTurn(
               id: id,
@@ -140,7 +150,7 @@ final class AskConversationModel: ObservableObject {
         text: turn.text,
         isStreaming: turn.isStreaming,
         revision: revision)
-      if let index = turns.firstIndex(where: { $0.id == id }) {
+      if let index = indexByID[id] {
         turns[index] = observed
       } else {
         turns.append(observed)
@@ -205,19 +215,24 @@ final class AskConversationModel: ObservableObject {
     if parsedRevisions[id] == revision { return }
     if latestRequests[id]?.revision == revision { return }
     latestRequests[id] = (text: text, revision: revision)
+    touch(id)
     kickWorker()
   }
 
   /// One worker for the whole conversation. Each round drains the pending
   /// requests, parses them off MainActor, then applies only results that are
-  /// still the newest known revision for their turn. A snapshot is emitted
-  /// only when an accepted result actually changed the visible content.
+  /// still eligible: same thread epoch, the id still observed (live or within
+  /// the recency budget), no newer request pending, and the result's revision
+  /// still the current one. Retired or stale results are dropped, never
+  /// reinserted after a prune. A snapshot is emitted only when an accepted
+  /// result actually changed the visible content.
   private func kickWorker() {
     guard worker == nil else { return }
     worker = Task { [weak self] in
       guard let self else { return }
       defer { self.worker = nil }
       while !Task.isCancelled {
+        let epoch = self.epoch
         let batch = self.latestRequests
         self.latestRequests.removeAll()
         if batch.isEmpty { return }
@@ -229,17 +244,23 @@ final class AskConversationModel: ObservableObject {
             }
           }.value
         guard !Task.isCancelled else { return }
+        // A thread replacement while parsing retires the whole round.
+        guard self.epoch == epoch else { return }
         var applied = false
         for result in results {
-          self.parseInvocations[result.id, default: 0] += 1
-          self.touch(result.id)
+          // A retired/evicted id has no observation left: drop the result
+          // instead of reinserting it after the prune.
+          guard let current = self.observedRevisions[result.id] else { continue }
           // A request queued while this round parsed is newer; it will be
           // parsed next round, so this stale result drops instead of
           // overwriting newer text.
           if let pending = self.latestRequests[result.id], pending.revision > result.revision {
             continue
           }
+          guard result.revision == current.revision else { continue }
           guard result.revision >= (self.parsedRevisions[result.id] ?? 0) else { continue }
+          self.parseInvocations[result.id, default: 0] += 1
+          self.touch(result.id)
           self.documents[result.id] = result.document
           self.parsedRevisions[result.id] = result.revision
           applied = true
@@ -291,11 +312,15 @@ final class AskConversationModel: ObservableObject {
   }
 
   /// A different conversation now owns the surface: the history window and
-  /// follow state restart; parsed documents stay cached within the retention
-  /// budget, so a quick scope round-trip does not re-parse.
+  /// follow state restart, retired pending parse work is dropped, and in-flight
+  /// results from the old epoch are refused when they land. Parsed documents
+  /// stay cached within the retention budget, so a quick scope round-trip
+  /// does not re-parse.
   func replaceThread() {
     window.reset()
     schedulers.removeAll()
+    latestRequests.removeAll()
+    epoch &+= 1
     if follow.handle(.threadChanged) == .scrollToLiveEdge {
       scrollRequests += 1
     }
@@ -310,16 +335,18 @@ final class AskConversationModel: ObservableObject {
     }
   }
 
-  /// Bounds AST retention to the visible window (the budget the user chose)
-  /// plus the live turn and a recency budget, and drops pending requests for
-  /// evicted ids so a retired thread cannot leave obsolete parse work behind.
-  /// Revision memory is cheap and stays for the whole live conversation —
-  /// evicted ASTs simply re-parse lazily when a reveal brings their turn
-  /// back into the window.
+  /// Bounds AST retention to the live streaming turn plus a recency budget of
+  /// actually used parses — never the whole thread. The visible window's
+  /// turns are touched when their parse is requested, so ordinary history
+  /// stays hot while a fully revealed 10000-turn backlog cannot retain every
+  /// admitted AST forever: evicted entries simply re-parse lazily when a
+  /// reveal or publication brings their turn back into use. Pending requests
+  /// for evicted ids are dropped so retired work leaves nothing behind.
+  /// Revision memory is cheap and stays for the live conversation plus the
+  /// same recency budget.
   private func pruneRetention() {
     let liveIDs = Set(turns.map(\.id))
-    var astKeep = Set(
-      turns[window.visibleRange(total: turns.count)].map(\.id))
+    var astKeep: Set<String> = []
     for turn in turns where turn.isStreaming { astKeep.insert(turn.id) }
     var budget = Self.retentionBudget
     var recencyKeep: Set<String> = []
@@ -438,56 +465,56 @@ struct AskConversationTranscript: View {
   var identifierPrefix: String
 
   private let liveEdgeID = "pensieve.ask.liveEdge"
-  @State private var containerWidth: CGFloat = 0
+  /// The one horizontal inset of the transcript column; the markdown layout
+  /// width is the slot width minus exactly this, so the readable column and
+  /// the code/table viewports always see real geometry.
+  static let horizontalPadding: CGFloat = 12
   @State private var scrollIntent = AskScrollIntentRouter()
 
   var body: some View {
-    ScrollViewReader { proxy in
-      ScrollView {
-        VStack(alignment: .leading, spacing: 6) {
-          AskTranscriptView(
-            snapshot: model.snapshot,
-            tokens: themeManager.skin.tokens,
-            containerWidth: containerWidth,
-            revealedTurnIDs: model.revealedTurnIDs,
-            onRevealEarlier: { model.revealEarlier() },
-            onJumpToLatest: { model.jumpToLatest() },
-            onRevealTurn: { id in model.revealTurn(id) }
-          )
-          footer
-          Color.clear
-            .frame(height: 1)
-            .id(liveEdgeID)
+    GeometryReader { outer in
+      ScrollViewReader { proxy in
+        ScrollView {
+          VStack(alignment: .leading, spacing: 6) {
+            AskTranscriptView(
+              snapshot: model.snapshot,
+              tokens: themeManager.skin.tokens,
+              containerWidth: max(0, outer.size.width - Self.horizontalPadding * 2),
+              revealedTurnIDs: model.revealedTurnIDs,
+              onRevealEarlier: { model.revealEarlier() },
+              onJumpToLatest: { model.jumpToLatest() },
+              onRevealTurn: { id in model.revealTurn(id) }
+            )
+            footer
+            Color.clear
+              .frame(height: 1)
+              .id(liveEdgeID)
+          }
+          .padding(.horizontal, Self.horizontalPadding)
+          .padding(.vertical, 4)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
-      }
-      .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { width in
-        // The transcript's readable column and the code/table viewports
-        // follow the REAL slot width, never a hardcoded minimum.
-        containerWidth = width
-      }
-      .onChange(of: model.snapshot.scrollRequests) { _, _ in
-        proxy.scrollTo(liveEdgeID, anchor: .bottom)
-      }
-      .onScrollGeometryChange(
-        for: Bool.self,
-        of: { geometry in
-          StreamScrollFollowState.followTailAfterScroll(
-            contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
-            viewportHeight: geometry.containerSize.height)
-        },
-        action: { _, isAtLiveEdge in
-          // Geometry alone is not user intent: programmatic scrolls, content
-          // growth and resize only inform the router's position memory.
-          for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+        .onChange(of: model.snapshot.scrollRequests) { _, _ in
+          proxy.scrollTo(liveEdgeID, anchor: .bottom)
+        }
+        .onScrollGeometryChange(
+          for: Bool.self,
+          of: { geometry in
+            StreamScrollFollowState.followTailAfterScroll(
+              contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
+              viewportHeight: geometry.containerSize.height)
+          },
+          action: { _, isAtLiveEdge in
+            // Geometry alone is not user intent: programmatic scrolls, content
+            // growth and resize only inform the router's position memory.
+            for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+              apply(intent)
+            }
+          }
+        )
+        .onScrollPhaseChange { _, phase in
+          for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
             apply(intent)
           }
-        }
-      )
-      .onScrollPhaseChange { _, phase in
-        for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
-          apply(intent)
         }
       }
     }
