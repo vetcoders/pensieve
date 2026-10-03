@@ -1,7 +1,7 @@
 codescribe-root=/Users/polyversai/.vibecrafted/worktrees/vetcoders/codescribe/2026_1003/pensieve-ask-rich-attachments
-codescribe-head=c837a44d4a42ec48de3d0a5a9ec9ed1dc02fc157
-codescribe-describe=baseline/transcription-1292-90-gc837a44d
+codescribe-head=1c342f19beb122b04ea8d44b78447e8276dd6135
+codescribe-describe=baseline/transcription-1292-91-g1c342f19
 ffi-profile=release
-dylib-sha256=7635d2ff4d542070eaa0d8c75e89c041726f7e72032660d8aad1f458b5611e72
-built-at=2026-10-03T10:05:40Z
+dylib-sha256=023bd9e9f539d8bd0c272df5e7f6a9a560aa80637e0c7908f36be987c0154970
+built-at=2026-10-03T13:13:11Z
 host=dragon
