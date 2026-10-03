@@ -19,6 +19,9 @@ struct AskSurface<Transcript: View, Composer: View>: View {
   @State private var dockDragStart: CGFloat?
   @State private var floatDragStart: CGPoint?
   @State private var floatResizeStart: CGSize?
+  /// Captured on the first pointer sample so a dock drag cannot flip into a
+  /// float move, and a float move cannot fall through to `resizeDock`.
+  @State private var activeGrip: AskPointerGesture?
 
   var body: some View {
     GeometryReader { proxy in
@@ -67,6 +70,12 @@ struct AskSurface<Transcript: View, Composer: View>: View {
     .foregroundStyle(Color(nsColor: palette.text))
     .background { shellBackground(material: material, shape: shape, palette: palette) }
     .clipShape(shape)
+    .overlay(alignment: .bottomTrailing) {
+      if AskPointerRoute.corner(mode: presentation.mode) != nil {
+        resizeHandle(content: content, palette: palette)
+          .padding(4)
+      }
+    }
     .accessibilityElement(children: .contain)
     .accessibilityAdjustableAction { direction in
       let delta: CGFloat = direction == .increment ? 24 : -24
@@ -90,10 +99,10 @@ struct AskSurface<Transcript: View, Composer: View>: View {
       .frame(maxWidth: .infinity)
       .frame(height: max(layout.grip.height, 0))
       .contentShape(Rectangle())
-      .gesture(dockDrag(content: content))
+      .gesture(gripDrag(content: content))
       .accessibilityIdentifier("pensieve.askSurface.grip")
-      .accessibilityLabel("Resize Ask")
-      .help("Drag to resize Ask")
+      .accessibilityLabel(presentation.mode == .floating ? "Move Ask" : "Resize Ask")
+      .help(presentation.mode == .floating ? "Drag to move Ask" : "Drag to resize Ask")
   }
 
   private func chrome(
@@ -103,6 +112,10 @@ struct AskSurface<Transcript: View, Composer: View>: View {
       Text("Ask")
         .font(palette.headingFont)
         .foregroundStyle(Color(nsColor: palette.text))
+        .contentShape(Rectangle())
+        .gesture(
+          floatDrag(content: content),
+          including: presentation.mode == .floating ? .gesture : .none)
       Spacer(minLength: 8)
       chromeButtons(content: content, palette: palette)
     }
@@ -210,16 +223,97 @@ struct AskSurface<Transcript: View, Composer: View>: View {
     }
   }
 
-  private func dockDrag(content: CGSize) -> some Gesture {
+  private func resizeHandle(content: CGSize, palette: AskSurfacePalette) -> some View {
+    Image(systemName: "arrow.up.left.and.arrow.down.right")
+      .font(.system(size: 9, weight: .semibold))
+      .foregroundStyle(Color(nsColor: palette.muted))
+      .frame(width: 16, height: 16)
+      .contentShape(Rectangle())
+      .gesture(floatResize(content: content))
+      .accessibilityIdentifier("pensieve.askSurface.resize")
+      .accessibilityLabel("Resize floating Ask")
+      .help("Drag to resize the floating Ask")
+  }
+
+  private func gripDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
-        let start = dockDragStart ?? presentation.preferredDockHeight
-        if dockDragStart == nil { dockDragStart = start }
-        update { state in
-          state.resizeDock(to: start - value.translation.height, in: content)
+        let route = activeGrip ?? AskPointerRoute.grip(mode: presentation.mode)
+        if activeGrip == nil { activeGrip = route }
+        switch route {
+        case .dockResize:
+          let start = dockDragStart ?? presentation.preferredDockHeight
+          if dockDragStart == nil { dockDragStart = start }
+          update { state in
+            AskPointerRoute.apply(
+              .dockResize,
+              to: &state,
+              content: content,
+              dockStart: start,
+              originStart: state.floatOrigin,
+              sizeStart: state.preferredFloatSize,
+              translation: value.translation)
+          }
+        case .floatDrag:
+          let start = floatDragStart ?? presentation.floatOrigin
+          if floatDragStart == nil { floatDragStart = start }
+          update { state in
+            AskPointerRoute.apply(
+              .floatDrag,
+              to: &state,
+              content: content,
+              dockStart: state.preferredDockHeight,
+              originStart: start,
+              sizeStart: state.preferredFloatSize,
+              translation: value.translation)
+          }
+        case .floatResize:
+          break
         }
       }
-      .onEnded { _ in dockDragStart = nil }
+      .onEnded { _ in
+        activeGrip = nil
+        dockDragStart = nil
+        floatDragStart = nil
+      }
+  }
+
+  private func floatDrag(content: CGSize) -> some Gesture {
+    DragGesture(minimumDistance: 1)
+      .onChanged { value in
+        let start = floatDragStart ?? presentation.floatOrigin
+        if floatDragStart == nil { floatDragStart = start }
+        update { state in
+          AskPointerRoute.apply(
+            .floatDrag,
+            to: &state,
+            content: content,
+            dockStart: state.preferredDockHeight,
+            originStart: start,
+            sizeStart: state.preferredFloatSize,
+            translation: value.translation)
+        }
+      }
+      .onEnded { _ in floatDragStart = nil }
+  }
+
+  private func floatResize(content: CGSize) -> some Gesture {
+    DragGesture(minimumDistance: 1)
+      .onChanged { value in
+        let start = floatResizeStart ?? presentation.preferredFloatSize
+        if floatResizeStart == nil { floatResizeStart = start }
+        update { state in
+          AskPointerRoute.apply(
+            .floatResize,
+            to: &state,
+            content: content,
+            dockStart: state.preferredDockHeight,
+            originStart: state.floatOrigin,
+            sizeStart: start,
+            translation: value.translation)
+        }
+      }
+      .onEnded { _ in floatResizeStart = nil }
   }
 
   private func syncFloatOrigin(to content: CGSize) {

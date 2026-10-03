@@ -25,6 +25,7 @@ final class AskSurfaceLayoutTests: XCTestCase {
       reference.height,
       accuracy: 0.01)
     assertReachable(layout, in: reference)
+    XCTAssertFalse(layout.controls.contains { $0.role == .resize })
   }
 
   func testMinimumContentKeepsEditorAndStatus() {
@@ -117,6 +118,8 @@ final class AskSurfaceLayoutTests: XCTestCase {
     XCTAssertEqual(narrow.status.height, 26, accuracy: 0.01)
     XCTAssertFalse(overlaps(narrow.askRegion, narrow.status))
     assertReachable(narrow, in: minimum)
+    XCTAssertTrue(wide.controls.contains { $0.role == .resize })
+    XCTAssertTrue(narrow.controls.contains { $0.role == .resize })
 
     let hiddenEditor = editorAfterHide(state, content: minimum)
     XCTAssertEqual(hiddenEditor, minimum.height - 26, accuracy: 0.01)

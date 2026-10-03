@@ -160,6 +160,47 @@ enum AskChromeMaterial: Equatable, Sendable {
   case plain
 }
 
+/// Pointer routing for the dock grip and the floating corner.
+/// The dock grip grows the dock. The same grip moves the overlay while
+/// floating and must not rewrite the remembered dock height. The corner
+/// exists only in floating mode. Neither path opens a window.
+enum AskPointerGesture: Equatable, Sendable {
+  case dockResize
+  case floatDrag
+  case floatResize
+}
+
+enum AskPointerRoute {
+  static func grip(mode: AskPresentationMode) -> AskPointerGesture {
+    mode == .floating ? .floatDrag : .dockResize
+  }
+
+  static func corner(mode: AskPresentationMode) -> AskPointerGesture? {
+    mode == .floating ? .floatResize : nil
+  }
+
+  /// Dock drag uses an inverted y: dragging up grows the dock.
+  /// Float resize adds the translation, so dragging down and right grows it.
+  static func apply(
+    _ gesture: AskPointerGesture,
+    to state: inout AskPresentationState,
+    content: CGSize,
+    dockStart: CGFloat,
+    originStart: CGPoint,
+    sizeStart: CGSize,
+    translation: CGSize
+  ) {
+    switch gesture {
+    case .dockResize:
+      state.resizeDock(to: dockStart - translation.height, in: content)
+    case .floatDrag:
+      state.dragFloat(from: originStart, by: translation, in: content)
+    case .floatResize:
+      state.resizeFloat(from: sizeStart, by: translation, in: content)
+    }
+  }
+}
+
 extension AskChromeMaterial {
   /// macOS 26 glass groups the floating shell and the chrome controls.
   /// Earlier systems use the system material. Reduce Transparency drops both

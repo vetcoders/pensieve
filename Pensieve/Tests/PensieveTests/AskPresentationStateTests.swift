@@ -56,6 +56,71 @@ final class AskPresentationStateTests: XCTestCase {
       7)
   }
 
+  func testGripMovesTheFloatAndTheCornerDoesNotRewriteTheDock() {
+    let content = CGSize(width: 900, height: 700)
+    var floating = AskPresentationState.expandedDefault
+    XCTAssertEqual(floating.apply(.float, content: content), .presented)
+    let dock = floating.preferredDockHeight
+    let origin = floating.floatOrigin
+    let size = floating.preferredFloatSize
+    XCTAssertEqual(AskPointerRoute.grip(mode: .floating), .floatDrag)
+    XCTAssertEqual(AskPointerRoute.grip(mode: .docked), .dockResize)
+    XCTAssertEqual(AskPointerRoute.corner(mode: .floating), .floatResize)
+    XCTAssertNil(AskPointerRoute.corner(mode: .docked))
+    XCTAssertNil(AskPointerRoute.corner(mode: .hidden))
+
+    AskPointerRoute.apply(
+      .floatDrag,
+      to: &floating,
+      content: content,
+      dockStart: dock,
+      originStart: origin,
+      sizeStart: size,
+      translation: CGSize(width: 36, height: -24))
+    XCTAssertEqual(floating.mode, .floating)
+    XCTAssertEqual(floating.preferredDockHeight, dock, accuracy: 0.01)
+    XCTAssertEqual(floating.preferredFloatSize, size)
+    XCTAssertNotEqual(floating.floatOrigin, origin)
+    let moved = AskSurfaceLayout.allocate(content: content, presentation: floating)
+    XCTAssertEqual(moved.editor.height, content.height - 26, accuracy: 0.01)
+    XCTAssertFalse(moved.controls.filter { $0.role == .resize }.isEmpty)
+
+    let grownFrom = floating.preferredFloatSize
+    AskPointerRoute.apply(
+      .floatResize,
+      to: &floating,
+      content: content,
+      dockStart: dock,
+      originStart: floating.floatOrigin,
+      sizeStart: grownFrom,
+      translation: CGSize(width: 48, height: 40))
+    XCTAssertEqual(floating.mode, .floating)
+    XCTAssertEqual(floating.preferredDockHeight, dock, accuracy: 0.01)
+    XCTAssertGreaterThan(floating.preferredFloatSize.width, grownFrom.width)
+    XCTAssertGreaterThan(floating.preferredFloatSize.height, grownFrom.height)
+    let resized = AskSurfaceLayout.allocate(content: content, presentation: floating)
+    let overlap = resized.askRegion.intersection(resized.status)
+    XCTAssertEqual(resized.editor.height, content.height - 26, accuracy: 0.01)
+    XCTAssertFalse(overlap.width > 0.5 && overlap.height > 0.5)
+
+    var docked = AskPresentationState.expandedDefault
+    let floatOrigin = docked.floatOrigin
+    AskPointerRoute.apply(
+      .dockResize,
+      to: &docked,
+      content: content,
+      dockStart: docked.preferredDockHeight,
+      originStart: floatOrigin,
+      sizeStart: docked.preferredFloatSize,
+      translation: CGSize(width: 0, height: -40))
+    XCTAssertEqual(docked.mode, .docked)
+    XCTAssertEqual(docked.floatOrigin, floatOrigin)
+    XCTAssertGreaterThan(docked.preferredDockHeight, AskSurfaceLayout.preferredExpandedDockHeight)
+    let dockLayout = AskSurfaceLayout.allocate(content: content, presentation: docked)
+    XCTAssertFalse(dockLayout.controls.contains { $0.role == .resize })
+    XCTAssertGreaterThanOrEqual(dockLayout.editor.height, 160)
+  }
+
   func testGlassIsAvailabilityGatedAndTransparencyStaysSolid() {
     XCTAssertEqual(
       AskChromeMaterial.resolve(majorVersion: 26, reduceTransparency: false, role: .floatingShell),

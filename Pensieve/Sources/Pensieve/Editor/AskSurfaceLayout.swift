@@ -88,7 +88,7 @@ enum AskSurfaceLayout {
         composer: parts.composer,
         status: status,
         askRegion: ask,
-        controls: controls(grip: parts.grip, chrome: parts.chrome))
+        controls: floatingControls(grip: parts.grip, chrome: parts.chrome, ask: ask))
     }
   }
 
@@ -216,6 +216,26 @@ enum AskSurfaceLayout {
     return frames
   }
 
+  /// Chrome buttons plus the corner the float uses to resize. The dock has no
+  /// corner: its grip already owns height.
+  private static func floatingControls(grip: CGRect, chrome: CGRect, ask: CGRect)
+    -> [AskControlFrame]
+  {
+    var frames = controls(grip: grip, chrome: chrome)
+    let side: CGFloat = 16
+    let inset: CGFloat = 4
+    guard ask.width >= side + inset, ask.height >= side + inset else { return frames }
+    frames.append(
+      AskControlFrame(
+        role: .resize,
+        frame: CGRect(
+          x: ask.maxX - inset - side,
+          y: ask.maxY - inset - side,
+          width: side,
+          height: side)))
+    return frames
+  }
+
   private static func clampedAxis(_ origin: CGFloat, length: CGFloat, limit: CGFloat) -> CGFloat {
     guard limit > 0 else { return 0 }
     let span = min(max(length, 0), limit)
@@ -233,6 +253,8 @@ enum AskControlRole: String, Equatable, Sendable {
   case expand
   case presentation
   case hide
+  /// Bottom-trailing corner. Present only while the surface is floating.
+  case resize
 }
 
 struct AskControlFrame: Equatable, Sendable {
