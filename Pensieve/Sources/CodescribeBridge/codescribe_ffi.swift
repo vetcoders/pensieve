@@ -729,6 +729,15 @@ public protocol CodescribeAgentProtocol: AnyObject, Sendable {
      */
     func streamReplyWithAttachments(text: String, threadId: String, attachments: [CsAttachment], listener: CsAgentListener) async throws  -> String
 
+    /**
+     * Run the same agent loop against the embedding app's workspace.
+     * The model sees only `workspace_search` and `workspace_read`. Both are
+     * read-only and call back through [`CsDocumentToolHost::execute`], the
+     * same host callback the document session uses. This does not replace
+     * [`Self::stream_document`] or its three tools.
+     */
+    func streamWorkspace(text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
+
 }
 /**
  * Thin handle to the codescribe agent engine.
@@ -995,6 +1004,30 @@ open func streamReplyWithAttachments(text: String, threadId: String, attachments
                 uniffi_codescribe_ffi_fn_method_codescribeagent_stream_reply_with_attachments(
                     self.uniffiCloneHandle(),
                     FfiConverterString.lower(text),FfiConverterString.lower(threadId),FfiConverterSequenceTypeCsAttachment.lower(attachments),FfiConverterTypeCsAgentListener_lower(listener)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
+}
+
+    /**
+     * Run the same agent loop against the embedding app's workspace.
+     * The model sees only `workspace_search` and `workspace_read`. Both are
+     * read-only and call back through [`CsDocumentToolHost::execute`], the
+     * same host callback the document session uses. This does not replace
+     * [`Self::stream_document`] or its three tools.
+     */
+open func streamWorkspace(text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribeagent_stream_workspace(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(text),FfiConverterString.lower(threadId),FfiConverterTypeCsDocumentToolHost_lower(workspace),FfiConverterOptionTypeCsDocumentProvider.lower(provider),FfiConverterTypeCsAgentListener_lower(listener)
                 )
             },
             pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
@@ -16857,6 +16890,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_reply_with_attachments() != 7965) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_workspace() != 32111) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagentstatus_agentic_readiness() != 27253) {

@@ -12,6 +12,7 @@ struct ContentView: View {
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @StateObject private var askThreads: DocumentAskThreadStore
   @State private var lastIngestedDictation = ""
+  @State private var workspaceAskSelected = false
   /// Shared with the status bar's Ask chip and the composer header — one key,
   /// three surfaces. Default visible preserves the pre-toggle behavior.
   @AppStorage("pensieve.ask.visible") private var askVisible = true
@@ -71,8 +72,27 @@ struct ContentView: View {
         if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
           WindowErrorBanner(error: error) { appState.dismissVisibleError() }
         }
+        if askVisible, !appState.workspaceRoots.isEmpty {
+          HStack(spacing: 12) {
+            if appState.documentHasEditableBuffer {
+              Button("Document") { workspaceAskSelected = false }
+                .disabled(!workspaceAskSelected)
+            }
+            Button("Workspace") { workspaceAskSelected = true }
+              .disabled(workspaceAskSelected || !appState.documentHasEditableBuffer)
+            Spacer()
+          }
+          .controlSize(.small)
+          .padding(.horizontal, 12)
+          .padding(.top, 6)
+          .accessibilityIdentifier("pensieve.ask.scope")
+          if workspaceAskSelected || !appState.documentHasEditableBuffer {
+            WorkspaceAskPanel(
+              workspace: appState.workspaceStore, providerSettings: providerSettings)
+          }
+        }
         if appState.documentHasEditableBuffer {
-          if askVisible,
+          if askVisible, !workspaceAskSelected || appState.workspaceRoots.isEmpty,
             let thread = askThreads.existingThread(for: appState.documentSession.askThreadID)
           {
             AskComposerView(
