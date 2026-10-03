@@ -18,6 +18,10 @@ enum AskSurfaceLayout {
   static let statusBarHeight: CGFloat = 26
   static let gripHeight: CGFloat = 10
   static let chromeHeight: CGFloat = 36
+  static let compactChromeHeight: CGFloat = 62
+  static let compactHeaderWidth: CGFloat = 680
+
+  static func usesCompactHeader(width: CGFloat) -> Bool { width < compactHeaderWidth }
   /// Design cap. The composer slot may be shorter when the dock is clamped;
   /// it is never taller than this.
   static let composerMaxHeight: CGFloat = 112
@@ -40,7 +44,7 @@ enum AskSurfaceLayout {
   }
 
   static var minimumFloatHeight: CGFloat {
-    gripHeight + chromeHeight + 64
+    gripHeight + compactChromeHeight + 64
   }
 
   static func allocate(
@@ -175,7 +179,8 @@ enum AskSurfaceLayout {
     var remaining = max(0, region.height)
     let gripH = min(gripHeight, remaining)
     remaining -= gripH
-    let chromeH = min(chromeHeight, remaining)
+    let chromeH = min(
+      usesCompactHeader(width: region.width) ? compactChromeHeight : chromeHeight, remaining)
     remaining -= chromeH
     let composerH = min(composerMaxHeight, remaining)
     remaining -= composerH

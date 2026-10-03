@@ -706,6 +706,7 @@ struct AskProviderHeader: View {
   var apiKeyProvider: CompletionProviderShape
   var readinessContext: AskEndpointContext?
   var isStreaming: Bool
+  var compact: Bool = false
   var openProviderSettings: @MainActor () -> Void = {
     _ = PensieveSettingsWindowController.shared.show(section: .ai)
   }
@@ -721,16 +722,36 @@ struct AskProviderHeader: View {
   var body: some View {
     if showsScopePicker {
       HStack(spacing: 4) {
-        Button("Document") { workspaceSelected = false }
-          .disabled(!workspaceSelected || !documentScopeEnabled)
-        Button("Workspace") { workspaceSelected = true }
-          .disabled(workspaceSelected || !workspaceScopeEnabled)
+        Button {
+          workspaceSelected = false
+        } label: {
+          scopeLabel("Document", symbol: "doc.text")
+        }
+        .accessibilityLabel("Document")
+        .disabled(!workspaceSelected || !documentScopeEnabled)
+        Button {
+          workspaceSelected = true
+        } label: {
+          scopeLabel("Workspace", symbol: "folder")
+        }
+        .accessibilityLabel("Workspace")
+        .disabled(workspaceSelected || !workspaceScopeEnabled)
       }
       .controlSize(.small)
+      .fixedSize()
       .accessibilityIdentifier("pensieve.ask.scope")
     }
     providerMenu
     readinessChip
+  }
+
+  @ViewBuilder
+  private func scopeLabel(_ title: String, symbol: String) -> some View {
+    if compact {
+      Image(systemName: symbol).frame(width: 22, height: 16)
+    } else {
+      Text(title).fixedSize()
+    }
   }
 
   private var providerMenu: some View {
@@ -798,17 +819,26 @@ struct AskProviderHeader: View {
     }
   }
 
+  @ViewBuilder
   private var readinessChip: some View {
     let ready = AskReadiness.isReady(provider, context: readinessContext)
-    return Text(AskReadiness.chipLabel(for: provider, context: readinessContext))
-      .font(.system(size: 10.5))
-      .foregroundStyle(ready ? AnyShapeStyle(.secondary) : AnyShapeStyle(warningColor))
-      .lineLimit(1)
-      .padding(.horizontal, 6)
-      .padding(.vertical, 2)
-      .overlay(statusCapsule)
-      .help(ready ? "" : AskReadiness.notReadyMessage(for: provider))
-      .accessibilityIdentifier("pensieve.ask.ready")
+    let label = AskReadiness.chipLabel(for: provider, context: readinessContext)
+    Group {
+      if compact {
+        Circle().fill(ready ? Color.green : warningColor).frame(width: 7, height: 7)
+      } else {
+        Text(label)
+          .font(.system(size: 10.5))
+          .foregroundStyle(ready ? AnyShapeStyle(.secondary) : AnyShapeStyle(warningColor))
+          .lineLimit(1)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 2)
+          .overlay(statusCapsule)
+      }
+    }
+    .help(ready ? label : AskReadiness.notReadyMessage(for: provider))
+    .accessibilityLabel(label)
+    .accessibilityIdentifier("pensieve.ask.ready")
   }
 
   private var statusCapsule: some View {

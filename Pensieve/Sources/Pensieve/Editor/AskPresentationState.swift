@@ -22,7 +22,9 @@ struct AskPresentationState: Equatable, Sendable {
       preferredDockHeight: AskSurfaceLayout.preferredExpandedDockHeight,
       floatOrigin: AskSurfaceLayout.defaultFloatOrigin(in: content),
       preferredFloatSize: CGSize(
-        width: 420, height: AskSurfaceLayout.preferredExpandedDockHeight))
+        width: 420,
+        height: AskSurfaceLayout.preferredExpandedDockHeight
+          + AskSurfaceLayout.compactChromeHeight - AskSurfaceLayout.chromeHeight))
   }
 
   mutating func apply(_ command: AskSurfaceCommand, content: CGSize) -> AskCommandEffect {

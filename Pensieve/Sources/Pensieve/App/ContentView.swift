@@ -741,8 +741,8 @@ private struct AskSurfaceHost: View {
   }
 
   var body: some View {
-    AskSurface(presentation: $presentation) {
-      headerSlot
+    AskSurface(presentation: $presentation) { compact in
+      headerSlot(compact: compact)
     } transcript: {
       transcriptSlot
     } composer: {
@@ -762,17 +762,17 @@ private struct AskSurfaceHost: View {
     .onChange(of: workspaceThread?.identity.workspaceID) { _, _ in conversation.replaceThread() }
   }
 
-  @ViewBuilder private var headerSlot: some View {
+  @ViewBuilder private func headerSlot(compact: Bool) -> some View {
     if !workspaceScopeActive, let thread = documentThread {
       AskDocumentThreadObservation(thread: thread) { observed in
-        providerHeader(isStreaming: observed.isStreaming)
+        providerHeader(isStreaming: observed.isStreaming, compact: compact)
       }
     } else {
-      providerHeader(isStreaming: activeIsBusy)
+      providerHeader(isStreaming: activeIsBusy, compact: compact)
     }
   }
 
-  private func providerHeader(isStreaming: Bool) -> some View {
+  private func providerHeader(isStreaming: Bool, compact: Bool) -> some View {
     AskProviderHeader(
       showsScopePicker: hasWorkspace,
       workspaceSelected: $workspaceAskSelected,
@@ -783,7 +783,8 @@ private struct AskSurfaceHost: View {
       apiKey: providerSettings.apiKey,
       apiKeyProvider: providerSettings.providerShape,
       readinessContext: readinessContext,
-      isStreaming: isStreaming)
+      isStreaming: isStreaming,
+      compact: compact)
   }
 
   @ViewBuilder private var transcriptSlot: some View {

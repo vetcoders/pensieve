@@ -7,6 +7,22 @@ final class AskSurfaceLayoutTests: XCTestCase {
   private let reference = CGSize(width: 900, height: 700)
   private let minimum = CGSize(width: 640, height: 480)
 
+  func testNarrowFloatReservesTwoHeaderRowsAndKeepsComposerInsideShell() {
+    for width: CGFloat in [320, 420, 520] {
+      var state = AskPresentationState.expandedDefault
+      _ = state.apply(.float, content: reference)
+      state.preferredFloatSize = CGSize(width: width, height: 398)
+      let layout = AskSurfaceLayout.allocate(content: reference, presentation: state)
+      XCTAssertTrue(AskSurfaceLayout.usesCompactHeader(width: layout.chrome.width))
+      XCTAssertEqual(layout.chrome.height, 62)
+      XCTAssertLessThanOrEqual(layout.chrome.maxY, layout.transcript.minY)
+      XCTAssertLessThanOrEqual(layout.transcript.maxY, layout.composer.minY)
+      XCTAssertLessThanOrEqual(layout.composer.maxY, layout.askRegion.maxY)
+      assertReachable(layout, in: reference)
+    }
+    XCTAssertFalse(AskSurfaceLayout.usesCompactHeader(width: 680))
+  }
+
   func testExpandedReferenceGivesTranscriptAtLeast240() {
     let layout = AskSurfaceLayout.allocate(
       content: reference, presentation: .expandedDefault)

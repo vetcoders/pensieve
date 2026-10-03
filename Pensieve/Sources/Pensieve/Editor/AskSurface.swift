@@ -10,12 +10,11 @@ import SwiftUI
 /// at the bottom and does not draw it. Theme comes from the scene's
 /// `ThemeManager`; the surface does not construct a second one.
 ///
-/// `headerControls` rides the single chrome row between the title and the
-/// surface buttons, so scope/provider/readiness join the same header instead
-/// of stacking a second Ask header beneath it.
+/// Narrow panels put scope/provider/readiness on a second compact row; the
+/// title and surface buttons retain their width instead of wrapping or clipping.
 struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View {
   @Binding var presentation: AskPresentationState
-  @ViewBuilder var headerControls: () -> HeaderControls
+  @ViewBuilder var headerControls: (Bool) -> HeaderControls
   @ViewBuilder var transcript: () -> Transcript
   @ViewBuilder var composer: () -> Composer
   @EnvironmentObject private var themeManager: ThemeManager
@@ -69,6 +68,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("pensieve.askSurface.transcript")
       composer()
+        .padding(.top, 6)
+        .padding(.bottom, presentation.mode == .floating ? 24 : 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(height: max(layout.composer.height, 0))
         .accessibilityElement(children: .contain)
@@ -115,18 +116,28 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   private func chrome(
     layout: AskSurfaceAllocation, content: CGSize, palette: AskSurfacePalette
   ) -> some View {
-    HStack(spacing: 8) {
-      Text("Ask")
-        .font(palette.headingFont)
-        .foregroundStyle(Color(nsColor: palette.text))
-        .contentShape(Rectangle())
-        .gesture(
-          floatDrag(content: content),
-          including: presentation.mode == .floating ? .gesture : .none)
-      headerControls()
-        .layoutPriority(1)
-      Spacer(minLength: 8)
-      chromeButtons(content: content, palette: palette)
+    let compact = AskSurfaceLayout.usesCompactHeader(width: layout.chrome.width)
+    return VStack(spacing: 4) {
+      HStack(spacing: 8) {
+        Text("Ask")
+          .font(palette.headingFont)
+          .foregroundStyle(Color(nsColor: palette.text))
+          .fixedSize()
+          .contentShape(Rectangle())
+          .gesture(
+            floatDrag(content: content),
+            including: presentation.mode == .floating ? .gesture : .none)
+        if !compact { headerControls(false) }
+        Spacer(minLength: 0)
+        chromeButtons(content: content, palette: palette)
+          .fixedSize()
+      }
+      if compact {
+        HStack(spacing: 8) {
+          headerControls(true)
+          Spacer(minLength: 0)
+        }
+      }
     }
     .padding(.horizontal, 12)
     .frame(height: max(layout.chrome.height, 0))
