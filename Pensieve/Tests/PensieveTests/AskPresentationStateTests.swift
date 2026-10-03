@@ -136,7 +136,13 @@ final class AskPresentationStateTests: XCTestCase {
       .systemMaterial)
     XCTAssertEqual(
       AskChromeMaterial.resolve(majorVersion: 26, reduceTransparency: false, role: .dockShell),
+      .liquidGlass)
+    XCTAssertEqual(
+      AskChromeMaterial.resolve(majorVersion: 15, reduceTransparency: false, role: .dockShell),
       .systemMaterial)
+    XCTAssertEqual(
+      AskChromeMaterial.resolve(majorVersion: 26, reduceTransparency: true, role: .dockShell),
+      .solidTheme)
     XCTAssertEqual(
       AskChromeMaterial.resolve(majorVersion: 26, reduceTransparency: false, role: .transcript),
       .plain)

@@ -202,15 +202,15 @@ enum AskPointerRoute {
 }
 
 extension AskChromeMaterial {
-  /// macOS 26 glass groups the floating shell and the chrome controls.
-  /// Earlier systems use the system material. Reduce Transparency drops both
+  /// macOS 26 glass covers both shell presentations and the chrome controls.
+  /// Earlier systems use the system material. Reduce Transparency drops glass
   /// for the theme's solid source colour. Transcript prose never takes glass.
   static func resolve(
     majorVersion: Int, reduceTransparency: Bool, role: AskChromeRole
   ) -> AskChromeMaterial {
     if role == .transcript { return .plain }
     if reduceTransparency { return .solidTheme }
-    if majorVersion >= 26, role == .floatingShell || role == .chromeGroup {
+    if majorVersion >= 26 {
       return .liquidGlass
     }
     return .systemMaterial
