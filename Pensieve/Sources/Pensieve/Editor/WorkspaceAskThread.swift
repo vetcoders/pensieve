@@ -30,18 +30,25 @@ final class WorkspaceAskThread {
   private(set) var lastError: String?
   var draft = ""
 
+  /// Pending image attachments for the next send. Staged clipboard copies are
+  /// Pensieve-owned; external files are only referenced.
+  let attachmentStore: AskAttachmentStore
+
   @ObservationIgnored private let makeAgent: @Sendable () -> any WorkspaceAgentStreaming
   @ObservationIgnored private var agent: (any WorkspaceAgentStreaming)?
   @ObservationIgnored private var inFlightTask: Task<Void, Never>?
   @ObservationIgnored private var activeHost: WorkspaceToolHost?
   @ObservationIgnored private var generation: UUID?
+  @ObservationIgnored private var inFlightPrompt: String?
 
   init(
     identity: WorkspaceIdentity,
-    makeAgent: @escaping @Sendable () -> any WorkspaceAgentStreaming = { CodescribeAgent() }
+    makeAgent: @escaping @Sendable () -> any WorkspaceAgentStreaming = { CodescribeAgent() },
+    attachmentStore: AskAttachmentStore? = nil
   ) {
     self.identity = identity
     self.makeAgent = makeAgent
+    self.attachmentStore = attachmentStore ?? AskAttachmentStore()
   }
 
   /// Called on submit, never in a view body. Only indexed documents belonging
@@ -202,16 +209,20 @@ final class WorkspaceAskThread {
     }
     let agent = self.agent ?? makeAgent()
     self.agent = agent
+    let attachments = attachmentStore.attachments
     let token = UUID()
     generation = token
     activeHost = host
-    turns.append(AskTurn(role: .user, text: prompt))
+    inFlightPrompt = prompt
+    turns.append(
+      AskTurn(role: .user, text: prompt, attachmentIDs: attachments.map(\.id)))
     let assistantID = UUID()
     turns.append(AskTurn(id: assistantID, role: .assistant, text: "", isStreaming: true))
     isStreaming = true
     lastError = nil
     draft = ""
     let threadID = id.uuidString.lowercased()
+    let attachmentStore = self.attachmentStore
     inFlightTask = Task { [weak self] in
       let listener = AskStreamListener()
       let reader = Task { @MainActor [weak self] in
@@ -222,17 +233,56 @@ final class WorkspaceAskThread {
       }
       do {
         try Task.checkCancellation()
-        let final = try await agent.streamWorkspace(
-          text: prompt, threadId: threadID, workspace: host,
-          provider: configuration, listener: listener)
+        let final: String
+        if attachments.isEmpty {
+          final = try await agent.streamWorkspace(
+            text: prompt, threadId: threadID, workspace: host,
+            provider: configuration, listener: listener)
+        } else {
+          // Validation runs here, off the UI actor and before anything reaches
+          // the provider; the Rust side re-validates authoritatively.
+          let validationProbe = attachmentStore.validationProbe
+          try await Task.detached(priority: .userInitiated) {
+            if let validationProbe { try await validationProbe() }
+            try AskAttachmentStore.validateForSend(attachments)
+          }.value
+          // A Stop landing while validation was detached cancels before the
+          // Rust turn exists; without this re-check the finished validator
+          // would still start a provider request after Stop.
+          try Task.checkCancellation()
+          guard let self, self.generation == token else { throw CancellationError() }
+          guard let streaming = agent as? any WorkspaceAgentAttachmentStreaming else {
+            throw CsError.Agent(
+              msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+          }
+          final = try await streaming.streamWorkspaceWithAttachments(
+            text: prompt, threadId: threadID,
+            attachments: attachments.map { CsAttachment(path: $0.url.path) }, workspace: host,
+            provider: configuration, listener: listener)
+        }
         listener.finish()
         await reader.value
         guard let self, self.generation == token else { return }
-        self.complete(assistantID: assistantID, text: final, error: self.lastError)
+        self.inFlightPrompt = nil
+        if let eventError = self.lastError {
+          // A failure reported through listener events is a failed send even
+          // when the call returned: keep the draft and every attachment.
+          if self.draft.isEmpty { self.draft = prompt }
+          self.complete(assistantID: assistantID, text: final, error: eventError)
+        } else {
+          // A completed send consumes its attachments so the same images
+          // cannot be submitted twice; staged copies are released.
+          attachmentStore.releaseSent(ids: attachments.map(\.id))
+          self.complete(assistantID: assistantID, text: final, error: nil)
+        }
       } catch {
         listener.finish()
         await reader.value
         guard let self, self.generation == token else { return }
+        // A failed send keeps the draft (unless a newer one exists) and keeps
+        // every attachment pending.
+        if self.draft.isEmpty { self.draft = prompt }
+        self.inFlightPrompt = nil
         self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
@@ -249,6 +299,9 @@ final class WorkspaceAskThread {
     inFlightTask?.cancel()
     inFlightTask = nil
     for index in turns.indices { turns[index].isStreaming = false }
+    // A stopped turn keeps the user's input unless a newer draft replaced it.
+    if let prompt = inFlightPrompt, draft.isEmpty { draft = prompt }
+    inFlightPrompt = nil
     isStreaming = false
   }
 

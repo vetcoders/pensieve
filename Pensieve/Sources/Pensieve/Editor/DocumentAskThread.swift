@@ -14,15 +14,24 @@ final class DocumentAskThread: ObservableObject, Identifiable {
   @Published private(set) var lastError: String?
   @Published var draft: String = ""
 
+  /// Pending image attachments for the next send. Staged clipboard copies are
+  /// Pensieve-owned; external files are only referenced.
+  let attachmentStore: AskAttachmentStore
+
   private let agent: any CodescribeAgentStreaming
   private var inFlightTask: Task<Void, Never>?
   private var activeHost: DocumentToolHost?
   private var generation: UUID?
+  private var inFlightPrompt: String?
   @Published private(set) var activity: String?
 
-  init(id: UUID, agent: any CodescribeAgentStreaming) {
+  init(
+    id: UUID, agent: any CodescribeAgentStreaming,
+    attachmentStore: AskAttachmentStore? = nil
+  ) {
     self.id = id
     self.agent = agent
+    self.attachmentStore = attachmentStore ?? AskAttachmentStore()
   }
 
   var isStreaming: Bool {
@@ -57,7 +66,9 @@ final class DocumentAskThread: ObservableObject, Identifiable {
       lastError = "Write a question before sending."
       return false
     }
-    startStreaming(prompt: prompt, host: host, configuration: configuration)
+    startStreaming(
+      prompt: prompt, attachments: attachmentStore.attachments, host: host,
+      configuration: configuration)
     return true
   }
 
@@ -68,18 +79,26 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     generation = nil
     _ = agent.cancelTurn(threadId: id.uuidString.lowercased())
     inFlightTask?.cancel()
+    inFlightTask = nil
     for index in turns.indices { turns[index].isStreaming = false }
+    // A stopped turn keeps the user's input: restore the prompt and keep the
+    // pending attachments, unless a newer draft already replaced it.
+    if let prompt = inFlightPrompt, draft.isEmpty { draft = prompt }
+    inFlightPrompt = nil
     activity = "Stopped"
     phase = .idle
   }
 
   private func startStreaming(
-    prompt: String, host: DocumentToolHost, configuration: CsDocumentProvider?
+    prompt: String, attachments: [AskAttachment], host: DocumentToolHost,
+    configuration: CsDocumentProvider?
   ) {
     let token = UUID()
     generation = token
     activeHost = host
-    turns.append(AskTurn(role: .user, text: prompt))
+    inFlightPrompt = prompt
+    turns.append(
+      AskTurn(role: .user, text: prompt, attachmentIDs: attachments.map(\.id)))
     let assistantID = UUID()
     turns.append(AskTurn(id: assistantID, role: .assistant, text: "", isStreaming: true))
     phase = .streaming
@@ -88,6 +107,7 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     lastError = nil
     let threadID = id.uuidString.lowercased()
     let agent = self.agent
+    let attachmentStore = self.attachmentStore
     inFlightTask = Task { [weak self] in
       let listener = AskStreamListener()
       let reader = Task { @MainActor [weak self] in
@@ -98,17 +118,56 @@ final class DocumentAskThread: ObservableObject, Identifiable {
       }
       do {
         try Task.checkCancellation()
-        let final = try await agent.streamDocument(
-          text: prompt, threadId: threadID, document: host,
-          provider: configuration, listener: listener)
+        let final: String
+        if attachments.isEmpty {
+          final = try await agent.streamDocument(
+            text: prompt, threadId: threadID, document: host,
+            provider: configuration, listener: listener)
+        } else {
+          // Validation runs here, off the UI actor and before anything reaches
+          // the provider; the Rust side re-validates authoritatively.
+          let validationProbe = attachmentStore.validationProbe
+          try await Task.detached(priority: .userInitiated) {
+            if let validationProbe { try await validationProbe() }
+            try AskAttachmentStore.validateForSend(attachments)
+          }.value
+          // A Stop landing while validation was detached cancels before the
+          // Rust turn exists; without this re-check the finished validator
+          // would still start a provider request after Stop.
+          try Task.checkCancellation()
+          guard let self, self.generation == token else { throw CancellationError() }
+          guard let streaming = agent as? any CodescribeAgentAttachmentStreaming else {
+            throw CsError.Agent(
+              msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+          }
+          final = try await streaming.streamDocumentWithAttachments(
+            text: prompt, threadId: threadID,
+            attachments: attachments.map { CsAttachment(path: $0.url.path) }, document: host,
+            provider: configuration, listener: listener)
+        }
         listener.finish()
         await reader.value
         guard let self, self.generation == token else { return }
-        self.complete(assistantID: assistantID, text: final, error: self.lastError)
+        self.inFlightPrompt = nil
+        if let eventError = self.lastError {
+          // A failure reported through listener events is a failed send even
+          // when the call returned: keep the draft and every attachment.
+          if self.draft.isEmpty { self.draft = prompt }
+          self.complete(assistantID: assistantID, text: final, error: eventError)
+        } else {
+          // A completed send consumes its attachments: staged copies are
+          // released and the same images cannot be submitted twice.
+          attachmentStore.releaseSent(ids: attachments.map(\.id))
+          self.complete(assistantID: assistantID, text: final, error: nil)
+        }
       } catch {
         listener.finish()
         await reader.value
         guard let self, self.generation == token else { return }
+        // A failed send keeps the draft (unless a newer one exists) and keeps
+        // every attachment pending.
+        if self.draft.isEmpty { self.draft = prompt }
+        self.inFlightPrompt = nil
         self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
@@ -165,12 +224,18 @@ struct AskTurn: Equatable, Identifiable, Sendable {
   var role: Role
   var text: String
   var isStreaming: Bool
+  /// Exact pending-attachment IDs joined to this user turn at send time.
+  var attachmentIDs: [UUID]
 
-  init(id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false) {
+  init(
+    id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false,
+    attachmentIDs: [UUID] = []
+  ) {
     self.id = id
     self.role = role
     self.text = text
     self.isStreaming = isStreaming
+    self.attachmentIDs = attachmentIDs
   }
 }
 
@@ -270,6 +335,19 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
       text: text, threadId: threadId, document: document, provider: provider, listener: listener)
   }
 
+  func streamDocumentWithAttachments(
+    text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    guard let streaming = resolved() as? any CodescribeAgentAttachmentStreaming else {
+      throw CsError.Agent(
+        msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+    }
+    return try await streaming.streamDocumentWithAttachments(
+      text: text, threadId: threadId, attachments: attachments, document: document,
+      provider: provider, listener: listener)
+  }
+
   func cancelTurn(threadId: String) -> Bool {
     lock.lock()
     let agent = boxed
@@ -294,6 +372,8 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
     return created
   }
 }
+
+extension DeferredCodescribeAgent: CodescribeAgentAttachmentStreaming {}
 
 final class AskStreamListener: CsAgentListener, Sendable {
   enum Event: Sendable {

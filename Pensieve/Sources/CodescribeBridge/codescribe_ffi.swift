@@ -697,6 +697,17 @@ public protocol CodescribeAgentProtocol: AnyObject, Sendable {
     func streamDocument(text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
 
     /**
+     * The document-scoped loop with composer image attachments forwarded as
+     * real vision input. Attachments reuse the single composer validation
+     * (`validate_composer_attachments` over core's `load_image_for_vision`),
+     * all-or-nothing and gated on the vision capability of the provider this
+     * session will actually use — a readable error, never a silent drop. The
+     * tool registry stays the exact document registry: an attachment is
+     * message input, never a filesystem or desktop capability.
+     */
+    func streamDocumentWithAttachments(text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
+
+    /**
      * Stream one agent reply for `text` on the conversation identified by
      * `thread_id`, forwarding token/reasoning/tool events to `listener` as they
      * arrive. Returns the final assembled assistant text.
@@ -736,6 +747,14 @@ public protocol CodescribeAgentProtocol: AnyObject, Sendable {
      * The host owns membership, tab routing, revisions and undo.
      */
     func streamWorkspace(text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
+
+    /**
+     * The workspace-scoped loop with composer image attachments forwarded as
+     * real vision input. Same attachment contract as
+     * [`Self::stream_document_with_attachments`]; the registry stays the exact
+     * workspace registry (workspace discovery + live-buffer document tools).
+     */
+    func streamWorkspaceWithAttachments(text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
 
 }
 /**
@@ -951,6 +970,32 @@ open func streamDocument(text: String, threadId: String, document: CsDocumentToo
 }
 
     /**
+     * The document-scoped loop with composer image attachments forwarded as
+     * real vision input. Attachments reuse the single composer validation
+     * (`validate_composer_attachments` over core's `load_image_for_vision`),
+     * all-or-nothing and gated on the vision capability of the provider this
+     * session will actually use — a readable error, never a silent drop. The
+     * tool registry stays the exact document registry: an attachment is
+     * message input, never a filesystem or desktop capability.
+     */
+open func streamDocumentWithAttachments(text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribeagent_stream_document_with_attachments(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(text),FfiConverterString.lower(threadId),FfiConverterSequenceTypeCsAttachment.lower(attachments),FfiConverterTypeCsDocumentToolHost_lower(document),FfiConverterOptionTypeCsDocumentProvider.lower(provider),FfiConverterTypeCsAgentListener_lower(listener)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
+}
+
+    /**
      * Stream one agent reply for `text` on the conversation identified by
      * `thread_id`, forwarding token/reasoning/tool events to `listener` as they
      * arrive. Returns the final assembled assistant text.
@@ -1026,6 +1071,29 @@ open func streamWorkspace(text: String, threadId: String, workspace: CsDocumentT
                 uniffi_codescribe_ffi_fn_method_codescribeagent_stream_workspace(
                     self.uniffiCloneHandle(),
                     FfiConverterString.lower(text),FfiConverterString.lower(threadId),FfiConverterTypeCsDocumentToolHost_lower(workspace),FfiConverterOptionTypeCsDocumentProvider.lower(provider),FfiConverterTypeCsAgentListener_lower(listener)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
+}
+
+    /**
+     * The workspace-scoped loop with composer image attachments forwarded as
+     * real vision input. Same attachment contract as
+     * [`Self::stream_document_with_attachments`]; the registry stays the exact
+     * workspace registry (workspace discovery + live-buffer document tools).
+     */
+open func streamWorkspaceWithAttachments(text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribeagent_stream_workspace_with_attachments(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(text),FfiConverterString.lower(threadId),FfiConverterSequenceTypeCsAttachment.lower(attachments),FfiConverterTypeCsDocumentToolHost_lower(workspace),FfiConverterOptionTypeCsDocumentProvider.lower(provider),FfiConverterTypeCsAgentListener_lower(listener)
                 )
             },
             pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
@@ -16884,6 +16952,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_document() != 12706) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_document_with_attachments() != 58150) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_reply() != 57150) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16891,6 +16962,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_workspace() != 7808) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_workspace_with_attachments() != 44225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagentstatus_agentic_readiness() != 27253) {
