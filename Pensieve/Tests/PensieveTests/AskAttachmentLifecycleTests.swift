@@ -48,6 +48,17 @@ final class AskAttachmentLifecycleTests: XCTestCase {
 
   private let pngBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01])
 
+  /// Staged-file deletion runs off the UI actor; poll for it instead of
+  /// racing it.
+  private func waitForFileRemoval(_ path: String, timeout: TimeInterval = 2.0) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if !FileManager.default.fileExists(atPath: path) { return true }
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return !FileManager.default.fileExists(atPath: path)
+  }
+
   func testStagedClipboardImageIsPensieveOwnedAndRemoveDeletesIt() async throws {
     let store = makeStore()
     let attachment = try await store.stageImage(data: pngBytes, fileExtension: "png")
@@ -62,8 +73,9 @@ final class AskAttachmentLifecycleTests: XCTestCase {
 
     store.remove(id: attachment.id)
     XCTAssertTrue(store.attachments.isEmpty)
-    XCTAssertFalse(
-      FileManager.default.fileExists(atPath: attachment.url.path),
+    let removed = await waitForFileRemoval(attachment.url.path)
+    XCTAssertTrue(
+      removed,
       "removing a staged attachment deletes its Pensieve-owned copy")
   }
 
@@ -180,11 +192,29 @@ final class AskAttachmentLifecycleTests: XCTestCase {
     _ = try await store.addExternal(url: external)
     try FileManager.default.removeItem(at: external)
 
-    XCTAssertThrowsError(try AskAttachmentStore.validateForSend(store.attachments)) { error in
+    let pending = store.attachments
+    do {
+      try await Task.detached(priority: .userInitiated) {
+        try AskAttachmentStore.validateForSend(pending)
+      }.value
+      XCTFail("expected the vanished file to fail validation")
+    } catch {
       guard case AskAttachmentError.missing(let name) = error else {
         return XCTFail("expected missing, got \(error)")
       }
       XCTAssertEqual(name, "volatile.png")
+    }
+  }
+
+  /// Send-time validation stats files, so it must refuse the UI actor
+  /// outright; the threads reach it only through a detached executor.
+  func testValidateForSendRefusesTheMainThread() {
+    XCTAssertTrue(Thread.isMainThread)
+    XCTAssertThrowsError(try AskAttachmentStore.validateForSend([])) { error in
+      guard case CsError.Agent(let message) = error else {
+        return XCTFail("expected a main-thread refusal, got \(error)")
+      }
+      XCTAssertTrue(message.contains("off the main thread"), message)
     }
   }
 
@@ -197,9 +227,8 @@ final class AskAttachmentLifecycleTests: XCTestCase {
 
     store.releaseSent(ids: [staged.id, external.id, UUID()])
     XCTAssertTrue(store.attachments.isEmpty)
-    XCTAssertFalse(
-      FileManager.default.fileExists(atPath: stagedPath),
-      "a sent staged copy is deleted")
+    let removed = await waitForFileRemoval(stagedPath)
+    XCTAssertTrue(removed, "a sent staged copy is deleted")
     XCTAssertTrue(
       FileManager.default.fileExists(atPath: externalURL.path),
       "a sent external file is unreferenced, never deleted")

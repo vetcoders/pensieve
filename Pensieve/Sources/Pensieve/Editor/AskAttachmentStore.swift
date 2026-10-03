@@ -87,6 +87,11 @@ final class AskAttachmentStore: ObservableObject {
 
   @Published private(set) var attachments: [AskAttachment] = []
 
+  /// Test-only seam: when set, send-time validation awaits it first so a test
+  /// can deterministically pause validation (e.g. to cancel mid-validation).
+  /// Production never sets it.
+  var validationProbe: (@Sendable () async throws -> Void)?
+
   let stagingDirectory: URL
   private let fileManager: FileManager
 
@@ -140,8 +145,12 @@ final class AskAttachmentStore: ObservableObject {
       }
     } catch {
       // A stale or over-limit staging task must not attach: its copy is
-      // Pensieve-owned, so it is deleted rather than leaked.
-      try? fileManager.removeItem(at: staged.url)
+      // Pensieve-owned, so it is deleted (off the UI actor) rather than
+      // leaked.
+      let orphan = staged.url
+      Task.detached(priority: .utility) {
+        try? FileManager.default.removeItem(at: orphan)
+      }
       throw error
     }
     attachments.append(staged)
@@ -169,20 +178,25 @@ final class AskAttachmentStore: ObservableObject {
     return attachment
   }
 
-  /// Remove one pending attachment. Staged copies are deleted; external files
-  /// are only unreferenced.
+  /// Remove one pending attachment. Staged copies are deleted (off the UI
+  /// actor); external files are only unreferenced.
   func remove(id: UUID) {
     guard let index = attachments.firstIndex(where: { $0.id == id }) else { return }
     let attachment = attachments.remove(at: index)
     deleteIfStaged(attachment)
   }
 
-  /// Re-validate the pending set immediately before a send, on the caller's
-  /// (background) executor. All-or-nothing: the first failure aborts the send
-  /// with a readable error instead of sending a quietly degraded message.
+  /// Re-validate the pending set immediately before a send. Stats files, so it
+  /// must never run on the UI actor; the threads call it on a detached
+  /// executor and this guard makes a synchronous misuse a loud error instead
+  /// of a hidden main-thread stall. All-or-nothing: the first failure aborts
+  /// the send with a readable error instead of a quietly degraded message.
   nonisolated static func validateForSend(
     _ attachments: [AskAttachment], fileManager: FileManager = .default
   ) throws {
+    guard !Thread.isMainThread else {
+      throw CsError.Agent(msg: "Attachment validation must run off the main thread.")
+    }
     guard attachments.count <= maximumAttachments else {
       throw AskAttachmentError.tooMany(
         count: attachments.count, limit: maximumAttachments)
@@ -205,13 +219,19 @@ final class AskAttachmentStore: ObservableObject {
     for attachment in released { deleteIfStaged(attachment) }
   }
 
+  /// Deleting a Pensieve-owned staged copy is file I/O, so it leaves the UI
+  /// actor; the pending-set mutation itself has already happened above on the
+  /// actor. Only files inside the staging root are ever deleted.
   private func deleteIfStaged(_ attachment: AskAttachment) {
     guard attachment.origin == .staged else { return }
     guard
       attachment.url.deletingLastPathComponent().standardizedFileURL
         == stagingDirectory.standardizedFileURL
     else { return }
-    try? fileManager.removeItem(at: attachment.url)
+    let url = attachment.url
+    Task.detached(priority: .utility) {
+      try? FileManager.default.removeItem(at: url)
+    }
   }
 
   /// Write clipboard image data under the staging root. Off-main callers only:

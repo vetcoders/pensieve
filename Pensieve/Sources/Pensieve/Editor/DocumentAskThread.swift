@@ -126,9 +126,16 @@ final class DocumentAskThread: ObservableObject, Identifiable {
         } else {
           // Validation runs here, off the UI actor and before anything reaches
           // the provider; the Rust side re-validates authoritatively.
+          let validationProbe = attachmentStore.validationProbe
           try await Task.detached(priority: .userInitiated) {
+            if let validationProbe { try await validationProbe() }
             try AskAttachmentStore.validateForSend(attachments)
           }.value
+          // A Stop landing while validation was detached cancels before the
+          // Rust turn exists; without this re-check the finished validator
+          // would still start a provider request after Stop.
+          try Task.checkCancellation()
+          guard let self, self.generation == token else { throw CancellationError() }
           guard let streaming = agent as? any CodescribeAgentAttachmentStreaming else {
             throw CsError.Agent(
               msg: "This Ask engine cannot send attachments. Remove them or update the app.")
@@ -141,11 +148,18 @@ final class DocumentAskThread: ObservableObject, Identifiable {
         listener.finish()
         await reader.value
         guard let self, self.generation == token else { return }
-        // A completed send consumes its attachments: staged copies are
-        // released and the same images cannot be submitted twice.
-        attachmentStore.releaseSent(ids: attachments.map(\.id))
         self.inFlightPrompt = nil
-        self.complete(assistantID: assistantID, text: final, error: self.lastError)
+        if let eventError = self.lastError {
+          // A failure reported through listener events is a failed send even
+          // when the call returned: keep the draft and every attachment.
+          if self.draft.isEmpty { self.draft = prompt }
+          self.complete(assistantID: assistantID, text: final, error: eventError)
+        } else {
+          // A completed send consumes its attachments: staged copies are
+          // released and the same images cannot be submitted twice.
+          attachmentStore.releaseSent(ids: attachments.map(\.id))
+          self.complete(assistantID: assistantID, text: final, error: nil)
+        }
       } catch {
         listener.finish()
         await reader.value

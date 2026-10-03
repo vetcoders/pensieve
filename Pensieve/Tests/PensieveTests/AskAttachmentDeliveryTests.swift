@@ -52,6 +52,12 @@ final class AskAttachmentDeliveryTests: XCTestCase {
     return predicate()
   }
 
+  /// Staged-file deletion runs off the UI actor; poll for it instead of
+  /// racing it.
+  private func waitForFileRemoval(_ path: String) async -> Bool {
+    await waitUntil { !FileManager.default.fileExists(atPath: path) }
+  }
+
   // MARK: Document lane
 
   func testDocumentSendDeliversExactPathsAndConsumesAttachments() async throws {
@@ -81,8 +87,9 @@ final class AskAttachmentDeliveryTests: XCTestCase {
       "the sent turn carries the exact attachment IDs")
     XCTAssertTrue(
       store.attachments.isEmpty, "a completed send consumes its attachments")
-    XCTAssertFalse(
-      FileManager.default.fileExists(atPath: stagedPath),
+    let stagedRemoved = await waitForFileRemoval(stagedPath)
+    XCTAssertTrue(
+      stagedRemoved,
       "the staged copy is released after the successful send")
     XCTAssertEqual(thread.draft, "")
     XCTAssertNil(thread.lastError)
@@ -149,6 +156,29 @@ final class AskAttachmentDeliveryTests: XCTestCase {
     XCTAssertEqual(thread.draft, "Caption this.")
     XCTAssertEqual(store.attachments.count, 1)
     XCTAssertEqual(thread.turns.first { $0.role == .user }?.attachmentIDs.count, 1)
+  }
+
+  /// A failure reported through listener events (no throw) is still a failed
+  /// send: draft and attachments stay, nothing is released.
+  func testEventOnlyFailureKeepsDraftAndAttachments() async throws {
+    let agent = RecordingAttachmentAgent()
+    agent.eventFailure = "provider stream stalled"
+    let store = makeStore()
+    let thread = makeDocumentThread(agent: agent, store: store)
+    _ = try await store.stageImage(data: Data([0x89, 0x50]), fileExtension: "png")
+    thread.draft = "Describe the diagram."
+
+    XCTAssertTrue(
+      thread.send(provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note")))
+    let settled = await waitUntil { thread.phase != .streaming }
+    XCTAssertTrue(settled)
+
+    guard case .failed(let message) = thread.phase else {
+      return XCTFail("expected a failed phase, got \(thread.phase)")
+    }
+    XCTAssertEqual(message, "provider stream stalled")
+    XCTAssertEqual(thread.draft, "Describe the diagram.")
+    XCTAssertEqual(store.attachments.count, 1, "an event-only failure releases nothing")
   }
 
   func testEngineWithoutAttachmentSupportFailsExplicitly() async throws {
@@ -224,8 +254,31 @@ final class AskAttachmentDeliveryTests: XCTestCase {
     XCTAssertEqual(agent.plainSends, 0)
     XCTAssertEqual(thread.turns.first { $0.role == .user }?.attachmentIDs, [attachment.id])
     XCTAssertTrue(store.attachments.isEmpty)
-    XCTAssertFalse(FileManager.default.fileExists(atPath: stagedPath))
+    let stagedRemoved = await waitForFileRemoval(stagedPath)
+    XCTAssertTrue(stagedRemoved)
     XCTAssertNil(thread.lastError)
+  }
+
+  /// Workspace lane: an event-only failure preserves the user's input too.
+  func testWorkspaceEventOnlyFailureKeepsDraftAndAttachments() async throws {
+    let agent = RecordingWorkspaceAttachmentAgent()
+    agent.eventFailure = "workspace provider stream stalled"
+    let store = makeStore()
+    let thread = WorkspaceAskThread(
+      identity: WorkspaceIdentity.make(rootURL: scratch, bookmarkData: nil),
+      makeAgent: { agent }, attachmentStore: store)
+    _ = try await store.stageImage(data: Data([0x89, 0x50]), fileExtension: "png")
+
+    XCTAssertTrue(
+      thread.send(
+        text: "Inspect the screenshot.", host: makeWorkspaceHost(),
+        provider: .apiKey("sk-test")))
+    let settled = await waitUntil { !thread.isStreaming }
+    XCTAssertTrue(settled)
+
+    XCTAssertEqual(thread.lastError, "workspace provider stream stalled")
+    XCTAssertEqual(thread.draft, "Inspect the screenshot.")
+    XCTAssertEqual(store.attachments.count, 1, "an event-only failure releases nothing")
   }
 
   func testWorkspaceSendWithoutAttachmentsKeepsThePlainEntrypoint() async throws {
@@ -264,6 +317,59 @@ final class AskAttachmentDeliveryTests: XCTestCase {
       agent.attachmentSends, 1, "the seam was entered but nothing was released or delivered")
   }
 
+  /// Stop while validation is suspended must never start a provider request:
+  /// the finished validator re-checks cancellation and generation first.
+  func testCancelDuringValidationNeverStartsTheProviderAndKeepsInput() async throws {
+    let agent = RecordingAttachmentAgent()
+    let gate = ValidationGate()
+    let store = makeStore()
+    store.validationProbe = { await gate.wait() }
+    let thread = makeDocumentThread(agent: agent, store: store)
+    _ = try await store.stageImage(data: Data([0x89, 0x50]), fileExtension: "png")
+    thread.draft = "Pause here."
+
+    XCTAssertTrue(
+      thread.send(provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note")))
+    let probing = await waitUntil { gate.entered }
+    XCTAssertTrue(probing, "validation should be in flight before the Stop")
+    thread.cancel()
+    gate.open()
+    for _ in 0..<20 { await Task.yield() }
+
+    XCTAssertEqual(agent.attachmentSends.count, 0, "no attachment request after Stop")
+    XCTAssertEqual(agent.plainSends, 0, "no provider request at all after Stop")
+    XCTAssertEqual(thread.phase, .idle)
+    XCTAssertEqual(thread.draft, "Pause here.", "Stop keeps the draft")
+    XCTAssertEqual(store.attachments.count, 1, "Stop keeps the attachments pending")
+  }
+
+  /// Workspace lane: the same cancel-during-validation boundary.
+  func testWorkspaceCancelDuringValidationNeverStartsTheProviderAndKeepsInput() async throws {
+    let agent = RecordingWorkspaceAttachmentAgent()
+    let gate = ValidationGate()
+    let store = makeStore()
+    store.validationProbe = { await gate.wait() }
+    let thread = WorkspaceAskThread(
+      identity: WorkspaceIdentity.make(rootURL: scratch, bookmarkData: nil),
+      makeAgent: { agent }, attachmentStore: store)
+    _ = try await store.stageImage(data: Data([0x89, 0x50]), fileExtension: "png")
+
+    XCTAssertTrue(
+      thread.send(
+        text: "Pause here too.", host: makeWorkspaceHost(), provider: .apiKey("sk-test")))
+    let probing = await waitUntil { gate.entered }
+    XCTAssertTrue(probing, "validation should be in flight before the Stop")
+    thread.cancel()
+    gate.open()
+    for _ in 0..<20 { await Task.yield() }
+
+    XCTAssertEqual(agent.attachmentSends.count, 0, "no attachment request after Stop")
+    XCTAssertEqual(agent.plainSends, 0, "no provider request at all after Stop")
+    XCTAssertFalse(thread.isStreaming)
+    XCTAssertEqual(thread.draft, "Pause here too.", "Stop keeps the draft")
+    XCTAssertEqual(store.attachments.count, 1, "Stop keeps the attachments pending")
+  }
+
   // MARK: Vendored payload
 
   /// The scoped attachment entrypoints must exist in the delivered library,
@@ -292,6 +398,36 @@ final class AskAttachmentDeliveryTests: XCTestCase {
 
 // MARK: - Test doubles
 
+/// Controllable suspension for send-time validation: `wait` blocks until
+/// `open`, so a test can cancel precisely while validation is in flight.
+private final class ValidationGate: @unchecked Sendable {
+  private struct State: Sendable {
+    var entered = false
+    var release: (@Sendable () -> Void)?
+  }
+
+  private let state = Mutex(State())
+  var entered: Bool { state.withLock { $0.entered } }
+
+  func wait() async {
+    await withCheckedContinuation { continuation in
+      state.withLock {
+        $0.entered = true
+        $0.release = { continuation.resume() }
+      }
+    }
+  }
+
+  func open() {
+    let release = state.withLock { current -> (@Sendable () -> Void)? in
+      let pending = current.release
+      current.release = nil
+      return pending
+    }
+    release?()
+  }
+}
+
 /// Records both entrypoints; an injected failure simulates a provider-side
 /// rejection after validation (e.g. the vision gate).
 private final class RecordingAttachmentAgent: CodescribeAgentAttachmentStreaming,
@@ -310,12 +446,17 @@ private final class RecordingAttachmentAgent: CodescribeAgentAttachmentStreaming
 
   private let state = Mutex(State())
   private let failureBox = Mutex<(any Error)?>(nil)
+  private let eventFailureBox = Mutex<String?>(nil)
 
   var attachmentSends: [AttachmentSend] { state.withLock { $0.attachmentSends } }
   var plainSends: Int { state.withLock { $0.plainSends } }
   var failure: (any Error)? {
     get { failureBox.withLock { $0 } }
     set { failureBox.withLock { $0 = newValue } }
+  }
+  var eventFailure: String? {
+    get { eventFailureBox.withLock { $0 } }
+    set { eventFailureBox.withLock { $0 = newValue } }
   }
 
   func streamDocument(
@@ -337,6 +478,7 @@ private final class RecordingAttachmentAgent: CodescribeAgentAttachmentStreaming
         AttachmentSend(text: text, threadId: threadId, paths: attachments.map(\.path)))
     }
     if let failure { throw failure }
+    if let eventFailure { listener.onError(message: eventFailure) }
     listener.onTextDone(text: "image reply")
     listener.onDone()
     return "image reply"
@@ -378,10 +520,15 @@ private final class RecordingWorkspaceAttachmentAgent: WorkspaceAgentAttachmentS
   }
 
   private let state = Mutex(State())
+  private let eventFailureBox = Mutex<String?>(nil)
   var attachmentSends: [RecordingAttachmentAgent.AttachmentSend] {
     state.withLock { $0.attachmentSends }
   }
   var plainSends: Int { state.withLock { $0.plainSends } }
+  var eventFailure: String? {
+    get { eventFailureBox.withLock { $0 } }
+    set { eventFailureBox.withLock { $0 = newValue } }
+  }
 
   func streamWorkspace(
     text: String, threadId: String, workspace: CsDocumentToolHost,
@@ -401,6 +548,7 @@ private final class RecordingWorkspaceAttachmentAgent: WorkspaceAgentAttachmentS
       $0.attachmentSends.append(
         .init(text: text, threadId: threadId, paths: attachments.map(\.path)))
     }
+    if let eventFailure { listener.onError(message: eventFailure) }
     listener.onTextDone(text: "workspace image reply")
     listener.onDone()
     return "workspace image reply"
