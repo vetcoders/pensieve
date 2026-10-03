@@ -244,26 +244,30 @@ final class AskConversationModel: ObservableObject {
             }
           }.value
         guard !Task.isCancelled else { return }
-        // A thread replacement while parsing retires the whole round.
-        guard self.epoch == epoch else { return }
         var applied = false
-        for result in results {
-          // A retired/evicted id has no observation left: drop the result
-          // instead of reinserting it after the prune.
-          guard let current = self.observedRevisions[result.id] else { continue }
-          // A request queued while this round parsed is newer; it will be
-          // parsed next round, so this stale result drops instead of
-          // overwriting newer text.
-          if let pending = self.latestRequests[result.id], pending.revision > result.revision {
-            continue
+        // A thread replacement while parsing retires the whole round: its
+        // results drop — but the loop CONTINUES, so requests queued for the
+        // new thread while this round was in flight drain right behind it
+        // instead of being stranded until another observation.
+        if self.epoch == epoch {
+          for result in results {
+            // A retired/evicted id has no observation left: drop the result
+            // instead of reinserting it after the prune.
+            guard let current = self.observedRevisions[result.id] else { continue }
+            // A request queued while this round parsed is newer; it will be
+            // parsed next round, so this stale result drops instead of
+            // overwriting newer text.
+            if let pending = self.latestRequests[result.id], pending.revision > result.revision {
+              continue
+            }
+            guard result.revision == current.revision else { continue }
+            guard result.revision >= (self.parsedRevisions[result.id] ?? 0) else { continue }
+            self.parseInvocations[result.id, default: 0] += 1
+            self.touch(result.id)
+            self.documents[result.id] = result.document
+            self.parsedRevisions[result.id] = result.revision
+            applied = true
           }
-          guard result.revision == current.revision else { continue }
-          guard result.revision >= (self.parsedRevisions[result.id] ?? 0) else { continue }
-          self.parseInvocations[result.id, default: 0] += 1
-          self.touch(result.id)
-          self.documents[result.id] = result.document
-          self.parsedRevisions[result.id] = result.revision
-          applied = true
         }
         if applied {
           self.noteContentChanged()

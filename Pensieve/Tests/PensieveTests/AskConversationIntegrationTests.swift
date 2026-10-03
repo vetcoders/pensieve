@@ -400,6 +400,36 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertEqual(model.document(for: newID.uuidString)?.source, "new thread reply")
   }
 
+  /// Requests queued for the NEW thread while the retired round was still in
+  /// flight must drain right behind it — the old round drops, the worker
+  /// continues, and the new thread's AST arrives with no extra observation.
+  func testParseQueuedDuringRetiredRoundDrainsWithoutExtraObservation() async {
+    let gate = ParseGate()
+    let model = AskConversationModel(
+      clock: { 0 },
+      parse: { text in
+        gate.wait()
+        return AskMarkdownParser.parse(text)
+      })
+    let oldID = UUID()
+    model.observe(turns: [AskTurn(id: oldID, role: .assistant, text: "old thread reply")])
+    // The old thread's parse is suspended at the gate when the replacement
+    // and the new thread's first observation land.
+    model.replaceThread()
+    let newID = UUID()
+    model.observe(turns: [AskTurn(id: newID, role: .assistant, text: "new thread reply")])
+    gate.open()
+    await drain(model)
+
+    XCTAssertNil(
+      model.document(for: oldID.uuidString),
+      "the retired round still drops")
+    XCTAssertEqual(
+      model.document(for: newID.uuidString)?.source, "new thread reply",
+      "the new thread's queued parse drains behind the retired round")
+    XCTAssertFalse(model.hasPendingWork, "no request is stranded")
+  }
+
   /// Fifty thread replacements cannot pile up ASTs: every visible turn still
   /// parses once, but retention stays inside the budget and stale pending
   /// work for retired threads is dropped.
