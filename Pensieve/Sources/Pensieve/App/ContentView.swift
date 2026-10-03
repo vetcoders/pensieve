@@ -742,17 +742,7 @@ private struct AskSurfaceHost: View {
 
   var body: some View {
     AskSurface(presentation: $presentation) {
-      AskProviderHeader(
-        showsScopePicker: hasWorkspace,
-        workspaceSelected: $workspaceAskSelected,
-        documentScopeEnabled: hasDocumentBuffer,
-        workspaceScopeEnabled: hasWorkspace,
-        grokAccount: grokAccount,
-        codexAccount: codexAccount,
-        apiKey: providerSettings.apiKey,
-        apiKeyProvider: providerSettings.providerShape,
-        readinessContext: readinessContext,
-        isStreaming: activeIsBusy)
+      headerSlot
     } transcript: {
       transcriptSlot
     } composer: {
@@ -772,6 +762,30 @@ private struct AskSurfaceHost: View {
     .onChange(of: workspaceThread?.identity.workspaceID) { _, _ in conversation.replaceThread() }
   }
 
+  @ViewBuilder private var headerSlot: some View {
+    if !workspaceScopeActive, let thread = documentThread {
+      AskDocumentThreadObservation(thread: thread) { observed in
+        providerHeader(isStreaming: observed.isStreaming)
+      }
+    } else {
+      providerHeader(isStreaming: activeIsBusy)
+    }
+  }
+
+  private func providerHeader(isStreaming: Bool) -> some View {
+    AskProviderHeader(
+      showsScopePicker: hasWorkspace,
+      workspaceSelected: $workspaceAskSelected,
+      documentScopeEnabled: hasDocumentBuffer,
+      workspaceScopeEnabled: hasWorkspace,
+      grokAccount: grokAccount,
+      codexAccount: codexAccount,
+      apiKey: providerSettings.apiKey,
+      apiKeyProvider: providerSettings.providerShape,
+      readinessContext: readinessContext,
+      isStreaming: isStreaming)
+  }
+
   @ViewBuilder private var transcriptSlot: some View {
     if workspaceScopeActive {
       if let thread = workspaceThread {
@@ -780,7 +794,9 @@ private struct AskSurfaceHost: View {
         Color.clear
       }
     } else if let thread = documentThread {
-      documentComposer(thread).transcript
+      AskDocumentThreadObservation(thread: thread) { observed in
+        documentComposer(observed).transcript
+      }
     } else {
       Color.clear
     }
@@ -794,7 +810,9 @@ private struct AskSurfaceHost: View {
         Color.clear
       }
     } else if let thread = documentThread {
-      documentComposer(thread).composer
+      AskDocumentThreadObservation(thread: thread) { observed in
+        documentComposer(observed).composer
+      }
     } else {
       Color.clear
     }

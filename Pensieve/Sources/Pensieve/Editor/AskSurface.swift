@@ -66,10 +66,12 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       transcript()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(height: max(layout.transcript.height, 0))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("pensieve.askSurface.transcript")
       composer()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(height: max(layout.composer.height, 0))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("pensieve.askSurface.composer")
     }
     .foregroundStyle(Color(nsColor: palette.text))
@@ -130,33 +132,13 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     .frame(height: max(layout.chrome.height, 0))
   }
 
-  @ViewBuilder
   private func chromeButtons(content: CGSize, palette: AskSurfacePalette) -> some View {
-    let buttons = HStack(spacing: 4) {
+    HStack(spacing: 4) {
       expandButton(content: content, palette: palette)
       presentationButton(content: content, palette: palette)
       hideButton(palette: palette)
     }
-    let grouped = AskChromeMaterial.resolve(
-      majorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
-      reduceTransparency: reduceTransparency,
-      role: .chromeGroup)
-    if grouped == .liquidGlass {
-      glassButtons(buttons)
-    } else {
-      buttons.buttonStyle(.borderless)
-    }
-  }
-
-  @ViewBuilder
-  private func glassButtons<V: View>(_ buttons: V) -> some View {
-    if #available(macOS 26, *) {
-      GlassEffectContainer(spacing: 6) {
-        buttons.buttonStyle(.glass)
-      }
-    } else {
-      buttons.buttonStyle(.borderless)
-    }
+    .buttonStyle(.plain)
   }
 
   private func expandButton(content: CGSize, palette: AskSurfacePalette) -> some View {
@@ -167,7 +149,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       }
     } label: {
       Image(systemName: expanded ? AskSurfaceSymbol.collapse : AskSurfaceSymbol.expand)
-        .frame(width: 28, height: 28)
+        .frame(width: 25, height: 25)
+        .contentShape(Rectangle())
     }
     .foregroundStyle(Color(nsColor: palette.text))
     .accessibilityIdentifier("pensieve.askSurface.expand")
@@ -183,7 +166,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       }
     } label: {
       Image(systemName: floating ? AskSurfaceSymbol.dock : AskSurfaceSymbol.float)
-        .frame(width: 28, height: 28)
+        .frame(width: 25, height: 25)
+        .contentShape(Rectangle())
     }
     .foregroundStyle(Color(nsColor: palette.text))
     .accessibilityIdentifier("pensieve.askSurface.presentation")
@@ -198,7 +182,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       }
     } label: {
       Image(systemName: AskSurfaceSymbol.hide)
-        .frame(width: 28, height: 28)
+        .frame(width: 25, height: 25)
+        .contentShape(Rectangle())
     }
     .foregroundStyle(Color(nsColor: palette.text))
     .accessibilityIdentifier("pensieve.askSurface.hide")

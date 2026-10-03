@@ -1,4 +1,6 @@
+import AppKit
 import CodescribeBridge
+import SwiftUI
 import Synchronization
 import XCTest
 
@@ -11,6 +13,32 @@ import XCTest
 @MainActor
 final class AskConversationIntegrationTests: XCTestCase {
   private var scratch: URL!
+
+  /// A mounted SwiftUI observer must reevaluate an extracted slot when the
+  /// document thread changes. No window or WindowServer fixture is allocated.
+  func testMountedDocumentSlotObservesDraftAndTurnsWithoutRemount() async {
+    let thread = DocumentAskThread(id: UUID(), agent: IntegrationAttachmentAgent())
+    let seen = Mutex([String]())
+    let hosting = NSHostingView(
+      rootView: AskDocumentThreadObservation(thread: thread) { observed in
+        let text = observed.draft + "|" + (observed.turns.last?.text ?? "")
+        seen.withLock { $0.append(text) }
+        return Text(text)
+      })
+    hosting.frame = CGRect(x: 0, y: 0, width: 400, height: 100)
+    _ = hosting.fittingSize
+    XCTAssertTrue(seen.withLock { $0.contains("|") })
+    thread.draft = "question"
+    thread.appendDictation("reply")
+    for _ in 0..<20 {
+      await Task.yield()
+      _ = hosting.fittingSize
+      if seen.withLock({ $0.contains("question|reply") }) { break }
+    }
+    XCTAssertTrue(
+      seen.withLock { $0.contains("question|reply") },
+      "thread changes must reach the mounted slot without hiding or resizing Ask")
+  }
 
   override func setUp() {
     scratch = FileManager.default.temporaryDirectory.appendingPathComponent(

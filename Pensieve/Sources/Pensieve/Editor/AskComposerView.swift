@@ -1,6 +1,15 @@
 import CodescribeBridge
 import SwiftUI
 
+/// Slot extraction must happen inside a mounted observer's body. Reading a
+/// computed slot on an unmounted View does not install its @ObservedObject.
+struct AskDocumentThreadObservation<Content: View>: View {
+  @ObservedObject var thread: DocumentAskThread
+  @ViewBuilder var content: (DocumentAskThread) -> Content
+
+  var body: some View { content(thread) }
+}
+
 /// Document-scope Ask: a thin wrapper that binds the document thread to the
 /// ONE shared conversation UI. Session authority stays in `DocumentAskThread`;
 /// this view only supplies bindings and callbacks to the assembled surface,
@@ -78,6 +87,7 @@ struct AskComposerView: View {
       onSend: send,
       onStop: { thread.cancel() }
     )
+    .accessibilityElement(children: .contain)
     .accessibilityIdentifier("pensieve.ask.composer")
   }
 

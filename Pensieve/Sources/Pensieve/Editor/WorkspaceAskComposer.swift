@@ -57,6 +57,7 @@ struct WorkspaceAskComposer: View {
       onSend: submit,
       onStop: { thread.cancel() }
     )
+    .accessibilityElement(children: .contain)
     .accessibilityIdentifier(Self.accessibilityIdentifier)
   }
 
