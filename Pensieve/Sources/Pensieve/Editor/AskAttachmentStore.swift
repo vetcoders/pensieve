@@ -87,6 +87,11 @@ final class AskAttachmentStore: ObservableObject {
 
   @Published private(set) var attachments: [AskAttachment] = []
 
+  /// Nonisolated mirror of this store's live staged URLs, so `deinit` (which
+  /// cannot touch MainActor state) can retire exactly the Pensieve-owned
+  /// copies this owner still holds. External references are never tracked.
+  let stagedTracker = AskStagedTracker()
+
   /// Test-only seam: when set, send-time validation awaits it first so a test
   /// can deterministically pause validation (e.g. to cancel mid-validation).
   /// Production never sets it.
@@ -154,6 +159,7 @@ final class AskAttachmentStore: ObservableObject {
       throw error
     }
     attachments.append(staged)
+    stagedTracker.insert(staged.url)
     return staged
   }
 
@@ -183,6 +189,7 @@ final class AskAttachmentStore: ObservableObject {
   func remove(id: UUID) {
     guard let index = attachments.firstIndex(where: { $0.id == id }) else { return }
     let attachment = attachments.remove(at: index)
+    if attachment.origin == .staged { stagedTracker.remove(attachment.url) }
     deleteIfStaged(attachment)
   }
 
@@ -216,7 +223,10 @@ final class AskAttachmentStore: ObservableObject {
     let sent = Set(ids)
     let released = attachments.filter { sent.contains($0.id) }
     attachments.removeAll { sent.contains($0.id) }
-    for attachment in released { deleteIfStaged(attachment) }
+    for attachment in released {
+      if attachment.origin == .staged { stagedTracker.remove(attachment.url) }
+      deleteIfStaged(attachment)
+    }
   }
 
   /// Deleting a Pensieve-owned staged copy is file I/O, so it leaves the UI
@@ -224,13 +234,32 @@ final class AskAttachmentStore: ObservableObject {
   /// actor. Only files inside the staging root are ever deleted.
   private func deleteIfStaged(_ attachment: AskAttachment) {
     guard attachment.origin == .staged else { return }
+    Self.deleteOwnedFile(at: attachment.url, inside: stagingDirectory)
+  }
+
+  /// The one deletion authority for staged copies: a file goes away only if
+  /// it sits directly inside this store's staging root, and always off the
+  /// caller's actor.
+  nonisolated static func deleteOwnedFile(at url: URL, inside stagingDirectory: URL) {
     guard
-      attachment.url.deletingLastPathComponent().standardizedFileURL
+      url.deletingLastPathComponent().standardizedFileURL
         == stagingDirectory.standardizedFileURL
     else { return }
-    let url = attachment.url
     Task.detached(priority: .utility) {
       try? FileManager.default.removeItem(at: url)
+    }
+  }
+
+  /// Genuine owner destruction (window closed for good, thread store
+  /// discarded): retire exactly the staged copies this owner still holds, off
+  /// main. Failed/Stop sends and scope/float/hide transitions never reach
+  /// this — the store is still alive there, and pending images stay.
+  deinit {
+    let orphans = stagedTracker.drain()
+    guard !orphans.isEmpty else { return }
+    let stagingDirectory = self.stagingDirectory
+    for url in orphans {
+      Self.deleteOwnedFile(at: url, inside: stagingDirectory)
     }
   }
 
@@ -277,5 +306,34 @@ final class AskAttachmentStore: ObservableObject {
       throw AskAttachmentError.tooLarge(name: name, limitBytes: maximumImageBytes)
     }
     return AskAttachment(id: id, url: url, origin: origin, byteCount: size)
+  }
+}
+
+/// Nonisolated set of one store's live staged URLs. `deinit` of a
+/// MainActor-isolated store cannot read its published state, so the store
+/// mirrors only what the retirement seam needs: which Pensieve-owned files it
+/// still owns.
+final class AskStagedTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var urls: Set<URL> = []
+
+  func insert(_ url: URL) {
+    lock.lock()
+    urls.insert(url)
+    lock.unlock()
+  }
+
+  func remove(_ url: URL) {
+    lock.lock()
+    urls.remove(url)
+    lock.unlock()
+  }
+
+  func drain() -> Set<URL> {
+    lock.lock()
+    defer { lock.unlock() }
+    let drained = urls
+    urls = []
+    return drained
   }
 }

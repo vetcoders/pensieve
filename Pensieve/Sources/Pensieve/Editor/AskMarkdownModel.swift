@@ -474,6 +474,31 @@ enum AskMarkdownInlineParser {
   }
 }
 
+/// Bounds the per-table work a message body may do. A single table is one
+/// block, so the top-level block page cannot cap it: rows render in bounded
+/// pages and column weights scan only a bounded sample of those rows. The
+/// exact full source stays on the document for selection and Copy; later
+/// rows reveal on demand without ever materializing the whole grid at once.
+enum AskMarkdownTableBudget {
+  static let rowPageSize = 40
+  static let weightScanRowLimit = 80
+
+  /// Rows rendered for a table after `revealed` user-driven page reveals.
+  static func visibleRowCount(total: Int, revealed: Int?) -> Int {
+    min(revealed ?? rowPageSize, max(total, 0))
+  }
+
+  /// The next page after one reveal, capped at the total.
+  static func nextReveal(current: Int, total: Int) -> Int {
+    min(current + rowPageSize, max(total, 0))
+  }
+
+  /// Rows fed to the weight scan: the visible page, never more than the cap.
+  static func weightScanCount(visible: Int, total: Int) -> Int {
+    min(max(visible, 0), weightScanRowLimit, max(total, 0))
+  }
+}
+
 /// Prose wraps inside the message. Wide tables and code keep their content
 /// width and scroll inside that same width, so a long row cannot push the
 /// surrounding prose past the viewport.

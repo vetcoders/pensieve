@@ -11,6 +11,15 @@ import UniformTypeIdentifiers
 /// runs off MainActor through ONE latest-wins worker — a new delta never
 /// spawns a new job, it replaces the pending request, and a stale result can
 /// never overwrite newer text. Completed turns parse once per revision.
+///
+/// Three budget rules keep a long or frequently replaced conversation cheap:
+/// UI snapshots and follow-tail scrolls are emitted only for structural
+/// changes, actual coalesced publications and accepted parse results — never
+/// per incoming delta; only the visible history window (plus the live turn)
+/// is parsed eagerly, hidden turns wait for reveal; and parsed AST retention
+/// is bounded to the window plus a recency budget, so retired threads cannot
+/// accumulate stale documents. The owning thread keeps full history and
+/// source; nothing here truncates it.
 @MainActor
 final class AskConversationModel: ObservableObject {
   struct ObservedTurn: Equatable {
@@ -20,6 +29,12 @@ final class AskConversationModel: ObservableObject {
     var isStreaming: Bool
     var revision: UInt64
   }
+
+  /// Parsed documents outlive their turn's visibility only within this
+  /// budget. Two window pages cover a scope round-trip without retaining
+  /// every previously displayed thread.
+  static let retentionBudget = AskTranscriptWindow.pageSize * 2
+  private static let recencyTrackingLimit = retentionBudget * 2
 
   @Published private(set) var snapshot = AskTranscriptSnapshot(
     turns: [], hiddenCount: 0, totalCount: 0,
@@ -31,6 +46,9 @@ final class AskConversationModel: ObservableObject {
   /// How often the parser actually ran per turn. Diagnostic surface for the
   /// bounded-parse regressions; not read by any view.
   private(set) var parseInvocations: [String: Int] = [:]
+  /// How many snapshots the model emitted. Diagnostic for the publication
+  /// budget: a delta burst must not become a snapshot burst.
+  private(set) var snapshotEmissions = 0
 
   private let clock: () -> TimeInterval
   private let parse: @Sendable (String) -> AskMarkdownDocument
@@ -38,16 +56,18 @@ final class AskConversationModel: ObservableObject {
   private var follow = StreamScrollFollowState()
   private var window = AskTranscriptWindow()
   private var turns: [ObservedTurn] = []
-  /// Revision memory independent of the visible list. Switching scope empties
-  /// `turns`, but a turn that comes back with unchanged text keeps its
-  /// revision, so its cached document is reused instead of re-parsed — and a
-  /// low restarted revision can never be mistaken for newer text.
+  /// Revision memory independent of the visible list. A turn that comes back
+  /// with unchanged text keeps its revision, so its cached document is reused
+  /// instead of re-parsed — and a low restarted revision can never be
+  /// mistaken for newer text. Pruned with the same retention budget.
   private var observedRevisions: [String: (text: String, isStreaming: Bool, revision: UInt64)] =
     [:]
   private var schedulers: [String: AskMarkdownStreamScheduler] = [:]
   private var documents: [String: AskMarkdownDocument] = [:]
   private var parsedRevisions: [String: UInt64] = [:]
   private var latestRequests: [String: (text: String, revision: UInt64)] = [:]
+  /// Access-ordered turn ids (least → most recent) for bounded retention.
+  private var recency: [String] = []
   private var scrollRequests = 0
   private var worker: Task<Void, Never>?
 
@@ -61,6 +81,8 @@ final class AskConversationModel: ObservableObject {
 
   func parseCount(for id: String) -> Int { parseInvocations[id] ?? 0 }
   func document(for id: String) -> AskMarkdownDocument? { documents[id] }
+  /// Total parsed documents currently retained (bounded by the budget).
+  var retainedDocumentCount: Int { documents.count }
 
   /// Test seam: are there parse requests queued or in flight?
   var hasPendingWork: Bool { !latestRequests.isEmpty || worker != nil }
@@ -81,11 +103,14 @@ final class AskConversationModel: ObservableObject {
   }
 
   /// Observe the thread's current turns. Diffed by revision: an unchanged
-  /// turn costs nothing, a changed one feeds the coalescer or the final
-  /// flush. Never parses here.
+  /// turn costs nothing. A snapshot is emitted only for structural changes
+  /// (turn added/removed/reordered) or actual visible work — a bare
+  /// subinterval delta publishes nothing. Parsing is requested only for the
+  /// visible window; hidden history waits for `revealEarlier`.
   func observe(turns newTurns: [AskTurn]) {
     var seen: Set<String> = []
-    var changed = false
+    var structural = false
+    var visibleWork = false
     for turn in newTurns {
       let id = turn.id.uuidString
       seen.insert(id)
@@ -102,10 +127,11 @@ final class AskConversationModel: ObservableObject {
               text: turn.text,
               isStreaming: turn.isStreaming,
               revision: memory.revision))
-          changed = true
+          structural = true
         }
         continue
       }
+      let wasStreaming = memory?.isStreaming ?? false
       let revision = (memory?.revision ?? 0) &+ 1
       observedRevisions[id] = (text: turn.text, isStreaming: turn.isStreaming, revision: revision)
       let observed = ObservedTurn(
@@ -118,52 +144,74 @@ final class AskConversationModel: ObservableObject {
         turns[index] = observed
       } else {
         turns.append(observed)
+        structural = true
       }
-      ingestChange(observed)
-      changed = true
+      touch(id)
+      if ingestChange(observed, wasStreaming: wasStreaming) { visibleWork = true }
     }
     if turns.count != newTurns.count {
       turns.removeAll { !seen.contains($0.id) }
-      changed = true
+      structural = true
     }
-    if changed {
+    if structural {
       // The display list follows the thread's order; re-added turns
       // (scope switch) and appends must not scramble it.
       let positions = Dictionary(
         uniqueKeysWithValues: newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) })
       turns.sort { (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max) }
-      publish()
     }
+    // Eager parse is due only for the window the user can actually see.
+    requestParsesForVisibleTurns()
+    if structural || visibleWork { publish() }
   }
 
-  /// A streaming delta enters the coalescer; only a publication (or the final
-  /// flush) requests a parse, so the parser never sees every incoming delta.
-  private func ingestChange(_ turn: ObservedTurn) {
+  /// A streaming delta enters the coalescer; only a publication requests a
+  /// parse and a UI refresh, so neither the parser nor SwiftUI sees every
+  /// incoming delta. A genuine stream completion (was streaming, now final)
+  /// is the terminal flush and publishes immediately. Returns whether
+  /// visible work happened.
+  private func ingestChange(_ turn: ObservedTurn, wasStreaming: Bool) -> Bool {
     if turn.isStreaming {
       var scheduler = schedulers[turn.id] ?? AskMarkdownStreamScheduler()
-      if let publication = scheduler.ingest(
-        text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
-      {
-        requestParse(id: turn.id, text: publication.text, revision: publication.generation)
-      }
-      schedulers[turn.id] = scheduler
-    } else {
-      schedulers.removeValue(forKey: turn.id)
+      defer { schedulers[turn.id] = scheduler }
+      guard
+        let publication = scheduler.ingest(
+          text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
+      else { return false }
+      requestParse(id: turn.id, text: publication.text, revision: publication.generation)
+      noteContentChanged()
+      return true
+    }
+    schedulers.removeValue(forKey: turn.id)
+    // A live turn going final is visible even mid-gesture; a historical
+    // completed turn changes nothing on screen by itself.
+    guard wasStreaming else { return false }
+    noteContentChanged()
+    return true
+  }
+
+  /// Eager parsing is bounded to the visible history window. Hidden turns
+  /// keep only their revision memory; `revealEarlier` pulls their parse.
+  private func requestParsesForVisibleTurns() {
+    let range = window.visibleRange(total: turns.count)
+    guard !turns.isEmpty else { return }
+    for turn in turns[range] where !turn.isStreaming {
       requestParse(id: turn.id, text: turn.text, revision: turn.revision)
     }
-    noteContentChanged()
   }
 
   /// Latest-wins: the pending request for a turn is replaced, never queued.
   private func requestParse(id: String, text: String, revision: UInt64) {
     if parsedRevisions[id] == revision { return }
+    if latestRequests[id]?.revision == revision { return }
     latestRequests[id] = (text: text, revision: revision)
     kickWorker()
   }
 
   /// One worker for the whole conversation. Each round drains the pending
   /// requests, parses them off MainActor, then applies only results that are
-  /// still the newest known revision for their turn.
+  /// still the newest known revision for their turn. A snapshot is emitted
+  /// only when an accepted result actually changed the visible content.
   private func kickWorker() {
     guard worker == nil else { return }
     worker = Task { [weak self] in
@@ -181,8 +229,10 @@ final class AskConversationModel: ObservableObject {
             }
           }.value
         guard !Task.isCancelled else { return }
+        var applied = false
         for result in results {
           self.parseInvocations[result.id, default: 0] += 1
+          self.touch(result.id)
           // A request queued while this round parsed is newer; it will be
           // parsed next round, so this stale result drops instead of
           // overwriting newer text.
@@ -192,8 +242,12 @@ final class AskConversationModel: ObservableObject {
           guard result.revision >= (self.parsedRevisions[result.id] ?? 0) else { continue }
           self.documents[result.id] = result.document
           self.parsedRevisions[result.id] = result.revision
+          applied = true
         }
-        self.publish()
+        if applied {
+          self.noteContentChanged()
+          self.publish()
+        }
       }
     }
   }
@@ -204,7 +258,15 @@ final class AskConversationModel: ObservableObject {
     }
   }
 
-  func userViewportChanged(isAtLiveEdge: Bool) {
+  /// A genuine user gesture began (tracking/interacting/decelerating — never
+  /// programmatic animation, content growth or resize).
+  func userScrollBegan() {
+    _ = follow.handle(.userScrollBegan)
+    publish()
+  }
+
+  /// A genuine user gesture ended; the settled position decides follow.
+  func userScrollEnded(isAtLiveEdge: Bool) {
     _ = follow.handle(.userScrollEnded(isAtLiveEdge: isAtLiveEdge))
     publish()
   }
@@ -213,11 +275,14 @@ final class AskConversationModel: ObservableObject {
     if follow.handle(.jumpToLatest) == .scrollToLiveEdge {
       scrollRequests += 1
     }
+    requestParsesForVisibleTurns()
     publish()
   }
 
+  /// Revealing hidden history is exactly when its parse becomes due.
   func revealEarlier() {
     window.revealEarlier()
+    requestParsesForVisibleTurns()
     publish()
   }
 
@@ -226,7 +291,8 @@ final class AskConversationModel: ObservableObject {
   }
 
   /// A different conversation now owns the surface: the history window and
-  /// follow state restart; parsed documents stay cached by turn id.
+  /// follow state restart; parsed documents stay cached within the retention
+  /// budget, so a quick scope round-trip does not re-parse.
   func replaceThread() {
     window.reset()
     schedulers.removeAll()
@@ -236,7 +302,45 @@ final class AskConversationModel: ObservableObject {
     publish()
   }
 
+  private func touch(_ id: String) {
+    recency.removeAll { $0 == id }
+    recency.append(id)
+    if recency.count > Self.recencyTrackingLimit {
+      recency.removeFirst(recency.count - Self.recencyTrackingLimit)
+    }
+  }
+
+  /// Bounds AST retention to the visible window (the budget the user chose)
+  /// plus the live turn and a recency budget, and drops pending requests for
+  /// evicted ids so a retired thread cannot leave obsolete parse work behind.
+  /// Revision memory is cheap and stays for the whole live conversation —
+  /// evicted ASTs simply re-parse lazily when a reveal brings their turn
+  /// back into the window.
+  private func pruneRetention() {
+    let liveIDs = Set(turns.map(\.id))
+    var astKeep = Set(
+      turns[window.visibleRange(total: turns.count)].map(\.id))
+    for turn in turns where turn.isStreaming { astKeep.insert(turn.id) }
+    var budget = Self.retentionBudget
+    var recencyKeep: Set<String> = []
+    for id in recency.reversed() where budget > 0 {
+      if recencyKeep.contains(id) { continue }
+      recencyKeep.insert(id)
+      budget -= 1
+    }
+    astKeep.formUnion(recencyKeep)
+    documents = documents.filter { astKeep.contains($0.key) }
+    parsedRevisions = parsedRevisions.filter { astKeep.contains($0.key) }
+    parseInvocations = parseInvocations.filter { astKeep.contains($0.key) }
+    latestRequests = latestRequests.filter { astKeep.contains($0.key) }
+    let memoryKeep = liveIDs.union(recencyKeep)
+    observedRevisions = observedRevisions.filter { memoryKeep.contains($0.key) }
+    schedulers = schedulers.filter { liveIDs.contains($0.key) }
+    recency = recency.filter { memoryKeep.contains($0) }
+  }
+
   private func publish() {
+    snapshotEmissions += 1
     let range = window.visibleRange(total: turns.count)
     let rendered = turns[range].map { turn -> AskTranscriptRenderedTurn in
       let document = documents[turn.id]
@@ -264,6 +368,61 @@ final class AskConversationModel: ObservableObject {
       showsJumpToLatest: follow.showsJumpToLatest,
       jumpTitle: StreamScrollFollowState.jumpToLatestTitle,
       scrollRequests: scrollRequests)
+    pruneRetention()
+  }
+}
+
+/// What the transcript's scroll routing may tell the model. Only a real user
+/// gesture produces these; geometry alone never does.
+enum AskScrollIntent: Equatable, Sendable {
+  case userScrollBegan
+  case userScrollEnded(isAtLiveEdge: Bool)
+}
+
+/// Scroll phases with SwiftUI's `ScrollPhase` mapped into three truth values:
+/// user-driven movement, programmatic animation, and rest.
+enum AskScrollPhase: Equatable, Sendable {
+  case userActive
+  case programmatic
+  case idle
+
+  init(_ phase: ScrollPhase) {
+    switch phase {
+    case .idle: self = .idle
+    case .tracking, .interacting, .decelerating: self = .userActive
+    case .animating: self = .programmatic
+    @unknown default: self = .programmatic
+    }
+  }
+}
+
+/// Genuine-user scroll routing for the production transcript. Programmatic
+/// `scrollTo`, content growth during streaming and window resize all move the
+/// scroll geometry; none of them is user intent. Geometry is remembered so a
+/// gesture's END can be judged, but only phase transitions emit intents — a
+/// manually paused follow stays paused through streams and resizes, and
+/// Jump to latest stays the only automatic resume.
+struct AskScrollIntentRouter: Equatable, Sendable {
+  private(set) var userDriven = false
+  private(set) var atLiveEdge = true
+
+  mutating func phaseChanged(to phase: AskScrollPhase) -> [AskScrollIntent] {
+    switch phase {
+    case .userActive:
+      userDriven = true
+      return [.userScrollBegan]
+    case .idle:
+      guard userDriven else { return [] }
+      userDriven = false
+      return [.userScrollEnded(isAtLiveEdge: atLiveEdge)]
+    case .programmatic:
+      return []
+    }
+  }
+
+  mutating func geometryChanged(isAtLiveEdge: Bool) -> [AskScrollIntent] {
+    atLiveEdge = isAtLiveEdge
+    return []
   }
 }
 
@@ -279,6 +438,8 @@ struct AskConversationTranscript: View {
   var identifierPrefix: String
 
   private let liveEdgeID = "pensieve.ask.liveEdge"
+  @State private var containerWidth: CGFloat = 0
+  @State private var scrollIntent = AskScrollIntentRouter()
 
   var body: some View {
     ScrollViewReader { proxy in
@@ -287,7 +448,7 @@ struct AskConversationTranscript: View {
           AskTranscriptView(
             snapshot: model.snapshot,
             tokens: themeManager.skin.tokens,
-            containerWidth: 0,
+            containerWidth: containerWidth,
             revealedTurnIDs: model.revealedTurnIDs,
             onRevealEarlier: { model.revealEarlier() },
             onJumpToLatest: { model.jumpToLatest() },
@@ -301,6 +462,11 @@ struct AskConversationTranscript: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
       }
+      .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { width in
+        // The transcript's readable column and the code/table viewports
+        // follow the REAL slot width, never a hardcoded minimum.
+        containerWidth = width
+      }
       .onChange(of: model.snapshot.scrollRequests) { _, _ in
         proxy.scrollTo(liveEdgeID, anchor: .bottom)
       }
@@ -312,11 +478,29 @@ struct AskConversationTranscript: View {
             viewportHeight: geometry.containerSize.height)
         },
         action: { _, isAtLiveEdge in
-          model.userViewportChanged(isAtLiveEdge: isAtLiveEdge)
+          // Geometry alone is not user intent: programmatic scrolls, content
+          // growth and resize only inform the router's position memory.
+          for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+            apply(intent)
+          }
         }
       )
+      .onScrollPhaseChange { _, phase in
+        for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
+          apply(intent)
+        }
+      }
     }
     .accessibilityIdentifier("\(identifierPrefix).turns")
+  }
+
+  private func apply(_ intent: AskScrollIntent) {
+    switch intent {
+    case .userScrollBegan:
+      model.userScrollBegan()
+    case .userScrollEnded(let isAtLiveEdge):
+      model.userScrollEnded(isAtLiveEdge: isAtLiveEdge)
+    }
   }
 
   @ViewBuilder

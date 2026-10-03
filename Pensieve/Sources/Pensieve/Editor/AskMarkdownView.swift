@@ -120,6 +120,8 @@ private struct AskMarkdownBlockView: View {
   let containerWidth: CGFloat
   let showsCaret: Bool
   let baseSize: CGFloat
+  /// User-driven row reveals for a large table; nil shows the first page.
+  @State private var revealedTableRows: Int?
 
   var body: some View {
     switch block {
@@ -314,29 +316,54 @@ private struct AskMarkdownBlockView: View {
   private func table(
     header: [AskMarkdownText], rows: [[AskMarkdownText]], columnCount: Int
   ) -> some View {
+    // One block can hold thousands of rows; the block page cannot bound that.
+    // Render rows in bounded pages and scan weights only over a bounded
+    // sample — never the whole grid in a view body. Full source stays on the
+    // document for selection/copy; later rows reveal on demand.
+    let visible = AskMarkdownTableBudget.visibleRowCount(
+      total: rows.count, revealed: revealedTableRows)
+    let shownRows = Array(rows.prefix(visible))
+    let scanCount = AskMarkdownTableBudget.weightScanCount(
+      visible: visible, total: rows.count)
     let plan = AskMarkdownOverflow.plan(
       containerWidth: containerWidth, codeCharacters: 0, tableColumns: columnCount)
     let weights = AskMarkdownParser.columnWeights(
       header: header.map(\.source),
-      rows: rows.map { $0.map(\.source) },
+      rows: shownRows.prefix(scanCount).map { $0.map(\.source) },
       count: columnCount)
-    return ScrollView(.horizontal, showsIndicators: true) {
-      AskMarkdownTableLayout(columns: columnCount, rowCount: rows.count + 1, weights: weights) {
-        ForEach(0..<columnCount, id: \.self) { column in
-          tableCell(cell(header, column), isHeader: true, isLastRow: rows.isEmpty)
-        }
-        ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+    return VStack(alignment: .leading, spacing: 4) {
+      ScrollView(.horizontal, showsIndicators: true) {
+        AskMarkdownTableLayout(
+          columns: columnCount, rowCount: shownRows.count + 1, weights: weights
+        ) {
           ForEach(0..<columnCount, id: \.self) { column in
-            tableCell(
-              cell(row, column),
-              isHeader: false,
-              isLastRow: index == rows.count - 1)
+            tableCell(cell(header, column), isHeader: true, isLastRow: shownRows.isEmpty)
+          }
+          ForEach(Array(shownRows.enumerated()), id: \.offset) { index, row in
+            ForEach(0..<columnCount, id: \.self) { column in
+              tableCell(
+                cell(row, column),
+                isHeader: false,
+                isLastRow: index == shownRows.count - 1)
+            }
           }
         }
+        .frame(minWidth: plan.tableContentWidth)
       }
-      .frame(minWidth: plan.tableContentWidth)
+      .frame(width: plan.tableViewportWidth, alignment: .leading)
+      if visible < rows.count {
+        Button {
+          revealedTableRows = AskMarkdownTableBudget.nextReveal(
+            current: visible, total: rows.count)
+        } label: {
+          Text("Show more rows · \(rows.count - visible) remaining")
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(Color(nsColor: tokens.accent.nsColor))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Show more table rows")
+      }
     }
-    .frame(width: plan.tableViewportWidth, alignment: .leading)
   }
 
   private func cell(_ row: [AskMarkdownText], _ column: Int) -> AskMarkdownText {

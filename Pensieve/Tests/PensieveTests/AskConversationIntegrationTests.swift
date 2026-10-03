@@ -238,6 +238,184 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertNotEqual(AskCommandEffect.cancelTurn, .concealed, "Stop and Hide stay distinct")
   }
 
+  // MARK: Publication budget (production UI work, not only parser count)
+
+  /// Fifty provider deltas inside 250ms must not become fifty snapshot
+  /// emissions or fifty scroll requests: the UI publishes on structure,
+  /// coalesced publications, the terminal flush and accepted parse results.
+  func testSubintervalDeltaBurstDoesNotBurstSnapshotsOrScrolls() async {
+    let now = Mutex(TimeInterval(0))
+    let model = AskConversationModel(clock: { now.withLock { $0 } })
+    let turnID = UUID()
+    for step in 0..<50 {
+      now.withLock { $0 = TimeInterval(step) * 0.005 }
+      model.observe(turns: [
+        AskTurn(
+          id: turnID, role: .assistant, text: String(repeating: "x", count: step + 1),
+          isStreaming: true)
+      ])
+    }
+    now.withLock { $0 = 1.0 }
+    model.observe(turns: [
+      AskTurn(id: turnID, role: .assistant, text: "final text", isStreaming: false)
+    ])
+    await drain(model)
+
+    XCTAssertLessThanOrEqual(
+      model.snapshotEmissions, 15,
+      "50 subinterval deltas coalesce to a handful of UI publications, got \(model.snapshotEmissions)"
+    )
+    XCTAssertLessThanOrEqual(
+      model.snapshot.scrollRequests, 15,
+      "follow-tail scrolling is tied to visible publications, not delta rate")
+    XCTAssertEqual(model.snapshot.turns.last?.document.source, "final text")
+  }
+
+  // MARK: Genuine user scroll routing
+
+  /// Programmatic motion (own scrollTo, content growth, resize) never
+  /// produces a user-scroll intent; only real gesture phases do.
+  func testScrollIntentRoutingIgnoresProgrammaticMotion() {
+    var router = AskScrollIntentRouter()
+    XCTAssertEqual(router.geometryChanged(isAtLiveEdge: false), [])
+    XCTAssertEqual(router.phaseChanged(to: .programmatic), [])
+    XCTAssertEqual(router.geometryChanged(isAtLiveEdge: true), [])
+    XCTAssertFalse(router.userDriven, "geometry alone is never a gesture")
+
+    XCTAssertEqual(router.phaseChanged(to: .userActive), [.userScrollBegan])
+    XCTAssertEqual(router.geometryChanged(isAtLiveEdge: false), [])
+    XCTAssertEqual(router.phaseChanged(to: .idle), [.userScrollEnded(isAtLiveEdge: false)])
+
+    XCTAssertEqual(router.phaseChanged(to: .programmatic), [])
+    XCTAssertEqual(router.geometryChanged(isAtLiveEdge: true), [])
+    XCTAssertEqual(
+      router.phaseChanged(to: .idle), [],
+      "settling after our own scrollTo is not the user resuming follow")
+
+    XCTAssertEqual(router.phaseChanged(to: .userActive), [.userScrollBegan])
+    _ = router.geometryChanged(isAtLiveEdge: true)
+    XCTAssertEqual(router.phaseChanged(to: .idle), [.userScrollEnded(isAtLiveEdge: true)])
+  }
+
+  /// A reader who scrolled up stays parked through the stream; Jump to
+  /// latest is the only automatic resume.
+  func testManuallyPausedFollowStaysPausedThroughStreaming() async {
+    let model = AskConversationModel(clock: { 0 })
+    let turnID = UUID()
+    model.observe(turns: [
+      AskTurn(id: turnID, role: .assistant, text: "one", isStreaming: true)
+    ])
+    await drain(model)
+    let baseline = model.snapshot.scrollRequests
+
+    model.userScrollBegan()
+    model.userScrollEnded(isAtLiveEdge: false)
+    model.observe(turns: [
+      AskTurn(id: turnID, role: .assistant, text: "one two", isStreaming: true)
+    ])
+    await drain(model)
+
+    XCTAssertEqual(
+      model.snapshot.scrollRequests, baseline,
+      "streaming growth cannot drag a reader who scrolled up")
+    XCTAssertTrue(model.snapshot.showsJumpToLatest)
+    model.jumpToLatest()
+    XCTAssertGreaterThan(
+      model.snapshot.scrollRequests, baseline,
+      "Jump to latest is the explicit resume")
+  }
+
+  // MARK: Lazy history and bounded AST retention
+
+  /// A 10000-turn history opens without parsing hidden turns: only the
+  /// visible window parses eagerly, and reveal pulls the next bounded page.
+  func testLargeHistoryParsesOnlyTheVisibleWindowUntilReveal() async {
+    let model = AskConversationModel(clock: { 0 })
+    let total = 10_000
+    let ids = (0..<total).map { _ in UUID() }
+    model.observe(
+      turns: ids.map { AskTurn(id: $0, role: .assistant, text: "answer \($0.uuidString)") })
+    await drain(model)
+
+    var parses = ids.reduce(0) { $0 + model.parseCount(for: $1.uuidString) }
+    XCTAssertLessThanOrEqual(
+      parses, AskTranscriptWindow.pageSize,
+      "hidden history is not parsed on observe, got \(parses)")
+    XCTAssertLessThanOrEqual(model.retainedDocumentCount, AskTranscriptWindow.pageSize)
+    XCTAssertEqual(model.snapshot.totalCount, total)
+    XCTAssertGreaterThan(model.snapshot.hiddenCount, 0, "history stays behind the window")
+
+    model.revealEarlier()
+    await drain(model)
+    parses = ids.reduce(0) { $0 + model.parseCount(for: $1.uuidString) }
+    XCTAssertLessThanOrEqual(
+      parses, AskTranscriptWindow.pageSize * 2,
+      "reveal pulls exactly the newly visible page, got \(parses)")
+    XCTAssertLessThanOrEqual(
+      model.retainedDocumentCount,
+      AskConversationModel.retentionBudget + AskTranscriptWindow.pageSize)
+  }
+
+  /// Fifty thread replacements cannot pile up ASTs: every visible turn still
+  /// parses once, but retention stays inside the budget and stale pending
+  /// work for retired threads is dropped.
+  func testThreadReplacementsKeepAstRetentionBounded() async {
+    let model = AskConversationModel(clock: { 0 })
+    var totalParses = 0
+    for round in 0..<50 {
+      let roundIDs = (0..<30).map { _ in UUID() }
+      model.replaceThread()
+      model.observe(
+        turns: roundIDs.map {
+          AskTurn(id: $0, role: .assistant, text: "round \(round) \($0.uuidString)")
+        })
+      await drain(model)
+      totalParses += roundIDs.reduce(0) { $0 + model.parseCount(for: $1.uuidString) }
+    }
+    XCTAssertEqual(totalParses, 50 * 30, "each visible turn parses exactly once")
+    XCTAssertLessThanOrEqual(
+      model.retainedDocumentCount,
+      AskConversationModel.retentionBudget + AskTranscriptWindow.pageSize,
+      "retired threads cannot accumulate stale documents")
+  }
+
+  // MARK: Table work budget
+
+  /// One huge table below the inline cap: the block page cannot bound it, so
+  /// the table budget does — bounded first page, bounded weight scan, every
+  /// row still reachable, full source intact for copy.
+  func testSingleHugeTableBelowInlineCapIsBounded() {
+    let source =
+      (["| a | b | c |", "| - | - | - |"]
+      + Array(repeating: "| 1 | 2 | 3 |", count: 1200)).joined(separator: "\n")
+    XCTAssertLessThan(source.utf8.count, OversizedBubblePolicy.inlineUTF8Cap)
+    let document = AskMarkdownParser.parse(source)
+    guard case .table(_, let rows, let columns) = document.blocks.first else {
+      return XCTFail("expected a table block")
+    }
+    XCTAssertEqual(rows.count, 1200)
+
+    let visible = AskMarkdownTableBudget.visibleRowCount(total: rows.count, revealed: nil)
+    XCTAssertEqual(visible, AskMarkdownTableBudget.rowPageSize)
+    let scan = AskMarkdownTableBudget.weightScanCount(visible: visible, total: rows.count)
+    XCTAssertLessThanOrEqual(
+      scan, AskMarkdownTableBudget.weightScanRowLimit,
+      "column weights never scan the whole grid in a view body")
+    XCTAssertEqual(
+      (visible + 1) * columns, (AskMarkdownTableBudget.rowPageSize + 1) * 3,
+      "materialized cells are bounded to the page plus the header")
+
+    var revealed = visible
+    var pages = 1
+    while revealed < rows.count {
+      revealed = AskMarkdownTableBudget.nextReveal(current: revealed, total: rows.count)
+      pages += 1
+    }
+    XCTAssertEqual(revealed, rows.count, "every row stays reachable through reveal")
+    XCTAssertEqual(pages, 30)
+    XCTAssertEqual(document.copyableSource, source, "the exact full source survives")
+  }
+
   // MARK: Gesture continuity (Founder resize steering review)
 
   /// A collapsed dock (preferred 398 remembered, 158 displayed) must drag

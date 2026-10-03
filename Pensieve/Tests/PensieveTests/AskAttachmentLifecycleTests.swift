@@ -245,4 +245,38 @@ final class AskAttachmentLifecycleTests: XCTestCase {
       FileManager.default.fileExists(atPath: pending.url.path),
       "an unsent staged copy stays for the next send")
   }
+
+  /// Genuine owner destruction retires exactly this store's Pensieve-owned
+  /// staged copies (off main); an external reference is never a file we own
+  /// and must survive untouched.
+  func testOwnerDestructionRetiresOnlyItsStagedCopies() async throws {
+    var store: AskAttachmentStore? = makeStore()
+    let staged = try await store!.stageImage(data: pngBytes, fileExtension: "png")
+    let externalURL = try writeFile("keep.png", bytes: 16)
+    _ = try await store!.addExternal(url: externalURL)
+    let stagedPath = staged.url.path
+    XCTAssertTrue(FileManager.default.fileExists(atPath: stagedPath))
+
+    store = nil
+    let removed = await waitForFileRemoval(stagedPath)
+    XCTAssertTrue(
+      removed,
+      "destroying the owner retires its still-pending staged copy")
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: externalURL.path),
+      "an external file is referenced, never owned — it survives")
+  }
+
+  /// A removed-then-released staged copy is not double-tracked: after
+  /// `remove`, owner destruction has nothing left to retire.
+  func testRemovedStagedCopyIsNotRetiredTwice() async throws {
+    var store: AskAttachmentStore? = makeStore()
+    let staged = try await store!.stageImage(data: pngBytes, fileExtension: "png")
+    let stagedPath = staged.url.path
+    store!.remove(id: staged.id)
+    let removed = await waitForFileRemoval(stagedPath)
+    XCTAssertTrue(removed)
+    XCTAssertTrue(store!.stagedTracker.drain().isEmpty, "removal already untracked it")
+    store = nil
+  }
 }
