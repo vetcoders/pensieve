@@ -2802,6 +2802,10 @@ final class IndexDatabase {
       guard let document = documentsByPath[record.path] else { return nil }
       return makeResult(record: record, document: document, query: query)
     }
+    // Reopened/bookmarked roots can have more than one indexed workspace
+    // identity. List identity is the live URL: keep its best-ranked hit once,
+    // before applying the user-visible limit, without deleting index records.
+    var seenDocumentIDs = Set<DocumentRef.ID>()
     return Array(
       results
         .sorted { lhs, rhs in
@@ -2809,6 +2813,7 @@ final class IndexDatabase {
           if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
           return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
         }
+        .filter { seenDocumentIDs.insert($0.id).inserted }
         .prefix(limit)
     )
   }
