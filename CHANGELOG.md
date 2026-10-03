@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- One Ask conversation surface for both scopes: a resizable dock that
+  remembers its height, an optional in-window float, and a native Markdown
+  transcript (headings, lists, quotes, tasks, links, code and tables) with
+  role labels, full-source selection and copy, follow-tail scrolling and a
+  bounded history window. Streaming replies parse off the main thread,
+  coalesced to at most ten updates a second, and long answers render in
+  bounded block pages. Scope, provider and readiness share the single header.
+- Image attachments in Ask: file picker, image/file paste and drag/drop with
+  removable preview chips. Clipboard images stage in Pensieve-owned support
+  storage; sends validate off the main thread, join the exact images to their
+  turn, and keep the draft and attachments on failure or Stop. Pasting an
+  image never inserts bytes or marker text into the draft or document.
+- Keyless local Ask: a genuinely loopback Responses endpoint (localhost,
+  127.0.0.1 or ::1 over HTTP/S) with a configured model is ready without an
+  API key, in both document and workspace scopes. Remote endpoints keep the
+  API-key and account sign-in rules.
 - Workspace Ask can open or activate an indexed document tab and use the
   embedded engine's document tools on its live buffer, including unsaved text
   and native Undo/Redo. Opening returns a receipt, not the entire document.
@@ -20,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access confirmation and whole-document character counting at submission.
 - Ask retrieves relevant excerpts on demand instead of requiring an initial
   full-document scan. Workspace conversation scope follows newly opened tabs.
+- The fixed 96/120 pt plain-text transcript and fixed-height Ask panels are
+  replaced by the shared surface above; the status bar, sidebar and editor
+  invariants are unchanged, and Hide remains distinct from Stop.
 
 ## [0.6.0] - 2026-09-29
 

@@ -134,6 +134,9 @@ struct AskTranscriptRenderedTurn: Identifiable, Equatable, Sendable {
   var disposition: BubbleTextDisposition
   var sharesListSelection: Bool
   var excerpt: String
+  /// Who said it ("You" / "Pensieve" / "Dictation"). Empty when the pure
+  /// engine produced the turn without scope context.
+  var roleLabel: String = ""
 }
 
 struct AskTranscriptSnapshot: Equatable, Sendable {
@@ -362,31 +365,69 @@ struct AskTranscriptView: View {
 
   @ViewBuilder
   private func turnBody(_ turn: AskTranscriptRenderedTurn) -> some View {
-    switch turn.disposition {
-    case .inline:
-      AskMarkdownView(
-        document: turn.document,
-        tokens: tokens,
-        containerWidth: AskTranscriptWidthPolicy.contentWidth(for: containerWidth),
-        showsCaret: turn.isStreaming)
-    case .headPreview:
-      if revealedTurnIDs.contains(turn.id) {
+    VStack(alignment: .leading, spacing: 3) {
+      if !turn.roleLabel.isEmpty {
+        Text(turn.roleLabel)
+          .font(.system(size: 10.5, weight: .medium))
+          .foregroundStyle(Color(nsColor: tokens.muted.nsColor))
+          .accessibilityAddTraits(.isHeader)
+      }
+      turnContent(turn)
+    }
+    .accessibilityIdentifier(
+      turn.isStreaming ? "pensieve.ask.stream" : "pensieve.ask.turn.\(turn.id)")
+  }
+
+  @ViewBuilder
+  private func turnContent(_ turn: AskTranscriptRenderedTurn) -> some View {
+    if turn.document.blocks.isEmpty {
+      // The first off-main parse for this revision has not landed yet (or the
+      // text is genuinely block-free); show the bounded plain text instead
+      // of parsing here or rendering blank.
+      plainFallback(turn)
+    } else {
+      switch turn.disposition {
+      case .inline:
         AskMarkdownView(
           document: turn.document,
           tokens: tokens,
           containerWidth: AskTranscriptWidthPolicy.contentWidth(for: containerWidth),
           showsCaret: turn.isStreaming)
-      } else {
-        VStack(alignment: .leading, spacing: 6) {
-          Text(turn.excerpt)
-            .font(.system(size: 13))
-            .foregroundStyle(Color(nsColor: tokens.text.nsColor))
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-          Button("Show full message") { onRevealTurn(turn.id) }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color(nsColor: tokens.accent.nsColor))
+      case .headPreview:
+        if revealedTurnIDs.contains(turn.id) {
+          AskMarkdownView(
+            document: turn.document,
+            tokens: tokens,
+            containerWidth: AskTranscriptWidthPolicy.contentWidth(for: containerWidth),
+            showsCaret: turn.isStreaming)
+        } else {
+          VStack(alignment: .leading, spacing: 6) {
+            Text(turn.excerpt)
+              .font(.system(size: 13))
+              .foregroundStyle(Color(nsColor: tokens.text.nsColor))
+              .textSelection(.enabled)
+              .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Show full message") { onRevealTurn(turn.id) }
+              .buttonStyle(.plain)
+              .foregroundStyle(Color(nsColor: tokens.accent.nsColor))
+          }
         }
+      }
+    }
+  }
+
+  private func plainFallback(_ turn: AskTranscriptRenderedTurn) -> some View {
+    HStack(alignment: .bottom, spacing: 2) {
+      Text(turn.excerpt.isEmpty && turn.isStreaming ? "…" : turn.excerpt)
+        .font(.system(size: 13))
+        .foregroundStyle(Color(nsColor: tokens.text.nsColor))
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      if turn.isStreaming {
+        Rectangle()
+          .fill(Color(nsColor: tokens.warning.nsColor))
+          .frame(width: 7, height: 15)
+          .accessibilityLabel("Streaming")
       }
     }
   }

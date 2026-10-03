@@ -67,11 +67,17 @@ final class AskInteractionTests: XCTestCase {
     rig.settle(0.3)
     let editor = try XCTUnwrap(rig.textView()?.enclosingScrollView)
     let rect = editor.convert(editor.bounds, to: rig.hosting)
-    // The expanded composer is 280pt; the status bar must still have its 26pt.
+    // The new flexible dock policy at a minimum-sized window: the dock is
+    // clamped (never the old fixed 280) so the editor floor and the 26pt
+    // status bar both survive. At 480pt content: dock ≤ 294, editor ≥ 160.
     let spaceBelow =
       rig.hosting.isFlipped
       ? rig.hosting.bounds.maxY - rect.maxY : rect.minY - rig.hosting.bounds.minY
-    XCTAssertGreaterThanOrEqual(spaceBelow, 306)
+    XCTAssertGreaterThanOrEqual(spaceBelow, 26, "the status bar keeps its space")
+    XCTAssertLessThanOrEqual(
+      spaceBelow, 320, "the clamped dock plus status bar never exceed the flexible policy")
+    XCTAssertGreaterThanOrEqual(
+      rect.height, 159, "the editor keeps its floor at the minimum content size")
     XCTAssertLessThanOrEqual(rig.hosting.bounds.height, 480)
     XCTAssertGreaterThanOrEqual(rect.minY, rig.hosting.bounds.minY)
     XCTAssertLessThanOrEqual(rect.maxY, rig.hosting.bounds.maxY)

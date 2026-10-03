@@ -6,6 +6,14 @@ struct AskDraftEditor: NSViewRepresentable {
   @Binding var text: String
   var isEnabled: Bool
   var onSubmit: () -> Void
+  /// Routes image/file paste to the attachment lane. Returning true means the
+  /// pasteboard held an attachable payload, so NOTHING is inserted into the
+  /// draft — an image must never spill raw bytes or marker text into the
+  /// editor. Text paste falls through to the native path unchanged.
+  var attachmentPasteHandler: ((NSPasteboard) -> Bool)?
+  /// The scope's draft identifier — the document and workspace composers
+  /// share this editor but keep their own accessibility names.
+  var accessibilityIdentifier: String = "pensieve.ask.draft"
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -25,7 +33,7 @@ struct AskDraftEditor: NSViewRepresentable {
     view.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
     view.delegate = context.coordinator
     view.setAccessibilityLabel("Ask question")
-    view.setAccessibilityIdentifier("pensieve.ask.draft")
+    view.setAccessibilityIdentifier(accessibilityIdentifier)
     scroll.documentView = view
     updateNSView(scroll, context: context)
     return scroll
@@ -37,6 +45,8 @@ struct AskDraftEditor: NSViewRepresentable {
     if view.string != text { view.string = text }
     view.isEditable = isEnabled
     view.onSubmit = onSubmit
+    view.attachmentPasteHandler = attachmentPasteHandler
+    view.setAccessibilityIdentifier(accessibilityIdentifier)
   }
 
   final class Coordinator: NSObject, NSTextViewDelegate {
@@ -51,6 +61,7 @@ struct AskDraftEditor: NSViewRepresentable {
 
 final class AskDraftTextView: NSTextView {
   var onSubmit: (() -> Void)?
+  var attachmentPasteHandler: ((NSPasteboard) -> Bool)?
 
   override func keyDown(with event: NSEvent) {
     let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
@@ -59,5 +70,18 @@ final class AskDraftTextView: NSTextView {
       return
     }
     super.keyDown(with: event)
+  }
+
+  /// Image and file paste becomes an attachment, never inserted text.
+  override func paste(_ sender: Any?) {
+    if let handler = attachmentPasteHandler, handler(NSPasteboard.general) { return }
+    super.paste(sender)
+  }
+
+  /// Dragging an image or file onto the draft attaches it instead of
+  /// dropping a file-path string into the message.
+  override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+    if let handler = attachmentPasteHandler, handler(sender.draggingPasteboard) { return true }
+    return super.performDragOperation(sender)
   }
 }

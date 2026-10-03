@@ -481,7 +481,10 @@ final class ProviderSettings: ObservableObject {
     value.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  nonisolated private static func isLocalProviderEndpoint(_ endpoint: String) -> Bool {
+  /// Shared with Ask readiness: the exact loopback set (localhost, 127.0.0.1,
+  /// ::1) that may run without an API key. Exact host match only — a
+  /// lookalike such as `127.0.0.1.evil.com` is remote.
+  nonisolated static func isLocalProviderEndpoint(_ endpoint: String) -> Bool {
     guard let host = URL(string: endpoint)?.host?.lowercased() else { return false }
     return host == "localhost" || host == "127.0.0.1" || host == "::1"
   }

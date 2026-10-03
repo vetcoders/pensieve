@@ -20,6 +20,10 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   private let agent: any CodescribeAgentStreaming
   private var inFlightTask: Task<Void, Never>?
+  /// The most recently started send task, retained past cancellation so a
+  /// test can deterministically observe its completion instead of yielding
+  /// and hoping a suspended validator already resumed.
+  private(set) var lastSendTask: Task<Void, Never>?
   private var activeHost: DocumentToolHost?
   private var generation: UUID?
   private var inFlightPrompt: String?
@@ -57,7 +61,8 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     configuration: CsDocumentProvider? = nil
   ) -> Bool {
     guard !isStreaming else { return false }
-    guard AskReadiness.isReady(provider) else {
+    guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
+    else {
       lastError = AskReadiness.notReadyMessage(for: provider)
       return false
     }
@@ -108,7 +113,7 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     let threadID = id.uuidString.lowercased()
     let agent = self.agent
     let attachmentStore = self.attachmentStore
-    inFlightTask = Task { [weak self] in
+    let sendTask = Task { [weak self] in
       let listener = AskStreamListener()
       let reader = Task { @MainActor [weak self] in
         for await event in listener.events {
@@ -171,6 +176,8 @@ final class DocumentAskThread: ObservableObject, Identifiable {
         self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
+    inFlightTask = sendTask
+    lastSendTask = sendTask
   }
 
   private func consume(_ event: AskStreamListener.Event, assistantID: UUID) {
@@ -253,21 +260,57 @@ enum AskProvider: Equatable, Sendable {
   case codex(accountAuthorized: Bool)
 }
 
-/// API-key providers are ready when the key is non-empty. Grok and Codex are
-/// ready only when the embedded engine reports that Pensieve account authorized.
+/// The endpoint and model an API-key send is actually configured with. Ask
+/// readiness reads this so a genuinely loopback Responses endpoint can run
+/// without a credential while remote providers keep the API-key rule.
+struct AskEndpointContext: Equatable, Sendable {
+  var endpoint: String
+  var model: String
+
+  init(endpoint: String, model: String) {
+    self.endpoint = endpoint
+    self.model = model
+  }
+
+  init?(configuration: CsDocumentProvider?) {
+    guard let configuration else { return nil }
+    self.init(endpoint: configuration.endpoint, model: configuration.model)
+  }
+}
+
+/// API-key providers are ready when the key is non-empty, or when the
+/// configured endpoint is a genuinely loopback HTTP(S) Responses endpoint
+/// with a non-empty model (the donor's key-optional local lane). Grok and
+/// Codex are ready only when the embedded engine reports that Pensieve
+/// account authorized.
 enum AskReadiness {
   static let apiKeyNotReadyMessage = "Add a provider API key in Settings before asking."
   static let grokNotReadyMessage = "Sign in to Grok in Settings ▸ AI before asking."
   static let codexNotReadyMessage = "Sign in to Codex in Settings ▸ AI before asking."
 
-  static func isReady(_ provider: AskProvider) -> Bool {
+  static func isReady(_ provider: AskProvider, context: AskEndpointContext? = nil) -> Bool {
     switch provider {
     case .apiKey(let apiKey):
       let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      return !key.isEmpty
+      if !key.isEmpty { return true }
+      return context.map { isKeylessLoopback(endpoint: $0.endpoint, model: $0.model) } ?? false
     case .grok(let accountAuthorized), .codex(let accountAuthorized):
       return accountAuthorized
     }
+  }
+
+  /// Keyless Ask is lawful only against a real loopback server: a valid
+  /// http(s) URL whose host is exactly localhost / 127.0.0.1 / ::1 (the
+  /// shared `ProviderSettings` set — no parallel parser), with a model to
+  /// send. Lookalike hosts and non-HTTP schemes stay on the API-key rule.
+  static func isKeylessLoopback(endpoint: String, model: String) -> Bool {
+    guard let url = URL(string: endpoint),
+      let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https",
+      url.host != nil
+    else { return false }
+    guard ProviderSettings.isLocalProviderEndpoint(endpoint) else { return false }
+    return !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   static func notReadyMessage(for provider: AskProvider) -> String {
@@ -279,12 +322,21 @@ enum AskReadiness {
   }
 
   /// The composer's chip names the credential that will actually be used.
-  static func chipLabel(for provider: AskProvider) -> String {
+  static func chipLabel(for provider: AskProvider, context: AskEndpointContext? = nil) -> String {
     switch provider {
-    case .apiKey: return isReady(provider) ? "Ready" : "Needs API key"
+    case .apiKey:
+      guard isReady(provider, context: context) else { return "Needs API key" }
+      return provider.apiKeyPresent ? "Ready" : "Local endpoint ready"
     case .grok: return isReady(provider) ? "Grok ready" : "Grok: sign in"
     case .codex: return isReady(provider) ? "Codex ready" : "Codex: sign in"
     }
+  }
+}
+
+extension AskProvider {
+  fileprivate var apiKeyPresent: Bool {
+    guard case .apiKey(let key) = self else { return false }
+    return !(key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
   }
 }
 

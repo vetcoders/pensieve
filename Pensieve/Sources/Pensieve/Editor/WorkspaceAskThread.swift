@@ -37,6 +37,10 @@ final class WorkspaceAskThread {
   @ObservationIgnored private let makeAgent: @Sendable () -> any WorkspaceAgentStreaming
   @ObservationIgnored private var agent: (any WorkspaceAgentStreaming)?
   @ObservationIgnored private var inFlightTask: Task<Void, Never>?
+  /// The most recently started send task, retained past cancellation so a
+  /// test can deterministically observe its completion instead of yielding
+  /// and hoping a suspended validator already resumed.
+  private(set) var lastSendTask: Task<Void, Never>?
   @ObservationIgnored private var activeHost: WorkspaceToolHost?
   @ObservationIgnored private var generation: UUID?
   @ObservationIgnored private var inFlightPrompt: String?
@@ -170,7 +174,8 @@ final class WorkspaceAskThread {
     )? = nil
   ) async -> Bool {
     guard !isBusy else { return false }
-    guard AskReadiness.isReady(provider) else {
+    guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
+    else {
       lastError = AskReadiness.notReadyMessage(for: provider)
       return false
     }
@@ -197,7 +202,8 @@ final class WorkspaceAskThread {
     configuration: CsDocumentProvider? = nil
   ) -> Bool {
     guard !isBusy else { return false }
-    guard AskReadiness.isReady(provider) else {
+    guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
+    else {
       lastError = AskReadiness.notReadyMessage(for: provider)
       host.invalidate()
       return false
@@ -223,7 +229,7 @@ final class WorkspaceAskThread {
     draft = ""
     let threadID = id.uuidString.lowercased()
     let attachmentStore = self.attachmentStore
-    inFlightTask = Task { [weak self] in
+    let sendTask = Task { [weak self] in
       let listener = AskStreamListener()
       let reader = Task { @MainActor [weak self] in
         for await event in listener.events {
@@ -286,6 +292,8 @@ final class WorkspaceAskThread {
         self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
+    inFlightTask = sendTask
+    lastSendTask = sendTask
     return true
   }
 

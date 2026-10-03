@@ -9,8 +9,13 @@ import SwiftUI
 /// `WindowChromeRecipe`'s content size. The layout reserves the status bar
 /// at the bottom and does not draw it. Theme comes from the scene's
 /// `ThemeManager`; the surface does not construct a second one.
-struct AskSurface<Transcript: View, Composer: View>: View {
+///
+/// `headerControls` rides the single chrome row between the title and the
+/// surface buttons, so scope/provider/readiness join the same header instead
+/// of stacking a second Ask header beneath it.
+struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View {
   @Binding var presentation: AskPresentationState
+  @ViewBuilder var headerControls: () -> HeaderControls
   @ViewBuilder var transcript: () -> Transcript
   @ViewBuilder var composer: () -> Composer
   @EnvironmentObject private var themeManager: ThemeManager
@@ -116,6 +121,8 @@ struct AskSurface<Transcript: View, Composer: View>: View {
         .gesture(
           floatDrag(content: content),
           including: presentation.mode == .floating ? .gesture : .none)
+      headerControls()
+        .layoutPriority(1)
       Spacer(minLength: 8)
       chromeButtons(content: content, palette: palette)
     }
@@ -242,7 +249,14 @@ struct AskSurface<Transcript: View, Composer: View>: View {
         if activeGrip == nil { activeGrip = route }
         switch route {
         case .dockResize:
-          let start = dockDragStart ?? presentation.preferredDockHeight
+          // The first sample starts from the DISPLAYED height: a collapsed or
+          // clamped dock drags continuously instead of jumping from the
+          // remembered preferred height. Only a deliberate resize rewrites
+          // the preference.
+          let start =
+            dockDragStart
+            ?? AskSurfaceLayout.displayedDockHeight(
+              presentation: presentation, content: content)
           if dockDragStart == nil { dockDragStart = start }
           update { state in
             AskPointerRoute.apply(
@@ -255,7 +269,11 @@ struct AskSurface<Transcript: View, Composer: View>: View {
               translation: value.translation)
           }
         case .floatDrag:
-          let start = floatDragStart ?? presentation.floatOrigin
+          let start =
+            floatDragStart
+            ?? AskSurfaceLayout.displayedFloatFrame(
+              presentation: presentation, content: content
+            ).origin
           if floatDragStart == nil { floatDragStart = start }
           update { state in
             AskPointerRoute.apply(
@@ -281,7 +299,11 @@ struct AskSurface<Transcript: View, Composer: View>: View {
   private func floatDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
-        let start = floatDragStart ?? presentation.floatOrigin
+        let start =
+          floatDragStart
+          ?? AskSurfaceLayout.displayedFloatFrame(
+            presentation: presentation, content: content
+          ).origin
         if floatDragStart == nil { floatDragStart = start }
         update { state in
           AskPointerRoute.apply(
@@ -300,7 +322,13 @@ struct AskSurface<Transcript: View, Composer: View>: View {
   private func floatResize(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
-        let start = floatResizeStart ?? presentation.preferredFloatSize
+        // Same continuity rule for the corner: a clamped float resizes from
+        // its displayed frame, not from a hidden larger preference.
+        let start =
+          floatResizeStart
+          ?? AskSurfaceLayout.displayedFloatFrame(
+            presentation: presentation, content: content
+          ).size
         if floatResizeStart == nil { floatResizeStart = start }
         update { state in
           AskPointerRoute.apply(

@@ -25,25 +25,53 @@ enum AskMarkdownPresentation {
   }
 }
 
+/// Top-level block budget for one message. A multi-thousand-block answer
+/// renders its first page and reveals more on demand — the outer lazy turn
+/// list cannot virtualize a single huge message, so the message bounds
+/// itself. The exact source stays whole for selection and Copy.
+enum AskMarkdownBlockPaging {
+  static let pageSize = 120
+}
+
 /// Native rendering of an already-parsed Ask document.
 ///
 /// The view does not parse. Tables and fenced code scroll horizontally inside
 /// the prose column; headings, lists, quotes, tasks and links stay in the
 /// column and wrap. Copy hands back the exact source held by the document.
+/// Top-level blocks render in bounded pages; "Show more" reveals the next
+/// page, so even a fully revealed reply never materialized all pages at once.
 struct AskMarkdownView: View {
   var document: AskMarkdownDocument
   var tokens: ThemeTokens
   var containerWidth: CGFloat
   var showsCaret: Bool = false
+  var blockPageSize: Int = AskMarkdownBlockPaging.pageSize
+
+  @State private var revealedBlockCount: Int?
 
   var body: some View {
-    AskMarkdownBlockStack(
-      blocks: document.blocks,
-      tokens: tokens,
-      containerWidth: containerWidth,
-      showsCaretOnLast: showsCaret,
-      baseSize: 14
-    )
+    let total = document.blocks.count
+    let revealed = min(revealedBlockCount ?? blockPageSize, total)
+    VStack(alignment: .leading, spacing: 7) {
+      AskMarkdownBlockStack(
+        blocks: Array(document.blocks.prefix(revealed)),
+        tokens: tokens,
+        containerWidth: containerWidth,
+        showsCaretOnLast: showsCaret,
+        baseSize: 14
+      )
+      if revealed < total {
+        Button {
+          revealedBlockCount = min(revealed + blockPageSize, total)
+        } label: {
+          Text("Show more of this reply · \(total - revealed) remaining")
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(Color(nsColor: tokens.accent.nsColor))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Show more of this reply")
+      }
+    }
     .textSelection(.enabled)
     .frame(maxWidth: .infinity, alignment: .leading)
     .overlay(alignment: .topTrailing) {

@@ -318,7 +318,9 @@ final class AskAttachmentDeliveryTests: XCTestCase {
   }
 
   /// Stop while validation is suspended must never start a provider request:
-  /// the finished validator re-checks cancellation and generation first.
+  /// the finished validator re-checks cancellation and generation first. The
+  /// regression observes the send task's actual completion — not a yield
+  /// budget — so a not-yet-resumed validator cannot pass vacuously.
   func testCancelDuringValidationNeverStartsTheProviderAndKeepsInput() async throws {
     let agent = RecordingAttachmentAgent()
     let gate = ValidationGate()
@@ -330,11 +332,13 @@ final class AskAttachmentDeliveryTests: XCTestCase {
 
     XCTAssertTrue(
       thread.send(provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note")))
+    let sentTask = thread.lastSendTask
+    XCTAssertNotNil(sentTask, "the send task exists before Stop")
     let probing = await waitUntil { gate.entered }
     XCTAssertTrue(probing, "validation should be in flight before the Stop")
     thread.cancel()
     gate.open()
-    for _ in 0..<20 { await Task.yield() }
+    await sentTask?.value
 
     XCTAssertEqual(agent.attachmentSends.count, 0, "no attachment request after Stop")
     XCTAssertEqual(agent.plainSends, 0, "no provider request at all after Stop")
@@ -343,7 +347,8 @@ final class AskAttachmentDeliveryTests: XCTestCase {
     XCTAssertEqual(store.attachments.count, 1, "Stop keeps the attachments pending")
   }
 
-  /// Workspace lane: the same cancel-during-validation boundary.
+  /// Workspace lane: the same cancel-during-validation boundary, observed
+  /// through the send task's completion.
   func testWorkspaceCancelDuringValidationNeverStartsTheProviderAndKeepsInput() async throws {
     let agent = RecordingWorkspaceAttachmentAgent()
     let gate = ValidationGate()
@@ -357,11 +362,13 @@ final class AskAttachmentDeliveryTests: XCTestCase {
     XCTAssertTrue(
       thread.send(
         text: "Pause here too.", host: makeWorkspaceHost(), provider: .apiKey("sk-test")))
+    let sentTask = thread.lastSendTask
+    XCTAssertNotNil(sentTask, "the send task exists before Stop")
     let probing = await waitUntil { gate.entered }
     XCTAssertTrue(probing, "validation should be in flight before the Stop")
     thread.cancel()
     gate.open()
-    for _ in 0..<20 { await Task.yield() }
+    await sentTask?.value
 
     XCTAssertEqual(agent.attachmentSends.count, 0, "no attachment request after Stop")
     XCTAssertEqual(agent.plainSends, 0, "no provider request at all after Stop")
