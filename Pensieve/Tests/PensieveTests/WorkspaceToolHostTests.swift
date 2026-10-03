@@ -126,7 +126,7 @@ final class WorkspaceToolHostTests: XCTestCase {
     XCTAssertEqual((window["text"] as? String)?.count, 100)
   }
 
-  func testDocumentReplaceIsUnknownOnTheWorkspaceHost() throws {
+  func testDocumentReplaceRequiresAnExplicitOpen() throws {
     let calls = Calls()
     let toolHost = host(calls: calls)
     XCTAssertThrowsError(
@@ -134,10 +134,26 @@ final class WorkspaceToolHostTests: XCTestCase {
         name: "document_replace",
         argumentsJson: #"{"revision":"x","old_text":"a","new_text":"b"}"#)
     ) { error in
-      XCTAssertEqual(agentMessage(error), "Unknown workspace tool.")
+      XCTAssertEqual(agentMessage(error), "Open a workspace document with document_open first.")
     }
     XCTAssertEqual(calls.searches, 0)
     XCTAssertEqual(calls.reads, 0)
+  }
+
+  func testCancellationDuringOpenRevokesTheLateDocumentHost() throws {
+    let document = AskDocumentFixture.host(text: "live")
+    let owner = Mutex<WorkspaceToolHost?>(nil)
+    let host = WorkspaceToolHost(
+      search: { _, _ in "{}" }, containsPath: { $0 == "inside.md" }, readFile: { _ in "disk" },
+      openDocument: { _, _ in
+        owner.withLock { $0 }?.invalidate()
+        return document
+      })
+    owner.withLock { $0 = host }
+    XCTAssertThrowsError(try invoke(host, "document_open", ["path": "inside.md"]))
+    XCTAssertFalse(document.isActive())
+    XCTAssertFalse(host.isActive())
+    owner.withLock { $0 = nil }
   }
 
   func testDocumentHostRejectsWorkspaceSearch() throws {

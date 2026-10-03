@@ -12,7 +12,7 @@ struct ContentView: View {
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @StateObject private var askThreads: DocumentAskThreadStore
   @State private var lastIngestedDictation = ""
-  @State private var workspaceAskSelected = false
+  @AppStorage("pensieve.ask.workspaceSelected") private var workspaceAskSelected = false
   /// Shared with the status bar's Ask chip and the composer header — one key,
   /// three surfaces. Default visible preserves the pre-toggle behavior.
   @AppStorage("pensieve.ask.visible") private var askVisible = true
@@ -36,19 +36,7 @@ struct ContentView: View {
   }
 
   private func makeDocumentHost() -> DocumentToolHost {
-    let id = appState.documentSession.askThreadID
-    return DocumentToolHost(
-      documentID: id,
-      snapshot: { [weak appState] in
-        guard let appState, appState.documentHasEditableBuffer else { return nil }
-        return AskDocumentSnapshot(
-          id: appState.documentSession.askThreadID,
-          title: appState.documentTitle, text: appState.documentSession.text)
-      },
-      replace: { [weak controller] expected, replacement in
-        controller?.applyAgentDocumentEdit(id: id, expected: expected, replacement: replacement)
-          ?? false
-      })
+    controller.makeAgentDocumentHost()
   }
 
   var body: some View {
@@ -88,7 +76,12 @@ struct ContentView: View {
           .accessibilityIdentifier("pensieve.ask.scope")
           if workspaceAskSelected || !appState.documentHasEditableBuffer {
             WorkspaceAskPanel(
-              workspace: appState.workspaceStore, providerSettings: providerSettings)
+              workspace: appState.workspaceStore, providerSettings: providerSettings,
+              openDocument: { [weak controller] ref, isActive in
+                guard let controller else { throw CsError.Agent(msg: "The window was closed.") }
+                workspaceAskSelected = true
+                return try await controller.openAgentDocument(ref, isActive: isActive)
+              })
           }
         }
         if appState.documentHasEditableBuffer {
@@ -99,7 +92,6 @@ struct ContentView: View {
               thread: thread,
               grokAccount: .shared,
               codexAccount: .shared,
-              documentText: appState.documentSession.text,
               apiKey: providerSettings.apiKey,
               makeDocumentHost: makeDocumentHost,
               apiConfiguration: CsDocumentProvider(

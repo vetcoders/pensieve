@@ -1,7 +1,7 @@
 import CodescribeBridge
 import SwiftUI
 
-/// Multiline Ask composer: informed preflight, then a visible streamed turn.
+/// Multiline Ask composer with a visible streamed turn and on-demand tools.
 /// This is the Ask send path — it is not the rewrite one-line alert.
 struct AskComposerView: View {
   @ObservedObject var thread: DocumentAskThread
@@ -9,7 +9,6 @@ struct AskComposerView: View {
   /// with Settings ▸ AI.
   @ObservedObject var grokAccount: GrokAccount
   @ObservedObject var codexAccount: CodexAccount
-  let documentText: String
   let apiKey: String
   let makeDocumentHost: @MainActor () -> DocumentToolHost
   let apiConfiguration: CsDocumentProvider
@@ -40,9 +39,6 @@ struct AskComposerView: View {
           VStack(alignment: .leading, spacing: 6) {
             if !thread.turns.isEmpty {
               turnList
-            }
-            if let preflight = thread.preflight, thread.phase == .awaitingConfirmation {
-              preflightPanel(preflight)
             }
             if let error = thread.lastError, !thread.isStreaming {
               Text(error)
@@ -88,7 +84,6 @@ struct AskComposerView: View {
 
   private var isCompact: Bool {
     thread.turns.isEmpty
-      && (thread.preflight == nil || thread.phase != .awaitingConfirmation)
       && thread.lastError == nil
       && grokAccount.lastError == nil
       && codexAccount.lastError == nil
@@ -211,33 +206,6 @@ struct AskComposerView: View {
     .accessibilityIdentifier("pensieve.ask.turns")
   }
 
-  private func preflightPanel(_ preflight: AskPreflight) -> some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text("Before sending")
-        .font(.caption.weight(.semibold))
-      Text(preflight.summary)
-        .font(.caption)
-        .textSelection(.enabled)
-      HStack {
-        Button("Cancel") {
-          thread.cancelPreflight()
-        }
-        .accessibilityIdentifier("pensieve.ask.cancel")
-        Button("Send") {
-          _ = thread.confirmAndSend(
-            document: documentText, provider: provider, host: makeDocumentHost(),
-            configuration: grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
-              ? nil : apiConfiguration)
-        }
-        .keyboardShortcut(.defaultAction)
-        .accessibilityIdentifier("pensieve.ask.confirm")
-      }
-    }
-    .padding(8)
-    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
-    .accessibilityIdentifier("pensieve.ask.preflight")
-  }
-
   private var composer: some View {
     HStack(alignment: .bottom, spacing: 8) {
       ZStack(alignment: .topLeading) {
@@ -251,7 +219,7 @@ struct AskComposerView: View {
             .accessibilityHidden(true)
         }
         AskDraftEditor(text: $thread.draft, isEnabled: !thread.isStreaming) {
-          prepareSend()
+          send()
         }
         .font(.callout)
         .scrollContentBackground(.hidden)
@@ -261,7 +229,7 @@ struct AskComposerView: View {
         .accessibilityIdentifier("pensieve.ask.draft")
       }
       Button(thread.isStreaming ? "Asking…" : "Ask") {
-        prepareSend()
+        send()
       }
       .buttonStyle(.borderedProminent)
       .controlSize(.small)
@@ -284,15 +252,12 @@ struct AskComposerView: View {
     }
   }
 
-  private func prepareSend() {
-    if thread.phase == .awaitingConfirmation {
-      _ = thread.confirmAndSend(
-        document: documentText, provider: provider, host: makeDocumentHost(),
-        configuration: grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
-          ? nil : apiConfiguration)
-    } else {
-      _ = thread.prepareSend(document: documentText, provider: provider)
-    }
+  private func send() {
+    guard !thread.isStreaming else { return }
+    _ = thread.send(
+      provider: provider, host: makeDocumentHost(),
+      configuration: grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
+        ? nil : apiConfiguration)
   }
 
   /// Compact status, same hairline capsule as the status-bar chips. The words

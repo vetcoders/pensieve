@@ -112,6 +112,35 @@ final class DocumentToolHostTests: XCTestCase {
     XCTAssertTrue(result.contains("Unsaved"))
   }
 
+  func testPagedSearchReachesLaterMatchesAndTailReadIsBounded() async throws {
+    let buffer = Buffer()
+    buffer.text = String(repeating: "common line\n", count: 191_000) + "FINAL_SENTINEL 🧠"
+    let host = buffer.host()
+    let first = try await Task.detached {
+      try host.execute(name: "document_search", argumentsJson: #"{"query":"common","limit":2}"#)
+    }.value
+    let page = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any])
+    let next = try XCTUnwrap(page["next_offset"] as? Int)
+    let second = try await Task.detached {
+      try host.execute(
+        name: "document_search",
+        argumentsJson: "{\"query\":\"common\",\"offset\":\(next),\"limit\":2}")
+    }.value
+    let later = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(second.utf8)) as? [String: Any])
+    let matches = try XCTUnwrap(later["matches"] as? [[String: Any]])
+    XCTAssertGreaterThanOrEqual(try XCTUnwrap(matches.first?["offset"] as? Int), next)
+    let tail = try await Task.detached {
+      try host.execute(
+        name: "document_read", argumentsJson: #"{"offset":20,"limit":20,"from_end":true}"#)
+    }.value
+    let excerpt = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(tail.utf8)) as? [String: Any])
+    XCTAssertTrue((excerpt["text"] as? String)?.contains("FINAL_SENTINEL 🧠") == true)
+    XCTAssertLessThanOrEqual((excerpt["text"] as? String)?.count ?? 21, 20)
+    XCTAssertTrue(excerpt["next_offset"] is NSNull)
+  }
+
   func testControllerEditIsDirtyUndoableAndBoundToDocument() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }

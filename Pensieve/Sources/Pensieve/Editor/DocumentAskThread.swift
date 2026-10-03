@@ -11,7 +11,6 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   @Published private(set) var turns: [AskTurn] = []
   @Published private(set) var phase: AskThreadPhase = .idle
-  @Published private(set) var preflight: AskPreflight?
   @Published private(set) var lastError: String?
   @Published var draft: String = ""
 
@@ -41,56 +40,16 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     turns.append(AskTurn(role: .dictation, text: utterance))
   }
 
-  /// Explains document access before starting the agent.
+  /// Sending authorizes the live document tools. No document is inspected or
+  /// added to the prompt here; the agent requests relevant fragments later.
   @discardableResult
-  func prepareSend(document: String, provider: AskProvider) -> AskPreflight? {
-    guard !isStreaming else { return nil }
-    lastError = nil
-    guard AskReadiness.isReady(provider) else {
-      lastError = AskReadiness.notReadyMessage(for: provider)
-      preflight = nil
-      phase = .idle
-      return nil
-    }
-    let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !prompt.isEmpty else {
-      lastError = "Write a question before sending."
-      preflight = nil
-      phase = .idle
-      return nil
-    }
-    let prepared = AskPreflight.make(prompt: prompt, document: document)
-    preflight = prepared
-    phase = .awaitingConfirmation
-    return prepared
-  }
-
-  /// Document access starts only after the user confirms.
-  @discardableResult
-  func sendWithoutConfirm(document: String, provider: AskProvider) -> Bool {
-    lastError = "Confirm document access before sending."
-    return false
-  }
-
-  func cancelPreflight() {
-    preflight = nil
-    lastError = nil
-    if phase == .awaitingConfirmation {
-      phase = .idle
-    }
-  }
-
-  @discardableResult
-  func confirmAndSend(
-    document: String, provider: AskProvider, host: DocumentToolHost,
+  func send(
+    provider: AskProvider, host: DocumentToolHost,
     configuration: CsDocumentProvider? = nil
   ) -> Bool {
+    guard !isStreaming else { return false }
     guard AskReadiness.isReady(provider) else {
       lastError = AskReadiness.notReadyMessage(for: provider)
-      return false
-    }
-    guard phase == .awaitingConfirmation, preflight != nil else {
-      lastError = "Confirm document access before sending."
       return false
     }
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -98,7 +57,6 @@ final class DocumentAskThread: ObservableObject, Identifiable {
       lastError = "Write a question before sending."
       return false
     }
-    preflight = AskPreflight.make(prompt: prompt, document: document)
     startStreaming(prompt: prompt, host: host, configuration: configuration)
     return true
   }
@@ -113,7 +71,6 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     for index in turns.indices { turns[index].isStreaming = false }
     activity = "Stopped"
     phase = .idle
-    preflight = nil
   }
 
   private func startStreaming(
@@ -185,7 +142,6 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     lastError = error
     phase = error.map(AskThreadPhase.failed) ?? .completed
     activity = error == nil ? nil : "Failed"
-    preflight = nil
     inFlightTask = nil
   }
 
@@ -193,7 +149,6 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
 enum AskThreadPhase: Equatable, Sendable {
   case idle
-  case awaitingConfirmation
   case streaming
   case completed
   case failed(String)
@@ -265,21 +220,6 @@ enum AskReadiness {
     case .grok: return isReady(provider) ? "Grok ready" : "Grok: sign in"
     case .codex: return isReady(provider) ? "Codex ready" : "Codex: sign in"
     }
-  }
-}
-
-struct AskPreflight: Equatable, Sendable {
-  var promptCharacters: Int
-  var documentCharacters: Int
-  var summary: String
-
-  static func make(prompt: String, document: String) -> AskPreflight {
-    AskPreflight(
-      promptCharacters: prompt.count, documentCharacters: document.count,
-      summary:
-        "Instruction: \(prompt.count) characters. Current document: \(document.count) characters. "
-        + "The agent can read this document and make undoable edits when requested. Changes follow your document save settings."
-    )
   }
 }
 
@@ -382,6 +322,9 @@ final class AskStreamListener: CsAgentListener, Sendable {
     case "document_read": label = "Reading document…"
     case "document_search": label = "Searching document…"
     case "document_replace": label = "Editing document…"
+    case "document_open": label = "Opening document…"
+    case "workspace_search": label = "Searching workspace…"
+    case "workspace_read": label = "Reading workspace file…"
     default: label = "Working…"
     }
     continuation.yield(.activity(label))

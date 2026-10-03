@@ -131,6 +131,9 @@ private struct WorkspaceAskTranscript: View {
 struct WorkspaceAskPanel: View {
   let workspace: WorkspaceStore
   @ObservedObject var providerSettings: ProviderSettings
+  let openDocument:
+    @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
+      DocumentToolHost
   @ObservedObject private var grokAccount = GrokAccount.shared
   @ObservedObject private var codexAccount = CodexAccount.shared
   @State private var thread: WorkspaceAskThread?
@@ -164,7 +167,8 @@ struct WorkspaceAskPanel: View {
                   wire: providerSettings.providerShape.rawValue,
                   endpoint: providerSettings.providerShape.normalizeEndpoint(
                     providerSettings.endpoint),
-                  model: providerSettings.model, apiKey: providerSettings.apiKey))
+                  model: providerSettings.model, apiKey: providerSettings.apiKey),
+              openDocument: openDocument)
           })
       }
     }

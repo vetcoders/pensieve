@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Workspace Ask can open or activate an indexed document tab and use the
+  embedded engine's document tools on its live buffer, including unsaved text
+  and native Undo/Redo. Opening returns a receipt, not the entire document.
+- Read the end of a document directly and page through literal search results.
+
+### Changed
+
+- Submit Document Ask immediately with Enter or Ask. Remove the extra document
+  access confirmation and whole-document character counting at submission.
+- Ask retrieves relevant excerpts on demand instead of requiring an initial
+  full-document scan. Workspace conversation scope follows newly opened tabs.
+
 ## [0.6.0] - 2026-09-29
 
 ### Added

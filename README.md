@@ -25,6 +25,15 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 - **Agent-Aware Writing:** Current-document dispatch and local AI autocomplete are wired into the native editor.
 - **Word/PDF Transfer Bridge:** Export Markdown to `.docx`; open or import `.docx` and text-based `.pdf` files as editable Markdown drafts.
 
+## Ask
+
+Ask uses Pensieve's embedded Codescribe engine. Document Ask reads and edits the
+live buffer, including unsaved text, with Undo/Redo. Workspace Ask searches the
+index, opens or activates document tabs, and uses the same document tools.
+Enter submits; Shift+Enter inserts a newline. Submitting a question does not
+preload the entire document: the agent searches and requests bounded excerpts, including
+the tail and later search matches, as needed for the task.
+
 ## Current AI and dictation limits
 
 Custom rewrite instructions use a single-line field. Rewrite sends the entire

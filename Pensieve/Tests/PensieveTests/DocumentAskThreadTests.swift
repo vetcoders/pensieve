@@ -79,14 +79,6 @@ final class DocumentAskThreadTests: XCTestCase {
       "the blocked message names the credential that is actually missing")
   }
 
-  func testLargeDocumentAccessIsDescribedWithoutPromisingSeparateTurns() {
-    let document = String(repeating: "x", count: 20_000)
-    let preflight = AskPreflight.make(prompt: "Summarise", document: document)
-    XCTAssertEqual(preflight.documentCharacters, 20_000)
-    XCTAssertTrue(preflight.summary.contains("read this document"))
-    XCTAssertFalse(preflight.summary.contains("pages"))
-  }
-
   func testStreamingPhaseIsObservableAndUsesTheDocumentThreadID() async throws {
     let agent = RecordingCodescribeAgent()
     let threadID = UUID()
@@ -94,11 +86,9 @@ final class DocumentAskThreadTests: XCTestCase {
     thread.draft = "Say hello."
 
     XCTAssertEqual(thread.phase, .idle)
-    XCTAssertTrue(thread.prepareSend(document: "note", provider: .apiKey("sk-test")) != nil)
-    XCTAssertEqual(thread.phase, .awaitingConfirmation)
     XCTAssertTrue(
-      thread.confirmAndSend(
-        document: "note", provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note"))
+      thread.send(
+        provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note"))
     )
     XCTAssertEqual(thread.phase, .streaming)
     XCTAssertTrue(thread.isStreaming)
@@ -132,10 +122,9 @@ final class DocumentAskThreadTests: XCTestCase {
     let thread = DocumentAskThread(id: UUID(), agent: agent)
     let document = String(repeating: "x", count: 8000 * 2 + 20)
     thread.draft = "Continue."
-    XCTAssertNotNil(thread.prepareSend(document: document, provider: .apiKey("sk-test")))
     XCTAssertTrue(
-      thread.confirmAndSend(
-        document: document, provider: .apiKey("sk-test"),
+      thread.send(
+        provider: .apiKey("sk-test"),
         host: AskDocumentFixture.host(text: document)))
 
     let finished = await waitUntil(timeout: 1.0) { thread.phase == .completed }
@@ -145,14 +134,13 @@ final class DocumentAskThreadTests: XCTestCase {
     XCTAssertEqual(agent.threadIDs.first, thread.id.uuidString.lowercased())
   }
 
-  func testConfirmationDoesNotSendAStaleDocument() async {
+  func testSendReadsTheLiveDocumentOnDemand() async {
     let agent = RecordingCodescribeAgent()
     let thread = DocumentAskThread(id: UUID(), agent: agent)
     thread.draft = "Find the decision."
-    XCTAssertNotNil(thread.prepareSend(document: "OLD decision", provider: .apiKey("test")))
     XCTAssertTrue(
-      thread.confirmAndSend(
-        document: "CURRENT decision", provider: .apiKey("test"),
+      thread.send(
+        provider: .apiKey("test"),
         host: AskDocumentFixture.host(text: "CURRENT decision")))
     let finished = await waitUntil(timeout: 1) { thread.phase == .completed }
     XCTAssertTrue(finished)
@@ -176,8 +164,7 @@ final class DocumentAskThreadTests: XCTestCase {
     let thread = DocumentAskThread(id: UUID(), agent: agent)
     let host = AskDocumentFixture.host(text: "unsaved")
     thread.draft = "Edit this"
-    _ = thread.prepareSend(document: "unsaved", provider: .apiKey("test"))
-    XCTAssertTrue(thread.confirmAndSend(document: "unsaved", provider: .apiKey("test"), host: host))
+    XCTAssertTrue(thread.send(provider: .apiKey("test"), host: host))
     let started = await waitUntil(timeout: 1) { agent.started }
     XCTAssertTrue(started)
     thread.cancel()

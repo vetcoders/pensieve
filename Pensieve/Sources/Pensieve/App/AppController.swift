@@ -1,4 +1,5 @@
 import AppKit
+import CodescribeBridge
 import Combine
 import CoreGraphics
 import Foundation
@@ -1598,6 +1599,55 @@ final class AppController: ObservableObject {
 
     DebugTrace.log("openDocumentWindow -> registry: \(ref.id.lastPathComponent)")
     requestOpenDocumentWindow(ref)
+  }
+
+  /// Use the same tab routing, staged load, working set and recents as a
+  /// workspace click. Return tools bound to the actual owning controller,
+  /// never to whichever window happens to have desktop focus.
+  func openAgentDocument(
+    _ ref: DocumentRef, isActive: @escaping @Sendable () -> Bool
+  ) async throws -> DocumentToolHost {
+    guard isActive(), !ref.isAdHoc, let root = ref.rootURL,
+      appState.workspaceRoots.contains(where: {
+        $0.url.standardizedFileURL == root.standardizedFileURL
+      }),
+      appState.allDocuments.contains(where: { $0.id == ref.id })
+    else { throw CsError.Agent(msg: "The document is no longer in this workspace.") }
+    openDocumentWindow(id: ref.id)
+    let identity = DocumentIdentity.file(ref.url.standardizedFileURL)
+    let deadline = ContinuousClock.now + .seconds(30)
+    while isActive(), ContinuousClock.now < deadline {
+      try Task.checkCancellation()
+      let owner =
+        documentWindowRegistry.controller(for: identity)
+        ?? (appState.selectedDocumentID?.standardizedFileURL == ref.url.standardizedFileURL
+          ? self : nil)
+      if let owner, !owner.hasPendingDocumentLoad {
+        guard owner.appState.documentSession.identity?.standardized == identity.standardized,
+          owner.appState.documentHasEditableBuffer
+        else { throw CsError.Agent(msg: "The document could not be opened for editing.") }
+        return owner.makeAgentDocumentHost()
+      }
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    throw CsError.Agent(
+      msg: isActive()
+        ? "The document did not finish opening." : "The workspace request was stopped.")
+  }
+
+  func makeAgentDocumentHost() -> DocumentToolHost {
+    let id = appState.documentSession.askThreadID
+    return DocumentToolHost(
+      documentID: id,
+      snapshot: { [weak self] in
+        guard let self, self.appState.documentHasEditableBuffer else { return nil }
+        return AskDocumentSnapshot(
+          id: self.appState.documentSession.askThreadID,
+          title: self.appState.documentTitle, text: self.appState.documentSession.text)
+      },
+      replace: { [weak self] expected, replacement in
+        self?.applyAgentDocumentEdit(id: id, expected: expected, replacement: replacement) ?? false
+      })
   }
 
   func selectSearchResult(_ result: WorkspaceSearchResult) {

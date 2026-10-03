@@ -2,10 +2,8 @@ import CodescribeBridge
 import Foundation
 import Synchronization
 
-/// Read-only tools for one workspace. Search, membership, and file bytes are
-/// injected: this type does not import the search cut, and a path the
-/// membership closure rejects never reaches `readFile`. The host itself does
-/// not open files.
+/// Workspace membership gates every path. Opening a file selects a live
+/// DocumentToolHost, which remains the authority for revisions and undo.
 final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
   private static let defaultSearchLimit = 5
   private static let searchLimitRange = 1...20
@@ -15,26 +13,67 @@ final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
   private let containsPath: @Sendable (String) -> Bool
   private let readFile: @Sendable (String) throws -> String
   private let active = Mutex(true)
+  private let selectedDocument = Mutex<(path: String, host: DocumentToolHost)?>(nil)
+  private let openDocument:
+    (@Sendable (String, @escaping @Sendable () -> Bool) throws -> DocumentToolHost)?
 
   init(
     search: @escaping @Sendable (String, Int) throws -> String,
     containsPath: @escaping @Sendable (String) -> Bool,
-    readFile: @escaping @Sendable (String) throws -> String
+    readFile: @escaping @Sendable (String) throws -> String,
+    openDocument: (@Sendable (String, @escaping @Sendable () -> Bool) throws -> DocumentToolHost)? =
+      nil
   ) {
     self.search = search
     self.containsPath = containsPath
     self.readFile = readFile
+    self.openDocument = openDocument
   }
 
   func isActive() -> Bool { active.withLock { $0 } }
 
-  func invalidate() { active.withLock { $0 = false } }
+  func invalidate() {
+    active.withLock { $0 = false }
+    let selected = selectedDocument.withLock { current in
+      let previous = current
+      current = nil
+      return previous
+    }
+    selected?.host.invalidate()
+  }
 
   func execute(name: String, argumentsJson arguments: String) throws -> String {
     guard isActive() else { throw failure("This workspace session is no longer active.") }
     let data = Data(arguments.utf8)
     let decoder = JSONDecoder()
     switch name {
+    case "document_open":
+      let request = try decoder.decode(Open.self, from: data)
+      guard containsPath(request.path), let openDocument else {
+        throw failure("The document cannot be opened from this workspace.")
+      }
+      let host = try openDocument(request.path, { [weak self] in self?.isActive() == true })
+      guard isActive() else {
+        host.invalidate()
+        throw failure("This workspace session is no longer active.")
+      }
+      let previous = selectedDocument.withLock { current in
+        let previous = current
+        current = (request.path, host)
+        return previous
+      }
+      previous?.host.invalidate()
+      // Cancellation may race the assignment; never leave a usable orphan.
+      guard isActive() else {
+        host.invalidate()
+        throw failure("This workspace session is no longer active.")
+      }
+      return try json(["opened": true, "path": request.path, "document_tools_available": true])
+    case "document_read", "document_search", "document_replace":
+      guard let host = selectedDocument.withLock({ $0?.host }) else {
+        throw failure("Open a workspace document with document_open first.")
+      }
+      return try host.execute(name: name, argumentsJson: arguments)
     case "workspace_search":
       let request = try decoder.decode(Search.self, from: data)
       let query = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -58,6 +97,15 @@ final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
       }
       guard containsPath(request.path) else {
         throw failure("Path is outside this workspace.")
+      }
+      if let selected = selectedDocument.withLock({ $0 }), selected.path == request.path {
+        let live = try selected.host.execute(
+          name: "document_read",
+          argumentsJson: try json(["offset": offset, "limit": limit]))
+        var payload =
+          try JSONSerialization.jsonObject(with: Data(live.utf8)) as? [String: Any] ?? [:]
+        payload["path"] = request.path
+        return try json(payload)
       }
       let file = try readFile(request.path)
       let total = file.count
@@ -89,6 +137,7 @@ final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
     let limit: Int?
   }
 
+  private struct Open: Decodable { let path: String }
   private struct Read: Decodable {
     let path: String
     let offset: Int?

@@ -731,10 +731,9 @@ public protocol CodescribeAgentProtocol: AnyObject, Sendable {
 
     /**
      * Run the same agent loop against the embedding app's workspace.
-     * The model sees only `workspace_search` and `workspace_read`. Both are
-     * read-only and call back through [`CsDocumentToolHost::execute`], the
-     * same host callback the document session uses. This does not replace
-     * [`Self::stream_document`] or its three tools.
+     * Workspace discovery and explicit document opening use the same host
+     * callback and standard live-buffer tools as [`Self::stream_document`].
+     * The host owns membership, tab routing, revisions and undo.
      */
     func streamWorkspace(text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener) async throws  -> String
 
@@ -1016,10 +1015,9 @@ open func streamReplyWithAttachments(text: String, threadId: String, attachments
 
     /**
      * Run the same agent loop against the embedding app's workspace.
-     * The model sees only `workspace_search` and `workspace_read`. Both are
-     * read-only and call back through [`CsDocumentToolHost::execute`], the
-     * same host callback the document session uses. This does not replace
-     * [`Self::stream_document`] or its three tools.
+     * Workspace discovery and explicit document opening use the same host
+     * callback and standard live-buffer tools as [`Self::stream_document`].
+     * The host owns membership, tab routing, revisions and undo.
      */
 open func streamWorkspace(text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?, listener: CsAgentListener)async throws  -> String  {
     return
@@ -16892,7 +16890,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_reply_with_attachments() != 7965) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_workspace() != 32111) {
+    if (uniffi_codescribe_ffi_checksum_method_codescribeagent_stream_workspace() != 7808) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeagentstatus_agentic_readiness() != 27253) {

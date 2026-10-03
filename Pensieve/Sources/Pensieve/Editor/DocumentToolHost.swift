@@ -62,22 +62,30 @@ final class DocumentToolHost: CsDocumentToolHost, Sendable {
     case "document_read":
       let request = try decoder.decode(Read.self, from: data)
       let count = document.text.count
-      guard request.offset >= 0, request.offset <= count, (1...8000).contains(request.limit) else {
+      guard request.offset >= 0, request.fromEnd == true || request.offset <= count,
+        (1...8000).contains(request.limit)
+      else {
         throw failure("Read offset or limit is out of bounds.")
       }
-      let text = String(document.text.dropFirst(request.offset).prefix(request.limit))
-      let end = request.offset + text.count
+      let start = request.fromEnd == true ? max(0, count - request.offset) : request.offset
+      let text = String(document.text.dropFirst(start).prefix(request.limit))
+      let end = start + text.count
       return try json([
         "title": document.title, "revision": document.revision, "text": text,
-        "offset": request.offset, "total_characters": count,
+        "offset": start, "total_characters": count,
         "next_offset": end < count ? end as Any : NSNull(),
       ])
     case "document_search":
       let request = try decoder.decode(Search.self, from: data)
       guard !request.query.isEmpty else { throw failure("Search text must not be empty.") }
-      var cursor = document.text.startIndex
+      let offset = request.offset ?? 0
+      let limit = request.limit ?? 30
+      guard offset >= 0, offset <= document.text.count, (1...30).contains(limit) else {
+        throw failure("Search offset or limit is out of bounds.")
+      }
+      var cursor = document.text.index(document.text.startIndex, offsetBy: offset)
       var matches: [[String: Any]] = []
-      while cursor < document.text.endIndex, matches.count < 30,
+      while cursor < document.text.endIndex, matches.count < limit,
         let range = document.text.range(of: request.query, range: cursor..<document.text.endIndex)
       {
         matches.append([
@@ -88,7 +96,9 @@ final class DocumentToolHost: CsDocumentToolHost, Sendable {
       }
       return try json([
         "revision": document.revision, "matches": matches,
-        "limit_reached": matches.count == 30,
+        "limit_reached": matches.count == limit,
+        "next_offset": matches.count == limit && cursor < document.text.endIndex
+          ? document.text.distance(from: document.text.startIndex, to: cursor) as Any : NSNull(),
       ])
     case "document_replace":
       let request = try decoder.decode(Replacement.self, from: data)
@@ -139,8 +149,17 @@ final class DocumentToolHost: CsDocumentToolHost, Sendable {
   private struct Read: Decodable {
     let offset: Int
     let limit: Int
+    let fromEnd: Bool?
+    enum CodingKeys: String, CodingKey {
+      case offset, limit
+      case fromEnd = "from_end"
+    }
   }
-  private struct Search: Decodable { let query: String }
+  private struct Search: Decodable {
+    let query: String
+    let offset: Int?
+    let limit: Int?
+  }
   private struct Replacement: Decodable {
     let revision: String
     let oldText: String

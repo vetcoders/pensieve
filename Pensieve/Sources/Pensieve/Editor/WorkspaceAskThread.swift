@@ -46,7 +46,13 @@ final class WorkspaceAskThread {
 
   /// Called on submit, never in a view body. Only indexed documents belonging
   /// to these roots are admitted; ad-hoc files are outside workspace access.
-  func makeHost(documents: [DocumentRef], database: IndexDatabase) async -> WorkspaceToolHost {
+  func makeHost(
+    documents: [DocumentRef], database: IndexDatabase,
+    openDocument: (
+      @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
+        DocumentToolHost
+    )? = nil
+  ) async -> WorkspaceToolHost {
     let identity = self.identity
     return await Task.detached(priority: .userInitiated) {
       let roots = Set(identity.canonicalRootURLs.map(\.standardizedFileURL))
@@ -66,6 +72,9 @@ final class WorkspaceAskThread {
           autoreleasepool { (ref.url.standardizedFileURL.path, ref.url.resolvingSymlinksInPath()) }
         },
         uniquingKeysWith: { first, _ in first })
+      let references = Dictionary(
+        scoped.map { ($0.url.standardizedFileURL.path, $0) },
+        uniquingKeysWith: { first, _ in first })
       return WorkspaceToolHost(
         search: { query, limit in
           try Self.searchFromCallback(
@@ -80,8 +89,41 @@ final class WorkspaceAskThread {
             URL(fileURLWithPath: path).resolvingSymlinksInPath() == target
           else { throw CsError.Agent(msg: "Path is outside this workspace.") }
           return try autoreleasepool { try String(contentsOf: target, encoding: .utf8) }
+        },
+        openDocument: { path, isActive in
+          guard let ref = references[path], let target = allowed[path],
+            URL(fileURLWithPath: path).resolvingSymlinksInPath() == target,
+            let openDocument
+          else { throw CsError.Agent(msg: "The document cannot be opened from this workspace.") }
+          return try Self.openFromCallback(ref: ref, isActive: isActive, openDocument: openDocument)
         })
     }.value
+  }
+
+  nonisolated private static func openFromCallback(
+    ref: DocumentRef, isActive: @escaping @Sendable () -> Bool,
+    openDocument:
+      @escaping @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
+      DocumentToolHost
+  ) throws -> DocumentToolHost {
+    guard !Thread.isMainThread else {
+      throw CsError.Agent(msg: "Document opening must run off the main thread.")
+    }
+    let ready = DispatchSemaphore(value: 0)
+    let result = Mutex<Result<DocumentToolHost, any Error>?>(nil)
+    Task { @MainActor in
+      defer { ready.signal() }
+      do {
+        guard isActive() else { throw CsError.Agent(msg: "The workspace request was stopped.") }
+        let host = try await openDocument(ref, isActive)
+        result.withLock { $0 = .success(host) }
+      } catch { result.withLock { $0 = .failure(error) } }
+    }
+    ready.wait()
+    guard let outcome = result.withLock({ $0 }) else {
+      throw CsError.Agent(msg: "Document opening did not return a result.")
+    }
+    return try outcome.get()
   }
 
   /// UniFFI's synchronous callback runs on Rust's spawn_blocking pool. Wait
@@ -114,7 +156,11 @@ final class WorkspaceAskThread {
   @discardableResult
   func prepareAndSend(
     text: String, documents: [DocumentRef], database: IndexDatabase,
-    provider: AskProvider, configuration: CsDocumentProvider? = nil
+    provider: AskProvider, configuration: CsDocumentProvider? = nil,
+    openDocument: (
+      @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
+        DocumentToolHost
+    )? = nil
   ) async -> Bool {
     guard !isBusy else { return false }
     guard AskReadiness.isReady(provider) else {
@@ -124,7 +170,7 @@ final class WorkspaceAskThread {
     let token = UUID()
     generation = token
     isPreparing = true
-    let host = await makeHost(documents: documents, database: database)
+    let host = await makeHost(documents: documents, database: database, openDocument: openDocument)
     guard generation == token, !Task.isCancelled else {
       host.invalidate()
       if generation == token {
@@ -219,7 +265,7 @@ final class WorkspaceAskThread {
         sessionId: request.sessionId, threadId: request.threadId, callId: request.callId,
         approved: false, remember: false)
       lastError =
-        "The agent requested an action outside read-only workspace access. It was refused."
+        "The agent requested an action outside this workspace and its open documents. It was refused."
     case .activity: break
     }
   }

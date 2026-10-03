@@ -23,7 +23,7 @@ final class AskInteractionTests: XCTestCase {
     XCTAssertEqual(sends, 1, "streaming must block keyboard submission too")
   }
 
-  func testAskPreflightAndRepeatedVisibilityChangesLeaveRoomForStatusBar() throws {
+  func testAskConversationAndRepeatedVisibilityChangesLeaveRoomForStatusBar() throws {
     let defaults = makeEphemeralDefaults(prefix: "ask-footer")
     defaults.set(true, forKey: "pensieve.ask.visible")
     let rig = WindowErrorChromeRig(defaults: defaults)
@@ -33,7 +33,7 @@ final class AskInteractionTests: XCTestCase {
     rig.settle(0.3)
     let thread = rig.askThreads.thread(for: rig.appState.documentSession.askThreadID)
     thread.draft = "Explain the document"
-    _ = thread.prepareSend(document: rig.appState.activeDocumentText, provider: .apiKey("test"))
+    thread.appendDictation("Explain the document")
     rig.settle(0.3)
     let expandedHeight = try XCTUnwrap(rig.editorPaneHeight())
     assertStatusSpace(rig)
@@ -50,7 +50,7 @@ final class AskInteractionTests: XCTestCase {
     }
   }
 
-  func testPreflightLeavesStatusBarInsideTheMinimumWindow() throws {
+  func testConversationLeavesStatusBarInsideTheMinimumWindow() throws {
     let defaults = makeEphemeralDefaults(prefix: "ask-small-footer")
     defaults.set(true, forKey: "pensieve.ask.visible")
     let rig = WindowErrorChromeRig(defaults: defaults)
@@ -61,7 +61,7 @@ final class AskInteractionTests: XCTestCase {
     rig.settle(0.3)
     let thread = rig.askThreads.thread(for: rig.appState.documentSession.askThreadID)
     thread.draft = "Explain"
-    _ = thread.prepareSend(document: "# Document", provider: .apiKey("test"))
+    thread.appendDictation("Explain")
     rig.settle(0.3)
     rig.window.setContentSize(WindowChromeRecipe.minimumContentSize)
     rig.settle(0.3)
