@@ -78,12 +78,29 @@ mkdir -p \
   "$PENSIEVE_ROOT/Sources/codescribe_ffiFFI" \
   "$VENDOR_DIR"
 
+python3 - "$GEN_DIR/codescribe_ffi.swift" "$GEN_DIR/codescribe_ffiFFI.h" <<'PY_FORMAT'
+import sys
+from pathlib import Path
+for name in sys.argv[1:]:
+    path = Path(name)
+    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()).rstrip() + "\n")
+PY_FORMAT
+
 cp "$GEN_DIR/codescribe_ffi.swift" "$GENERATED_SWIFT"
 cp "$GEN_DIR/codescribe_ffiFFI.h" "$GENERATED_HEADER"
 cp "$LIB_DIR/libcodescribe_ffi.dylib" "$VENDOR_DIR/libcodescribe_ffi.dylib"
 install_name_tool -id "@rpath/libcodescribe_ffi.dylib" \
   "$VENDOR_DIR/libcodescribe_ffi.dylib"
 codesign -f -s - "$VENDOR_DIR/libcodescribe_ffi.dylib"
+
+# Both Swift configurations use these generated bindings. A release refresh
+# supplies the same optimized engine to debug so neither configuration keeps
+# an older ABI, and the single provenance receipt describes both payloads.
+if [[ "$FFI_PROFILE" == "release" ]]; then
+  mkdir -p "$PENSIEVE_ROOT/Vendor/codescribe-ffi/debug"
+  cp "$VENDOR_DIR/libcodescribe_ffi.dylib" \
+    "$PENSIEVE_ROOT/Vendor/codescribe-ffi/debug/libcodescribe_ffi.dylib"
+fi
 
 if [[ ! -f "$PENSIEVE_ROOT/Sources/codescribe_ffiFFI/module.modulemap" ]]; then
   cat >"$PENSIEVE_ROOT/Sources/codescribe_ffiFFI/module.modulemap" <<'MODULEMAP'

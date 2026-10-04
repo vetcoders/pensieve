@@ -299,13 +299,9 @@ struct SidebarView: View {
           emptyWorkspaceRoot
         }
       } else {
-        List {
-          ForEach(treeSnapshot.rows) { row in
-            workspaceRowView(row)
-          }
+        SidebarWorkspaceList(rows: treeSnapshot.rows) { row in
+          workspaceRowView(row)
         }
-        .listStyle(.sidebar)
-        .accessibilityIdentifier("pensieve.sidebar.list.workspace")
       }
     }
   }
@@ -429,11 +425,10 @@ struct SidebarView: View {
 
   @ViewBuilder
   private func searchResultRowView(_ result: WorkspaceSearchResult) -> some View {
-    let isExplicitlySelected = selectedSearchResultIDs.contains(result.document.id)
     let isHovered = hoveredDocumentID == result.document.id
-    let isSelected =
-      isExplicitlySelected
-      || (selectedSearchResultIDs.isEmpty && isSelectedOrHovered(result.document.id))
+    let isSelected = Self.searchResultIsSelected(
+      result.document.id, selectedIDs: selectedSearchResultIDs,
+      activeDocumentID: appState.selectedDocumentID)
 
     Button {
       let isCommandPressed = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
@@ -607,7 +602,8 @@ struct SidebarView: View {
       }
       .buttonStyle(.plain)
       .onHover { isHovered in
-        hoveredFolderID = isHovered ? node.id : nil
+        hoveredFolderID = Self.updatedHover(
+          hoveredFolderID, eventID: node.id, isHovered: isHovered)
         if isHovered, let url = node.url {
           appState.sidebarFocusedURL = url.standardizedFileURL
         }
@@ -757,8 +753,8 @@ struct SidebarView: View {
     RoundedRectangle(cornerRadius: 6, style: .continuous)
       .fill(
         isSelected
-          ? Color.accentColor.opacity(0.24)
-          : (isHovered ? Color.primary.opacity(0.06) : Color.clear)
+          ? themeAccent.opacity(0.24)
+          : (isHovered ? themeText.opacity(0.06) : Color.clear)
       )
   }
 
@@ -1235,7 +1231,20 @@ struct SidebarView: View {
   }
 
   private func updateHoveredDocument(_ id: DocumentRef.ID, isHovered: Bool) {
-    hoveredDocumentID = isHovered ? id : nil
+    hoveredDocumentID = Self.updatedHover(hoveredDocumentID, eventID: id, isHovered: isHovered)
+  }
+
+  /// A late exit from the previous row must not erase the new row's hover.
+  static func updatedHover<ID: Equatable>(_ current: ID?, eventID: ID, isHovered: Bool) -> ID? {
+    if isHovered { return eventID }
+    return current == eventID ? nil : current
+  }
+
+  /// Hover is transient pointer feedback, never a document selection.
+  static func searchResultIsSelected(
+    _ id: DocumentRef.ID, selectedIDs: Set<DocumentRef.ID>, activeDocumentID: DocumentRef.ID?
+  ) -> Bool {
+    selectedIDs.isEmpty ? activeDocumentID == id : selectedIDs.contains(id)
   }
 
   private func toggleExpanded(_ id: WorkspaceNode.ID) {
@@ -1243,6 +1252,39 @@ struct SidebarView: View {
       expandedNodeIDs.remove(id)
     } else {
       expandedNodeIDs.insert(id)
+    }
+  }
+}
+
+/// The shipped workspace list, also exercised without a window by the native
+/// list cost tests. Its row closure keeps the document/folder actions owned by
+/// SidebarView.
+struct SidebarWorkspaceList<RowContent: View>: View {
+  let rows: [FlattenedWorkspaceRow]
+  @ViewBuilder var rowContent: (FlattenedWorkspaceRow) -> RowContent
+
+  var body: some View {
+    List {
+      ForEach(rows) { row in
+        SidebarWorkspaceRow {
+          rowContent(row)
+        }
+      }
+    }
+    .listStyle(.sidebar)
+    .accessibilityIdentifier("pensieve.sidebar.list.workspace")
+  }
+}
+
+/// List can count one direct row without evaluating the conditional
+/// document/folder/foreign-file content. Keep the closure deferred until this
+/// row's body is needed; calling it in ForEach would still build the whole list.
+private struct SidebarWorkspaceRow<Content: View>: View {
+  @ViewBuilder var content: () -> Content
+
+  var body: some View {
+    HStack(spacing: 0) {
+      content()
     }
   }
 }

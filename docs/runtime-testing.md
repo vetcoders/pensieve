@@ -151,7 +151,7 @@ broad delete.
 | Caches and framework state | The bounded namespace includes the exact bundle-ID paths under `Caches`, `WebKit`, `HTTPStorages`, `Cookies`, `Containers`, and `Application Scripts`, plus WebKit's exact `GPU`, `Networking`, and `WebContent` paths under the canonical Darwin per-user `C` and `T` roots returned by `getconf`. Darwin `C` is removable run-owned cache. Matching `T` entries are protected per-identity filesystem residue under an OS-managed root: cleanup validates them strictly and retains empty entries rather than pretending it can delete them. An empty retained entry contains no application payload and is not evidence of live app state. The Developer ID lane does not claim sandbox-container semantics merely because it retires an incidental exact container path. |
 | LaunchServices             | The exact staged bundle is registered for the experiment and unregistered before that bundle is removed. Cleanup never performs a global LaunchServices reset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
-The run's schema-5 identity manifest has an explicit, one-way state machine:
+The run's schema-6 identity manifest has an explicit, one-way state machine:
 
 ```text
 atomic reservation (cleanup-only authority)
@@ -175,7 +175,11 @@ A process name or commit stamp alone is not identity proof. The owner root must
 be a canonical real directory owned by the current user, and the manifest,
 bundle, and support path must be non-symlink direct children. Legacy
 single-phase manifest schemas cannot authorize verification or launch. New
-reservation, finalization, verification and launch require schema 5. Cleanup
+reservation, finalization, verification and launch require schema 6.
+Schema 6 also pins the agent credential account `codescribe_keychain_bundle_v1`
+in the same isolated Keychain service as `api-key`. Cleanup retires both exact
+items. Earlier schema-5 manifests remain cleanup-only, with their original
+single-account scope; they cannot authorize a new launch. Cleanup
 also accepts a legacy two-phase schema-4 reservation or finalized manifest
 created by the preceding harness: after validating its original bounded
 coordinates, cleanup derives today's canonical Darwin roots from `getconf` and

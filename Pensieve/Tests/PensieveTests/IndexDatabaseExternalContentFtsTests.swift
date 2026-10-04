@@ -203,6 +203,50 @@ final class IndexDatabaseExternalContentFtsTests: XCTestCase {
 
   // MARK: - (6) Partial-name (infix) search falls back to substring LIKE
 
+  /// A reopened/bookmarked root can have more than one indexed workspace
+  /// identity. Those rows must not become duplicate URL identities in List.
+  func testSearchCollapsesWorkspaceCopiesBeforeApplyingResultLimit() async throws {
+    let base = try makeBase()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let root = base.appendingPathComponent("ws", isDirectory: true).standardizedFileURL
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let databaseURL = base.appendingPathComponent("index.db")
+    let database = IndexDatabase(databaseURL: databaseURL)
+    database.open()
+    let first = try makeDoc(root: root, name: "first.md", body: "hoverneedle first")
+    let second = try makeDoc(root: root, name: "second.md", body: "hoverneedle second")
+    let identity = makeIdentity(root: root)
+    await database.upsertWorkspace(
+      identity: identity, roots: [root], documents: [first, second])
+
+    let pool = try DatabasePool(path: databaseURL.path)
+    try await pool.write { db in
+      try db.execute(
+        sql: """
+          INSERT INTO workspaces
+              (workspace_id, canonical_path, first_seen_at, last_seen_at, status)
+          SELECT 'second-identity', canonical_path, first_seen_at, last_seen_at, status
+          FROM workspaces WHERE workspace_id = ?
+          """, arguments: [identity.workspaceID])
+      try db.execute(
+        sql: """
+          INSERT INTO documents
+              (workspace_id, path, title, body, mtime, size, is_ad_hoc, indexed_at)
+          SELECT 'second-identity', path, title, body, mtime, size, is_ad_hoc, indexed_at
+          FROM documents WHERE workspace_id = ?
+          """, arguments: [identity.workspaceID])
+    }
+    try pool.close()
+
+    for query in ["hoverneedle", "verneedle"] {
+      let results = database.search(query: query, documents: [first, second], limit: 2)
+      XCTAssertEqual(results.count, 2, "both distinct documents should fill the limit")
+      XCTAssertEqual(
+        Set(results.map(\.id)), [first.id, second.id],
+        "FTS and substring fallback must produce one row per physical document")
+    }
+  }
+
   /// FTS5 `unicode61` does token-PREFIX matching, so an infix query ("liczek"
   /// inside the token "pliczek") yields ZERO FTS hits. The search must then fall
   /// through to the substring LIKE scan and still find the file by partial name.

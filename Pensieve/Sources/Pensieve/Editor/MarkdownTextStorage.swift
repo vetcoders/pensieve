@@ -274,6 +274,14 @@ final class MarkdownTextStorage: NSTextContentStorage {
       return
     }
 
+    // The sweep will cover every pending edit. Absorb its debounce just as a
+    // synchronous full refresh does; otherwise a plain-document load queues
+    // an unbounded scoped repaint behind this viewport-first pass.
+    highlightWorkItem?.cancel()
+    highlightWorkItem = nil
+    pendingHighlightRange = nil
+    pendingRequiresFullRefresh = false
+
     let scope = codeBlockAwareScope(
       for: scopedHighlightRange(for: viewportRange, in: string))
     refreshHighlighting(in: scope)
@@ -424,29 +432,27 @@ final class MarkdownTextStorage: NSTextContentStorage {
     MainActor.assumeIsolated {
       uiStorage.processUIEdit(
         editedString: editedString, editedCharacters: editedCharacters,
-        newCharRange: newCharRange, delta: delta, invalidatedCharRange: invalidatedCharRange)
+        newCharRange: newCharRange, delta: delta)
     }
   }
 
   private func processUIEdit(
     editedString: String, editedCharacters: Bool, newCharRange: NSRange,
-    delta: Int, invalidatedCharRange: NSRange
+    delta: Int
   ) {
     if editedCharacters {
       let oldString = lastProcessedString as NSString
       let newString = editedString as NSString
-      let editedRange = postEditRange(
-        newCharRange: newCharRange,
-        invalidatedCharRange: invalidatedCharRange,
-        delta: delta,
-        textLength: newString.length
-      )
+      // TextKit's invalidated range includes attribute fixing beyond the edit.
+      // Treating that as changed Markdown can reach a neighbouring fence and
+      // repaint the entire document on each character or soft line break.
+      // Only the character edit determines syntax and offset-cache changes.
+      let editedRange = clampedRange(newCharRange, textLength: newString.length)
       let scopedRange = scopedHighlightRange(for: editedRange, in: newString)
       let requiresFullRefresh = editTouchesFence(
         oldString: oldString,
         newString: newString,
         newCharRange: newCharRange,
-        invalidatedCharRange: invalidatedCharRange,
         delta: delta
       )
 
@@ -661,22 +667,6 @@ final class MarkdownTextStorage: NSTextContentStorage {
     onHighlightingRepainted?(scopedRange)
   }
 
-  private func postEditRange(
-    newCharRange: NSRange,
-    invalidatedCharRange: NSRange,
-    delta: Int,
-    textLength: Int
-  ) -> NSRange {
-    let newRange = clampedRange(newCharRange, textLength: textLength)
-    let invalidatedLocation = min(max(0, invalidatedCharRange.location), textLength)
-    let adjustedInvalidatedLength = max(0, invalidatedCharRange.length + delta)
-    let invalidatedRange = clampedRange(
-      NSRange(location: invalidatedLocation, length: adjustedInvalidatedLength),
-      textLength: textLength
-    )
-    return NSUnionRange(newRange, invalidatedRange)
-  }
-
   private func scopedHighlightRange(for range: NSRange, in string: NSString) -> NSRange {
     guard string.length > 0 else {
       return NSRange(location: 0, length: 0)
@@ -870,20 +860,16 @@ final class MarkdownTextStorage: NSTextContentStorage {
     oldString: NSString,
     newString: NSString,
     newCharRange: NSRange,
-    invalidatedCharRange: NSRange,
     delta: Int
   ) -> Bool {
+    let oldCharRange = NSRange(
+      location: newCharRange.location, length: max(0, newCharRange.length - delta))
     let oldAffectedRange = scopedHighlightRange(
-      for: clampedRange(invalidatedCharRange, textLength: oldString.length),
+      for: clampedRange(oldCharRange, textLength: oldString.length),
       in: oldString
     )
     let newAffectedRange = scopedHighlightRange(
-      for: postEditRange(
-        newCharRange: newCharRange,
-        invalidatedCharRange: invalidatedCharRange,
-        delta: delta,
-        textLength: newString.length
-      ),
+      for: clampedRange(newCharRange, textLength: newString.length),
       in: newString
     )
 

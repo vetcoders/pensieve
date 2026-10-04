@@ -216,8 +216,14 @@ final class CodescribeListenerBridge: CsTranscriptionListener, @unchecked Sendab
 /// Ask-stream seam over the same vendored FFI. W5 streams Ask through this —
 /// do not build a second pipe beside it.
 protocol CodescribeAgentStreaming: AnyObject, Sendable {
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
-    -> String
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String
+  func cancelTurn(threadId: String) -> Bool
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool
 }
 
 extension CodescribeAgent: CodescribeAgentStreaming {}

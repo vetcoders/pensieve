@@ -1358,7 +1358,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       return true
     }
     textStorage.replaceCharacters(in: conversion.range, with: conversion.replacement)
-    textContentStorage.refreshHighlighting()
+    // Text storage schedules highlighting for the actual edit. A list/quote
+    // continuation must not replace that bounded pass with a full repaint.
     textView.setSelectedRange(conversion.selectedRange)
     centerCaretLineIfNeeded()
     textView.didChangeText()

@@ -29,7 +29,7 @@ class CodeBlockHighlighter {
     case literal
   }
 
-  /// Compiled-once fence regex + per-language colorizer tables. Previously every
+  /// Compiled-once per-language colorizer tables. Previously every
   /// `highlight` call recompiled the fence regex and every matched code block
   /// recompiled 3-4 language regexes FRESH — 15-20+ `NSRegularExpression`
   /// compilations per keystroke on a doc with code blocks. These are all
@@ -37,8 +37,6 @@ class CodeBlockHighlighter {
   /// NOT baked in here: rules carry a `Role`, resolved against the cached theme
   /// colours in the pass.
   private enum Patterns {
-    static let fence = compile("(?s)```(.*?)\\n(.*?)```")
-
     /// One compiled colorizer rule: a precompiled regex paired with the role it
     /// paints. Patterns are CONSTANT, so they are compiled once per process.
     struct ColorRule {
@@ -167,7 +165,7 @@ class CodeBlockHighlighter {
 
   /// A fenced block whose extent the CALLER already knows.
   ///
-  /// `Patterns.fence` has to see a COMPLETE ```…``` inside the range it is
+  /// The delimiter scan has to see a COMPLETE ```…``` inside the range it is
   /// handed, so a repaint covering only a SLICE of a block finds nothing and
   /// leaves that code on the prose palette. `MarkdownTextStorage` clamps a block
   /// too big to repaint whole out of its chunk — swallowing a megabyte fence to
@@ -229,15 +227,28 @@ class CodeBlockHighlighter {
     guard NSIntersectionRange(range, fullRange).length > 0 || range.length == 0 else { return }
     let targetRange = NSIntersectionRange(range, fullRange)
 
-    // Bridge the whole document once and reuse for the fence scan.
-    let swiftString = string as String
     let colors = self.colors()
-
-    Patterns.fence.enumerateMatches(in: swiftString, options: [], range: targetRange) {
-      match, _, _ in
-      guard let match = match else { return }
-      let langRange = match.range(at: 1)
-      let codeRange = match.range(at: 2)
+    let end = NSMaxRange(targetRange)
+    var cursor = targetRange.location
+    // Each search advances past the previous delimiter. An unfinished block
+    // visits its tail once, instead of retrying that tail at every newline.
+    // UTF-16 ranges preserve NSTextStorage offsets, including emoji in prose.
+    while cursor < end {
+      let opening = string.range(
+        of: "```", options: .literal, range: NSRange(location: cursor, length: end - cursor))
+      guard opening.location != NSNotFound else { break }
+      let infoStart = NSMaxRange(opening)
+      let newline = string.range(
+        of: "\n", options: .literal, range: NSRange(location: infoStart, length: end - infoStart))
+      guard newline.location != NSNotFound else { break }
+      let codeStart = NSMaxRange(newline)
+      let closing = string.range(
+        of: "```", options: .literal, range: NSRange(location: codeStart, length: end - codeStart))
+      guard closing.location != NSNotFound else { break }
+      cursor = NSMaxRange(closing)
+      let blockRange = NSRange(location: opening.location, length: cursor - opening.location)
+      let langRange = NSRange(location: infoStart, length: newline.location - infoStart)
+      let codeRange = NSRange(location: codeStart, length: closing.location - codeStart)
 
       let lang =
         langRange.length > 0
@@ -245,15 +256,14 @@ class CodeBlockHighlighter {
           .lowercased() : ""
 
       // Base code block styling
-      textStorage.addAttribute(.foregroundColor, value: colors.base, range: match.range)
+      textStorage.addAttribute(.foregroundColor, value: colors.base, range: blockRange)
 
-      guard let rules = Patterns.languageRules[lang] else { return }
+      guard let rules = Patterns.languageRules[lang] else { continue }
 
       // Highlight actual code. Bridge the code substring once and reuse it
       // across every language rule for this block.
       let codeString = string.substring(with: codeRange)
       let nsCodeString = codeString as NSString
-      let codeStart = codeRange.location
       let codeFullRange = NSRange(location: 0, length: nsCodeString.length)
 
       for rule in rules {

@@ -201,8 +201,8 @@ protocol PreviewSink: AnyObject {
 ///      reader never stares at an empty pane; subsequent requests are
 ///      coalesced through `removeDuplicates` and debounced 400 ms on the main
 ///      run loop.
-///   3. Render markdown to HTML via `MarkdownRenderer` and compose a
-///      `PreviewDocument` via `PreviewDocument.make`.
+///   3. Render debounced markdown off the main actor, one parse at a time,
+///      and compose the current result via `PreviewDocument.make`.
 ///   4. Hand the document to the attached `PreviewSink`.
 ///
 /// The pipeline outlives SwiftUI re-renders because it is owned by
@@ -216,6 +216,11 @@ final class PreviewPipeline {
   private let debounceInterval: DispatchQueue.SchedulerTimeType.Stride
   private var cancellable: AnyCancellable?
   private weak var sink: PreviewSink?
+  private let renderBody: @Sendable (PreviewRenderRequest) -> String
+  private var renderTask: Task<Void, Never>?
+  private var pendingRender: PreviewRenderRequest?
+  private var latestSubmitted: PreviewRenderRequest?
+  private var attachmentGeneration: UInt64 = 0
 
   /// The most recently applied request. Used to short-circuit redundant
   /// applies when the bus delivers a duplicate after the initial fast-path.
@@ -230,17 +235,26 @@ final class PreviewPipeline {
     themeManager: ThemeManager,
     renderer: MarkdownRenderer = MarkdownRenderer(),
     scheduler: DispatchQueue = .main,
-    debounce: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(400)
+    debounce: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(400),
+    renderBody: (@Sendable (PreviewRenderRequest) -> String)? = nil
   ) {
     self.themeManager = themeManager
     self.renderer = renderer
     self.scheduler = scheduler
     self.debounceInterval = debounce
+    self.renderBody =
+      renderBody ?? { request in
+        switch request.renderMode {
+        case .markdown: return MarkdownRenderer().render(request.markdown).body
+        case .plainText: return Self.plainTextBody(for: request.markdown)
+        }
+      }
   }
 
   /// Attach a sink and start the scheduling subscription. Safe to call once
   /// per pipeline lifecycle (NSViewRepresentable mount).
   func attach(sink: PreviewSink) {
+    attachmentGeneration &+= 1
     self.sink = sink
     cancellable =
       subject
@@ -248,26 +262,31 @@ final class PreviewPipeline {
       .debounce(for: debounceInterval, scheduler: scheduler)
       .sink { @Sendable [weak self] request in
         if Thread.isMainThread {
-          MainActor.assumeIsolated { self?.apply(request) }
+          MainActor.assumeIsolated { self?.enqueueRender(request) }
         } else {
-          Task { @MainActor [weak self] in self?.apply(request) }
+          Task { @MainActor [weak self] in self?.enqueueRender(request) }
         }
       }
   }
 
   func detach() {
+    attachmentGeneration &+= 1
     cancellable?.cancel()
     cancellable = nil
     sink = nil
+    pendingRender = nil
+    latestSubmitted = nil
   }
 
-  /// Submit a request. `initial == true` applies the request synchronously
-  /// before queuing it onto the bus, so the first mount renders without
-  /// waiting for the debounce interval. Both branches converge on `apply`,
-  /// which dedupes against `lastApplied`.
+  /// Small initial requests render immediately. Other requests parse off-main
+  /// after the debounce, and only the latest submitted request may publish.
   func submit(_ request: PreviewRenderRequest, initial: Bool) {
-    if initial {
+    latestSubmitted = request
+    if initial, !LargeDocument.isLarge(request.markdown.utf8.count) {
+      pendingRender = nil
       apply(request)
+    } else if initial {
+      enqueueRender(request)
     }
     subject.send(request)
   }
@@ -291,6 +310,10 @@ final class PreviewPipeline {
     case .plainText:
       body = Self.plainTextBody(for: request.markdown)
     }
+    return makeDocument(for: request, body: body)
+  }
+
+  private func makeDocument(for request: PreviewRenderRequest, body: String) -> PreviewDocument {
     let css = themeManager.css(for: request.theme)
     let mermaidJavaScript =
       body.contains("class=\"mermaid\"")
@@ -314,7 +337,7 @@ final class PreviewPipeline {
     )
   }
 
-  private static func plainTextBody(for text: String) -> String {
+  nonisolated private static func plainTextBody(for text: String) -> String {
     let escaped = HTMLEmitter.escapeText(text)
     return """
       <pre class="vc-plain-text" data-vc-block="0" style="font-size: var(--vc-font-size);"><code>\(escaped)</code></pre>
@@ -328,5 +351,42 @@ final class PreviewPipeline {
     let document = makeDocument(for: request)
     lastDocument = document
     sink.load(document: document)
+  }
+
+  private func enqueueRender(_ request: PreviewRenderRequest) {
+    guard sink != nil, request != lastApplied else { return }
+    pendingRender = request
+    startPendingRender()
+  }
+
+  private func startPendingRender() {
+    guard renderTask == nil, let request = pendingRender, sink != nil else { return }
+    pendingRender = nil
+    guard request == latestSubmitted, request != lastApplied else { return }
+    let generation = attachmentGeneration
+    // The parser cannot be interrupted mid-parse. Keep one worker and one
+    // newest request, so typing cannot accumulate simultaneous document parses.
+    renderTask = Task { [weak self, renderBody] in
+      let body = await Task.detached(priority: .userInitiated) {
+        renderBody(request)
+      }.value
+      guard let self else { return }
+      self.renderTask = nil
+      if self.attachmentGeneration == generation, self.latestSubmitted == request,
+        let sink = self.sink
+      {
+        let document = self.makeDocument(for: request, body: body)
+        self.lastApplied = request
+        self.lastDocument = document
+        sink.load(document: document)
+      }
+      self.startPendingRender()
+    }
+  }
+
+  /// Drains admitted parses, including the newest coalesced successor. Does not
+  /// advance the debounce timer for requests that have not been admitted yet.
+  func waitForPendingRender() async {
+    while let renderTask { await renderTask.value }
   }
 }

@@ -149,9 +149,10 @@ final class CodescribeFFIBindingTests: XCTestCase {
     let agent = FakeCodescribeAgent()
     let collector = CollectingAgentListener()
 
-    let final = try await agent.streamReply(
+    let final = try await agent.streamDocument(
       text: "Say hello in exactly three words.",
       threadId: "ask-thread-1",
+      document: AskDocumentFixture.host(text: "Current unsaved note"), provider: nil,
       listener: collector)
 
     XCTAssertEqual(agent.lastText, "Say hello in exactly three words.")
@@ -193,6 +194,7 @@ final class CodescribeFFIBindingTests: XCTestCase {
       documentIndex: 0,
       label: "",
       renderedText: text,
+      deliveryText: text,
       phase: terminal ? "final" : "live",
       canPaste: false,
       canInsert: false,
@@ -232,7 +234,15 @@ private final class FakeCodescribeAgent: CodescribeAgentStreaming, @unchecked Se
   var lastText: String?
   var lastThreadId: String?
 
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
+  func cancelTurn(threadId: String) -> Bool { true }
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool { false }
+
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+    listener: CsAgentListener
+  ) async throws
     -> String
   {
     lastText = text

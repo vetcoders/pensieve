@@ -167,40 +167,6 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   }
 }
 
-final class NonActivatingTaflaPanel: NSPanel {
-  // A non-activating panel can still become key for its own controls. Without
-  // this, pickers, selectable transcript text, and buttons present as live but
-  // cannot reliably receive keyboard/click interaction.
-  override var canBecomeKey: Bool { true }
-  override var canBecomeMain: Bool { false }
-}
-
-private final class TaflaContentContainer: NSView {
-  private let hostingView: NSView
-
-  init(hostingView: NSView) {
-    self.hostingView = hostingView
-    super.init(frame: .zero)
-    addSubview(hostingView)
-    hostingView.frame = bounds
-  }
-
-  @available(*, unavailable)
-  required init?(coder: NSCoder) {
-    fatalError("init(coder:) is not used")
-  }
-
-  override func setFrameSize(_ newSize: NSSize) {
-    super.setFrameSize(newSize)
-    hostingView.frame = bounds
-  }
-
-  override func layout() {
-    super.layout()
-    hostingView.frame = bounds
-  }
-}
-
 @MainActor
 private final class TranscriptionTaflaRoutingState: ObservableObject {
   @Published var language: TranscriptionLanguageChoice = .automatic

@@ -912,7 +912,7 @@ run_certless_cleanup_tests() {
         "$reservation_id" "$(isolated_app_darwin_user_directory temp)" "$darwin_role")" ]] \
       || fail "reservation manifest did not pin the Darwin T $darwin_role coordinate"
   done
-  pass "schema-5 cleanup authority pins exact Darwin C/T WebKit coordinates"
+  pass "schema-6 cleanup authority pins exact Darwin C/T WebKit coordinates"
 
   legacy_reservation_owner="$FIXTURE_ROOT/legacy-schema-4-reservation-owner"
   legacy_reservation_manifest="$legacy_reservation_owner/identity.plist"
@@ -941,7 +941,7 @@ run_certless_cleanup_tests() {
   [[ ! -e "$legacy_reservation_owner" && -e "$reservation_manifest" ]] \
     || fail "schema-4 reservation cleanup damaged current cleanup authority"
   isolated_app_validate_reservation "$reservation_manifest" "$reservation_owner" \
-    || fail "schema-4 cleanup damaged the current schema-5 reservation"
+    || fail "schema-4 cleanup damaged the current schema-6 reservation"
   pass "authentic schema-4 reservations retain cleanup-only compatibility"
 
   # CI and certificate-free hosts must also exercise legacy *finalized*
@@ -1029,7 +1029,7 @@ run_certless_cleanup_tests() {
     || fail "full cleanup did not wire retained-shell facts to its operator notice"
   /bin/rmdir "$legacy_temp_gpu"
   isolated_app_validate_reservation "$reservation_manifest" "$reservation_owner" \
-    || fail "schema-4 finalized cleanup damaged current schema-5 authority"
+    || fail "schema-4 finalized cleanup damaged current schema-6 authority"
   pass "schema-4 finalized cleanup uses getconf C and best-effort retained-shell reporting"
 
   reservation_darwin_gpu="$(isolated_app_manifest_value \
@@ -1638,6 +1638,26 @@ isolated_app_finalize_manifest "$MANIFEST" "$OWNER_ROOT" \
 isolated_app_verify_bundle_from_manifest "$MANIFEST" "$OWNER_ROOT" \
   || fail "manifest verification rejected the correctly staged fixture"
 pass "identity.plist finalizes only after the staged bundle matches and authenticates"
+
+AGENT_ACCOUNT="$(isolated_app_manifest_value "$MANIFEST" agentKeychainAccount)"
+[[ "$AGENT_ACCOUNT" == "$ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT" ]] \
+  || fail "agent credential cleanup account was not reserved"
+/usr/bin/plutil -replace agentKeychainAccount -string arbitrary-account -- "$MANIFEST"
+if isolated_app_validate_cleanup_manifest "$MANIFEST" "$OWNER_ROOT" >/dev/null 2>&1; then
+  fail "tampered agent credential account granted cleanup authority"
+fi
+/usr/bin/plutil -replace agentKeychainAccount -string "$AGENT_ACCOUNT" -- "$MANIFEST"
+PREVIOUS_MANIFEST="$OWNER_ROOT/schema-5.plist"
+/bin/cp -p -- "$MANIFEST" "$PREVIOUS_MANIFEST"
+/usr/bin/plutil -replace schemaVersion -integer 5 -- "$PREVIOUS_MANIFEST"
+/usr/bin/plutil -remove agentKeychainAccount -- "$PREVIOUS_MANIFEST"
+isolated_app_validate_cleanup_manifest "$PREVIOUS_MANIFEST" "$OWNER_ROOT" \
+  || fail "schema-5 manifest lost its original cleanup authority"
+if isolated_app_verify_bundle_from_manifest "$PREVIOUS_MANIFEST" "$OWNER_ROOT" >/dev/null 2>&1; then
+  fail "schema-5 manifest authorized a new launch"
+fi
+/bin/rm -f -- "$PREVIOUS_MANIFEST"
+pass "agent credentials have exact cleanup authority; schema-5 cannot launch"
 
 LEGACY_MANIFEST="$OWNER_ROOT/legacy-schema-4.plist"
 /bin/cp -p -- "$MANIFEST" "$LEGACY_MANIFEST"

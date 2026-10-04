@@ -14,6 +14,77 @@ import XCTest
 /// the surface. Either way the result is measured, not guessed.
 final class EditorScrollStabilityProbeTests: XCTestCase {
 
+  /// Attribute fixing can extend through the paragraph following a keystroke.
+  /// A nearby fence must not turn that into a whole-document syntax repaint.
+  /// Wait past the 70 ms debounce: an immediate-only scroll probe misses it.
+  @MainActor
+  func test_markdown_edits_keep_highlighting_local() async throws {
+    let document = (1...100).map {
+      "# Heading \($0)\n\nParagraph **bold** and _italic_ text.\n\n```swift\nlet value = 1\n```\n\n"
+    }.joined()
+    for command in ["character", "newline", "lineBreak"] {
+      let (surface, window) = makeHostedSurface(text: document)
+      defer { window.contentView = nil }
+      try await Task.sleep(for: .milliseconds(150))
+      let paragraph = (surface.textStorage.string as NSString).range(
+        of: "Paragraph", options: [],
+        range: NSRange(
+          location: document.utf16.count / 2,
+          length: document.utf16.count - document.utf16.count / 2))
+      let caret = paragraph.location + 15
+      let before = pinViewportAroundCaret(surface, caret: caret)
+      let fullRefreshes = surface.textContentStorage.fullRefreshCount
+      var repaintedRanges: [NSRange] = []
+      surface.textContentStorage.onHighlightingRepainted = { repaintedRanges.append($0) }
+      switch command {
+      case "newline": surface.textView.insertNewline(nil)
+      case "lineBreak": surface.textView.insertLineBreak(nil)
+      default: surface.textView.insertText("x", replacementRange: surface.textView.selectedRange())
+      }
+      let immediate = surface.scrollView.contentView.bounds.origin
+      try await Task.sleep(for: .milliseconds(150))
+      surface.scrollView.layoutSubtreeIfNeeded()
+      surface.textLayoutManager.ensureLayout(for: surface.textLayoutManager.documentRange)
+      let after = surface.scrollView.contentView.bounds.origin
+      XCTAssertEqual(immediate.y, before.y, accuracy: 0.5, command)
+      XCTAssertFalse(repaintedRanges.isEmpty, "The deferred pass must actually run: \(command)")
+      for range in repaintedRanges {
+        XCTAssertLessThan(range.length, 200, "Only the edited paragraph needs repainting")
+        XCTAssertGreaterThan(range.location, 0, "Unchanged document head must retain layout")
+      }
+      XCTAssertEqual(surface.textContentStorage.fullRefreshCount, fullRefreshes, command)
+      XCTAssertEqual(after.y, before.y, accuracy: 0.5, command)
+    }
+  }
+
+  @MainActor
+  func test_fence_insertion_and_deletion_repaint_affected_code() async throws {
+    let fenced = "intro\n\n```swift\nlet value = 1\n```\n\nending"
+    let unfenced = "intro\n\nlet value = 1\n```\n\nending"
+    for inserting in [false, true] {
+      let content = MarkdownTextStorage()
+      let storage = NSTextStorage(string: inserting ? unfenced : fenced)
+      content.textStorage = storage
+      content.refreshHighlighting()
+      let before = content.fullRefreshCount
+      storage.replaceCharacters(
+        in: NSRange(location: 7, length: inserting ? 0 : 9),
+        with: inserting ? "```swift\n" : "")
+      try await Task.sleep(for: .milliseconds(150))
+
+      XCTAssertEqual(storage.string, inserting ? fenced : unfenced)
+      XCTAssertEqual(content.fullRefreshCount, before + 1)
+      // A real fence change still has to restyle text beyond the edited line.
+      // Compare with a fresh full pass, including removal of stale code styles.
+      let expected = NSTextStorage(string: storage.string)
+      let fullRange = NSRange(location: 0, length: expected.length)
+      content.highlighter.resetBaseAttributes(expected, range: fullRange)
+      content.highlighter.highlight(expected, range: fullRange)
+      content.codeBlockHighlighter.highlight(expected, range: fullRange)
+      XCTAssertTrue(storage.isEqual(to: expected))
+    }
+  }
+
   /// A document tall enough to scroll inside a 400pt viewport.
   private func longDocument() -> String {
     (1...200)

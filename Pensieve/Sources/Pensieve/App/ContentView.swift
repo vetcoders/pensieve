@@ -1,4 +1,5 @@
 import AppKit
+import CodescribeBridge
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
@@ -9,26 +10,95 @@ struct ContentView: View {
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
-  @StateObject private var askThreads = DocumentAskThreadStore()
+  @StateObject private var askThreads: DocumentAskThreadStore
   @State private var lastIngestedDictation = ""
-  /// Shared with the status bar's Ask chip and the composer header — one key,
-  /// three surfaces. Default visible preserves the pre-toggle behavior.
+  /// Shared with the status bar's Ask chip and the surface's hide control —
+  /// one key, three surfaces. Default visible preserves the pre-toggle behavior.
   @AppStorage("pensieve.ask.visible") private var askVisible = true
+  /// The assembled surface's remembered geometry: presentation mode, the
+  /// user-resized dock height, and expansion. Hidden is NOT stored here — it
+  /// is `pensieve.ask.visible`, synced both ways below.
+  @AppStorage("pensieve.ask.presentationMode") private var askModeRaw =
+    AskPresentationMode.docked.rawValue
+  @AppStorage("pensieve.ask.dockHeight") private var askDockHeight = 0.0
+  @AppStorage("pensieve.ask.expanded") private var askExpanded = true
+  @State private var askPresentation = AskPresentationState.expandedDefault
+  @State private var askPresentationLoaded = false
+  @StateObject private var askPanelController = AskPanelController()
   @Binding private var hostWindow: NSWindow?
-  private let providerSettings: ProviderSettings
+  @ObservedObject private var providerSettings: ProviderSettings
 
   @MainActor
   init(
     hostWindow: Binding<NSWindow?> = .constant(nil),
     providerSettings: ProviderSettings = .shared,
-    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil
+    providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil,
+    askThreads: DocumentAskThreadStore? = nil
   ) {
+    _askThreads = StateObject(wrappedValue: askThreads ?? DocumentAskThreadStore())
     _hostWindow = hostWindow
-    self.providerSettings = providerSettings
+    _providerSettings = ObservedObject(wrappedValue: providerSettings)
     _providerOnboardingCoordinator = ObservedObject(
       wrappedValue: providerOnboardingCoordinator ?? .shared)
     _providerSettingsTransition = StateObject(
       wrappedValue: ProviderOnboardingSettingsTransition())
+  }
+
+  private func makeDocumentHost() -> DocumentToolHost {
+    controller.makeAgentDocumentHost()
+  }
+
+  /// First-mount restore of the assembled surface: persisted mode, dock
+  /// height and expansion, with hidden read from the shared visibility key.
+  private func loadAskPresentation() {
+    guard !askPresentationLoaded else { return }
+    askPresentationLoaded = true
+    var state = AskPresentationState.expandedDefault
+    state.isExpanded = askExpanded
+    if askDockHeight > 0 { state.preferredDockHeight = askDockHeight }
+    state.mode =
+      askVisible
+      ? (AskPresentationMode(rawValue: askModeRaw) ?? .docked) : .hidden
+    askPresentation = state
+    askPanelController.presentation = state
+    askPanelController.onPresentationChange = { [self] newState in
+      if askPresentation != newState {
+        askPresentation = newState
+      }
+    }
+  }
+
+  /// The status-bar chip (or dictation) flipped visibility: move the surface,
+  /// remembering the non-hidden mode it returns to.
+  private func syncAskVisibility(_ visible: Bool) {
+    guard askPresentationLoaded else { return }
+    if visible {
+      if askPresentation.mode == .hidden {
+        askPresentation.mode = AskPresentationMode(rawValue: askModeRaw) ?? .docked
+      }
+    } else if askPresentation.mode != .hidden {
+      askPresentation.mode = .hidden
+    }
+    askPanelController.presentation = askPresentation
+  }
+
+  /// The surface moved (hide button, float/dock, drag): write visibility back
+  /// to the shared key and remember geometry. Guards keep the two stores
+  /// from bouncing each other.
+  private func persistAskPresentation(_ state: AskPresentationState) {
+    guard askPresentationLoaded else { return }
+    if state.mode == .hidden, askVisible { askVisible = false }
+    if state.mode != .hidden {
+      if !askVisible { askVisible = true }
+      if askModeRaw != state.mode.rawValue { askModeRaw = state.mode.rawValue }
+    }
+    if askDockHeight != state.preferredDockHeight {
+      askDockHeight = state.preferredDockHeight
+    }
+    if askExpanded != state.isExpanded { askExpanded = state.isExpanded }
+    if askPanelController.presentation != state {
+      askPanelController.presentation = state
+    }
   }
 
   var body: some View {
@@ -36,39 +106,89 @@ struct ContentView: View {
       SidebarView()
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
-      VStack(spacing: 0) {
-        if let sourceURL = appState.documentSession.recoverySourceURL {
-          RecoveredFileBanner(
-            sourceURL: sourceURL,
-            saveToOriginal: { controller.saveActiveDocument() },
-            saveAs: { saveRecoveredFileAs() }
-          )
-        }
-        EditorPreviewSplit()
-        // Deliberately OUTSIDE the buffer gate below: the errors that most need
-        // saying (a workspace that will not open, a file that has moved, a
-        // recovery draft that could not be written) can all land in a window
-        // with nothing open, where the status bar does not exist.
-        if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
-          WindowErrorBanner(error: error) { appState.dismissVisibleError() }
-        }
-        if appState.documentHasEditableBuffer {
-          if askVisible {
-            AskComposerView(
-              thread: askThreads.thread(for: appState.documentSession.askThreadID),
-              grokAccount: .shared,
-              codexAccount: .shared,
-              documentText: appState.documentSession.text,
-              apiKey: providerSettings.apiKey,
-              apiKeyProvider: providerSettings.providerShape
-            )
-            .id(appState.documentSession.askThreadID)
+      GeometryReader { proxy in
+        let askEligible =
+          appState.documentHasEditableBuffer || !appState.workspaceRoots.isEmpty
+        let dockPlaceholder =
+          askEligible && askPresentation.mode == .docked
+          ? AskSurfaceLayout.displayedDockHeight(
+            presentation: askPresentation, content: proxy.size) : 0
+        ZStack(alignment: .topLeading) {
+          VStack(spacing: 0) {
+            if let sourceURL = appState.documentSession.recoverySourceURL {
+              RecoveredFileBanner(
+                sourceURL: sourceURL,
+                saveToOriginal: { controller.saveActiveDocument() },
+                saveAs: { saveRecoveredFileAs() }
+              )
+            }
+            EditorPreviewSplit()
+            // Deliberately OUTSIDE the buffer gate below: the errors that most need
+            // saying (a workspace that will not open, a file that has moved, a
+            // recovery draft that could not be written) can all land in a window
+            // with nothing open, where the status bar does not exist.
+            if case .banner(let error) = WindowErrorSurface.resolve(for: appState.currentError) {
+              WindowErrorBanner(error: error) { appState.dismissVisibleError() }
+            }
+            // The docked surface draws exactly over this reserved band: both
+            // are bottom-anchored against the same 26pt status reserve, with
+            // or without banners above. Floating and hidden reserve nothing.
+            if dockPlaceholder > 0 {
+              Color.clear.frame(height: dockPlaceholder)
+            }
+            if appState.documentHasEditableBuffer {
+              EditorStatusBar()
+                .environmentObject(askThreads)
+                .opacity(appState.mode == .focus ? 0.45 : 1)
+            }
           }
-          EditorStatusBar()
-            .environmentObject(askThreads)
-            .opacity(appState.mode == .focus ? 0.45 : 1)
+          if askEligible {
+            AskPanelHostView(
+              controller: askPanelController,
+              presentation: $askPresentation,
+              contentSize: proxy.size,
+              hostWindow: hostWindow
+            ) {
+              AskSurfaceHost(
+                providerSettings: providerSettings,
+                askThreads: askThreads,
+                presentation: $askPresentation,
+                makeDocumentHost: makeDocumentHost
+              )
+              .environment(appState)
+              .environmentObject(controller)
+              .environmentObject(themeManager)
+              .environmentObject(askThreads)
+            }
+          }
+        }
+        .onAppear { loadAskPresentation() }
+        .onChange(of: askVisible) { _, visible in
+          syncAskVisibility(visible)
+        }
+        .onChange(of: askPresentation) { _, state in
+          persistAskPresentation(state)
         }
       }
+    }
+    .task(id: appState.documentHasEditableBuffer ? appState.documentSession.askThreadID : nil) {
+      if askVisible, appState.documentHasEditableBuffer {
+        _ = askThreads.thread(for: appState.documentSession.askThreadID)
+      }
+    }
+    .onChange(of: askVisible) { _, visible in
+      if visible, appState.documentHasEditableBuffer {
+        _ = askThreads.thread(for: appState.documentSession.askThreadID)
+      }
+    }
+    .onChange(of: appState.documentSession.askThreadID) { oldID, _ in
+      askThreads.existingThread(for: oldID)?.cancel()
+    }
+    .onDisappear { askThreads.cancelAll() }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
+      notification in
+      guard let closing = notification.object as? NSWindow, closing === hostWindow else { return }
+      askThreads.cancelAll()
     }
     .navigationTitle(
       DocumentWindowSurface.navigationTitle(
@@ -295,7 +415,7 @@ struct EditorPreviewSplit: View {
     }
     .frame(
       minWidth: Self.paneMinWidth, maxWidth: .infinity,
-      minHeight: 320, maxHeight: .infinity)
+      minHeight: 0, maxHeight: .infinity)
   }
 
   @ViewBuilder
@@ -581,5 +701,195 @@ private struct RecoveredDraftRow: View {
       .controlSize(.small)
     }
     .accessibilityIdentifier("pensieve.recoveredDrafts.row")
+  }
+}
+
+/// The assembled Ask surface: one dock/float surface whose conversation slots
+/// switch between the document and workspace scopes. Threads, drafts and
+/// attachments stay in their owning thread objects, so a scope or
+/// presentation switch never starts a second session, submits twice, or
+/// loses input. The shared `AskConversationModel` keeps its parse cache
+/// across both.
+private struct AskSurfaceHost: View {
+  @Environment(AppState.self) private var appState
+  @EnvironmentObject private var controller: AppController
+  @ObservedObject var providerSettings: ProviderSettings
+  @ObservedObject var askThreads: DocumentAskThreadStore
+  @Binding var presentation: AskPresentationState
+  let makeDocumentHost: @MainActor () -> DocumentToolHost
+
+  @ObservedObject private var grokAccount = GrokAccount.shared
+  @ObservedObject private var codexAccount = CodexAccount.shared
+  @StateObject private var conversation = AskConversationModel()
+  @AppStorage("pensieve.ask.workspaceSelected") private var workspaceAskSelected = false
+  @State private var workspaceThread: WorkspaceAskThread?
+
+  private var hasDocumentBuffer: Bool { appState.documentHasEditableBuffer }
+  private var hasWorkspace: Bool { !appState.workspaceRoots.isEmpty }
+
+  private var workspaceScopeActive: Bool {
+    hasWorkspace && (workspaceAskSelected || !hasDocumentBuffer)
+  }
+
+  private var documentThread: DocumentAskThread? {
+    askThreads.existingThread(for: appState.documentSession.askThreadID)
+  }
+
+  private var usesAccountProvider: Bool {
+    grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
+  }
+
+  private var provider: AskProvider {
+    grokAccount.snapshot.askUsesGrok
+      ? grokAccount.snapshot.askProvider(apiKey: providerSettings.apiKey)
+      : codexAccount.snapshot.askProvider(apiKey: providerSettings.apiKey)
+  }
+
+  private var apiConfiguration: CsDocumentProvider {
+    CsDocumentProvider(
+      wire: providerSettings.providerShape.rawValue,
+      endpoint: providerSettings.providerShape.normalizeEndpoint(providerSettings.endpoint),
+      model: providerSettings.model,
+      apiKey: providerSettings.apiKey)
+  }
+
+  private var readinessContext: AskEndpointContext? {
+    usesAccountProvider ? nil : AskEndpointContext(configuration: apiConfiguration)
+  }
+
+  private var activeIsBusy: Bool {
+    workspaceScopeActive
+      ? workspaceThread?.isBusy ?? false
+      : documentThread?.isStreaming ?? false
+  }
+
+  var body: some View {
+    AskSurface(presentation: $presentation) { compact in
+      headerSlot(compact: compact)
+    } transcript: {
+      transcriptSlot
+    } composer: {
+      composerSlot
+    }
+    .task(id: appState.workspaceRoots.map(\.url)) {
+      await refreshWorkspaceThread()
+    }
+    .task {
+      await grokAccount.refreshIfStale()
+      await codexAccount.refreshIfStale()
+      await grokAccount.adoptGrokForAskIfSignedIn()
+      await codexAccount.adoptCodexForAskIfSignedIn()
+    }
+    .onChange(of: workspaceScopeActive) { _, _ in conversation.replaceThread() }
+    .onChange(of: appState.documentSession.askThreadID) { _, _ in conversation.replaceThread() }
+    .onChange(of: workspaceThread?.identity.workspaceID) { _, _ in conversation.replaceThread() }
+  }
+
+  @ViewBuilder private func headerSlot(compact: Bool) -> some View {
+    if !workspaceScopeActive, let thread = documentThread {
+      AskDocumentThreadObservation(thread: thread) { observed in
+        providerHeader(isStreaming: observed.isStreaming, compact: compact)
+      }
+    } else {
+      providerHeader(isStreaming: activeIsBusy, compact: compact)
+    }
+  }
+
+  private func providerHeader(isStreaming: Bool, compact: Bool) -> some View {
+    AskProviderHeader(
+      showsScopePicker: hasWorkspace,
+      workspaceSelected: $workspaceAskSelected,
+      documentScopeEnabled: hasDocumentBuffer,
+      workspaceScopeEnabled: hasWorkspace,
+      grokAccount: grokAccount,
+      codexAccount: codexAccount,
+      apiKey: providerSettings.apiKey,
+      apiKeyProvider: providerSettings.providerShape,
+      readinessContext: readinessContext,
+      isStreaming: isStreaming,
+      compact: compact)
+  }
+
+  @ViewBuilder private var transcriptSlot: some View {
+    if workspaceScopeActive {
+      if let thread = workspaceThread {
+        workspaceComposer(thread).transcript
+      } else {
+        Color.clear
+      }
+    } else if let thread = documentThread {
+      AskDocumentThreadObservation(thread: thread) { observed in
+        documentComposer(observed).transcript
+      }
+    } else {
+      Color.clear
+    }
+  }
+
+  @ViewBuilder private var composerSlot: some View {
+    if workspaceScopeActive {
+      if let thread = workspaceThread {
+        workspaceComposer(thread).composer
+      } else {
+        Color.clear
+      }
+    } else if let thread = documentThread {
+      AskDocumentThreadObservation(thread: thread) { observed in
+        documentComposer(observed).composer
+      }
+    } else {
+      Color.clear
+    }
+  }
+
+  private func documentComposer(_ thread: DocumentAskThread) -> AskComposerView {
+    AskComposerView(
+      thread: thread,
+      grokAccount: grokAccount,
+      codexAccount: codexAccount,
+      apiKey: providerSettings.apiKey,
+      makeDocumentHost: makeDocumentHost,
+      apiConfiguration: apiConfiguration,
+      conversation: conversation)
+  }
+
+  private func workspaceComposer(_ thread: WorkspaceAskThread) -> WorkspaceAskComposer {
+    WorkspaceAskComposer(
+      thread: thread,
+      conversation: conversation,
+      provider: provider,
+      readinessContext: readinessContext,
+      onSubmit: { [weak controller] prompt in
+        await thread.prepareAndSend(
+          text: prompt,
+          documents: appState.workspaceStore.documents,
+          database: .shared,
+          provider: provider,
+          configuration: usesAccountProvider ? nil : apiConfiguration,
+          openDocument: { [weak controller] ref, isActive in
+            guard let controller else { throw CsError.Agent(msg: "The window was closed.") }
+            workspaceAskSelected = true
+            return try await controller.openAgentDocument(ref, isActive: isActive)
+          })
+      })
+  }
+
+  /// Session creation belongs to a root-change task, never a view-body read.
+  private func refreshWorkspaceThread() async {
+    let roots = appState.workspaceRoots.map(\.url)
+    guard !roots.isEmpty else {
+      workspaceThread?.cancel()
+      workspaceThread = nil
+      return
+    }
+    let bookmark = appState.workspaceStore.bookmarkData
+    let identity = await Task.detached {
+      WorkspaceIdentity.make(roots: roots, bookmarkData: bookmark)
+    }.value
+    guard !Task.isCancelled else { return }
+    if let workspaceThread, workspaceThread.identity.workspaceID != identity.workspaceID {
+      workspaceThread.cancel()
+    }
+    workspaceThread = WorkspaceAskThreadStore.shared.thread(for: identity)
   }
 }

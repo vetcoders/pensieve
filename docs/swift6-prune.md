@@ -118,8 +118,11 @@ and data-race checking contract.
 `make install-built-app` installs the already built signed artifact after strict
 provenance and idle checks. It never quits a running session, rebuilds the app,
 or launches it as a side effect. The previous bundle is retained at the printed
-transaction path. `make install-app` checks idle before its build and uses the
-same installation transaction. Launch the installed bundle explicitly afterward.
+transaction path. `make install-app` builds and verifies the candidate first,
+then requests a normal Quit, uses the same installation transaction, and reopens
+the installed bundle. Cancelling Quit or leaving the app running aborts the swap;
+the installer never escalates to a forced termination. Launch failures are reported
+separately from a successful installation.
 
 ## Security parser coverage
 

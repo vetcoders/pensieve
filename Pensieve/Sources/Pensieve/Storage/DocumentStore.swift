@@ -190,6 +190,9 @@ final class FolderManager {
   /// background path, so every early `return` in the build task tears the spinner down.
   private func finishOpenFlow(generation: UInt64, into appState: AppState) {
     guard generation == openFlowGeneration else { return }
+    // A completed value-returning task still owns its full scan result.
+    // Only this generation may release the current cancellation handle.
+    workspaceValidationTask = nil
     guard appState.workspaceActivity != nil else { return }
     setOpenActivity(nil, into: appState)
   }
@@ -1059,11 +1062,13 @@ final class FolderManager {
 
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     let previousSelection = appState.selectedDocumentID
     let protectsDirtySession = appState.documentSession.isDirty
 
     if presentationChanged {
-      applyWorkspaceScans(snapshot.scans, into: appState)
+      applyWorkspaceScans(
+        snapshot.scans, presentationSignature: snapshot.presentationSignature, into: appState)
       if let fingerprint = snapshot.fingerprint {
         workspaceIndexWriteTask = commitWorkspaceManifest(
           rootURLs: roots,
@@ -1393,6 +1398,7 @@ final class FolderManager {
     forcedRefreshTask?.cancel()
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
   }
 
   /// Deterministic sync point for the post-close index housekeeping, and the quit's only handle on
@@ -1426,6 +1432,7 @@ final class FolderManager {
   func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     // Take ownership of the activity display so the cancelled build's terminal clear
     // cannot race the direct `workspaceActivity = nil` below.
     openFlowGeneration &+= 1
@@ -1481,6 +1488,7 @@ final class FolderManager {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     openFlowGeneration &+= 1
     // Before the hot-reopen short-circuit below, so BOTH open shapes are covered by one bump.
     workspaceOpenGeneration.bump()
@@ -1688,6 +1696,7 @@ final class FolderManager {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
     workspaceValidationTask?.cancel()
+    workspaceValidationTask = nil
     openFlowGeneration &+= 1
     // The background sibling of the bump in `openResolvedWorkspace` — same reason, and it covers
     // this path's own hot-reopen branch too.
@@ -1797,7 +1806,8 @@ final class FolderManager {
       }
 
       // Publication happens only after cancellation, generation, roots, and open-file guards.
-      self.applyWorkspaceScans(validation.scans, into: appState)
+      self.applyWorkspaceScans(
+        validation.scans, presentationSignature: validation.presentationSignature, into: appState)
 
       // Open the index OFF the main thread (coalesced — subsequent DB consumers reuse this pool).
       await self.indexDatabase.openInBackground(into: appState)
@@ -2341,9 +2351,6 @@ final class FolderManager {
         exclusions: exclusions,
         fingerprint: fingerprint
       )
-      if let cachedScans {
-        try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
-      }
       let documents = appState.documents
       // Handed over through `scheduleIndexWrite` rather than a bare `Task` for the same reason the
       // save tail is: these three calls are `IndexDatabase` WRITES, and a bare task is invisible to
@@ -2352,7 +2359,18 @@ final class FolderManager {
       // landing mid-manifest used to drain, checkpoint, and only THEN take these writes' frames,
       // recreating the WAL the maintenance had just truncated. One mechanism for every writer.
       let indexDatabase = self.indexDatabase
+      let cacheStore = self.cacheStore
       return indexDatabase.scheduleIndexWrite {
+        if let cachedScans {
+          let cacheWrite = Task.detached(priority: .utility) {
+            try cacheStore.writeWorkspaceScans(cachedScans, for: identity)
+          }
+          do {
+            try await cacheWrite.value
+          } catch {
+            NSLog("%@", "Presentation cache write failed: \(error)")
+          }
+        }
         await indexDatabase.upsertWorkspace(
           identity: identity,
           roots: rootURLs,
@@ -2391,10 +2409,15 @@ final class FolderManager {
     }
   }
 
-  private func applyWorkspaceScans(_ scans: [WorkspaceScan], into appState: AppState) {
+  private func applyWorkspaceScans(
+    _ scans: [WorkspaceScan],
+    presentationSignature: WorkspacePresentationSignature? = nil,
+    into appState: AppState
+  ) {
     appState.documents = scans.flatMap(\.documents)
     appState.workspaceTree = scans.map(\.rootNode)
-    lastWorkspacePresentationSignature = WorkspacePresentationSignature(scans: scans)
+    lastWorkspacePresentationSignature =
+      presentationSignature ?? WorkspacePresentationSignature(scans: scans)
 
     let workspaceIDs = Set(appState.documents.map(\.id))
     appState.openFiles.removeAll { workspaceIDs.contains($0.id) }
@@ -3005,100 +3028,111 @@ enum WorkspaceScanner {
     visitedDirectories: inout Set<String>,
     cancellationCheck: () throws -> Void
   ) throws -> (documents: [DocumentRef], nodes: [WorkspaceNode]) {
-    try cancellationCheck()
-    let standardizedDirectory = url.standardizedFileURL
-    guard contains(standardizedDirectory, in: root),
-      visitedDirectories.insert(standardizedDirectory.path).inserted
-    else {
-      return ([], [])
-    }
-
-    let fm = FileManager.default
-    guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
-      return ([], [])
-    }
-    // The URL-based directory API rejects a workspace root that is itself a
-    // symlink on current macOS. Enumerate names through the path API, then
-    // anchor each child to the logical workspace URL. Entry classification
-    // below reads link identity before directory/file target type.
-    let urls = childNames.map { url.appendingPathComponent($0) }
-
-    var documents: [DocumentRef] = []
-    var nodes: [WorkspaceNode] = []
-    let gitIgnoreRules =
-      inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
-    var entries: [WorkspaceDirectoryEntry] = []
-    entries.reserveCapacity(urls.count)
-    for childURL in urls {
+    // Recursive results survive the pool; directory enumeration, sorting and URL temporaries
+    // do not accumulate across the entire workspace walk.
+    return try autoreleasepool {
       try cancellationCheck()
-      if let entry = entry(
-        for: childURL,
-        root: root,
-        exclusions: exclusions,
-        gitIgnoreRules: gitIgnoreRules
-      ) {
-        entries.append(entry)
+      let standardizedDirectory = url.standardizedFileURL
+      guard contains(standardizedDirectory, in: root),
+        visitedDirectories.insert(standardizedDirectory.path).inserted
+      else {
+        return ([], [])
       }
-    }
-    entries.sort(by: workspaceSort)
 
-    for entry in entries {
-      try cancellationCheck()
-      if entry.isDirectory {
-        let childScan = try scanChildren(
-          folder: entry.url,
-          root: root,
-          exclusions: exclusions,
-          gitIgnoreRules: gitIgnoreRules,
-          visitedDirectories: &visitedDirectories,
-          cancellationCheck: cancellationCheck
-        )
-        documents.append(contentsOf: childScan.documents)
-        nodes.append(
-          WorkspaceNode(
-            id: "folder:\(entry.standardizedURL.path)",
-            name: entry.name,
-            kind: .folder,
-            url: entry.standardizedURL,
-            children: childScan.nodes
-          )
-        )
-      } else if entry.isRegularFile, isMarkdownFile(entry.url) {
-        let ref = DocumentRef(
-          id: entry.standardizedURL,
-          rootURL: root,
-          relativePath: entry.relativePath,
-          isAdHoc: false
-        )
-        documents.append(ref)
-        nodes.append(
-          WorkspaceNode(
-            id: "document:\(entry.standardizedURL.path)",
-            name: entry.url.deletingPathExtension().lastPathComponent,
-            kind: .document,
-            url: entry.standardizedURL,
-            children: nil
-          )
-        )
-      } else if entry.isRegularFile {
-        // Outside the markdown allow-list, but still on disk: surface it as an inert
-        // sidebar node instead of silently dropping it (that silence is how a rename
-        // that loses its extension used to look like data loss). It never joins
-        // `documents`, so FTS indexing, Open Files, and the open-document guards
-        // stay untouched.
-        nodes.append(
-          WorkspaceNode(
-            id: "foreign:\(entry.standardizedURL.path)",
-            name: entry.url.lastPathComponent,
-            kind: .foreignFile,
-            url: entry.standardizedURL,
-            children: nil
-          )
-        )
+      let fm = FileManager.default
+      guard let childNames = try? fm.contentsOfDirectory(atPath: url.path) else {
+        return ([], [])
       }
-    }
+      // The URL-based directory API rejects a workspace root that is itself a
+      // symlink on current macOS. Enumerate names through the path API, then
+      // anchor each child to the logical workspace URL. Entry classification
+      // below reads link identity before directory/file target type.
+      let urls = childNames.map { url.appendingPathComponent($0) }
 
-    return (documents, nodes)
+      var documents: [DocumentRef] = []
+      var nodes: [WorkspaceNode] = []
+      let gitIgnoreRules =
+        inheritedGitIgnoreRules + loadGitIgnoreRules(folder: url, root: root)
+      var entries: [WorkspaceDirectoryEntry] = []
+      entries.reserveCapacity(urls.count)
+      for childURL in urls {
+        try cancellationCheck()
+        // Foundation path/metadata calls autorelease temporary objects. A detached scan can walk
+        // the entire workspace before its executor drains them; only retain the classified entry.
+        let classified = autoreleasepool {
+          entry(
+            for: childURL,
+            root: root,
+            exclusions: exclusions,
+            gitIgnoreRules: gitIgnoreRules
+          )
+        }
+        if let classified {
+          entries.append(classified)
+        }
+      }
+      entries.sort(by: workspaceSort)
+
+      for entry in entries {
+        try cancellationCheck()
+        try autoreleasepool {
+          if entry.isDirectory {
+            let childScan = try scanChildren(
+              folder: entry.url,
+              root: root,
+              exclusions: exclusions,
+              gitIgnoreRules: gitIgnoreRules,
+              visitedDirectories: &visitedDirectories,
+              cancellationCheck: cancellationCheck
+            )
+            documents.append(contentsOf: childScan.documents)
+            nodes.append(
+              WorkspaceNode(
+                id: "folder:\(entry.standardizedURL.path)",
+                name: entry.name,
+                kind: .folder,
+                url: entry.standardizedURL,
+                children: childScan.nodes
+              )
+            )
+          } else if entry.isRegularFile, isMarkdownFile(entry.url) {
+            let ref = DocumentRef(
+              id: entry.standardizedURL,
+              rootURL: root,
+              relativePath: entry.relativePath,
+              isAdHoc: false
+            )
+            documents.append(ref)
+            nodes.append(
+              WorkspaceNode(
+                id: "document:\(entry.standardizedURL.path)",
+                name: entry.url.deletingPathExtension().lastPathComponent,
+                kind: .document,
+                url: entry.standardizedURL,
+                children: nil
+              )
+            )
+          } else if entry.isRegularFile {
+            // Outside the markdown allow-list, but still on disk: surface it as an inert
+            // sidebar node instead of silently dropping it (that silence is how a rename
+            // that loses its extension used to look like data loss). It never joins
+            // `documents`, so FTS indexing, Open Files, and the open-document guards
+            // stay untouched.
+            nodes.append(
+              WorkspaceNode(
+                id: "foreign:\(entry.standardizedURL.path)",
+                name: entry.url.lastPathComponent,
+                kind: .foreignFile,
+                url: entry.standardizedURL,
+                children: nil
+              )
+            )
+          }
+        }
+      }
+
+      return (documents, nodes)
+    }
   }
 
   private static func entry(
@@ -3206,7 +3240,7 @@ enum WorkspaceScanner {
 }
 
 private struct GitIgnoreRule: Sendable {
-  let pattern: String
+  let expression: NSRegularExpression
   let baseRelativePath: String
   let isNegated: Bool
   let isDirectoryOnly: Bool
@@ -3239,7 +3273,8 @@ private struct GitIgnoreRule: Sendable {
     }
     guard !line.isEmpty else { return nil }
 
-    self.pattern = line
+    guard let expression = Self.compile(line) else { return nil }
+    self.expression = expression
     self.baseRelativePath = baseRelativePath
     self.isNegated = isNegated
     self.isDirectoryOnly = isDirectoryOnly
@@ -3255,10 +3290,10 @@ private struct GitIgnoreRule: Sendable {
       return false
     }
 
-    if isAnchored || containsSlash {
-      return Self.glob(pattern, matches: candidate)
-    }
-    return Self.glob(pattern, matches: name)
+    let value = isAnchored || containsSlash ? candidate : name
+    return expression.rangeOfFirstMatch(
+      in: value, range: NSRange(value.startIndex..<value.endIndex, in: value)
+    ).location != NSNotFound
   }
 
   private func candidatePath(for relativePath: String) -> String? {
@@ -3272,7 +3307,9 @@ private struct GitIgnoreRule: Sendable {
     return String(relativePath.dropFirst(baseRelativePath.count + 1))
   }
 
-  private static func glob(_ pattern: String, matches value: String) -> Bool {
+  /// A rule is immutable and inherited by its descendants. Compile once when it is loaded,
+  /// rather than rebuilding the same ICU expression for every directory entry.
+  private static func compile(_ pattern: String) -> NSRegularExpression? {
     let regex =
       "^"
       + pattern.reduce(into: "") { result, character in
@@ -3287,7 +3324,7 @@ private struct GitIgnoreRule: Sendable {
           result.append(character)
         }
       } + "$"
-    return value.range(of: regex, options: .regularExpression) != nil
+    return try? NSRegularExpression(pattern: regex)
   }
 }
 

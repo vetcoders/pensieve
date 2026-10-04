@@ -35,7 +35,7 @@ struct GrokAccountSection: View {
     } footer: {
       Text(
         "Grok signs in with an xAI device code you approve on any device. "
-          + "Changes apply at once — Save is only for the autocomplete provider."
+          + "Changes apply at once — Save API Settings applies only to the API configuration."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -105,7 +105,7 @@ struct GrokAccountSection: View {
     case .awaitingApproval(let code):
       GrokDeviceCodePanel(code: code)
     case .authorized:
-      Label("Signed in. Grok can answer Ask.", systemImage: "checkmark.circle.fill")
+      Label("Signed in.", systemImage: "checkmark.circle.fill")
         .font(.caption)
         .foregroundStyle(.green)
         .accessibilityIdentifier("pensieve.provider.grok.authorized")
@@ -142,7 +142,7 @@ struct GrokAccountSection: View {
     } else if snapshot.isSignedIn {
       HStack {
         Text(
-          snapshot.assistiveProviderID == CodexAccount.providerID
+          snapshot.askUsesCodex
             ? "Ask uses Codex." : "Ask uses your \(apiKeyProvider.displayName) API key."
         )
         .font(.caption)

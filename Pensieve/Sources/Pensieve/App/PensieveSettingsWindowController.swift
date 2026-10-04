@@ -232,7 +232,12 @@ final class PensieveSettingsWindowController: NSWindowController, ObservableObje
   /// Updates the menu-routing signal using object identity only. Kept internal
   /// so the Settings precedence can be pinned with unpublished test windows.
   func synchronizeCommandSurfaceOwnership(keyWindow: NSWindow?) {
-    ownsCommandSurface = keyWindow === ownedWindow
+    let ownsSurface = keyWindow === ownedWindow
+    // AppKit can report document focus inside SwiftUI's window update. An
+    // unchanged @Published assignment still invalidates that update, even
+    // when Settings has never owned the command surface.
+    guard ownsCommandSurface != ownsSurface else { return }
+    ownsCommandSurface = ownsSurface
   }
 
   private func observeCommandSurfaceOwnership() {

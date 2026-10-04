@@ -12,22 +12,20 @@ import Foundation
 /// and the failure mode of a drift is invisible: a file that stages its read but
 /// then freezes on the highlight anyway.
 enum LargeDocument {
-  /// 1 MiB.
+  /// 64 KiB.
   ///
   /// Sized from what the main thread actually owes a document of this length in
   /// ONE run-loop turn. The repo's own measurement for a full reset + both
   /// highlighters is ~0.7 µs per character in a debug build
-  /// (`MarkdownTextStorage.seedSecondsPerCharacter`), so 1 MiB of
-  /// ASCII-dominated markdown is ~0.7 s of highlighting alone — before the
+  /// (`MarkdownTextStorage.seedSecondsPerCharacter`), so 64 KiB of
+  /// ASCII-dominated markdown is already ~46 ms of highlighting alone — before the
   /// wholesale `replaceCharacters` and the full cmark parse the same turn also
   /// carries. That is well past the ~100 ms at which a click stops feeling like
   /// it landed, and it lands with no signal at all: the window simply stops
   /// responding.
   ///
-  /// Below the gate the same three costs fit inside a couple of frames, and
-  /// staging them would buy nothing while adding a hop and a placeholder flash
-  /// to every ordinary note. A markdown file over a megabyte is not an ordinary
-  /// note.
+  /// Staging above this gate keeps the much larger, visibly blocking work out
+  /// of the opening click. Smaller notes retain the immediate opening path.
   ///
   /// Applied in TWO units, deliberately with ONE number: bytes on disk before
   /// the file is read (the only measure available at that point) and UTF-16
@@ -36,7 +34,7 @@ enum LargeDocument {
   /// stage the READ of a document whose highlight then still runs in a single
   /// pass — the harmless direction. It can never let a document past the gate
   /// that should have been staged.
-  static let sizeBudget = 1_048_576
+  static let sizeBudget = 65_536
 
   /// Whether `size` — bytes on disk, or UTF-16 length in memory — puts a
   /// document past the gate.
