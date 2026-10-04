@@ -5,10 +5,16 @@ All notable changes to Pensieve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-04
 
 ### Added
 
+- Native AppKit floating panel for Ask: detached Ask floats in its own
+  borderless, resizable AppKit panel (`TaflaPanel`) sharing the presentation
+  recipe with transcription. Includes an Always-on-Top (AoT) toggle (`.floating`
+  vs `.normal`), native AppKit window dragging (`performDrag(with:)`), and
+  seamless dock/float transitions backed by a single persistent hosting view
+  preserving draft, conversation state, attachments, and active streams.
 - One Ask conversation surface for both scopes: a resizable dock that
   remembers its height, an optional in-window float, and a native Markdown
   transcript (headings, lists, quotes, tasks, links, code and tables) with

@@ -1,30 +1,28 @@
 import CoreGraphics
 import Foundation
 
-/// Dock, float, or hidden. The float is an overlay inside the owner content
-/// rect. This value does not open a window, register restoration, or subscribe
-/// to a stream. Conversation, draft, attachments, provider, and request identity
-/// live beside it and are not copied when the mode changes.
+/// Dock, float, or hidden. The native float is an AppKit panel window outside
+/// the editor. Dock is anchored above the status bar. This value does not register
+/// restoration or subscribe to a stream. Conversation, draft, attachments, provider,
+/// and request identity live beside it and are not copied when the mode changes.
 struct AskPresentationState: Equatable, Sendable {
   var mode: AskPresentationMode
   var isExpanded: Bool
   /// User-resized dock height, including grip, header, transcript, and composer.
   /// Window clamping reads it; only a dock drag writes it.
   var preferredDockHeight: CGFloat
-  var floatOrigin: CGPoint
+  /// Desired size for the native floating panel.
   var preferredFloatSize: CGSize
+  /// Always-on-top level for the native floating panel (.floating vs .normal).
+  var isAlwaysOnTop: Bool
 
   static var expandedDefault: AskPresentationState {
-    let content = AskSurfaceLayout.referenceContent
-    return AskPresentationState(
+    AskPresentationState(
       mode: .docked,
       isExpanded: true,
       preferredDockHeight: AskSurfaceLayout.preferredExpandedDockHeight,
-      floatOrigin: AskSurfaceLayout.defaultFloatOrigin(in: content),
-      preferredFloatSize: CGSize(
-        width: 420,
-        height: AskSurfaceLayout.preferredExpandedDockHeight
-          + AskSurfaceLayout.compactChromeHeight - AskSurfaceLayout.chromeHeight))
+      preferredFloatSize: CGSize(width: 640, height: 520),
+      isAlwaysOnTop: true)
   }
 
   mutating func apply(_ command: AskSurfaceCommand, content: CGSize) -> AskCommandEffect {
@@ -60,31 +58,6 @@ struct AskPresentationState: Equatable, Sendable {
     preferredDockHeight = min(max(proposed, lower), max(maxDock, lower))
     isExpanded = preferredDockHeight > AskSurfaceLayout.collapsedDockHeight + 0.5
     mode = .docked
-  }
-
-  mutating func dragFloat(from start: CGPoint, by translation: CGSize, in content: CGSize) {
-    floatOrigin = CGPoint(x: start.x + translation.width, y: start.y + translation.height)
-    mode = .floating
-    floatOrigin = AskSurfaceLayout.displayedFloatFrame(presentation: self, content: content).origin
-  }
-
-  mutating func resizeFloat(from start: CGSize, by translation: CGSize, in content: CGSize) {
-    preferredFloatSize = CGSize(
-      width: max(1, start.width + translation.width),
-      height: max(1, start.height + translation.height))
-    mode = .floating
-    let shown = AskSurfaceLayout.displayedFloatFrame(presentation: self, content: content)
-    preferredFloatSize = shown.size
-    floatOrigin = shown.origin
-    isExpanded = shown.size.height > AskSurfaceLayout.collapsedDockHeight + 0.5
-  }
-
-  /// Pulls the float origin back inside the owner after the window changes size.
-  /// The remembered dock height and float size stay, so growing the window
-  /// returns the room the user already chose.
-  mutating func clampOrigin(to content: CGSize) {
-    guard mode == .floating else { return }
-    floatOrigin = AskSurfaceLayout.displayedFloatFrame(presentation: self, content: content).origin
   }
 }
 
@@ -146,6 +119,8 @@ enum AskSurfaceSymbol {
   static let hide = "xmark"
   static let stop = "stop.fill"
   static let grip = "line.3.horizontal"
+  static let alwaysOnTopActive = "pin.fill"
+  static let alwaysOnTopInactive = "pin"
 }
 
 enum AskChromeRole: Equatable, Sendable {
@@ -162,43 +137,32 @@ enum AskChromeMaterial: Equatable, Sendable {
   case plain
 }
 
-/// Pointer routing for the dock grip and the floating corner.
-/// The dock grip grows the dock. The same grip moves the overlay while
-/// floating and must not rewrite the remembered dock height. The corner
-/// exists only in floating mode. Neither path opens a window.
+/// Pointer routing for the dock grip. Dock resize drags vertically to grow the dock.
+/// Native floating panel movement and resizing are handled natively by AppKit.
 enum AskPointerGesture: Equatable, Sendable {
   case dockResize
-  case floatDrag
-  case floatResize
 }
 
 enum AskPointerRoute {
-  static func grip(mode: AskPresentationMode) -> AskPointerGesture {
-    mode == .floating ? .floatDrag : .dockResize
+  static func grip(mode: AskPresentationMode) -> AskPointerGesture? {
+    mode == .docked ? .dockResize : nil
   }
 
   static func corner(mode: AskPresentationMode) -> AskPointerGesture? {
-    mode == .floating ? .floatResize : nil
+    nil
   }
 
   /// Dock drag uses an inverted y: dragging up grows the dock.
-  /// Float resize adds the translation, so dragging down and right grows it.
   static func apply(
     _ gesture: AskPointerGesture,
     to state: inout AskPresentationState,
     content: CGSize,
     dockStart: CGFloat,
-    originStart: CGPoint,
-    sizeStart: CGSize,
     translation: CGSize
   ) {
     switch gesture {
     case .dockResize:
       state.resizeDock(to: dockStart - translation.height, in: content)
-    case .floatDrag:
-      state.dragFloat(from: originStart, by: translation, in: content)
-    case .floatResize:
-      state.resizeFloat(from: sizeStart, by: translation, in: content)
     }
   }
 }

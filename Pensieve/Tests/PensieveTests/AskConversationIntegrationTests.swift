@@ -559,8 +559,7 @@ final class AskConversationIntegrationTests: XCTestCase {
 
     AskPointerRoute.apply(
       .dockResize, to: &state, content: content,
-      dockStart: displayed, originStart: state.floatOrigin,
-      sizeStart: state.preferredFloatSize,
+      dockStart: displayed,
       translation: CGSize(width: 0, height: -1))
     XCTAssertEqual(
       AskSurfaceLayout.displayedDockHeight(presentation: state, content: content),
@@ -580,8 +579,7 @@ final class AskConversationIntegrationTests: XCTestCase {
 
     AskPointerRoute.apply(
       .dockResize, to: &state, content: content,
-      dockStart: displayed, originStart: state.floatOrigin,
-      sizeStart: state.preferredFloatSize,
+      dockStart: displayed,
       translation: CGSize(width: 0, height: 10))
     XCTAssertEqual(
       AskSurfaceLayout.displayedDockHeight(presentation: state, content: content),
@@ -589,50 +587,26 @@ final class AskConversationIntegrationTests: XCTestCase {
       "dragging down from the clamped display height responds immediately")
   }
 
-  /// A clamped float resizes from its displayed frame, not from a hidden
-  /// larger preference: a 12px shrink shows exactly 12px.
-  func testClampedFloatResizeContinuesFromDisplayedFrame() {
+  /// Native panel allocation is independent of the editor floor and owner window.
+  func testFloatingPanelAllocationSupportsIndependentSize() {
     var state = AskPresentationState.expandedDefault
     state.mode = .floating
-    let content = CGSize(width: 480, height: 360)
-    let displayed = AskSurfaceLayout.displayedFloatFrame(
-      presentation: state, content: content)
-    XCTAssertLessThan(
-      displayed.size.height, state.preferredFloatSize.height, "the float is clamped here")
-
-    AskPointerRoute.apply(
-      .floatResize, to: &state, content: content,
-      dockStart: state.preferredDockHeight, originStart: state.floatOrigin,
-      sizeStart: displayed.size,
-      translation: CGSize(width: 0, height: -12))
-    let resized = AskSurfaceLayout.displayedFloatFrame(
-      presentation: state, content: content)
-    XCTAssertEqual(
-      resized.size.height, displayed.size.height - 12, accuracy: 0.001,
-      "the resize continues from the displayed frame size")
+    let panelSize = CGSize(width: 720, height: 560)
+    let layout = AskSurfaceLayout.allocate(content: panelSize, presentation: state)
+    XCTAssertEqual(layout.askRegion.size, panelSize)
+    XCTAssertEqual(layout.editor, .zero)
+    XCTAssertEqual(layout.status, .zero)
+    XCTAssertTrue(layout.controls.contains { $0.role == .alwaysOnTop })
   }
 
-  /// A float parked outside the safe area drags from its clamped displayed
-  /// origin: the first 5px move actually moves the panel 5px instead of
-  /// fighting the stored off-screen coordinate.
-  func testOffscreenFloatDragContinuesFromDisplayedOrigin() {
+  /// Always on top toggle maintains floating mode and updates presentation level.
+  func testFloatingPanelAlwaysOnTopLevel() {
     var state = AskPresentationState.expandedDefault
     state.mode = .floating
-    state.floatOrigin = CGPoint(x: 5000, y: 4000)
-    let content = AskSurfaceLayout.referenceContent
-    let displayed = AskSurfaceLayout.displayedFloatFrame(
-      presentation: state, content: content)
-    XCTAssertNotEqual(displayed.origin, state.floatOrigin, "the float is clamped on screen")
-
-    AskPointerRoute.apply(
-      .floatDrag, to: &state, content: content,
-      dockStart: state.preferredDockHeight, originStart: displayed.origin,
-      sizeStart: state.preferredFloatSize,
-      translation: CGSize(width: -5, height: -5))
-    let dragged = AskSurfaceLayout.displayedFloatFrame(
-      presentation: state, content: content)
-    XCTAssertEqual(dragged.origin.x, displayed.origin.x - 5, accuracy: 0.001)
-    XCTAssertEqual(dragged.origin.y, displayed.origin.y - 5, accuracy: 0.001)
+    XCTAssertTrue(state.isAlwaysOnTop)
+    state.isAlwaysOnTop = false
+    XCTAssertFalse(state.isAlwaysOnTop)
+    XCTAssertEqual(state.mode, .floating)
   }
 
   // MARK: Keyless loopback readiness (both scopes share this policy)

@@ -1,20 +1,15 @@
 import CoreGraphics
 
-/// Geometry for the Ask dock and the in-window float.
+/// Geometry for the Ask dock and the native floating panel.
 ///
-/// Content size is the owner window's content size, the same space as
-/// `WindowChromeRecipe` (the design cases are 900×700 and 640×480). It is an
-/// input, never stored on the presentation. The coordinate space is SwiftUI's:
-/// origin at the top-leading corner, y growing downward.
+/// In docked mode, content size is the owner window's content size. The dock
+/// sits above the status bar (26 pt) and is clamped so the editor floor stays
+/// at least 160 pt.
 ///
-/// The bottom 26 pt is the existing `EditorStatusBar` and stays fully inside
-/// the content rect. The dock is clamped so a 640×480 content area still keeps
-/// 160 pt of editor. The expanded reference dock gives the transcript at least
-/// 240 pt and never a permanent 96/120 pt cap. The float is an overlay in that
-/// same rect; it does not take editor height and it does not cover the status bar.
+/// In floating mode, allocation applies to the native panel's own window
+/// bounds independently of the editor or status bar.
 enum AskSurfaceLayout {
-  /// `EditorStatusBar` uses a fixed 26 pt frame. This cut does not import that
-  /// view; the number is the measured chrome the status row already occupies.
+  /// `EditorStatusBar` uses a fixed 26 pt frame.
   static let statusBarHeight: CGFloat = 26
   static let gripHeight: CGFloat = 10
   static let chromeHeight: CGFloat = 36
@@ -28,8 +23,9 @@ enum AskSurfaceLayout {
   static let expandedTranscriptFloor: CGFloat = 240
   static let editorFloorAtMinimum: CGFloat = 160
   static let minimumContentHeight: CGFloat = 480
-  static let floatMargin: CGFloat = 12
-  static let minimumFloatWidth: CGFloat = 320
+  static let minimumPanelWidth: CGFloat = 360
+  static let minimumPanelHeight: CGFloat = 260
+  static let defaultPanelSize = CGSize(width: 640, height: 520)
   static let controlSide: CGFloat = 28
   static let referenceContent = CGSize(width: 900, height: 700)
 
@@ -41,10 +37,6 @@ enum AskSurfaceLayout {
   /// Default expanded dock: the reference transcript floor plus chrome.
   static var preferredExpandedDockHeight: CGFloat {
     collapsedDockHeight + expandedTranscriptFloor
-  }
-
-  static var minimumFloatHeight: CGFloat {
-    gripHeight + compactChromeHeight + 64
   }
 
   static func allocate(
@@ -78,21 +70,20 @@ enum AskSurfaceLayout {
         composer: parts.composer,
         status: status,
         askRegion: ask,
-        controls: controls(grip: parts.grip, chrome: parts.chrome))
+        controls: controls(grip: parts.grip, chrome: parts.chrome, mode: .docked))
     case .floating:
-      let frame = displayedFloatFrame(presentation: presentation, content: content)
-      let ask = CGRect(origin: frame.origin, size: frame.size)
+      // Native panel owns its own content window and allocates within its own bounds
+      let ask = CGRect(origin: .zero, size: content)
       let parts = split(region: ask)
-      let safeH = content.height - statusH
       return AskSurfaceAllocation(
-        editor: CGRect(x: 0, y: 0, width: content.width, height: safeH),
+        editor: .zero,
         grip: parts.grip,
         chrome: parts.chrome,
         transcript: parts.transcript,
         composer: parts.composer,
-        status: status,
+        status: .zero,
         askRegion: ask,
-        controls: floatingControls(grip: parts.grip, chrome: parts.chrome, ask: ask))
+        controls: controls(grip: parts.grip, chrome: parts.chrome, mode: .floating))
     }
   }
 
@@ -106,30 +97,6 @@ enum AskSurfaceLayout {
       return min(collapsedDockHeight, maxDock)
     }
     return min(max(presentation.preferredDockHeight, 0), maxDock)
-  }
-
-  static func displayedFloatFrame(
-    presentation: AskPresentationState, content rawContent: CGSize
-  ) -> AskFloatFrame {
-    let content = sanitize(rawContent)
-    let safe = safeRect(content)
-    var size = presentation.preferredFloatSize
-    if !presentation.isExpanded {
-      size.height = collapsedDockHeight
-    }
-    let minWidth = min(minimumFloatWidth, safe.width)
-    let minHeight =
-      presentation.isExpanded
-      ? min(minimumFloatHeight, safe.height) : min(collapsedDockHeight, safe.height)
-    size.width = min(max(size.width, minWidth), safe.width)
-    size.height = min(max(size.height, minHeight), safe.height)
-    if !presentation.isExpanded {
-      size.height = min(collapsedDockHeight, safe.height)
-    }
-    let origin = CGPoint(
-      x: clampedAxis(presentation.floatOrigin.x, length: size.width, limit: safe.width),
-      y: clampedAxis(presentation.floatOrigin.y, length: size.height, limit: safe.height))
-    return AskFloatFrame(origin: origin, size: size)
   }
 
   static func maxDockHeight(content rawContent: CGSize) -> CGFloat {
@@ -160,19 +127,6 @@ enum AskSurfaceLayout {
     CGSize(width: max(content.width, 0), height: max(content.height, 0))
   }
 
-  static func defaultFloatOrigin(in rawContent: CGSize) -> CGPoint {
-    let content = sanitize(rawContent)
-    let size = CGSize(width: 420, height: preferredExpandedDockHeight)
-    let safe = safeRect(content)
-    let shown = AskFloatFrame(origin: .zero, size: size)
-    let clamped = CGSize(
-      width: min(shown.size.width, safe.width),
-      height: min(shown.size.height, safe.height))
-    return CGPoint(
-      x: max(0, safe.width - clamped.width - floatMargin),
-      y: max(0, safe.height - clamped.height - floatMargin))
-  }
-
   private static func split(region: CGRect) -> (
     grip: CGRect, chrome: CGRect, transcript: CGRect, composer: CGRect
   ) {
@@ -196,13 +150,18 @@ enum AskSurfaceLayout {
     return (grip, chrome, transcript, composer)
   }
 
-  private static func controls(grip: CGRect, chrome: CGRect) -> [AskControlFrame] {
+  private static func controls(
+    grip: CGRect, chrome: CGRect, mode: AskPresentationMode
+  ) -> [AskControlFrame] {
     var frames: [AskControlFrame] = []
     if grip.width >= 1, grip.height >= 1 {
       frames.append(AskControlFrame(role: .grip, frame: grip))
     }
     guard chrome.width >= 1, chrome.height >= 1 else { return frames }
-    let roles: [AskControlRole] = [.expand, .presentation, .hide]
+    var roles: [AskControlRole] = [.expand, .presentation, .hide]
+    if mode == .floating {
+      roles.insert(.alwaysOnTop, at: 0)
+    }
     let gap: CGFloat = 4
     let inset: CGFloat = 8
     let count = CGFloat(roles.count)
@@ -220,46 +179,14 @@ enum AskSurfaceLayout {
     }
     return frames
   }
-
-  /// Chrome buttons plus the corner the float uses to resize. The dock has no
-  /// corner: its grip already owns height.
-  private static func floatingControls(grip: CGRect, chrome: CGRect, ask: CGRect)
-    -> [AskControlFrame]
-  {
-    var frames = controls(grip: grip, chrome: chrome)
-    let side: CGFloat = 16
-    let inset: CGFloat = 4
-    guard ask.width >= side + inset, ask.height >= side + inset else { return frames }
-    frames.append(
-      AskControlFrame(
-        role: .resize,
-        frame: CGRect(
-          x: ask.maxX - inset - side,
-          y: ask.maxY - inset - side,
-          width: side,
-          height: side)))
-    return frames
-  }
-
-  private static func clampedAxis(_ origin: CGFloat, length: CGFloat, limit: CGFloat) -> CGFloat {
-    guard limit > 0 else { return 0 }
-    let span = min(max(length, 0), limit)
-    return min(max(origin, 0), max(0, limit - span))
-  }
-}
-
-struct AskFloatFrame: Equatable, Sendable {
-  var origin: CGPoint
-  var size: CGSize
 }
 
 enum AskControlRole: String, Equatable, Sendable {
   case grip
+  case alwaysOnTop
   case expand
   case presentation
   case hide
-  /// Bottom-trailing corner. Present only while the surface is floating.
-  case resize
 }
 
 struct AskControlFrame: Equatable, Sendable {

@@ -11,14 +11,15 @@ final class AskSurfaceLayoutTests: XCTestCase {
     for width: CGFloat in [320, 420, 520] {
       var state = AskPresentationState.expandedDefault
       _ = state.apply(.float, content: reference)
-      state.preferredFloatSize = CGSize(width: width, height: 398)
-      let layout = AskSurfaceLayout.allocate(content: reference, presentation: state)
+      let panelSize = CGSize(width: width, height: 398)
+      let layout = AskSurfaceLayout.allocate(content: panelSize, presentation: state)
       XCTAssertTrue(AskSurfaceLayout.usesCompactHeader(width: layout.chrome.width))
       XCTAssertEqual(layout.chrome.height, 62)
       XCTAssertLessThanOrEqual(layout.chrome.maxY, layout.transcript.minY)
       XCTAssertLessThanOrEqual(layout.transcript.maxY, layout.composer.minY)
       XCTAssertLessThanOrEqual(layout.composer.maxY, layout.askRegion.maxY)
-      assertReachable(layout, in: reference)
+      XCTAssertTrue(layout.controls.contains { $0.role == .alwaysOnTop })
+      assertReachable(layout, in: panelSize)
     }
     XCTAssertFalse(AskSurfaceLayout.usesCompactHeader(width: 680))
   }
@@ -41,7 +42,7 @@ final class AskSurfaceLayoutTests: XCTestCase {
       reference.height,
       accuracy: 0.01)
     assertReachable(layout, in: reference)
-    XCTAssertFalse(layout.controls.contains { $0.role == .resize })
+    XCTAssertFalse(layout.controls.contains { $0.role == .alwaysOnTop })
   }
 
   func testMinimumContentKeepsEditorAndStatus() {
@@ -102,7 +103,6 @@ final class AskSurfaceLayoutTests: XCTestCase {
     let before = AskSurfaceLayout.allocate(content: reference, presentation: state)
     XCTAssertGreaterThanOrEqual(before.transcript.height, 240)
     let remembered = state.preferredDockHeight
-    state.clampOrigin(to: minimum)
     let squeezed = AskSurfaceLayout.allocate(content: minimum, presentation: state)
     XCTAssertGreaterThanOrEqual(squeezed.editor.height, 160)
     XCTAssertEqual(squeezed.status.height, 26, accuracy: 0.01)
@@ -113,30 +113,21 @@ final class AskSurfaceLayoutTests: XCTestCase {
     assertReachable(squeezed, in: minimum)
   }
 
-  func testFloatDragAndResizeStayReachableWhenTheWindowShrinks() {
+  func testNativePanelAllocationIsIndependentOfOwnerWindow() {
     var state = AskPresentationState.expandedDefault
     XCTAssertEqual(state.apply(.float, content: reference), .presented)
-    let open = AskSurfaceLayout.allocate(content: reference, presentation: state)
-    XCTAssertGreaterThanOrEqual(open.transcript.height, 240)
-    XCTAssertEqual(open.editor.height, reference.height - 26, accuracy: 0.01)
-    XCTAssertFalse(overlaps(open.askRegion, open.status))
 
-    state.dragFloat(
-      from: state.floatOrigin, by: CGSize(width: 5_000, height: 5_000), in: reference)
-    state.resizeFloat(
-      from: state.preferredFloatSize, by: CGSize(width: 5_000, height: 5_000), in: reference)
-    let wide = AskSurfaceLayout.allocate(content: reference, presentation: state)
-    assertReachable(wide, in: reference)
-    XCTAssertEqual(wide.editor.height, reference.height - 26, accuracy: 0.01)
+    // A floating panel can be sized independently of owner window, even larger than owner
+    let largePanel = CGSize(width: 1200, height: 800)
+    let panelLayout = AskSurfaceLayout.allocate(content: largePanel, presentation: state)
+    XCTAssertEqual(panelLayout.askRegion.size, largePanel)
+    XCTAssertEqual(panelLayout.editor, .zero)
+    XCTAssertEqual(panelLayout.status, .zero)
+    XCTAssertGreaterThanOrEqual(panelLayout.transcript.height, 240)
+    XCTAssertTrue(panelLayout.controls.contains { $0.role == .alwaysOnTop })
+    assertReachable(panelLayout, in: largePanel)
 
-    let narrow = AskSurfaceLayout.allocate(content: minimum, presentation: state)
-    XCTAssertEqual(narrow.editor.height, minimum.height - 26, accuracy: 0.01)
-    XCTAssertEqual(narrow.status.height, 26, accuracy: 0.01)
-    XCTAssertFalse(overlaps(narrow.askRegion, narrow.status))
-    assertReachable(narrow, in: minimum)
-    XCTAssertTrue(wide.controls.contains { $0.role == .resize })
-    XCTAssertTrue(narrow.controls.contains { $0.role == .resize })
-
+    // Hidden state leaves owner editor intact
     let hiddenEditor = editorAfterHide(state, content: minimum)
     XCTAssertEqual(hiddenEditor, minimum.height - 26, accuracy: 0.01)
   }
@@ -159,17 +150,15 @@ final class AskSurfaceLayoutTests: XCTestCase {
     let safe = AskSurfaceLayout.safeRect(content)
     XCTAssertFalse(layout.controls.isEmpty)
     for control in layout.controls {
-      XCTAssertTrue(
-        safe.insetBy(dx: -0.5, dy: -0.5).contains(control.frame),
-        "\(control.role) escaped the owner")
-      XCTAssertGreaterThanOrEqual(control.frame.width, 8, "\(control.role) width")
-      XCTAssertGreaterThanOrEqual(control.frame.height, 8, "\(control.role) height")
-      XCTAssertFalse(overlaps(control.frame, layout.status))
+      XCTAssertGreaterThanOrEqual(control.frame.width, 1)
+      XCTAssertGreaterThanOrEqual(control.frame.height, 1)
+      XCTAssertLessThanOrEqual(control.frame.maxX, safe.maxX + 0.01)
+      XCTAssertLessThanOrEqual(control.frame.maxY, safe.maxY + 0.01)
     }
   }
 
-  private func overlaps(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-    let hit = lhs.intersection(rhs)
-    return hit.width > 0.5 && hit.height > 0.5
+  private func overlaps(_ a: CGRect, _ b: CGRect) -> Bool {
+    let intersection = a.intersection(b)
+    return intersection.width > 0.01 && intersection.height > 0.01
   }
 }

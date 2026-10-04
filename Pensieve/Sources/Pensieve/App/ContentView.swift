@@ -24,6 +24,7 @@ struct ContentView: View {
   @AppStorage("pensieve.ask.expanded") private var askExpanded = true
   @State private var askPresentation = AskPresentationState.expandedDefault
   @State private var askPresentationLoaded = false
+  @StateObject private var askPanelController = AskPanelController()
   @Binding private var hostWindow: NSWindow?
   @ObservedObject private var providerSettings: ProviderSettings
 
@@ -59,6 +60,12 @@ struct ContentView: View {
       askVisible
       ? (AskPresentationMode(rawValue: askModeRaw) ?? .docked) : .hidden
     askPresentation = state
+    askPanelController.presentation = state
+    askPanelController.onPresentationChange = { [self] newState in
+      if askPresentation != newState {
+        askPresentation = newState
+      }
+    }
   }
 
   /// The status-bar chip (or dictation) flipped visibility: move the surface,
@@ -72,6 +79,7 @@ struct ContentView: View {
     } else if askPresentation.mode != .hidden {
       askPresentation.mode = .hidden
     }
+    askPanelController.presentation = askPresentation
   }
 
   /// The surface moved (hide button, float/dock, drag): write visibility back
@@ -88,6 +96,9 @@ struct ContentView: View {
       askDockHeight = state.preferredDockHeight
     }
     if askExpanded != state.isExpanded { askExpanded = state.isExpanded }
+    if askPanelController.presentation != state {
+      askPanelController.presentation = state
+    }
   }
 
   var body: some View {
@@ -132,11 +143,23 @@ struct ContentView: View {
             }
           }
           if askEligible {
-            AskSurfaceHost(
-              providerSettings: providerSettings,
-              askThreads: askThreads,
+            AskPanelHostView(
+              controller: askPanelController,
               presentation: $askPresentation,
-              makeDocumentHost: makeDocumentHost)
+              contentSize: proxy.size,
+              hostWindow: hostWindow
+            ) {
+              AskSurfaceHost(
+                providerSettings: providerSettings,
+                askThreads: askThreads,
+                presentation: $askPresentation,
+                makeDocumentHost: makeDocumentHost
+              )
+              .environment(appState)
+              .environmentObject(controller)
+              .environmentObject(themeManager)
+              .environmentObject(askThreads)
+            }
           }
         }
         .onAppear { loadAskPresentation() }
@@ -836,7 +859,7 @@ private struct AskSurfaceHost: View {
       conversation: conversation,
       provider: provider,
       readinessContext: readinessContext,
-      onSubmit: { prompt in
+      onSubmit: { [weak controller] prompt in
         await thread.prepareAndSend(
           text: prompt,
           documents: appState.workspaceStore.documents,

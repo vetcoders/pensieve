@@ -3,12 +3,10 @@ import SwiftUI
 
 /// Generic Ask chrome. The transcript and composer are slots the assembly
 /// worker fills with whichever transport owns the turn. This view does not
-/// create a session, subscribe to a stream, or open a window.
+/// create a session or subscribe to a stream.
 ///
-/// Place it in the owner content view, the rect whose size is
-/// `WindowChromeRecipe`'s content size. The layout reserves the status bar
-/// at the bottom and does not draw it. Theme comes from the scene's
-/// `ThemeManager`; the surface does not construct a second one.
+/// In docked mode, it is placed in the owner window's detail view above the
+/// status bar. In floating mode, it lives inside the native AppKit panel (`TaflaPanel`).
 ///
 /// Narrow panels put scope/provider/readiness on a second compact row; the
 /// title and surface buttons retain their width instead of wrapping or clipping.
@@ -21,11 +19,6 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
   @State private var dockDragStart: CGFloat?
-  @State private var floatDragStart: CGPoint?
-  @State private var floatResizeStart: CGSize?
-  /// Captured on the first pointer sample so a dock drag cannot flip into a
-  /// float move, and a float move cannot fall through to `resizeDock`.
-  @State private var activeGrip: AskPointerGesture?
 
   var body: some View {
     GeometryReader { proxy in
@@ -41,11 +34,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       let palette = AskSurfacePalette.resolve(tokens: tokens, material: shellMaterial)
       panel(layout: layout, content: content, palette: palette, material: shellMaterial)
         .frame(width: max(layout.askRegion.width, 0), height: max(layout.askRegion.height, 0))
-        .offset(x: layout.askRegion.minX, y: layout.askRegion.minY)
         .opacity(presentation.mode == .hidden ? 0 : 1)
         .allowsHitTesting(presentation.mode != .hidden && layout.askRegion.height > 1)
-        .onAppear { syncFloatOrigin(to: content) }
-        .onChange(of: proxy.size) { _, newSize in syncFloatOrigin(to: newSize) }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .accessibilityIdentifier("pensieve.askSurface")
@@ -69,7 +59,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         .accessibilityIdentifier("pensieve.askSurface.transcript")
       composer()
         .padding(.top, 6)
-        .padding(.bottom, presentation.mode == .floating ? 24 : 8)
+        .padding(.bottom, presentation.mode == .floating ? 16 : 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(height: max(layout.composer.height, 0))
         .accessibilityElement(children: .contain)
@@ -78,39 +68,43 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     .foregroundStyle(Color(nsColor: palette.text))
     .background { shellBackground(material: material, shape: shape, palette: palette) }
     .clipShape(shape)
-    .overlay(alignment: .bottomTrailing) {
-      if AskPointerRoute.corner(mode: presentation.mode) != nil {
-        resizeHandle(content: content, palette: palette)
-          .padding(4)
-      }
-    }
     .accessibilityElement(children: .contain)
     .accessibilityAdjustableAction { direction in
       let delta: CGFloat = direction == .increment ? 24 : -24
       update { state in
-        if state.mode == .floating {
-          state.resizeFloat(
-            from: state.preferredFloatSize, by: CGSize(width: 0, height: delta), in: content)
-        } else {
-          state.resizeDock(to: state.preferredDockHeight + delta, in: content)
-        }
+        state.resizeDock(to: state.preferredDockHeight + delta, in: content)
       }
     }
   }
 
+  @ViewBuilder
   private func grip(
     layout: AskSurfaceAllocation, content: CGSize, palette: AskSurfacePalette
   ) -> some View {
-    Image(systemName: AskSurfaceSymbol.grip)
-      .font(.system(size: 9, weight: .semibold))
-      .foregroundStyle(Color(nsColor: palette.muted))
+    if presentation.mode == .floating {
+      ZStack {
+        WindowDragHandle()
+        Image(systemName: AskSurfaceSymbol.grip)
+          .font(.system(size: 9, weight: .semibold))
+          .foregroundStyle(Color(nsColor: palette.muted))
+      }
       .frame(maxWidth: .infinity)
       .frame(height: max(layout.grip.height, 0))
-      .contentShape(Rectangle())
-      .gesture(gripDrag(content: content))
       .accessibilityIdentifier("pensieve.askSurface.grip")
-      .accessibilityLabel(presentation.mode == .floating ? "Move Ask" : "Resize Ask")
-      .help(presentation.mode == .floating ? "Drag to move Ask" : "Drag to resize Ask")
+      .accessibilityLabel("Move Ask")
+      .help("Drag to move Ask window")
+    } else {
+      Image(systemName: AskSurfaceSymbol.grip)
+        .font(.system(size: 9, weight: .semibold))
+        .foregroundStyle(Color(nsColor: palette.muted))
+        .frame(maxWidth: .infinity)
+        .frame(height: max(layout.grip.height, 0))
+        .contentShape(Rectangle())
+        .gesture(dockGripDrag(content: content))
+        .accessibilityIdentifier("pensieve.askSurface.grip")
+        .accessibilityLabel("Resize Ask")
+        .help("Drag to resize Ask")
+    }
   }
 
   private func chrome(
@@ -119,14 +113,18 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     let compact = AskSurfaceLayout.usesCompactHeader(width: layout.chrome.width)
     return VStack(spacing: 4) {
       HStack(spacing: 8) {
-        Text("Ask")
-          .font(palette.headingFont)
-          .foregroundStyle(Color(nsColor: palette.text))
-          .fixedSize()
-          .contentShape(Rectangle())
-          .gesture(
-            floatDrag(content: content),
-            including: presentation.mode == .floating ? .gesture : .none)
+        if presentation.mode == .floating {
+          Text("Ask")
+            .font(palette.headingFont)
+            .foregroundStyle(Color(nsColor: palette.text))
+            .fixedSize()
+            .background(WindowDragHandle())
+        } else {
+          Text("Ask")
+            .font(palette.headingFont)
+            .foregroundStyle(Color(nsColor: palette.text))
+            .fixedSize()
+        }
         if !compact { headerControls(false) }
         Spacer(minLength: 0)
         chromeButtons(content: content, palette: palette)
@@ -145,11 +143,36 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func chromeButtons(content: CGSize, palette: AskSurfacePalette) -> some View {
     HStack(spacing: 4) {
+      if presentation.mode == .floating {
+        alwaysOnTopButton(palette: palette)
+      }
       expandButton(content: content, palette: palette)
       presentationButton(content: content, palette: palette)
       hideButton(palette: palette)
     }
     .buttonStyle(.plain)
+  }
+
+  private func alwaysOnTopButton(palette: AskSurfacePalette) -> some View {
+    let aot = presentation.isAlwaysOnTop
+    return Button {
+      update { state in
+        state.isAlwaysOnTop.toggle()
+      }
+    } label: {
+      Image(
+        systemName: aot ? AskSurfaceSymbol.alwaysOnTopActive : AskSurfaceSymbol.alwaysOnTopInactive
+      )
+      .frame(width: 25, height: 25)
+      .contentShape(Rectangle())
+    }
+    .foregroundStyle(Color(nsColor: palette.text))
+    .accessibilityIdentifier("pensieve.askSurface.alwaysOnTop")
+    .accessibilityLabel(aot ? "Disable Always on Top" : "Enable Always on Top")
+    .help(
+      aot
+        ? "Keep Ask on top of other windows (active)"
+        : "Keep Ask on top of other windows (inactive)")
   }
 
   private func expandButton(content: CGSize, palette: AskSurfacePalette) -> some View {
@@ -183,7 +206,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     .foregroundStyle(Color(nsColor: palette.text))
     .accessibilityIdentifier("pensieve.askSurface.presentation")
     .accessibilityLabel(floating ? "Dock Ask" : "Float Ask")
-    .help(floating ? "Dock Ask in the window" : "Float Ask inside the window")
+    .help(floating ? "Dock Ask in the window" : "Float Ask in a native panel")
   }
 
   private func hideButton(palette: AskSurfacePalette) -> some View {
@@ -226,122 +249,26 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     }
   }
 
-  private func resizeHandle(content: CGSize, palette: AskSurfacePalette) -> some View {
-    Image(systemName: "arrow.up.left.and.arrow.down.right")
-      .font(.system(size: 9, weight: .semibold))
-      .foregroundStyle(Color(nsColor: palette.muted))
-      .frame(width: 16, height: 16)
-      .contentShape(Rectangle())
-      .gesture(floatResize(content: content))
-      .accessibilityIdentifier("pensieve.askSurface.resize")
-      .accessibilityLabel("Resize floating Ask")
-      .help("Drag to resize the floating Ask")
-  }
-
-  private func gripDrag(content: CGSize) -> some Gesture {
+  private func dockGripDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
-        let route = activeGrip ?? AskPointerRoute.grip(mode: presentation.mode)
-        if activeGrip == nil { activeGrip = route }
-        switch route {
-        case .dockResize:
-          // The first sample starts from the DISPLAYED height: a collapsed or
-          // clamped dock drags continuously instead of jumping from the
-          // remembered preferred height. Only a deliberate resize rewrites
-          // the preference.
-          let start =
-            dockDragStart
-            ?? AskSurfaceLayout.displayedDockHeight(
-              presentation: presentation, content: content)
-          if dockDragStart == nil { dockDragStart = start }
-          update { state in
-            AskPointerRoute.apply(
-              .dockResize,
-              to: &state,
-              content: content,
-              dockStart: start,
-              originStart: state.floatOrigin,
-              sizeStart: state.preferredFloatSize,
-              translation: value.translation)
-          }
-        case .floatDrag:
-          let start =
-            floatDragStart
-            ?? AskSurfaceLayout.displayedFloatFrame(
-              presentation: presentation, content: content
-            ).origin
-          if floatDragStart == nil { floatDragStart = start }
-          update { state in
-            AskPointerRoute.apply(
-              .floatDrag,
-              to: &state,
-              content: content,
-              dockStart: state.preferredDockHeight,
-              originStart: start,
-              sizeStart: state.preferredFloatSize,
-              translation: value.translation)
-          }
-        case .floatResize:
-          break
+        let start =
+          dockDragStart
+          ?? AskSurfaceLayout.displayedDockHeight(
+            presentation: presentation, content: content)
+        if dockDragStart == nil { dockDragStart = start }
+        update { state in
+          AskPointerRoute.apply(
+            .dockResize,
+            to: &state,
+            content: content,
+            dockStart: start,
+            translation: value.translation)
         }
       }
       .onEnded { _ in
-        activeGrip = nil
         dockDragStart = nil
-        floatDragStart = nil
       }
-  }
-
-  private func floatDrag(content: CGSize) -> some Gesture {
-    DragGesture(minimumDistance: 1)
-      .onChanged { value in
-        let start =
-          floatDragStart
-          ?? AskSurfaceLayout.displayedFloatFrame(
-            presentation: presentation, content: content
-          ).origin
-        if floatDragStart == nil { floatDragStart = start }
-        update { state in
-          AskPointerRoute.apply(
-            .floatDrag,
-            to: &state,
-            content: content,
-            dockStart: state.preferredDockHeight,
-            originStart: start,
-            sizeStart: state.preferredFloatSize,
-            translation: value.translation)
-        }
-      }
-      .onEnded { _ in floatDragStart = nil }
-  }
-
-  private func floatResize(content: CGSize) -> some Gesture {
-    DragGesture(minimumDistance: 1)
-      .onChanged { value in
-        // Same continuity rule for the corner: a clamped float resizes from
-        // its displayed frame, not from a hidden larger preference.
-        let start =
-          floatResizeStart
-          ?? AskSurfaceLayout.displayedFloatFrame(
-            presentation: presentation, content: content
-          ).size
-        if floatResizeStart == nil { floatResizeStart = start }
-        update { state in
-          AskPointerRoute.apply(
-            .floatResize,
-            to: &state,
-            content: content,
-            dockStart: state.preferredDockHeight,
-            originStart: state.floatOrigin,
-            sizeStart: start,
-            translation: value.translation)
-        }
-      }
-      .onEnded { _ in floatResizeStart = nil }
-  }
-
-  private func syncFloatOrigin(to content: CGSize) {
-    update { state in state.clampOrigin(to: content) }
   }
 
   private func update(_ body: (inout AskPresentationState) -> Void) {
@@ -376,5 +303,20 @@ struct AskSurfacePalette: Equatable {
       headingFamily: tokens.previewHeadingFamily,
       headingSize: 12,
       material: material)
+  }
+}
+
+/// Initiates native macOS window dragging on mouse down.
+struct WindowDragHandle: NSViewRepresentable {
+  func makeNSView(context: Context) -> WindowDragHandleView {
+    WindowDragHandleView()
+  }
+
+  func updateNSView(_ nsView: WindowDragHandleView, context: Context) {}
+}
+
+final class WindowDragHandleView: NSView {
+  override func mouseDown(with event: NSEvent) {
+    window?.performDrag(with: event)
   }
 }
