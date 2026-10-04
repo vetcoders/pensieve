@@ -74,6 +74,11 @@ final class AskConversationModel: ObservableObject {
   private var epoch: UInt64 = 0
   private var scrollRequests = 0
   private var worker: Task<Void, Never>?
+  private var flushTasks: [String: Task<Void, Never>] = [:]
+
+  deinit {
+    for task in flushTasks.values { task.cancel() }
+  }
 
   init(
     clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -193,20 +198,50 @@ final class AskConversationModel: ObservableObject {
     if turn.isStreaming {
       var scheduler = schedulers[turn.id] ?? AskMarkdownStreamScheduler()
       defer { schedulers[turn.id] = scheduler }
-      guard
-        let publication = scheduler.ingest(
-          text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
-      else { return false }
-      requestParse(id: turn.id, text: publication.text, revision: publication.generation)
-      noteContentChanged()
-      return true
+      if let publication = scheduler.ingest(
+        text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
+      {
+        flushTasks[turn.id]?.cancel()
+        flushTasks.removeValue(forKey: turn.id)
+        requestParse(id: turn.id, text: publication.text, revision: publication.generation)
+        noteContentChanged()
+        return true
+      }
+      scheduleTrailingFlush(for: turn.id, generation: turn.revision)
+      return false
     }
+    flushTasks[turn.id]?.cancel()
+    flushTasks.removeValue(forKey: turn.id)
     schedulers.removeValue(forKey: turn.id)
     // A live turn going final is visible even mid-gesture; a historical
     // completed turn changes nothing on screen by itself.
     guard wasStreaming else { return false }
     noteContentChanged()
     return true
+  }
+
+  private func scheduleTrailingFlush(for id: String, generation: UInt64) {
+    flushTasks[id]?.cancel()
+    let currentEpoch = self.epoch
+    flushTasks[id] = Task { [weak self] in
+      try? await Task.sleep(for: .milliseconds(110))
+      guard !Task.isCancelled else { return }
+      await MainActor.run { [weak self] in
+        guard let self, self.epoch == currentEpoch else { return }
+        self.flushTrailingText(for: id, generation: generation)
+      }
+    }
+  }
+
+  private func flushTrailingText(for id: String, generation: UInt64) {
+    flushTasks.removeValue(forKey: id)
+    guard var scheduler = schedulers[id] else { return }
+    let now = clock()
+    guard let publication = scheduler.advance(to: now) else { return }
+    schedulers[id] = scheduler
+    requestParse(id: id, text: publication.text, revision: publication.generation)
+    noteContentChanged()
+    publish()
   }
 
   /// Eager parsing is bounded to the visible history window. Hidden turns
@@ -333,6 +368,8 @@ final class AskConversationModel: ObservableObject {
     window.reset()
     schedulers.removeAll()
     latestRequests.removeAll()
+    for task in flushTasks.values { task.cancel() }
+    flushTasks.removeAll()
     epoch &+= 1
     if follow.handle(.threadChanged) == .scrollToLiveEdge {
       scrollRequests += 1

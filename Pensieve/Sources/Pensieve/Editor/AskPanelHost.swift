@@ -42,6 +42,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   var hostingView: NSView?
   private var isSyncing = false
+  private var isOwnerClosed = false
+  private var hasPositionedPanel = false
   private var ownerCloseObserver: Any?
   private var ownerMiniaturizeObserver: Any?
   private var ownerDeminiaturizeObserver: Any?
@@ -160,6 +162,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
     self.ownerWindow = window
     guard let window else { return }
+    isOwnerClosed = false
+    hasPositionedPanel = false
 
     ownerCloseObserver = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification,
@@ -195,9 +199,19 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
   }
 
   func handleOwnerWindowWillClose() {
+    isOwnerClosed = true
     if let panel {
       dismissPanel(panel)
     }
+    attachOwnerWindow(nil)
+    dockAnchorView = nil
+    hostingView?.removeFromSuperview()
+    hostingView = nil
+    onPresentationChange = nil
+  }
+
+  func teardown() {
+    handleOwnerWindowWillClose()
   }
 
   func windowWillClose(_ notification: Notification) {
@@ -262,6 +276,12 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   func syncPresentation(_ targetPresentation: AskPresentationState, contentSize: CGSize) {
     guard !isSyncing else { return }
+    if isOwnerClosed {
+      if let panel, panelIsVisible(panel) {
+        dismissPanel(panel)
+      }
+      return
+    }
     isSyncing = true
     defer { isSyncing = false }
 
@@ -317,10 +337,15 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
         }
       }
 
+      let panelSize = targetPresentation.preferredFloatSize
+      if panel.contentView?.bounds.size != panelSize {
+        panel.setContentSize(panelSize)
+      }
+
       if !panelIsVisible(panel) {
-        if let ownerWindow, panel.frame.origin.x <= 0 && panel.frame.origin.y <= 0 {
+        if let ownerWindow, !hasPositionedPanel {
+          hasPositionedPanel = true
           let ownerFrame = ownerWindow.frame
-          let panelSize = targetPresentation.preferredFloatSize
           let initialOrigin = CGPoint(
             x: max(ownerFrame.maxX - panelSize.width - 24, 60),
             y: max(ownerFrame.minY + 60, 60)

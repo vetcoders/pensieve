@@ -75,7 +75,15 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     .accessibilityAdjustableAction { direction in
       let delta: CGFloat = direction == .increment ? 24 : -24
       update { state in
-        state.resizeDock(to: state.preferredDockHeight + delta, in: content)
+        if state.mode == .docked {
+          let bounds = ownerSize ?? content
+          state.resizeDock(to: state.preferredDockHeight + delta, in: bounds)
+        } else if state.mode == .floating {
+          state.preferredFloatSize.width = max(
+            AskSurfaceLayout.minimumPanelWidth, state.preferredFloatSize.width + delta)
+          state.preferredFloatSize.height = max(
+            AskSurfaceLayout.minimumPanelHeight, state.preferredFloatSize.height + delta)
+        }
       }
     }
   }
@@ -180,9 +188,10 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func expandButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let expanded = presentation.isExpanded
+    let bounds = ownerSize ?? content
     return Button {
       update { state in
-        _ = state.apply(expanded ? .collapse : .expand, content: content)
+        _ = state.apply(expanded ? .collapse : .expand, content: bounds)
       }
     } label: {
       Image(systemName: expanded ? AskSurfaceSymbol.collapse : AskSurfaceSymbol.expand)
@@ -197,9 +206,10 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func presentationButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let floating = presentation.mode == .floating
+    let bounds = ownerSize ?? content
     return Button {
       update { state in
-        _ = state.apply(floating ? .dock : .float, content: content)
+        _ = state.apply(floating ? .dock : .float, content: bounds)
       }
     } label: {
       Image(systemName: floating ? AskSurfaceSymbol.dock : AskSurfaceSymbol.float)
@@ -244,16 +254,17 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   private func dockGripDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
+        let bounds = ownerSize ?? content
         let start =
           dockDragStart
           ?? AskSurfaceLayout.displayedDockHeight(
-            presentation: presentation, content: content)
+            presentation: presentation, content: bounds)
         if dockDragStart == nil { dockDragStart = start }
         update { state in
           AskPointerRoute.apply(
             .dockResize,
             to: &state,
-            content: content,
+            content: bounds,
             dockStart: start,
             translation: value.translation)
         }

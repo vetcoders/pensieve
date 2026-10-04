@@ -337,6 +337,36 @@ final class AskPanelHostTests: XCTestCase {
     XCTAssertEqual(fixture.controller.presentation.preferredFloatSize, largeSize)
   }
 
+  func testOwnerWindowCloseTearsDownControllerAndClearsReferences() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+
+    let owner = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true
+    )
+    let anchor = AskDockAnchorView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
+    let hosting = NSView(frame: NSRect(x: 0, y: 374, width: 900, height: 300))
+    anchor.addSubview(hosting)
+    fixture.controller.dockAnchorView = anchor
+    fixture.controller.hostingView = hosting
+    fixture.controller.attachOwnerWindow(owner)
+
+    fixture.controller.onPresentationChange = { _ in }
+
+    fixture.controller.syncPresentation(
+      .expandedDefault, contentSize: CGSize(width: 900, height: 700))
+
+    NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: owner)
+
+    XCTAssertNil(fixture.controller.ownerWindow)
+    XCTAssertNil(fixture.controller.dockAnchorView)
+    XCTAssertNil(fixture.controller.hostingView)
+    XCTAssertNil(fixture.controller.onPresentationChange)
+  }
+
   private func makeFixture() -> Fixture {
     let panel = NonActivatingTaflaPanel(
       contentRect: NSRect(x: 100, y: 100, width: 640, height: 520),

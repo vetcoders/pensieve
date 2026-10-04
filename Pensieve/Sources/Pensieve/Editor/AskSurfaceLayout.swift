@@ -73,10 +73,13 @@ enum AskSurfaceLayout {
         askRegion: .zero,
         controls: [])
     case .docked:
+      if isSlotAllocation(content: content, presentation: presentation) {
+        return allocateSlot(content: content, presentation: presentation)
+      }
       let dockH = displayedDockHeight(presentation: presentation, content: content)
       let editorH = max(0, content.height - statusH - dockH)
       let ask = CGRect(x: 0, y: editorH, width: content.width, height: dockH)
-      let parts = split(region: ask)
+      let parts = split(region: ask, isExpanded: presentation.isExpanded)
       return AskSurfaceAllocation(
         editor: CGRect(x: 0, y: 0, width: content.width, height: editorH),
         grip: parts.grip,
@@ -87,19 +90,38 @@ enum AskSurfaceLayout {
         askRegion: ask,
         controls: controls(grip: parts.grip, chrome: parts.chrome, mode: .docked))
     case .floating:
-      // Native panel owns its own content window and allocates within its own bounds
-      let ask = CGRect(origin: .zero, size: content)
-      let parts = split(region: ask)
-      return AskSurfaceAllocation(
-        editor: .zero,
-        grip: parts.grip,
-        chrome: parts.chrome,
-        transcript: parts.transcript,
-        composer: parts.composer,
-        status: .zero,
-        askRegion: ask,
-        controls: controls(grip: parts.grip, chrome: parts.chrome, mode: .floating))
+      return allocateSlot(content: content, presentation: presentation)
     }
+  }
+
+  static func allocateSlot(
+    content rawContent: CGSize, presentation: AskPresentationState
+  ) -> AskSurfaceAllocation {
+    let content = sanitize(rawContent)
+    let ask = CGRect(origin: .zero, size: content)
+    let parts = split(region: ask, isExpanded: presentation.isExpanded)
+    return AskSurfaceAllocation(
+      editor: .zero,
+      grip: parts.grip,
+      chrome: parts.chrome,
+      transcript: parts.transcript,
+      composer: parts.composer,
+      status: .zero,
+      askRegion: ask,
+      controls: controls(grip: parts.grip, chrome: parts.chrome, mode: presentation.mode))
+  }
+
+  static func isSlotAllocation(content: CGSize, presentation: AskPresentationState) -> Bool {
+    if content.height < minimumContentHeight {
+      return true
+    }
+    if abs(content.height - presentation.preferredDockHeight) < 0.5 {
+      return true
+    }
+    if !presentation.isExpanded && abs(content.height - collapsedDockHeight) < 0.5 {
+      return true
+    }
+    return false
   }
 
   static func displayedDockHeight(
@@ -142,7 +164,7 @@ enum AskSurfaceLayout {
     CGSize(width: max(content.width, 0), height: max(content.height, 0))
   }
 
-  private static func split(region: CGRect) -> (
+  private static func split(region: CGRect, isExpanded: Bool = true) -> (
     grip: CGRect, chrome: CGRect, transcript: CGRect, composer: CGRect
   ) {
     var remaining = max(0, region.height)
@@ -153,7 +175,7 @@ enum AskSurfaceLayout {
     remaining -= chromeH
     let composerH = min(composerMaxHeight, remaining)
     remaining -= composerH
-    let transcriptH = max(0, remaining)
+    let transcriptH = isExpanded ? max(0, remaining) : 0
     var y = region.minY
     let grip = CGRect(x: region.minX, y: y, width: region.width, height: gripH)
     y += gripH

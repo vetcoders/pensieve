@@ -582,7 +582,10 @@ final class AutocompleteControllerTests: XCTestCase {
     // error is discarded by the request guard, leaving the latch unarmed and
     // the retry path untested.
     controller.textDidChange(prefix: "hello")
-    await waitUntil { controller.lastError != nil }
+    await waitUntil {
+      attempts.value == 1
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
+    }
     XCTAssertEqual(attempts.value, 1)
 
     controller.cancel()
