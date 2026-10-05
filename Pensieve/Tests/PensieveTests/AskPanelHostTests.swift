@@ -258,14 +258,12 @@ final class AskPanelHostTests: XCTestCase {
     anchor.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
     window.contentView = anchor
 
-    class HitTestControl: NSView {
-      override var isFlipped: Bool { true }
-      override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(point) ? self : nil
-      }
-    }
-    let control = HitTestControl(frame: CGRect(x: 400, y: 400, width: 100, height: 40))
+    let control = NSButton(frame: CGRect(x: 400, y: 400, width: 100, height: 40))
     anchor.addSubview(control)
+
+    func hit(_ point: NSPoint) -> NSView? {
+      anchor.hitTest(anchor.convert(point, to: anchor.superview))
+    }
 
     // Docked mode
     let dockRect = CGRect(x: 0, y: 374, width: 900, height: 300)
@@ -273,22 +271,56 @@ final class AskPanelHostTests: XCTestCase {
     anchor.isDocked = true
 
     // Click in editor (y < 374) -> passes through (nil)
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 100)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 100)))
 
     // Click in status bar (y > 674) -> passes through (nil)
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 685)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 685)))
 
     // Click in dock on control -> hits control
-    XCTAssertEqual(anchor.hitTest(NSPoint(x: 450, y: 420)), control)
+    XCTAssertEqual(hit(NSPoint(x: 450, y: 420)), control)
 
     // Click in dock outside control -> hits anchor
-    XCTAssertEqual(anchor.hitTest(NSPoint(x: 100, y: 450)), anchor)
+    XCTAssertEqual(hit(NSPoint(x: 100, y: 450)), anchor)
 
     // Non-docked (floating or hidden) -> passes everything through
     anchor.isDocked = false
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 420)))
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 100)))
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 685)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 420)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 100)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 685)))
+  }
+
+  func testDockedComposerAndCollapseReceiveNativeHitsAfterReopening() {
+    let parent = NSView(frame: CGRect(x: 0, y: 0, width: 1100, height: 900))
+    let anchor = AskDockAnchorView(frame: CGRect(x: 80, y: 100, width: 900, height: 700))
+    parent.addSubview(anchor)
+    let dockRect = CGRect(x: 0, y: 374, width: 900, height: 300)
+    anchor.dockRect = dockRect
+
+    let host = NSView(frame: dockRect)
+    anchor.addSubview(host)
+    let collapse = NSButton(frame: CGRect(x: 790, y: 248, width: 25, height: 25))
+    let draft = AskDraftTextView(frame: CGRect(x: 20, y: 16, width: 760, height: 80))
+    draft.isEditable = true
+    host.addSubview(collapse)
+    host.addSubview(draft)
+
+    // AppKit receives hit-test points in the receiver's superview coordinates.
+    // Use the real controls' contract, with a translated anchor and host.
+    let draftPoint = parent.convert(CGPoint(x: 200, y: 40), from: draft)
+    let collapsePoint = parent.convert(CGPoint(x: 12, y: 12), from: collapse)
+    let editorPoint = parent.convert(CGPoint(x: 200, y: 100), from: anchor)
+    let statusPoint = parent.convert(CGPoint(x: 200, y: 685), from: anchor)
+
+    for _ in 0..<3 {
+      anchor.isDocked = true
+      XCTAssertTrue(anchor.hitTest(draftPoint) === draft)
+      XCTAssertTrue(anchor.hitTest(collapsePoint) === collapse)
+      XCTAssertNil(anchor.hitTest(editorPoint))
+      XCTAssertNil(anchor.hitTest(statusPoint))
+      anchor.isDocked = false
+      XCTAssertNil(anchor.hitTest(draftPoint))
+      XCTAssertNil(anchor.hitTest(collapsePoint))
+    }
   }
 
   func testNativePanelAllocationIsIndependentOfOwnerWindow() {

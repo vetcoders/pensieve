@@ -354,16 +354,14 @@ final class AskDockAnchorView: NSView {
   var isDocked: Bool = false
 
   override func hitTest(_ point: NSPoint) -> NSView? {
-    guard isDocked, dockRect.contains(point) else {
+    // AppKit supplies the point in our superview's coordinates. The dock
+    // filter uses local coordinates; native descendants keep AppKit's normal
+    // hit-test traversal so their frame offsets are applied exactly once.
+    let localPoint = convert(point, from: superview)
+    guard isDocked, dockRect.contains(localPoint) else {
       return nil
     }
-    for subview in subviews.reversed() {
-      let subPoint = convert(point, to: subview)
-      if let hit = subview.hitTest(subPoint) {
-        return hit
-      }
-    }
-    return self
+    return super.hitTest(point)
   }
 }
 
