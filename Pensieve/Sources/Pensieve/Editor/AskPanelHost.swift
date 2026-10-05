@@ -10,14 +10,25 @@ import SwiftUI
 /// second session or restarting work.
 @MainActor
 final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
+  /// One owner for the entire application, including restored native tabs.
+  static let shared = AskPanelController(defaults: .standard)
+  let documentThreadID = UUID()
+  let threads: DocumentAskThreadStore
+  private let defaults: UserDefaults?
+  private var rememberedMode: AskPresentationMode = .docked
+  private var contentSize: CGSize = .zero
+  private var theme: PensieveTheme = .graphite
+
   weak var ownerWindow: NSWindow?
   private(set) var panel: NSPanel?
   weak var dockAnchorView: AskDockAnchorView?
 
-  var presentation: AskPresentationState {
+  @Published var presentation: AskPresentationState {
     didSet {
       if oldValue != presentation {
+        persistPresentation()
         onPresentationChange?(presentation)
+        if !isSyncing { syncPresentation(presentation, contentSize: contentSize) }
       }
     }
   }
@@ -38,19 +49,73 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   init(
     presentation: AskPresentationState = .expandedDefault,
+    defaults: UserDefaults? = nil,
+    threads: DocumentAskThreadStore? = nil,
     panelFactory: (@MainActor () -> NSPanel)? = nil,
     presentPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderFront(nil) },
     dismissPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderOut(nil) },
     panelIsVisible: @escaping @MainActor (NSPanel) -> Bool = { $0.isVisible },
     onPresentationChange: (@MainActor (AskPresentationState) -> Void)? = nil
   ) {
-    self.presentation = presentation
+    self.defaults = defaults
+    self.threads = threads ?? DocumentAskThreadStore()
+    var restored = presentation
+    if let defaults {
+      restored.isExpanded = defaults.object(forKey: "pensieve.ask.expanded") as? Bool ?? true
+      let height = defaults.double(forKey: "pensieve.ask.dockHeight")
+      if height > 0 { restored.preferredDockHeight = height }
+      rememberedMode =
+        AskPresentationMode(
+          rawValue:
+            defaults.string(forKey: "pensieve.ask.presentationMode") ?? "") ?? .docked
+      if rememberedMode == .hidden { rememberedMode = .docked }
+      restored.mode =
+        defaults.object(forKey: "pensieve.ask.visible") as? Bool == false
+        ? .hidden : rememberedMode
+    }
+    self.presentation = restored
     self.panelFactory = panelFactory ?? { AskPanelController.makeProductionPanelWindow() }
     self.presentPanel = presentPanel
     self.dismissPanel = dismissPanel
     self.panelIsVisible = panelIsVisible
     self.onPresentationChange = onPresentationChange
     super.init()
+  }
+
+  var isVisible: Bool { presentation.mode != .hidden }
+
+  func setVisible(_ visible: Bool) {
+    presentation.mode = visible ? rememberedMode : .hidden
+  }
+
+  private func persistPresentation() {
+    if presentation.mode != .hidden { rememberedMode = presentation.mode }
+    guard let defaults else { return }
+    defaults.set(isVisible, forKey: "pensieve.ask.visible")
+    defaults.set(rememberedMode.rawValue, forKey: "pensieve.ask.presentationMode")
+    defaults.set(presentation.preferredDockHeight, forKey: "pensieve.ask.dockHeight")
+    defaults.set(presentation.isExpanded, forKey: "pensieve.ask.expanded")
+  }
+
+  /// Only the selected document root may reparent or update the shared host.
+  func activateHost(_ anchor: AskDockAnchorView, window: NSWindow?) {
+    if dockAnchorView !== anchor { dockAnchorView?.isDocked = false }
+    dockAnchorView = anchor
+    attachOwnerWindow(window)
+  }
+
+  func releaseHost(_ anchor: AskDockAnchorView) {
+    guard dockAnchorView === anchor else { return }
+    anchor.isDocked = false
+    hostingView?.removeFromSuperview()
+    dockAnchorView = nil
+    attachOwnerWindow(nil)
+    if let panel { dismissPanel(panel) }
+  }
+
+  func updateTheme(_ theme: PensieveTheme) {
+    self.theme = theme
+    if let panel { TaflaPanelChrome.applyTheme(theme, to: panel) }
   }
 
   isolated deinit {
@@ -171,8 +236,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   private func configurePanel(_ panel: NSPanel) {
     panel.title = "Ask"
-    panel.titleVisibility = .hidden
-    panel.titlebarAppearsTransparent = true
+    TaflaPanelChrome.configure(panel)
+    TaflaPanelChrome.applyTheme(theme, to: panel)
     panel.isFloatingPanel = true
     panel.level = presentation.isAlwaysOnTop ? .floating : .normal
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -200,7 +265,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
     isSyncing = true
     defer { isSyncing = false }
 
-    self.presentation = targetPresentation
+    self.contentSize = contentSize
+    if presentation != targetPresentation { self.presentation = targetPresentation }
 
     switch targetPresentation.mode {
     case .docked:
@@ -208,6 +274,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
         dismissPanel(panel)
       }
 
+      // Retire the old sizing writer before the same hosting view docks.
+      panel?.contentView = nil
       guard let dockAnchorView else { return }
       dockAnchorView.isDocked = true
 
@@ -305,29 +373,30 @@ struct AskPanelHostView<Content: View>: NSViewRepresentable {
   @Binding var presentation: AskPresentationState
   let contentSize: CGSize
   let hostWindow: NSWindow?
+  let isActive: Bool
+  let theme: PensieveTheme
   let content: () -> Content
+
+  final class Coordinator {
+    let controller: AskPanelController
+    init(controller: AskPanelController) { self.controller = controller }
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
 
   func makeNSView(context: Context) -> AskDockAnchorView {
     let anchor = AskDockAnchorView()
-    controller.dockAnchorView = anchor
-    controller.attachOwnerWindow(hostWindow)
-
-    if controller.hostingView == nil {
-      let hosting = NSHostingView(rootView: content())
-      hosting.sizingOptions = []
-      hosting.translatesAutoresizingMaskIntoConstraints = true
-      hosting.autoresizingMask = []
-      controller.hostingView = hosting
-    }
-
-    controller.syncPresentation(presentation, contentSize: contentSize)
+    updateNSView(anchor, context: context)
     return anchor
   }
 
   func updateNSView(_ anchor: AskDockAnchorView, context: Context) {
-    controller.dockAnchorView = anchor
-    controller.attachOwnerWindow(hostWindow)
-
+    guard isActive else {
+      controller.releaseHost(anchor)
+      anchor.isDocked = false
+      return
+    }
+    controller.activateHost(anchor, window: hostWindow)
     if let hosting = controller.hostingView as? NSHostingView<Content> {
       hosting.rootView = content()
     } else if controller.hostingView == nil {
@@ -337,7 +406,11 @@ struct AskPanelHostView<Content: View>: NSViewRepresentable {
       hosting.autoresizingMask = []
       controller.hostingView = hosting
     }
-
+    controller.updateTheme(theme)
     controller.syncPresentation(presentation, contentSize: contentSize)
+  }
+
+  static func dismantleNSView(_ anchor: AskDockAnchorView, coordinator: Coordinator) {
+    coordinator.controller.releaseHost(anchor)
   }
 }

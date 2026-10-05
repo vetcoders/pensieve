@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 
@@ -6,6 +7,115 @@ import XCTest
 
 @MainActor
 final class AskPanelHostTests: XCTestCase {
+  func testDockRetiresTheFloatingContainerSoItCannotResizeDockedContent() throws {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    let anchor = AskDockAnchorView()
+    fixture.controller.dockAnchorView = anchor
+    let content = NSView()
+    fixture.controller.hostingView = content
+    var state = AskPresentationState.expandedDefault
+    state.mode = .floating
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    state.mode = .docked
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    XCTAssertNil(fixture.panel.contentView, "the hidden panel must not retain a dock sizing writer")
+    XCTAssertTrue(content.superview === anchor)
+    let dockFrame = content.frame
+    fixture.panel.contentView?.setFrameSize(CGSize(width: 360, height: 260))
+    XCTAssertEqual(content.frame, dockFrame)
+  }
+
+  func testFloatingChromeHasOneCloseControlWithoutDetachedTrafficLights() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    var state = AskPresentationState.expandedDefault
+    state.mode = .floating
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+      XCTAssertTrue(fixture.panel.standardWindowButton(button)?.isHidden ?? true)
+    }
+  }
+
+  func testUnchangedNativeSynchronizationPublishesNoSwiftUIUpdates() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    var updates = 0
+    let observation = fixture.controller.$presentation.dropFirst().sink { _ in updates += 1 }
+    let state = fixture.controller.presentation
+    for _ in 0..<100 {
+      fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    }
+    XCTAssertEqual(
+      updates, 0, "layout updates must not feed an invalidation loop on the main thread")
+    withExtendedLifetime(observation) {}
+  }
+
+  func testMultipleDocumentRootsShareOneHostAndExclusiveDockFloatState() throws {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    let defaults = makeEphemeralDefaults(prefix: "one-application-ask")
+    let context = CommandSurfaceContext()
+    let first = WindowErrorChromeRig(
+      defaults: defaults, askSession: fixture.controller, commandSurface: context)
+    defer { first.tearDown() }
+    first.appState.documentSession = .untitled()
+    first.appState.documentSession.text = "First document"
+    first.settle()
+    let thread = fixture.controller.threads.thread(for: fixture.controller.documentThreadID)
+    thread.draft = "Keep this draft when switching documents"
+    thread.appendDictation("One conversation")
+    let second = WindowErrorChromeRig(
+      defaults: defaults, askSession: fixture.controller, commandSurface: context)
+    defer { second.tearDown() }
+    second.appState.documentSession = .untitled()
+    second.appState.documentSession.text = "Second document"
+    second.settle()
+    let host = try XCTUnwrap(fixture.controller.hostingView)
+    fixture.controller.presentation.mode = .floating
+    second.settle()
+    XCTAssertTrue(fixture.isPresented)
+    XCTAssertTrue(host.superview === fixture.panel.contentView)
+    for _ in 0..<3 {
+      context.adopt(appState: first.appState, controller: first.controller)
+      first.settle()
+      XCTAssertTrue(fixture.controller.ownerWindow === first.window)
+      context.adopt(appState: second.appState, controller: second.controller)
+      second.settle()
+      XCTAssertTrue(fixture.controller.ownerWindow === second.window)
+      XCTAssertTrue(fixture.controller.hostingView === host)
+    }
+    fixture.controller.presentation.mode = .docked
+    second.settle()
+    XCTAssertFalse(fixture.isPresented)
+    let anchor = try XCTUnwrap(fixture.controller.dockAnchorView)
+    XCTAssertTrue(anchor.isDocked)
+    XCTAssertTrue(host.superview === anchor)
+    XCTAssertNil(fixture.panel.contentView)
+    XCTAssertEqual(thread.draft, "Keep this draft when switching documents")
+    XCTAssertEqual(thread.turns.count, 1)
+    fixture.controller.setVisible(false)
+    second.settle()
+    XCTAssertFalse(fixture.isPresented)
+    XCTAssertNil(host.superview)
+    fixture.controller.setVisible(true)
+    second.settle()
+    XCTAssertEqual(fixture.controller.presentation.mode, .docked)
+    XCTAssertTrue(fixture.controller.hostingView === host)
+  }
+
+  func testFloatingPanelUsesTheLiveThemeAndRetainsItsIdentity() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    fixture.controller.presentation.mode = .floating
+    let panel = fixture.panel
+    for theme: PensieveTheme in [.graphite, .parchment, .ink, .porcelain, .default] {
+      fixture.controller.updateTheme(theme)
+      XCTAssertEqual(panel.appearance?.name, WindowChromeRecipe.windowAppearance(for: theme)?.name)
+      XCTAssertTrue(fixture.controller.panel === panel)
+    }
+  }
+
   func testPersistentHostingIdentityAcrossDockFloatAndHide() {
     let fixture = makeFixture()
     defer { fixture.close() }

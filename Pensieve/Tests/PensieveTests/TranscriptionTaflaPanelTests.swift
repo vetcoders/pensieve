@@ -37,6 +37,30 @@ final class TranscriptionTaflaPanelTests: XCTestCase {
     XCTAssertFalse(panel.isMainWindow)
   }
 
+  func testDictationUsesThemeChangesAndOnlyOneCloseControl() {
+    let panel = NonActivatingTaflaPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+      styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+      backing: .buffered, defer: true)
+    let theme = ThemeManager(defaults: makeEphemeralDefaults(prefix: "dictation-theme"))
+    let controller = TranscriptionTaflaPanelController(
+      service: TranscriptionService(), themeManager: theme,
+      panelFactory: { panel }, presentPanel: { _ in }, dismissPanel: { _ in })
+    defer {
+      controller.hide()
+      panel.close()
+    }
+    controller.show()
+    for skin: PensieveTheme in [.graphite, .parchment, .ink] {
+      theme.skin = skin
+      XCTAssertEqual(panel.appearance?.name, WindowChromeRecipe.windowAppearance(for: skin)?.name)
+      for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+        XCTAssertTrue(panel.standardWindowButton(kind)?.isHidden ?? true)
+      }
+      assertUnpublished(panel)
+    }
+  }
+
   func testConfiguredPanelSharingTypeIsCapturable() {
     let fixture = makeFixture()
     defer { close(fixture) }

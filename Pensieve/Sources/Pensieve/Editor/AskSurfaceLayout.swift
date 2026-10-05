@@ -39,6 +39,21 @@ enum AskSurfaceLayout {
     collapsedDockHeight + expandedTranscriptFloor
   }
 
+  /// The native host has already reserved the dock and status geometry. Its
+  /// bounds belong entirely to Ask; subtracting the editor floor here again
+  /// would shrink the transcript to a handful of lines.
+  static func allocateHosted(
+    content rawContent: CGSize, presentation: AskPresentationState
+  ) -> AskSurfaceAllocation {
+    let region = CGRect(origin: .zero, size: sanitize(rawContent))
+    let parts = split(region: region)
+    return AskSurfaceAllocation(
+      editor: .zero, grip: parts.grip, chrome: parts.chrome,
+      transcript: parts.transcript, composer: parts.composer, status: .zero,
+      askRegion: region,
+      controls: controls(grip: parts.grip, chrome: parts.chrome, mode: presentation.mode))
+  }
+
   static func allocate(
     content rawContent: CGSize, presentation: AskPresentationState
   ) -> AskSurfaceAllocation {

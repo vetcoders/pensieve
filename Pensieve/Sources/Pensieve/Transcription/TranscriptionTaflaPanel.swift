@@ -5,6 +5,8 @@ import SwiftUI
 final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
   var onVisibilityChanged: (() -> Void)?
 
+  private let themeManager: ThemeManager
+  private var themeBinding: TaflaPanelThemeBinding?
   private let service: TranscriptionService
   private let routingState = TranscriptionTaflaRoutingState()
   private let onSend: (TranscriptionSendTarget) -> Bool
@@ -17,12 +19,14 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
   init(
     service: TranscriptionService,
+    themeManager: ThemeManager = .shared,
     onSend: @escaping (TranscriptionSendTarget) -> Bool = { _ in false },
     panelFactory: (@MainActor () -> NSPanel)? = nil,
     presentPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderFront(nil) },
     dismissPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderOut(nil) },
     panelIsVisible: @escaping @MainActor (NSPanel) -> Bool = { $0.isVisible }
   ) {
+    self.themeManager = themeManager
     self.service = service
     self.onSend = onSend
     self.panelFactory =
@@ -99,8 +103,8 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
 
   private func configure(_ panel: NSPanel) {
     panel.title = "Dictation"
-    panel.titleVisibility = .hidden
-    panel.titlebarAppearsTransparent = true
+    TaflaPanelChrome.configure(panel)
+    themeBinding = TaflaPanelThemeBinding(panel: panel, themeManager: themeManager)
     panel.isFloatingPanel = true
     panel.level = .floating
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -125,7 +129,7 @@ final class TranscriptionTaflaPanelController: NSObject, NSWindowDelegate {
         self?.hide()
       }
     )
-    let hostingView = NSHostingView(rootView: root)
+    let hostingView = NSHostingView(rootView: root.environmentObject(themeManager))
     // Match Codescribe's proven floating-panel host: the window owns its size,
     // while an absolute frame sync keeps SwiftUI from exporting changing
     // fitting-size constraints back into the resizable panel.
@@ -175,6 +179,7 @@ private final class TranscriptionTaflaRoutingState: ObservableObject {
 }
 
 private struct TranscriptionTaflaPanelView: View {
+  @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject var service: TranscriptionService
   @ObservedObject var routingState: TranscriptionTaflaRoutingState
   let onSend: (TranscriptionSendTarget) -> Bool
@@ -185,7 +190,7 @@ private struct TranscriptionTaflaPanelView: View {
 
   var body: some View {
     ZStack {
-      TaflaVisualEffect()
+      TaflaSurfaceBackground(theme: themeManager.skin)
       VStack(alignment: .leading, spacing: 14) {
         header
         Divider()
@@ -196,6 +201,13 @@ private struct TranscriptionTaflaPanelView: View {
       }
       .padding(20)
     }
+    .foregroundStyle(
+      Color(nsColor: themeManager.skin.tokens.text.nsColor),
+      Color(nsColor: themeManager.skin.tokens.muted.nsColor)
+    )
+    .tint(Color(nsColor: themeManager.skin.tokens.legibleAccent))
+    .preferredColorScheme(WindowChromeRecipe.skinChrome(for: themeManager.skin).window)
+    .ignoresSafeArea(.container, edges: .top)
     .frame(minWidth: 520, minHeight: 380)
     .accessibilityIdentifier("pensieve.dictation.root")
   }
@@ -260,7 +272,7 @@ private struct TranscriptionTaflaPanelView: View {
     .padding(12)
     .background {
       RoundedRectangle(cornerRadius: 10, style: .continuous)
-        .fill(Color(NSColor.controlBackgroundColor).opacity(0.62))
+        .fill(Color(nsColor: themeManager.skin.tokens.codeBackground.nsColor).opacity(0.62))
     }
   }
 
@@ -281,6 +293,7 @@ private struct TranscriptionTaflaPanelView: View {
       }
 
       Spacer(minLength: 16)
+        .background(WindowDragHandle())
 
       Button(action: start) {
         HStack(spacing: 6) {
@@ -339,7 +352,7 @@ private struct TranscriptionTaflaPanelView: View {
         .padding(12)
         .id("pensieve.dictation.transcript.bottom")
       }
-      .background(Color(NSColor.textBackgroundColor).opacity(0.58))
+      .background(Color(nsColor: themeManager.skin.tokens.source.nsColor).opacity(0.58))
       .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
       .overlay {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -507,18 +520,6 @@ private struct TranscriptionTaflaPanelView: View {
       controlError = routingState.sendTarget.failureMessage
     }
   }
-}
-
-private struct TaflaVisualEffect: NSViewRepresentable {
-  func makeNSView(context: Context) -> NSVisualEffectView {
-    let view = NSVisualEffectView()
-    view.material = .hudWindow
-    view.blendingMode = .behindWindow
-    view.state = .active
-    return view
-  }
-
-  func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 extension VistaStatusSignal {

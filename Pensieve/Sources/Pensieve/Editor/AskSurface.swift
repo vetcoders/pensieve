@@ -12,6 +12,7 @@ import SwiftUI
 /// title and surface buttons retain their width instead of wrapping or clipping.
 struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View {
   @Binding var presentation: AskPresentationState
+  var dockOwnerSize: CGSize? = nil
   @ViewBuilder var headerControls: (Bool) -> HeaderControls
   @ViewBuilder var transcript: () -> Transcript
   @ViewBuilder var composer: () -> Composer
@@ -23,7 +24,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   var body: some View {
     GeometryReader { proxy in
       let content = proxy.size
-      let layout = AskSurfaceLayout.allocate(content: content, presentation: presentation)
+      let layout = AskSurfaceLayout.allocateHosted(content: content, presentation: presentation)
       let tokens = themeManager.skin.tokens
       let shellRole: AskChromeRole =
         presentation.mode == .floating ? .floatingShell : .dockShell
@@ -32,7 +33,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         reduceTransparency: reduceTransparency,
         role: shellRole)
       let palette = AskSurfacePalette.resolve(tokens: tokens, material: shellMaterial)
-      panel(layout: layout, content: content, palette: palette, material: shellMaterial)
+      let resizeBounds = presentation.mode == .docked ? (dockOwnerSize ?? content) : content
+      panel(layout: layout, content: resizeBounds, palette: palette, material: shellMaterial)
         .frame(width: max(layout.askRegion.width, 0), height: max(layout.askRegion.height, 0))
         .opacity(presentation.mode == .hidden ? 0 : 1)
         .allowsHitTesting(presentation.mode != .hidden && layout.askRegion.height > 1)
@@ -232,20 +234,9 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     switch material {
     case .solidTheme, .plain:
       shape.fill(Color(nsColor: palette.background))
-    case .systemMaterial:
-      shape.fill(.regularMaterial)
-    case .liquidGlass:
-      glassFill(shape: shape, fallback: Color(nsColor: palette.background))
-    }
-  }
+    case .systemMaterial, .liquidGlass:
+      TaflaSurfaceBackground(theme: themeManager.skin)
 
-  @ViewBuilder
-  private func glassFill(shape: RoundedRectangle, fallback: Color) -> some View {
-    if #available(macOS 26, *) {
-      Color.clear.glassEffect(.regular, in: shape)
-    } else {
-      shape.fill(.regularMaterial)
-        .overlay { shape.fill(fallback.opacity(0.01)) }
     }
   }
 

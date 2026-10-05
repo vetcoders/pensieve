@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fixed Ask multiplying floating panels across restored documents. One
+  application-owned conversation moves exclusively between the active document's
+  dock and one native panel, preserving its draft and attachments. Corrected dock
+  height allocation and themed Ask/Dictation glass; removed detached traffic
+  lights in favor of one close control.
+
 - Submit Document Ask immediately with Enter or Ask. Remove the extra document
   access confirmation and whole-document character counting at submission.
 - Ask retrieves relevant excerpts on demand instead of requiring an initial

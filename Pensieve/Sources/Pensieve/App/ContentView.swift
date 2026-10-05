@@ -12,19 +12,11 @@ struct ContentView: View {
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
   @StateObject private var askThreads: DocumentAskThreadStore
   @State private var lastIngestedDictation = ""
-  /// Shared with the status bar's Ask chip and the surface's hide control —
-  /// one key, three surfaces. Default visible preserves the pre-toggle behavior.
-  @AppStorage("pensieve.ask.visible") private var askVisible = true
-  /// The assembled surface's remembered geometry: presentation mode, the
-  /// user-resized dock height, and expansion. Hidden is NOT stored here — it
-  /// is `pensieve.ask.visible`, synced both ways below.
-  @AppStorage("pensieve.ask.presentationMode") private var askModeRaw =
-    AskPresentationMode.docked.rawValue
-  @AppStorage("pensieve.ask.dockHeight") private var askDockHeight = 0.0
-  @AppStorage("pensieve.ask.expanded") private var askExpanded = true
-  @State private var askPresentation = AskPresentationState.expandedDefault
-  @State private var askPresentationLoaded = false
-  @StateObject private var askPanelController = AskPanelController()
+  @ObservedObject private var askPanelController: AskPanelController
+  @ObservedObject private var commandSurface: CommandSurfaceContext
+
+  private var askPresentation: AskPresentationState { askPanelController.presentation }
+  private var ownsAsk: Bool { commandSurface.controller === controller }
   @Binding private var hostWindow: NSWindow?
   @ObservedObject private var providerSettings: ProviderSettings
 
@@ -33,9 +25,14 @@ struct ContentView: View {
     hostWindow: Binding<NSWindow?> = .constant(nil),
     providerSettings: ProviderSettings = .shared,
     providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil,
-    askThreads: DocumentAskThreadStore? = nil
+    askThreads: DocumentAskThreadStore? = nil,
+    askPanelController: AskPanelController? = nil,
+    commandSurface: CommandSurfaceContext = .shared
   ) {
-    _askThreads = StateObject(wrappedValue: askThreads ?? DocumentAskThreadStore())
+    let session = askPanelController ?? .shared
+    _askPanelController = ObservedObject(wrappedValue: session)
+    _commandSurface = ObservedObject(wrappedValue: commandSurface)
+    _askThreads = StateObject(wrappedValue: askThreads ?? session.threads)
     _hostWindow = hostWindow
     _providerSettings = ObservedObject(wrappedValue: providerSettings)
     _providerOnboardingCoordinator = ObservedObject(
@@ -48,59 +45,6 @@ struct ContentView: View {
     controller.makeAgentDocumentHost()
   }
 
-  /// First-mount restore of the assembled surface: persisted mode, dock
-  /// height and expansion, with hidden read from the shared visibility key.
-  private func loadAskPresentation() {
-    guard !askPresentationLoaded else { return }
-    askPresentationLoaded = true
-    var state = AskPresentationState.expandedDefault
-    state.isExpanded = askExpanded
-    if askDockHeight > 0 { state.preferredDockHeight = askDockHeight }
-    state.mode =
-      askVisible
-      ? (AskPresentationMode(rawValue: askModeRaw) ?? .docked) : .hidden
-    askPresentation = state
-    askPanelController.presentation = state
-    askPanelController.onPresentationChange = { [self] newState in
-      if askPresentation != newState {
-        askPresentation = newState
-      }
-    }
-  }
-
-  /// The status-bar chip (or dictation) flipped visibility: move the surface,
-  /// remembering the non-hidden mode it returns to.
-  private func syncAskVisibility(_ visible: Bool) {
-    guard askPresentationLoaded else { return }
-    if visible {
-      if askPresentation.mode == .hidden {
-        askPresentation.mode = AskPresentationMode(rawValue: askModeRaw) ?? .docked
-      }
-    } else if askPresentation.mode != .hidden {
-      askPresentation.mode = .hidden
-    }
-    askPanelController.presentation = askPresentation
-  }
-
-  /// The surface moved (hide button, float/dock, drag): write visibility back
-  /// to the shared key and remember geometry. Guards keep the two stores
-  /// from bouncing each other.
-  private func persistAskPresentation(_ state: AskPresentationState) {
-    guard askPresentationLoaded else { return }
-    if state.mode == .hidden, askVisible { askVisible = false }
-    if state.mode != .hidden {
-      if !askVisible { askVisible = true }
-      if askModeRaw != state.mode.rawValue { askModeRaw = state.mode.rawValue }
-    }
-    if askDockHeight != state.preferredDockHeight {
-      askDockHeight = state.preferredDockHeight
-    }
-    if askExpanded != state.isExpanded { askExpanded = state.isExpanded }
-    if askPanelController.presentation != state {
-      askPanelController.presentation = state
-    }
-  }
-
   var body: some View {
     NavigationSplitView {
       SidebarView()
@@ -110,7 +54,7 @@ struct ContentView: View {
         let askEligible =
           appState.documentHasEditableBuffer || !appState.workspaceRoots.isEmpty
         let dockPlaceholder =
-          askEligible && askPresentation.mode == .docked
+          askEligible && ownsAsk && askPresentation.mode == .docked
           ? AskSurfaceLayout.displayedDockHeight(
             presentation: askPresentation, content: proxy.size) : 0
         ZStack(alignment: .topLeading) {
@@ -139,56 +83,42 @@ struct ContentView: View {
             if appState.documentHasEditableBuffer {
               EditorStatusBar()
                 .environmentObject(askThreads)
+                .environmentObject(askPanelController)
                 .opacity(appState.mode == .focus ? 0.45 : 1)
             }
           }
-          if askEligible {
+          if askEligible || ownsAsk {
             AskPanelHostView(
               controller: askPanelController,
-              presentation: $askPresentation,
+              presentation: $askPanelController.presentation,
               contentSize: proxy.size,
-              hostWindow: hostWindow
+              hostWindow: hostWindow,
+              isActive: ownsAsk && askEligible,
+              theme: themeManager.skin
             ) {
               AskSurfaceHost(
                 providerSettings: providerSettings,
                 askThreads: askThreads,
-                presentation: $askPresentation,
+                threadID: askPanelController.documentThreadID,
+                ownerContentSize: proxy.size,
+                presentation: $askPanelController.presentation,
                 makeDocumentHost: makeDocumentHost
               )
               .environment(appState)
               .environmentObject(controller)
               .environmentObject(themeManager)
               .environmentObject(askThreads)
+              .preferredColorScheme(WindowChromeRecipe.skinChrome(for: themeManager.skin).window)
+              .ignoresSafeArea(.container, edges: .top)
             }
           }
         }
-        .onAppear { loadAskPresentation() }
-        .onChange(of: askVisible) { _, visible in
-          syncAskVisibility(visible)
-        }
-        .onChange(of: askPresentation) { _, state in
-          persistAskPresentation(state)
-        }
       }
     }
-    .task(id: appState.documentHasEditableBuffer ? appState.documentSession.askThreadID : nil) {
-      if askVisible, appState.documentHasEditableBuffer {
-        _ = askThreads.thread(for: appState.documentSession.askThreadID)
+    .task(id: ownsAsk && askPanelController.isVisible && appState.documentHasEditableBuffer) {
+      if ownsAsk, askPanelController.isVisible, appState.documentHasEditableBuffer {
+        _ = askThreads.thread(for: askPanelController.documentThreadID)
       }
-    }
-    .onChange(of: askVisible) { _, visible in
-      if visible, appState.documentHasEditableBuffer {
-        _ = askThreads.thread(for: appState.documentSession.askThreadID)
-      }
-    }
-    .onChange(of: appState.documentSession.askThreadID) { oldID, _ in
-      askThreads.existingThread(for: oldID)?.cancel()
-    }
-    .onDisappear { askThreads.cancelAll() }
-    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
-      notification in
-      guard let closing = notification.object as? NSWindow, closing === hostWindow else { return }
-      askThreads.cancelAll()
     }
     .navigationTitle(
       DocumentWindowSurface.navigationTitle(
@@ -346,9 +276,9 @@ struct ContentView: View {
     }
     lastIngestedDictation = trimmed
     guard !utterance.isEmpty else { return }
-    askThreads.thread(for: appState.documentSession.askThreadID).appendDictation(utterance)
+    askThreads.thread(for: askPanelController.documentThreadID).appendDictation(utterance)
     // Dictation landing in a hidden composer is feedback nobody sees. Reopen it.
-    askVisible = true
+    askPanelController.setVisible(true)
   }
 
   private func saveRecoveredFileAs() {
@@ -715,6 +645,8 @@ private struct AskSurfaceHost: View {
   @EnvironmentObject private var controller: AppController
   @ObservedObject var providerSettings: ProviderSettings
   @ObservedObject var askThreads: DocumentAskThreadStore
+  let threadID: UUID
+  let ownerContentSize: CGSize
   @Binding var presentation: AskPresentationState
   let makeDocumentHost: @MainActor () -> DocumentToolHost
 
@@ -732,7 +664,7 @@ private struct AskSurfaceHost: View {
   }
 
   private var documentThread: DocumentAskThread? {
-    askThreads.existingThread(for: appState.documentSession.askThreadID)
+    askThreads.existingThread(for: threadID)
   }
 
   private var usesAccountProvider: Bool {
@@ -764,7 +696,7 @@ private struct AskSurfaceHost: View {
   }
 
   var body: some View {
-    AskSurface(presentation: $presentation) { compact in
+    AskSurface(presentation: $presentation, dockOwnerSize: ownerContentSize) { compact in
       headerSlot(compact: compact)
     } transcript: {
       transcriptSlot
@@ -781,7 +713,6 @@ private struct AskSurfaceHost: View {
       await codexAccount.adoptCodexForAskIfSignedIn()
     }
     .onChange(of: workspaceScopeActive) { _, _ in conversation.replaceThread() }
-    .onChange(of: appState.documentSession.askThreadID) { _, _ in conversation.replaceThread() }
     .onChange(of: workspaceThread?.identity.workspaceID) { _, _ in conversation.replaceThread() }
   }
 
