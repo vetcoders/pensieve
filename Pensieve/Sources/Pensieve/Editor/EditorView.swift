@@ -560,6 +560,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var lastNotifiedFindCount = -1
   private var lastNotifiedFindActiveIndex: Int?
   private var pendingEditorFocusRequest: EditorFocusRequest?
+  private var appliedWrapLines: Bool?
 
   init(
     text: String,
@@ -840,12 +841,21 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   /// Injectable wrap seam. Tests drive ON/OFF here without showing a window.
   func applyWrapPreference(_ wrapLines: Bool) {
+    // Notifications and SwiftUI updates reach the same surface. A keystroke
+    // must not resize the container or invalidate its layout again.
+    guard appliedWrapLines != wrapLines else { return }
+    appliedWrapLines = wrapLines
     let config = WrapPreference.textContainerConfiguration(wrapLines: wrapLines)
+    scrollView.hasHorizontalScroller = config.hasHorizontalScroller
     textContainer.widthTracksTextView = config.widthTracksTextView
     textView.isHorizontallyResizable = config.isHorizontallyResizable
     if config.autoresizesWidth {
       textView.autoresizingMask = [.width]
-      let trackedWidth = max(scrollView.contentSize.width, textView.bounds.width, 640)
+      let viewportWidth = scrollView.contentSize.width
+      let trackedWidth = viewportWidth > 0 ? viewportWidth : 640
+      // OFF can grow the document view to the longest line. Re-enabling width
+      // tracking alone retains that wide frame and horizontal scroll extent.
+      textView.setFrameSize(NSSize(width: trackedWidth, height: textView.frame.height))
       textContainer.size = NSSize(
         width: trackedWidth,
         height: CGFloat.greatestFiniteMagnitude)
@@ -855,7 +865,6 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
         width: CGFloat.greatestFiniteMagnitude,
         height: CGFloat.greatestFiniteMagnitude)
     }
-    scrollView.hasHorizontalScroller = config.hasHorizontalScroller
   }
 
   @objc private func wrapPreferenceDidChange(_ notification: Notification) {
