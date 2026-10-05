@@ -725,18 +725,19 @@ struct AskProviderHeader: View {
         Button {
           workspaceSelected = false
         } label: {
-          scopeLabel("Document", symbol: "doc.text")
+          scopeLabel("Document", symbol: "doc.text", selected: !workspaceSelected)
         }
         .accessibilityLabel("Document")
-        .disabled(!workspaceSelected || !documentScopeEnabled)
+        .disabled(!documentScopeEnabled || isStreaming)
         Button {
           workspaceSelected = true
         } label: {
-          scopeLabel("Workspace", symbol: "folder")
+          scopeLabel("Workspace", symbol: "folder", selected: workspaceSelected)
         }
         .accessibilityLabel("Workspace")
-        .disabled(workspaceSelected || !workspaceScopeEnabled)
+        .disabled(!workspaceScopeEnabled || isStreaming)
       }
+      .buttonStyle(.plain)
       .controlSize(.small)
       .fixedSize()
       .accessibilityIdentifier("pensieve.ask.scope")
@@ -745,13 +746,27 @@ struct AskProviderHeader: View {
     readinessChip
   }
 
-  @ViewBuilder
-  private func scopeLabel(_ title: String, symbol: String) -> some View {
-    if compact {
-      Image(systemName: symbol).frame(width: 22, height: 16)
-    } else {
-      Text(title).fixedSize()
+  private func scopeLabel(_ title: String, symbol: String, selected: Bool) -> some View {
+    let tokens = themeManager.skin.tokens
+    let accent = Color(nsColor: tokens.legibleAccent)
+    return Group {
+      if compact {
+        Image(systemName: symbol).frame(width: 22, height: 16)
+      } else {
+        Text(title).fixedSize()
+      }
     }
+    .font(.system(size: 10.5, weight: selected ? .semibold : .regular))
+    .foregroundStyle(selected ? accent : Color(nsColor: tokens.text.nsColor))
+    .padding(.horizontal, 6)
+    .padding(.vertical, 3)
+    .background {
+      RoundedRectangle(cornerRadius: 5).fill(accent.opacity(selected ? 0.14 : 0))
+    }
+    .overlay(alignment: .leading) {
+      if selected { RoundedRectangle(cornerRadius: 1).fill(accent).frame(width: 2) }
+    }
+    .contentShape(Rectangle())
   }
 
   private var providerMenu: some View {

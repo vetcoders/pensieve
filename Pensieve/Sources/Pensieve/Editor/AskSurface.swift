@@ -68,6 +68,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         .accessibilityIdentifier("pensieve.askSurface.composer")
     }
     .foregroundStyle(Color(nsColor: palette.text))
+    .tint(Color(nsColor: themeManager.skin.tokens.legibleAccent))
     .background { shellBackground(material: material, shape: shape, palette: palette) }
     .clipShape(shape)
     .accessibilityElement(children: .contain)
