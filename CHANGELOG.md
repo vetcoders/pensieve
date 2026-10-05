@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Document Find and Replace now share Match Case (`Aa`) and Whole Words (`Word`)
+  switches. Matching remains literal, preserves accents, and respects Unicode
+  word boundaries. Replace has its own row so the controls fit narrower windows.
 - Native AppKit floating panel for Ask: detached Ask floats in its own
   borderless, resizable AppKit panel (`TaflaPanel`) sharing the presentation
   recipe with transcription. Includes an Always-on-Top (AoT) toggle (`.floating`

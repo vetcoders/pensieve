@@ -299,6 +299,11 @@ final class AppState {
     set { windowModel.findReplaceQuery = newValue }
   }
 
+  var findOptions: DocumentFindOptions {
+    get { windowModel.findOptions }
+    set { windowModel.findOptions = newValue }
+  }
+
   var findFocusToken: Int {
     get { windowModel.findFocusToken }
     set { windowModel.findFocusToken = newValue }

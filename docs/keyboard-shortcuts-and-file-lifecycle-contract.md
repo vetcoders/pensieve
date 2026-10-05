@@ -370,6 +370,13 @@ Minimizes the active window. Must not open Settings/Preferences or trigger any o
 
 Opens the find bar and searches only in the active document. This is not workspace or global search and must not disappear through a `CommandGroup` override.
 
+`Aa` (Match Case) distinguishes uppercase and lowercase; `Word` (Whole Words)
+matches complete words rather than fragments inside a longer word or identifier.
+They are independent switches shared by Find, Replace and Replace All. Both
+default off and retain their choice while the document window stays open.
+Accents remain distinct, and replacement text is inserted literally.
+`Cmd+Option+F` opens the replacement row under the search row.
+
 ### `Shift+Cmd+F` — Search in Workspace
 
 Runs a search across the workspace via the index / FTS / fallback. Does not replace `Cmd+F`, and the results must reflect the current state of the files.

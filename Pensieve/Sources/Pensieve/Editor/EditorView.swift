@@ -32,6 +32,7 @@ struct EditorView: View {
         rewriteCommand: appState.pendingAIRewriteCommand,
         findQuery: $appState.findQuery,
         findReplacement: $appState.findReplaceQuery,
+        findOptions: appState.findOptions,
         findBarVisible: appState.findBarVisible,
         findCommand: appState.pendingFindCommand,
         tableTidyOnPaste: appState.tableTidyOnPaste,
@@ -182,6 +183,7 @@ struct EditorRepresentable: NSViewRepresentable {
   let rewriteCommand: AIRewriteCommand?
   @Binding var findQuery: String
   @Binding var findReplacement: String
+  let findOptions: DocumentFindOptions
   let findBarVisible: Bool
   let findCommand: FindBarCommand?
   let tableTidyOnPaste: Bool
@@ -214,6 +216,7 @@ struct EditorRepresentable: NSViewRepresentable {
     rewriteCommand: AIRewriteCommand? = nil,
     findQuery: Binding<String>,
     findReplacement: Binding<String>,
+    findOptions: DocumentFindOptions = DocumentFindOptions(),
     findBarVisible: Bool,
     findCommand: FindBarCommand?,
     tableTidyOnPaste: Bool,
@@ -242,6 +245,7 @@ struct EditorRepresentable: NSViewRepresentable {
     self.rewriteCommand = rewriteCommand
     self._findQuery = findQuery
     self._findReplacement = findReplacement
+    self.findOptions = findOptions
     self.findBarVisible = findBarVisible
     self.findCommand = findCommand
     self.tableTidyOnPaste = tableTidyOnPaste
@@ -372,7 +376,8 @@ struct EditorRepresentable: NSViewRepresentable {
       asciiSafeTables: asciiSafeTables,
       aiAutocompleteEnabled: aiAutocompleteEnabled,
       findQuery: findQuery,
-      findBarVisible: findBarVisible
+      findBarVisible: findBarVisible,
+      findOptions: findOptions
     )
     if textUnchanged {
       if surface.typewriterScrollEnabled {
@@ -475,7 +480,7 @@ struct EditorRepresentable: NSViewRepresentable {
       case .useSelection:
         let selectedText = surface.selectedTextForFind()
         if !selectedText.isEmpty {
-          surface.updateFind(query: selectedText, visible: true)
+          surface.updateFind(query: selectedText, visible: true, options: surface.findOptions)
           surface.selectFindMatch(direction: .forward)
           return selectedText
         }
@@ -550,10 +555,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   private var lineAnchorOffset = 0
   private var lineAnchorLine = 0
   private var findQuery = ""
+  private(set) var findOptions = DocumentFindOptions()
   /// `.foregroundColor` runs the find washes painted over, captured at paint
   /// time so a teardown can restore them without a highlight pass per match.
   private var inkUnderFindWashes: [(range: NSRange, color: NSColor?)] = []
   private var findMatches: [NSRange] = []
+  private var findMatchesNeedRefresh = true
   private var activeFindMatchIndex: Int?
   private var isFindBarVisible = false
   private var hasNotifiedFindState = false
@@ -704,6 +711,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       // string identity, and a memo that outlived the buffer it describes would
       // claim the model is in sync with characters that are no longer there.
       self?.syncedTextObject = nil
+      self?.findMatchesNeedRefresh = true
     }
     // The gutter no longer counts its row numbers off the enumeration (which is
     // what forced every repaint to lay out the whole document); it starts at the
@@ -886,7 +894,8 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     asciiSafeTables: Bool,
     aiAutocompleteEnabled: Bool,
     findQuery: String,
-    findBarVisible: Bool
+    findBarVisible: Bool,
+    findOptions: DocumentFindOptions = DocumentFindOptions()
   ) {
     textView.tableTidyOnPaste = tableTidyOnPaste
     textView.asciiSafeTables = asciiSafeTables
@@ -952,7 +961,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
       isApplyingExternalText = false
     }
 
-    updateFind(query: findQuery, visible: findBarVisible)
+    updateFind(query: findQuery, visible: findBarVisible, options: findOptions)
     updateGutterCurrentLine()
   }
 
@@ -1626,8 +1635,13 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     case backward
   }
 
-  func updateFind(query: String, visible: Bool) {
+  func updateFind(
+    query: String, visible: Bool, options: DocumentFindOptions = DocumentFindOptions()
+  ) {
+    let wasVisible = isFindBarVisible
     isFindBarVisible = visible
+    let optionsChanged = options != findOptions
+    findOptions = options
     guard visible, !query.isEmpty else {
       findQuery = ""
       clearFindHighlights()
@@ -1637,9 +1651,12 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
     // Unchanged query with matches already computed: the highlights are on
     // screen. SwiftUI routes every render pass through here, and re-applying
     // thousands of attributes per pass is a main-thread hang on big documents.
-    guard query != findQuery || findMatches.isEmpty else { return }
+    guard query != findQuery || optionsChanged || !wasVisible || findMatchesNeedRefresh else {
+      return
+    }
 
     findQuery = query
+    activeFindMatchIndex = nil
     refreshFindMatches()
   }
 
@@ -1692,13 +1709,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   func clearFindHighlights() {
     removeFindHighlights()
     findMatches = []
+    findMatchesNeedRefresh = true
     activeFindMatchIndex = nil
     notifyFindStateChanged()
   }
 
   func selectFindMatch(direction: FindDirection) {
     guard !findQuery.isEmpty else { return }
-    if findMatches.isEmpty {
+    if findMatches.isEmpty || findMatchesNeedRefresh {
       refreshFindMatches()
     }
     guard !findMatches.isEmpty else { return }
@@ -1733,7 +1751,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   func replaceCurrentFindMatch(query: String, replacement: String) {
-    updateFind(query: query, visible: true)
+    updateFind(query: query, visible: true, options: findOptions)
     if activeFindMatchIndex == nil {
       selectFindMatch(direction: .forward)
     }
@@ -1754,7 +1772,7 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
   }
 
   func replaceAllFindMatches(query: String, replacement: String) {
-    updateFind(query: query, visible: true)
+    updateFind(query: query, visible: true, options: findOptions)
     guard !findMatches.isEmpty else { return }
 
     let fullRange = NSRange(location: 0, length: (textStorage.string as NSString).length)
@@ -1785,27 +1803,14 @@ final class MarkdownEditorSurface: NSObject, NSTextViewDelegate {
 
   private func refreshFindMatches() {
     removeFindHighlights()
+    findMatchesNeedRefresh = false
     guard !findQuery.isEmpty else {
       findMatches = []
       activeFindMatchIndex = nil
       return
     }
 
-    let haystack = textStorage.string as NSString
-    var ranges: [NSRange] = []
-    var searchRange = NSRange(location: 0, length: haystack.length)
-    while searchRange.length > 0 {
-      let found = haystack.range(
-        of: findQuery,
-        options: [.caseInsensitive, .diacriticInsensitive],
-        range: searchRange
-      )
-      guard found.location != NSNotFound, found.length > 0 else { break }
-      ranges.append(found)
-      let nextLocation = found.location + found.length
-      searchRange = NSRange(location: nextLocation, length: haystack.length - nextLocation)
-    }
-    findMatches = ranges
+    findMatches = findOptions.matches(in: textStorage.string as NSString, query: findQuery)
     if let activeFindMatchIndex, !findMatches.indices.contains(activeFindMatchIndex) {
       self.activeFindMatchIndex = nil
     }
