@@ -85,6 +85,15 @@ final class AskConversationModel: ObservableObject {
 
   func parseCount(for id: String) -> Int { parseInvocations[id] ?? 0 }
   func document(for id: String) -> AskMarkdownDocument? { documents[id] }
+
+  /// Export from current thread text, not a parsed/coalesced snapshot or its
+  /// oversized-message excerpt. Filtering preserves the conversation order.
+  func selectedMessages(for ids: Set<String>) -> [AskSelectedMessage] {
+    turns.compactMap { turn in
+      guard ids.contains(turn.id) else { return nil }
+      return AskSelectedMessage(id: turn.id, roleLabel: turn.roleLabel, text: turn.text)
+    }
+  }
   /// Total parsed documents currently retained (bounded by the budget).
   var retainedDocumentCount: Int { documents.count }
 
@@ -474,55 +483,134 @@ struct AskConversationTranscript: View {
   /// the code/table viewports always see real geometry.
   static let horizontalPadding: CGFloat = 12
   @State private var scrollIntent = AskScrollIntentRouter()
+  @State private var selection = AskMessageSelection()
+  @State private var copyTask: Task<Void, Never>?
+  @State private var isCopying = false
+  @State private var copyError: String?
 
   var body: some View {
     GeometryReader { outer in
-      ScrollViewReader { proxy in
-        ScrollView {
-          VStack(alignment: .leading, spacing: 6) {
-            AskTranscriptView(
-              snapshot: model.snapshot,
-              tokens: themeManager.skin.tokens,
-              containerWidth: max(0, outer.size.width - Self.horizontalPadding * 2),
-              revealedTurnIDs: model.revealedTurnIDs,
-              onRevealEarlier: { model.revealEarlier() },
-              onJumpToLatest: { model.jumpToLatest() },
-              onRevealTurn: { id in model.revealTurn(id) }
-            )
-            footer
-            Color.clear
-              .frame(height: 1)
-              .id(liveEdgeID)
+      VStack(spacing: 4) {
+        selectionToolbar
+        ScrollViewReader { proxy in
+          ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+              AskTranscriptView(
+                snapshot: model.snapshot,
+                tokens: themeManager.skin.tokens,
+                containerWidth: max(0, outer.size.width - Self.horizontalPadding * 2),
+                revealedTurnIDs: model.revealedTurnIDs,
+                onRevealEarlier: { model.revealEarlier() },
+                onJumpToLatest: { model.jumpToLatest() },
+                onRevealTurn: { id in model.revealTurn(id) },
+                selectsMessages: selection.isActive,
+                selectedMessageIDs: selection.ids,
+                onSelectMessage: { id, extending in
+                  selection.toggle(id, in: model.snapshot.turns.map(\.id), extending: extending)
+                }
+              )
+              footer
+              Color.clear
+                .frame(height: 1)
+                .id(liveEdgeID)
+            }
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.vertical, 4)
           }
-          .padding(.horizontal, Self.horizontalPadding)
-          .padding(.vertical, 4)
-        }
-        .onChange(of: model.snapshot.scrollRequests) { _, _ in
-          proxy.scrollTo(liveEdgeID, anchor: .bottom)
-        }
-        .onScrollGeometryChange(
-          for: Bool.self,
-          of: { geometry in
-            StreamScrollFollowState.followTailAfterScroll(
-              contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
-              viewportHeight: geometry.containerSize.height)
-          },
-          action: { _, isAtLiveEdge in
-            // Geometry alone is not user intent: programmatic scrolls, content
-            // growth and resize only inform the router's position memory.
-            for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+          .onChange(of: model.snapshot.scrollRequests) { _, _ in
+            proxy.scrollTo(liveEdgeID, anchor: .bottom)
+          }
+          .onScrollGeometryChange(
+            for: Bool.self,
+            of: { geometry in
+              StreamScrollFollowState.followTailAfterScroll(
+                contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
+                viewportHeight: geometry.containerSize.height)
+            },
+            action: { _, isAtLiveEdge in
+              // Geometry alone is not user intent: programmatic scrolls, content
+              // growth and resize only inform the router's position memory.
+              for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+                apply(intent)
+              }
+            }
+          )
+          .onScrollPhaseChange { _, phase in
+            for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
               apply(intent)
             }
-          }
-        )
-        .onScrollPhaseChange { _, phase in
-          for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
-            apply(intent)
           }
         }
       }
     }
+    .onChange(of: model.snapshot.turns.map(\.id)) { _, _ in
+      guard selection.isActive else { return }
+      selection.retain(Set(model.selectedMessages(for: selection.ids).map(\.id)))
+    }
+    .onDisappear {
+      copyTask?.cancel()
+      copyTask = nil
+      isCopying = false
+    }
     .accessibilityIdentifier("\(identifierPrefix).turns")
+  }
+
+  private var selectionToolbar: some View {
+    HStack(spacing: 12) {
+      if selection.isActive {
+        Button(isCopying ? "Copying…" : "Copy selected · \(selection.ids.count)") {
+          copySelectedMessages()
+        }
+        .disabled(selection.ids.isEmpty || isCopying)
+        .accessibilityIdentifier("\(identifierPrefix).copySelected")
+        Text("Shift-click to select a range")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer(minLength: 0)
+        Button("Done") {
+          copyTask?.cancel()
+          copyTask = nil
+          isCopying = false
+          copyError = nil
+          selection.end()
+        }
+        .accessibilityIdentifier("\(identifierPrefix).selectionDone")
+      } else {
+        Spacer(minLength: 0)
+        Button {
+          selection.begin()
+          // Streaming must not move the messages the user is selecting.
+          model.userScrollBegan()
+        } label: {
+          Label("Select messages", systemImage: "checkmark.circle")
+        }
+        .accessibilityIdentifier("\(identifierPrefix).selectMessages")
+      }
+    }
+    .buttonStyle(.plain)
+    .font(.system(size: 11, weight: .medium))
+    .padding(.horizontal, Self.horizontalPadding)
+    .padding(.top, 2)
+  }
+
+  private func copySelectedMessages() {
+    let messages = model.selectedMessages(for: selection.ids)
+    guard !messages.isEmpty, !isCopying else { return }
+    let pasteboard = NSPasteboard.general
+    let changeCount = pasteboard.changeCount
+    isCopying = true
+    copyError = nil
+    copyTask = Task { @MainActor in
+      let text = await Task.detached(priority: .userInitiated) {
+        AskMessageCopy.source(messages)
+      }.value
+      guard !Task.isCancelled else { return }
+      if !AskMessageCopy.write(text, to: pasteboard, expecting: changeCount) {
+        copyError = "Clipboard changed. Copy the selected messages again."
+      }
+      isCopying = false
+      copyTask = nil
+    }
   }
 
   private func apply(_ intent: AskScrollIntent) {
@@ -536,6 +624,12 @@ struct AskConversationTranscript: View {
 
   @ViewBuilder
   private var footer: some View {
+    if let copyError {
+      Text(copyError)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("\(identifierPrefix).copyError")
+    }
     if let error {
       Text(error)
         .font(.system(size: 10.5))
