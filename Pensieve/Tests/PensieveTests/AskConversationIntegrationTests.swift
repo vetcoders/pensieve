@@ -7,20 +7,20 @@ import XCTest
 @testable import Pensieve
 
 /// Real-path integration for the assembled Ask UI: the production transcript
-/// model (off-main, bounded, latest-wins), scoped attachment sends through
-/// both threads, surface transitions that preserve conversation state, and
-/// the keyless loopback readiness policy shared by both scopes.
+/// model (off-main, bounded, latest-wins), unified attachment sends with
+/// empty/file/root context, surface transitions that preserve conversation
+/// state, and the keyless loopback readiness policy.
 @MainActor
 final class AskConversationIntegrationTests: XCTestCase {
   private var scratch: URL!
 
   /// A mounted SwiftUI observer must reevaluate an extracted slot when the
-  /// document thread changes. No window or WindowServer fixture is allocated.
-  func testMountedDocumentSlotObservesDraftAndTurnsWithoutRemount() async {
-    let thread = DocumentAskThread(id: UUID(), agent: IntegrationAttachmentAgent())
+  /// thread changes. No window or WindowServer fixture is allocated.
+  func testMountedSlotObservesDraftAndTurnsWithoutRemount() async {
+    let thread = AskThread(makeAgent: { IntegrationAttachmentAgent() })
     let seen = Mutex([String]())
     let hosting = NSHostingView(
-      rootView: AskDocumentThreadObservation(thread: thread) { observed in
+      rootView: AskThreadObservation(thread: thread) { observed in
         let text = observed.draft + "|" + (observed.turns.last?.text ?? "")
         seen.withLock { $0.append(text) }
         return Text(text)
@@ -141,9 +141,9 @@ final class AskConversationIntegrationTests: XCTestCase {
       "at most one parse per revision, none for unchanged re-observation")
   }
 
-  /// A scope switch evicts turns from the visible list; coming back with
+  /// A conversation switch evicts turns from the visible list; coming back with
   /// unchanged text must reuse the cached document, not re-parse.
-  func testScopeSwitchRoundTripReusesParsedDocuments() async {
+  func testConversationSwitchRoundTripReusesParsedDocuments() async {
     let model = AskConversationModel(clock: { 0 })
     let documentTurn = UUID()
     let workspaceTurn = UUID()
@@ -151,12 +151,12 @@ final class AskConversationIntegrationTests: XCTestCase {
     await drain(model)
     XCTAssertEqual(model.parseCount(for: documentTurn.uuidString), 1)
 
-    // Workspace scope becomes active: the document turn leaves the list.
+    // A different conversation becomes active: the first turn leaves the list.
     model.observe(turns: [AskTurn(id: workspaceTurn, role: .assistant, text: "workspace answer")])
     await drain(model)
     XCTAssertEqual(model.snapshot.turns.map(\.id), [workspaceTurn.uuidString])
 
-    // Back to the document scope with the same text: cached, not re-parsed.
+    // Back to the first conversation with the same text: cached, not re-parsed.
     model.observe(turns: [AskTurn(id: documentTurn, role: .assistant, text: "document answer")])
     await drain(model)
     XCTAssertEqual(model.snapshot.turns.map(\.id), [documentTurn.uuidString])
@@ -165,77 +165,49 @@ final class AskConversationIntegrationTests: XCTestCase {
       "an unchanged turn keeps its revision and its cached document")
   }
 
-  // MARK: Scoped attachments through the real send path
+  // MARK: Attachments through the real send path
 
-  /// Document scope: a staged image reaches the scoped provider seam with its
-  /// exact path, the sent turn carries the exact attachment ID, and the
-  /// transcript model renders the completed conversation.
-  func testDocumentScopedAttachmentSendIntegratesWithTranscript() async throws {
-    let agent = IntegrationAttachmentAgent()
-    let store = makeStore()
-    let thread = DocumentAskThread(id: UUID(), agent: agent, attachmentStore: store)
-    let model = AskConversationModel()
-    let attachment = try await store.stageImage(
-      data: Data([0x89, 0x50, 0x4E, 0x47]), fileExtension: "png")
-    thread.draft = "What is in this image?"
-    model.observe(turns: thread.turns)
+  /// Empty, explicit-file, and root contexts use the same provider seam and
+  /// transcript path. A completed image turn consumes exactly its attachment.
+  func testAttachmentSendIntegratesWithTranscriptAcrossContexts() async throws {
+    let file = DocumentRef(id: scratch.appendingPathComponent("note.md"), isAdHoc: true)
+    let contexts = [AskContext.empty, AskContext(files: [file]), AskContext(roots: [scratch])]
+    for context in contexts {
+      let agent = IntegrationAttachmentAgent()
+      let store = makeStore()
+      let thread = AskThread(context: context, makeAgent: { agent }, attachmentStore: store)
+      let model = AskConversationModel()
+      let attachment = try await store.stageImage(
+        data: Data([0x89, 0x50, 0x4E, 0x47]), fileExtension: "png")
+      thread.draft = "What is in this image?"
+      model.observe(turns: thread.turns)
 
-    XCTAssertTrue(
-      thread.send(provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note")))
-    let sentTask = thread.lastSendTask
-    await sentTask?.value
+      XCTAssertTrue(
+        thread.send(text: thread.draft, host: makeWorkspaceHost(), provider: .apiKey("sk-test")))
+      await thread.lastSendTask?.value
 
-    XCTAssertEqual(agent.attachmentPaths, [attachment.url.path])
-    XCTAssertEqual(agent.configurations.count, 0, "no API-key configuration was supplied")
-    let userTurn = try XCTUnwrap(thread.turns.first { $0.role == .user })
-    XCTAssertEqual(userTurn.attachmentIDs, [attachment.id])
-    XCTAssertTrue(store.attachments.isEmpty, "a completed send consumes its attachments")
-    XCTAssertEqual(thread.phase, .completed)
+      XCTAssertEqual(agent.attachmentPaths, [attachment.url.path])
+      XCTAssertEqual(agent.configurations.count, 0, "no API-key configuration was supplied")
+      let userTurn = try XCTUnwrap(thread.turns.first { $0.role == .user })
+      XCTAssertEqual(userTurn.attachmentIDs, [attachment.id])
+      XCTAssertTrue(store.attachments.isEmpty, "a completed send consumes its attachments")
+      XCTAssertEqual(thread.phase, .completed)
 
-    model.observe(turns: thread.turns)
-    await drain(model)
-    XCTAssertEqual(model.snapshot.totalCount, 2)
-    XCTAssertEqual(model.snapshot.turns.first?.roleLabel, "You")
-    XCTAssertEqual(model.snapshot.turns.last?.roleLabel, "Pensieve")
-    XCTAssertEqual(
-      model.snapshot.turns.last?.document.blocks.isEmpty, false,
-      "the assistant reply rendered through the off-main parse")
-  }
-
-  /// Workspace scope: the same delivery through the scoped workspace seam.
-  func testWorkspaceScopedAttachmentSendIntegratesWithTranscript() async throws {
-    let agent = IntegrationWorkspaceAttachmentAgent()
-    let store = makeStore()
-    let thread = WorkspaceAskThread(
-      identity: WorkspaceIdentity.make(rootURL: scratch, bookmarkData: nil),
-      makeAgent: { agent }, attachmentStore: store)
-    let model = AskConversationModel()
-    let attachment = try await store.stageImage(
-      data: Data([0x89, 0x50, 0x4E, 0x47]), fileExtension: "png")
-
-    XCTAssertTrue(
-      thread.send(
-        text: "Summarize the screenshot.", host: makeWorkspaceHost(),
-        provider: .apiKey("sk-test")))
-    let sentTask = thread.lastSendTask
-    await sentTask?.value
-
-    XCTAssertEqual(agent.attachmentPaths, [attachment.url.path])
-    XCTAssertEqual(thread.turns.first { $0.role == .user }?.attachmentIDs, [attachment.id])
-    XCTAssertTrue(store.attachments.isEmpty)
-    XCTAssertFalse(thread.isStreaming)
-    XCTAssertNil(thread.lastError)
-
-    model.observe(turns: thread.turns)
-    await drain(model)
-    XCTAssertEqual(model.snapshot.totalCount, 2)
-    XCTAssertEqual(model.snapshot.turns.last?.document.source, "workspace image reply")
+      model.observe(turns: thread.turns)
+      await drain(model)
+      XCTAssertEqual(model.snapshot.totalCount, 2)
+      XCTAssertEqual(model.snapshot.turns.first?.roleLabel, "You")
+      XCTAssertEqual(model.snapshot.turns.last?.roleLabel, "Pensieve")
+      XCTAssertEqual(
+        model.snapshot.turns.last?.document.blocks.isEmpty, false,
+        "the assistant reply rendered through the off-main parse")
+    }
   }
 
   /// Dock/float/expand/hide transitions rewrite the presentation only: the
   /// conversation, draft, attachments and provider ride along unchanged, and
   /// no transition duplicates the request or its stream subscription.
-  func testSurfaceTransitionsPreserveScopedConversationState() throws {
+  func testSurfaceTransitionsPreserveConversationState() throws {
     let userTurn = AskTurn(role: .user, text: "attached question", attachmentIDs: [UUID()])
     var carry = AskSurfaceCarry(
       conversation: [userTurn],
@@ -609,7 +581,7 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertEqual(state.mode, .floating)
   }
 
-  // MARK: Keyless loopback readiness (both scopes share this policy)
+  // MARK: Keyless loopback readiness
 
   func testLoopbackEndpointWithoutKeyReadinessMatrix() {
     let positives = [
@@ -655,12 +627,12 @@ final class AskConversationIntegrationTests: XCTestCase {
       "Local endpoint ready")
   }
 
-  /// The scoped send path with an empty key: the configured loopback
+  /// The unified send path with an empty key: the configured loopback
   /// endpoint and model reach the provider seam unchanged — no invented
   /// credential, no readiness block.
-  func testDocumentSendToLoopbackWithEmptyKeySendsConfiguredEndpoint() async throws {
+  func testSendToLoopbackWithEmptyKeySendsConfiguredEndpoint() async throws {
     let agent = IntegrationAttachmentAgent()
-    let thread = DocumentAskThread(id: UUID(), agent: agent, attachmentStore: makeStore())
+    let thread = AskThread(makeAgent: { agent }, attachmentStore: makeStore())
     thread.draft = "Hello, local model."
     let configuration = CsDocumentProvider(
       wire: "openai-responses",
@@ -670,7 +642,7 @@ final class AskConversationIntegrationTests: XCTestCase {
 
     XCTAssertTrue(
       thread.send(
-        provider: .apiKey(""), host: AskDocumentFixture.host(text: "note"),
+        text: thread.draft, host: makeWorkspaceHost(), provider: .apiKey(""),
         configuration: configuration))
     let sentTask = thread.lastSendTask
     await sentTask?.value
@@ -687,12 +659,12 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertEqual(thread.phase, .completed)
   }
 
-  /// The same policy gates the workspace lane: a remote endpoint with an
-  /// empty key is refused before any host work; loopback goes through.
-  func testWorkspaceSendKeylessPolicyMatchesDocumentScope() async throws {
-    let refused = WorkspaceAskThread(
-      identity: WorkspaceIdentity.make(rootURL: scratch, bookmarkData: nil),
-      makeAgent: { IntegrationWorkspaceAttachmentAgent() }, attachmentStore: makeStore())
+  /// Preparation refuses a remote endpoint with an empty key before host
+  /// work, while a configured loopback endpoint can be sent directly.
+  func testPreparationAndDirectSendShareKeylessPolicy() async throws {
+    let refused = AskThread(
+      context: AskContext(roots: [scratch]),
+      makeAgent: { IntegrationAttachmentAgent() }, attachmentStore: makeStore())
     let remote = CsDocumentProvider(
       wire: "openai-responses", endpoint: "https://api.openai.com/v1/responses", model: "gpt",
       apiKey: "")
@@ -704,9 +676,9 @@ final class AskConversationIntegrationTests: XCTestCase {
     XCTAssertFalse(refusedSend)
     XCTAssertEqual(refused.lastError, AskReadiness.apiKeyNotReadyMessage)
 
-    let agent = IntegrationWorkspaceAttachmentAgent()
-    let thread = WorkspaceAskThread(
-      identity: WorkspaceIdentity.make(rootURL: scratch, bookmarkData: nil),
+    let agent = IntegrationAttachmentAgent()
+    let thread = AskThread(
+      context: AskContext(roots: [scratch]),
       makeAgent: { agent }, attachmentStore: makeStore())
     let local = CsDocumentProvider(
       wire: "openai-responses", endpoint: "http://localhost:8000/v1/responses", model: "buddy",
@@ -754,7 +726,7 @@ private final class ParseGate: @unchecked Sendable {
 
 /// Records plain and attachment sends plus the provider configurations the
 /// scoped seams actually received.
-private final class IntegrationAttachmentAgent: CodescribeAgentAttachmentStreaming,
+private final class IntegrationAttachmentAgent: AskAgentAttachmentStreaming,
   @unchecked Sendable
 {
   private struct State: Sendable {
@@ -768,8 +740,8 @@ private final class IntegrationAttachmentAgent: CodescribeAgentAttachmentStreami
   var attachmentPaths: [String] { state.withLock { $0.attachmentPaths } }
   var configurations: [CsDocumentProvider] { state.withLock { $0.configurations } }
 
-  func streamDocument(
-    text: String, threadId: String, document: CsDocumentToolHost,
+  func streamWorkspace(
+    text: String, threadId: String, workspace: CsDocumentToolHost,
     provider: CsDocumentProvider?, listener: CsAgentListener
   ) async throws -> String {
     state.withLock {
@@ -781,8 +753,8 @@ private final class IntegrationAttachmentAgent: CodescribeAgentAttachmentStreami
     return "plain reply"
   }
 
-  func streamDocumentWithAttachments(
-    text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost,
+  func streamWorkspaceWithAttachments(
+    text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost,
     provider: CsDocumentProvider?, listener: CsAgentListener
   ) async throws -> String {
     state.withLock {
@@ -793,50 +765,6 @@ private final class IntegrationAttachmentAgent: CodescribeAgentAttachmentStreami
     listener.onTextDone(text: "image reply")
     listener.onDone()
     return "image reply"
-  }
-
-  func cancelTurn(threadId: String) -> Bool { true }
-  func resolveToolApproval(
-    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
-  ) -> Bool { false }
-}
-
-/// Workspace twin of `IntegrationAttachmentAgent`.
-private final class IntegrationWorkspaceAttachmentAgent: WorkspaceAgentAttachmentStreaming,
-  @unchecked Sendable
-{
-  private struct State: Sendable {
-    var attachmentPaths: [String] = []
-    var configurations: [CsDocumentProvider] = []
-  }
-
-  private let state = Mutex(State())
-  var attachmentPaths: [String] { state.withLock { $0.attachmentPaths } }
-  var configurations: [CsDocumentProvider] { state.withLock { $0.configurations } }
-
-  func streamWorkspace(
-    text: String, threadId: String, workspace: CsDocumentToolHost,
-    provider: CsDocumentProvider?, listener: CsAgentListener
-  ) async throws -> String {
-    state.withLock {
-      if let provider { $0.configurations.append(provider) }
-    }
-    listener.onTextDone(text: "plain workspace reply")
-    listener.onDone()
-    return "plain workspace reply"
-  }
-
-  func streamWorkspaceWithAttachments(
-    text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost,
-    provider: CsDocumentProvider?, listener: CsAgentListener
-  ) async throws -> String {
-    state.withLock {
-      $0.attachmentPaths.append(contentsOf: attachments.map(\.path))
-      if let provider { $0.configurations.append(provider) }
-    }
-    listener.onTextDone(text: "workspace image reply")
-    listener.onDone()
-    return "workspace image reply"
   }
 
   func cancelTurn(threadId: String) -> Bool { true }

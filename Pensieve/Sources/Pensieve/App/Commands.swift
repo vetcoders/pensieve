@@ -291,7 +291,11 @@ enum DocumentOpenPanel {
 /// ⌘Q can never fall back to SwiftUI's unguarded default termination command.
 struct ApplicationCommandLane {
   var resolveTermination: @MainActor () -> NSApplication.TerminateReply = {
-    DocumentWindowRegistry.shared.resolveTerminationRequest()
+    AskPanelController.shared.prepareForTermination(
+      confirmUnsavedHistoryQuit: AskPanelController.confirmQuitWithoutSavedHistory
+    ) {
+      DocumentWindowRegistry.shared.resolveTerminationRequest()
+    }
   }
   var terminate: @MainActor () -> Void = {
     NSApplication.shared.terminate(nil)
@@ -492,6 +496,7 @@ private struct DocumentlessFileCommands: Commands {
 }
 
 private struct ActivePensieveCommands: Commands {
+  @ObservedObject private var askPanelController = AskPanelController.shared
   // @Observable AppState observed via a plain stored property.
   var appState: AppState
   @ObservedObject var controller: AppController
@@ -721,6 +726,10 @@ private struct ActivePensieveCommands: Commands {
       }
 
       Divider()
+
+      Button(askPanelController.isVisible ? "Hide Ask" : "Show Ask") {
+        askPanelController.setVisible(!askPanelController.isVisible)
+      }
 
       Button(appState.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") {
         controller.toggleSidebar()

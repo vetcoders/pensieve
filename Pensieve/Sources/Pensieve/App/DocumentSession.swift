@@ -89,10 +89,10 @@ struct DocumentSession: Equatable, Sendable {
   private var storedOriginalSaveFailure: String?
   var text: String
   var isDirty: Bool
-  /// Birth UUID for the codescribe Ask thread. Minted with the session, not
-  /// derived from `persistentID` (that is still `file:<url>` and would fork
-  /// the conversation on Save As). Rename / Save As keep this value; opening
-  /// a different file or creating a new untitled buffer mints a new one.
+  /// Buffer capability token used by document tools (legacy property name).
+  /// Rename / Save As keep it; replacing the buffer mints a new token so an
+  /// old tool host cannot edit another document. Conversation UUIDs are owned
+  /// independently by AskThreadStore.
   var askThreadID: UUID
 
   static let empty = DocumentSession(kind: .empty, text: "", isDirty: false)

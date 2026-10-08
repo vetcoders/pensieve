@@ -62,7 +62,7 @@ final class AskPanelHostTests: XCTestCase {
     first.appState.documentSession = .untitled()
     first.appState.documentSession.text = "First document"
     first.settle()
-    let thread = fixture.controller.threads.thread(for: fixture.controller.documentThreadID)
+    let thread = fixture.controller.threads.thread(for: fixture.controller.activeThreadID)
     thread.draft = "Keep this draft when switching documents"
     thread.appendDictation("One conversation")
     let second = WindowErrorChromeRig(

@@ -183,12 +183,12 @@ struct EditorStatusBar: View {
 /// only asked for a NON-minting lookup so a document never opened for Ask does
 /// not birth an empty thread just by being displayed.
 private struct AskToggleChip: View {
-  @EnvironmentObject private var askThreads: DocumentAskThreadStore
+  @EnvironmentObject private var askThreads: AskThreadStore
   @EnvironmentObject private var askPanelController: AskPanelController
   private var askVisible: Bool { askPanelController.isVisible }
 
   var body: some View {
-    if let thread = askThreads.existingThread(for: askPanelController.documentThreadID) {
+    if let thread = askThreads.existingThread(for: askPanelController.activeThreadID) {
       button(isStreaming: thread.isStreaming, hasTurns: !thread.turns.isEmpty)
     } else {
       button(isStreaming: false, hasTurns: false)

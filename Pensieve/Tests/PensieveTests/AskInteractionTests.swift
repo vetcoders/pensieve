@@ -31,7 +31,7 @@ final class AskInteractionTests: XCTestCase {
     rig.appState.documentSession = .untitled()
     rig.appState.documentSession.text = "# An open document"
     rig.settle(0.3)
-    let thread = rig.askThreads.thread(for: rig.askPanelController.documentThreadID)
+    let thread = rig.askThreads.thread(for: rig.askPanelController.activeThreadID)
     thread.draft = "Explain the document"
     thread.appendDictation("Explain the document")
     rig.settle(0.3)
@@ -59,7 +59,7 @@ final class AskInteractionTests: XCTestCase {
     rig.appState.documentSession = .untitled()
     rig.appState.documentSession.text = "# Document"
     rig.settle(0.3)
-    let thread = rig.askThreads.thread(for: rig.askPanelController.documentThreadID)
+    let thread = rig.askThreads.thread(for: rig.askPanelController.activeThreadID)
     thread.draft = "Explain"
     thread.appendDictation("Explain")
     rig.settle(0.3)

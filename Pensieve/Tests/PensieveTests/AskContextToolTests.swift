@@ -8,7 +8,7 @@ import XCTest
 @testable import Pensieve
 
 @MainActor
-final class WorkspaceAskThreadTests: XCTestCase {
+final class AskContextToolTests: XCTestCase {
   /// Admission uses the delivered library, independently of the test agent.
   func testVendoredWorkspaceSessionActuallyExists() throws {
     let package = URL(fileURLWithPath: #filePath)
@@ -47,7 +47,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
       identity: WorkspaceIdentity.make(rootURL: foreignRoot, bookmarkData: nil),
       roots: [foreignRoot], documents: [foreign])
     let agent = ToolCallingAgent()
-    let thread = WorkspaceAskThread(identity: fixture.identity, makeAgent: { agent })
+    let thread = AskThread(context: AskContext(roots: [fixture.root]), makeAgent: { agent })
     let host = await thread.makeHost(documents: [document, foreign], database: database)
     XCTAssertTrue(thread.send(text: "alpha beta", host: host, provider: .apiKey("test-key")))
     try await waitUntil { !thread.isStreaming }
@@ -95,7 +95,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
     controller.hostWindowProvider = { window }
     let undo = try XCTUnwrap(window.undoManager)
     undo.groupsByEvent = false
-    let thread = WorkspaceAskThread(identity: fixture.identity)
+    let thread = AskThread(context: AskContext(roots: [fixture.root]))
     let host = await thread.makeHost(
       documents: [ref], database: database,
       openDocument: { ref, isActive in
@@ -198,6 +198,86 @@ final class WorkspaceAskThreadTests: XCTestCase {
     XCTAssertEqual(targetState.documentSession.text, "TARGET_UNSAVED")
   }
 
+  func testOriginalWorkspaceOpensLiveBufferAfterAskMovesToForeignWorkspace() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let original = try fixture.document("original.md", text: "ORIGINAL_DISK")
+    let foreignRoot = fixture.base.appendingPathComponent("foreign", isDirectory: true)
+    try FileManager.default.createDirectory(at: foreignRoot, withIntermediateDirectories: true)
+    let foreign = DocumentRef(
+      id: foreignRoot.appendingPathComponent("foreign.md"), rootURL: foreignRoot,
+      relativePath: "foreign.md")
+    try "FOREIGN_DISK".write(to: foreign.url, atomically: true, encoding: .utf8)
+    let defaults = makeEphemeralDefaults(prefix: "ask-original-workspace")
+    let originalState = AppState(defaults: defaults)
+    originalState.workspaceRoots = [WorkspaceRoot(id: fixture.root)]
+    originalState.documents = [original]
+    originalState.documentSession = DocumentSession(document: original, text: "ORIGINAL_UNSAVED")
+    originalState.documentSession.isDirty = true
+    originalState.selectedDocumentID = original.id
+    let foreignState = AppState(defaults: defaults)
+    foreignState.workspaceRoots = [WorkspaceRoot(id: foreignRoot)]
+    foreignState.documents = [foreign]
+    foreignState.documentSession = DocumentSession(document: foreign, text: "FOREIGN_UNSAVED")
+    foreignState.documentSession.isDirty = true
+    foreignState.selectedDocumentID = foreign.id
+    let window = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: true)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    let registry = DocumentWindowRegistry(
+      canMutateWindowTabs: { false }, scheduleDeferredMainWork: { _ in },
+      scheduleLauncherWindowSweep: { _ in },
+      orderAndActivateWindow: { _ in XCTFail("Root routing must not present an inert fixture") },
+      applicationWindows: { [window] })
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let bookmarks = BookmarkStore(defaults: defaults)
+    func owner(_ state: AppState) -> AppController {
+      AppController(
+        appState: state,
+        folderManager: FolderManager(
+          metadataStore: WorkspaceMetadataStore(
+            metadataURL: fixture.base.appendingPathComponent("workspace.json")),
+          indexDatabase: database, bookmarkStore: bookmarks),
+        documentStore: makeTestDocumentStore(
+          indexDatabase: database, bookmarkStore: bookmarks,
+          savingSettings: makeAutoSaveSettings(enabled: false), indexDocument: { _, _, _ in }),
+        indexDatabase: database, documentWindowRegistry: registry,
+        recentDocuments: RecentDocumentsStore(controller: FakeWorkspaceRecents()))
+    }
+    let originalOwner = owner(originalState)
+    let foreignOwner = owner(foreignState)
+    registry.registerController(originalOwner, for: window)
+    let context = AskContext(roots: [fixture.root])
+    let documents = try XCTUnwrap(
+      AskContextSelection.documents(for: context, controller: foreignOwner, registry: registry))
+    XCTAssertTrue(documents.contains(original))
+    let thread = AskThread(context: context)
+    let host = await thread.makeHost(
+      documents: documents, database: database,
+      openDocument: { ref, isActive in
+        try await AskContextSelection.openDocument(
+          ref, context: context, controller: foreignOwner, registry: registry, isActive: isActive)
+      })
+    let opened = try await invoke(host, "document_open", ["path": original.url.path])
+    XCTAssertEqual(opened["opened"] as? Bool, true)
+    let read = try await invoke(host, "document_read", ["offset": 0, "limit": 8000])
+    XCTAssertEqual(read["text"] as? String, "ORIGINAL_UNSAVED")
+    XCTAssertEqual(foreignState.documentSession.text, "FOREIGN_UNSAVED")
+    XCTAssertTrue(foreignState.documentSession.isDirty)
+    XCTAssertEqual(try String(contentsOf: original.url, encoding: .utf8), "ORIGINAL_DISK")
+
+    originalState.workspaceRoots = []
+    XCTAssertNil(
+      AskContextSelection.documents(for: context, controller: foreignOwner, registry: registry))
+    do {
+      _ = try await AskContextSelection.openDocument(
+        original, context: context, controller: foreignOwner, registry: registry, isActive: { true }
+      )
+      XCTFail("A closed original workspace must not be borrowed from another window")
+    } catch {}
+    host.invalidate()
+  }
+
   func testOpenOutsideWorkspaceNeverInvokesTheApplication() async throws {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
@@ -205,7 +285,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
     let outside = fixture.base.appendingPathComponent("outside.md")
     try "outside".write(to: outside, atomically: true, encoding: .utf8)
     let calls = Mutex(0)
-    let thread = WorkspaceAskThread(identity: fixture.identity)
+    let thread = AskThread(context: AskContext(roots: [fixture.root]))
     let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
     let host = await thread.makeHost(
       documents: [ref], database: database,
@@ -229,20 +309,178 @@ final class WorkspaceAskThreadTests: XCTestCase {
     return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any])
   }
 
-  func testOneConversationPerRootSetAcrossDocumentsAndRootOrder() throws {
+  func testContextRootOrderDeduplicatesButDoesNotIdentifyThreads() throws {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
     let other = fixture.base.appendingPathComponent("second", isDirectory: true)
     try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
-    let store = WorkspaceAskThreadStore()
-    let first = store.thread(
-      for: WorkspaceIdentity.make(roots: [fixture.root, other], bookmarkData: nil))
-    let same = store.thread(
-      for: WorkspaceIdentity.make(roots: [other, fixture.root], bookmarkData: Data([1])))
-    XCTAssertTrue(first === same)
-    first.draft = "Keep this workspace question"
-    XCTAssertEqual(same.draft, first.draft)
-    XCTAssertFalse(first === store.thread(for: fixture.identity))
+    let firstContext = AskContext(roots: [fixture.root, other])
+    let sameContext = AskContext(roots: [other, fixture.root])
+    XCTAssertEqual(firstContext, sameContext)
+    let store = AskThreadStore()
+    XCTAssertNotEqual(
+      store.newThread(context: firstContext).id, store.newThread(context: sameContext).id)
+  }
+
+  func testEmptyContextCannotReadOrOpenScannedDocuments() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let ref = try fixture.document("private.md", text: "private")
+    let thread = AskThread()
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let calls = Mutex(0)
+    let seed = AskDocumentFixture.host(text: "private")
+    let host = await thread.makeHost(
+      documents: [ref], database: database,
+      initialDocument: (ref.url.path, seed),
+      openDocument: { _, _ in
+        calls.withLock { $0 += 1 }
+        return AskDocumentFixture.host(text: "private")
+      })
+    XCTAssertFalse(seed.isActive(), "An unselected current buffer must be refused")
+    for name in ["workspace_read", "document_open", "document_read", "document_replace"] {
+      do {
+        _ = try await invoke(host, name, ["path": ref.url.path])
+        XCTFail("Empty context must not expose \(name)")
+      } catch {}
+    }
+    XCTAssertEqual(calls.withLock { $0 }, 0)
+  }
+
+  func testExplicitFilesAdmitAdHocSelectionWithoutAdmittingSiblings() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let first = try fixture.document("first.md", text: "first")
+    let secondURL = fixture.base.appendingPathComponent("selected.md")
+    try "selected ad hoc".write(to: secondURL, atomically: true, encoding: .utf8)
+    let selected = DocumentRef(id: secondURL, isAdHoc: true)
+    let sibling = try fixture.document("sibling.md", text: "private sibling")
+    let thread = AskThread(context: AskContext(files: [first, selected]))
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let host = await thread.makeHost(documents: [first, selected, sibling], database: database)
+    for ref in [first, selected] {
+      let result = try await invoke(host, "workspace_read", ["path": ref.url.path])
+      XCTAssertFalse((result["text"] as? String ?? "").isEmpty)
+    }
+    do {
+      _ = try await invoke(host, "workspace_read", ["path": sibling.url.path])
+      XCTFail("Selecting two files must not authorize their sibling")
+    } catch {}
+  }
+
+  func testExplicitSymlinkSelectionPinsPhysicalTargetAtThreadBirth() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let original = try fixture.document("original.md", text: "selected")
+    let replacement = try fixture.document("replacement.md", text: "private")
+    let link = fixture.base.appendingPathComponent("selected-link.md")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: original.url)
+    let thread = AskThread(context: AskContext(files: [DocumentRef(id: link, isAdHoc: true)]))
+    try FileManager.default.removeItem(at: link)
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: replacement.url)
+    XCTAssertEqual(thread.context.files.first?.url, original.url)
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let host = await thread.makeHost(documents: [original, replacement], database: database)
+    let read = try await invoke(host, "workspace_read", ["path": original.url.path])
+    XCTAssertEqual(read["text"] as? String, "selected")
+    for path in [link.path, replacement.url.path] {
+      do {
+        _ = try await invoke(host, "workspace_read", ["path": path])
+        XCTFail("Retargeting a selected alias must not change conversation authority")
+      } catch {}
+    }
+  }
+
+  func testReplacingCanonicalSelectedFileWithSymlinkRevokesAccess() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let original = try fixture.document("original.md", text: "selected")
+    let outside = fixture.base.appendingPathComponent("outside.md")
+    try "private outside".write(to: outside, atomically: true, encoding: .utf8)
+    let thread = AskThread(context: AskContext(files: [original]))
+    try FileManager.default.removeItem(at: original.url)
+    try FileManager.default.createSymbolicLink(at: original.url, withDestinationURL: outside)
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let host = await thread.makeHost(documents: [], database: database)
+    for path in [original.url.path, outside.path] {
+      do {
+        _ = try await invoke(host, "workspace_read", ["path": path])
+        XCTFail("Replacing a selected canonical file with a symlink must revoke its authority")
+      } catch {}
+    }
+  }
+
+  func testReplacingCanonicalSelectedRootWithSymlinkRevokesAccess() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let original = try fixture.document("same.md", text: "selected")
+    let outsideRoot = fixture.base.appendingPathComponent("outside", isDirectory: true)
+    try FileManager.default.createDirectory(at: outsideRoot, withIntermediateDirectories: true)
+    let outside = outsideRoot.appendingPathComponent("same.md")
+    try "private outside".write(to: outside, atomically: true, encoding: .utf8)
+    let thread = AskThread(context: AskContext(roots: [fixture.root]))
+    try FileManager.default.removeItem(at: fixture.root)
+    try FileManager.default.createSymbolicLink(at: fixture.root, withDestinationURL: outsideRoot)
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let host = await thread.makeHost(documents: [original], database: database)
+    do {
+      _ = try await invoke(host, "workspace_read", ["path": original.url.path])
+      XCTFail("Replacing a selected canonical root must not admit another directory")
+    } catch {}
+  }
+
+  func testSeededUnsavedBufferIsScopedByDraftUUID() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let thread = AskThread(context: AskContext(draftID: UUID()))
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let live = AskDocumentFixture.host(text: "UNSAVED live buffer")
+    let path = try XCTUnwrap(thread.context.draftPath)
+    let host = await thread.makeHost(
+      documents: [], database: database, initialDocument: (path, live))
+    let read = try await invoke(host, "document_read", ["offset": 0, "limit": 8000])
+    XCTAssertTrue((read["text"] as? String ?? "").contains("UNSAVED"))
+    let liveRead = try await invoke(host, "workspace_read", ["path": path])
+    XCTAssertTrue((liveRead["text"] as? String ?? "").contains("UNSAVED"))
+    host.invalidate()
+    XCTAssertFalse(live.isActive())
+  }
+
+  func testMissingOriginalUnsavedBufferFailsBeforeProviderRequest() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let agent = HeldAgent()
+    let thread = AskThread(context: AskContext(draftID: UUID()), makeAgent: { agent })
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let accepted = await thread.prepareAndSend(
+      text: "read it", documents: [], database: database, provider: .apiKey("test"))
+    XCTAssertFalse(accepted)
+    XCTAssertTrue(thread.lastError?.contains("no longer open") == true)
+    XCTAssertTrue(thread.turns.isEmpty)
+    XCTAssertNil(agent.pending.withLock { $0 })
+  }
+
+  func testStopDuringHostPreparationPreventsProviderRequest() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let agent = HeldAgent()
+    let thread = AskThread(makeAgent: { agent })
+    let gate = PreparationGate()
+    thread.preparationProbe = { await gate.wait() }
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    let submit = Task { @MainActor in
+      await thread.prepareAndSend(
+        text: "wait", documents: [], database: database, provider: .apiKey("test"))
+    }
+    try await waitUntil { thread.isPreparing }
+    thread.cancel()
+    await gate.release()
+    let accepted = await submit.value
+    XCTAssertFalse(accepted)
+    XCTAssertFalse(thread.isBusy)
+    XCTAssertEqual(thread.activity, "Stopped")
+    XCTAssertTrue(thread.turns.isEmpty)
+    XCTAssertNil(agent.pending.withLock { $0 })
   }
 
   func testReadRejectsAdHocAndEscapingSymlinkAndEditsRequireOpen() async throws {
@@ -255,7 +493,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
     let symlink = DocumentRef(id: link, rootURL: fixture.root, relativePath: "escape.md")
     let adHoc = DocumentRef(id: outside, isAdHoc: true)
     let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
-    let thread = WorkspaceAskThread(identity: fixture.identity)
+    let thread = AskThread(context: AskContext(roots: [fixture.root]))
     let host = await thread.makeHost(documents: [symlink, adHoc], database: database)
     for path in [link.path, outside.path] {
       let args = String(
@@ -270,7 +508,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
     let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
-    let thread = WorkspaceAskThread(identity: fixture.identity)
+    let thread = AskThread(context: AskContext(roots: [fixture.root]))
     let host = await thread.makeHost(documents: [], database: database)
     XCTAssertThrowsError(
       try host.execute(name: "workspace_search", argumentsJson: #"{"query":"alpha"}"#))
@@ -280,7 +518,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
     let agent = HeldAgent()
-    let thread = WorkspaceAskThread(identity: fixture.identity, makeAgent: { agent })
+    let thread = AskThread(context: AskContext(roots: [fixture.root]), makeAgent: { agent })
     let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
     let host = await thread.makeHost(documents: [], database: database)
     XCTAssertTrue(thread.send(text: "wait", host: host, provider: .codex(accountAuthorized: true)))
@@ -310,7 +548,8 @@ final class WorkspaceAskThreadTests: XCTestCase {
 
     init() throws {
       base = FileManager.default.temporaryDirectory.appendingPathComponent(
-        "WorkspaceAsk-\(UUID())", isDirectory: true)
+        "UnifiedAsk-\(UUID())", isDirectory: true
+      ).resolvingSymlinksInPath()
       root = base.appendingPathComponent("workspace", isDirectory: true).standardizedFileURL
       try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
@@ -325,7 +564,7 @@ final class WorkspaceAskThreadTests: XCTestCase {
   }
 }
 
-private final class ToolCallingAgent: WorkspaceAgentStreaming, Sendable {
+private final class ToolCallingAgent: AskAgentStreaming, Sendable {
   let searchResult = Mutex<String?>(nil)
   let readResult = Mutex<String?>(nil)
 
@@ -358,7 +597,7 @@ private final class ToolCallingAgent: WorkspaceAgentStreaming, Sendable {
   ) -> Bool { false }
 }
 
-private final class HeldAgent: WorkspaceAgentStreaming, Sendable {
+private final class HeldAgent: AskAgentStreaming, Sendable {
   let pending = Mutex<CheckedContinuation<String, any Error>?>(nil)
 
   func streamWorkspace(
@@ -381,4 +620,20 @@ private final class FakeWorkspaceRecents: RecentDocumentsControlling {
   var recentDocumentURLs: [URL] = []
   func noteNewRecentDocumentURL(_ url: URL) { recentDocumentURLs.append(url) }
   func clearRecentDocuments(_ sender: Any?) { recentDocumentURLs = [] }
+}
+
+private actor PreparationGate {
+  private var released = false
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func wait() async {
+    guard !released else { return }
+    await withCheckedContinuation { continuation = $0 }
+  }
+
+  func release() {
+    released = true
+    continuation?.resume()
+    continuation = nil
+  }
 }

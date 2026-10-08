@@ -3,7 +3,7 @@ import Foundation
 import Observation
 import Synchronization
 
-protocol WorkspaceAgentStreaming: AnyObject, Sendable {
+protocol AskAgentStreaming: AnyObject, Sendable {
   func streamWorkspace(
     text: String, threadId: String, workspace: CsDocumentToolHost,
     provider: CsDocumentProvider?, listener: CsAgentListener
@@ -14,28 +14,32 @@ protocol WorkspaceAgentStreaming: AnyObject, Sendable {
   ) -> Bool
 }
 
-extension CodescribeAgent: WorkspaceAgentStreaming {}
+extension CodescribeAgent: AskAgentStreaming {}
 
-/// A workspace conversation survives document and tab changes. The root-set
-/// identity, not the editor's document identity, owns its history and tools.
+/// One conversation and one streaming lane, independent of the current document.
+/// Its UUID owns the history; its immutable context owns the capabilities.
 @Observable
 @MainActor
-final class WorkspaceAskThread {
-  let identity: WorkspaceIdentity
-  let id = UUID()
-  private(set) var turns: [AskTurn] = []
-  private(set) var isStreaming = false
+final class AskThread: Identifiable {
+  let id: UUID
+  let context: AskContext
+  private(set) var turns: [AskTurn] = [] { didSet { onChange?(self) } }
+  private(set) var phase: AskThreadPhase = .idle { didSet { onChange?(self) } }
+  var isStreaming: Bool { phase == .streaming }
   private(set) var isPreparing = false
   var isBusy: Bool { isStreaming || isPreparing }
   private(set) var lastError: String?
-  var draft = ""
+  var draft = "" { didSet { onChange?(self) } }
+  private(set) var activity: String?
+  @ObservationIgnored var preparationProbe: (@Sendable () async -> Void)?
+  @ObservationIgnored var onChange: (@MainActor (AskThread) -> Void)?
 
   /// Pending image attachments for the next send. Staged clipboard copies are
   /// Pensieve-owned; external files are only referenced.
   let attachmentStore: AskAttachmentStore
 
-  @ObservationIgnored private let makeAgent: @Sendable () -> any WorkspaceAgentStreaming
-  @ObservationIgnored private var agent: (any WorkspaceAgentStreaming)?
+  @ObservationIgnored private let makeAgent: @Sendable () -> any AskAgentStreaming
+  @ObservationIgnored private var agent: (any AskAgentStreaming)?
   @ObservationIgnored private var inFlightTask: Task<Void, Never>?
   /// The most recently started send task, retained past cancellation so a
   /// test can deterministically observe its completion instead of yielding
@@ -46,37 +50,85 @@ final class WorkspaceAskThread {
   @ObservationIgnored private var inFlightPrompt: String?
 
   init(
-    identity: WorkspaceIdentity,
-    makeAgent: @escaping @Sendable () -> any WorkspaceAgentStreaming = { CodescribeAgent() },
+    id: UUID = UUID(), context: AskContext = .empty,
+    makeAgent: @escaping @Sendable () -> any AskAgentStreaming = { DeferredCodescribeAgent() },
     attachmentStore: AskAttachmentStore? = nil
   ) {
-    self.identity = identity
+    self.id = id
+    self.context = context
     self.makeAgent = makeAgent
     self.attachmentStore = attachmentStore ?? AskAttachmentStore()
   }
 
-  /// Called on submit, never in a view body. Only indexed documents belonging
-  /// to these roots are admitted; ad-hoc files are outside workspace access.
+  var streamingText: String {
+    turns.last(where: { $0.role == .assistant && $0.isStreaming })?.text ?? ""
+  }
+
+  func appendDictation(_ text: String) {
+    let utterance = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !utterance.isEmpty else { return }
+    turns.append(AskTurn(role: .dictation, text: utterance))
+  }
+
+  func restore(turns: [AskTurn], draft: String) {
+    cancel()
+    self.turns = turns.map { turn in
+      var restored = turn
+      restored.isStreaming = false
+      return restored
+    }
+    self.draft = draft
+    lastError = nil
+    activity = nil
+    phase = .idle
+  }
+
+  /// Caller-side capability preparation can fail before a host exists. Keep
+  /// that failure visible while preserving the user's draft and attachments.
+  @discardableResult
+  func rejectSubmission(_ message: String) -> Bool {
+    guard !isBusy else { return false }
+    lastError = message
+    activity = "Failed"
+    phase = .failed(message)
+    return false
+  }
+
+  /// Build capabilities only on submit. Roots admit their scanned files;
+  /// explicitly selected files (including ad-hoc files) are admitted individually.
   func makeHost(
     documents: [DocumentRef], database: IndexDatabase,
+    initialDocument: (path: String, host: DocumentToolHost)? = nil,
     openDocument: (
       @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
         DocumentToolHost
     )? = nil
   ) async -> WorkspaceToolHost {
-    let identity = self.identity
+    let context = self.context
+    let preparationProbe = self.preparationProbe
     return await Task.detached(priority: .userInitiated) {
-      let roots = Set(identity.canonicalRootURLs.map(\.standardizedFileURL))
+      if let preparationProbe { await preparationProbe() }
+      // Context paths were resolved at birth. Replacing that physical path
+      // with a symlink must revoke access, not silently select a new target.
+      let roots = context.roots.filter { $0.isFileURL && $0.resolvingSymlinksInPath() == $0 }
       let physicalRoots = roots.map { $0.resolvingSymlinksInPath() }
-      let scoped = documents.filter { ref in
+      let rooted = documents.filter { ref in
         autoreleasepool {
-          guard let root = ref.rootURL, !ref.isAdHoc else { return false }
-          return roots.contains(root.standardizedFileURL)
-            && WorkspaceScanner.contains(ref.url, in: root)
+          guard !ref.isAdHoc else { return false }
+          return roots.contains {
+            WorkspaceScanner.contains(ref.url.resolvingSymlinksInPath(), in: $0)
+          }
             && physicalRoots.contains {
               WorkspaceScanner.contains(ref.url.resolvingSymlinksInPath(), in: $0)
             }
         }
+      }
+      // Explicit selections are capabilities in their own right. They do not
+      // grant access to sibling files or their parent directory.
+      var paths: Set<String> = []
+      let pinnedFiles = context.files.filter { $0.url.resolvingSymlinksInPath() == $0.url }
+      let scoped = (pinnedFiles + rooted).filter {
+        $0.url.isFileURL && paths.insert($0.url.standardizedFileURL.path).inserted
       }
       let allowed = Dictionary(
         scoped.map { ref in
@@ -86,12 +138,25 @@ final class WorkspaceAskThread {
       let references = Dictionary(
         scoped.map { ($0.url.standardizedFileURL.path, $0) },
         uniquingKeysWith: { first, _ in first })
+      let seededDocument = initialDocument.flatMap { initial in
+        if initial.path == context.draftPath { return initial }
+        guard let target = allowed[initial.path],
+          URL(fileURLWithPath: initial.path).resolvingSymlinksInPath() == target
+        else { return nil }
+        return initial
+      }
+      if seededDocument == nil { initialDocument?.host.invalidate() }
       return WorkspaceToolHost(
         search: { query, limit in
           try Self.searchFromCallback(
-            query: query, limit: limit, documents: scoped, database: database)
+            query: query, limit: limit,
+            documents: scoped.filter { ref in
+              let path = ref.url.standardizedFileURL.path
+              return ref.url.resolvingSymlinksInPath() == allowed[path]
+            }, database: database)
         },
         containsPath: { path in
+          if path == context.draftPath, seededDocument != nil { return true }
           guard let target = allowed[path] else { return false }
           return URL(fileURLWithPath: path).resolvingSymlinksInPath() == target
         },
@@ -101,6 +166,7 @@ final class WorkspaceAskThread {
           else { throw CsError.Agent(msg: "Path is outside this workspace.") }
           return try autoreleasepool { try String(contentsOf: target, encoding: .utf8) }
         },
+        initialDocument: seededDocument,
         openDocument: { path, isActive in
           guard let ref = references[path], let target = allowed[path],
             URL(fileURLWithPath: path).resolvingSymlinksInPath() == target,
@@ -168,26 +234,47 @@ final class WorkspaceAskThread {
   func prepareAndSend(
     text: String, documents: [DocumentRef], database: IndexDatabase,
     provider: AskProvider, configuration: CsDocumentProvider? = nil,
+    initialDocument: (path: String, host: DocumentToolHost)? = nil,
     openDocument: (
       @MainActor @Sendable (DocumentRef, @escaping @Sendable () -> Bool) async throws ->
         DocumentToolHost
     )? = nil
   ) async -> Bool {
-    guard !isBusy else { return false }
+    guard !isBusy else {
+      initialDocument?.host.invalidate()
+      return false
+    }
     guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
     else {
       lastError = AskReadiness.notReadyMessage(for: provider)
+      initialDocument?.host.invalidate()
+      return false
+    }
+    if context.draftID != nil, initialDocument?.path != context.draftPath {
+      lastError =
+        "The unsaved document for this conversation is no longer open. Start a new thread."
+      initialDocument?.host.invalidate()
+      return false
+    }
+    let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !prompt.isEmpty else {
+      lastError = "Write a question before sending."
+      initialDocument?.host.invalidate()
       return false
     }
     let token = UUID()
     generation = token
     isPreparing = true
-    let host = await makeHost(documents: documents, database: database, openDocument: openDocument)
+    activity = "Preparing…"
+    let host = await makeHost(
+      documents: documents, database: database, initialDocument: initialDocument,
+      openDocument: openDocument)
     guard generation == token, !Task.isCancelled else {
       host.invalidate()
       if generation == token {
         generation = nil
         isPreparing = false
+        activity = nil
       }
       return false
     }
@@ -201,7 +288,10 @@ final class WorkspaceAskThread {
     text: String, host: WorkspaceToolHost, provider: AskProvider,
     configuration: CsDocumentProvider? = nil
   ) -> Bool {
-    guard !isBusy else { return false }
+    guard !isBusy else {
+      if host !== activeHost { host.invalidate() }
+      return false
+    }
     guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
     else {
       lastError = AskReadiness.notReadyMessage(for: provider)
@@ -210,6 +300,7 @@ final class WorkspaceAskThread {
     }
     let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !prompt.isEmpty else {
+      lastError = "Write a question before sending."
       host.invalidate()
       return false
     }
@@ -224,7 +315,8 @@ final class WorkspaceAskThread {
       AskTurn(role: .user, text: prompt, attachmentIDs: attachments.map(\.id)))
     let assistantID = UUID()
     turns.append(AskTurn(id: assistantID, role: .assistant, text: "", isStreaming: true))
-    isStreaming = true
+    phase = .streaming
+    activity = "Working…"
     lastError = nil
     draft = ""
     let threadID = id.uuidString.lowercased()
@@ -257,7 +349,7 @@ final class WorkspaceAskThread {
           // would still start a provider request after Stop.
           try Task.checkCancellation()
           guard let self, self.generation == token else { throw CancellationError() }
-          guard let streaming = agent as? any WorkspaceAgentAttachmentStreaming else {
+          guard let streaming = agent as? any AskAgentAttachmentStreaming else {
             throw CsError.Agent(
               msg: "This Ask engine cannot send attachments. Remove them or update the app.")
           }
@@ -310,11 +402,12 @@ final class WorkspaceAskThread {
     // A stopped turn keeps the user's input unless a newer draft replaced it.
     if let prompt = inFlightPrompt, draft.isEmpty { draft = prompt }
     inFlightPrompt = nil
-    isStreaming = false
+    activity = "Stopped"
+    phase = .idle
   }
 
   private func consume(
-    _ event: AskStreamListener.Event, assistantID: UUID, agent: any WorkspaceAgentStreaming
+    _ event: AskStreamListener.Event, assistantID: UUID, agent: any AskAgentStreaming
   ) {
     guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
     switch event {
@@ -326,8 +419,8 @@ final class WorkspaceAskThread {
         sessionId: request.sessionId, threadId: request.threadId, callId: request.callId,
         approved: false, remember: false)
       lastError =
-        "The agent requested an action outside this workspace and its open documents. It was refused."
-    case .activity: break
+        "The agent requested an action outside this conversation’s context. It was refused."
+    case .activity(let text): activity = text
     }
   }
 
@@ -340,24 +433,110 @@ final class WorkspaceAskThread {
     generation = nil
     inFlightTask = nil
     lastError = error
-    isStreaming = false
+    activity = error == nil ? nil : "Failed"
+    phase = error.map(AskThreadPhase.failed) ?? .completed
   }
 }
 
-@MainActor
-final class WorkspaceAskThreadStore {
-  static let shared = WorkspaceAskThreadStore()
-  private var threads: [String: WorkspaceAskThread] = [:]
-  private let makeAgent: @Sendable () -> any WorkspaceAgentStreaming
+/// Constructs the real FFI agent only on first send so XCTest hosts of
+/// `ContentView` never touch a live `CodescribeAgent()` handle.
+final class DeferredCodescribeAgent: AskAgentStreaming, @unchecked Sendable {
+  private let lock = NSLock()
+  private var boxed: (any AskAgentStreaming)?
+  private let factory: @Sendable () -> any AskAgentStreaming
 
-  init(makeAgent: @escaping @Sendable () -> any WorkspaceAgentStreaming = { CodescribeAgent() }) {
-    self.makeAgent = makeAgent
+  init(factory: @escaping @Sendable () -> any AskAgentStreaming = { CodescribeAgent() }) {
+    self.factory = factory
   }
 
-  func thread(for identity: WorkspaceIdentity) -> WorkspaceAskThread {
-    if let existing = threads[identity.workspaceID] { return existing }
-    let thread = WorkspaceAskThread(identity: identity, makeAgent: makeAgent)
-    threads[identity.workspaceID] = thread
-    return thread
+  func streamWorkspace(
+    text: String, threadId: String, workspace: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    try await resolved().streamWorkspace(
+      text: text, threadId: threadId, workspace: workspace, provider: provider, listener: listener)
   }
+
+  func streamWorkspaceWithAttachments(
+    text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    guard let streaming = resolved() as? any AskAgentAttachmentStreaming else {
+      throw CsError.Agent(
+        msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+    }
+    return try await streaming.streamWorkspaceWithAttachments(
+      text: text, threadId: threadId, attachments: attachments, workspace: workspace,
+      provider: provider, listener: listener)
+  }
+
+  func cancelTurn(threadId: String) -> Bool {
+    lock.lock()
+    let agent = boxed
+    lock.unlock()
+    return agent?.cancelTurn(threadId: threadId) ?? false
+  }
+
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool {
+    resolved().resolveToolApproval(
+      sessionId: sessionId, threadId: threadId, callId: callId, approved: approved,
+      remember: remember)
+  }
+
+  private func resolved() -> any AskAgentStreaming {
+    lock.lock()
+    defer { lock.unlock() }
+    if let boxed { return boxed }
+    let created = factory()
+    boxed = created
+    return created
+  }
+}
+
+extension DeferredCodescribeAgent: AskAgentAttachmentStreaming {}
+
+final class AskStreamListener: CsAgentListener, Sendable {
+  enum Event: Sendable {
+    case delta(String)
+    case text(String)
+    case activity(String)
+    case failure(String)
+    case approval(CsToolApprovalRequest)
+  }
+  let events: AsyncStream<Event>
+  private let continuation: AsyncStream<Event>.Continuation
+
+  init() {
+    let stream = AsyncStream<Event>.makeStream()
+    events = stream.stream
+    continuation = stream.continuation
+  }
+
+  func finish() { continuation.finish() }
+  func onTextDelta(delta: String) { continuation.yield(.delta(delta)) }
+  func onTextDone(text: String) { continuation.yield(.text(text)) }
+  func onReasoningDelta(delta: String) {}
+  func onToolExecuting(name: String, id: String) {
+    let label: String
+    switch name {
+    case "document_read": label = "Reading document…"
+    case "document_search": label = "Searching document…"
+    case "document_replace": label = "Editing document…"
+    case "document_open": label = "Opening document…"
+    case "workspace_search": label = "Searching context…"
+    case "workspace_read": label = "Reading file…"
+    default: label = "Working…"
+    }
+    continuation.yield(.activity(label))
+  }
+  func onToolApprovalRequested(request: CsToolApprovalRequest) {
+    continuation.yield(.approval(request))
+  }
+  func onToolResult(name: String, id: String, summary: String, isError: Bool) {
+    continuation.yield(.activity(isError ? "Action failed: \(summary)" : "Action completed"))
+  }
+  func onDone() {}
+  func onError(message: String) { continuation.yield(.failure(message)) }
 }

@@ -135,7 +135,7 @@ final class AskConversationModel: ObservableObject {
       seen.insert(id)
       let memory = observedRevisions[id]
       if memory?.text == turn.text, memory?.isStreaming == turn.isStreaming {
-        // Unchanged since the last observation. If a scope switch evicted it
+        // Unchanged since the last observation. If a thread change evicted it
         // from the visible list, put it back with its remembered revision —
         // the cached document still matches, so nothing reparses.
         if let memory, indexByID[id] == nil {
@@ -174,7 +174,7 @@ final class AskConversationModel: ObservableObject {
     }
     if structural {
       // The display list follows the thread's order; re-added turns
-      // (scope switch) and appends must not scramble it.
+      // (thread change) and appends must not scramble it.
       let positions = Dictionary(
         uniqueKeysWithValues: newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) })
       turns.sort { (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max) }
@@ -790,10 +790,6 @@ struct AskConversationComposer: View {
 /// two competing headers. All three read the same account truth as the
 /// status bar and Settings ▸ AI.
 struct AskProviderHeader: View {
-  var showsScopePicker: Bool
-  @Binding var workspaceSelected: Bool
-  var documentScopeEnabled: Bool
-  var workspaceScopeEnabled: Bool
   @ObservedObject var grokAccount: GrokAccount
   @ObservedObject var codexAccount: CodexAccount
   var apiKey: String
@@ -814,53 +810,8 @@ struct AskProviderHeader: View {
   }
 
   var body: some View {
-    if showsScopePicker {
-      HStack(spacing: 4) {
-        Button {
-          workspaceSelected = false
-        } label: {
-          scopeLabel("Document", symbol: "doc.text", selected: !workspaceSelected)
-        }
-        .accessibilityLabel("Document")
-        .disabled(!documentScopeEnabled || isStreaming)
-        Button {
-          workspaceSelected = true
-        } label: {
-          scopeLabel("Workspace", symbol: "folder", selected: workspaceSelected)
-        }
-        .accessibilityLabel("Workspace")
-        .disabled(!workspaceScopeEnabled || isStreaming)
-      }
-      .buttonStyle(.plain)
-      .controlSize(.small)
-      .fixedSize()
-      .accessibilityIdentifier("pensieve.ask.scope")
-    }
     providerMenu
     readinessChip
-  }
-
-  private func scopeLabel(_ title: String, symbol: String, selected: Bool) -> some View {
-    let tokens = themeManager.skin.tokens
-    let accent = Color(nsColor: tokens.legibleAccent)
-    return Group {
-      if compact {
-        Image(systemName: symbol).frame(width: 22, height: 16)
-      } else {
-        Text(title).fixedSize()
-      }
-    }
-    .font(.system(size: 10.5, weight: selected ? .semibold : .regular))
-    .foregroundStyle(selected ? accent : Color(nsColor: tokens.text.nsColor))
-    .padding(.horizontal, 6)
-    .padding(.vertical, 3)
-    .background {
-      RoundedRectangle(cornerRadius: 5).fill(accent.opacity(selected ? 0.14 : 0))
-    }
-    .overlay(alignment: .leading) {
-      if selected { RoundedRectangle(cornerRadius: 1).fill(accent).frame(width: 2) }
-    }
-    .contentShape(Rectangle())
   }
 
   private var providerMenu: some View {
