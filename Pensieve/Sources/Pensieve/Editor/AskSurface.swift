@@ -76,7 +76,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
       let delta: CGFloat = direction == .increment ? 24 : -24
       update { state in
         if state.mode == .docked {
-          let bounds = ownerSize ?? content
+          let bounds = dockOwnerSize ?? content
           state.resizeDock(to: state.preferredDockHeight + delta, in: bounds)
         } else if state.mode == .floating {
           state.preferredFloatSize.width = max(
@@ -188,7 +188,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func expandButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let expanded = presentation.isExpanded
-    let bounds = ownerSize ?? content
+    let bounds = dockOwnerSize ?? content
     return Button {
       update { state in
         _ = state.apply(expanded ? .collapse : .expand, content: bounds)
@@ -206,7 +206,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func presentationButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let floating = presentation.mode == .floating
-    let bounds = ownerSize ?? content
+    let bounds = dockOwnerSize ?? content
     return Button {
       update { state in
         _ = state.apply(floating ? .dock : .float, content: bounds)
@@ -254,7 +254,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   private func dockGripDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
-        let bounds = ownerSize ?? content
+        let bounds = dockOwnerSize ?? content
         let start =
           dockDragStart
           ?? AskSurfaceLayout.displayedDockHeight(
