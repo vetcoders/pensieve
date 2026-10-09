@@ -9,17 +9,24 @@ final class PR65ReviewProbes: XCTestCase {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 900, height: 700), styleMask: [.titled],
       backing: .buffered, defer: true)
-    let anchor = AskDockAnchorView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
-    window.contentView = anchor
+    let parent = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 800))
+    window.contentView = parent
+    let anchor = AskDockAnchorView(frame: NSRect(x: 35, y: 45, width: 900, height: 700))
+    parent.addSubview(anchor)
     anchor.isDocked = true
     anchor.dockRect = CGRect(x: 0, y: 374, width: 900, height: 300)
     let control = NSView(frame: NSRect(x: 400, y: 400, width: 100, height: 40))
     anchor.addSubview(control)
-    let point = NSPoint(x: 450, y: 420)
+    let localPoint = NSPoint(x: 450, y: 420)
+    // Each hitTest takes a point in that view's parent coordinates. The
+    // flipped anchor and its native child therefore need different points.
+    let parentPoint = parent.convert(localPoint, from: anchor)
     XCTAssertTrue(
-      control.hitTest(point) === control, "AppKit control baseline uses parent coordinates")
+      control.hitTest(localPoint) === control, "AppKit control baseline uses parent coordinates")
     XCTAssertTrue(
-      anchor.hitTest(point) === control, "Dock must return the real control, not swallow the click")
+      anchor.hitTest(parentPoint) === control,
+      "Dock must return the real control, not swallow the click")
+    XCTAssertNil(anchor.hitTest(parent.convert(NSPoint(x: 450, y: 100), from: anchor)))
   }
 
   func testDockSlotKeepsTheHeightTheOwnerAllocated() {
