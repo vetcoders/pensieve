@@ -207,7 +207,8 @@ final class CodescribeFFIBindingTests: XCTestCase {
       delivery: .unattempted,
       acousticReceipts: [],
       sealCoverage: nil,
-      consultationPresentations: [])
+      consultationPresentations: [],
+      uncertainSpans: [])
   }
 }
 
