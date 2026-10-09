@@ -649,7 +649,6 @@ private struct AskSurfaceHost: View {
   let ownerContentSize: CGSize
   @Binding var presentation: AskPresentationState
   let makeDocumentHost: @MainActor () -> DocumentToolHost
-  var ownerContentSize: CGSize? = nil
 
   @ObservedObject private var grokAccount = GrokAccount.shared
   @ObservedObject private var codexAccount = CodexAccount.shared
